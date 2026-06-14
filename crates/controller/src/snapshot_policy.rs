@@ -129,6 +129,15 @@ pub fn consecutive_failures(backups: &[Snapshot]) -> i64 {
     n
 }
 
+/// Parse an RFC3339 timestamp (e.g. `status.lastVerified`) to Unix seconds for
+/// the `kopiur_snapshot_verified_timestamp_seconds` gauge. `None` on a malformed
+/// value so a bad timestamp simply leaves the gauge unset rather than crashing.
+fn rfc3339_unix_secs(s: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 /// Reconcile a `SnapshotPolicy`.
 #[tracing::instrument(skip(config, ctx), fields(kind = "SnapshotPolicy", namespace = %config.namespace().unwrap_or_default(), name = %config.name_any()))]
 pub async fn reconcile(config: Arc<SnapshotPolicy>, ctx: Arc<Context>) -> Result<Action> {
@@ -302,6 +311,20 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         status["lastSuccessfulSnapshot"] = serde_json::json!(ts);
     }
     io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
+
+    // §4: surface the most recent successful verify as a gauge for staleness
+    // alerting (mirrors kopiur_snapshot_last_success_timestamp_seconds). The mover
+    // stamps `status.lastVerified` on a successful quick/deep verify; reading it
+    // from status here keeps the gauge fresh on the status-change reconcile and on
+    // the periodic verify requeue below. No-op until a first verify lands.
+    if let Some(ts) = config
+        .status
+        .as_ref()
+        .and_then(|s| s.last_verified.as_deref())
+        .and_then(rfc3339_unix_secs)
+    {
+        ctx.metrics.set_snapshot_verified(&namespace, &name, ts);
+    }
 
     // §4: first-class verification scheduling. When `spec.verification` is set, the
     // policy reconciler doubles as the verify scheduler (mirroring the Maintenance
@@ -502,6 +525,24 @@ mod tests {
         );
         // No terminal backups (e.g. only Running/Pending) → 0.
         assert_eq!(consecutive_failures(&[]), 0);
+    }
+
+    #[test]
+    fn rfc3339_unix_secs_parses_last_verified_and_rejects_garbage() {
+        // 2023-11-14T22:13:20Z == 1_700_000_000 (the value status.lastVerified
+        // carries → kopiur_snapshot_verified_timestamp_seconds).
+        assert_eq!(
+            rfc3339_unix_secs("2023-11-14T22:13:20Z"),
+            Some(1_700_000_000)
+        );
+        // Offset timestamps normalize to the same instant.
+        assert_eq!(
+            rfc3339_unix_secs("2023-11-14T23:13:20+01:00"),
+            Some(1_700_000_000)
+        );
+        // Malformed → None (gauge stays unset rather than crashing the reconcile).
+        assert_eq!(rfc3339_unix_secs("not-a-timestamp"), None);
+        assert_eq!(rfc3339_unix_secs(""), None);
     }
 
     #[test]

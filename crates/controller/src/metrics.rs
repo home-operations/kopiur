@@ -52,6 +52,7 @@ pub struct Metrics {
 
     // Snapshot business metrics.
     backup_last_success_timestamp: Gauge<i64>,
+    backup_verified_timestamp: Gauge<i64>,
     backup_consecutive_failures: Gauge<i64>,
     backup_size_bytes: Gauge<i64>,
     backup_files: Gauge<i64>,
@@ -127,6 +128,13 @@ impl Metrics {
         let backup_last_success_timestamp = m
             .i64_gauge("kopiur_snapshot_last_success_timestamp_seconds")
             .with_description("Unix timestamp of the most recent successful backup.")
+            .build();
+        let backup_verified_timestamp = m
+            .i64_gauge("kopiur_snapshot_verified_timestamp_seconds")
+            .with_description(
+                "Unix timestamp of the most recent successful SnapshotPolicy verification \
+                 (quick or deep), from status.lastVerified.",
+            )
             .build();
         let backup_consecutive_failures = m
             .i64_gauge("kopiur_snapshot_consecutive_failures")
@@ -213,6 +221,7 @@ impl Metrics {
             reconcile_duration,
             resource_phase,
             backup_last_success_timestamp,
+            backup_verified_timestamp,
             backup_consecutive_failures,
             backup_size_bytes,
             backup_files,
@@ -299,6 +308,15 @@ impl Metrics {
     /// Stamp the Unix timestamp of a successful backup.
     pub fn set_backup_last_success(&self, ns: &str, name: &str, ts: i64) {
         self.backup_last_success_timestamp
+            .record(ts, &ns_name(ns, name));
+    }
+
+    /// Stamp the Unix timestamp of a SnapshotPolicy's most recent successful
+    /// verification (from `status.lastVerified`). Mirrors
+    /// [`Self::set_backup_last_success`] for staleness alerting (ADR-0005 §4):
+    /// `time() - kopiur_snapshot_verified_timestamp_seconds` is the verify age.
+    pub fn set_snapshot_verified(&self, ns: &str, name: &str, ts: i64) {
+        self.backup_verified_timestamp
             .record(ts, &ns_name(ns, name));
     }
 
@@ -451,6 +469,7 @@ mod tests {
         m.inc_orphaned_snapshot("ns");
         m.set_backup_phase("ns", "db", SnapshotPhase::Succeeded);
         m.set_backup_stats("ns", "db", Some(1234), Some(10), Some(5));
+        m.set_snapshot_verified("ns", "db", 1_700_000_000);
         m.set_repository_maintenance_configured("Repository", "ns", "nas", false);
         let text = String::from_utf8(m.gather()).unwrap();
         // The Prometheus exporter appends `_total` to counters.
@@ -461,6 +480,10 @@ mod tests {
         assert!(text.contains("kopiur_orphaned_snapshots_total"), "{text}");
         assert!(text.contains("kopiur_resource_phase"), "{text}");
         assert!(text.contains("kopiur_snapshot_size_bytes"), "{text}");
+        assert!(
+            text.contains("kopiur_snapshot_verified_timestamp_seconds"),
+            "{text}"
+        );
         assert!(
             text.contains("kopiur_repository_maintenance_configured"),
             "{text}"
