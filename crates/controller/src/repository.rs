@@ -610,10 +610,15 @@ async fn bootstrap_via_mover(
         });
     // The bootstrap (connect/create) Job has no recipe `mover`, but inherits the
     // repository's `moverDefaults` — the bootstrap-gap fix (ADR-0004 §1): a
-    // filesystem/NFS repo on a non-65532-owned directory becomes bootstrappable by
-    // setting `moverDefaults.podSecurityContext.fsGroup` / `securityContext.runAsUser`
-    // once, with no special-case knob. Not subject to the privileged-mover namespace
-    // gate: it runs in the repo's own namespace and is authored by the repo owner.
+    // filesystem repo on a non-65532-owned directory becomes bootstrappable by
+    // setting an effective write identity in `moverDefaults` once, with no
+    // special-case knob. For a **PVC** (block CSI) that is `podSecurityContext.fsGroup`
+    // or `securityContext.runAsUser`; for **inline NFS** `fsGroup` is silently a
+    // no-op (the kubelet never recursively chowns an in-tree NFS mount), so use
+    // `podSecurityContext.supplementalGroups` against a group-writable export, or
+    // `securityContext.runAsUser` matching the export owner, or remap NAS-side
+    // (TrueNAS Mapall). Not subject to the privileged-mover namespace gate: it runs
+    // in the repo's own namespace and is authored by the repo owner.
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.spec.mover_defaults.as_ref(),
         None,

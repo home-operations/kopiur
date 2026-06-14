@@ -310,6 +310,66 @@ async fn nfs_repo_bootstrap_backup_restore() {
     run_backend_lifecycle(&world, "e2e-nfs", repo_json).await;
 }
 
+/// Inline-NFS repository on a **group-restricted export**, with the web-UI server,
+/// end to end — the regression guard for the NFS uid-mismatch fix. The repo path is
+/// a subdirectory the harness creates `root:NFS_REPO_GID` mode `2770`: writable ONLY
+/// by a process carrying that GID as a supplemental group, NEVER by the bare mover
+/// uid (and `fsGroup` is a no-op on NFS, so it can't help). This proves three pods
+/// all reach it via the shared group:
+///   * the **bootstrap** mover (`moverDefaults.podSecurityContext.supplementalGroups`)
+///     → Repository `Ready`,
+///   * the **backup/restore** movers (same default) → Snapshot `Succeeded` / Restore
+///     `Completed`, and
+///   * the long-lived **kopia-ui server** (`server.podSecurityContext.supplementalGroups`,
+///     the field this fix adds) → its Deployment becomes Ready, which it can only do
+///     by reading/writing the group-owned repo.
+/// Primary uids stay the default 65532 throughout, so nothing trips the
+/// privileged-mover gate — the group is purely additive.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + nfs server + built images + helm install"]
+async fn nfs_shared_group_repo_with_server() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Nfs, Need::Filesystem])
+        .await
+        .expect("provision nfs server (group-restricted export) + source/dest PVCs");
+
+    let gid = consts::NFS_REPO_GID;
+    let repo_json = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Repository",
+        "metadata": { "name": "e2e-nfsgrp-repo", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "backend": { "filesystem": {
+                "path": "/repo",
+                // The group-restricted subdir, reached at the NFSv4 pseudo-root.
+                "volume": { "nfs": { "server": world.nfs_host(), "path": consts::NFS_GROUP_REPO_PATH } }
+            }},
+            "encryption": { "passwordSecretRef": { "name": consts::SECRET_NFS_CREDS, "key": consts::KEY_KOPIA_PASSWORD } },
+            "create": { "enabled": true },
+            // Bootstrap + every backup/restore/maintenance mover joins the export's
+            // group. fsGroup would be silently ignored on NFS — supplementalGroups is
+            // the load-bearing knob.
+            "moverDefaults": { "podSecurityContext": { "supplementalGroups": [gid] } },
+            // The web-UI server mounts and writes the same export, so it needs the
+            // group too (the new spec.server.podSecurityContext field).
+            "server": { "podSecurityContext": { "supplementalGroups": [gid] } }
+        }
+    });
+    // Repo Ready + backup Succeeded + restore Completed — all three writing through
+    // the shared group. (The Repository's own name is the server instance.)
+    run_backend_lifecycle(&world, "e2e-nfsgrp", repo_json).await;
+
+    // The kopia-ui server Deployment reaches Ready ONLY because it carries the shared
+    // group: without spec.server.podSecurityContext it could not read/write the
+    // group-owned repo and would CrashLoop. Its name is `<instance>-kopia-ui`.
+    kopiur_e2e::wait::deployment_ready(world.client(), E2E_NAMESPACE, "e2e-nfsgrp-repo-kopia-ui")
+        .await
+        .expect("kopia-ui server should become Ready via the shared supplemental group");
+}
+
 /// Inline-NFS **source**, end to end. The repository is S3 (MinIO) — proving an
 /// NFS source is independent of the backend — and the `SnapshotPolicy` source is an
 /// inline NFS export with no PVC. The operator mounts the export read-only into

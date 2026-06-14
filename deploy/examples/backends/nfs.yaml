@@ -13,7 +13,9 @@
 # PERMISSIONS: the export must be WRITABLE by the UID the mover runs as (default
 # 65532). If create/connect fails with "permission denied", the operator's Warning
 # Event names the exact UID and the `chown -R <uid> <path>` to run on the NAS. See
-# the Permissions guide.
+# the Permissions guide. NOTE: `fsGroup` is a NO-OP on NFS — if the export is owned
+# by a dedicated UID/GID and your apps run as other UIDs, use a shared supplemental
+# group instead (see nfs-shared-group.yaml).
 #
 # Field shapes verified against crates/api: externally-tagged backend
 # (`backend.filesystem`) with an externally-tagged `volume` (`volume.nfs`).

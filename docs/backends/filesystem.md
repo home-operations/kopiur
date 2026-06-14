@@ -102,6 +102,30 @@ If your NAS forces all clients to one identity (`all_squash` /
 owner instead — or set the mover's `runAsUser` to whatever UID the NAS expects.
 The full decision table is in [Permissions, UID & GID](../permissions.md).
 
+/// warning | `fsGroup` does **not** work here
+
+A natural instinct is to set `moverDefaults.podSecurityContext.fsGroup` to the
+export's GID — but **`fsGroup` is a no-op on NFS** (the kubelet doesn't chown
+in-tree NFS mounts). For an export owned by a dedicated UID/GID while your apps
+run as other UIDs, use a **shared supplemental group** instead: make the export
+group-writable (`chown root:3001 … && chmod 2775 …`) and give every
+backend-writer (movers **and** the kopia-ui server) that group:
+
+```yaml
+spec:
+  moverDefaults:
+    podSecurityContext:
+      supplementalGroups: [3001]
+  server: # only if the web UI is enabled
+    podSecurityContext:
+      supplementalGroups: [3001]
+```
+
+Per-policy source reads stay correct (the mover reads the source as the app's
+UID; the group is additive). The admission webhook **warns** when an NFS
+filesystem repo relies only on `fsGroup`. Full recipe:
+[Security context → NFS filesystem repositories](../security-context.md#nfs-filesystem-repositories).
+
 ## Inline NFS (no PVC) { #inline-nfs-no-pvc }
 
 kopia has **no native NFS backend** — NFS is reached _through_ the filesystem
@@ -169,7 +193,9 @@ the mover `securityContext`. Full story: [Permissions, UID & GID](../permissions
 ///
 
 - **`permission denied`** on create/connect — `chown -R 65532 <path>` (or set the
-  mover UID to the owner). See above.
+  mover UID to the owner). If the export is owned by a dedicated UID/GID and your
+  apps run as other UIDs, use a [shared supplemental group](#preparing-the-export-nfs-side-ownership)
+  rather than `fsGroup` (which NFS ignores). See above.
 - **Mover Job pending** — for a PVC, it isn't bound or isn't `ReadWriteMany`; check
   the PVC and StorageClass. For NFS, the pod can't mount the export — confirm the
   `server`/`path` are reachable from the cluster nodes and the export permits them.

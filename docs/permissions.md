@@ -96,6 +96,12 @@ A complete, apply-ready example (Repository + SnapshotPolicy with this block, pl
 
 ///
 
+/// warning | `fsGroup` does nothing on NFS
+
+`fsGroup` relies on the kubelet chowning the volume, which it **does not do for in-tree NFS mounts**. So `fsGroup` can't grant write to an NFS source or an NFS-backed filesystem repo. Use `podSecurityContext.supplementalGroups` against a group-writable export (supplemental GIDs *are* honored over NFS), `securityContext.runAsUser` matching the export owner, or a server-side remap (TrueNAS Mapall / `all_squash`). See [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
+
+///
+
 ## Step 3 — Verify it worked
 
 Re-run the backup and confirm it actually read files, rather than silently snapshotting an empty/partial tree:
@@ -159,6 +165,8 @@ Warning  PermissionDenied  the repository path is not writable by the operator's
 ```
 
 The UID in that message is the operator's real effective UID (it varies with the chart's `podSecurityContext.runAsUser`), so the `chown` it prints is always correct for your install. Run it on the NAS/host backing the PVC, then reconcile.
+
+For an **NFS-backed** repo whose export is owned by a dedicated UID/GID while your apps run as other UIDs, don't reach for `fsGroup` (a no-op on NFS) — make the export group-writable and give every backend-writer (movers via `moverDefaults.podSecurityContext.supplementalGroups`, and the kopia-ui server via `server.podSecurityContext.supplementalGroups`) the shared group. This keeps per-policy source reads as the app's UID while the group grants repo writes. Full recipe and an apply-ready example: [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
 
 ## Restore-side permissions
 
