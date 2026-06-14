@@ -333,16 +333,26 @@ pub fn nfs_deployment(ns: &str) -> Deployment {
                         "name": "chmod-export",
                         "image": consts::NFS_IMAGE,
                         "imagePullPolicy": "IfNotPresent",
-                        // The export root stays world-writable (most scenarios run as
-                        // the default mover uid). A `grouprepo` subdir models the
-                        // real-world UID-mismatch case: owned `root:NFS_REPO_GID` mode
+                        // Each NFS consumer gets its OWN `0777` subtree — `repo` for
+                        // the plain repository, `source` for the snapshot source — so
+                        // none mounts the bare pseudo-root. That matters because the
+                        // `grouprepo` subdir (below) is owned `root:NFS_REPO_GID` mode
                         // 2770 (group rwx, setgid, others NONE) — writable ONLY by a
                         // process carrying NFS_REPO_GID as a supplemental group, never
-                        // by the bare mover uid. Proves the shared-group recipe (and
-                        // that fsGroup wouldn't have helped — it's a no-op on NFS).
+                        // by the bare mover uid. kopia's `repository create` /
+                        // `snapshot create` recurse into every child of their path, so
+                        // a repo/source rooted at `/` would trip on `grouprepo` with
+                        // `permission denied`; isolated subtrees keep them clear of it.
+                        // `grouprepo` proves the shared-group recipe (and that fsGroup
+                        // wouldn't have helped — it's a no-op on NFS).
                         "command": ["sh", "-c", format!(
-                            "chmod 0777 {export} && mkdir -p {export}{grp} && chown 0:{gid} {export}{grp} && chmod 2770 {export}{grp}",
+                            "chmod 0777 {export} \
+                             && mkdir -p {export}{repo} && chmod 0777 {export}{repo} \
+                             && mkdir -p {export}{src} && chmod 0777 {export}{src} \
+                             && mkdir -p {export}{grp} && chown 0:{gid} {export}{grp} && chmod 2770 {export}{grp}",
                             export = consts::NFS_EXPORT_PATH,
+                            repo = consts::NFS_REPO_PATH,
+                            src = consts::NFS_SOURCE_PATH,
                             grp = consts::NFS_GROUP_REPO_PATH,
                             gid = consts::NFS_REPO_GID,
                         )],

@@ -352,6 +352,19 @@ pub const NFS_REPO_GID: i64 = 3001;
 /// root). The Repository sets `volume.nfs.path` to this; the export dir on the
 /// server is `NFS_EXPORT_PATH` + this.
 pub const NFS_GROUP_REPO_PATH: &str = "/grouprepo";
+/// Client mount path for the **plain** (world-writable) repo subdir. NFS consumers
+/// mount their own subtree, never the bare pseudo-root: a foreign sibling like
+/// [`NFS_GROUP_REPO_PATH`] (mode `2770`, unreadable by the mover uid) lives at the
+/// export root, and kopia's `repository create` / `snapshot create` recurse into
+/// every child of the path they're given — so pointing a repo or source at `/`
+/// would trip on `grouprepo` with `permission denied`. The init container creates
+/// this `0777`; the export dir on the server is `NFS_EXPORT_PATH` + this.
+pub const NFS_REPO_PATH: &str = "/repo";
+/// Client mount path for the NFS **source** subtree (the `source.nfs.path` a
+/// `SnapshotPolicy` snapshots). Its own `0777` subdir for the same reason as
+/// [`NFS_REPO_PATH`]: a snapshot of the bare pseudo-root would recurse into the
+/// group-restricted [`NFS_GROUP_REPO_PATH`] sibling and fail `permission denied`.
+pub const NFS_SOURCE_PATH: &str = "/source";
 
 // --- foreign-repo seeder (tests/import.rs) --------------------------------------
 /// The locally-built mover image (loaded into kind by `images-load`). The import
