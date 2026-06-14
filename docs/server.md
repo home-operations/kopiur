@@ -232,6 +232,29 @@ keep the UI on an object-store repository.
 
 ///
 
+### Server permissions on an NFS-backed repo
+
+Like a mover, the server pod mounts the filesystem repo **read-write** and writes
+to the backend — so it must be able to write the export. The server gets the same
+hardened pod defaults as movers (`fsGroup: 65532`), but **`fsGroup` is a no-op on
+NFS**. If the export is owned by a dedicated UID/GID, give the server the shared
+group via `spec.server.podSecurityContext` (mirrors `moverDefaults.podSecurityContext`):
+
+```yaml
+spec:
+  server:
+    podSecurityContext:
+      supplementalGroups: [3001] # the export's group; matches moverDefaults
+  moverDefaults:
+    podSecurityContext:
+      supplementalGroups: [3001]
+```
+
+Without it, the server CrashLoops on startup (it can't read/write the repo). See
+[Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
+The container-level `spec.server.securityContext` overrides the hardened
+**container** context (e.g. `runAsUser`) independently.
+
 ## Inspecting status
 
 The reconciler pins a `status.server` block (it never stores a password):

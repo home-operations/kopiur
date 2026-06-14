@@ -75,8 +75,11 @@ podSecurityContext:
 
 The `fsGroup` matches the mover image's GID so the operator-managed **kopia cache** is writable out of the box. Without it, a PVC-backed cache (`moverDefaults.cache.mode: Ephemeral`/`Persistent`) is created `root:root` and the unprivileged mover fails with `mkdir /var/cache/kopia/logs: permission denied`. `OnRootMismatch` keeps it cheap — a volume already owned by the group isn't re-chowned on every run. Because this is the lowest merge layer, `moverDefaults.podSecurityContext` and a recipe's `mover.podSecurityContext` override it field-wise (e.g. set `fsGroup` to your app's GID for a restore; the rest of the hardened defaults stay put).
 
-!!! warning "`fsGroup` cannot fix root-squashed NFS"
-    `fsGroup` works by having the kubelet chown the volume. On an **NFS** StorageClass with **root-squash** (e.g. TrueNAS / democratic-csi), that chown is denied, so a kopia cache on such a class stays `root:root` and the mover still gets `permission denied`. A content-addressed scratch cache has no business on networked storage anyway — leave `moverDefaults.cache` unset (the default is a node-local `emptyDir`, always writable) or point `cache.storageClass` at a block class (e.g. Ceph RBD) that honors `fsGroup`.
+!!! warning "`fsGroup` has no effect on NFS"
+    `fsGroup` works by having the **kubelet** chown the volume on mount. The kubelet **skips that chown entirely for in-tree `nfs:` volumes** (and many NFS-backed CSI drivers) — so `fsGroup` is silently a **no-op on NFS**, not just on root-squashed exports. Two consequences:
+
+    - A kopia **cache** on an NFS StorageClass stays `root:root` and the mover gets `permission denied`. A content-addressed scratch cache has no business on networked storage anyway — leave `moverDefaults.cache` unset (the default is a node-local `emptyDir`, always writable) or point `cache.storageClass` at a block class (e.g. Ceph RBD) that honors `fsGroup`.
+    - An **inline-NFS filesystem repository** can't be made writable with `fsGroup`. Use `supplementalGroups` against a group-writable export, `runAsUser` matching the export owner, or remap server-side — see [NFS filesystem repositories](#nfs-filesystem-repositories) below. The admission webhook **warns** when an NFS filesystem repo relies only on `fsGroup`.
 
 ## How to decide what to set
 
@@ -225,6 +228,51 @@ If `stat` shows several different owners and some files are owner-only (`0600`),
 
 - **NFS exports** often apply `root_squash` (root is remapped to `nobody`) and their own UID mapping server-side. A root mover may *not* help there; match the UID the NFS server expects, or relax the export.
 - A **filesystem repository** adds a second, separate permission surface: the **repository path** must be writable by the operator/mover UID. That's not a `securityContext` knob — see [Permissions → Filesystem repositories](permissions.md#filesystem-repositories-the-other-permission).
+
+#### NFS filesystem repositories
+
+A filesystem repository backed by an inline NFS export (`backend.filesystem.volume.nfs`) is the case where the two surfaces collide: a **single** mover pod must *read the source PVC* (as the app's UID, e.g. `1000`) **and** *write the repo backend* (which lives on an NFS export owned by some dedicated UID/GID, e.g. `3001`). And because [`fsGroup` is a no-op on NFS](#the-default-hardened-context), you can't lean on it.
+
+The clean answer is to **decouple the two**: read the source as the app's UID, write the repo through a **shared supplemental group**. Supplemental GIDs *are* sent to the NFS server over AUTH_SYS (within the 16-group limit), so a group-writable export grants write without changing the process's primary UID.
+
+1. **On the NAS** — own the export by the shared group and make it group-writable + setgid (so new repo blobs inherit the GID):
+
+    ```console
+    chown -R root:3001 /export/kopia    # or: chown -R 3001:3001
+    chmod -R 2775 /export/kopia         # 2 = setgid
+    ```
+
+2. **On the repository** — every pod that *writes the backend* (the bootstrap connect/create Job, every snapshot/maintenance mover, **and** the kopia-ui server) must carry the shared group:
+
+    ```yaml
+    spec:
+      moverDefaults:
+        podSecurityContext:
+          supplementalGroups: [3001] # movers + bootstrap join the export's group
+      server: # only if you enable the web UI
+        podSecurityContext:
+          supplementalGroups: [3001] # the long-lived server joins it too
+    ```
+
+3. **Per recipe** — source reads stay correct because each `SnapshotPolicy`/`Restore` reads as the *app's* identity, e.g. via `inheritSecurityContextFrom`. The supplemental group is additive and doesn't disturb the primary UID:
+
+    ```yaml
+    # SnapshotPolicy
+    spec:
+      mover:
+        inheritSecurityContextFrom:
+          podSelector: { matchLabels: { app.kubernetes.io/name: my-app } }
+    ```
+
+Full, apply-ready example:
+
+```yaml
+--8<-- "deploy/examples/backends/nfs-shared-group.yaml"
+```
+
+!!! note "Alternatives"
+    - **`runAsUser`** matching the export owner also works (it changes the actual process UID, unlike `fsGroup`) — but if the source PVC is owned by a *different* UID, the mover then can't read it, which is why the shared-group split is usually better.
+    - **Server-side remap** (TrueNAS **Mapall User/Group**, or `all_squash`/`anonuid` on a Linux exporter) makes *every* client write land as one identity on the server, regardless of the pod's UID. Zero pod-side config; the admission warning is then a false positive you can ignore.
 
 ### Restricted namespaces (Pod Security Admission)
 

@@ -140,6 +140,16 @@ fn ptr(path: &str) -> PointerBuf {
     PointerBuf::parse(path).expect("static JSON pointer is valid")
 }
 
+/// Attach non-blocking admission warnings to an already-allowed response (e.g. the
+/// inline-NFS `fsGroup` footgun). Empty input leaves the response untouched so the
+/// API server doesn't surface a spurious empty warning list.
+fn with_warnings(mut resp: AdmissionResponse, warnings: Vec<String>) -> AdmissionResponse {
+    if !warnings.is_empty() {
+        resp.warnings = Some(warnings);
+    }
+    resp
+}
+
 /// `metadata.finalizers` may be absent. Build a patch op that appends the snapshot
 /// finalizer without clobbering existing finalizers.
 ///
@@ -502,7 +512,10 @@ fn handle_cluster_repository(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
-    Ok(resp)
+    Ok(with_warnings(
+        resp,
+        api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref()),
+    ))
 }
 
 // --- Repository -------------------------------------------------------------
@@ -529,7 +542,10 @@ fn handle_repository(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
-    Ok(resp)
+    Ok(with_warnings(
+        resp,
+        api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref()),
+    ))
 }
 
 // --- shared tenancy adapter -------------------------------------------------
@@ -575,5 +591,70 @@ fn set_spec_field(data: &Value, field: &str, value: Value) -> PatchOperation {
             path: ptr("/spec"),
             value: json!({ field: value }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build a CREATE `AdmissionRequest` for the given kind/spec, the way the API
+    /// server would. No cluster needed — Repository/ClusterRepository validation is
+    /// pure, and `dispatch` only touches a `Client` for the tenancy-gated kinds.
+    fn admission_request(kind: &str, spec: Value) -> AdmissionRequest<DynamicObject> {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "test-uid",
+                "kind": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "kind": kind },
+                "resource": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "resource": "repositories" },
+                "name": "repo",
+                "namespace": "kopiur-system",
+                "operation": "CREATE",
+                "userInfo": { "username": "tester" },
+                "object": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": kind,
+                    "metadata": { "name": "repo", "namespace": "kopiur-system" },
+                    "spec": spec,
+                }
+            }
+        });
+        let review: kube::core::admission::AdmissionReview<DynamicObject> =
+            serde_json::from_value(review).unwrap();
+        review.try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn nfs_repository_admission_carries_the_fsgroup_warning() {
+        let spec = json!({
+            "backend": { "filesystem": { "path": "/repo", "volume": { "nfs": { "server": "nas.lan", "path": "/export/kopia" } } } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let req = admission_request("Repository", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(resp.allowed, "NFS repo must still be admitted");
+        assert_eq!(
+            resp.warnings.as_deref(),
+            Some(&[api::validate::NFS_FSGROUP_WARNING.to_string()][..]),
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_repository_admission_has_no_warnings() {
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let req = admission_request("Repository", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(resp.allowed);
+        assert!(
+            resp.warnings.is_none(),
+            "no spurious warnings: {:?}",
+            resp.warnings
+        );
     }
 }
