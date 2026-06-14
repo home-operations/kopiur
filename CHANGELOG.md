@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.4](https://github.com/home-operations/kopiur/compare/0.4.3...0.4.4) (2026-06-14)
+
+
+### Bug Fixes
+
+* **controller:** don't reap staged source until the mover Job is terminal ([#103](https://github.com/home-operations/kopiur/issues/103)) ([#104](https://github.com/home-operations/kopiur/issues/104)) ([fed3344](https://github.com/home-operations/kopiur/commit/fed3344c6f0bfad4d45d682c062ffe55a9694dda))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.3 manifest ([561587b](https://github.com/home-operations/kopiur/commit/561587b8a5c5cd95a873d59ef5e48a2b83d5c670))
+
 ## [0.4.3](https://github.com/home-operations/kopiur/compare/0.4.2...0.4.3) (2026-06-14)
 
 
