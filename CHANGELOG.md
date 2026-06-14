@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.5](https://github.com/home-operations/kopiur/compare/0.4.4...0.4.5) (2026-06-14)
+
+
+### Features
+
+* **observability:** refresh dashboard + implement snapshot verified-timestamp metric ([#106](https://github.com/home-operations/kopiur/issues/106)) ([4b962d1](https://github.com/home-operations/kopiur/commit/4b962d182c844f6954fb0569c7129ccd92911266))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate time (0.3.47 → 0.3.49) ([#94](https://github.com/home-operations/kopiur/issues/94)) ([c62518a](https://github.com/home-operations/kopiur/commit/c62518abc2e6433368f702fa13415f15c7fdec11))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.4 manifest ([226f7b9](https://github.com/home-operations/kopiur/commit/226f7b971657dbddc31878bed683144b9080adb2))
+* **mise:** update tool aqua:astral-sh/uv (0.9.9 → 0.11.21) ([#62](https://github.com/home-operations/kopiur/issues/62)) ([d537044](https://github.com/home-operations/kopiur/commit/d537044712160ed8d39a32dca8dde3b233dcfdb2))
+* **mise:** update tool helm (4.2.0 → 4.2.1) ([#96](https://github.com/home-operations/kopiur/issues/96)) ([63c7df2](https://github.com/home-operations/kopiur/commit/63c7df28fc206a7c733e5c945a530267b8d458ca))
+* **mise:** update tool kubectl (1.36.1 → 1.36.2) ([#95](https://github.com/home-operations/kopiur/issues/95)) ([e055a1e](https://github.com/home-operations/kopiur/commit/e055a1ef86cfa51ad0810a1bf7e0b71f8c46e3b3))
+
 ## [0.4.4](https://github.com/home-operations/kopiur/compare/0.4.3...0.4.4) (2026-06-14)
 
 
