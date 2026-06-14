@@ -67,6 +67,11 @@ pub struct ServerWorkSpec {
     /// Serve the embedded HTML UI. Defaults to enabled.
     #[serde(default = "default_true")]
     pub ui: bool,
+    /// Connect the repository **read-only** (`repository connect --readonly`) before
+    /// `server start`, so nothing the UI does can mutate the repo. The controller resolves
+    /// this from `spec.mode: ReadOnly` OR `spec.server.readOnly`. Defaults to `false`.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl ServerWorkSpec {
@@ -116,6 +121,7 @@ mod tests {
                 username: "kopia".into(),
             },
             ui: true,
+            read_only: false,
         };
         assert_eq!(roundtrip(&spec), spec);
         let start = spec.to_start_spec();
@@ -137,6 +143,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.version, 1, "version defaults");
         assert!(spec.ui, "ui defaults true");
+        assert!(!spec.read_only, "read_only defaults false");
         assert_eq!(spec.auth.kind_str(), "None");
         assert_eq!(
             spec.to_start_spec().auth,
@@ -145,6 +152,17 @@ mod tests {
         // Wire shape is externally tagged.
         let v = serde_json::to_value(&spec).unwrap();
         assert!(v["auth"]["none"].is_object());
+    }
+
+    #[test]
+    fn read_only_roundtrips_and_is_camel_case() {
+        let spec: ServerWorkSpec = serde_json::from_str(
+            r#"{"repository":{"filesystem":{"path":"/repo"}},"listenPort":51515,"auth":{"none":{}},"readOnly":true}"#,
+        )
+        .unwrap();
+        assert!(spec.read_only);
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["readOnly"], serde_json::json!(true));
     }
 
     #[test]

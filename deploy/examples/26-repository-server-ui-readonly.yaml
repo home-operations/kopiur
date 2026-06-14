@@ -1,0 +1,66 @@
+# Example 26 — A read-only Kopia web UI (`spec.server.readOnly`)
+#
+# Same as example 25, but the server connects the repository READ-ONLY: the
+# operator runs `kopia repository connect --readonly` before `kopia server start`,
+# so creating, deleting, or altering backups through the UI is rejected by the
+# repository. This is the safe choice when you want humans to BROWSE and RESTORE
+# through the UI but never mutate backups.
+#
+# ┌─ WHAT read-only DOES AND DOESN'T DO ───────────────────────────────────────┐
+# │ DOES:    block create / delete / alter of snapshots, policies, maintenance  │
+# │          through the UI (the repository connection rejects every write).    │
+# │ DOESN'T: hide data — the server pod still holds the DECRYPTION KEY, so       │
+# │          anyone who reaches the UI can still READ and RESTORE every backup.  │
+# │          Read-only is not confidentiality: keep auth on and ClusterIP.      │
+# │ NOTE:    kopia's UI does not grey out the (now non-functional) write/delete  │
+# │          buttons; the actions simply fail at the backend.                   │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# Effective read-only is `spec.mode: ReadOnly` OR `spec.server.readOnly: true`.
+# A `Repository` with `spec.mode: ReadOnly` already forces the UI read-only (you
+# don't need the field); use `server.readOnly: true` to get a read-only UI on a
+# normal ReadWrite repository that still takes backups via movers. The effective
+# value is pinned to `status.server.readOnly`.
+#
+# Verified against crates/api: `server.readOnly` is `Option<bool>` on ServerSpec.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: apps
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: apps
+spec:
+  # This repository still takes backups normally (mode defaults to ReadWrite);
+  # only the *UI* is read-only, via server.readOnly below.
+  backend:
+    s3:
+      bucket: my-backups
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  server:
+    readOnly: true # the UI cannot mutate the repository (browse + restore only)
+    auth:
+      generate:
+        username: kopia
+    service:
+      type: ClusterIP
+      port: 51515
+      annotations: {}

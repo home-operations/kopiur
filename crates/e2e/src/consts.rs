@@ -175,6 +175,10 @@ pub const BUCKETS: &[&str] = &[
     // Repository with `spec.server` whose embedded UI is GETted via the apiserver
     // Service proxy.
     "kopiur-server-ui",
+    // Read-only web-UI server scenario (crates/e2e/tests/lifecycle.rs,
+    // `server_read_only_ui_connects_read_only`): a distinct bucket so the
+    // read-only and read-write server fixtures don't collide.
+    "kopiur-server-ui-ro",
     // Foreign-repo import scenarios (crates/e2e/tests/import.rs): repositories +
     // snapshots created by RAW kopia (the seeder pod), then adopted by kopiur.
     "kopiur-import",

@@ -1711,6 +1711,16 @@ fn server_repository_json(name: &str) -> serde_json::Value {
     })
 }
 
+/// A read-only-UI variant of [`server_repository_json`]: `spec.server.readOnly: true`
+/// so the served kopia connection cannot mutate the repository. Distinct bucket/name
+/// from the read-write fixture so the two server tests don't collide.
+fn server_readonly_repository_json(name: &str) -> serde_json::Value {
+    let mut v = server_repository_json(name);
+    v["spec"]["backend"]["s3"]["bucket"] = serde_json::json!("kopiur-server-ui-ro");
+    v["spec"]["server"]["readOnly"] = serde_json::json!(true);
+    v
+}
+
 /// Wait until a `Deployment` reports at least one available replica.
 async fn wait_deployment_available(
     deps: &Api<k8s_openapi::api::apps::v1::Deployment>,
@@ -1851,6 +1861,117 @@ async fn server_exposes_repository_ui() {
     )
     .await
     .expect("server Deployment should be deleted when spec.server is removed");
+
+    // Cleanup.
+    let _ = repos.delete(repo_name, &DeleteParams::default()).await;
+}
+
+/// Regression guard for `spec.server.readOnly`: the operator must connect the server
+/// read-only end-to-end. Proves (a) the controller resolves+pins
+/// `status.server.readOnly: true`, (b) it threads `readOnly: true` into the mover's
+/// work-spec ConfigMap, and (c) the kopia server still **comes up and serves the UI**
+/// against a read-only connection (the one behaviour that couldn't be unit-tested —
+/// browse sessions connect read-only but never run `server start`). We assert the
+/// operator-real signals rather than attempting an HTTP mutation through the proxy:
+/// kopia's write API is CSRF/auth-gated, so a rejected write wouldn't isolate the
+/// read-only cause. The read-only connect itself is unit-tested in the mover serve path.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn server_read_only_ui_connects_read_only() {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use k8s_openapi::api::core::v1::{ConfigMap, Service};
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio])
+        .await
+        .expect("provision MinIO fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let deps: Api<Deployment> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let svcs: Api<Service> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let repo_name = "e2e-srv-ro-repo";
+    let object_name = "e2e-srv-ro-repo-kopia-ui";
+
+    // 1. Repository with spec.server.readOnly becomes Ready.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(server_readonly_repository_json(repo_name)),
+        )
+        .await
+        .expect("create read-only server Repository");
+    wait_phase(&repos, repo_name, "Ready")
+        .await
+        .expect("read-only server Repository should reach Ready");
+
+    // 2. The controller pins the EFFECTIVE read-only state to status.server.readOnly.
+    wait_until(
+        "status.server.readOnly is pinned true",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repos, repo_name).await;
+            let ro = s
+                .get("server")
+                .and_then(|sv| sv.get("readOnly"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok(ro.then_some(()))
+        },
+    )
+    .await
+    .expect("controller should pin status.server.readOnly: true");
+
+    // 3. The mover work-spec ConfigMap carries readOnly: true (the contract that makes
+    //    the serve entrypoint connect with --readonly).
+    let cm = cms
+        .get(object_name)
+        .await
+        .expect("server ConfigMap should exist");
+    let spec_json = &cm.data.expect("ConfigMap has data")["server-spec.json"];
+    let ws: serde_json::Value = serde_json::from_str(spec_json).expect("server-spec.json parses");
+    assert_eq!(
+        ws.get("readOnly").and_then(|v| v.as_bool()),
+        Some(true),
+        "work spec should instruct the mover to connect read-only: {ws}"
+    );
+
+    // 4. The server still serves the UI over a read-only connection (the real risk:
+    //    kopia 0.23 `server start` had never been validated against a --readonly
+    //    connect in our image). A non-empty 200 through the Service proxy proves it.
+    svcs.get(object_name)
+        .await
+        .expect("server Service should exist");
+    wait_deployment_available(&deps, object_name)
+        .await
+        .expect("read-only server Deployment should become Available");
+    let ui = wait_until(
+        "kopia UI responds via the service proxy (read-only)",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let path =
+                format!("/api/v1/namespaces/{E2E_NAMESPACE}/services/{object_name}:http/proxy/");
+            let req = http::Request::get(path).body(Vec::new()).unwrap();
+            match client.request_text(req).await {
+                Ok(body) if !body.is_empty() => Ok(Some(body)),
+                Ok(_) | Err(_) => Ok(None),
+            }
+        },
+    )
+    .await
+    .expect("read-only kopia UI should serve over HTTP through the service proxy");
+    let lower = ui.to_lowercase();
+    assert!(
+        lower.contains("kopia") || lower.contains("<!doctype") || lower.contains("<html"),
+        "proxied response should be the kopia web UI, got: {}",
+        &ui.chars().take(200).collect::<String>()
+    );
 
     // Cleanup.
     let _ = repos.delete(repo_name, &DeleteParams::default()).await;

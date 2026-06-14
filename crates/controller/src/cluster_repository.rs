@@ -515,6 +515,7 @@ async fn reconcile_cluster_server(
         backend: &repo.spec.backend,
         encryption: &repo.spec.encryption,
         server: cluster_server.map(|s| &s.server),
+        read_only_mode: !repo.spec.mode.allows_writes(),
         target_namespace: desired_ns,
         observed_namespace: observed_ns,
         owner: None,

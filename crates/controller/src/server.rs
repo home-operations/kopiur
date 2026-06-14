@@ -161,6 +161,9 @@ pub struct ServerBuildInputs<'a> {
     pub service_account: Option<&'a str>,
     /// How the server connects to the repository.
     pub repository: RepositoryConnect,
+    /// Connect the repository read-only (no UI mutation). The **effective** value
+    /// (`spec.mode: ReadOnly` OR `spec.server.readOnly`), resolved by the reconciler.
+    pub read_only: bool,
     /// Listen/Service port.
     pub port: u16,
     /// Service type string (`ClusterIP`/`NodePort`/`LoadBalancer`).
@@ -210,6 +213,7 @@ pub fn build_server_work_spec(inputs: &ServerBuildInputs<'_>) -> ServerWorkSpec 
             ResolvedAuth::None => ServerAuthSpec::None {},
         },
         ui: true,
+        read_only: inputs.read_only,
     }
 }
 
@@ -551,6 +555,9 @@ pub struct ServerStatusPin {
     pub namespace: String,
     /// Resolved auth-mode discriminant (`Generate`/`SecretRef`/`Insecure`).
     pub auth_mode: String,
+    /// Effective read-only state of the served connection (`spec.mode: ReadOnly` OR
+    /// `spec.server.readOnly`). Pinned to `status.server.readOnly`.
+    pub read_only: bool,
     /// For `Generate` mode: the operator-owned credentials Secret name.
     pub generated_secret_ref: Option<String>,
 }
@@ -579,6 +586,9 @@ pub struct ServerReconcileCtx<'a> {
     pub encryption: &'a kopiur_api::common::Encryption,
     /// The (namespace-agnostic) server spec; `None` when disabled.
     pub server: Option<&'a kopiur_api::server::ServerSpec>,
+    /// Whether the repository's `spec.mode` forbids writes (`ReadOnly`). A ReadOnly repo
+    /// forces the server's connection read-only regardless of `spec.server.readOnly`.
+    pub read_only_mode: bool,
     /// Target namespace when enabled.
     pub target_namespace: Option<String>,
     /// `status.server.namespace` (the last-applied namespace).
@@ -608,6 +618,7 @@ pub fn server_status_json(outcome: &ServerOutcome) -> Option<serde_json::Value> 
                 "endpoint": p.endpoint,
                 "namespace": p.namespace,
                 "authMode": p.auth_mode,
+                "readOnly": p.read_only,
                 "generatedSecretRef": p.generated_secret_ref.as_ref().map(|n| serde_json::json!({ "name": n })),
             }
         })),
@@ -760,6 +771,11 @@ async fn ensure_in(
     // Resolve auth → builder form + (for Generate) the credentials to mint once.
     let (auth, generated_secret_ref) = resolve_auth(rc, namespace, server).await?;
 
+    // Effective read-only = the repository's ReadOnly mode OR an explicit
+    // `spec.server.readOnly`. Either makes the served connection read-only so the UI
+    // cannot mutate the repository. Pinned to status below.
+    let read_only = rc.read_only_mode || server.read_only.unwrap_or(false);
+
     let repository = crate::snapshot::backend_to_repository_connect(rc.backend);
     let inputs = ServerBuildInputs {
         instance: rc.instance,
@@ -770,6 +786,7 @@ async fn ensure_in(
         image_pull_policy: rc.image_pull_policy,
         service_account: rc.service_account,
         repository,
+        read_only,
         port,
         service_type,
         service_annotations,
@@ -828,6 +845,7 @@ async fn ensure_in(
             .as_ref()
             .map(|a| a.kind_str().to_string())
             .unwrap_or_else(|| "Generate".to_string()),
+        read_only,
         generated_secret_ref,
     })
 }
@@ -900,6 +918,7 @@ mod tests {
                 disable_tls_verification: false,
                 ambient_credentials: false,
             },
+            read_only: false,
             port: 51515,
             service_type: "ClusterIP",
             service_annotations: BTreeMap::new(),
@@ -957,6 +976,30 @@ mod tests {
     fn work_spec_maps_no_auth() {
         let ws = build_server_work_spec(&inputs("ns", ResolvedAuth::None));
         assert_eq!(ws.auth, ServerAuthSpec::None {});
+    }
+
+    #[test]
+    fn work_spec_maps_read_only() {
+        // Default fixture is read-write; the work spec must not connect read-only.
+        let rw = build_server_work_spec(&inputs("ns", gen_auth()));
+        assert!(!rw.read_only);
+        // Flip the resolved flag → the mover connects read-only.
+        let mut ro_inputs = inputs("ns", gen_auth());
+        ro_inputs.read_only = true;
+        assert!(build_server_work_spec(&ro_inputs).read_only);
+    }
+
+    #[test]
+    fn status_json_emits_effective_read_only() {
+        let pin = ServerStatusPin {
+            endpoint: "nas-kopia-ui.ns.svc:51515".into(),
+            namespace: "ns".into(),
+            auth_mode: "Generate".into(),
+            read_only: true,
+            generated_secret_ref: Some("nas-kopia-ui-auth".into()),
+        };
+        let v = server_status_json(&ServerOutcome::Active(pin)).unwrap();
+        assert_eq!(v["server"]["readOnly"], serde_json::json!(true));
     }
 
     #[test]

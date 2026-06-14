@@ -93,6 +93,7 @@ fn run_serve() -> std::process::ExitCode {
         repository = spec.repository.kind_str(),
         port = spec.listen_port,
         auth = spec.auth.kind_str(),
+        read_only = spec.read_only,
         "loaded server work spec"
     );
 
@@ -101,11 +102,20 @@ fn run_serve() -> std::process::ExitCode {
     // Connect to the repository first (short, idempotent) so the server can read
     // the connected repo from the kopia config file. Cache tuning is inherited from
     // the pod environment (KOPIA_CACHE_DIRECTORY), so the default is correct here.
+    //
+    // When `read_only` is set, connect with `--readonly`: the read-only bit persists in
+    // the kopia config, so the long-lived `server start` that follows (and everything the
+    // UI does through it) is structurally unable to mutate the repository. kopia 0.23 has
+    // no server-level read-only flag, so this connection-level bit is the mechanism.
     let cache = kopiur_kopia::CacheTuning::default();
-    if let Err(e) =
-        runtime.block_on(client.repository_connect(&spec.repository.to_connect_spec(), cache))
-    {
-        error!(error = %e, "repository connect failed before server start");
+    let connect_spec = spec.repository.to_connect_spec();
+    let connect = if spec.read_only {
+        runtime.block_on(client.repository_connect_readonly(&connect_spec, cache))
+    } else {
+        runtime.block_on(client.repository_connect(&connect_spec, cache))
+    };
+    if let Err(e) = connect {
+        error!(error = %e, read_only = spec.read_only, "repository connect failed before server start");
         return std::process::ExitCode::FAILURE;
     }
     // Drop the tokio runtime before exec — kopia takes over this process entirely.

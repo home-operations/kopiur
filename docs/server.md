@@ -18,7 +18,8 @@ The UI is an **interactive** surface for a human. Reach for it when you want to:
 - **Browse and verify** snapshots, policies, and sources visually, without the
   [kubectl plugin](cli/index.md).
 - **Restore ad hoc** through the UI — pick a snapshot, mount it, pull a file.
-- Give an operator a point-and-click view of a repository's contents.
+- Give an operator a point-and-click view of a repository's contents — ideally
+  [read-only](#read-only-ui), so browsing can't accidentally delete a backup.
 
 You do **not** need it for normal operation. Scheduled backups, restores, and
 maintenance all run headless in short-lived mover Jobs — the UI is never on that
@@ -26,13 +27,15 @@ path. Because it is a **long-lived pod that holds the repository decryption key*
 (see the warning below), only run it where you actually want interactive access,
 and tear it down when you're done.
 
-/// warning | The kopia UI has no read-only mode
+/// warning | The UI holds the decryption key
 
-Anyone who can reach the UI can **read, create, and delete** backups, and the
-server pod holds the repository **decryption key**. There is no view-only mode in
-kopia's server. Treat exposing the UI exactly like exposing the repository
-itself: keep it `ClusterIP` (the default), put authentication in front of it, and
-restrict who can reach the `Service` with a `NetworkPolicy`.
+By default the UI is full **read/write/delete**, and the server pod **always**
+holds the repository **decryption key** — even in [read-only mode](#read-only-ui).
+Setting [`readOnly`](#read-only-ui) blocks *mutation* but not *reading*: anyone who
+can reach the UI can still read and restore every backup. So treat exposing the UI
+exactly like exposing the repository itself: keep it `ClusterIP` (the default),
+put authentication in front of it, and restrict who can reach the `Service` with a
+`NetworkPolicy`.
 
 ///
 
@@ -41,6 +44,7 @@ restrict who can reach the `Service` with a `NetworkPolicy`.
 | Field | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `auth` | externally-tagged [enum](#authentication) (`generate` \| `secretRef` \| `insecure`) | `generate` | UI login. Omitted ⇒ operator-generated credentials. **Never** defaults to no-auth. |
+| `readOnly` | bool | `false` | [Read-only UI](#read-only-ui) — connect the repository read-only so the UI cannot create/delete/alter backups (browse + restore only). Forced on when the `Repository` has `spec.mode: ReadOnly`. |
 | `service.type` | enum(**`ClusterIP`**\|`NodePort`\|`LoadBalancer`) | `ClusterIP` | How the `Service` is exposed. Routing outside the cluster is your job. |
 | `service.port` | int | `51515` | Listen + `Service` port. |
 | `service.annotations` | map | — | Applied to the `Service` — the seam for your ingress/LB controller. |
@@ -159,6 +163,59 @@ and pair it with a `NetworkPolicy`.
 
 ///
 
+## Read-only UI { #read-only-ui }
+
+Set `spec.server.readOnly: true` and the operator connects the server's repository
+**read-only** (`kopia repository connect --readonly`) before starting the UI. Every
+operation on that connection — and so everything the UI does — is then **unable to
+mutate the repository**: creating, deleting, or altering snapshots/policies/
+maintenance is rejected. It's the right default for a point-and-click *browse* and
+*restore* surface where you never want a stray click to delete a backup.
+
+```yaml
+server:
+    readOnly: true # the UI cannot mutate the repository (browse + restore only)
+    auth: { generate: {} }
+```
+
+The **effective** read-only state is `spec.mode: ReadOnly` **OR**
+`spec.server.readOnly: true`:
+
+- A `Repository` with [`spec.mode: ReadOnly`](repositories.md) already serves
+  restores only — its UI is forced read-only and you don't need the field. Setting
+  an explicit `readOnly: false` on such a repository is **rejected by the webhook**
+  (a read-only repository can't serve a writable UI).
+- A normal `ReadWrite` repository (still taking backups via movers) gets a
+  read-only *UI* by opting in with `readOnly: true`.
+
+The reconciler pins the resolved value to `status.server.readOnly`. A complete,
+apply-ready read-only `Repository` (a ReadWrite repo with a read-only UI):
+
+```yaml
+--8<-- "deploy/examples/26-repository-server-ui-readonly.yaml"
+```
+
+/// warning | Read-only blocks mutation, not reading
+
+`readOnly` stops the UI from **changing** backups; it does **not** make the UI
+confidential. The server pod still holds the repository **decryption key**, so
+anyone who can reach the UI can still **read and restore** every backup. Keep auth
+on and the `Service` `ClusterIP` regardless. Note too that kopia's UI does not grey
+out the (now non-functional) write/delete buttons — the actions simply fail at the
+backend.
+
+///
+
+/// info | Why a connection-level flag (not a server flag)
+
+kopia 0.23 — the version Kopiur ships — has no `kopia server start --readonly`
+flag; that landed later upstream. Kopiur achieves the same guarantee with the
+read-only *connection*, whose read-only bit every later operation inherits. One
+side effect: kopia may log occasional errors if its internal scheduler probes for
+maintenance on a read-only connection. They're harmless (nothing can be written).
+
+///
+
 ## Exposing the Service
 
 `spec.server.service` controls the `Service`; `port` defaults to `51515`.
@@ -268,6 +325,7 @@ $ kubectl get repository nas-primary -n apps -o jsonpath='{.status.server}' | jq
 | `endpoint` | In-cluster address, `<service>.<namespace>.svc:<port>`. |
 | `namespace` | Namespace the server objects were last applied to (used to detect a `namespace` change). |
 | `authMode` | Resolved auth discriminant — `Generate` / `SecretRef` / `Insecure`. |
+| `readOnly` | Effective read-only state — `true` when `spec.mode: ReadOnly` or `spec.server.readOnly: true`. |
 | `generatedSecretRef` | **`generate` mode only** — the operator-owned Secret holding the UI credentials. |
 
 When the server is disabled, `status.server` is cleared to null.
@@ -297,5 +355,6 @@ auth, plus commented `HTTPRoute` + `NetworkPolicy` templates):
 - [Installation](install.md) — install scope and the RBAC the controller needs to manage the server objects.
 - [GitOps (Flux / Argo)](gitops.md) — deploying the field through a GitOps pipeline.
 - [`deploy/examples/25-repository-server-ui.yaml`](#full-example) — the apply-ready example above.
+- [`deploy/examples/26-repository-server-ui-readonly.yaml`](#read-only-ui) — the read-only-UI variant.
 - [ADR-0003 §4.14](adr/0003-kopiur-rust-operator.md) — the design rationale.
 </content>
