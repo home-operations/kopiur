@@ -576,13 +576,25 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             }
             // Staged-source reap is normally done at the Succeeded transition;
             // re-issuing here covers a crash between the phase patch and the
-            // cleanup (idempotent, no-op for Direct).
+            // cleanup (idempotent, no-op for Direct). BUT the mover stamps
+            // `Succeeded` before its pod exits and before the Job controller
+            // marks the Job terminal, so this branch can run while the Job is
+            // still Active. Tearing the staged PVC + mover pod down now would
+            // strand an unschedulable replacement pod (#103) — gate the reap on
+            // the Job being terminal (or already gone).
             if backup
                 .status
                 .as_ref()
                 .and_then(|s| s.staged.as_ref())
                 .is_some()
             {
+                let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+                let job = job_api.get_opt(&name).await?;
+                if !staged_teardown_ready(job.as_ref()) {
+                    // The owned-Job watch re-triggers us when the Job reaches
+                    // Complete; the requeue is a backstop for a missed event.
+                    return Ok(Action::requeue(Duration::from_secs(15)));
+                }
                 io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             }
             // §13(c): spec.pin stays live after the mover Job is gone.
@@ -2382,6 +2394,23 @@ pub(crate) fn job_terminal_state(job: &Job) -> Option<bool> {
     None
 }
 
+/// Whether the staged-source teardown may proceed for a `Succeeded` Snapshot.
+///
+/// The mover stamps `phase: Succeeded` on the CR itself *before* its pod has
+/// exited and *before* the Job controller marks the Job terminal. Reaping the
+/// staged `-src` PVC + mover pod while the Job is still Active makes the Job
+/// controller treat the vanished pod as a failure and spawn a replacement pod
+/// that can never schedule (the `-src` PVC is already gone) — the Job then
+/// lingers `Active` forever and trips `KubeJobNotCompleted` (#103). Only reap
+/// once the Job is terminal (Complete/Failed) or already gone (TTL-reaped, or a
+/// discovered Snapshot that never owned a Job).
+fn staged_teardown_ready(job: Option<&Job>) -> bool {
+    match job {
+        None => true,
+        Some(j) => job_terminal_state(j).is_some(),
+    }
+}
+
 /// `error_policy` for the `Snapshot` controller.
 pub fn error_policy(backup: Arc<Snapshot>, err: &Error, ctx: Arc<Context>) -> Action {
     error_policy_for("Snapshot", backup.as_ref(), err, &ctx)
@@ -3114,5 +3143,55 @@ mod tests {
             effective_deletion_policy(Some(DeletionPolicy::Retain), Origin::Scheduled),
             DeletionPolicy::Retain
         );
+    }
+
+    fn job_with_status(status: Option<k8s_openapi::api::batch::v1::JobStatus>) -> Job {
+        Job {
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn job_condition(type_: &str, status: &str) -> k8s_openapi::api::batch::v1::JobCondition {
+        k8s_openapi::api::batch::v1::JobCondition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // #103: the mover stamps `Succeeded` before its Job is terminal, so the
+    // SucceededSteadyState reap must wait until the Job is Complete/Failed/gone.
+    #[test]
+    fn staged_teardown_waits_for_a_still_running_job() {
+        use k8s_openapi::api::batch::v1::JobStatus;
+        let running = job_with_status(Some(JobStatus {
+            active: Some(1),
+            ..Default::default()
+        }));
+        assert!(
+            !staged_teardown_ready(Some(&running)),
+            "must not reap while the mover Job is still Active (#103)"
+        );
+        // No status at all is also non-terminal.
+        assert!(!staged_teardown_ready(Some(&job_with_status(None))));
+    }
+
+    #[test]
+    fn staged_teardown_proceeds_on_terminal_or_absent_job() {
+        use k8s_openapi::api::batch::v1::JobStatus;
+        let complete = job_with_status(Some(JobStatus {
+            conditions: Some(vec![job_condition("Complete", "True")]),
+            succeeded: Some(1),
+            ..Default::default()
+        }));
+        let failed = job_with_status(Some(JobStatus {
+            conditions: Some(vec![job_condition("Failed", "True")]),
+            ..Default::default()
+        }));
+        assert!(staged_teardown_ready(Some(&complete)), "Complete → reap");
+        assert!(staged_teardown_ready(Some(&failed)), "Failed → reap");
+        // TTL-reaped, or a discovered Snapshot that never owned a Job.
+        assert!(staged_teardown_ready(None), "absent Job → reap");
     }
 }

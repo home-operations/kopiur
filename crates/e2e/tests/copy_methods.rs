@@ -292,6 +292,36 @@ async fn snapshot_mode_stages_a_csi_volumesnapshot_and_cleans_up() {
     .await
     .expect("staged PVC should be cleaned up after the backup succeeds");
 
+    // #103 regression: the mover Job must reach a terminal `Complete` state — it must NOT
+    // linger `Active` with an unschedulable replacement pod referencing the now-reaped
+    // `-src` PVC (which would trip `KubeJobNotCompleted`). Before the fix, reaping the
+    // staged PVC while the Job was still Active made the Job controller spawn a
+    // replacement that could never schedule, pinning the Job `Active 0/1` forever.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "mover Job Complete with no stuck Active pod",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            match jobs.get_opt("e2e-cm-csi-backup").await? {
+                // Already TTL-reaped is also acceptable: it only self-GCs once terminal.
+                None => Ok(Some(())),
+                Some(job) => {
+                    let status = job.status.unwrap_or_default();
+                    let active = status.active.unwrap_or(0);
+                    let complete = status
+                        .conditions
+                        .into_iter()
+                        .flatten()
+                        .any(|c| c.type_ == "Complete" && c.status == "True");
+                    Ok((active == 0 && complete).then_some(()))
+                }
+            }
+        },
+    )
+    .await
+    .expect("mover Job should reach Complete with no stuck Active replacement pod (#103)");
+
     // Cleanup.
     let _ = backups
         .delete("e2e-cm-csi-backup", &DeleteParams::default())

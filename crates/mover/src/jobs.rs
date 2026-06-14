@@ -46,12 +46,23 @@ pub const WORK_SPEC_ENV: &str = crate::env::WORK_SPEC_PATH;
 /// only for `BootstrapRepository` Jobs). Single definition shared with the mover.
 pub const RESULT_CONFIGMAP_ENV: &str = crate::env::RESULT_CONFIGMAP;
 
+/// Built-in `Job.spec.activeDeadlineSeconds` applied by [`build_job`] when a
+/// recipe's `failurePolicy.activeDeadlineSeconds` is unset. A generous 48h
+/// wall-clock backstop: long enough never to interrupt a legitimate
+/// backup/restore/maintenance run, short enough that a Job which can never make
+/// progress (e.g. a mover that hangs after its snapshot) is failed and reaped
+/// instead of lingering `Active` forever and tripping `KubeJobNotCompleted`
+/// (#103). Override per-recipe via `spec.failurePolicy.activeDeadlineSeconds`.
+pub const DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 48 * 60 * 60;
+
 /// Defaults for the mover `Job`, sourced from `FailurePolicy` (ADR §4.10, G6).
 #[derive(Debug, Clone, Copy)]
 pub struct JobLimits {
     /// `Job.spec.backoffLimit`. ADR default of 2 retries when unset.
     pub backoff_limit: i32,
-    /// `Job.spec.activeDeadlineSeconds`. None = no deadline.
+    /// `Job.spec.activeDeadlineSeconds`. `None` = use the built-in
+    /// [`DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS`] backstop ([`build_job`] applies
+    /// it); `Some` is an explicit per-recipe override.
     pub active_deadline_seconds: Option<i64>,
     /// `Job.spec.ttlSecondsAfterFinished`. `None` (the default) leaves cleanup to
     /// owner-reference GC — correct for one-Job-per-CR runs (backup/restore),
@@ -521,7 +532,14 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
         },
         spec: Some(JobSpec {
             backoff_limit: Some(inputs.limits.backoff_limit),
-            active_deadline_seconds: inputs.limits.active_deadline_seconds,
+            // Unset → the built-in 48h backstop so a Job can never linger Active
+            // indefinitely (#103); an explicit recipe value passes through.
+            active_deadline_seconds: Some(
+                inputs
+                    .limits
+                    .active_deadline_seconds
+                    .unwrap_or(DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS),
+            ),
             ttl_seconds_after_finished: inputs.limits.ttl_seconds_after_finished.map(|t| t as i32),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
@@ -960,7 +978,23 @@ mod tests {
     #[test]
     fn default_backoff_limit_is_two() {
         assert_eq!(JobLimits::default().backoff_limit, 2);
+        // The struct default carries no explicit deadline; build_job supplies the
+        // built-in backstop (see deadline_defaults_to_48h_backstop_when_unset).
         assert_eq!(JobLimits::default().active_deadline_seconds, None);
+    }
+
+    #[test]
+    fn deadline_defaults_to_48h_backstop_when_unset() {
+        // #103: a mover Job with no explicit failurePolicy.activeDeadlineSeconds
+        // must still carry the built-in wall-clock cap so it can never linger
+        // Active forever.
+        let ws = sample_work_spec();
+        let job = build_job(&inputs(&ws, JobLimits::default()));
+        assert_eq!(
+            job.spec.unwrap().active_deadline_seconds,
+            Some(DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS),
+        );
+        assert_eq!(DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS, 172_800);
     }
 
     #[test]
