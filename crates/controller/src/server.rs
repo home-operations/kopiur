@@ -16,16 +16,18 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvFromSource, EnvVar,
-    EnvVarSource, NFSVolumeSource, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
-    Probe, ResourceRequirements, Secret, SecretEnvSource, SecretKeySelector, SecurityContext,
-    Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    EnvVarSource, NFSVolumeSource, PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec,
+    PodTemplateSpec, Probe, ResourceRequirements, Secret, SecretEnvSource, SecretKeySelector,
+    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kopiur_mover::serve::{ServerAuthSpec, ServerWorkSpec};
 use kopiur_mover::workspec::RepositoryConnect;
 
-use kopiur_api::common::hardened_security_context;
+use kopiur_api::common::{
+    hardened_pod_security_context, hardened_security_context, merge_pod_security_context,
+};
 
 use crate::consts::{
     MANAGED_BY_LABEL, MANAGED_BY_VALUE, SERVER_COMPONENT_LABEL, SERVER_COMPONENT_VALUE,
@@ -180,6 +182,10 @@ pub struct ServerBuildInputs<'a> {
     pub resources: Option<ResourceRequirements>,
     /// Optional security-context override (defaults to the hardened context).
     pub security_context: Option<SecurityContext>,
+    /// Optional pod-level security-context override, overlaid on the hardened pod
+    /// base (`fsGroup`). Carries `supplementalGroups` so the server can write a
+    /// group-owned NFS/RWX filesystem backend (`fsGroup` is a no-op on NFS).
+    pub pod_security_context: Option<PodSecurityContext>,
 }
 
 impl ServerBuildInputs<'_> {
@@ -250,6 +256,14 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         .security_context
         .clone()
         .unwrap_or_else(hardened_security_context);
+    // Pod-level securityContext: the hardened base (fsGroup) overlaid by any
+    // override, exactly as movers resolve it (ADR-0004 §2). This is what lets the
+    // server carry `supplementalGroups` to write a group-owned NFS/RWX backend —
+    // `fsGroup` alone is silently ignored by the kubelet for in-tree NFS mounts.
+    let pod_sec_ctx = match &inputs.pod_security_context {
+        Some(over) => merge_pod_security_context(&hardened_pod_security_context(), over),
+        None => hardened_pod_security_context(),
+    };
 
     // Volumes: work-spec ConfigMap (ro), writable config + cache (emptyDir), and the
     // repo PVC (rw) for filesystem backends.
@@ -423,6 +437,7 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         containers: vec![container],
         volumes: Some(volumes),
         service_account_name: inputs.service_account.map(str::to_string),
+        security_context: Some(pod_sec_ctx),
         ..Default::default()
     };
 
@@ -780,6 +795,7 @@ async fn ensure_in(
         repo_volume,
         resources: server.resources.clone(),
         security_context: server.security_context.clone(),
+        pod_security_context: server.pod_security_context.clone(),
     };
 
     // Generate auth: create the Secret ONCE (never re-apply → never rotate).
@@ -911,7 +927,22 @@ mod tests {
             repo_volume: None,
             resources: None,
             security_context: None,
+            pod_security_context: None,
         }
+    }
+
+    /// The pod-level securityContext of the server Deployment, for assertions.
+    fn pod_sec_ctx(dep: &Deployment) -> PodSecurityContext {
+        dep.spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .security_context
+            .clone()
+            .expect("server pod carries a pod-level securityContext")
     }
 
     fn gen_auth() -> ResolvedAuth {
@@ -1091,6 +1122,65 @@ mod tests {
         let nfs = repo.nfs.unwrap();
         assert_eq!(nfs.server, "nas.lan");
         assert_eq!(nfs.path, "/export/kopia");
+    }
+
+    #[test]
+    fn server_pod_carries_hardened_fsgroup_by_default() {
+        // Regression: the server pod used to have NO pod-level securityContext, so
+        // it could carry neither fsGroup nor supplementalGroups. It now matches the
+        // mover's hardened pod base out of the box.
+        let dep = build_server_deployment(&inputs("ns", gen_auth()));
+        let psc = pod_sec_ctx(&dep);
+        assert_eq!(psc.fs_group, Some(kopiur_api::common::MOVER_NONROOT_ID));
+        assert_eq!(
+            psc.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
+        assert!(
+            psc.supplemental_groups.is_none(),
+            "no supplemental groups unless configured"
+        );
+    }
+
+    #[test]
+    fn server_pod_security_context_supplemental_groups_merge_over_hardened() {
+        // The NFS-shared-group path: an explicit supplementalGroups is overlaid on
+        // the hardened base, and the hardened fsGroup survives (field-wise merge).
+        let mut i = inputs("ns", gen_auth());
+        i.pod_security_context = Some(PodSecurityContext {
+            supplemental_groups: Some(vec![3001]),
+            ..Default::default()
+        });
+        let dep = build_server_deployment(&i);
+        let psc = pod_sec_ctx(&dep);
+        assert_eq!(psc.supplemental_groups.as_deref(), Some(&[3001i64][..]));
+        // Hardened base is preserved through the merge.
+        assert_eq!(psc.fs_group, Some(kopiur_api::common::MOVER_NONROOT_ID));
+        assert_eq!(
+            psc.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
+    }
+
+    #[test]
+    fn server_pod_security_context_override_wins_over_hardened_fsgroup() {
+        // An explicit fsGroup/runAsUser in the override beats the hardened default,
+        // while the container securityContext stays independent (its own resolution).
+        let mut i = inputs("ns", gen_auth());
+        i.pod_security_context = Some(PodSecurityContext {
+            fs_group: Some(3001),
+            run_as_user: Some(3001),
+            ..Default::default()
+        });
+        let dep = build_server_deployment(&i);
+        let psc = pod_sec_ctx(&dep);
+        assert_eq!(psc.fs_group, Some(3001));
+        assert_eq!(psc.run_as_user, Some(3001));
+        // Container securityContext is still the hardened default (not the pod one).
+        let container = &dep.spec.unwrap().template.spec.unwrap().containers[0];
+        let csc = container.security_context.as_ref().unwrap();
+        assert_eq!(csc.run_as_non_root, Some(true));
+        assert_eq!(csc.run_as_user, None);
     }
 
     #[test]

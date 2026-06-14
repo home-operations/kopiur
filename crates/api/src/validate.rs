@@ -14,9 +14,11 @@
 //! `Vec<ValidationError>` so a user sees every independent problem in one apply.
 //! An empty vec means valid.
 
-use crate::backend::NfsVolume;
+use crate::backend::{Backend, NfsVolume, RepoVolume};
 use crate::cluster_repository::{AllowedNamespaces, ClusterRepositorySpec};
-use crate::common::{DeletionPolicy, MoverSpec, RepositoryKind, RepositoryMode, RepositoryRef};
+use crate::common::{
+    DeletionPolicy, MoverDefaults, MoverSpec, RepositoryKind, RepositoryMode, RepositoryRef,
+};
 use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
 use crate::repository::RepositorySpec;
@@ -804,6 +806,57 @@ pub fn validate_server(server: &ServerSpec, mode: RepositoryMode) -> Vec<Validat
         });
     }
     errs
+}
+
+/// The actionable admission warning for an inline-NFS filesystem repo whose
+/// `moverDefaults` grant write access only via `fsGroup`. **`fsGroup` is silently
+/// ignored on NFS** (the kubelet doesn't recursively chown in-tree NFS mounts), so
+/// the mover/server/bootstrap reach the export as the unprivileged uid and the
+/// repo `connect`/`create` fails with `permission denied`. Non-blocking (a user
+/// fixing it NAS-side via Mapall can ignore it). Kept short for the admission
+/// response (kube truncates very long warnings).
+pub const NFS_FSGROUP_WARNING: &str = "NFS filesystem repo: fsGroup is ignored on NFS — \
+     grant the mover write access via moverDefaults.podSecurityContext.supplementalGroups \
+     (with a group-writable export), securityContext.runAsUser, or NAS-side Mapall";
+
+/// Whether `moverDefaults` configures an NFS-effective write identity — i.e. a
+/// `runAsUser` (container or pod) that owns the export, or a `supplementalGroups`
+/// the export is group-writable by. `fsGroup` deliberately does **not** count: it
+/// is a no-op on NFS.
+fn nfs_write_identity_configured(mover_defaults: Option<&MoverDefaults>) -> bool {
+    let Some(md) = mover_defaults else {
+        return false;
+    };
+    let container_uid = md.security_context.as_ref().and_then(|sc| sc.run_as_user);
+    let pod_uid = md
+        .pod_security_context
+        .as_ref()
+        .and_then(|psc| psc.run_as_user);
+    let suppl_groups = md
+        .pod_security_context
+        .as_ref()
+        .and_then(|psc| psc.supplemental_groups.as_ref())
+        .is_some_and(|g| !g.is_empty());
+    container_uid.is_some() || pod_uid.is_some() || suppl_groups
+}
+
+/// Non-blocking admission warnings for a `Repository`/`ClusterRepository`. Shared
+/// by both handlers (the rules can't fork). Today: the inline-NFS + `fsGroup`-only
+/// footgun (see [`NFS_FSGROUP_WARNING`]). Takes the resolved `backend` +
+/// `moverDefaults` so it serves both kinds without re-deriving them.
+pub fn repository_warnings(
+    backend: &Backend,
+    mover_defaults: Option<&MoverDefaults>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let inline_nfs = matches!(
+        backend,
+        Backend::Filesystem(fs) if matches!(fs.volume, Some(RepoVolume::Nfs(_)))
+    );
+    if inline_nfs && !nfs_write_identity_configured(mover_defaults) {
+        warnings.push(NFS_FSGROUP_WARNING.to_string());
+    }
+    warnings
 }
 
 /// Validate `spec.catalog` (ADR §3.1/§3.2): the refresh interval must parse and
@@ -3074,6 +3127,135 @@ catalog:
                 .any(|e| e.to_string().contains("catalog.refreshInterval")),
             "{errs:?}"
         );
+    }
+
+    // --- repository_warnings (inline-NFS fsGroup footgun) ---
+
+    #[test]
+    fn nfs_repo_without_write_identity_warns_about_fsgroup() {
+        // An inline-NFS filesystem repo that relies only on the default/fsGroup
+        // identity gets the actionable warning (it would fail at runtime: fsGroup
+        // is a no-op on NFS).
+        let repo: RepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  filesystem:
+    path: /repo
+    volume:
+      nfs:
+        server: nas.lan
+        path: /export/kopia
+encryption:
+  passwordSecretRef:
+    name: creds
+moverDefaults:
+  podSecurityContext:
+    fsGroup: 3001
+"#,
+        );
+        let warns = repository_warnings(&repo.backend, repo.mover_defaults.as_ref());
+        assert_eq!(warns, vec![NFS_FSGROUP_WARNING.to_string()]);
+    }
+
+    #[test]
+    fn nfs_repo_with_supplemental_groups_does_not_warn() {
+        let repo: RepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  filesystem:
+    path: /repo
+    volume:
+      nfs:
+        server: nas.lan
+        path: /export/kopia
+encryption:
+  passwordSecretRef:
+    name: creds
+moverDefaults:
+  podSecurityContext:
+    supplementalGroups: [3001]
+"#,
+        );
+        assert!(repository_warnings(&repo.backend, repo.mover_defaults.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn nfs_repo_with_run_as_user_does_not_warn() {
+        let repo: RepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  filesystem:
+    path: /repo
+    volume:
+      nfs:
+        server: nas.lan
+        path: /export/kopia
+encryption:
+  passwordSecretRef:
+    name: creds
+moverDefaults:
+  securityContext:
+    runAsUser: 3001
+"#,
+        );
+        assert!(repository_warnings(&repo.backend, repo.mover_defaults.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn pvc_filesystem_and_object_store_repos_never_warn() {
+        // The warning is NFS-specific: a PVC-backed filesystem repo honors fsGroup
+        // (block CSI), and object stores have no filesystem permission surface.
+        let pvc: RepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  filesystem:
+    path: /repo
+    volume:
+      pvc:
+        name: repo-rwx
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+        );
+        assert!(repository_warnings(&pvc.backend, pvc.mover_defaults.as_ref()).is_empty());
+
+        let s3: RepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  s3:
+    bucket: b
+    endpoint: https://minio
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+        );
+        assert!(repository_warnings(&s3.backend, s3.mover_defaults.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn cluster_nfs_repo_shares_the_same_warning() {
+        // ClusterRepository routes through the same helper (backend + moverDefaults).
+        let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+            r#"
+backend:
+  filesystem:
+    path: /repo
+    volume:
+      nfs:
+        server: nas.lan
+        path: /export/kopia
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+"#,
+        );
+        let warns = repository_warnings(&crepo.backend, crepo.mover_defaults.as_ref());
+        assert_eq!(warns, vec![NFS_FSGROUP_WARNING.to_string()]);
     }
 
     // --- validate_server (spec.server) ---

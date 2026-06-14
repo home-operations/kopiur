@@ -1,0 +1,89 @@
+# Backend: Filesystem over inline NFS, with a UID mismatch (the homelab norm)
+#
+# The common real-world case: the NFS export is owned by a dedicated user/group
+# (here UID/GID 3001), but your apps run as assorted UIDs (1000, 568, …). A
+# filesystem repo's mover is ONE pod that must do two things at once:
+#
+#   * READ the source PVC  — as the app's UID (so it can read the data)
+#   * WRITE the repo backend — to an NFS export owned by 3001
+#
+# `fsGroup` CANNOT bridge this: the kubelet does not chown in-tree NFS mounts, so
+# fsGroup is silently a no-op on NFS. The fix is to DECOUPLE the two surfaces:
+# read the source as the app's UID, and write the repo through a SHARED SUPPLEMENTAL
+# GROUP (supplemental GIDs are honored by NFS over AUTH_SYS).
+#
+# ON THE NAS, make the export group-writable by the shared GID, with setgid so new
+# blobs inherit it:
+#     chown -R root:3001 /export/kopia
+#     chmod -R 2775 /export/kopia
+# (TrueNAS: set the dataset's group, or use a Mapall User/Group to remap all
+# clients server-side instead — then no pod-side group is needed.)
+#
+# See the Permissions and Security-context guides. For the simple same-UID case,
+# see nfs.yaml; for a PVC-backed filesystem repo, see filesystem.yaml.
+#
+# Field shapes verified against crates/api: ServerSpec.podSecurityContext and
+# MoverDefaults.podSecurityContext both accept supplementalGroups.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nfs-repo-creds
+  namespace: backups
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-shared
+  namespace: backups
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        nfs:
+          server: nas.lan
+          path: /export/kopia # owned root:3001, mode 2775 on the NAS
+  encryption:
+    passwordSecretRef:
+      name: nfs-repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  # Every pod that WRITES the backend — the bootstrap connect/create Job and every
+  # snapshot/maintenance mover — joins the export's group. The primary UID is left
+  # alone (so per-policy source reads stay correct); the group is purely additive.
+  moverDefaults:
+    podSecurityContext:
+      supplementalGroups: [3001]
+  # The kopia-ui web server also mounts and writes the NFS backend, so it needs the
+  # same group. (Omit this whole block if you don't enable the UI.)
+  server:
+    podSecurityContext:
+      supplementalGroups: [3001]
+---
+# Per-recipe: read the SOURCE as the app's own identity. The supplemental group
+# from moverDefaults still applies (it's additive), so the same mover reads the
+# source as UID 1000 AND writes the repo via group 3001.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: backups
+spec:
+  repository:
+    name: nas-shared
+  sources:
+    - pvc:
+        name: my-app-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  mover:
+    inheritSecurityContextFrom:
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: my-app

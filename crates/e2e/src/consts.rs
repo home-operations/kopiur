@@ -175,6 +175,10 @@ pub const BUCKETS: &[&str] = &[
     // Repository with `spec.server` whose embedded UI is GETted via the apiserver
     // Service proxy.
     "kopiur-server-ui",
+    // Read-only web-UI server scenario (crates/e2e/tests/lifecycle.rs,
+    // `server_read_only_ui_connects_read_only`): a distinct bucket so the
+    // read-only and read-write server fixtures don't collide.
+    "kopiur-server-ui-ro",
     // Foreign-repo import scenarios (crates/e2e/tests/import.rs): repositories +
     // snapshots created by RAW kopia (the seeder pod), then adopted by kopiur.
     "kopiur-import",
@@ -337,6 +341,17 @@ pub const NFS_EXPORT_PATH: &str = "/exports";
 pub const NFS_MOUNT_PATH: &str = "/";
 /// Secret holding just the repo password for the NFS/filesystem repo.
 pub const SECRET_NFS_CREDS: &str = "kopia-nfs-creds";
+/// GID that owns the **group-restricted** subdirectory of the NFS export, exercising
+/// the real-world "export owned by a dedicated GID, apps run as other UIDs" case.
+/// The init container creates it `root:NFS_REPO_GID` mode `2770` — writable only via
+/// the group, NOT by the default mover uid ([`MOVER_UID`]) alone. A mover/server
+/// reaches it only when it carries this GID as a `supplementalGroups` entry
+/// (`fsGroup` being a no-op on NFS). Distinct from any real cluster GID.
+pub const NFS_REPO_GID: i64 = 3001;
+/// Client mount path for the group-restricted subdir (under the `PSEUDO_PATH=/`
+/// root). The Repository sets `volume.nfs.path` to this; the export dir on the
+/// server is `NFS_EXPORT_PATH` + this.
+pub const NFS_GROUP_REPO_PATH: &str = "/grouprepo";
 
 // --- foreign-repo seeder (tests/import.rs) --------------------------------------
 /// The locally-built mover image (loaded into kind by `images-load`). The import

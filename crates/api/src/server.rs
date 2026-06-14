@@ -36,7 +36,7 @@
 //! variant — which would serialize as a bare string — and never a bare `bool`).
 
 use crate::common::SecretRef;
-use k8s_openapi::api::core::v1::{ResourceRequirements, SecurityContext};
+use k8s_openapi::api::core::v1::{PodSecurityContext, ResourceRequirements, SecurityContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -75,6 +75,16 @@ pub struct ServerSpec {
     /// Override the hardened default container security context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_context: Option<SecurityContext>,
+    /// Pod-level security context for the server pod. The hardened base
+    /// (`fsGroup`) is applied first, then this is overlaid field-wise — the same
+    /// resolution movers get (ADR-0004 §2). Notably carries `supplementalGroups`
+    /// so the server can write a filesystem backend whose export is owned by a
+    /// shared GID: **`fsGroup` is silently a no-op on NFS** (the kubelet does not
+    /// recursively chown in-tree NFS mounts), so a group-writable export + a
+    /// supplemental group is the way to grant the long-lived server write access.
+    /// `PartialEq` only (embeds the k8s-openapi `PodSecurityContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_security_context: Option<PodSecurityContext>,
 }
 
 /// `ClusterRepository`-only server config: a cluster-scoped server has no implicit
@@ -333,6 +343,43 @@ mod tests {
         assert_eq!(st.read_only, Some(true));
         let v = serde_json::to_value(&st).unwrap();
         assert_eq!(v["readOnly"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn server_spec_carries_pod_security_context_supplemental_groups() {
+        // The NFS-shared-group knob: a supplemental GID the server joins so it can
+        // write a group-owned export (fsGroup being a no-op on NFS).
+        let spec: ServerSpec =
+            from_yaml("auth:\n  generate: {}\npodSecurityContext:\n  supplementalGroups: [3001]\n");
+        let psc = spec
+            .pod_security_context
+            .as_ref()
+            .expect("podSecurityContext present");
+        assert_eq!(psc.supplemental_groups.as_deref(), Some(&[3001i64][..]));
+        // Structurally stable through the cluster's YAML→JSON→typed→JSON path.
+        let reparsed: ServerSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(spec, reparsed);
+        // Absent by default (skip_serializing_if) so the wire shape stays minimal.
+        let bare: ServerSpec = from_yaml("auth:\n  generate: {}\n");
+        assert!(bare.pod_security_context.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("podSecurityContext")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_server_spec_flattens_pod_security_context() {
+        let cs: ClusterServerSpec = from_yaml(
+            "namespace: kopiur-system\npodSecurityContext:\n  supplementalGroups: [3001]\n  fsGroup: 3001\n",
+        );
+        assert_eq!(cs.namespace, "kopiur-system");
+        let psc = cs.server.pod_security_context.as_ref().unwrap();
+        assert_eq!(psc.supplemental_groups.as_deref(), Some(&[3001i64][..]));
+        assert_eq!(psc.fs_group, Some(3001));
     }
 
     #[test]

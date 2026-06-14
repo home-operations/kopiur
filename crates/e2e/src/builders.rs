@@ -333,7 +333,19 @@ pub fn nfs_deployment(ns: &str) -> Deployment {
                         "name": "chmod-export",
                         "image": consts::NFS_IMAGE,
                         "imagePullPolicy": "IfNotPresent",
-                        "command": ["sh", "-c", format!("chmod 0777 {}", consts::NFS_EXPORT_PATH)],
+                        // The export root stays world-writable (most scenarios run as
+                        // the default mover uid). A `grouprepo` subdir models the
+                        // real-world UID-mismatch case: owned `root:NFS_REPO_GID` mode
+                        // 2770 (group rwx, setgid, others NONE) — writable ONLY by a
+                        // process carrying NFS_REPO_GID as a supplemental group, never
+                        // by the bare mover uid. Proves the shared-group recipe (and
+                        // that fsGroup wouldn't have helped — it's a no-op on NFS).
+                        "command": ["sh", "-c", format!(
+                            "chmod 0777 {export} && mkdir -p {export}{grp} && chown 0:{gid} {export}{grp} && chmod 2770 {export}{grp}",
+                            export = consts::NFS_EXPORT_PATH,
+                            grp = consts::NFS_GROUP_REPO_PATH,
+                            gid = consts::NFS_REPO_GID,
+                        )],
                         "volumeMounts": [{ "name": "export", "mountPath": consts::NFS_EXPORT_PATH }],
                     }],
                     "containers": [{
