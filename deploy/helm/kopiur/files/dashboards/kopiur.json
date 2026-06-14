@@ -7,6 +7,7 @@
   "tags": ["kopiur", "backup"],
   "title": "Kopiur — Backup Operator",
   "uid": "kopiur-overview",
+  "description": "Fleet health and per-resource detail for the Kopiur backup operator. The top band is the at-a-glance status; the rows below drill into backups, restores, repositories/maintenance, and operator internals.",
   "templating": {
     "list": [
       {
@@ -34,21 +35,28 @@
   "time": { "from": "now-24h", "to": "now" },
   "refresh": "30s",
   "panels": [
-    { "type": "row", "title": "Fleet", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1 },
+    { "type": "row", "title": "Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1 },
     {
       "id": 2,
       "type": "stat",
-      "title": "Backups Succeeded",
+      "title": "Backups OK",
+      "description": "Snapshot CRs currently in the Succeeded phase.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
+        "textMode": "value",
         "reduceOptions": { "calcs": ["lastNotNull"] }
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Backup\", phase=\"Succeeded\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=\"Snapshot\", phase=\"Succeeded\", namespace=~\"$namespace\"} == 1) or vector(0)",
           "refId": "A"
         }
       ]
@@ -57,11 +65,13 @@
       "id": 3,
       "type": "stat",
       "title": "Backups Failed",
+      "description": "Snapshot CRs currently in the Failed phase. Non-zero = backups are not completing.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
+            "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
               { "color": "red", "value": 1 }
@@ -72,11 +82,12 @@
       "options": {
         "colorMode": "background",
         "graphMode": "none",
+        "textMode": "value",
         "reduceOptions": { "calcs": ["lastNotNull"] }
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Backup\", phase=\"Failed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=\"Snapshot\", phase=\"Failed\", namespace=~\"$namespace\"} == 1) or vector(0)",
           "refId": "A"
         }
       ]
@@ -84,12 +95,52 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Repositories Ready",
+      "title": "Oldest Backup Age",
+      "description": "Time since the most recent successful backup, across all sources (the worst case). Yellow >26h, red >48h — tune to your schedule.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 93600 },
+              { "color": "red", "value": 172800 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "max(time() - kopiur_snapshot_last_success_timestamp_seconds{namespace=~\"$namespace\"})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Repos Ready",
+      "description": "Repository + ClusterRepository resources in the Ready phase.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
+        "textMode": "value",
         "reduceOptions": { "calcs": ["lastNotNull"] }
       },
       "targets": [
@@ -100,14 +151,16 @@
       ]
     },
     {
-      "id": 5,
+      "id": 6,
       "type": "stat",
       "title": "Repos Degraded/Failed",
+      "description": "Repository + ClusterRepository resources in the Degraded or Failed phase.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
+            "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
               { "color": "red", "value": 1 }
@@ -118,6 +171,7 @@
       "options": {
         "colorMode": "background",
         "graphMode": "none",
+        "textMode": "value",
         "reduceOptions": { "calcs": ["lastNotNull"] }
       },
       "targets": [
@@ -128,15 +182,227 @@
       ]
     },
     {
-      "id": 6,
+      "id": 7,
+      "type": "stat",
+      "title": "Unmaintained Repos",
+      "description": "Repositories with no Maintenance CR. These never reclaim storage and grow unbounded — non-zero needs attention.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "count(kopiur_repository_maintenance_configured == 0) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Restores Completed",
+      "description": "Restore CRs currently in the Completed phase.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Completed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Restores Failed",
+      "description": "Restore CRs currently in the Failed phase.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Failed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Max Consecutive Failures",
+      "description": "Largest run of consecutive backup failures across policies. Yellow ≥1, red ≥3.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "max(kopiur_snapshot_consecutive_failures{namespace=~\"$namespace\"}) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Backups Refused (24h)",
+      "description": "Backups deliberately refused by policy in the last 24h (e.g. ReadOnly repo, ungated privileged mover).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kopiur_snapshot_refusals_total{namespace=~\"$namespace\"}[24h])) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Snapshot Delete Failures (24h)",
+      "description": "kopia snapshot-delete failures during finalizer handling in the last 24h. Non-zero risks leaked snapshots.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kopiur_snapshot_deletion_failures_total{namespace=~\"$namespace\"}[24h])) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Orphaned Snapshots (24h)",
+      "description": "kopia snapshots intentionally left in the repository (Orphan deletionPolicy or the skip-cleanup escape hatch) in the last 24h.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kopiur_orphaned_snapshots_total{namespace=~\"$namespace\"}[24h])) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Backups",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 20
+    },
+    {
+      "id": 21,
       "type": "table",
       "title": "Backups by phase",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
       "options": { "showHeader": true },
       "targets": [
         {
-          "expr": "kopiur_resource_phase{kind=\"Backup\", namespace=~\"$namespace\"} == 1",
+          "expr": "kopiur_resource_phase{kind=\"Snapshot\", namespace=~\"$namespace\"} == 1",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -159,11 +425,12 @@
       ]
     },
     {
-      "id": 7,
+      "id": 22,
       "type": "timeseries",
       "title": "Resources by phase",
+      "description": "Live count of Snapshot/Restore/Repository/ClusterRepository resources in each phase.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
       "targets": [
         {
           "expr": "sum by (kind, phase) (kopiur_resource_phase{namespace=~\"$namespace\"} == 1)",
@@ -173,18 +440,12 @@
       ]
     },
     {
-      "type": "row",
-      "title": "Backups",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
-      "id": 10
-    },
-    {
-      "id": 11,
+      "id": 23,
       "type": "timeseries",
       "title": "Time since last successful backup",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "s" } },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 18 },
       "targets": [
         {
           "expr": "time() - kopiur_snapshot_last_success_timestamp_seconds{namespace=~\"$namespace\"}",
@@ -194,12 +455,12 @@
       ]
     },
     {
-      "id": 12,
+      "id": 24,
       "type": "timeseries",
       "title": "Last backup size",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "bytes" } },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 18 },
       "targets": [
         {
           "expr": "kopiur_snapshot_size_bytes{namespace=~\"$namespace\"}",
@@ -209,12 +470,12 @@
       ]
     },
     {
-      "id": 13,
+      "id": 25,
       "type": "timeseries",
       "title": "Last backup duration",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "s" } },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 18 },
       "targets": [
         {
           "expr": "kopiur_snapshot_duration_seconds{namespace=~\"$namespace\"}",
@@ -224,11 +485,26 @@
       ]
     },
     {
-      "id": 14,
+      "id": 26,
+      "type": "timeseries",
+      "title": "Last backup files",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "expr": "kopiur_snapshot_files{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 27,
       "type": "timeseries",
       "title": "Consecutive backup failures",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 22 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 25 },
       "targets": [
         {
           "expr": "kopiur_snapshot_consecutive_failures{namespace=~\"$namespace\"}",
@@ -238,11 +514,12 @@
       ]
     },
     {
-      "id": 15,
+      "id": 28,
       "type": "timeseries",
       "title": "Scheduled backups created (rate)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 25 },
       "targets": [
         {
           "expr": "sum by (namespace, name) (rate(kopiur_schedule_snapshots_created_total{namespace=~\"$namespace\"}[1h]))",
@@ -252,28 +529,116 @@
       ]
     },
     {
-      "type": "row",
-      "title": "Repositories & Maintenance",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 },
-      "id": 20
+      "id": 29,
+      "type": "timeseries",
+      "title": "Backups refused (rate by reason)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(kopiur_snapshot_refusals_total{namespace=~\"$namespace\"}[1h]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
     },
     {
-      "id": 21,
+      "id": 30,
+      "type": "timeseries",
+      "title": "Snapshot lifecycle issues (rate)",
+      "description": "Finalizer-path problems: kopia delete failures and intentionally-orphaned snapshots.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(rate(kopiur_snapshot_deletion_failures_total{namespace=~\"$namespace\"}[1h]))",
+          "legendFormat": "delete failures",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(kopiur_orphaned_snapshots_total{namespace=~\"$namespace\"}[1h]))",
+          "legendFormat": "orphaned",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Restores",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "id": 40
+    },
+    {
+      "id": 41,
+      "type": "table",
+      "title": "Restores by phase",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "expr": "kopiur_resource_phase{kind=\"Restore\", namespace=~\"$namespace\"} == 1",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "kind": true,
+              "__name__": true,
+              "job": true,
+              "instance": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Last restore duration",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "expr": "kopiur_restore_duration_seconds{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Repositories & Maintenance",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "id": 50
+    },
+    {
+      "id": 51,
       "type": "timeseries",
       "title": "Repository size",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "bytes" } },
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 30 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 49 },
       "targets": [
         { "expr": "kopiur_repo_size_bytes", "legendFormat": "{{namespace}}/{{name}}", "refId": "A" }
       ]
     },
     {
-      "id": 22,
+      "id": 52,
       "type": "timeseries",
       "title": "Snapshots & discovered backups",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 30 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 49 },
       "targets": [
         {
           "expr": "kopiur_repo_snapshot_count",
@@ -288,12 +653,12 @@
       ]
     },
     {
-      "id": 23,
+      "id": 53,
       "type": "timeseries",
       "title": "Maintenance reclaimed bytes",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "bytes" } },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 30 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 49 },
       "targets": [
         {
           "expr": "kopiur_maintenance_last_reclaimed_bytes",
@@ -303,18 +668,93 @@
       ]
     },
     {
-      "type": "row",
-      "title": "Controller, Mover & Webhook",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 },
-      "id": 30
+      "id": 54,
+      "type": "table",
+      "title": "Maintenance configured (per repository)",
+      "description": "Whether a Maintenance CR references each repository. A repository with no maintenance never reclaims storage.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 56 },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "expr": "kopiur_repository_maintenance_configured",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": { "Value": "Maintenance" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Maintenance" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "✗ none", "index": 0 },
+                      "1": { "text": "✓ ok", "index": 1 }
+                    }
+                  }
+                ]
+              },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
     },
     {
-      "id": 31,
+      "id": 55,
+      "type": "timeseries",
+      "title": "Credential Secrets projected (rate)",
+      "description": "Secrets copied into a mover namespace via spec.credentialProjection (opt-in).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum by (namespace) (rate(kopiur_secrets_projected_total{namespace=~\"$namespace\"}[1h]))",
+          "legendFormat": "{{namespace}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Controller, Mover & Webhook",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
+      "id": 60
+    },
+    {
+      "id": 61,
       "type": "timeseries",
       "title": "Reconcile rate by kind",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 38 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 64 },
       "targets": [
         {
           "expr": "sum by (kind) (rate(kopiur_controller_reconciliations_total[5m]))",
@@ -324,12 +764,12 @@
       ]
     },
     {
-      "id": 32,
+      "id": 62,
       "type": "timeseries",
       "title": "Reconcile error rate by class",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 38 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 64 },
       "targets": [
         {
           "expr": "sum by (kind, class) (rate(kopiur_controller_reconcile_errors_total[5m]))",
@@ -339,12 +779,12 @@
       ]
     },
     {
-      "id": 33,
+      "id": 63,
       "type": "timeseries",
       "title": "Reconcile duration p95",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "s" } },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 38 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 64 },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(kopiur_controller_reconcile_duration_seconds_bucket[5m])))",
@@ -354,12 +794,28 @@
       ]
     },
     {
-      "id": 34,
+      "id": 64,
+      "type": "timeseries",
+      "title": "Controller memory (RSS)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 71 },
+      "targets": [
+        {
+          "expr": "kopiur_process_resident_memory_bytes",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 65,
       "type": "timeseries",
       "title": "Mover operations (rate by result)",
+      "description": "Mover Jobs push via OTLP — visible only when an OTLP collector re-exports to Prometheus.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 45 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 71 },
       "targets": [
         {
           "expr": "sum by (operation, result) (rate(kopiur_mover_operations_total[15m]))",
@@ -369,12 +825,28 @@
       ]
     },
     {
-      "id": 35,
+      "id": 66,
+      "type": "timeseries",
+      "title": "Mover operation duration p95",
+      "description": "Mover Jobs push via OTLP — visible only when an OTLP collector re-exports to Prometheus.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 71 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(kopiur_mover_operation_duration_seconds_bucket[1h])))",
+          "legendFormat": "{{operation}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 67,
       "type": "timeseries",
       "title": "Webhook admissions (rate by decision)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 45 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 78 },
       "targets": [
         {
           "expr": "sum by (kind, decision) (rate(kopiur_webhook_admission_total[15m]))",
