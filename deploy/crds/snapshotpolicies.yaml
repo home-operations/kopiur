@@ -11227,7 +11227,7 @@ spec:
               lastVerified:
                 description: |-
                   RFC3339 timestamp of the most recent successful verification (any tier),
-                  ADR-0005 §4. Backs the `kopiur_snapshot_verified_timestamp` gauge.
+                  ADR-0005 §4. Backs the `kopiur_snapshot_verified_timestamp_seconds` gauge.
                 nullable: true
                 type: string
               observedGeneration:

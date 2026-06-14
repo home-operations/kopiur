@@ -534,7 +534,7 @@
       "title": "Backups refused (rate by reason)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 32 },
       "targets": [
         {
           "expr": "sum by (reason) (rate(kopiur_snapshot_refusals_total{namespace=~\"$namespace\"}[1h]))",
@@ -550,7 +550,7 @@
       "description": "Finalizer-path problems: kopia delete failures and intentionally-orphaned snapshots.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" } },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 32 },
       "targets": [
         {
           "expr": "sum(rate(kopiur_snapshot_deletion_failures_total{namespace=~\"$namespace\"}[1h]))",
@@ -561,6 +561,22 @@
           "expr": "sum(rate(kopiur_orphaned_snapshots_total{namespace=~\"$namespace\"}[1h]))",
           "legendFormat": "orphaned",
           "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Time since last verify",
+      "description": "Age of the most recent successful SnapshotPolicy verification (quick or deep). A growing value means backups aren't being integrity-checked — alert on staleness like the last-backup age (ADR-0005 §4).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 32 },
+      "targets": [
+        {
+          "expr": "time() - kopiur_snapshot_verified_timestamp_seconds{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{name}}",
+          "refId": "A"
         }
       ]
     },

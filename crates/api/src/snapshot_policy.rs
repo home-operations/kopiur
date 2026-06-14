@@ -554,7 +554,7 @@ pub struct SnapshotPolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
     /// RFC3339 timestamp of the most recent successful verification (any tier),
-    /// ADR-0005 §4. Backs the `kopiur_snapshot_verified_timestamp` gauge.
+    /// ADR-0005 §4. Backs the `kopiur_snapshot_verified_timestamp_seconds` gauge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
     /// Standard Kubernetes conditions (e.g. `RepositoryReachable`,
