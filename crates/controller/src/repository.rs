@@ -418,6 +418,7 @@ async fn reconcile_repository_server(
         backend: &repo.spec.backend,
         encryption: &repo.spec.encryption,
         server: repo.spec.server.as_ref(),
+        read_only_mode: !repo.spec.mode.allows_writes(),
         target_namespace: desired_ns,
         observed_namespace: observed_ns,
         owner,

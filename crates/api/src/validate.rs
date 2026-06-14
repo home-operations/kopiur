@@ -16,7 +16,7 @@
 
 use crate::backend::NfsVolume;
 use crate::cluster_repository::{AllowedNamespaces, ClusterRepositorySpec};
-use crate::common::{DeletionPolicy, MoverSpec, RepositoryKind, RepositoryRef};
+use crate::common::{DeletionPolicy, MoverSpec, RepositoryKind, RepositoryMode, RepositoryRef};
 use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
 use crate::repository::RepositorySpec;
@@ -765,20 +765,24 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
         errs.extend(validate_catalog_bounds(c, false));
     }
     if let Some(server) = &spec.server {
-        errs.extend(validate_server(server));
+        errs.extend(validate_server(server, spec.mode));
     }
     errs
 }
 
 /// The shared `spec.server` rules the type system can't express (server addendum):
 ///   * `auth.insecure` requires `acknowledgeInsecure: true` — a no-auth server exposes
-///     full read/write/delete of the repository, so it must be explicit.
+///     full read/read of the repository, so it must be explicit.
 ///   * `service.port` must be non-zero.
+///   * `readOnly: false` is contradictory on a `mode: ReadOnly` repository — a ReadOnly
+///     repo can never serve a writable UI, so the explicit denial is rejected (omitting
+///     the field is fine; the mode forces read-only).
 ///
-/// Accumulates so a user sees every server problem at once. The PVC `ReadWriteMany`
-/// requirement for filesystem-backend servers is **not** here — it needs a live PVC
-/// read and is enforced at reconcile, not admission.
-pub fn validate_server(server: &ServerSpec) -> Vec<ValidationError> {
+/// `mode` is the parent repository's [`RepositoryMode`] (both callers have it). Accumulates
+/// so a user sees every server problem at once. The PVC `ReadWriteMany` requirement for
+/// filesystem-backend servers is **not** here — it needs a live PVC read and is enforced
+/// at reconcile, not admission.
+pub fn validate_server(server: &ServerSpec, mode: RepositoryMode) -> Vec<ValidationError> {
     let mut errs = Vec::new();
     if let Some(ServerAuth::Insecure(ack)) = &server.auth
         && !ack.acknowledge_insecure
@@ -789,6 +793,15 @@ pub fn validate_server(server: &ServerSpec) -> Vec<ValidationError> {
         && service.port == Some(0)
     {
         errs.push(ValidationError::InvalidServerPort { port: 0 });
+    }
+    if server.read_only == Some(false) && !mode.allows_writes() {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "server.readOnly".to_string(),
+            reason: "a Repository with spec.mode: ReadOnly cannot serve a read-write UI; remove \
+                     server.readOnly (the ReadOnly mode forces the UI read-only) or set the \
+                     repository's spec.mode: ReadWrite"
+                .to_string(),
+        });
     }
     errs
 }
@@ -1170,7 +1183,7 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         if server.namespace.trim().is_empty() {
             errs.push(ValidationError::ServerNamespaceRequired);
         }
-        errs.extend(validate_server(&server.server));
+        errs.extend(validate_server(&server.server, spec.mode));
     }
     errs
 }
@@ -3076,7 +3089,7 @@ catalog:
             ..Default::default()
         };
         assert_eq!(
-            validate_server(&server),
+            validate_server(&server, RepositoryMode::ReadWrite),
             vec![ValidationError::InsecureServerNotAcknowledged]
         );
     }
@@ -3089,12 +3102,12 @@ catalog:
             })),
             ..Default::default()
         };
-        assert!(validate_server(&server).is_empty());
+        assert!(validate_server(&server, RepositoryMode::ReadWrite).is_empty());
     }
 
     #[test]
     fn server_generate_and_default_are_ok() {
-        assert!(validate_server(&ServerSpec::default()).is_empty());
+        assert!(validate_server(&ServerSpec::default(), RepositoryMode::ReadWrite).is_empty());
         let server = ServerSpec {
             auth: Some(ServerAuth::Generate(Default::default())),
             service: Some(ServerService {
@@ -3104,7 +3117,7 @@ catalog:
             }),
             ..Default::default()
         };
-        assert!(validate_server(&server).is_empty());
+        assert!(validate_server(&server, RepositoryMode::ReadWrite).is_empty());
     }
 
     #[test]
@@ -3117,9 +3130,32 @@ catalog:
             ..Default::default()
         };
         assert_eq!(
-            validate_server(&server),
+            validate_server(&server, RepositoryMode::ReadWrite),
             vec![ValidationError::InvalidServerPort { port: 0 }]
         );
+    }
+
+    #[test]
+    fn server_read_only_false_on_read_only_repo_is_rejected() {
+        // Contradictory: a ReadOnly repository cannot serve a writable UI.
+        let server = ServerSpec {
+            read_only: Some(false),
+            ..Default::default()
+        };
+        let errs = validate_server(&server, RepositoryMode::ReadOnly);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(matches!(
+            &errs[0],
+            ValidationError::InvalidFieldValue { field, .. } if field == "server.readOnly"
+        ));
+        // The same field on a ReadWrite repo (the opt-in) is fine, as is omitting it.
+        assert!(validate_server(&server, RepositoryMode::ReadWrite).is_empty());
+        let on = ServerSpec {
+            read_only: Some(true),
+            ..Default::default()
+        };
+        assert!(validate_server(&on, RepositoryMode::ReadOnly).is_empty());
+        assert!(validate_server(&ServerSpec::default(), RepositoryMode::ReadOnly).is_empty());
     }
 
     #[test]

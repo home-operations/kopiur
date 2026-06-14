@@ -7,13 +7,26 @@
 //!
 //! ## Security reality (read before changing defaults)
 //!
-//! kopia's server UI has **no read-only mode**: it is full read-write-**delete**, and
-//! the server process holds the repository decryption key. Exposing it therefore
-//! exposes full mutation of all backups. Consequences encoded here:
+//! By default the server holds a **read-write** repository connection: kopia's UI is
+//! full read-write-**delete**, and the server process holds the repository decryption
+//! key, so exposing it exposes full mutation of all backups. Consequences encoded here:
 //!   * [`ServerAuth`] defaults (when `auth` is omitted) to [`ServerAuth::Generate`] —
 //!     never to no-auth.
 //!   * the no-auth variant ([`ServerAuth::Insecure`]) carries a mandatory
 //!     `acknowledgeInsecure: true`, webhook-rejected otherwise (see `api::validate`).
+//!
+//! ### Read-only (`readOnly`)
+//!
+//! [`ServerSpec::read_only`] (and a `Repository` with `spec.mode: ReadOnly`) connects the
+//! server's kopia process **read-only** (`kopia repository connect --readonly`), so
+//! creating/deleting/altering backups through the UI is rejected by the repository. kopia
+//! 0.23 has no server-level read-only *flag*; the guarantee comes from the read-only
+//! *connection*, which every later operation on that connection inherits. Two caveats it
+//! does **not** remove: the server still holds the decryption key (anyone reaching the UI
+//! can still **read and restore** every backup — read-only is not confidentiality), and
+//! kopia's UI does not hide the now-non-functional write/delete buttons. The **effective**
+//! read-only state is `mode: ReadOnly` OR `readOnly: true`, and is pinned to
+//! `status.server.readOnly`.
 //!
 //! ## Encoding
 //!
@@ -45,6 +58,14 @@ pub struct ServerSpec {
     /// admission, pinned to `status.server.authMode`). **Never** defaults to no-auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ServerAuth>,
+    /// Connect the server's repository **read-only** so the UI cannot create, delete, or
+    /// alter backups (browse + restore-download only). Omitted ⇒ `false`. A `Repository`
+    /// with `spec.mode: ReadOnly` forces this on regardless of the field; setting an
+    /// explicit `readOnly: false` on a `ReadOnly` repository is rejected (contradictory).
+    /// Read-only blocks *mutation*, not *reading*: the server still holds the decryption
+    /// key. Orthogonal to [`ServerSpec::auth`] — no-auth still needs `acknowledgeInsecure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
     /// How the server is exposed as a Kubernetes `Service`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServerService>,
@@ -196,6 +217,10 @@ pub struct ServerStatus {
     /// Resolved auth mode discriminant (`Generate`/`SecretRef`/`Insecure`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
+    /// **Effective** read-only state of the served connection — `spec.mode: ReadOnly` OR
+    /// `spec.server.readOnly: true`. When `true` the UI cannot mutate the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
     /// For `Generate` mode: the operator-owned Secret holding the UI credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_secret_ref: Option<SecretRef>,
@@ -284,6 +309,30 @@ mod tests {
             .resolved_port(),
             8080
         );
+    }
+
+    #[test]
+    fn read_only_defaults_off_and_roundtrips() {
+        // Omitted ⇒ None (the controller resolves the effective value).
+        let off: ServerSpec = from_yaml("auth:\n  generate: {}\n");
+        assert_eq!(off.read_only, None);
+        // Present ⇒ pinned bool, externally visible as `readOnly`.
+        let on: ServerSpec = from_yaml("readOnly: true\nauth:\n  generate: {}\n");
+        assert_eq!(on.read_only, Some(true));
+        let v = serde_json::to_value(&on).unwrap();
+        assert_eq!(v["readOnly"], serde_json::json!(true));
+        let reparsed: ServerSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(on, reparsed);
+        // Default ServerSpec leaves it unset (so an unconfigured server is unaffected).
+        assert_eq!(ServerSpec::default().read_only, None);
+    }
+
+    #[test]
+    fn status_pins_effective_read_only() {
+        let st: ServerStatus = from_yaml("readOnly: true\nauthMode: Generate\n");
+        assert_eq!(st.read_only, Some(true));
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["readOnly"], serde_json::json!(true));
     }
 
     #[test]

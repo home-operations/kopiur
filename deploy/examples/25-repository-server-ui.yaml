@@ -6,10 +6,12 @@
 # created — wiring an Ingress/HTTPRoute is left to you (commented below).
 #
 # ┌─ SECURITY ─────────────────────────────────────────────────────────────────┐
-# │ Kopia's server UI has NO read-only mode. Anyone who can reach it can READ,   │
-# │ CREATE, and DELETE backups, and the server pod holds the repository          │
-# │ DECRYPTION KEY. Treat exposing it exactly like exposing the repository       │
-# │ itself. Defaults here are the safe ones:                                     │
+# │ By default the UI is full read-write-DELETE. Anyone who can reach it can     │
+# │ READ, CREATE, and DELETE backups, and the server pod holds the repository    │
+# │ DECRYPTION KEY. Set `server.readOnly: true` (or `spec.mode: ReadOnly` on the │
+# │ Repository) for a no-mutation UI — see example 26. Read-only still exposes    │
+# │ READING all backups, so keep auth + ClusterIP regardless. Defaults here are  │
+# │ the safe ones:                                                               │
 # │   * `auth: { generate: {} }` — the operator mints random UI credentials into │
 # │     an owned Secret (`<repo>-kopia-ui-auth`) and pins the ref to             │
 # │     `status.server.generatedSecretRef`. Read them with:                      │
@@ -65,6 +67,7 @@ spec:
     # Alternatives:
     #   auth: { secretRef: { name: my-ui-creds, usernameKey: username, passwordKey: password } }
     #   auth: { insecure: { acknowledgeInsecure: true } }   # NO auth — footgun
+    # readOnly: true   # no-mutation UI (browse + restore only) — see example 26
     service:
       type: ClusterIP # ClusterIP (default) | NodePort | LoadBalancer
       port: 51515

@@ -2149,6 +2149,16 @@ spec:
                   namespace:
                     description: Target namespace for the server Deployment/Service (and generated Secret).
                     type: string
+                  readOnly:
+                    description: |-
+                      Connect the server's repository **read-only** so the UI cannot create, delete, or
+                      alter backups (browse + restore-download only). Omitted ⇒ `false`. A `Repository`
+                      with `spec.mode: ReadOnly` forces this on regardless of the field; setting an
+                      explicit `readOnly: false` on a `ReadOnly` repository is rejected (contradictory).
+                      Read-only blocks *mutation*, not *reading*: the server still holds the decryption
+                      key. Orthogonal to [`ServerSpec::auth`] — no-auth still needs `acknowledgeInsecure`.
+                    nullable: true
+                    type: boolean
                   resources:
                     description: Resource requests/limits for the server pod.
                     nullable: true
@@ -2471,6 +2481,12 @@ spec:
                       reconciler detect a `server.namespace` change and delete the stale objects.
                     nullable: true
                     type: string
+                  readOnly:
+                    description: |-
+                      **Effective** read-only state of the served connection — `spec.mode: ReadOnly` OR
+                      `spec.server.readOnly: true`. When `true` the UI cannot mutate the repository.
+                    nullable: true
+                    type: boolean
                 type: object
               storageStats:
                 description: Repository size and snapshot counts from the last catalog scan.
