@@ -25,10 +25,14 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
         .name
         .clone()
         .unwrap_or_else(|| format!("{}-manual-{}", args.policy, now.format("%Y%m%d%H%M%S")));
-    let failure_policy = if args.backoff_limit.is_some() || args.active_deadline_seconds.is_some() {
+    let failure_policy = if args.backoff_limit.is_some()
+        || args.active_deadline_seconds.is_some()
+        || args.pod_startup_deadline_seconds.is_some()
+    {
         Some(FailurePolicy {
             backoff_limit: args.backoff_limit,
             active_deadline_seconds: args.active_deadline_seconds,
+            pod_startup_deadline_seconds: args.pod_startup_deadline_seconds,
         })
     } else {
         None
@@ -270,6 +274,7 @@ mod tests {
             pin: false,
             backoff_limit: None,
             active_deadline_seconds: None,
+            pod_startup_deadline_seconds: None,
             wait: false,
             logs: false,
             timeout: None,

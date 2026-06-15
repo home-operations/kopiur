@@ -103,6 +103,10 @@ retention:
 
 Set only the buckets you care about; omit the rest. There is deliberately **no** `successfulJobsHistoryLimit` — successful retention is GFS, full stop. (Failed runs are bounded separately by `failedJobsHistoryLimit` on the `SnapshotSchedule`.)
 
+/// warning | A `retention:` block that keeps nothing is rejected
+If you set `retention:` but leave every bucket unset or `0`, GFS would prune **every** snapshot the moment it runs — silent data loss. The admission webhook rejects that (*"keeps no snapshots … set at least one bucket"*). To disable pruning entirely, **omit `retention` altogether** (absent = don't prune); an empty-but-present block is the trap, so it's blocked.
+///
+
 ### Identity — what kopia records (`username@hostname:path`)
 
 kopia stores every snapshot under an identity. Kopiur resolves it **once at admission** and pins it to status; it is never re-rendered. The defaults:
@@ -329,13 +333,25 @@ spec:
     policyRef: { name: postgres-data }
     failurePolicy:
         backoffLimit: 2 # retry the mover Job this many times before marking it failed (default 2)
-        activeDeadlineSeconds: 3600 # kill a still-running backup after this many seconds (default: none)
+        activeDeadlineSeconds: 3600 # kill a still-RUNNING backup after this many seconds (default: 48h backstop)
+        podStartupDeadlineSeconds: 300 # fail a mover that can't START Running within this long (default 300 = 5m)
 ```
 
 | Value | What it does | When to change it |
 | --- | --- | --- |
 | `backoffLimit` | `Job.spec.backoffLimit` — retries before the run is marked failed. | Lower to fail fast on a flaky source; raise to ride out transient backend blips. |
-| `activeDeadlineSeconds` | `Job.spec.activeDeadlineSeconds` — a hard wall-clock cap. | Set a ceiling so a wedged backup doesn't run forever; size it above your largest expected run. |
+| `activeDeadlineSeconds` | `Job.spec.activeDeadlineSeconds` — a hard wall-clock cap on a mover that **is running**. | Set a ceiling so a long backup can't run forever; size it **above** your largest expected run. Defaults to a 48h backstop. |
+| `podStartupDeadlineSeconds` | How long the mover pod may sit **unable to start** — `CreateContainerConfigError`, `ImagePullBackOff`, or `Unschedulable` — before the run is failed with reason `MoverPodWedged`. | Raise on slow nodes/large images or when an RWO volume takes a while to detach from another node; lower to surface a misconfiguration faster. Default `300` (5 min). |
+
+/// warning | The two deadlines solve different problems — don't conflate them
+
+A pod that can't even **start** (e.g. an impossible `securityContext`, a missing image, or nowhere to schedule) never reaches a terminal state, so `backoffLimit` never trips — the Job, and the `Snapshot`, would otherwise hang for the full `activeDeadlineSeconds` (up to 48h) while the kubelet retries every few seconds. `podStartupDeadlineSeconds` is the short, separate fuse for *that* case: it fails the run fast (default 5 min) with an actionable `MoverPodWedged` message, and reaps the wedged Job so it stops hammering the API.
+
+- `activeDeadlineSeconds` — caps a mover that **is making progress** (running, moving data). Keep it large.
+- `podStartupDeadlineSeconds` — caps a mover that **can't get going at all**. Keep it small.
+
+If a mover legitimately needs longer than 5 minutes just to *schedule* (huge image pull, contended RWO volume), raise `podStartupDeadlineSeconds`; don't reach for `activeDeadlineSeconds`.
+///
 
 Failed `Snapshot` CRs from a schedule are bounded by `failedJobsHistoryLimit` (below); successful ones are pruned by GFS retention.
 

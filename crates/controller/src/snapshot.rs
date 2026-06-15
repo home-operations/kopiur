@@ -717,7 +717,45 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Ok(Action::requeue(Duration::from_secs(120)));
             }
             None => {
-                // Job exists but is still running; mark Running and wait.
+                // A wedged pod (impossible securityContext, missing image, Unschedulable)
+                // never reaches a terminal phase, so `backoffLimit` never trips and only
+                // the long `activeDeadlineSeconds` backstop would ever stop it — meanwhile
+                // the kubelet retries every few seconds, hammering the API. Fail fast once
+                // a pod has been wedged past the grace window, with an actionable reason.
+                let grace = backup
+                    .spec
+                    .failure_policy
+                    .as_ref()
+                    .and_then(|fp| fp.pod_startup_deadline_seconds)
+                    .unwrap_or(kopiur_api::common::DEFAULT_POD_STARTUP_DEADLINE_SECONDS);
+                if let io::WedgedVerdict::Wedged { reason, message } =
+                    io::wedged_pod_verdict(&ctx.client, &namespace, &name, grace).await?
+                {
+                    io::patch_status(
+                        &api,
+                        &name,
+                        snapshot_ready_status(
+                            backup,
+                            SnapshotPhase::Failed,
+                            "MoverPodWedged",
+                            &wedged_pod_message(&reason, &message, grace),
+                        ),
+                    )
+                    .await?;
+                    // Delete the wedged Job *and its pod* (Background cascade) so the
+                    // kubelet stops retrying immediately — don't wait for TTL/ownerRef GC.
+                    let _ = job_api.delete(&name, &DeleteParams::background()).await;
+                    if backup
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.staged.as_ref())
+                        .is_some()
+                    {
+                        io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                    }
+                    return Ok(Action::requeue(Duration::from_secs(120)));
+                }
+                // Job exists but is still running/starting; mark Running and wait.
                 if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Running) {
                     io::patch_status(
                         &api,
@@ -2358,6 +2396,20 @@ fn job_limits(backup: &Snapshot) -> JobLimits {
         },
         None => JobLimits::default(),
     }
+}
+
+/// Actionable failure message for a mover pod wedged in a non-starting state past the
+/// grace window — what failed, why, and how to fix it (the what/why/fix rule).
+fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64) -> String {
+    format!(
+        "the backup mover pod has been stuck ({reason}) for over {grace_seconds}s and cannot \
+         start: {detail}. Common causes: the resolved mover securityContext is invalid for the \
+         namespace's Pod Security policy (e.g. an inherited root UID without a privileged-mover \
+         opt-in), the mover image is unavailable, or the source volume cannot be scheduled. Fix \
+         the mover config (securityContext / inheritSecurityContextFrom / image) or the namespace \
+         policy and the next scheduled run will retry. Tune the window with \
+         spec.failurePolicy.podStartupDeadlineSeconds."
+    )
 }
 
 /// `IfNotPresent` when running against a locally-loaded mover image (kind e2e),

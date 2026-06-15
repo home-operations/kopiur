@@ -46,4 +46,5 @@ spec:
         memory: 4Gi
   failurePolicy:
     backoffLimit: 1
-    activeDeadlineSeconds: 14400
+    activeDeadlineSeconds: 14400 # cap a RUNNING maintenance Job (4h)
+    podStartupDeadlineSeconds: 300 # fail fast if the maintenance mover can't START in 5m (default 300)

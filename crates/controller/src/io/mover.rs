@@ -524,3 +524,242 @@ pub async fn resolve_mover_security_contexts(
         None => Ok((None, None)),
     }
 }
+
+/// Container `waiting.reason` values that mean the pod will never start without a spec
+/// change — a *wedged* mover, not a slow one. A pod in one of these states stays `Pending`
+/// forever: it never terminates, so `Job.backoffLimit` never decrements and only the (long)
+/// `activeDeadlineSeconds` backstop would ever stop it. `CreateContainerConfigError` is the
+/// exact reason an inherited-root securityContext produced before [`normalize_nonroot_invariant`].
+const WEDGED_WAITING_REASONS: &[&str] = &[
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+    "ErrImagePull",
+    "ImagePullBackOff",
+    "InvalidImageName",
+    "ErrImageNeverPull",
+];
+
+/// Verdict for the pods backing a non-terminal mover Job. See [`classify_wedged_pods`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WedgedVerdict {
+    /// No pod is wedged (or none exist yet) — the Job is making normal progress.
+    Progressing,
+    /// A pod is wedged but has not yet exceeded the grace window — keep waiting.
+    Within {
+        /// The wedged pod's reason (e.g. `CreateContainerConfigError`, `Unschedulable`).
+        reason: String,
+    },
+    /// A pod has been wedged past the grace window — fail the run fast.
+    Wedged {
+        /// The wedged pod's reason (e.g. `CreateContainerConfigError`, `Unschedulable`).
+        reason: String,
+        /// Human-readable detail (container name + kubelet/scheduler message) for the
+        /// `Failed` condition surfaced to the user.
+        message: String,
+    },
+}
+
+/// If `pod` is in a non-starting / unschedulable state, return its `(reason, message)`.
+/// Inspects init + regular container `waiting` reasons and the `PodScheduled=False /
+/// Unschedulable` condition. Pure.
+fn pod_wedge_reason(pod: &Pod) -> Option<(String, String)> {
+    let status = pod.status.as_ref()?;
+    let container_statuses = status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten());
+    for cs in container_statuses {
+        if let Some(w) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+            let reason = w.reason.as_deref().unwrap_or_default();
+            if WEDGED_WAITING_REASONS.contains(&reason) {
+                let detail = w.message.as_deref().unwrap_or_default();
+                let message = if detail.is_empty() {
+                    format!("container `{}`: {reason}", cs.name)
+                } else {
+                    format!("container `{}`: {reason} — {detail}", cs.name)
+                };
+                return Some((reason.to_string(), message));
+            }
+        }
+    }
+    for c in status.conditions.iter().flatten() {
+        if c.type_ == "PodScheduled"
+            && c.status == "False"
+            && c.reason.as_deref() == Some("Unschedulable")
+        {
+            let message = c
+                .message
+                .clone()
+                .unwrap_or_else(|| "pod is unschedulable".to_string());
+            return Some(("Unschedulable".to_string(), message));
+        }
+    }
+    None
+}
+
+/// Classify the pods of a non-terminal mover Job: is any pod stuck in a non-starting
+/// (`CreateContainerConfigError`/`ImagePullBackOff`/…) or `Unschedulable` state, and for
+/// how long? Pure + time-injected so it unit-tests without a clock or cluster.
+///
+/// `grace_seconds` bounds how long a wedged pod is tolerated; `now_unix` is the decision
+/// clock in unix seconds (the async wrapper passes `Utc::now().timestamp()` — never
+/// persisted to status, so no churn — per the status-churn/hot-loop guidance). A wedged
+/// pod's age is measured from its `creationTimestamp`: config/image errors are immediate
+/// and deterministic and won't self-heal, so age-since-creation is a sound, conservative
+/// proxy for "how long wedged". Working in unix seconds avoids the k8s-openapi `Time`
+/// (jiff) ↔ chrono mismatch.
+pub fn classify_wedged_pods(pods: &[Pod], grace_seconds: i64, now_unix: i64) -> WedgedVerdict {
+    let mut within: Option<String> = None;
+    for pod in pods {
+        let Some((reason, message)) = pod_wedge_reason(pod) else {
+            continue;
+        };
+        let age_secs = pod
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| now_unix - t.0.as_second())
+            .unwrap_or(0);
+        if age_secs >= grace_seconds {
+            return WedgedVerdict::Wedged { reason, message };
+        }
+        within.get_or_insert(reason);
+    }
+    match within {
+        Some(reason) => WedgedVerdict::Within { reason },
+        None => WedgedVerdict::Progressing,
+    }
+}
+
+/// Fetch a mover Job's pods (by the `batch.kubernetes.io/job-name` label the Job controller
+/// stamps) and classify whether one is wedged past `grace_seconds`. Thin IO over the pure
+/// [`classify_wedged_pods`]; the reconciler fails the owning CR fast on [`WedgedVerdict::Wedged`].
+pub async fn wedged_pod_verdict(
+    client: &kube::Client,
+    ns: &str,
+    job_name: &str,
+    grace_seconds: i64,
+) -> Result<WedgedVerdict> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let lp = ListParams::default().labels(&format!("batch.kubernetes.io/job-name={job_name}"));
+    let pods = api.list(&lp).await?.items;
+    Ok(classify_wedged_pods(
+        &pods,
+        grace_seconds,
+        chrono::Utc::now().timestamp(),
+    ))
+}
+
+#[cfg(test)]
+mod wedged_tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateWaiting, ContainerStatus, PodCondition, PodStatus,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    /// A pod created `age_secs` ago whose `mover` container is waiting on `reason`.
+    fn waiting_pod(reason: &str, created_unix: i64) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_second(created_unix).unwrap(),
+                )),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "mover".to_string(),
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some(reason.to_string()),
+                            message: Some("a kubelet detail".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn unschedulable_pod(created_unix: i64) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_second(created_unix).unwrap(),
+                )),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: Some("Unschedulable".to_string()),
+                    message: Some("0/6 nodes are available".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn create_container_config_error_past_grace_is_wedged() {
+        // The exact production failure: an impossible securityContext parks the container
+        // in CreateContainerConfigError. Past the grace window it must fail fast.
+        let pods = [waiting_pod("CreateContainerConfigError", 0)];
+        match classify_wedged_pods(&pods, 300, 600) {
+            WedgedVerdict::Wedged { reason, message } => {
+                assert_eq!(reason, "CreateContainerConfigError");
+                assert!(message.contains("mover"), "message names the container");
+            }
+            other => panic!("expected Wedged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn within_grace_is_not_yet_failed() {
+        // Same wedge, but only 60s old with a 300s grace → keep waiting, don't fail.
+        let pods = [waiting_pod("CreateContainerConfigError", 540)];
+        assert_eq!(
+            classify_wedged_pods(&pods, 300, 600),
+            WedgedVerdict::Within {
+                reason: "CreateContainerConfigError".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn image_pull_backoff_and_unschedulable_are_wedge_reasons() {
+        assert!(matches!(
+            classify_wedged_pods(&[waiting_pod("ImagePullBackOff", 0)], 300, 600),
+            WedgedVerdict::Wedged { .. }
+        ));
+        assert!(matches!(
+            classify_wedged_pods(&[unschedulable_pod(0)], 300, 600),
+            WedgedVerdict::Wedged { reason, .. } if reason == "Unschedulable"
+        ));
+    }
+
+    #[test]
+    fn a_normal_starting_pod_is_progressing() {
+        // No wedged reason (e.g. ContainerCreating is transient and not in the set) →
+        // Progressing, so a legitimately slow/long mover is never failed by this path.
+        let pods = [waiting_pod("ContainerCreating", 0)];
+        assert_eq!(
+            classify_wedged_pods(&pods, 300, 600),
+            WedgedVerdict::Progressing
+        );
+        // And no pods at all (Job just created) is Progressing too.
+        assert_eq!(
+            classify_wedged_pods(&[], 300, 600),
+            WedgedVerdict::Progressing
+        );
+    }
+}

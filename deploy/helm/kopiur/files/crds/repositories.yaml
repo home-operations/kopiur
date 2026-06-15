@@ -621,6 +621,18 @@ spec:
                         format: int32
                         nullable: true
                         type: integer
+                      podStartupDeadlineSeconds:
+                        description: |-
+                          How long (seconds) a mover **pod** may sit in a non-starting state — a container
+                          `CreateContainerConfigError` / `ImagePullBackOff` / `InvalidImageName`, or
+                          `Unschedulable` — before the controller fails the run with an actionable reason,
+                          rather than waiting out `active_deadline_seconds` (which can be many hours and
+                          is meant for *long-running*, not *wedged*, work). A wedged pod never reaches a
+                          terminal phase, so `backoffLimit` never trips — this is the only thing that bounds
+                          it. Unset uses the built-in [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`].
+                        format: int64
+                        nullable: true
+                        type: integer
                     type: object
                   mover:
                     description: Mover overrides for the managed `Maintenance` (object-store repositories).

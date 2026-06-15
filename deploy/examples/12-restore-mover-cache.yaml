@@ -76,7 +76,8 @@ spec:
   # ── Retry / deadline for the restore Job (mirrors Snapshot.spec.failurePolicy) ──
   failurePolicy:
     backoffLimit: 4 # retry the restore Job up to 4 times
-    activeDeadlineSeconds: 7200 # hard wall-clock cap (2h) for a big restore
+    activeDeadlineSeconds: 7200 # hard wall-clock cap (2h) for a big RUNNING restore
+    podStartupDeadlineSeconds: 300 # fail fast if the restore mover can't START in 5m (default 300)
   policy:
     onMissingSnapshot: Fail
     waitTimeout: 5m

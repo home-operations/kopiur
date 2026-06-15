@@ -487,6 +487,11 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "SECS")]
     pub active_deadline_seconds: Option<i64>,
 
+    /// Seconds a wedged mover pod (CreateContainerConfigError / ImagePullBackOff /
+    /// Unschedulable) may sit before the run is failed (failurePolicy.podStartupDeadlineSeconds).
+    #[arg(long, value_name = "SECS")]
+    pub pod_startup_deadline_seconds: Option<i64>,
+
     // --- invocation ---
     /// Name for the created Restore (default: restore-<source>-<timestamp>).
     #[arg(long, value_name = "NAME")]
@@ -608,6 +613,11 @@ pub struct SnapshotNowArgs {
     /// Wall-clock cap on the run in seconds (Job activeDeadlineSeconds).
     #[arg(long, value_name = "SECS")]
     pub active_deadline_seconds: Option<i64>,
+
+    /// Seconds a wedged mover pod (CreateContainerConfigError / ImagePullBackOff /
+    /// Unschedulable) may sit before the run is failed (failurePolicy.podStartupDeadlineSeconds).
+    #[arg(long, value_name = "SECS")]
+    pub pod_startup_deadline_seconds: Option<i64>,
 
     /// Wait for the Snapshot to reach Succeeded (exit 0) or Failed (exit 1).
     #[arg(long)]

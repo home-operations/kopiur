@@ -75,11 +75,12 @@ podSecurityContext:
 
 The `fsGroup` matches the mover image's GID so the operator-managed **kopia cache** is writable out of the box. Without it, a PVC-backed cache (`moverDefaults.cache.mode: Ephemeral`/`Persistent`) is created `root:root` and the unprivileged mover fails with `mkdir /var/cache/kopia/logs: permission denied`. `OnRootMismatch` keeps it cheap — a volume already owned by the group isn't re-chowned on every run. Because this is the lowest merge layer, `moverDefaults.podSecurityContext` and a recipe's `mover.podSecurityContext` override it field-wise (e.g. set `fsGroup` to your app's GID for a restore; the rest of the hardened defaults stay put).
 
-!!! warning "`fsGroup` has no effect on NFS"
-    `fsGroup` works by having the **kubelet** chown the volume on mount. The kubelet **skips that chown entirely for in-tree `nfs:` volumes** (and many NFS-backed CSI drivers) — so `fsGroup` is silently a **no-op on NFS**, not just on root-squashed exports. Two consequences:
+/// warning | `fsGroup` has no effect on NFS
+`fsGroup` works by having the **kubelet** chown the volume on mount. The kubelet **skips that chown entirely for in-tree `nfs:` volumes** (and many NFS-backed CSI drivers) — so `fsGroup` is silently a **no-op on NFS**, not just on root-squashed exports. Two consequences:
 
-    - A kopia **cache** on an NFS StorageClass stays `root:root` and the mover gets `permission denied`. A content-addressed scratch cache has no business on networked storage anyway — leave `moverDefaults.cache` unset (the default is a node-local `emptyDir`, always writable) or point `cache.storageClass` at a block class (e.g. Ceph RBD) that honors `fsGroup`.
-    - An **inline-NFS filesystem repository** can't be made writable with `fsGroup`. Use `supplementalGroups` against a group-writable export, `runAsUser` matching the export owner, or remap server-side — see [NFS filesystem repositories](#nfs-filesystem-repositories) below. The admission webhook **warns** when an NFS filesystem repo relies only on `fsGroup`.
+- A kopia **cache** on an NFS StorageClass stays `root:root` and the mover gets `permission denied`. A content-addressed scratch cache has no business on networked storage anyway — leave `moverDefaults.cache` unset (the default is a node-local `emptyDir`, always writable) or point `cache.storageClass` at a block class (e.g. Ceph RBD) that honors `fsGroup`.
+- An **inline-NFS filesystem repository** can't be made writable with `fsGroup`. Use `supplementalGroups` against a group-writable export, `runAsUser` matching the export owner, or remap server-side — see [NFS filesystem repositories](#nfs-filesystem-repositories) below. The admission webhook **warns** when an NFS filesystem repo relies only on `fsGroup`.
+///
 
 ## How to decide what to set
 
@@ -153,6 +154,7 @@ Two constraints to remember:
 
 - **Mutually exclusive with both `securityContext` and `podSecurityContext`.** Because inherit copies both levels, combining it with either explicit context is rejected by the admission webhook.
 - **Inheriting a *root* workload is still elevated.** The *resolved* contexts are what's evaluated — container **and** pod — so inheriting from a pod that runs as root (or with `runAsUser: 0` at either level, or added capabilities) trips the [privileged-mover gate](#privileged-and-root-movers) exactly like an explicit root context would.
+- **Inheriting root just works — you don't hand-set `runAsNonRoot`.** When the workload runs as `runAsUser: 0`, Kopiur produces a *valid* root mover for you (it reconciles `runAsNonRoot` to `false`, since `runAsNonRoot: true` + `runAsUser: 0` is a contradiction the kubelet rejects with `CreateContainerConfigError`). So you only opt the namespace into [privileged movers](#privileged-and-root-movers); you never need to add `runAsNonRoot: false` to an `inheritSecurityContextFrom` recipe.
 
 Full, apply-ready example (SnapshotPolicy + the same knob on a `Restore`):
 
@@ -270,9 +272,10 @@ Full, apply-ready example:
 --8<-- "deploy/examples/backends/nfs-shared-group.yaml"
 ```
 
-!!! note "Alternatives"
-    - **`runAsUser`** matching the export owner also works (it changes the actual process UID, unlike `fsGroup`) — but if the source PVC is owned by a *different* UID, the mover then can't read it, which is why the shared-group split is usually better.
-    - **Server-side remap** (TrueNAS **Mapall User/Group**, or `all_squash`/`anonuid` on a Linux exporter) makes *every* client write land as one identity on the server, regardless of the pod's UID. Zero pod-side config; the admission warning is then a false positive you can ignore.
+/// note | Alternatives
+- **`runAsUser`** matching the export owner also works (it changes the actual process UID, unlike `fsGroup`) — but if the source PVC is owned by a *different* UID, the mover then can't read it, which is why the shared-group split is usually better.
+- **Server-side remap** (TrueNAS **Mapall User/Group**, or `all_squash`/`anonuid` on a Linux exporter) makes *every* client write land as one identity on the server, regardless of the pod's UID. Zero pod-side config; the admission warning is then a false positive you can ignore.
+///
 
 ### Restricted namespaces (Pod Security Admission)
 

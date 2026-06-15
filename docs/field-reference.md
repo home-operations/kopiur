@@ -151,7 +151,7 @@ the whole `spec` is empty.
 | --- | --- | --- | --- |
 | `policyRef` | [PolicyRef](#policyref) | — (absent for discovered) | The recipe to run. |
 | `tags` | map | — | Arbitrary kopia snapshot tags. |
-| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h) | Mover Job retry/deadline. Unset fields use the built-in defaults; the 48h `activeDeadlineSeconds` backstop guarantees a Job can never linger `Active` indefinitely. |
+| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?,`podStartupDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h), `podStartupDeadlineSeconds` 300 (5m) | Mover Job retry/deadline. `activeDeadlineSeconds` caps a *running* mover (48h backstop so it can't linger `Active`); `podStartupDeadlineSeconds` fails a mover that can't **start** (`CreateContainerConfigError`/`ImagePullBackOff`/`Unschedulable`) so it can't hang — see [Backups → failurePolicy](backups.md#failurepolicy--retry--deadline-for-the-mover-job). All must be positive (`backoffLimit` ≥ 0). |
 | `deletionPolicy` | enum(`Delete`\|`Retain`\|`Orphan`) | `Delete` (scheduled/manual), forced `Retain` (discovered) | What happens to the snapshot when this CR is deleted. §4.5 |
 | `pin` | bool | `false` | Exempt this snapshot from GFS retention. §13(c) |
 
@@ -222,7 +222,7 @@ CRD validation).
 | `policy` | {`onMissingSnapshot`?,`waitTimeout`?} | `Fail`/`Continue` by source | Missing-snapshot handling. |
 | `credentialProjection.enabled` | bool | `false` | Project the repo Secret into the mover namespace. |
 | `mover` | [MoverSpec](#moverspec) | — | Same surface a backup gets. |
-| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h) | Mover Job retry/deadline. Unset fields use the built-in defaults. |
+| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?,`podStartupDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h), `podStartupDeadlineSeconds` 300 (5m) | Mover Job retry/deadline. Unset fields use the built-in defaults. |
 
 ### `status`
 
@@ -257,7 +257,7 @@ Usually default-managed via the repository's `spec.maintenance` — see
 | `schedule.timezone` | string | — | IANA tz for both crons. |
 | `ownership` | {`owner`,`takeoverPolicy`} | `takeoverPolicy`=`Never` | Lease holder + takeover (`Never`/`PromptCondition`/`Force`). |
 | `mover` | [MoverSpec](#moverspec) | — | Object-store repos typically tune this. |
-| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h) | Failed-run handling. Unset fields use the built-in defaults. |
+| `failurePolicy` | {`backoffLimit`?,`activeDeadlineSeconds`?,`podStartupDeadlineSeconds`?} | `backoffLimit` 2, `activeDeadlineSeconds` 172800 (48h), `podStartupDeadlineSeconds` 300 (5m) | Failed-run handling. Unset fields use the built-in defaults. |
 | `credentialProjection.enabled` | bool | `false` | Project the repo Secret for the maintenance mover. |
 
 ### `status`

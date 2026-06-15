@@ -112,6 +112,37 @@ same `logTail`/`failure` fields appear on a failed `Restore`.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
 
+## Backup (or Restore) `Failed` with `MoverPodWedged` — the pod couldn't start
+
+The mover **Job** was created but its **pod never reached `Running`** — it sat in `CreateContainerConfigError`, `ImagePullBackOff`, or `Unschedulable`. A pod in those states never reaches a terminal phase, so `failurePolicy.backoffLimit` never trips. Kopiur watches for this and, after [`failurePolicy.podStartupDeadlineSeconds`](backups.md#failurepolicy--retry--deadline-for-the-mover-job) (default **5 minutes**), fails the run with reason `MoverPodWedged` and an actionable message, then deletes the wedged Job so it stops retrying:
+
+```console
+$ kubectl get snapshot <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}{"\n"}{.status.conditions[?(@.type=="Ready")].message}'
+MoverPodWedged
+the backup mover pod has been stuck (CreateContainerConfigError) for over 300s and cannot start: …
+```
+
+The message names the underlying reason. The usual causes and fixes:
+
+| Pod reason | Cause | Fix |
+| --- | --- | --- |
+| `CreateContainerConfigError` (*"container's runAsUser breaks non-root policy"*) | A securityContext that asks for **root** (`runAsUser: 0`) while also `runAsNonRoot: true`. Kopiur normalizes this for *resolved* contexts, so you'll only see it from a hand-written contradiction. | Don't pair `runAsUser: 0` with `runAsNonRoot: true`. For a root mover use `runAsUser: 0` + `runAsNonRoot: false` (and opt the namespace in — below). See [Security context](security-context.md#privileged-and-root-movers). |
+| `ImagePullBackOff` / `ErrImagePull` / `InvalidImageName` | The mover image can't be pulled (wrong registry, missing pull secret, air-gapped node). | Fix the image/pull secret; on a slow first pull, raise `podStartupDeadlineSeconds`. |
+| `Unschedulable` | No node satisfies the pod — a bad `moverDefaults.nodeSelector`/affinity, or an RWO volume still attached elsewhere (see the [Multi-Attach](#mover-pod-stuck-with-multi-attach-error-rwo-pvc) section below). | Fix the placement constraint; if a contended RWO volume just needs time to detach, raise `podStartupDeadlineSeconds`. |
+
+/// tip | Backing up root-owned data is the common trigger
+Apps like Synapse, MSSQL, or anything writing files as **root** need a **root mover** to read them. That's an *elevated* context, so two things must both be true: the namespace is opted into privileged movers (`kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`), **and** the mover resolves to root — either set `runAsUser: 0` + `runAsNonRoot: false` explicitly, or use [`inheritSecurityContextFrom`](security-context.md#2-inherit-it-from-the-workload) pointed at the root workload (Kopiur then produces a valid root context for you — you do **not** also set `runAsNonRoot`). Without the opt-in you get `MoverPermitted=False` (above), not a wedge.
+///
+
+If a mover legitimately needs **longer than 5 minutes just to start** (huge image pull, slow RWO detach), raise the window rather than letting it fail:
+
+```yaml
+spec:
+  failurePolicy:
+    podStartupDeadlineSeconds: 900 # tolerate up to 15m to start
+```
+
 ## Mover pod stuck with `Multi-Attach error` (RWO PVC)
 
 The mover **Job** exists but its **pod** never starts; `kubectl describe pod` shows:

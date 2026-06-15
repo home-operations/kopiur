@@ -28,4 +28,6 @@ spec:
   # Optional per-run failure controls passed through to the mover Job (G6):
   failurePolicy:
     backoffLimit: 2
-    activeDeadlineSeconds: 7200
+    activeDeadlineSeconds: 7200 # hard wall-clock cap on a RUNNING mover (default: 48h backstop)
+    podStartupDeadlineSeconds: 300 # fail fast if the mover can't START Running within 5m
+    # (CreateContainerConfigError / ImagePullBackOff / Unschedulable) instead of hanging. Default 300.

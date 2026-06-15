@@ -101,10 +101,14 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
         None
     };
 
-    let failure_policy = if args.backoff_limit.is_some() || args.active_deadline_seconds.is_some() {
+    let failure_policy = if args.backoff_limit.is_some()
+        || args.active_deadline_seconds.is_some()
+        || args.pod_startup_deadline_seconds.is_some()
+    {
         Some(FailurePolicy {
             backoff_limit: args.backoff_limit,
             active_deadline_seconds: args.active_deadline_seconds,
+            pod_startup_deadline_seconds: args.pod_startup_deadline_seconds,
         })
     } else {
         None

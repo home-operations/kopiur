@@ -21,6 +21,7 @@ pub mod creds;
 pub mod duration;
 pub mod error;
 pub mod identity;
+pub mod invariants;
 pub mod jitter;
 pub mod retention;
 pub mod success_expr;

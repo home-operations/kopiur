@@ -17,7 +17,8 @@
 use crate::backend::{Backend, NfsVolume, RepoVolume};
 use crate::cluster_repository::{AllowedNamespaces, ClusterRepositorySpec};
 use crate::common::{
-    DeletionPolicy, MoverDefaults, MoverSpec, RepositoryKind, RepositoryMode, RepositoryRef,
+    DeletionPolicy, FailurePolicy, MoverDefaults, MoverSpec, RepositoryKind, RepositoryMode,
+    RepositoryRef, Retention,
 };
 use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
@@ -28,6 +29,8 @@ use crate::server::{ServerAuth, ServerSpec};
 use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{Hook, SnapshotPolicySpec, Source};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
+use k8s_openapi::api::core::v1::ResourceRequirements;
+use kube_quantity::ParsedQuantity;
 use std::collections::BTreeMap;
 
 /// A `RepositoryRef` is well-formed: a `ClusterRepository` reference is by name
@@ -332,7 +335,104 @@ pub fn validate_mover(mover: &MoverSpec, context: &str) -> ValidationResult {
             });
         }
     }
+    if let Some(resources) = &mover.resources {
+        validate_resources(resources, context)?;
+    }
     Ok(())
+}
+
+/// The first resource key whose `requests` value exceeds its `limits` value (both present
+/// and parseable), as `(key, request, limit)`. Quantity comparison uses `kube_quantity`'s
+/// `ParsedQuantity` (the same `k8s-openapi` `Quantity` type the cluster uses), so
+/// `"1Gi" > "512Mi"` is compared correctly across binary/SI/milli suffixes. **Best-effort:**
+/// a key whose quantity fails to parse is skipped, never a false rejection.
+fn requests_exceeding_limits(resources: &ResourceRequirements) -> Option<(String, String, String)> {
+    let (Some(requests), Some(limits)) = (resources.requests.as_ref(), resources.limits.as_ref())
+    else {
+        return None;
+    };
+    for (key, req) in requests {
+        let Some(lim) = limits.get(key) else { continue };
+        let (Ok(req_p), Ok(lim_p)) = (ParsedQuantity::try_from(req), ParsedQuantity::try_from(lim))
+        else {
+            continue;
+        };
+        if req_p > lim_p {
+            return Some((key.clone(), req.0.clone(), lim.0.clone()));
+        }
+    }
+    None
+}
+
+/// Validate that a `ResourceRequirements` has no `requests > limits` for any key. A pod with
+/// `requests > limits` is **rejected by the API server**, so the mover Job never creates a
+/// pod and the run hangs — the same silent-wedge class as an impossible securityContext.
+/// `context` names the owner (e.g. `"SnapshotPolicy mover"`).
+pub fn validate_resources(resources: &ResourceRequirements, context: &str) -> ValidationResult {
+    if let Some((key, req, lim)) = requests_exceeding_limits(resources) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} resources.requests.{key}"),
+            reason: format!(
+                "request `{req}` exceeds limit `{lim}`; the API server rejects a pod whose \
+                 requests exceed its limits, so the mover Job would never create a pod (it hangs \
+                 instead of failing). Lower the request or raise the limit."
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a [`FailurePolicy`]'s numeric fields are sane: `activeDeadlineSeconds` and
+/// `podStartupDeadlineSeconds` must be positive (the kubelet rejects a non-positive Job
+/// deadline, and a non-positive grace would fail every pod on its first reconcile);
+/// `backoffLimit` must be non-negative. `context` names the owner (e.g. `"Snapshot"`).
+pub fn validate_failure_policy(fp: &FailurePolicy, context: &str) -> ValidationResult {
+    if let Some(d) = fp.active_deadline_seconds
+        && d <= 0
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} failurePolicy.activeDeadlineSeconds"),
+            reason: format!("must be a positive number of seconds (got {d})"),
+        });
+    }
+    if let Some(g) = fp.pod_startup_deadline_seconds
+        && g <= 0
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} failurePolicy.podStartupDeadlineSeconds"),
+            reason: format!(
+                "must be a positive number of seconds (got {g}); it bounds how long a \
+                 non-starting mover pod is tolerated before the run fails"
+            ),
+        });
+    }
+    if let Some(b) = fp.backoff_limit
+        && b < 0
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} failurePolicy.backoffLimit"),
+            reason: format!("must be >= 0 (got {b})"),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a [`Retention`] selects **no** snapshots — every bucket unset or `0`. The
+/// controller only prunes when `spec.retention` is `Some` ([`crate::retention::select_kept`]
+/// over the buckets), so a `Some(keeps-nothing)` retention prunes *every* `Snapshot`
+/// immediately: silent data loss. (`retention: None` is the safe "don't prune" case and is
+/// NOT flagged.)
+fn retention_keeps_nothing(r: &Retention) -> bool {
+    [
+        r.keep_latest,
+        r.keep_hourly,
+        r.keep_daily,
+        r.keep_weekly,
+        r.keep_monthly,
+        r.keep_annual,
+    ]
+    .into_iter()
+    .all(|bucket| bucket.unwrap_or(0) == 0)
 }
 
 /// A `Repository` spec does not carry kopia-side (repo-level) retention policy,
@@ -613,6 +713,20 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(e);
     }
+    // Data-loss guard: a retention that selects no snapshots prunes EVERY Snapshot the
+    // moment it runs. `retention: None` means "don't prune" (safe) and is not flagged;
+    // only an explicit but empty/all-zero retention is the trap.
+    if let Some(r) = &spec.retention
+        && retention_keeps_nothing(r)
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.retention".to_string(),
+            reason: "keeps no snapshots — every keep* bucket is unset or 0, so GFS retention \
+                     would prune every Snapshot immediately (data loss). Set at least one bucket \
+                     (e.g. keepLatest: 1), or omit spec.retention entirely to disable pruning."
+                .to_string(),
+        });
+    }
     // Verification (ADR-0005 §4): override schedules must parse, and the optional
     // `successExpr` (ADR-0005 §15) must compile + trial-evaluate to a bool with no
     // out-of-scope variable — rejected at admission rather than at first verify run.
@@ -719,6 +833,11 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Origin) -> Vec<ValidationErr
     if let Err(e) = validate_backup_deletion_policy(origin, spec.deletion_policy) {
         errs.push(e);
     }
+    if let Some(fp) = &spec.failure_policy
+        && let Err(e) = validate_failure_policy(fp, "Snapshot")
+    {
+        errs.push(e);
+    }
     errs
 }
 
@@ -766,6 +885,12 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, false));
     }
+    if let Some(md) = &spec.mover_defaults
+        && let Some(res) = &md.resources
+        && let Err(e) = validate_resources(res, "Repository moverDefaults")
+    {
+        errs.push(e);
+    }
     if let Some(server) = &spec.server {
         errs.extend(validate_server(server, spec.mode));
     }
@@ -804,6 +929,11 @@ pub fn validate_server(server: &ServerSpec, mode: RepositoryMode) -> Vec<Validat
                      repository's spec.mode: ReadWrite"
                 .to_string(),
         });
+    }
+    if let Some(res) = &server.resources
+        && let Err(e) = validate_resources(res, "server")
+    {
+        errs.push(e);
     }
     errs
 }
@@ -1195,6 +1325,11 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     {
         errs.push(e);
     }
+    if let Some(fp) = &spec.failure_policy
+        && let Err(e) = validate_failure_policy(fp, "Maintenance")
+    {
+        errs.push(e);
+    }
     errs
 }
 
@@ -1232,6 +1367,12 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, true));
     }
+    if let Some(md) = &spec.mover_defaults
+        && let Some(res) = &md.resources
+        && let Err(e) = validate_resources(res, "ClusterRepository moverDefaults")
+    {
+        errs.push(e);
+    }
     if let Some(server) = &spec.server {
         if server.namespace.trim().is_empty() {
             errs.push(ValidationError::ServerNamespaceRequired);
@@ -1251,6 +1392,16 @@ pub fn validate_restore_spec(spec: &RestoreSpec) -> Vec<ValidationError> {
         errs.push(e);
     }
     if let Err(e) = validate_restore(spec) {
+        errs.push(e);
+    }
+    if let Some(m) = &spec.mover
+        && let Err(e) = validate_mover(m, "Restore mover")
+    {
+        errs.push(e);
+    }
+    if let Some(fp) = &spec.failure_policy
+        && let Err(e) = validate_failure_policy(fp, "Restore")
+    {
         errs.push(e);
     }
     errs
@@ -3362,5 +3513,163 @@ server:
         );
         let errs = validate_cluster_repository(&spec);
         assert!(errs.contains(&ValidationError::ServerNamespaceRequired));
+    }
+
+    // --- resource requests <= limits (kube_quantity comparison) ---
+
+    mod resource_invariants {
+        use super::*;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        fn resources(reqs: &[(&str, &str)], lims: &[(&str, &str)]) -> ResourceRequirements {
+            let map = |kv: &[(&str, &str)]| {
+                let m: BTreeMap<String, Quantity> = kv
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), Quantity(v.to_string())))
+                    .collect();
+                if m.is_empty() { None } else { Some(m) }
+            };
+            ResourceRequirements {
+                requests: map(reqs),
+                limits: map(lims),
+                claims: None,
+            }
+        }
+
+        #[test]
+        fn request_exceeding_limit_is_rejected_across_units() {
+            // 1Gi request vs 512Mi limit — the comparison must span binary suffixes.
+            let r = resources(&[("memory", "1Gi")], &[("memory", "512Mi")]);
+            let err = validate_resources(&r, "SnapshotPolicy mover").unwrap_err();
+            match err {
+                ValidationError::InvalidFieldValue { field, reason } => {
+                    assert!(field.contains("resources.requests.memory"), "{field}");
+                    assert!(reason.contains("exceeds limit"), "{reason}");
+                }
+                other => panic!("expected InvalidFieldValue, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn cpu_millicpu_vs_whole_is_compared_correctly() {
+            // 2 (cores) request vs 500m limit → request exceeds.
+            assert!(
+                validate_resources(&resources(&[("cpu", "2")], &[("cpu", "500m")]), "m").is_err()
+            );
+            // 250m request vs 1 limit → fine.
+            assert!(
+                validate_resources(&resources(&[("cpu", "250m")], &[("cpu", "1")]), "m").is_ok()
+            );
+        }
+
+        #[test]
+        fn request_within_limit_is_ok() {
+            let r = resources(&[("memory", "256Mi")], &[("memory", "512Mi")]);
+            assert!(validate_resources(&r, "m").is_ok());
+        }
+
+        #[test]
+        fn missing_limit_for_a_request_is_not_flagged() {
+            // requests without a matching limit is valid (the limit is "unbounded").
+            let r = resources(&[("memory", "1Gi")], &[("cpu", "1")]);
+            assert!(validate_resources(&r, "m").is_ok());
+        }
+
+        #[test]
+        fn unparseable_quantity_is_skipped_never_a_false_reject() {
+            // Best-effort: a garbage quantity must not cause a (wrong) rejection.
+            let r = resources(&[("memory", "not-a-quantity")], &[("memory", "512Mi")]);
+            assert!(validate_resources(&r, "m").is_ok());
+        }
+    }
+
+    // --- failurePolicy positivity ---
+
+    #[test]
+    fn failure_policy_rejects_non_positive_and_negative_fields() {
+        let bad_deadline = FailurePolicy {
+            active_deadline_seconds: Some(0),
+            ..Default::default()
+        };
+        assert!(validate_failure_policy(&bad_deadline, "Snapshot").is_err());
+
+        let bad_grace = FailurePolicy {
+            pod_startup_deadline_seconds: Some(-5),
+            ..Default::default()
+        };
+        assert!(validate_failure_policy(&bad_grace, "Snapshot").is_err());
+
+        let bad_backoff = FailurePolicy {
+            backoff_limit: Some(-1),
+            ..Default::default()
+        };
+        assert!(validate_failure_policy(&bad_backoff, "Snapshot").is_err());
+
+        let good = FailurePolicy {
+            backoff_limit: Some(2),
+            active_deadline_seconds: Some(7200),
+            pod_startup_deadline_seconds: Some(300),
+        };
+        assert!(validate_failure_policy(&good, "Snapshot").is_ok());
+        // backoffLimit: 0 (no retries) is valid.
+        assert!(
+            validate_failure_policy(
+                &FailurePolicy {
+                    backoff_limit: Some(0),
+                    ..Default::default()
+                },
+                "Snapshot"
+            )
+            .is_ok()
+        );
+    }
+
+    // --- retention keeps-nothing data-loss guard ---
+
+    #[test]
+    fn retention_keeps_nothing_detects_empty_and_all_zero() {
+        assert!(retention_keeps_nothing(&Retention::default()));
+        assert!(retention_keeps_nothing(&Retention {
+            keep_latest: Some(0),
+            keep_daily: Some(0),
+            ..Default::default()
+        }));
+        assert!(!retention_keeps_nothing(&Retention {
+            keep_latest: Some(1),
+            ..Default::default()
+        }));
+        assert!(!retention_keeps_nothing(&Retention {
+            keep_daily: Some(7),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn backup_config_rejects_keeps_nothing_retention_but_not_absent() {
+        // Some(empty retention) → rejected (would prune everything).
+        let mut spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             retention: {}\n",
+        );
+        let errs = validate_backup_config(&spec);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. } if field == "spec.retention"
+            )),
+            "an empty retention must be rejected as data-loss: {errs:?}"
+        );
+
+        // retention: None → NOT flagged (means "don't prune").
+        spec.retention = None;
+        let errs = validate_backup_config(&spec);
+        assert!(
+            !errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. } if field == "spec.retention"
+            )),
+            "absent retention is the safe no-prune case and must not be flagged: {errs:?}"
+        );
     }
 }

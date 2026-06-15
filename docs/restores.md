@@ -166,14 +166,15 @@ spec:
         cache: { capacity: 16Gi, mode: Persistent, contentCacheSizeMb: 10000 }
     failurePolicy:
         backoffLimit: 4
-        activeDeadlineSeconds: 7200
+        activeDeadlineSeconds: 7200 # cap a RUNNING restore (default 48h backstop)
+        podStartupDeadlineSeconds: 300 # fail a restore mover that can't START in 5m (default 300)
 ```
 
 - **`mover.securityContext`** — run the restore mover (its **container**) as the UID/GID that should own the restored files. Without it the mover runs as the hardened default (UID 65532), which may write files the app can't read. This is the fix for "the restore mover had no UID control".
 - **`mover.podSecurityContext.fsGroup`** — a **pod**-level `fsGroup` that makes a freshly-provisioned target volume group-writable, so an **unprivileged** `runAsUser: 1000` mover can populate it on restore (instead of needing a root mover just to write the new volume). The headline case for restoring into a brand-new PVC as non-root. See [Security context → fsGroup](security-context.md).
 - **`mover.inheritSecurityContextFrom`** — instead of hard-coding them, copy **both** the container `securityContext` **and** the pod-level `securityContext` (so the restore mover gets the app's UID *and* its `fsGroup`) from a live workload pod (by label selector). Mutually exclusive with both `securityContext` and `podSecurityContext` (combining is webhook-rejected). See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload) and [example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload).
 - **`mover.cache`** — size the kopia cache for a large restore. `mode: Ephemeral` (default) gives a fresh per-run volume sized by `capacity` (or an `emptyDir` when unset); `mode: Persistent` keeps a controller-owned cache PVC and reuses it across runs for a warm cache. `contentCacheSizeMb` / `metadataCacheSizeMb` pass kopia's `--content/metadata-cache-size-mb` budgets. A repository's `moverDefaults.cache` are inherited and overlaid by `mover.cache`.
-- **`failurePolicy`** — the restore Job's `backoffLimit` and `activeDeadlineSeconds`. Absent uses the defaults (2 retries, a 48h `activeDeadlineSeconds` backstop so a stuck Job can't linger `Active` forever).
+- **`failurePolicy`** — the restore Job's `backoffLimit`, `activeDeadlineSeconds`, and `podStartupDeadlineSeconds`. Absent uses the defaults (2 retries; a 48h `activeDeadlineSeconds` backstop so a *running* Job can't linger forever; a 5-minute `podStartupDeadlineSeconds` so a restore mover that can't **start** — bad image, unschedulable, impossible `securityContext` — fails fast with `MoverPodWedged` instead of hanging). The two deadlines are explained in [Backups → `failurePolicy`](backups.md#failurepolicy--retry--deadline-for-the-mover-job).
 
 /// warning | An elevated restore mover needs the namespace to opt in
 

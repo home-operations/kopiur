@@ -435,7 +435,22 @@ pub struct FailurePolicy {
     /// after which a still-running run is killed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_deadline_seconds: Option<i64>,
+    /// How long (seconds) a mover **pod** may sit in a non-starting state — a container
+    /// `CreateContainerConfigError` / `ImagePullBackOff` / `InvalidImageName`, or
+    /// `Unschedulable` — before the controller fails the run with an actionable reason,
+    /// rather than waiting out `active_deadline_seconds` (which can be many hours and
+    /// is meant for *long-running*, not *wedged*, work). A wedged pod never reaches a
+    /// terminal phase, so `backoffLimit` never trips — this is the only thing that bounds
+    /// it. Unset uses the built-in [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_startup_deadline_seconds: Option<i64>,
 }
+
+/// Default grace before a non-starting (wedged) mover pod fails its run — 5 minutes.
+/// Long enough to absorb a slow image pull or a brief `Unschedulable` while an RWO volume
+/// detaches from another node, short enough that a genuinely-broken pod (e.g. an impossible
+/// securityContext, a missing image) surfaces as `Failed` fast instead of hanging for hours.
+pub const DEFAULT_POD_STARTUP_DEADLINE_SECONDS: i64 = 300;
 
 /// Per-recipe mover overrides (resources, cache, security context). ADR §3.3.
 ///
@@ -977,6 +992,16 @@ pub fn resolve_mover(
         Some(r) => merge_pod_security_context(&psc_base, r),
         None => psc_base,
     });
+    // Normalize the merged result against every kubelet/apiserver security-context invariant
+    // (see `crate::invariants`) so a contradiction the field-wise merge can assemble — most
+    // importantly an inherited-root `runAsUser: 0` left under the hardened `runAsNonRoot:
+    // true` — becomes a VALID (privileged-gated) mover rather than a pod wedged forever in
+    // `CreateContainerConfigError`.
+    let (security_context, pod_security_context) =
+        crate::invariants::enforce_security_context_invariants(
+            security_context,
+            pod_security_context,
+        );
     ResolvedMover {
         security_context,
         pod_security_context,
@@ -1596,6 +1621,77 @@ mod tests {
         let caps = m.security_context.capabilities.unwrap();
         assert_eq!(caps.add.unwrap(), vec!["NET_BIND_SERVICE"]);
         assert_eq!(caps.drop.unwrap(), vec!["ALL"]); // hardened drop survives
+    }
+
+    #[test]
+    fn inherited_root_uid_clears_hardened_run_as_non_root() {
+        // The production wedge: inheritSecurityContextFrom copies `runAsUser: 0` off a
+        // root workload (matrix/synapse, mssql). Merged under the hardened base it would
+        // be `{ runAsNonRoot: true, runAsUser: 0 }` — which the kubelet rejects, parking
+        // the pod in CreateContainerConfigError forever. resolve_mover must normalize it
+        // to a VALID root context so the mover can run (gated by the privileged check).
+        let inherited = SecurityContext {
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            ..Default::default()
+        };
+        let m = resolve_mover(None, Some(&inherited), None, None, None, None);
+        let sc = m.security_context;
+        assert_eq!(sc.run_as_user, Some(0), "inherited root UID preserved");
+        assert_eq!(
+            sc.run_as_non_root,
+            Some(false),
+            "the contradictory runAsNonRoot:true MUST be cleared for a root UID"
+        );
+        // The hardened tightening is still intact — this is a *valid* root mover, not a
+        // de-hardened one.
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.capabilities.unwrap().drop.unwrap(), vec!["ALL"]);
+        // And it is still recognized as elevated → the privileged-mover gate applies.
+        assert!(super::security_context_is_elevated(&SecurityContext {
+            run_as_user: Some(0),
+            run_as_non_root: Some(false),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn pod_level_root_uid_clears_container_run_as_non_root() {
+        // The cross-level case: the inherited *pod* context sets `runAsUser: 0` while the
+        // container keeps the hardened `runAsNonRoot: true`. The kubelet's effective UID
+        // is `container.runAsUser ?? pod.runAsUser`, so this is the same contradiction —
+        // normalization must clear runAsNonRoot at the container level too.
+        let inherited_psc = PodSecurityContext {
+            run_as_user: Some(0),
+            ..Default::default()
+        };
+        let m = resolve_mover(None, None, Some(&inherited_psc), None, None, None);
+        assert_eq!(
+            m.security_context.run_as_non_root,
+            Some(false),
+            "pod-level root UID must clear the container's hardened runAsNonRoot:true"
+        );
+        let psc = m.pod_security_context.unwrap();
+        assert_eq!(psc.run_as_user, Some(0));
+        // The hardened pod context never set runAsNonRoot, so there is no contradiction to
+        // clear at the pod level — it stays unset (valid: the kubelet permits runAsUser:0
+        // when runAsNonRoot is not true). What matters is it is never left `Some(true)`.
+        assert_ne!(psc.run_as_non_root, Some(true));
+    }
+
+    #[test]
+    fn nonroot_inherited_uid_keeps_run_as_non_root_true() {
+        // The common, non-root inherit (e.g. runAsUser: 2000) is untouched: runAsNonRoot
+        // stays true and the contexts remain mutually consistent — no over-normalization.
+        let inherited = SecurityContext {
+            run_as_user: Some(2000),
+            run_as_group: Some(2000),
+            run_as_non_root: Some(true),
+            ..Default::default()
+        };
+        let m = resolve_mover(None, Some(&inherited), None, None, None, None);
+        assert_eq!(m.security_context.run_as_user, Some(2000));
+        assert_eq!(m.security_context.run_as_non_root, Some(true));
     }
 
     #[test]
