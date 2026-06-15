@@ -206,21 +206,32 @@ env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -u
 CLUSTER=kopiur-e2e
+NODE="${CLUSTER}-control-plane"
+# Force-unmount NFS INSIDE the node BEFORE deleting it. Root cause of past unkillable
+# nodes (proven via the kernel stack): the e2e in-cluster NFS server (Ganesha) is killed
+# by `kind delete` while the node still holds an NFSv4 mount to it. The kernel's unmount
+# then fires a synchronous DESTROY_CLIENTID RPC to the now-dead server; on a hard mount
+# that blocks forever in uninterruptible D-state, so the node container can never be reaped
+# ("could not kill container: did not receive an exit event"). Lazy+force-unmounting while
+# the node (and the server) are still alive detaches those mounts so the node's death never
+# hits the blocking unmount path. Best-effort; a no-op when there are no NFS mounts.
+if docker inspect "$NODE" >/dev/null 2>&1; then
+  docker exec "$NODE" sh -c 'umount -f -l -a -t nfs4 2>/dev/null; umount -f -l -a -t nfs 2>/dev/null' >/dev/null 2>&1 || true
+fi
 echo "==> deleting kind cluster '$CLUSTER' (kubeconfig: $KUBECONFIG)"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-# `kind delete` can't reap a wedged node container (a stuck containerd shim →
-# "did not receive an exit event"), which would otherwise persist into the next run and
-# poison cluster-create. Force-remove the node container(s) directly by kind's cluster
-# label so teardown ALWAYS leaves a clean slate, pass or fail. A retry covers the daemon
-# briefly lagging on the exit event; if it still can't be removed the daemon is wedged —
-# say so loudly with the only real fix.
+# Fallback: force-remove the node container(s) by kind's cluster label if `kind delete`
+# left them, so teardown leaves a clean slate, pass or fail. A retry covers the daemon
+# briefly lagging on the exit event.
 leftover=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER" 2>/dev/null || true)
 if [ -n "$leftover" ]; then
   echo "==> force-removing leftover kind node container(s) for '$CLUSTER'"
   docker rm -f $leftover >/dev/null 2>&1 || { sleep 3; docker rm -f $leftover >/dev/null 2>&1 || true; }
 fi
+# If a node STILL can't be removed, a process is wedged unmounting NFS from the dead
+# in-cluster server (see above) — it clears when the RPC gives up or after a Docker restart.
 if docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER" 2>/dev/null | grep -q .; then
-  echo "==> WARNING: kind node container for '$CLUSTER' could not be removed; the Docker daemon is wedged — restart Docker to clear it" >&2
+  echo "==> WARNING: kind node for '$CLUSTER' could not be removed — likely a process stuck unmounting NFS (dead in-cluster server). Restart Docker to clear it." >&2
 fi
 rm -f "$KUBECONFIG" || true
 """
