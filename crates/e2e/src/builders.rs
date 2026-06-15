@@ -362,6 +362,20 @@ pub fn nfs_deployment(ns: &str) -> Deployment {
                         "name": "nfs",
                         "image": consts::NFS_IMAGE,
                         "imagePullPolicy": "IfNotPresent",
+                        // Force NFSv4 NUMERIC owner handling. The image's entrypoint
+                        // (`/opt/start_nfs.sh`) hardcodes `NFSV4 { Graceless = …; }` with no
+                        // id-mapping options, so Ganesha tries to resolve owners as
+                        // `user@domain`; with no shared idmap domain, every container uid/gid
+                        // (0, the mover uid, the shared gid) maps to `nobody`/anon and the
+                        // server then honors ONLY the `others` permission bits — so a 0777
+                        // export works but the group-restricted `grouprepo` (and even a
+                        // mover-owned dir) is unwritable (`EROFS`/anon-squash), failing the
+                        // shared-group test. `Only_Numeric_Owners`/`Allow_Numeric_Owners` make
+                        // Ganesha pass the numeric ids straight through (AUTH_SYS already sends
+                        // them), so owner/group perms apply. We sed the single NFSV4 line and
+                        // exec the original entrypoint, keeping all its rpc/dbus/config setup.
+                        "command": ["/bin/bash", "-c"],
+                        "args": ["sed -i '/^NFSV4 {/ s/; }$/; Allow_Numeric_Owners = true; Only_Numeric_Owners = true; }/' /opt/start_nfs.sh && exec /opt/start_nfs.sh"],
                         // Userspace NFS-Ganesha: no kernel nfsd module, so no
                         // `privileged` — just the two capabilities the image needs to
                         // bind/mount in its own namespace (per its docs).
@@ -910,6 +924,21 @@ mod tests {
         assert!(
             v.pointer("/spec/template/spec/initContainers/0/command")
                 .is_some()
+        );
+        // Regression guard: the entrypoint wrapper MUST inject NFSv4 numeric-owner
+        // handling. Without it, Ganesha resolves owners as `user@domain`, every
+        // container uid/gid maps to anon, and only world-writable exports work — the
+        // group-restricted `grouprepo` is unwritable (`EROFS`) and the shared-group
+        // test fails. Verified end-to-end: `Only_Numeric_Owners` makes group writes work.
+        let args = c
+            .pointer("/args/0")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default();
+        assert!(
+            args.contains("Only_Numeric_Owners = true")
+                && args.contains("Allow_Numeric_Owners = true")
+                && args.contains("/opt/start_nfs.sh"),
+            "nfs server must inject numeric-owner NFSv4 config and exec the original entrypoint; got: {args}"
         );
     }
 
