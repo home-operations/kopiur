@@ -60,7 +60,6 @@ RUN set -eux; \
     install -m 0755 /tmp/rclone /usr/local/bin/rclone
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-LABEL org.opencontainers.image.source="https://github.com/home-operations/kopiur"
 COPY --from=builder /usr/local/bin/kopiur-mover /usr/local/bin/kopiur-mover
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone

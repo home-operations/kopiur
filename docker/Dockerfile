@@ -52,7 +52,6 @@ RUN set -eux; \
 
 # Distroless runtime: glibc + CA certs, non-root (uid 65532), no shell.
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-LABEL org.opencontainers.image.source="https://github.com/home-operations/kopiur"
 COPY --from=builder /usr/local/bin/app /usr/local/bin/app
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
 USER 65532:65532
