@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.7](https://github.com/home-operations/kopiur/compare/0.4.6...0.4.7) (2026-06-15)
+
+
+### Features
+
+* **mover:** add some tests for the podStartupDeadlineSeconds ([a7daba9](https://github.com/home-operations/kopiur/commit/a7daba99b55e25d757e99716445986cbbc6706a4))
+* **mover:** support and create podStartupDeadlineSeconds ([3b6b362](https://github.com/home-operations/kopiur/commit/3b6b362c7140228c50e44d3f78ff1348d412f1d5))
+* **restore:** implement target.populator volume-populator handshake ([#117](https://github.com/home-operations/kopiur/issues/117)) ([e7aba93](https://github.com/home-operations/kopiur/commit/e7aba939bb66bc0e252065bc4a6b058cc9dbcc6f))
+* **tests:** I love having to fix this NFS test ([27f1e2f](https://github.com/home-operations/kopiur/commit/27f1e2f2bb4decdff67f53c79c4897fde543e11b))
+* **tests:** maybe finally fix the NFS E2E tests? ([2be6717](https://github.com/home-operations/kopiur/commit/2be6717496dcca52ec3f543f7ac38c8f2435cfec))
+* **tests:** update e2e tests to also cleanup kind ([ba44e10](https://github.com/home-operations/kopiur/commit/ba44e10eadac31dfca620198f1f74389ee979a8e))
+
+
+### Bug Fixes
+
+* **dev:** update mise e2e commands ([458f688](https://github.com/home-operations/kopiur/commit/458f688246800e3602ee73a494000c8b78d5bac9))
+* **tests:** also cleanup tests ([3de8beb](https://github.com/home-operations/kopiur/commit/3de8beb3f042fc44b494a2224e165270a266fc33))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.6 manifest ([66e03e5](https://github.com/home-operations/kopiur/commit/66e03e5149ff782da5e1fd10b86ce25f6716f6d7))
+
 ## [0.4.6](https://github.com/home-operations/kopiur/compare/0.4.5...0.4.6) (2026-06-15)
 
 
