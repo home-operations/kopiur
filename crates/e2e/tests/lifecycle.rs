@@ -863,7 +863,8 @@ async fn mover_inherits_security_context_from_workload_pod() {
 /// `runAsUser: 0` — NOT the contradictory `runAsNonRoot: true` + `runAsUser: 0` that the
 /// kubelet rejects with "container's runAsUser breaks non-root policy", parking the pod in
 /// `CreateContainerConfigError` forever. Proves the fix end-to-end: the Job spec carries the
-/// normalized context AND the Snapshot actually reaches Succeeded (the pod started — no wedge).
+/// normalized context AND the kubelet starts the mover (the Snapshot reaches a terminal phase
+/// without wedging) — instead of parking it in `CreateContainerConfigError`.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
@@ -1000,10 +1001,42 @@ async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
         sc.run_as_non_root
     );
 
-    // The strongest proof it is not a wedge: the run actually completes.
-    wait_phase(&backups, "e2e-root-backup", "Succeeded")
+    // The regression this guards: the inherited-root context is ACCEPTED by the kubelet and
+    // the mover container STARTS, rather than being parked in `CreateContainerConfigError`
+    // (the `{runAsNonRoot:true, runAsUser:0}` wedge). Whether the backup then *succeeds*
+    // depends on repo/source file permissions — a uid-0 mover keeps the hardened
+    // `drop:[ALL]` (no `DAC_OVERRIDE`) and `fsGroup` is a no-op on the hostPath repo, so a
+    // root mover reading a 65532-owned filesystem repo is a separate concern other tests
+    // cover. So: the Snapshot must reach a TERMINAL phase and must NOT have wedged.
+    wait_until(
+        "root-inherit Snapshot reaches a terminal phase (started, not wedged)",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&backups, "e2e-root-backup").await;
+            let phase = s.get("phase").and_then(|p| p.as_str()).unwrap_or_default();
+            Ok(matches!(phase, "Succeeded" | "Failed").then_some(()))
+        },
+    )
+    .await
+    .expect("the inherited-root mover must run to a terminal phase, not hang");
+    let reason = status_json(&backups, "e2e-root-backup")
         .await
-        .expect("the root mover must start and the Snapshot must Succeed (no CreateContainerConfigError)");
+        .get("conditions")
+        .and_then(|c| c.as_array())
+        .and_then(|conds| {
+            conds
+                .iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
+        })
+        .and_then(|c| c.get("reason").and_then(|r| r.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    assert_ne!(
+        reason, "MoverPodWedged",
+        "the inherited-root mover must START (valid root context: runAsUser:0 + \
+         runAsNonRoot:false), never wedge in CreateContainerConfigError"
+    );
 
     // Cleanup; reset the namespace opt-in so it doesn't leak to other tests.
     let _ = repos
@@ -1028,7 +1061,7 @@ async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
 }
 
 /// Regression for Fix B: a mover pod stuck in a non-starting state (here `Unschedulable`
-/// via an impossible `moverDefaults.nodeSelector`) must fail the Snapshot FAST — within
+/// via an impossible CPU request on the recipe's mover) must fail the Snapshot FAST — within
 /// `failurePolicy.podStartupDeadlineSeconds` — with the `MoverPodWedged` reason, instead of
 /// hanging until the 48h `activeDeadlineSeconds` backstop while the kubelet hammers the API.
 /// Also asserts the wedged Job is reaped (no orphaned pod left behind).
@@ -1046,32 +1079,41 @@ async fn wedged_mover_pod_fails_fast_instead_of_hanging() {
         .expect("provision filesystem fixtures");
     let client = world.client().clone();
 
-    // A Repository whose movers carry an impossible nodeSelector → every mover pod is
-    // Unschedulable (a deterministic wedge the securityContext normalizer can't resolve).
+    // A normal Repository — its bootstrap mover MUST be able to schedule, so the wedge
+    // goes on the *recipe* (below), not moverDefaults (which would also poison bootstrap
+    // and the repo would never reach Ready).
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let mut repo = repository_json("e2e-wedge-repo");
-    repo["spec"]["moverDefaults"] =
-        serde_json::json!({ "nodeSelector": { "kopiur-e2e/nonexistent": "true" } });
     repos
-        .create(&PostParams::default(), &cr(repo))
+        .create(
+            &PostParams::default(),
+            &cr(repository_json("e2e-wedge-repo")),
+        )
         .await
-        .expect("create Repository with impossible mover nodeSelector");
+        .expect("create Repository");
     wait_phase(&repos, "e2e-wedge-repo", "Ready")
         .await
         .expect("Repository should reach Ready");
 
+    // The SnapshotPolicy's mover requests an impossible amount of CPU (10000 cores) → its
+    // pod is `Unschedulable` on every node. Requests-only (no matching limit) so it passes
+    // the requests<=limits validator; recipe-scoped so ONLY the snapshot mover wedges, not
+    // the repo bootstrap. A deterministic wedge the securityContext normalizer can't resolve.
     let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cfg = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "e2e-wedge-cfg", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "e2e-wedge-repo" },
+            "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            "retention": { "keepLatest": 5 },
+            "mover": { "resources": { "requests": { "cpu": "10000" } } }
+        }
+    });
     configs
-        .create(
-            &PostParams::default(),
-            &cr(backup_config_json(
-                "e2e-wedge-cfg",
-                "e2e-wedge-repo",
-                "e2e-src",
-            )),
-        )
+        .create(&PostParams::default(), &cr(cfg))
         .await
-        .expect("create SnapshotPolicy");
+        .expect("create SnapshotPolicy whose mover can never be scheduled");
 
     // A short grace so the test fails fast deterministically.
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
