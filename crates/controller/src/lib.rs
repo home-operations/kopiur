@@ -30,7 +30,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, PersistentVolumeClaim, Secret, Service, ServiceAccount,
+};
 use kube::core::PartialObjectMeta;
 use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
@@ -671,6 +673,16 @@ async fn spawn_all(client: Client, ctx: Arc<Context>) {
             {
                 let store = restore_store.clone();
                 move |r: ClusterRepository| watch::cluster_repository_to_restores(&store, &r)
+            },
+        )
+        // Volume-populator handshake (ADR-0005 §9): a PVC claiming a populator Restore
+        // re-enqueues it so the prime-PVC/rebind dance advances on the watch.
+        .watches(
+            Api::<PersistentVolumeClaim>::all(client.clone()),
+            cfg.clone(),
+            {
+                let store = restore_store.clone();
+                move |pvc: PersistentVolumeClaim| watch::pvc_to_restores(&store, &pvc)
             },
         )
         // Same privileged-mover opt-in delivery as the Snapshot controller.

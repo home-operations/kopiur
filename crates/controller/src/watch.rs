@@ -16,7 +16,9 @@
 //! non-matching event (most cluster `Secret`s) yields an empty set and triggers
 //! nothing.
 
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, PersistentVolumeClaim, Secret, ServiceAccount,
+};
 use kube::ResourceExt;
 use kube::core::PartialObjectMeta;
 use kube::runtime::reflector::{ObjectRef, Store};
@@ -287,6 +289,28 @@ pub fn cluster_repository_to_restores(
             .repository
             .as_ref()
             .is_some_and(|r| ref_targets_cluster(r, &name))
+    })
+}
+
+/// Populator `Restore`s claimed by the changed `PersistentVolumeClaim` via
+/// `spec.dataSourceRef`. The claim and the Restore it names share a namespace, so a
+/// change to the claim re-enqueues the Restore to advance the handshake (ADR-0005 §9).
+pub fn pvc_to_restores(
+    store: &Store<Restore>,
+    pvc: &PersistentVolumeClaim,
+) -> Vec<ObjectRef<Restore>> {
+    let (Some(pvc_ns), Some(dsr)) = (
+        pvc.namespace(),
+        pvc.spec.as_ref().and_then(|s| s.data_source_ref.as_ref()),
+    ) else {
+        return Vec::new();
+    };
+    if dsr.kind != "Restore" || dsr.api_group.as_deref() != Some("kopiur.home-operations.com") {
+        return Vec::new();
+    }
+    let target = dsr.name.clone();
+    select(store, |r: &Restore| {
+        r.namespace().as_deref() == Some(pvc_ns.as_str()) && r.name_any() == target
     })
 }
 
