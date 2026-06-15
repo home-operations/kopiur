@@ -54,5 +54,4 @@ RUN set -eux; \
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /usr/local/bin/app /usr/local/bin/app
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
-USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/app"]
