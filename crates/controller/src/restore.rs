@@ -6,8 +6,10 @@
 //!
 //! The source-mode dispatch is an **exhaustive `match`** over the externally
 //! tagged `RestoreSource` enum (no `_ =>`), and [`default_on_missing`] /
-//! [`populator_state`] are pure decisions, all unit-tested. The pvc-prime
-//! handshake IO is a documented minimal partial (see NOTE in the reconcile body).
+//! [`populator_state`] are pure decisions, all unit-tested. The populator path
+//! ([`drive_populator_restore`]) implements the full CSI volume-populator
+//! handshake: restore into a controller-created **prime** PVC, then rebind its PV
+//! to the claiming PVC (mirrors `kubernetes-csi/lib-volume-populator`).
 
 use std::sync::Arc;
 
@@ -471,33 +473,499 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             drive_direct_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
         }
         PopulatorState::AwaitingClaim => {
-            // NOTE: passive populator mode. The full CSI populator handshake
-            // (PVC dataSourceRef -> prime PVC -> bind) requires the
-            // VolumePopulator lib-mover protocol. The minimal real implementation
-            // here surfaces the awaiting-claim condition and pins the resolved
-            // snapshot so a claim can proceed; wiring the prime-PVC dance is the
-            // documented residual.
-            let msg = "passive populator: awaiting a PVC dataSourceRef to claim this Restore";
-            let conditions = io::upsert_condition(
-                &existing_conditions(restore),
-                "AwaitingClaim",
-                true,
-                "AwaitingPvcDataSourceRef",
-                msg,
-                restore.metadata.generation,
-            );
-            let mut status = restore_ready_status_on(
-                restore,
-                &conditions,
-                RestorePhase::Pending,
-                "AwaitingPvcDataSourceRef",
-                msg,
-            );
-            status["target"] = serde_json::json!({ "pvcPrime": "awaiting-claim" });
-            io::patch_status(&api, &name, status).await?;
-            Ok(Action::requeue(std::time::Duration::from_secs(30)))
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
         }
     }
+}
+
+/// Park a populator `Restore` in `AwaitingClaim=True` / `Pending` with `reason`+`msg`
+/// (no claiming PVC yet, or a WaitForFirstConsumer claim that hasn't been scheduled).
+/// Mirrors the pre-handshake stub's status shape so consumers see a stable surface.
+async fn park_awaiting_claim(
+    api: &Api<Restore>,
+    restore: &Restore,
+    name: &str,
+    reason: &str,
+    msg: &str,
+) -> Result<()> {
+    let conditions = io::upsert_condition(
+        &existing_conditions(restore),
+        "AwaitingClaim",
+        true,
+        reason,
+        msg,
+        restore.metadata.generation,
+    );
+    let mut status =
+        restore_ready_status_on(restore, &conditions, RestorePhase::Pending, reason, msg);
+    status["target"] = serde_json::json!({ "pvcPrime": "awaiting-claim" });
+    io::patch_status(api, name, status).await
+}
+
+/// CSI volume-populator handshake for `target.populator: {}` (ADR-0005 §9): restore
+/// the snapshot into a prime PVC, then rebind its PV to the claiming PVC (mirrors
+/// kubernetes-csi/lib-volume-populator). Each step keys off observed state so requeues
+/// are idempotent; the prime PV is set `Retain` before its PVC is deleted so the
+/// volume survives the swap.
+async fn drive_populator_restore(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    snapshot_id: &str,
+) -> Result<Action> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+
+    // The claiming PVC: one in this namespace whose dataSourceRef targets this
+    // Restore. (dataSourceRef is namespace-local; a cross-namespace claim would need
+    // a ReferenceGrant, out of scope here.)
+    let consumer = pvc_api
+        .list(&kube::api::ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .find(|pvc| pvc_claims_restore(pvc, name));
+
+    let Some(consumer) = consumer else {
+        park_awaiting_claim(
+            api,
+            restore,
+            name,
+            "AwaitingPvcDataSourceRef",
+            "passive populator: awaiting a PVC dataSourceRef to claim this Restore",
+        )
+        .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+
+    let consumer_name = consumer.name_any();
+    let consumer_uid = consumer
+        .uid()
+        .ok_or_else(|| Error::Invariant("claiming PVC has no uid".into()))?;
+    let prime_name = format!("prime-{consumer_uid}");
+    let populate_job = format!("{name}-populate");
+
+    let phase = restore.status.as_ref().and_then(|s| s.phase);
+    // Terminal — and `finalize_populator` strips the rebind annotation, so the
+    // `our_rebound_pv` probe below would no longer recognize our PV. Short-circuit.
+    if phase == Some(RestorePhase::Completed) {
+        return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+    }
+
+    // The PV our populator earmarked for this consumer: claimRef → the consumer AND our
+    // rebind annotation. `Some` proves the prime→consumer rebind was already issued — so
+    // we never recreate the prime past that point, and we complete ONLY once the consumer
+    // is bound to THAT PV (not to an empty one a non-populator-aware provisioner handed it).
+    if let Some(pv_name) = our_rebound_pv(ctx, namespace, &consumer_name).await? {
+        if pvc_is_bound(&consumer)
+            && consumer
+                .spec
+                .as_ref()
+                .and_then(|s| s.volume_name.as_deref())
+                == Some(pv_name.as_str())
+        {
+            finalize_populator(ctx, namespace, &populate_job, &prime_name, Some(&pv_name)).await?;
+            io::patch_status(
+                api,
+                name,
+                restore_ready_status(
+                    restore,
+                    RestorePhase::Completed,
+                    crate::consts::RESTORE_POPULATED_REASON,
+                    "populator: restored the snapshot into the claiming PVC and rebound the volume",
+                ),
+            )
+            .await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+        }
+        // Rebind issued; wait for the PV controller to bind our PV to the consumer.
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
+
+    // WaitForFirstConsumer gate: a late-binding StorageClass only provisions once a
+    // pod schedules the claim (the `selected-node` annotation appears). Provision the
+    // prime PVC on the SAME node so its PV lands where the workload will run.
+    let selected_node = consumer
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("volume.kubernetes.io/selected-node").cloned());
+    if consumer_storage_class_is_wffc(ctx, &consumer).await? && selected_node.is_none() {
+        park_awaiting_claim(
+            api,
+            restore,
+            name,
+            "AwaitingPodSchedule",
+            "populator: waiting for a pod to schedule the claiming PVC (WaitForFirstConsumer)",
+        )
+        .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    }
+
+    // Provision the prime PVC (mirrors the claim's spec, no dataSourceRef), then run
+    // the restore mover into it.
+    ensure_prime_pvc(
+        ctx,
+        restore,
+        namespace,
+        &prime_name,
+        &consumer,
+        selected_node.as_deref(),
+    )
+    .await?;
+
+    match run_restore_mover(
+        ctx,
+        restore,
+        api,
+        namespace,
+        &populate_job,
+        &prime_name,
+        snapshot_id,
+    )
+    .await?
+    {
+        MoverOutcome::Running { created } => {
+            let phase = restore.status.as_ref().and_then(|s| s.phase);
+            if created || phase != Some(RestorePhase::Restoring) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(
+                        restore,
+                        RestorePhase::Restoring,
+                        "PopulatingPrimePvc",
+                        "populator: restoring the snapshot into the prime PVC",
+                    ),
+                )
+                .await?;
+            }
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+        MoverOutcome::Failed => {
+            let phase = restore.status.as_ref().and_then(|s| s.phase);
+            if phase != Some(RestorePhase::Failed) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(
+                        restore,
+                        RestorePhase::Failed,
+                        "MoverJobFailed",
+                        "the populator restore mover Job failed; see the Job/pod logs, fix the \
+                         cause, and re-create the claiming PVC — a Failed Restore is terminal",
+                    ),
+                )
+                .await?;
+            }
+            return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+        }
+        MoverOutcome::Wedged { message } => {
+            let phase = restore.status.as_ref().and_then(|s| s.phase);
+            if phase != Some(RestorePhase::Failed) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(restore, RestorePhase::Failed, "MoverPodWedged", &message),
+                )
+                .await?;
+            }
+            return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+        }
+        MoverOutcome::Succeeded { .. } => {}
+    }
+
+    // Mover done: hand the prime PV to the consumer, then requeue so the next pass
+    // observes the bind and finalizes. `rebind_prime_to_consumer` returns `false`
+    // (requeue soon) while the prime PV hasn't appeared yet.
+    if !rebind_prime_to_consumer(ctx, namespace, &prime_name, &consumer_name, &consumer_uid).await?
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
+    Ok(Action::requeue(std::time::Duration::from_secs(5)))
+}
+
+/// The selected-node annotation a late-binding (`WaitForFirstConsumer`) PVC carries
+/// once the scheduler picks a node for its first consuming pod.
+const SELECTED_NODE_ANNOTATION: &str = "volume.kubernetes.io/selected-node";
+/// Annotation kopiur stamps on a prime PV while it is temporarily forced to `Retain`
+/// during the rebind — carries the PV's ORIGINAL reclaim policy so
+/// [`finalize_populator`] can restore it once the consumer binds.
+const PRIME_ORIGINAL_RECLAIM_ANNOTATION: &str =
+    "kopiur.home-operations.com/populator-original-reclaim-policy";
+
+/// The `PersistentVolume` our populator earmarked for `consumer_name`: its `claimRef`
+/// targets the consumer and it carries [`PRIME_ORIGINAL_RECLAIM_ANNOTATION`] (stamped
+/// during the rebind). `Some` ⇒ the prime→consumer rebind has been issued.
+async fn our_rebound_pv(
+    ctx: &Context,
+    namespace: &str,
+    consumer_name: &str,
+) -> Result<Option<String>> {
+    use k8s_openapi::api::core::v1::PersistentVolume;
+    let pv_api: Api<PersistentVolume> = Api::all(ctx.client.clone());
+    Ok(pv_api
+        .list(&kube::api::ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .find(|pv| {
+            pv.metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.contains_key(PRIME_ORIGINAL_RECLAIM_ANNOTATION))
+                && pv
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.claim_ref.as_ref())
+                    .is_some_and(|cr| {
+                        cr.name.as_deref() == Some(consumer_name)
+                            && cr.namespace.as_deref() == Some(namespace)
+                    })
+        })
+        .map(|pv| pv.name_any()))
+}
+
+/// True when `pvc.spec.dataSourceRef` claims the populator `Restore` named
+/// `restore_name` (apiGroup `kopiur.home-operations.com`, kind `Restore`). Pure.
+fn pvc_claims_restore(
+    pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
+    restore_name: &str,
+) -> bool {
+    pvc.spec
+        .as_ref()
+        .and_then(|s| s.data_source_ref.as_ref())
+        .is_some_and(|dsr| {
+            dsr.kind == "Restore"
+                && dsr.name == restore_name
+                && dsr.api_group.as_deref() == Some("kopiur.home-operations.com")
+        })
+}
+
+/// True once `pvc` is bound to a `PersistentVolume`. Pure.
+fn pvc_is_bound(pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> bool {
+    pvc.spec
+        .as_ref()
+        .and_then(|s| s.volume_name.as_deref())
+        .is_some_and(|v| !v.is_empty())
+        || pvc.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Bound")
+}
+
+/// Whether the claim's `StorageClass` binds late (`WaitForFirstConsumer`), so the
+/// prime PVC must wait for the scheduler to pick a node. A claim with no class named
+/// is treated as `Immediate`.
+async fn consumer_storage_class_is_wffc(
+    ctx: &Context,
+    consumer: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
+) -> Result<bool> {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    let Some(scn) = consumer
+        .spec
+        .as_ref()
+        .and_then(|s| s.storage_class_name.clone())
+    else {
+        return Ok(false);
+    };
+    let sc_api: Api<StorageClass> = Api::all(ctx.client.clone());
+    Ok(sc_api
+        .get_opt(&scn)
+        .await?
+        .and_then(|sc| sc.volume_binding_mode)
+        .as_deref()
+        == Some("WaitForFirstConsumer"))
+}
+
+/// Create the prime PVC if absent: the claim's spec with the data source stripped (so
+/// a provisioner gives it a fresh PV), pinned to `selected_node` for late binding, and
+/// owned by the Restore. Idempotent.
+async fn ensure_prime_pvc(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    prime_name: &str,
+    consumer: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
+    selected_node: Option<&str>,
+) -> Result<()> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    if pvc_api.get_opt(prime_name).await?.is_some() {
+        return Ok(());
+    }
+    let mut spec = consumer
+        .spec
+        .clone()
+        .ok_or_else(|| Error::Invariant("claiming PVC has no spec".into()))?;
+    // The prime PVC must be provisioned normally, NOT via the populator — strip the
+    // data source and any bound-volume hints.
+    spec.data_source = None;
+    spec.data_source_ref = None;
+    spec.volume_name = None;
+    spec.selector = None;
+    let mut annotations = std::collections::BTreeMap::new();
+    if let Some(node) = selected_node {
+        annotations.insert(SELECTED_NODE_ANNOTATION.to_string(), node.to_string());
+    }
+    let prime = PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(prime_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(io::child_labels(&[(
+                crate::consts::OP_LABEL,
+                crate::consts::OP_RESTORE_POPULATE,
+            )])),
+            annotations: (!annotations.is_empty()).then_some(annotations),
+            owner_references: Some(vec![io::owner_ref_for(restore, "Restore")?]),
+            ..Default::default()
+        },
+        spec: Some(spec),
+        status: None,
+    };
+    match pvc_api
+        .create(&kube::api::PostParams::default(), &prime)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(prime = %prime_name, %namespace, "created populator prime PVC");
+            Ok(())
+        }
+        // Lost a create race with another reconcile — the PVC exists, which is all
+        // this function guarantees.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Hand the prime PV to the claiming PVC: set it `Retain` (stashing the original
+/// policy in an annotation), repoint `claimRef` at the consumer (clearing
+/// `resourceVersion`), then delete the prime PVC. Returns `false` while the prime PV
+/// isn't provisioned yet (caller requeues), `true` once the rebind is issued.
+async fn rebind_prime_to_consumer(
+    ctx: &Context,
+    namespace: &str,
+    prime_name: &str,
+    consumer_name: &str,
+    consumer_uid: &str,
+) -> Result<bool> {
+    use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim};
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let pv_api: Api<PersistentVolume> = Api::all(ctx.client.clone());
+
+    // Prime gone → rebind completed on a prior pass.
+    let Some(prime) = pvc_api.get_opt(prime_name).await? else {
+        return Ok(true);
+    };
+    // PV not provisioned/bound to the prime yet → requeue soon.
+    let Some(pv_name) = prime
+        .spec
+        .as_ref()
+        .and_then(|s| s.volume_name.clone())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(pv) = pv_api.get_opt(&pv_name).await? else {
+        return Ok(false);
+    };
+
+    let already = pv
+        .spec
+        .as_ref()
+        .and_then(|s| s.claim_ref.as_ref())
+        .is_some_and(|cr| {
+            cr.name.as_deref() == Some(consumer_name) && cr.uid.as_deref() == Some(consumer_uid)
+        });
+    if !already {
+        let original = pv
+            .spec
+            .as_ref()
+            .and_then(|s| s.persistent_volume_reclaim_policy.clone())
+            .unwrap_or_else(|| "Delete".to_string());
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { PRIME_ORIGINAL_RECLAIM_ANNOTATION: original } },
+            "spec": {
+                "persistentVolumeReclaimPolicy": "Retain",
+                "claimRef": {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "namespace": namespace,
+                    "name": consumer_name,
+                    "uid": consumer_uid,
+                    // RFC 7386 merge: null removes the stale resourceVersion so the PV
+                    // controller doesn't reject the rebind on a version mismatch.
+                    "resourceVersion": null,
+                },
+            },
+        });
+        pv_api
+            .patch(
+                &pv_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(patch),
+            )
+            .await?;
+        tracing::info!(pv = %pv_name, consumer = %consumer_name, "populator: rebound prime PV to the claiming PVC");
+    }
+    // Safe now: the PV is Retain + claimRef→consumer, so deleting the prime PVC frees
+    // the name without reaping the volume; the PV controller binds it to the consumer.
+    let _ = pvc_api
+        .delete(prime_name, &kube::api::DeleteParams::default())
+        .await;
+    Ok(true)
+}
+
+/// Finalize: restore the bound PV's original reclaim policy (stashed during rebind),
+/// then GC the populate Job/ConfigMap and any leftover prime PVC.
+async fn finalize_populator(
+    ctx: &Context,
+    namespace: &str,
+    populate_job: &str,
+    prime_name: &str,
+    bound_pv: Option<&str>,
+) -> Result<()> {
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim};
+    if let Some(pv_name) = bound_pv {
+        let pv_api: Api<PersistentVolume> = Api::all(ctx.client.clone());
+        if let Some(pv) = pv_api.get_opt(pv_name).await?
+            && let Some(orig) = pv
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(PRIME_ORIGINAL_RECLAIM_ANNOTATION))
+                .cloned()
+        {
+            let patch = serde_json::json!({
+                "metadata": { "annotations": { PRIME_ORIGINAL_RECLAIM_ANNOTATION: serde_json::Value::Null } },
+                "spec": { "persistentVolumeReclaimPolicy": orig },
+            });
+            pv_api
+                .patch(
+                    pv_name,
+                    &kube::api::PatchParams::default(),
+                    &kube::api::Patch::Merge(patch),
+                )
+                .await?;
+        }
+    }
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let bg = kube::api::DeleteParams {
+        propagation_policy: Some(kube::api::PropagationPolicy::Background),
+        ..Default::default()
+    };
+    let _ = job_api.delete(populate_job, &bg).await;
+    let _ = cm_api
+        .delete(populate_job, &kube::api::DeleteParams::default())
+        .await;
+    let _ = pvc_api
+        .delete(prime_name, &kube::api::DeleteParams::default())
+        .await;
+    Ok(())
 }
 
 /// Drive a restore-with-explicit-target: create the restore mover Job (writing
@@ -510,104 +978,9 @@ async fn drive_direct_restore(
     name: &str,
     snapshot_id: &str,
 ) -> Result<Action> {
-    use k8s_openapi::api::batch::v1::Job;
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    if let Some(job) = job_api.get_opt(name).await? {
-        // Guard each phase write with a phase-equality check so a tracked Job that
-        // sits terminal (or keeps running) doesn't re-patch an identical phase on
-        // every requeue and self-trigger. Mirrors the Snapshot reconciler.
-        let phase = restore.status.as_ref().and_then(|s| s.phase);
-        return match crate::snapshot::job_terminal_state(&job) {
-            Some(true) => {
-                if let Some(secs) = restore_job_duration_seconds(&job) {
-                    ctx.metrics.set_restore_duration(namespace, name, secs);
-                }
-                if phase != Some(RestorePhase::Completed) {
-                    io::patch_status(
-                        api,
-                        name,
-                        restore_ready_status(
-                            restore,
-                            RestorePhase::Completed,
-                            "RestoreSucceeded",
-                            "the restore mover Job completed; the snapshot data was \
-                             written into the target",
-                        ),
-                    )
-                    .await?;
-                }
-                Ok(Action::requeue(std::time::Duration::from_secs(600)))
-            }
-            Some(false) => {
-                if phase != Some(RestorePhase::Failed) {
-                    io::patch_status(
-                        api,
-                        name,
-                        restore_ready_status(
-                            restore,
-                            RestorePhase::Failed,
-                            "MoverJobFailed",
-                            "the restore mover Job failed; see the Job/pod logs for the \
-                             cause, fix it, and create a NEW Restore — a Failed Restore \
-                             is terminal and never retries",
-                        ),
-                    )
-                    .await?;
-                }
-                Ok(Action::requeue(std::time::Duration::from_secs(120)))
-            }
-            None => {
-                // A restore mover that can't START (impossible securityContext, bad image,
-                // unschedulable target) never terminates, so backoffLimit never trips — fail
-                // fast past the startup deadline instead of hanging to the 48h backstop.
-                let grace = kopiur_api::common::pod_startup_deadline_seconds(
-                    restore.spec.failure_policy.as_ref(),
-                );
-                if let io::WedgedVerdict::Wedged { reason, message } =
-                    io::wedged_pod_verdict(&ctx.client, namespace, name, grace).await?
-                {
-                    if phase != Some(RestorePhase::Failed) {
-                        io::patch_status(
-                            api,
-                            name,
-                            restore_ready_status(
-                                restore,
-                                RestorePhase::Failed,
-                                "MoverPodWedged",
-                                &crate::snapshot::wedged_pod_message(&reason, &message, grace),
-                            ),
-                        )
-                        .await?;
-                    }
-                    // Reap the wedged Job (cascade) so the kubelet stops retrying.
-                    let _ = job_api
-                        .delete(name, &kube::api::DeleteParams::background())
-                        .await;
-                    return Ok(Action::requeue(std::time::Duration::from_secs(120)));
-                }
-                if phase != Some(RestorePhase::Restoring) {
-                    io::patch_status(
-                        api,
-                        name,
-                        restore_ready_status(
-                            restore,
-                            RestorePhase::Restoring,
-                            "MoverJobRunning",
-                            "the restore mover Job is in flight",
-                        ),
-                    )
-                    .await?;
-                }
-                Ok(Action::requeue(std::time::Duration::from_secs(30)))
-            }
-        };
-    }
-
-    // Resolve the repository + target PVC for the restore Job.
-    let repo = resolve_restore_repository(ctx, restore, namespace).await?;
-    // DirectTarget is only reached for an explicit PVC target (populator routes to
-    // AwaitingClaim in the reconcile dispatch). Exhaustive over RestoreTarget so a new
-    // variant must be considered here.
+    // Resolve the target PVC for the restore Job. DirectTarget is only reached for
+    // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
+    // dispatch). Exhaustive over RestoreTarget so a new variant must be considered.
     let target_pvc = match &restore.spec.target {
         RestoreTarget::PvcRef(r) => r.name.clone(),
         // `target.pvc` means the operator CREATES the PVC (ADR §3.6) — without
@@ -625,7 +998,157 @@ async fn drive_direct_restore(
             ));
         }
     };
+
+    // The Job is named after the Restore and writes into the explicit target PVC;
+    // the helper creates/tracks it, the phase writes stay here.
+    let phase = restore.status.as_ref().and_then(|s| s.phase);
+    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, snapshot_id).await? {
+        MoverOutcome::Succeeded { duration_secs } => {
+            if let Some(secs) = duration_secs {
+                ctx.metrics.set_restore_duration(namespace, name, secs);
+            }
+            if phase != Some(RestorePhase::Completed) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(
+                        restore,
+                        RestorePhase::Completed,
+                        "RestoreSucceeded",
+                        "the restore mover Job completed; the snapshot data was \
+                         written into the target",
+                    ),
+                )
+                .await?;
+            }
+            Ok(Action::requeue(std::time::Duration::from_secs(600)))
+        }
+        MoverOutcome::Failed => {
+            if phase != Some(RestorePhase::Failed) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(
+                        restore,
+                        RestorePhase::Failed,
+                        "MoverJobFailed",
+                        "the restore mover Job failed; see the Job/pod logs for the \
+                         cause, fix it, and create a NEW Restore — a Failed Restore \
+                         is terminal and never retries",
+                    ),
+                )
+                .await?;
+            }
+            Ok(Action::requeue(std::time::Duration::from_secs(120)))
+        }
+        MoverOutcome::Running { created } => {
+            let (target_phase, reason, msg) = if created {
+                (
+                    RestorePhase::Restoring,
+                    "MoverJobCreated",
+                    "created the restore mover Job",
+                )
+            } else {
+                (
+                    RestorePhase::Restoring,
+                    "MoverJobRunning",
+                    "the restore mover Job is in flight",
+                )
+            };
+            // A new Job always writes; a poll only on a phase flip.
+            if created || phase != Some(RestorePhase::Restoring) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(restore, target_phase, reason, msg),
+                )
+                .await?;
+            }
+            Ok(Action::requeue(std::time::Duration::from_secs(30)))
+        }
+        MoverOutcome::Wedged { message } => {
+            if phase != Some(RestorePhase::Failed) {
+                io::patch_status(
+                    api,
+                    name,
+                    restore_ready_status(restore, RestorePhase::Failed, "MoverPodWedged", &message),
+                )
+                .await?;
+            }
+            Ok(Action::requeue(std::time::Duration::from_secs(120)))
+        }
+    }
+}
+
+/// Observed state of a restore mover Job, returned by [`run_restore_mover`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MoverOutcome {
+    /// Not yet terminal. `created` is `true` only on the reconcile that applied it.
+    Running { created: bool },
+    /// Completed; `duration_secs` from its start/completion times.
+    Succeeded { duration_secs: Option<i64> },
+    /// Terminal failure (the mover Job reported failure).
+    Failed,
+    /// The mover pod can't START past the pod-startup deadline (impossible
+    /// securityContext, bad image, unschedulable); the helper reaped the Job. `message`
+    /// is the ready-to-surface explanation.
+    Wedged { message: String },
+}
+
+/// Build + apply the restore mover Job named `job_name` (writing `snapshot_id` into
+/// `target_pvc`, mounted read-write at `/restore`) and report its [`MoverOutcome`].
+/// Idempotent: an existing Job is tracked to terminal, never re-applied. The caller
+/// owns the status/phase writes.
+async fn run_restore_mover(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    job_name: &str,
+    target_pvc: &str,
+    snapshot_id: &str,
+) -> Result<MoverOutcome> {
+    use k8s_openapi::api::batch::v1::Job;
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    if let Some(job) = job_api.get_opt(job_name).await? {
+        return Ok(match crate::snapshot::job_terminal_state(&job) {
+            Some(true) => MoverOutcome::Succeeded {
+                duration_secs: restore_job_duration_seconds(&job),
+            },
+            Some(false) => MoverOutcome::Failed,
+            // A mover that can't START (impossible securityContext, bad image,
+            // unschedulable) never terminates, so backoffLimit never trips — fail fast
+            // past the pod-startup deadline instead of hanging to the 48h backstop.
+            None => {
+                let grace = kopiur_api::common::pod_startup_deadline_seconds(
+                    restore.spec.failure_policy.as_ref(),
+                );
+                if let io::WedgedVerdict::Wedged { reason, message } =
+                    io::wedged_pod_verdict(&ctx.client, namespace, job_name, grace).await?
+                {
+                    // Reap the wedged Job (cascade) so the kubelet stops retrying.
+                    let _ = job_api
+                        .delete(job_name, &kube::api::DeleteParams::background())
+                        .await;
+                    MoverOutcome::Wedged {
+                        message: crate::snapshot::wedged_pod_message(&reason, &message, grace),
+                    }
+                } else {
+                    MoverOutcome::Running { created: false }
+                }
+            }
+        });
+    }
+
     let target_path = "/restore".to_string();
+    // Status patches and the work-spec `target_ref` reference the Restore itself; the
+    // Job/ConfigMap/cache are named after `job_name` (`<restore>-populate` for the
+    // populator path) so the two paths never collide.
+    let restore_name = restore.name_any();
+    let name = restore_name.as_str();
+
+    // Resolve the repository for the restore Job.
+    let repo = resolve_restore_repository(ctx, restore, namespace).await?;
 
     // The restore mover Job runs in this (workload) namespace: resolve its run
     // identity here — the user's workload-identity SA (preflighted + bound to the
@@ -900,7 +1423,7 @@ async fn drive_direct_restore(
         &ctx.client,
         namespace,
         owner.clone(),
-        &format!("kopiur-cache-{name}"),
+        &format!("kopiur-cache-{job_name}"),
         effective_cache.as_ref(),
     )
     .await?;
@@ -913,7 +1436,7 @@ async fn drive_direct_restore(
         let decision = io::resolve_source_colocation(
             &ctx.client,
             namespace,
-            &target_pvc,
+            target_pvc,
             resolved_mover.source_colocation,
         )
         .await?;
@@ -924,7 +1447,7 @@ async fn drive_direct_restore(
         )?
     };
     let inputs = MoverJobInputs {
-        name,
+        name: job_name,
         namespace,
         owner,
         work_spec: &work_spec,
@@ -964,20 +1487,11 @@ async fn drive_direct_restore(
     };
     let cm = jobs::build_config_map(&inputs)?;
     let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, name, &cm, &job).await?;
-    io::patch_status(
-        api,
-        name,
-        restore_ready_status(
-            restore,
-            RestorePhase::Restoring,
-            "MoverJobCreated",
-            "created the restore mover Job",
-        ),
-    )
-    .await?;
-    tracing::info!(restore = %name, %snapshot_id, "created restore Job");
-    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+    io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
+    tracing::info!(restore = %name, job = %job_name, %snapshot_id, "created restore mover Job");
+    // The Job is new; the CALLER writes the matching status (direct: MoverJobCreated;
+    // populator: PopulatingPrimePvc) so each path keeps its own phase discipline.
+    Ok(MoverOutcome::Running { created: true })
 }
 
 /// A fully-resolved restore source, ready to pin to `status.resolved` (ADR §4.6):
@@ -1654,5 +2168,47 @@ mod tests {
         assert_eq!(cond(&v, "Reconciling")["status"], "True");
         assert_eq!(cond(&v, "Reconciling")["reason"], "MoverJobRunning");
         assert_eq!(cond(&v, "Stalled")["status"], "False");
+    }
+
+    fn pvc(value: serde_json::Value) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn pvc_claims_restore_matches_only_our_datasourceref() {
+        let claim = pvc(serde_json::json!({
+            "metadata": { "name": "qui", "namespace": "downloads" },
+            "spec": { "dataSourceRef": {
+                "apiGroup": "kopiur.home-operations.com", "kind": "Restore", "name": "qui",
+            } },
+        }));
+        assert!(pvc_claims_restore(&claim, "qui"));
+        assert!(!pvc_claims_restore(&claim, "other"));
+
+        // Wrong apiGroup (a VolSync ReplicationDestination) must not match.
+        let volsync = pvc(serde_json::json!({
+            "metadata": { "name": "qui", "namespace": "downloads" },
+            "spec": { "dataSourceRef": {
+                "apiGroup": "volsync.backube", "kind": "ReplicationDestination", "name": "qui",
+            } },
+        }));
+        assert!(!pvc_claims_restore(&volsync, "qui"));
+
+        // No dataSourceRef at all.
+        let plain = pvc(serde_json::json!({ "metadata": { "name": "qui" }, "spec": {} }));
+        assert!(!pvc_claims_restore(&plain, "qui"));
+    }
+
+    #[test]
+    fn pvc_is_bound_reads_volume_name_or_phase() {
+        assert!(pvc_is_bound(&pvc(serde_json::json!({
+            "metadata": { "name": "p" }, "spec": { "volumeName": "pvc-123" },
+        }))));
+        assert!(pvc_is_bound(&pvc(serde_json::json!({
+            "metadata": { "name": "p" }, "spec": {}, "status": { "phase": "Bound" },
+        }))));
+        assert!(!pvc_is_bound(&pvc(serde_json::json!({
+            "metadata": { "name": "p" }, "spec": {}, "status": { "phase": "Pending" },
+        }))));
     }
 }

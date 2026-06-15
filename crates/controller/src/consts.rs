@@ -103,6 +103,12 @@ pub const CHECK_CREDENTIALS_ACTION: &str = "CheckCredentials";
 /// rejection ([`crate::io::BootstrapFailure`]).
 pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
 
+/// [`OP_LABEL`] value for a populator `Restore`'s prime PVC and populate mover Job
+/// (distinct from the direct-target `restore` Jobs). ADR-0005 §9.
+pub const OP_RESTORE_POPULATE: &str = "restore-populate";
+/// `Restore` Ready reason once a populator restored its snapshot and rebound the volume.
+pub const RESTORE_POPULATED_REASON: &str = "RestoreSucceeded";
+
 /// `Snapshot`/`Restore` condition surfaced when the mover Job's credential Secret is
 /// absent from the workload namespace — `False` carries the actionable message
 /// (which Secret, which namespace, why, and how to fix). ADR §4.12.

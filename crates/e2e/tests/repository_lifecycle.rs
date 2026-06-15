@@ -14,11 +14,17 @@ use kube::Api;
 use kube::api::{DeleteParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::storage::v1::StorageClass;
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
-    E2E_NAMESPACE, Need, World, default_timeout, poll_interval, scrape_controller_metrics,
-    wait_until,
+    E2E_NAMESPACE, Need, World, builders, default_timeout, poll_interval,
+    scrape_controller_metrics, wait, wait_until,
 };
+
+/// CSI hostpath StorageClass installed by the `snapshot-stack` harness step — a
+/// populator-aware provisioner (its external-provisioner defers to `dataSourceRef`).
+const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
 
 /// `Restore.spec.target.populator: {}` (ADR-0005 §9): the explicit passive-populator
 /// target form is accepted and threads through to a restore mover Job. (The empty
@@ -69,6 +75,127 @@ async fn restore_populator_target_form_is_accepted() {
             "a populator Restore must reach AwaitingClaim=True (passive, awaiting a PVC claim)",
         );
     let _ = restores.delete(name, &DeleteParams::default()).await;
+}
+
+/// ADR-0005 §9 end-to-end: a PVC whose `dataSourceRef` claims a populator `Restore`
+/// is filled via the prime-PVC/rebind handshake and binds carrying the snapshot's
+/// data (the seed source's `a.txt`).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn restore_populator_binds_pvc_and_restores_data() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    // The populator handshake needs a populator-aware CSI provisioner: its
+    // external-provisioner defers when the claim has a populator `dataSourceRef`, so the
+    // claim only ever binds to the PV our handshake hands it. The harness installs one as
+    // `csi-hostpath-sc` (snapshot-stack step); the default local-path does NOT defer and
+    // would bind the claim to an empty volume. Skip where CSI isn't present (a shard that
+    // doesn't install the snapshot stack), like the CSI copy-method tests.
+    let scs: Api<StorageClass> = Api::all(client.clone());
+    if scs
+        .get_opt(CSI_STORAGE_CLASS)
+        .await
+        .expect("list storageclasses")
+        .is_none()
+    {
+        eprintln!(
+            "skipping {CSI_STORAGE_CLASS} populator test: storageclass absent \
+             (run `mise run //crates/e2e:snapshot-stack`)"
+        );
+        return;
+    }
+
+    ensure_seed(
+        &client,
+        "e2e-pop2-repo",
+        "e2e-pop2-policy",
+        "e2e-pop2-seed",
+        "populator2",
+    )
+    .await;
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restore_name = "e2e-pop2-restore";
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore_name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "repository": { "kind": "Repository", "name": "e2e-pop2-repo" },
+                    "source": { "snapshotRef": { "name": "e2e-pop2-seed" } },
+                    "target": { "populator": {} }
+                }
+            })),
+        )
+        .await
+        .expect("create populator Restore");
+
+    // The claiming PVC: its dataSourceRef points at the Restore, so a provisioner
+    // defers to the populator handshake instead of binding it directly.
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let claim = "e2e-pop2-data";
+    pvcs.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": claim, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": CSI_STORAGE_CLASS,
+                "resources": { "requests": { "storage": "1Gi" } },
+                "dataSourceRef": {
+                    "apiGroup": "kopiur.home-operations.com",
+                    "kind": "Restore",
+                    "name": restore_name,
+                }
+            }
+        })),
+    )
+    .await
+    .expect("create claiming PVC");
+
+    // One pod does double duty: scheduling it unblocks WaitForFirstConsumer (so the
+    // prime PVC provisions on the chosen node), and it asserts the restored bytes —
+    // `a.txt` is "hello kopiur e2e" in the seed source. It can only run once the claim
+    // binds, so its success proves both the bind and the data.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let reader = "e2e-pop2-reader";
+    pods.create(
+        &PostParams::default(),
+        &builders::one_shot_pod(
+            E2E_NAMESPACE,
+            reader,
+            &[
+                "sh",
+                "-c",
+                "test \"$(cat /mnt/a.txt)\" = 'hello kopiur e2e'",
+            ],
+            &[(claim, "/mnt")],
+        ),
+    )
+    .await
+    .expect("create reader pod");
+
+    wait::pod_succeeded(&client, E2E_NAMESPACE, reader)
+        .await
+        .expect("the claiming PVC binds and a.txt is restored into it");
+    wait_phase(&restores, restore_name, "Completed")
+        .await
+        .expect("the populator Restore reaches Completed once the claim is bound");
+
+    let _ = pods.delete(reader, &DeleteParams::default()).await;
+    let _ = pvcs.delete(claim, &DeleteParams::default()).await;
+    let _ = restores
+        .delete(restore_name, &DeleteParams::default())
+        .await;
 }
 
 /// `mode: ReadOnly` (ADR-0005 §11): a ReadOnly repository serves restores but the
