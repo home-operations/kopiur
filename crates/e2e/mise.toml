@@ -32,7 +32,18 @@ set -eu
 CLUSTER=kopiur-e2e
 mkdir -p "$(dirname "$KUBECONFIG")"
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
-  echo "==> reusing kind cluster '$CLUSTER'"
+  # Reuse ONLY if the node is actually healthy. A wedged/half-dead node container (e.g. a
+  # stuck containerd shim left by a killed run) otherwise fails every later step with a
+  # cryptic "failed to get cluster internal kubeconfig". Probe it; if the probe fails,
+  # tear it down (force-reaping the node container) and recreate so a bad cluster self-heals.
+  if kind export kubeconfig --name "$CLUSTER" --kubeconfig "$KUBECONFIG" >/dev/null 2>&1 \\
+     && kubectl --kubeconfig "$KUBECONFIG" get --raw=/healthz >/dev/null 2>&1; then
+    echo "==> reusing healthy kind cluster '$CLUSTER'"
+  else
+    echo "==> existing kind cluster '$CLUSTER' is unhealthy; recreating"
+    mise run //crates/e2e:down
+    kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
+  fi
 else
   echo "==> creating kind cluster '$CLUSTER'"
   kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
@@ -194,8 +205,23 @@ dir = "{{config_root}}/../.."
 env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -u
-echo "==> deleting kind cluster 'kopiur-e2e' (kubeconfig: $KUBECONFIG)"
-kind delete cluster --name kopiur-e2e >/dev/null 2>&1 || true
+CLUSTER=kopiur-e2e
+echo "==> deleting kind cluster '$CLUSTER' (kubeconfig: $KUBECONFIG)"
+kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+# `kind delete` can't reap a wedged node container (a stuck containerd shim →
+# "did not receive an exit event"), which would otherwise persist into the next run and
+# poison cluster-create. Force-remove the node container(s) directly by kind's cluster
+# label so teardown ALWAYS leaves a clean slate, pass or fail. A retry covers the daemon
+# briefly lagging on the exit event; if it still can't be removed the daemon is wedged —
+# say so loudly with the only real fix.
+leftover=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER" 2>/dev/null || true)
+if [ -n "$leftover" ]; then
+  echo "==> force-removing leftover kind node container(s) for '$CLUSTER'"
+  docker rm -f $leftover >/dev/null 2>&1 || { sleep 3; docker rm -f $leftover >/dev/null 2>&1 || true; }
+fi
+if docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER" 2>/dev/null | grep -q .; then
+  echo "==> WARNING: kind node container for '$CLUSTER' could not be removed; the Docker daemon is wedged — restart Docker to clear it" >&2
+fi
 rm -f "$KUBECONFIG" || true
 """
 
@@ -267,7 +293,10 @@ for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
 echo "==> building kubectl-kopiur (CLI e2e subject)"
 cargo build -p kopiur-cli --locked
 echo "==> running e2e tests${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
-cargo test -p kopiur-e2e --features e2e $BINS -- \
+# `--no-fail-fast`: run EVERY test binary even when one fails, so a single flaky bin
+# (e.g. the heavyweight NFS/server backend test) can't hide the pass/fail of the rest.
+# cargo still exits non-zero overall, so the trap + CI failure are unaffected.
+cargo test -p kopiur-e2e --features e2e $BINS --no-fail-fast -- \
   --include-ignored --test-threads=1 --nocapture ${KOPIUR_E2E_TESTFILTER:-}
 echo "==> e2e tests passed"
 '''
