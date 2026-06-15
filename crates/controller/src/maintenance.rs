@@ -208,8 +208,32 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                 .await?;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
-            // Still running: poll.
-            None => Ok(Action::requeue(REQUEUE_RUNNING)),
+            // Still running — but a mover that can't START (impossible securityContext, bad
+            // image, unschedulable) never terminates, so it would otherwise hang to the 48h
+            // backstop. Past the startup deadline, surface it and reap the wedged Job; the
+            // failed-slot backoff (REQUEUE_FAILED) then re-spawns it as a bounded retry,
+            // exactly like a normally-failed slot.
+            None => {
+                let grace = kopiur_api::common::pod_startup_deadline_seconds(
+                    maint.spec.failure_policy.as_ref(),
+                );
+                if let io::WedgedVerdict::Wedged { reason, message } =
+                    io::wedged_pod_verdict(&ctx.client, &namespace, &job_name, grace).await?
+                {
+                    patch_condition_if_changed(
+                        &api,
+                        &name,
+                        maint,
+                        "False",
+                        "MoverPodWedged",
+                        &crate::snapshot::wedged_pod_message(&reason, &message, grace),
+                    )
+                    .await?;
+                    let _ = job_api.delete(&job_name, &DeleteParams::background()).await;
+                    return Ok(Action::requeue(REQUEUE_FAILED));
+                }
+                Ok(Action::requeue(REQUEUE_RUNNING))
+            }
         },
         None => {
             // G3: never run two maintenance Jobs for one repository at once.

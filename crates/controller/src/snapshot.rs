@@ -722,12 +722,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // the long `activeDeadlineSeconds` backstop would ever stop it — meanwhile
                 // the kubelet retries every few seconds, hammering the API. Fail fast once
                 // a pod has been wedged past the grace window, with an actionable reason.
-                let grace = backup
-                    .spec
-                    .failure_policy
-                    .as_ref()
-                    .and_then(|fp| fp.pod_startup_deadline_seconds)
-                    .unwrap_or(kopiur_api::common::DEFAULT_POD_STARTUP_DEADLINE_SECONDS);
+                let grace = kopiur_api::common::pod_startup_deadline_seconds(
+                    backup.spec.failure_policy.as_ref(),
+                );
                 if let io::WedgedVerdict::Wedged { reason, message } =
                     io::wedged_pod_verdict(&ctx.client, &namespace, &name, grace).await?
                 {
@@ -2400,15 +2397,15 @@ fn job_limits(backup: &Snapshot) -> JobLimits {
 
 /// Actionable failure message for a mover pod wedged in a non-starting state past the
 /// grace window — what failed, why, and how to fix it (the what/why/fix rule).
-fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64) -> String {
+pub(crate) fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64) -> String {
     format!(
-        "the backup mover pod has been stuck ({reason}) for over {grace_seconds}s and cannot \
-         start: {detail}. Common causes: the resolved mover securityContext is invalid for the \
+        "the mover pod has been stuck ({reason}) for over {grace_seconds}s and cannot start: \
+         {detail}. Common causes: the resolved mover securityContext is invalid for the \
          namespace's Pod Security policy (e.g. an inherited root UID without a privileged-mover \
          opt-in), the mover image is unavailable, or the source volume cannot be scheduled. Fix \
          the mover config (securityContext / inheritSecurityContextFrom / image) or the namespace \
-         policy and the next scheduled run will retry. Tune the window with \
-         spec.failurePolicy.podStartupDeadlineSeconds."
+         policy, then re-run (a new Snapshot/Restore, or the next maintenance slot). Tune the \
+         window with spec.failurePolicy.podStartupDeadlineSeconds."
     )
 }
 

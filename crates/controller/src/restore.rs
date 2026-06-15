@@ -557,6 +557,34 @@ async fn drive_direct_restore(
                 Ok(Action::requeue(std::time::Duration::from_secs(120)))
             }
             None => {
+                // A restore mover that can't START (impossible securityContext, bad image,
+                // unschedulable target) never terminates, so backoffLimit never trips — fail
+                // fast past the startup deadline instead of hanging to the 48h backstop.
+                let grace = kopiur_api::common::pod_startup_deadline_seconds(
+                    restore.spec.failure_policy.as_ref(),
+                );
+                if let io::WedgedVerdict::Wedged { reason, message } =
+                    io::wedged_pod_verdict(&ctx.client, namespace, name, grace).await?
+                {
+                    if phase != Some(RestorePhase::Failed) {
+                        io::patch_status(
+                            api,
+                            name,
+                            restore_ready_status(
+                                restore,
+                                RestorePhase::Failed,
+                                "MoverPodWedged",
+                                &crate::snapshot::wedged_pod_message(&reason, &message, grace),
+                            ),
+                        )
+                        .await?;
+                    }
+                    // Reap the wedged Job (cascade) so the kubelet stops retrying.
+                    let _ = job_api
+                        .delete(name, &kube::api::DeleteParams::background())
+                        .await;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+                }
                 if phase != Some(RestorePhase::Restoring) {
                     io::patch_status(
                         api,

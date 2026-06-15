@@ -452,6 +452,16 @@ pub struct FailurePolicy {
 /// securityContext, a missing image) surfaces as `Failed` fast instead of hanging for hours.
 pub const DEFAULT_POD_STARTUP_DEADLINE_SECONDS: i64 = 300;
 
+/// The effective pod-startup deadline (seconds) for a mover Job: the recipe's
+/// `failurePolicy.podStartupDeadlineSeconds`, or [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`]
+/// when unset. Shared by **every** reconciler that fast-fails a wedged mover (Snapshot,
+/// Restore, Maintenance) so the same default is applied identically on all three.
+pub fn pod_startup_deadline_seconds(failure_policy: Option<&FailurePolicy>) -> i64 {
+    failure_policy
+        .and_then(|fp| fp.pod_startup_deadline_seconds)
+        .unwrap_or(DEFAULT_POD_STARTUP_DEADLINE_SECONDS)
+}
+
 /// Per-recipe mover overrides (resources, cache, security context). ADR §3.3.
 ///
 /// These overlay the repository's [`MoverDefaults`] **field-wise** (recipe wins, the
@@ -1692,6 +1702,28 @@ mod tests {
         let m = resolve_mover(None, Some(&inherited), None, None, None, None);
         assert_eq!(m.security_context.run_as_user, Some(2000));
         assert_eq!(m.security_context.run_as_non_root, Some(true));
+    }
+
+    #[test]
+    fn pod_startup_deadline_defaults_to_five_minutes() {
+        // The contract every reconciler relies on: unset → 5 minutes. Pinned so a careless
+        // change to the constant fails a test rather than silently shifting every mover's
+        // fail-fast window.
+        assert_eq!(DEFAULT_POD_STARTUP_DEADLINE_SECONDS, 300);
+        // No failurePolicy at all → default.
+        assert_eq!(pod_startup_deadline_seconds(None), 300);
+        // failurePolicy present but field unset → default.
+        let fp_unset = FailurePolicy {
+            backoff_limit: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(pod_startup_deadline_seconds(Some(&fp_unset)), 300);
+        // Explicit value wins.
+        let fp_set = FailurePolicy {
+            pod_startup_deadline_seconds: Some(900),
+            ..Default::default()
+        };
+        assert_eq!(pod_startup_deadline_seconds(Some(&fp_set)), 900);
     }
 
     #[test]
