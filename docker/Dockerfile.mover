@@ -63,5 +63,4 @@ FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /usr/local/bin/kopiur-mover /usr/local/bin/kopiur-mover
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
-USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/kopiur-mover"]
