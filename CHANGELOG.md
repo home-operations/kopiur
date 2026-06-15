@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.6](https://github.com/home-operations/kopiur/compare/0.4.5...0.4.6) (2026-06-15)
+
+
+### Features
+
+* **nfs:** support podsecuritycontext for server too ([#109](https://github.com/home-operations/kopiur/issues/109)) ([ed2fe8b](https://github.com/home-operations/kopiur/commit/ed2fe8be0342fef7ea7101b49253e2b2b60905a4))
+* **server:** support read-only server ([#108](https://github.com/home-operations/kopiur/issues/108)) ([e317480](https://github.com/home-operations/kopiur/commit/e31748045a60abedebc3ca78de29c7590e36a1fe))
+
+
+### Bug Fixes
+
+* **e2e:** isolate NFS consumers from the group-restricted grouprepo subdir ([167e2ec](https://github.com/home-operations/kopiur/commit/167e2ec3ba44b4a331f41d5745f616af097916ce))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.5 manifest ([b9455a2](https://github.com/home-operations/kopiur/commit/b9455a2ce39cf85d9efbf6cfecabf25a1bab7ae5))
+
 ## [0.4.5](https://github.com/home-operations/kopiur/compare/0.4.4...0.4.5) (2026-06-14)
 
 
