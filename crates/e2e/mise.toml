@@ -216,7 +216,20 @@ NODE="${CLUSTER}-control-plane"
 # the node (and the server) are still alive detaches those mounts so the node's death never
 # hits the blocking unmount path. Best-effort; a no-op when there are no NFS mounts.
 if docker inspect "$NODE" >/dev/null 2>&1; then
-  docker exec "$NODE" sh -c 'umount -f -l -a -t nfs4 2>/dev/null; umount -f -l -a -t nfs 2>/dev/null' >/dev/null 2>&1 || true
+  # Kill the NFS *clients* (kopia movers and the long-lived kopia-ui servers) FIRST, then
+  # unmount — all while the in-cluster NFS server is still alive (before `kind delete`).
+  # Order matters: a kopia-ui server holds its NFS mount BUSY, so a bare `umount -l` only
+  # lazy-detaches and DEFERS the NFSv4 session-destroy RPC until that process exits at
+  # kind-delete time — by which point the server is gone and the destroy RPC hangs forever
+  # (uninterruptible D-state → unkillable node). Killing the clients frees the mounts so the
+  # destroy/clientid RPCs complete against the still-live server. Best-effort; pkill from the
+  # node's root PID ns reaches pod processes (they are descendant PID namespaces).
+  docker exec "$NODE" sh -c '
+    pkill -9 kopia 2>/dev/null || true
+    sleep 1
+    umount -f -a -t nfs4 2>/dev/null || true; umount -f -a -t nfs 2>/dev/null || true
+    umount -f -l -a -t nfs4 2>/dev/null || true; umount -f -l -a -t nfs 2>/dev/null || true
+  ' >/dev/null 2>&1 || true
 fi
 echo "==> deleting kind cluster '$CLUSTER' (kubeconfig: $KUBECONFIG)"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
