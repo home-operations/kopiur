@@ -11,7 +11,7 @@ use crate::common::{
     RepositoryMode, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
-use crate::repository::{CatalogStatus, RepositoryPhase, StorageStats};
+use crate::repository::{CatalogStatus, RepositoryHealthSpec, RepositoryPhase, StorageStats};
 use crate::server::{ClusterServerSpec, ServerStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
 use kube::CustomResource;
@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Backend","type":"string","jsonPath":".status.backend"}"#,
     printcolumn = r#"{"name":"Namespaces","type":"integer","jsonPath":".status.allowedNamespaceCount"}"#,
     printcolumn = r#"{"name":"Server","type":"string","jsonPath":".status.server.endpoint"}"#,
+    printcolumn = r#"{"name":"IndexBlobs","type":"integer","jsonPath":".status.storageStats.indexBlobCount","priority":1}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 // §7/§15: create-time-immutability transition rules (apiserver + CI), same set as
@@ -113,6 +114,11 @@ pub struct ClusterRepositorySpec {
     /// connect/bootstrap and maintenance projection. Surfaced via a condition.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
+    /// Repository health thresholds (ADR-0005 §13), shared with `Repository` — see
+    /// [`RepositoryHealthSpec`]. Tunes the index-blob-count warning. Absent uses
+    /// the built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RepositoryHealthSpec>,
 }
 
 /// The repository-OWNER side of credential projection on a `ClusterRepository`

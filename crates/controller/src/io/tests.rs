@@ -1370,6 +1370,7 @@ mod bootstrap_outcomes {
             snapshot_count: 0,
             snapshots: vec![],
             snapshots_truncated: false,
+            index_blob_count: None,
             failure: None,
         }
     }

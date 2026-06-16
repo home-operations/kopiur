@@ -483,9 +483,56 @@ pub struct MaintenanceInfo {
     pub schedule: Option<MaintenanceSchedule>,
 }
 
+/// One entry from `kopia index list --json` — a single content-index blob.
+///
+/// kopia's index is a set of these blobs; periodic maintenance compacts them.
+/// When maintenance stops running (e.g. a stale lease owner), the count grows
+/// unbounded and kopia eventually warns "Found too many index blobs (N)". We
+/// only need the COUNT (the length of the array), so we keep just enough fields
+/// to make a meaningful, future-proof model and let serde ignore the rest
+/// (`timestamp`, `Superseded`, …).
+///
+/// ```
+/// use kopiur_kopia::IndexBlobEntry;
+///
+/// let json = r#"{"id":"xn0_5ce…-c1","length":143,"timestamp":"2026-06-15T22:30:50Z","Superseded":null}"#;
+/// let e: IndexBlobEntry = serde_json::from_str(json).unwrap();
+/// assert_eq!(e.length, 143);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexBlobEntry {
+    /// The index blob's id (kopia's `id`, e.g. `xn0_…-c1`).
+    #[serde(default)]
+    pub id: String,
+    /// On-disk length of the index blob in bytes.
+    #[serde(default)]
+    pub length: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_blob_list_counts_entries() {
+        // The real shape emitted by `kopia index list --json` (verified against
+        // kopia 0.23.0): a JSON array of entries. The count is the array length.
+        let json = r#"[
+            {"id":"xn0_aaa-c1","length":143,"timestamp":"2026-06-15T22:30:50.3-07:00","Superseded":null},
+            {"id":"xn0_bbb-c1","length":201,"timestamp":"2026-06-15T22:31:01.1-07:00","Superseded":null}
+        ]"#;
+        let entries: Vec<IndexBlobEntry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "xn0_aaa-c1");
+        assert_eq!(entries[1].length, 201);
+    }
+
+    #[test]
+    fn index_blob_list_empty_is_zero() {
+        let entries: Vec<IndexBlobEntry> = serde_json::from_str("[]").unwrap();
+        assert_eq!(entries.len(), 0);
+    }
 
     #[test]
     fn snapshot_source_identity() {

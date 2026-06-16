@@ -118,6 +118,51 @@ kopia tracks a single **maintenance owner** per repository. When several cluster
 
 The lease is read inside the maintenance Job (which is the only place with repository access for object stores). If the policy declines to take over, the run is a successful no-op that records why on the resource's conditions.
 
+### Self-healing a stale owner
+
+kopia stamps a maintenance owner when a repository is **created**. kopiur stamps its own stable, lease-derived owner (e.g. `kopiur@kopiur-clusterrepository-nas`) so that every maintenance Job — each from a fresh, throwaway pod — recognizes itself as the owner and runs.
+
+A repository created by an **older** kopiur (or by another tool) can instead carry kopia's auto-assigned **ephemeral** pod identity as the owner (e.g. `nonroot@nas-bootstrap-5trlr`). With the default `takeoverPolicy: Never`, every maintenance run then sees a "foreign" owner and yields **forever** — full maintenance never compacts, and index blobs pile up (see below).
+
+kopiur now **self-heals this automatically**: on every bootstrap (initial connect and each catalog refresh), if the recorded owner doesn't match the stable lease owner, the operator re-stamps it (`kopia maintenance set --owner` is not owner-gated). No manual intervention is needed. `takeoverPolicy: Force` remains available as an immediate, one-time override if you'd rather not wait for the next bootstrap cycle.
+
+## Index-blob health
+
+kopia stores its content index as a set of **index blobs**. Each backup adds one; **maintenance compacts them back down**. So in a healthy repository the count rises during the day and falls after the next full-maintenance run. If maintenance stops keeping up — most often a stale owner (above), but also a disabled/failing `Maintenance` — the count climbs without bound, and once it gets high enough kopia warns "Found too many index blobs (N)" and backup/restore performance degrades.
+
+kopiur observes the count on every bootstrap and surfaces it three ways, **without blocking the repository** (it stays `Ready`; this is a degradation warning, not an outage):
+
+- a print column — `kubectl get repository` / `kubectl get clusterrepository` shows an `IndexBlobs` column (wide output);
+- `status.storageStats.indexBlobCount`;
+- when the count crosses the threshold, an `IndexBlobHealth=False` condition (reason `TooManyIndexBlobs`) **and** a Kubernetes **Warning** event with the remediation in its message:
+
+```console
+$ kubectl describe clusterrepository nas-shared | grep -A2 TooManyIndexBlobs
+$ kubectl get events --field-selector reason=TooManyIndexBlobs -A
+```
+
+### The threshold knob
+
+`spec.health.indexBlobWarnThreshold` sets the count above which the warning fires. It's optional on both `Repository` and `ClusterRepository`:
+
+| Value             | Meaning                                                              |
+| ----------------- | ------------------------------------------------------------------- |
+| _absent_          | Use the built-in default of **1000** (well above a healthy repo).   |
+| a positive number | Warn when the count exceeds it (lower = earlier warning).           |
+| `0`               | **Disable** the warning entirely.                                   |
+
+```yaml
+spec:
+  health:
+    indexBlobWarnThreshold: 500   # warn sooner than the default 1000
+```
+
+/// warning | A high index-blob count means maintenance isn't running
+
+The warning is a symptom; the fix is to get maintenance compacting again. Check that a `Maintenance` exists and is `Ready`, that it isn't yielding (`LeaseOwned=False`, reason `LeaseHeldByOther`), and that its owner is the stable lease owner — not an ephemeral `…-bootstrap-…` identity. The operator self-heals a stale owner on the next bootstrap; to recover **now**, set `spec.maintenance.takeoverPolicy: Force` once. Raising or zeroing `indexBlobWarnThreshold` only silences the warning — it does not compact the index.
+
+///
+
 ## Running maintenance on demand
 
 Maintenance normally fires on its quick/full crons, but you can request an

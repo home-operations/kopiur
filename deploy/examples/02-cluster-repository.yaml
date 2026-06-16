@@ -61,6 +61,16 @@ spec:
   # (KOPIUR_NAMESPACE) when omitted.
   maintenance:
     namespace: kopiur-system
+  # Index-blob health (ADR-0005 §13). kopia's content index grows with each
+  # backup and is compacted by maintenance; if maintenance stops keeping up the
+  # count climbs unbounded and backups eventually degrade. The operator records
+  # the count on `status.storageStats.indexBlobCount` (and an `IndexBlobs` print
+  # column) and emits a Warning event + a non-blocking `IndexBlobHealth=False`
+  # condition when it crosses this threshold. Optional — omit to use the default
+  # of 1000; set to 0 to disable the warning. The repository stays Ready either
+  # way (this is a degradation signal, not an outage). See docs/maintenance.md.
+  health:
+    indexBlobWarnThreshold: 1000
 ---
 # In the tenant namespace — no need to know the secret name or platform details.
 apiVersion: kopiur.home-operations.com/v1alpha1

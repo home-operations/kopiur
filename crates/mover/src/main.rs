@@ -489,6 +489,33 @@ async fn run_bootstrap_flow(
     }
 }
 
+/// Decide whether the bootstrap mover should re-stamp the stable maintenance
+/// owner on a *connect-to-existing* repository. Returns `Some(owner)` to stamp,
+/// or `None` to leave the recorded owner alone.
+///
+/// The self-heal fires only when ALL hold:
+///   * `!created` — on a repo we just CREATED the owner was already stamped
+///     unconditionally, so re-reading/re-stamping would be redundant work.
+///   * a stable owner is configured (`desired.is_some()`).
+///   * kopia's currently-recorded `current` owner differs from `desired` — i.e.
+///     it's the ephemeral bootstrap-pod identity (or any foreign value), the
+///     exact state that makes `takeoverPolicy: Never` maintenance yield forever.
+///
+/// Pulled out of `run_bootstrap` so the gate is unit-testable without spawning
+/// kopia. The string we return is `kopia_owner_for_lease(managed_lease(..))` —
+/// exactly the `my_owner` the maintenance mover compares against, so after a
+/// re-stamp `held_by_other` is false and `maintenance run` proceeds.
+fn maintenance_restamp_target<'a>(
+    created: bool,
+    desired: Option<&'a str>,
+    current: &str,
+) -> Option<&'a str> {
+    match desired {
+        Some(owner) if !created && current != owner => Some(owner),
+        _ => None,
+    }
+}
+
 /// The bootstrap routine: connect-first (adopt an existing repo), create only
 /// when gated by [`should_attempt_create`], then read identity + catalog.
 async fn run_bootstrap(
@@ -549,6 +576,42 @@ async fn run_bootstrap(
         }
     }
 
+    // Self-heal a stale maintenance owner on connect-to-EXISTING. The stable,
+    // lease-derived owner is only stamped on CREATE (above); a repo created by an
+    // older operator (or where that stamp failed) keeps kopia's auto-assigned
+    // EPHEMERAL pod identity as the owner, so every later maintenance mover sees a
+    // foreign owner and — with the default `takeoverPolicy: Never` — yields forever:
+    // full maintenance never runs and index blobs accumulate ("too many index
+    // blobs"). `maintenance set --owner` is NOT owner-gated (only `run` is), so we
+    // re-stamp the stable owner here, making maintenance match without a manual
+    // `takeoverPolicy: Force`. Best-effort — a failed read/stamp degrades to the
+    // pre-existing Force-recovery path rather than failing the bootstrap.
+    if !created && let Some(desired) = op.maintenance_owner.as_deref() {
+        match client.maintenance_info().await {
+            Ok(info) => {
+                if let Some(owner) = maintenance_restamp_target(created, Some(desired), &info.owner)
+                {
+                    match client.maintenance_set_owner(owner).await {
+                        Ok(()) => info!(
+                            %owner,
+                            stale = %info.owner,
+                            "re-stamped stale maintenance owner on existing repository"
+                        ),
+                        Err(e) => warn!(
+                            %owner,
+                            class = %e.class(),
+                            "could not re-stamp stale maintenance owner; maintenance may need takeoverPolicy=Force once"
+                        ),
+                    }
+                }
+            }
+            Err(e) => warn!(
+                class = %e.class(),
+                "could not read maintenance owner to self-heal; continuing bootstrap"
+            ),
+        }
+    }
+
     let unique_id = match client.repository_status().await {
         Ok(s) => Some(s.unique_id_hex),
         Err(e) => return BootstrapResult::failed(&e),
@@ -579,7 +642,29 @@ async fn run_bootstrap(
         );
     }
 
-    BootstrapResult::ready(created, unique_id, snapshot_count, snapshots, truncated)
+    // Index-blob health (best-effort, off the hot path): count the content-index
+    // blobs so the controller can warn before maintenance falls far enough behind
+    // to degrade backups. A read failure must never fail bootstrap — leave it
+    // `None` and the controller keeps the prior count.
+    let index_blob_count = match client.index_blob_count().await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            warn!(
+                class = %e.class(),
+                "could not read index blob count; skipping index-blob health for this run"
+            );
+            None
+        }
+    };
+
+    BootstrapResult::ready(
+        created,
+        unique_id,
+        snapshot_count,
+        snapshots,
+        truncated,
+        index_blob_count,
+    )
 }
 
 /// Persist a [`BootstrapResult`] into the work-spec ConfigMap (best-effort). The
@@ -1502,6 +1587,63 @@ mod tests {
         assert_eq!(body["status"]["ownership"]["owner"], "other/owner");
         assert_eq!(body["status"]["conditions"][0]["status"], "False");
         assert_eq!(body["status"]["conditions"][0]["type"], "LeaseOwned");
+    }
+
+    // --- maintenance-owner self-heal gate (connect-to-existing re-stamp) ---
+
+    #[test]
+    fn restamp_fires_on_existing_repo_with_foreign_owner() {
+        // The bug case: connect-to-existing (`created == false`), a stable owner
+        // is configured, and kopia recorded a foreign (ephemeral) owner. The
+        // self-heal must re-stamp the stable owner so `takeoverPolicy: Never`
+        // maintenance stops yielding forever.
+        assert_eq!(
+            maintenance_restamp_target(
+                false,
+                Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
+                "nonroot@rustfs-kopiur-bootstrap-5trlr",
+            ),
+            Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
+        );
+    }
+
+    #[test]
+    fn restamp_skipped_when_owner_already_stable() {
+        // Idempotent: the recorded owner already equals the stable value, so
+        // there is nothing to heal and we avoid a needless `maintenance set`.
+        assert_eq!(
+            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), "kopiur@kopiur-prod"),
+            None,
+        );
+    }
+
+    #[test]
+    fn restamp_skipped_on_create_path() {
+        // On CREATE the owner is stamped unconditionally elsewhere; the connect
+        // self-heal must not also fire (even if `current` looks foreign).
+        assert_eq!(
+            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), "ephemeral@pod-xyz"),
+            None,
+        );
+    }
+
+    #[test]
+    fn restamp_skipped_without_configured_owner() {
+        // No stable owner configured (e.g. maintenance disabled) → never stamp.
+        assert_eq!(
+            maintenance_restamp_target(false, None, "ephemeral@pod-xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn restamp_heals_empty_recorded_owner() {
+        // An empty recorded owner is still foreign relative to the stable value,
+        // so we stamp it (kopia would otherwise leave it unowned).
+        assert_eq!(
+            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), ""),
+            Some("kopiur@kopiur-prod"),
+        );
     }
 
     // --- `kopiur-mover ready` probe mode: the pure marker decision ---

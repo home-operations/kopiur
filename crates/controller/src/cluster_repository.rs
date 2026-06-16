@@ -21,6 +21,7 @@ use kube::{Api, ResourceExt};
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{CatalogBounds, RepositoryKind};
+use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{ClusterRepository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
 use kopiur_mover::bootstrap::{BootstrapResult, RESULT_CONFIGMAP_KEY};
@@ -35,6 +36,7 @@ use crate::consts::{
 };
 use crate::context::Context;
 use crate::error::{Error, Result, TERMINAL_HEARTBEAT, error_policy_for};
+use crate::health;
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs};
 use crate::server::{
@@ -875,7 +877,7 @@ async fn finalize_cluster_bootstrap(
     };
 
     let allowed_count = allowed_namespace_count(&repo.spec.allowed_namespaces);
-    let conditions = cluster_bootstrap_condition(
+    let mut conditions = cluster_bootstrap_condition(
         repo,
         true,
         "Bootstrapped",
@@ -885,6 +887,24 @@ async fn finalize_cluster_bootstrap(
             "connected to the existing repository"
         },
     );
+    // Index-blob health (ADR-0005 §13): fold IndexBlobHealth into the same
+    // conditions array and stamp the count onto storageStats (merge-patch
+    // preserves snapshotCount below). Best-effort in the mover — `None` leaves the
+    // prior condition/count. The Warning event fires only on the transition.
+    let threshold = resolve_index_blob_warn_threshold(repo.spec.health.as_ref());
+    let mut index_blob_event = None;
+    let mut storage_stats = serde_json::json!({ "snapshotCount": result.snapshot_count });
+    if let Some(count) = result.index_blob_count {
+        let upd = health::reconcile_index_blob_health(
+            &conditions,
+            count,
+            threshold,
+            repo.metadata.generation,
+        );
+        conditions = upd.conditions;
+        index_blob_event = upd.event;
+        storage_stats["indexBlobCount"] = serde_json::json!(count);
+    }
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
     // re-write of identical status would bump `resourceVersion` and re-trigger
@@ -905,11 +925,16 @@ async fn finalize_cluster_bootstrap(
             "backend": backend.kind_str(),
             "uniqueId": result.unique_id,
             "allowedNamespaceCount": allowed_count,
-            "storageStats": { "snapshotCount": result.snapshot_count },
+            "storageStats": storage_stats,
             "conditions": conditions,
         }),
     )
     .await?;
+    // Fire the Warning Event only on the transition into unhealthy. Non-blocking:
+    // the cluster repository stays Ready.
+    if let Some(w) = index_blob_event {
+        io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+    }
     if result.snapshots_truncated {
         tracing::warn!(
             repo = %name,
