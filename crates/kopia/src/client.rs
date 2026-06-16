@@ -24,7 +24,8 @@ use tokio::process::Command;
 
 use crate::error::{KopiaError, KopiaErrorClass, tail_lines};
 use crate::model::{
-    MaintenanceInfo, RepositoryStatus, SnapshotCreateResult, SnapshotListEntry, SnapshotSource,
+    IndexBlobEntry, MaintenanceInfo, RepositoryStatus, SnapshotCreateResult, SnapshotListEntry,
+    SnapshotSource,
 };
 
 /// Which maintenance pass to run.
@@ -1145,6 +1146,20 @@ impl KopiaClient {
     pub async fn maintenance_info(&self) -> Result<MaintenanceInfo, KopiaError> {
         let args = vec!["maintenance".into(), "info".into(), "--json".into()];
         self.run_json(&args, "maintenance info").await
+    }
+
+    /// Count the repository's content-index blobs (`kopia index list --json`,
+    /// array length). kopia's index is compacted by periodic maintenance; when
+    /// maintenance stops (e.g. a stale lease owner), this grows unbounded and
+    /// kopia eventually warns "Found too many index blobs (N), ensure periodic
+    /// repository maintenance". The operator surfaces a Kubernetes Warning when
+    /// this crosses a configurable threshold. Cheap — lists index-blob metadata
+    /// only, no content read. Verified against kopia 0.23 (`index list
+    /// --[no-]json`).
+    pub async fn index_blob_count(&self) -> Result<i64, KopiaError> {
+        let args = vec!["index".into(), "list".into(), "--json".into()];
+        let entries: Vec<IndexBlobEntry> = self.run_json(&args, "index list").await?;
+        Ok(entries.len() as i64)
     }
 
     /// Claim the repository's maintenance ownership for the *currently connected*

@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Backend","type":"string","jsonPath":".status.backend"}"#,
     printcolumn = r#"{"name":"Server","type":"string","jsonPath":".status.server.endpoint"}"#,
+    printcolumn = r#"{"name":"IndexBlobs","type":"integer","jsonPath":".status.storageStats.indexBlobCount","priority":1}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 // §7/§15: create-time-immutability transition rules in the CRD schema (apiserver +
@@ -98,6 +99,50 @@ pub struct RepositorySpec {
     /// skips connect/bootstrap and maintenance projection. Surfaced via a condition.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
+    /// Repository health thresholds (ADR-0005 §13): tuning for the warnings the
+    /// reconciler raises about a degrading-but-still-usable repository (currently
+    /// the index-blob-count warning). A sub-object so future health knobs slot in
+    /// without API breakage. Absent uses the built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RepositoryHealthSpec>,
+}
+
+/// Repository health thresholds (ADR-0005 §13). A sub-object on
+/// `Repository`/`ClusterRepository` `spec.health` so future health knobs slot in
+/// without API breakage. Shared by both kinds.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryHealthSpec {
+    /// Index-blob count above which the reconciler raises the `IndexBlobHealth`
+    /// condition + a Warning event (maintenance isn't compacting fast enough).
+    /// Absent uses [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`] (1000). `0` disables the
+    /// warning entirely; negative is rejected by the admission webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob_warn_threshold: Option<i64>,
+}
+
+/// Resolve the effective index-blob warning threshold from an optional
+/// `spec.health`. Pure, so it's shared by the admission webhook, the controller,
+/// and tests without forking the default/disable semantics:
+///
+/// * absent spec or unset field ⇒ [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`],
+/// * `Some(0)` ⇒ `0` (the sentinel that disables the warning),
+/// * `Some(n)` ⇒ `n`.
+///
+/// ```
+/// use kopiur_api::repository::{resolve_index_blob_warn_threshold, RepositoryHealthSpec};
+/// use kopiur_api::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD;
+///
+/// assert_eq!(resolve_index_blob_warn_threshold(None), DEFAULT_INDEX_BLOB_WARN_THRESHOLD);
+/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(0) };
+/// assert_eq!(resolve_index_blob_warn_threshold(Some(&h)), 0); // disabled
+/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(250) };
+/// assert_eq!(resolve_index_blob_warn_threshold(Some(&h)), 250);
+/// ```
+pub fn resolve_index_blob_warn_threshold(health: Option<&RepositoryHealthSpec>) -> i64 {
+    health
+        .and_then(|h| h.index_blob_warn_threshold)
+        .unwrap_or(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
 }
 
 /// Lifecycle phase of a repository. ADR §3.1 status.
@@ -198,6 +243,13 @@ pub struct StorageStats {
     /// RFC 3339 timestamp these stats were last observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed_at: Option<String>,
+    /// Number of content-index blobs (`kopia index list`) observed at the last
+    /// bootstrap. kopia compacts these during maintenance; an unbounded climb
+    /// means maintenance isn't keeping up. The reconciler raises the
+    /// `IndexBlobHealth` condition + a Warning event when this crosses
+    /// `spec.health.indexBlobWarnThreshold`. ADR-0005 §13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob_count: Option<i64>,
 }
 
 /// Status of catalog materialization for `origin: discovered` `Snapshot` CRs. ADR §3.1 status.
@@ -248,6 +300,78 @@ suspend: true
         assert_eq!(json["suspend"], true);
         let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn health_threshold_parses_and_resolver_honors_default_and_disable() {
+        // Absent spec.health → default threshold.
+        let bare: RepositorySpec = from_yaml(
+            r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+"#,
+        );
+        assert!(bare.health.is_none());
+        assert_eq!(
+            resolve_index_blob_warn_threshold(bare.health.as_ref()),
+            crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD
+        );
+
+        // Explicit override parses the cluster's way and resolves verbatim.
+        let tuned: RepositorySpec = from_yaml(
+            r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+health:
+  indexBlobWarnThreshold: 250
+"#,
+        );
+        assert_eq!(
+            resolve_index_blob_warn_threshold(tuned.health.as_ref()),
+            250
+        );
+
+        // 0 is the disable sentinel (not "fall back to default").
+        let disabled: RepositorySpec = from_yaml(
+            r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+health:
+  indexBlobWarnThreshold: 0
+"#,
+        );
+        assert_eq!(
+            resolve_index_blob_warn_threshold(disabled.health.as_ref()),
+            0
+        );
+    }
+
+    #[test]
+    fn storage_stats_index_blob_count_roundtrips() {
+        let stats = StorageStats {
+            snapshot_count: Some(12),
+            total_size: None,
+            last_observed_at: None,
+            index_blob_count: Some(1448),
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["indexBlobCount"], 1448);
+        let back: StorageStats = serde_json::from_value(json).unwrap();
+        assert_eq!(back, stats);
+    }
+
+    #[test]
+    fn repository_crd_exposes_index_blobs_print_column() {
+        let crd = Repository::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .expect("printer columns present");
+        assert!(
+            cols.iter().any(|c| c["name"] == "IndexBlobs"
+                && c["jsonPath"] == ".status.storageStats.indexBlobCount"),
+            "Repository must surface the IndexBlobs print column"
+        );
     }
 
     #[test]

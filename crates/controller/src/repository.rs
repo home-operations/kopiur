@@ -24,6 +24,7 @@ use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{CatalogBounds, RepositoryKind};
+use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{Repository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
 use kopiur_mover::bootstrap::{BootstrapResult, RESULT_CONFIGMAP_KEY};
@@ -35,6 +36,7 @@ use crate::catalog;
 use crate::consts::{API_VERSION, BOOTSTRAP_JOB_DEADLINE_SECS, REPOSITORY_BOOTSTRAPPED_CONDITION};
 use crate::context::Context;
 use crate::error::{Error, Result, TERMINAL_HEARTBEAT, error_policy_for};
+use crate::health;
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs};
 use crate::snapshot::{backend_to_repository_connect, mover_pull_policy_pub};
@@ -309,20 +311,86 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
 
             // Status: phase/uniqueId/backend/resolvedCredentialVersion.
             let status = client.repository_status().await?;
+
+            // Self-heal the maintenance owner on this in-process (bare-path
+            // filesystem) path, mirroring the mover's bootstrap stamp/self-heal
+            // (`maintenance_restamp_target`). kopia records the controller pod's
+            // ephemeral identity as owner on create, and an older operator may
+            // have left a stale one — either way the managed Maintenance's
+            // `takeoverPolicy: Never` would yield forever. Re-stamp the stable
+            // lease owner (`maintenance set --owner` is NOT owner-gated) so
+            // maintenance recognizes itself. Only when writes are allowed (a
+            // ReadOnly repo runs no maintenance). Best-effort — never fail the
+            // reconcile over it.
+            if repo.spec.mode.allows_writes() {
+                let owner = kopiur_api::maintenance::kopia_owner_for_lease(
+                    &kopiur_api::maintenance::managed_lease(
+                        RepositoryKind::Repository,
+                        &namespace,
+                        &name,
+                    ),
+                );
+                match client.maintenance_info().await {
+                    Ok(info) if info.owner != owner => {
+                        match client.maintenance_set_owner(&owner).await {
+                            Ok(()) => {
+                                tracing::info!(%owner, stale = %info.owner, "re-stamped maintenance owner on filesystem repository")
+                            }
+                            Err(e) => {
+                                tracing::warn!(%owner, class = %e.class(), "could not re-stamp maintenance owner; maintenance may need takeoverPolicy=Force once")
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(class = %e.class(), "could not read maintenance owner to self-heal; continuing")
+                    }
+                }
+            }
+
+            // Index-blob health (ADR-0005 §13): count the index blobs (best-effort)
+            // and fold the IndexBlobHealth condition into the conditions we pass on
+            // to `ensure_maintenance` (a status patch replaces the whole conditions
+            // array, so there must be a single source of truth). The Warning event
+            // fires only on the transition into unhealthy.
+            let index_blob_count = match client.index_blob_count().await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    tracing::warn!(class = %e.class(), "could not read index blob count; skipping index-blob health");
+                    None
+                }
+            };
+            let mut conditions = repo
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let mut index_blob_event = None;
+            let mut status_patch = serde_json::json!({
+                "phase": "Ready",
+                "backend": "Filesystem",
+                "uniqueId": status.unique_id_hex,
+                "observedGeneration": repo.metadata.generation,
+                "resolvedCredentialVersion": cred_version,
+            });
+            if let Some(count) = index_blob_count {
+                let threshold = resolve_index_blob_warn_threshold(repo.spec.health.as_ref());
+                let upd = health::reconcile_index_blob_health(
+                    &conditions,
+                    count,
+                    threshold,
+                    repo.metadata.generation,
+                );
+                conditions = upd.conditions;
+                index_blob_event = upd.event;
+                status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
+                status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
+            }
             let current = serde_json::to_value(&repo.status).ok();
-            io::patch_status_if_changed(
-                &api,
-                &name,
-                current.as_ref(),
-                serde_json::json!({
-                    "phase": "Ready",
-                    "backend": "Filesystem",
-                    "uniqueId": status.unique_id_hex,
-                    "observedGeneration": repo.metadata.generation,
-                    "resolvedCredentialVersion": cred_version,
-                }),
-            )
-            .await?;
+            io::patch_status_if_changed(&api, &name, current.as_ref(), status_patch).await?;
+            if let Some(w) = index_blob_event {
+                io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+            }
 
             // Catalog scan on the `catalog.refreshInterval` cadence — or
             // immediately on a spec change (`scan_due`'s generation arm: a
@@ -349,14 +417,11 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             }
 
             // Now that the repo is Ready, ensure its managed Maintenance exists
-            // (default-on) and surface the MaintenanceConfigured condition. A
-            // namespaced Repository's Maintenance lives in the repo's namespace.
-            // ADR §3.7.
-            let conditions = repo
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
+            // (default-on) and surface the MaintenanceConfigured condition. Built
+            // on the `conditions` we just patched (which include IndexBlobHealth),
+            // NOT the stale cached object — both writes replace the whole array, so
+            // re-reading would drop the condition we set above. A namespaced
+            // Repository's Maintenance lives in the repo's namespace. ADR §3.7.
             // §11: a ReadOnly repository runs no maintenance (it serves restores
             // only). Skip the projection so no managed Maintenance is created.
             if repo.spec.mode.allows_writes() {
@@ -807,7 +872,7 @@ async fn finalize_bootstrap(
     };
 
     // Success: Ready + uniqueId + a Bootstrapped=True condition.
-    let conditions = bootstrap_condition(
+    let mut conditions = bootstrap_condition(
         repo,
         true,
         "Bootstrapped",
@@ -817,27 +882,46 @@ async fn finalize_bootstrap(
             "connected to the existing repository"
         },
     );
+    // Index-blob health (ADR-0005 §13): fold the IndexBlobHealth condition into the
+    // SAME conditions array (a status patch replaces the whole array), and stamp
+    // the observed count on storageStats. `index_blob_count` is best-effort in the
+    // mover — `None` means the count couldn't be read this run, so leave the prior
+    // condition/count untouched. The Warning event fires only on the transition.
+    let threshold = resolve_index_blob_warn_threshold(repo.spec.health.as_ref());
+    let mut index_blob_event = None;
+    let mut status_patch = serde_json::json!({
+        "phase": "Ready",
+        "backend": backend.kind_str(),
+        "uniqueId": result.unique_id,
+        // Track the generation this result was taken for — the recycle gate
+        // compares it so a spec edit re-runs the bootstrap instead of
+        // re-reporting the old repository's identity forever.
+        "observedGeneration": repo.metadata.generation,
+    });
+    if let Some(count) = result.index_blob_count {
+        let upd = health::reconcile_index_blob_health(
+            &conditions,
+            count,
+            threshold,
+            repo.metadata.generation,
+        );
+        conditions = upd.conditions;
+        index_blob_event = upd.event;
+        // Merge-patch: setting storageStats.indexBlobCount preserves snapshotCount.
+        status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
+    }
+    status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
     // re-write of identical status would bump `resourceVersion` and re-trigger
     // this reconciler through its own primary watch, in a tight loop.
     let current = serde_json::to_value(&repo.status).ok();
-    io::patch_status_if_changed(
-        api,
-        name,
-        current.as_ref(),
-        serde_json::json!({
-            "phase": "Ready",
-            "backend": backend.kind_str(),
-            "uniqueId": result.unique_id,
-            // Track the generation this result was taken for — the recycle gate
-            // compares it so a spec edit re-runs the bootstrap instead of
-            // re-reporting the old repository's identity forever.
-            "observedGeneration": repo.metadata.generation,
-            "conditions": conditions,
-        }),
-    )
-    .await?;
+    io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
+    // Fire the Warning Event only on the transition into unhealthy (not on every
+    // requeue while it stays unhealthy). Non-blocking: the repo is still Ready.
+    if let Some(w) = index_blob_event {
+        io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+    }
     if result.snapshots_truncated {
         tracing::warn!(
             repo = %name,

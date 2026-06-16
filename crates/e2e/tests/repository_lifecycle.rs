@@ -11,10 +11,11 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::storage::v1::StorageClass;
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
@@ -512,4 +513,154 @@ async fn fixed_credential_secret_unsticks_failed_repository() {
     );
 
     let _ = repos.delete("e2e-rotate", &DeleteParams::default()).await;
+}
+
+/// Index-blob health (ADR-0005 §13): a repository whose content-index blob count
+/// crosses `spec.health.indexBlobWarnThreshold` must surface it non-blockingly —
+/// `status.storageStats.indexBlobCount`, an `IndexBlobHealth=False` condition
+/// (reason `TooManyIndexBlobs`), and a Kubernetes **Warning** event — while
+/// staying `Ready`. This is the symptom side of the maintenance-not-compacting
+/// problem that wedged a real cluster at 1448 index blobs.
+///
+/// We drive it deterministically: kopia adds an index blob per snapshot session
+/// (no maintenance compacts them here), so a couple of seeded snapshots push the
+/// count above a threshold of 1. We start the threshold high (healthy), seed the
+/// snapshots, then lower it to 1 — the spec edit bumps `generation`, which
+/// recycles the bootstrap Job (`bootstrap_recycle_due`) for a fresh count read,
+/// and exercises the healthy→unhealthy transition that gates the one-shot event.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn too_many_index_blobs_warns_without_blocking_ready() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_repo(&client, "idxhealth").await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Repository over the isolated `idxhealth` repo, with the warning threshold
+    // set HIGH so it starts healthy (a freshly-created repo has ~1 index blob).
+    let repo = "e2e-idx-repo";
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                repo,
+                "idxhealth",
+                serde_json::json!({ "health": { "indexBlobWarnThreshold": 100 } }),
+            )),
+        )
+        .await
+        .expect("create Repository with health threshold");
+    wait_phase(&repos, repo, "Ready")
+        .await
+        .expect("repo should connect to Ready");
+
+    // Seed two snapshots so the index-blob count climbs above 1 (one index blob
+    // per snapshot session; nothing compacts them mid-test).
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                "e2e-idx-policy",
+                "Repository",
+                repo,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+    for snap in ["e2e-idx-snap-1", "e2e-idx-snap-2"] {
+        backups
+            .create(
+                &PostParams::default(),
+                &cr(snapshot_json(
+                    E2E_NAMESPACE,
+                    snap,
+                    "e2e-idx-policy",
+                    serde_json::json!({}),
+                )),
+            )
+            .await
+            .expect("create Snapshot");
+        wait_phase(&backups, snap, "Succeeded")
+            .await
+            .expect("seed Snapshot Succeeded");
+    }
+
+    // Lower the threshold to 1. The spec edit bumps generation → recycles the
+    // bootstrap Job → fresh index_blob_count read against the now-1 threshold.
+    repos
+        .patch(
+            repo,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "spec": { "health": { "indexBlobWarnThreshold": 1 } }
+            })),
+        )
+        .await
+        .expect("patch threshold to 1");
+
+    // The IndexBlobHealth condition flips False with reason TooManyIndexBlobs.
+    let cond = wait_condition(&repos, repo, "IndexBlobHealth", "False")
+        .await
+        .expect("a repo over the index-blob threshold must surface IndexBlobHealth=False");
+    assert_eq!(
+        cond.get("reason").and_then(|r| r.as_str()),
+        Some("TooManyIndexBlobs"),
+        "the index-blob warning reason must be TooManyIndexBlobs"
+    );
+
+    // The observed count is stamped on status and is above the threshold.
+    let s = status_json(&repos, repo).await;
+    let count = s
+        .get("storageStats")
+        .and_then(|ss| ss.get("indexBlobCount"))
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    assert!(
+        count >= 2,
+        "status.storageStats.indexBlobCount must reflect the seeded snapshots (got {count}); status={s}"
+    );
+
+    // The repository stays Ready — the warning is informational, NOT an outage,
+    // so GitOps health gates are not tripped.
+    assert_eq!(
+        s.get("phase").and_then(|p| p.as_str()),
+        Some("Ready"),
+        "too many index blobs must NOT take the repository out of Ready"
+    );
+
+    // A Warning event with the machine-readable reason is published on the repo.
+    wait_until(
+        "a TooManyIndexBlobs Warning event is published for the Repository",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let list = events.list(&ListParams::default()).await?;
+            let found = list.items.iter().any(|e| {
+                e.type_.as_deref() == Some("Warning")
+                    && e.reason.as_deref() == Some("TooManyIndexBlobs")
+                    && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some(repo)
+            });
+            Ok(found.then_some(()))
+        },
+    )
+    .await
+    .expect("the index-blob-health Warning event must be published");
+
+    // Cleanup: remove the snapshots (Retain → no kopia delete) and the repo.
+    for snap in ["e2e-idx-snap-1", "e2e-idx-snap-2"] {
+        let _ = backups.delete(snap, &DeleteParams::default()).await;
+    }
+    let _ = policies
+        .delete("e2e-idx-policy", &DeleteParams::default())
+        .await;
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
 }

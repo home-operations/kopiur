@@ -8,6 +8,7 @@ pub mod config;
 pub mod consts;
 pub mod context;
 pub mod error;
+pub mod health;
 pub mod hooks;
 pub mod io;
 pub mod jobs;

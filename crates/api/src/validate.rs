@@ -22,7 +22,7 @@ use crate::common::{
 };
 use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
-use crate::repository::RepositorySpec;
+use crate::repository::{RepositoryHealthSpec, RepositorySpec};
 use crate::repository_replication::RepositoryReplicationSpec;
 use crate::restore::{RestoreSource, RestoreSpec, RestoreTarget};
 use crate::server::{ServerAuth, ServerSpec};
@@ -417,6 +417,30 @@ pub fn validate_failure_policy(fp: &FailurePolicy, context: &str) -> ValidationR
     Ok(())
 }
 
+/// `spec.health` rules shared by `Repository` and `ClusterRepository`
+/// (ADR-0005 §13). The index-blob warning threshold must be non-negative: a
+/// negative count is nonsensical, and `0` is the documented sentinel that
+/// disables the warning (so it is allowed). `context` names the kind for the
+/// message ("Repository" / "ClusterRepository").
+pub fn validate_repository_health(
+    health: Option<&RepositoryHealthSpec>,
+    context: &str,
+) -> ValidationResult {
+    if let Some(h) = health
+        && let Some(t) = h.index_blob_warn_threshold
+        && t < 0
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} health.indexBlobWarnThreshold"),
+            reason: format!(
+                "must be >= 0 (got {t}); 0 disables the index-blob warning, a positive \
+                 value is the count above which a Warning is raised"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Whether a [`Retention`] selects **no** snapshots — every bucket unset or `0`. The
 /// controller only prunes when `spec.retention` is `Some` ([`crate::retention::select_kept`]
 /// over the buckets), so a `Some(keeps-nothing)` retention prunes *every* `Snapshot`
@@ -553,7 +577,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         mover_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false,
+/// #         mover_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -893,6 +917,9 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     }
     if let Some(server) = &spec.server {
         errs.extend(validate_server(server, spec.mode));
+    }
+    if let Err(e) = validate_repository_health(spec.health.as_ref(), "Repository") {
+        errs.push(e);
     }
     errs
 }
@@ -1378,6 +1405,9 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
             errs.push(ValidationError::ServerNamespaceRequired);
         }
         errs.extend(validate_server(&server.server, spec.mode));
+    }
+    if let Err(e) = validate_repository_health(spec.health.as_ref(), "ClusterRepository") {
+        errs.push(e);
     }
     errs
 }
@@ -2391,6 +2421,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
         };
         assert!(validate_repository_no_inline_retention(&spec).is_ok());
     }
@@ -2607,6 +2638,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
         }
     }
 
@@ -2698,6 +2730,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
             credential_projection: None,
         };
         assert!(!validate_cluster_repository(&spec).is_empty());
@@ -2734,6 +2767,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
             credential_projection: None,
         };
         let errs = validate_cluster_repository(&spec);
@@ -2780,6 +2814,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
         }
     }
 
@@ -2836,6 +2871,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
             credential_projection: None,
         };
         assert!(
@@ -2930,6 +2966,7 @@ mod tests {
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             suspend: false,
+            health: None,
             credential_projection: None,
         };
         let old = mk("FIXED-4M");
@@ -3622,6 +3659,42 @@ server:
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn repository_health_rejects_negative_threshold_but_allows_zero() {
+        // Negative is nonsensical → rejected with an actionable message.
+        let bad = RepositoryHealthSpec {
+            index_blob_warn_threshold: Some(-1),
+        };
+        let err = validate_repository_health(Some(&bad), "Repository").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("indexBlobWarnThreshold"),
+            "names the field: {msg}"
+        );
+        assert!(msg.contains(">= 0"), "explains the constraint: {msg}");
+
+        // 0 (disable sentinel) and a positive threshold are valid; absent is valid.
+        assert!(
+            validate_repository_health(
+                Some(&RepositoryHealthSpec {
+                    index_blob_warn_threshold: Some(0)
+                }),
+                "Repository"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_repository_health(
+                Some(&RepositoryHealthSpec {
+                    index_blob_warn_threshold: Some(2000)
+                }),
+                "ClusterRepository"
+            )
+            .is_ok()
+        );
+        assert!(validate_repository_health(None, "Repository").is_ok());
     }
 
     // --- retention keeps-nothing data-loss guard ---

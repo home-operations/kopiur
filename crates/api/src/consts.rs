@@ -104,6 +104,22 @@ pub const STALLED_CONDITION: &str = "Stalled";
 /// plugin's `status` read it.
 pub const MAINTENANCE_CONFIGURED_CONDITION: &str = "MaintenanceConfigured";
 
+/// `Repository`/`ClusterRepository` condition reporting content-index-blob
+/// health (ADR-0005 §13). `True` = healthy (count under threshold); `False`
+/// with reason `TooManyIndexBlobs` = the index is growing unbounded because
+/// maintenance isn't compacting. NON-BLOCKING: the repository stays `Ready` and
+/// GitOps health gates are not tripped — it's a degradation warning, not an
+/// outage. Wire-visible (the kubectl plugin's `status` reads it).
+pub const INDEX_BLOB_HEALTH_CONDITION: &str = "IndexBlobHealth";
+
+/// Default `spec.health.indexBlobWarnThreshold`: the index-blob count above which
+/// the reconciler warns that maintenance isn't keeping up. A freshly-compacted
+/// repo sits near zero; a wedged-maintenance repo climbs unbounded (a real one
+/// reached 1448). Conservative so it only fires when maintenance is clearly
+/// behind. Overridable per-repo; `0` disables the warning. Part of the documented
+/// API contract, so it lives here rather than in the controller.
+pub const DEFAULT_INDEX_BLOB_WARN_THRESHOLD: i64 = 1000;
+
 /// Default catalog re-scan cadence when `spec.catalog.refreshInterval` is unset:
 /// how often a `Ready` repository re-lists its kopia snapshots to materialize
 /// (and expire) `origin: discovered` `Snapshot` CRs. Part of the documented API

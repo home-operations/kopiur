@@ -15,7 +15,7 @@ pub use client::{
 pub use error::{KopiaError, KopiaErrorClass};
 pub use model::{
     ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite,
-    MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus, RootEntry,
-    SnapshotCreateResult, SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo,
+    IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus,
+    RootEntry, SnapshotCreateResult, SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo,
 };
 pub use session::SessionCmd;
