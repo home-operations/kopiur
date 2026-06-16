@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.8](https://github.com/home-operations/kopiur/compare/0.4.7...0.4.8) (2026-06-16)
+
+
+### Features
+
+* **repository:** warn on too-many-index-blobs + self-heal stale maintenance owner ([#122](https://github.com/home-operations/kopiur/issues/122)) ([2365249](https://github.com/home-operations/kopiur/commit/2365249e3fa0152153026c852aeb50df35d40fc2))
+
+
+### Bug Fixes
+
+* **docker:** tolerate a v-prefixed KOPIA_VERSION so image builds don't 404 ([5cf2df2](https://github.com/home-operations/kopiur/commit/5cf2df2ea850c17c6ca150976faaca3526bffad0))
+* **restore:** complete the populator rebind when the mover stamps Completed early ([#121](https://github.com/home-operations/kopiur/issues/121)) ([19b6412](https://github.com/home-operations/kopiur/commit/19b6412328a2a204058d96fc40e6ac450b4df3a9))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.7 manifest ([01c6234](https://github.com/home-operations/kopiur/commit/01c62346dad1e969c4c083da4216c382cc565cb7))
+* **mise:** update tool kopia (0.23.0 → v0.23.1) ([#120](https://github.com/home-operations/kopiur/issues/120)) ([88edf8c](https://github.com/home-operations/kopiur/commit/88edf8cfba29f9b04bbf4dfb45c8fae48f41e2c6))
+* **mise:** update tool oxfmt (0.54.0 → 0.55.0) ([#119](https://github.com/home-operations/kopiur/issues/119)) ([5891810](https://github.com/home-operations/kopiur/commit/5891810983e8e6d3ece921aa31f4281c707c4764))
+
 ## [0.4.7](https://github.com/home-operations/kopiur/compare/0.4.6...0.4.7) (2026-06-15)
 
 
