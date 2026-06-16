@@ -30,6 +30,10 @@ ARG KOPIA_VERSION
 ARG TARGETARCH
 RUN set -eux; \
     test -n "${KOPIA_VERSION}" || { echo "KOPIA_VERSION build arg is required" >&2; exit 1; }; \
+    # Normalize the pin: mise/renovate may carry a leading "v" (e.g. "v0.23.1"), \
+    # but the release tag is "v<ver>" and the asset is "kopia-<ver>-...". Strip any \
+    # leading "v" so both "0.23.1" and "v0.23.1" resolve to the same real URL. \
+    KVER="${KOPIA_VERSION#v}"; \
     apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; \
     case "${TARGETARCH}" in \
       amd64) KARCH=x64 ;; \
@@ -37,9 +41,9 @@ RUN set -eux; \
       *) echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/kopia.tar.gz \
-      "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-${KARCH}.tar.gz"; \
+      "https://github.com/kopia/kopia/releases/download/v${KVER}/kopia-${KVER}-linux-${KARCH}.tar.gz"; \
     tar -xzf /tmp/kopia.tar.gz -C /tmp; \
-    install -m 0755 "/tmp/kopia-${KOPIA_VERSION}-linux-${KARCH}/kopia" /usr/local/bin/kopia
+    install -m 0755 "/tmp/kopia-${KVER}-linux-${KARCH}/kopia" /usr/local/bin/kopia
 
 # Pull the official rclone release binary at a pinned version (the rclone backend
 # shells out to it). Distributed as a .zip, so this stage needs unzip.
