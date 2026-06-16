@@ -131,10 +131,13 @@ jobs:
             backends: true
           # ADR-0004/0005 reshape scenarios (Filesystem only). Split in two so the
           # cron-driven verify/replication waits don't push one shard past the job
-          # timeout.
+          # timeout. `csi: true` installs the CSI snapshot stack (csi-hostpath-sc) so
+          # the populator-restore handshake (repository_lifecycle) and copyMethod
+          # Snapshot/Clone (copy_methods) tests run for real instead of self-skipping.
           - shard: reshape-core
-            bins: "mover_config data_integrity repository_lifecycle tenancy"
+            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods"
             backends: false
+            csi: true
           # Hooks (ADR §4.8) + GFS time-bucketed retention + policy knobs. The
           # httpRequest hook reuses the WebDAV fixture as its receiver, so this
           # shard preloads the backend images.
@@ -191,6 +194,15 @@ jobs:
       - name: Seed node fixtures
         run: mise run //crates/e2e:node-seed
 
+      # CSI snapshot stack (vendored, hermetic): csi-hostpath-sc + a default
+      # VolumeSnapshotClass. Required by the populator-restore handshake and the
+      # copyMethod Snapshot/Clone tests; those tests SKIP without it, so a shard that
+      # runs them must opt in via `csi: true`. Installed before the chart, matching
+      # scripts/with-kind.sh's ordering.
+      - name: Install CSI snapshot stack
+        if: matrix.csi
+        run: mise run //crates/e2e:snapshot-stack
+
       - name: Install chart
         run: mise run //crates/e2e:helm
 
@@ -198,6 +210,11 @@ jobs:
         env:
           KOPIUR_E2E_BINS: ${{ matrix.bins }}
           KOPIUR_E2E_SKIP_BUILD: "1"
+          # On a `csi: true` shard the stack is installed above, so a missing
+          # csi-hostpath-sc is a setup failure — make the CSI-dependent tests
+          # HARD-FAIL instead of silently skipping (which once let a populator
+          # regression ship green; see #121).
+          KOPIUR_E2E_REQUIRE_CSI: ${{ matrix.csi && '1' || '' }}
         run: mise run //crates/e2e:run
 
       # Dump cluster state for this shard before teardown so a failure is
