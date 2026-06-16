@@ -26,7 +26,7 @@ kubectl = "1.36.2"
 # `shellcheck` on staged *.sh files; pin it so the hook resolves a binary.
 shellcheck = "0.11.0"
 kind = "0.32.0"
-kopia = "0.23.0"
+kopia = "v0.23.1"
 "aqua:EmbarkStudios/cargo-deny" = "0.19.8"
 "aqua:taiki-e/cargo-llvm-cov" = "0.8.7"
 # Docs site toolchain. The docs are an MkDocs Material site (see `mise run docs`);
