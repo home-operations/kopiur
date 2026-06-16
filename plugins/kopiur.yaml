@@ -12,7 +12,7 @@ kind: Plugin
 metadata:
   name: kopiur
 spec:
-  version: "v0.4.7"
+  version: "v0.4.8"
   homepage: https://kopiur.home-operations.com/cli/
   shortDescription: Operate the kopiur backup operator
   description: |
@@ -28,21 +28,21 @@ spec:
   platforms:
     - selector:
         matchLabels: {os: linux, arch: amd64}
-      uri: https://github.com/home-operations/kopiur/releases/download/0.4.7/kopiur-cli_linux_amd64.tar.gz
-      sha256: "73ab813258b54abd96a6324fe831503a6013f729d16d4f76d2fa991cc0b1f79f"
+      uri: https://github.com/home-operations/kopiur/releases/download/0.4.8/kopiur-cli_linux_amd64.tar.gz
+      sha256: "0efc3b710dac35842ea6c4f530294985f32b192eeba15c0054e64edb84e05ab3"
       bin: kubectl-kopiur
     - selector:
         matchLabels: {os: linux, arch: arm64}
-      uri: https://github.com/home-operations/kopiur/releases/download/0.4.7/kopiur-cli_linux_arm64.tar.gz
-      sha256: "bde28d80d2558f081f7604343817b95eaa7b2122a741d8d46848e1009db25d0f"
+      uri: https://github.com/home-operations/kopiur/releases/download/0.4.8/kopiur-cli_linux_arm64.tar.gz
+      sha256: "47c29a8246ff01ef1c4150c48d7d266bcec73390c6fb1392041781de57fc47e5"
       bin: kubectl-kopiur
     - selector:
         matchLabels: {os: darwin, arch: amd64}
-      uri: https://github.com/home-operations/kopiur/releases/download/0.4.7/kopiur-cli_darwin_amd64.tar.gz
-      sha256: "80610e37cae5d1a64ee78676e9898053cb482749f604bff21071d67586f14476"
+      uri: https://github.com/home-operations/kopiur/releases/download/0.4.8/kopiur-cli_darwin_amd64.tar.gz
+      sha256: "1a8dd79345c7d3ddc03e7feb0851a4b04da762e817f135a43b1a715efac5b940"
       bin: kubectl-kopiur
     - selector:
         matchLabels: {os: darwin, arch: arm64}
-      uri: https://github.com/home-operations/kopiur/releases/download/0.4.7/kopiur-cli_darwin_arm64.tar.gz
-      sha256: "12915933890b85f69757f346ef3556bc54b58c061fddffd636e3e6961c86c300"
+      uri: https://github.com/home-operations/kopiur/releases/download/0.4.8/kopiur-cli_darwin_arm64.tar.gz
+      sha256: "cc9dd63030b9e429f7a074269faf16f413243785d164e6f7125c6182de1c09a1"
       bin: kubectl-kopiur
