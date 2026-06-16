@@ -57,10 +57,11 @@ pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists
 /// ```
 /// use kopiur_mover::bootstrap::BootstrapResult;
 ///
-/// let r = BootstrapResult::ready(true, Some("deadbeef".into()), 3, vec![], false);
+/// let r = BootstrapResult::ready(true, Some("deadbeef".into()), 3, vec![], false, Some(7));
 /// assert!(r.success && r.created);
 /// assert_eq!(r.unique_id.as_deref(), Some("deadbeef"));
 /// assert_eq!(r.snapshot_count, 3);
+/// assert_eq!(r.index_blob_count, Some(7));
 ///
 /// let json = serde_json::to_string(&r).unwrap();
 /// let back: BootstrapResult = serde_json::from_str(&json).unwrap();
@@ -90,6 +91,12 @@ pub struct BootstrapResult {
     /// list was capped (so the controller can log that not all were materialized).
     #[serde(default)]
     pub snapshots_truncated: bool,
+    /// Count of content-index blobs (`kopia index list`), when it could be read.
+    /// Best-effort: `None` if the query failed (the controller then leaves the
+    /// prior `status.storageStats.indexBlobCount` untouched). The controller
+    /// warns when this crosses `spec.health.indexBlobWarnThreshold`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob_count: Option<i64>,
     /// Structured failure block on `success == false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureBlock>,
@@ -103,6 +110,7 @@ impl BootstrapResult {
         snapshot_count: i64,
         snapshots: Vec<SnapshotListEntry>,
         snapshots_truncated: bool,
+        index_blob_count: Option<i64>,
     ) -> Self {
         BootstrapResult {
             success: true,
@@ -111,6 +119,7 @@ impl BootstrapResult {
             snapshot_count,
             snapshots,
             snapshots_truncated,
+            index_blob_count,
             failure: None,
         }
     }
@@ -124,6 +133,7 @@ impl BootstrapResult {
             snapshot_count: 0,
             snapshots: Vec::new(),
             snapshots_truncated: false,
+            index_blob_count: None,
             failure: Some(failure_block_from_kopia(err)),
         }
     }
@@ -143,6 +153,7 @@ impl BootstrapResult {
             snapshot_count: 0,
             snapshots: Vec::new(),
             snapshots_truncated: false,
+            index_blob_count: None,
             failure: Some(FailureBlock {
                 kopia_error_class: REPOSITORY_NOT_INITIALIZED_CLASS.to_string(),
                 message: REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),
@@ -230,13 +241,14 @@ mod tests {
 
     #[test]
     fn ready_result_roundtrips_via_serde() {
-        let r = BootstrapResult::ready(true, Some("abc".into()), 3, vec![], false);
+        let r = BootstrapResult::ready(true, Some("abc".into()), 3, vec![], false, Some(42));
         let back: BootstrapResult =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
         assert!(back.success && back.created);
         assert_eq!(back.unique_id.as_deref(), Some("abc"));
         assert_eq!(back.snapshot_count, 3);
+        assert_eq!(back.index_blob_count, Some(42));
     }
 
     #[test]

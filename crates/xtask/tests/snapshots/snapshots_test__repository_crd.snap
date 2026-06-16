@@ -28,6 +28,10 @@ spec:
     - jsonPath: .status.server.endpoint
       name: Server
       type: string
+    - jsonPath: .status.storageStats.indexBlobCount
+      name: IndexBlobs
+      priority: 1
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -590,6 +594,24 @@ spec:
                     type: object
                 required:
                 - passwordSecretRef
+                type: object
+              health:
+                description: |-
+                  Repository health thresholds (ADR-0005 §13): tuning for the warnings the
+                  reconciler raises about a degrading-but-still-usable repository (currently
+                  the index-blob-count warning). A sub-object so future health knobs slot in
+                  without API breakage. Absent uses the built-in defaults.
+                nullable: true
+                properties:
+                  indexBlobWarnThreshold:
+                    description: |-
+                      Index-blob count above which the reconciler raises the `IndexBlobHealth`
+                      condition + a Warning event (maintenance isn't compacting fast enough).
+                      Absent uses [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`] (1000). `0` disables the
+                      warning entirely; negative is rejected by the admission webhook.
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               maintenance:
                 description: |-
@@ -2548,6 +2570,16 @@ spec:
                 description: Repository size and snapshot counts from the last catalog scan.
                 nullable: true
                 properties:
+                  indexBlobCount:
+                    description: |-
+                      Number of content-index blobs (`kopia index list`) observed at the last
+                      bootstrap. kopia compacts these during maintenance; an unbounded climb
+                      means maintenance isn't keeping up. The reconciler raises the
+                      `IndexBlobHealth` condition + a Warning event when this crosses
+                      `spec.health.indexBlobWarnThreshold`. ADR-0005 §13.
+                    format: int64
+                    nullable: true
+                    type: integer
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true

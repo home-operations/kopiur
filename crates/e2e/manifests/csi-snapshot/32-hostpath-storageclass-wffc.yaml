@@ -1,0 +1,13 @@
+# A WaitForFirstConsumer variant of csi-hostpath-sc, over the SAME hostpath provisioner.
+# Late binding defers provisioning until a pod schedules the claim (the scheduler then
+# stamps `volume.kubernetes.io/selected-node`), which exercises the populator handshake's
+# selected-node path (prime-PVC node pinning) — see the WFFC populator e2e in
+# crates/e2e/tests/repository_lifecycle.rs.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath-sc-wffc
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
