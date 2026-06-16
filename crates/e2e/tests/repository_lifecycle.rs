@@ -25,7 +25,13 @@ use kopiur_e2e::{
 
 /// CSI hostpath StorageClass installed by the `snapshot-stack` harness step — a
 /// populator-aware provisioner (its external-provisioner defers to `dataSourceRef`).
+/// `Immediate` binding (provisions the prime PVC as soon as it's created).
 const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
+/// The `WaitForFirstConsumer` variant over the same hostpath provisioner (also installed
+/// by `snapshot-stack`). Exercises the populator handshake's late-binding path: the claim
+/// only gets a `selected-node` once a pod schedules it, which the controller pins the
+/// prime PVC to. See [`restore_populator_wffc_binds_pvc_and_restores_data`].
+const CSI_STORAGE_CLASS_WFFC: &str = "csi-hostpath-sc-wffc";
 
 /// `Restore.spec.target.populator: {}` (ADR-0005 §9): the explicit passive-populator
 /// target form is accepted and threads through to a restore mover Job. (The empty
@@ -78,49 +84,53 @@ async fn restore_populator_target_form_is_accepted() {
     let _ = restores.delete(name, &DeleteParams::default()).await;
 }
 
-/// ADR-0005 §9 end-to-end: a PVC whose `dataSourceRef` claims a populator `Restore`
-/// is filled via the prime-PVC/rebind handshake and binds carrying the snapshot's
-/// data (the seed source's `a.txt`).
-#[tokio::test]
-#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn restore_populator_binds_pvc_and_restores_data() {
-    let Some(world) = World::connect().await else {
-        return;
-    };
-    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
-    let client = world.client().clone();
-
-    // The populator handshake needs a populator-aware CSI provisioner: its
-    // external-provisioner defers when the claim has a populator `dataSourceRef`, so the
-    // claim only ever binds to the PV our handshake hands it. The harness installs one as
-    // `csi-hostpath-sc` (snapshot-stack step); the default local-path does NOT defer and
-    // would bind the claim to an empty volume. Skip where CSI isn't present (a shard that
-    // doesn't install the snapshot stack), like the CSI copy-method tests.
+/// Whether `storage_class` is present (proceed with the test). If it's absent we either
+/// HARD-FAIL or skip: a `csi: true` CI shard installs the snapshot stack and sets
+/// `KOPIUR_E2E_REQUIRE_CSI=1`, so there an absent class is a real setup failure and must
+/// NOT silently pass — a silent skip once let a populator regression ship green (#121).
+/// Without that env (local dev with no snapshot stack) we skip gracefully.
+async fn csi_class_present_or_skip(client: &kube::Client, storage_class: &str) -> bool {
     let scs: Api<StorageClass> = Api::all(client.clone());
     if scs
-        .get_opt(CSI_STORAGE_CLASS)
+        .get_opt(storage_class)
         .await
         .expect("list storageclasses")
-        .is_none()
+        .is_some()
     {
-        eprintln!(
-            "skipping {CSI_STORAGE_CLASS} populator test: storageclass absent \
-             (run `mise run //crates/e2e:snapshot-stack`)"
-        );
-        return;
+        return true;
     }
+    let require = std::env::var("KOPIUR_E2E_REQUIRE_CSI").is_ok_and(|v| v == "1");
+    assert!(
+        !require,
+        "storageclass {storage_class} absent but KOPIUR_E2E_REQUIRE_CSI=1 — this shard must \
+         install the CSI snapshot stack (mise run //crates/e2e:snapshot-stack) before the \
+         populator/copyMethod tests; refusing to silently skip (cf. #121)"
+    );
+    eprintln!(
+        "skipping populator test: storageclass {storage_class} absent \
+         (run `mise run //crates/e2e:snapshot-stack`)"
+    );
+    false
+}
 
-    ensure_seed(
-        &client,
-        "e2e-pop2-repo",
-        "e2e-pop2-policy",
-        "e2e-pop2-seed",
-        "populator2",
-    )
-    .await;
-
+/// Shared body for the populator data-integrity tests (ADR-0005 §9): given an
+/// already-seeded `repo`/`seed`, create a populator `Restore`, a claiming PVC whose
+/// `dataSourceRef` points at it on `storage_class`, and a reader pod that asserts the
+/// seed source's `a.txt`. The pod schedules the claim (also producing the `selected-node`
+/// a `WaitForFirstConsumer` class needs) and can only run once the claim BINDS, so its
+/// success proves BOTH the prime→consumer rebind and the restored bytes. Then assert the
+/// `Restore` settles `Completed` — the regression guard for the #121 wedge, where the
+/// mover stamped `Completed` before the rebind, leaving the claim `Pending` forever.
+/// `prefix` namespaces the per-test object names so the binding-mode variants don't clash.
+async fn assert_populator_binds_and_restores(
+    client: &kube::Client,
+    storage_class: &str,
+    repo: &str,
+    seed: &str,
+    prefix: &str,
+) {
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let restore_name = "e2e-pop2-restore";
+    let restore_name = format!("{prefix}-restore");
     restores
         .create(
             &PostParams::default(),
@@ -129,8 +139,8 @@ async fn restore_populator_binds_pvc_and_restores_data() {
                 "kind": "Restore",
                 "metadata": { "name": restore_name, "namespace": E2E_NAMESPACE },
                 "spec": {
-                    "repository": { "kind": "Repository", "name": "e2e-pop2-repo" },
-                    "source": { "snapshotRef": { "name": "e2e-pop2-seed" } },
+                    "repository": { "kind": "Repository", "name": repo },
+                    "source": { "snapshotRef": { "name": seed } },
                     "target": { "populator": {} }
                 }
             })),
@@ -138,10 +148,10 @@ async fn restore_populator_binds_pvc_and_restores_data() {
         .await
         .expect("create populator Restore");
 
-    // The claiming PVC: its dataSourceRef points at the Restore, so a provisioner
-    // defers to the populator handshake instead of binding it directly.
+    // The claiming PVC: its dataSourceRef points at the Restore, so a populator-aware
+    // provisioner defers to the handshake instead of binding it to an empty volume.
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let claim = "e2e-pop2-data";
+    let claim = format!("{prefix}-data");
     pvcs.create(
         &PostParams::default(),
         &cr(serde_json::json!({
@@ -150,7 +160,7 @@ async fn restore_populator_binds_pvc_and_restores_data() {
             "metadata": { "name": claim, "namespace": E2E_NAMESPACE },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
-                "storageClassName": CSI_STORAGE_CLASS,
+                "storageClassName": storage_class,
                 "resources": { "requests": { "storage": "1Gi" } },
                 "dataSourceRef": {
                     "apiGroup": "kopiur.home-operations.com",
@@ -163,40 +173,116 @@ async fn restore_populator_binds_pvc_and_restores_data() {
     .await
     .expect("create claiming PVC");
 
-    // One pod does double duty: scheduling it unblocks WaitForFirstConsumer (so the
-    // prime PVC provisions on the chosen node), and it asserts the restored bytes —
-    // `a.txt` is "hello kopiur e2e" in the seed source. It can only run once the claim
-    // binds, so its success proves both the bind and the data.
+    // One pod does double duty: scheduling it produces the `selected-node` a
+    // WaitForFirstConsumer claim needs (the controller pins the prime PVC to it), and it
+    // asserts the restored bytes — `a.txt` is "hello kopiur e2e" in the seed source. It
+    // can only run once the claim binds, so its success proves both the bind and the data.
     let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let reader = "e2e-pop2-reader";
+    let reader = format!("{prefix}-reader");
     pods.create(
         &PostParams::default(),
         &builders::one_shot_pod(
             E2E_NAMESPACE,
-            reader,
+            &reader,
             &[
                 "sh",
                 "-c",
                 "test \"$(cat /mnt/a.txt)\" = 'hello kopiur e2e'",
             ],
-            &[(claim, "/mnt")],
+            &[(claim.as_str(), "/mnt")],
         ),
     )
     .await
     .expect("create reader pod");
 
-    wait::pod_succeeded(&client, E2E_NAMESPACE, reader)
+    wait::pod_succeeded(client, E2E_NAMESPACE, &reader)
         .await
         .expect("the claiming PVC binds and a.txt is restored into it");
-    wait_phase(&restores, restore_name, "Completed")
+    wait_phase(&restores, &restore_name, "Completed")
         .await
         .expect("the populator Restore reaches Completed once the claim is bound");
 
-    let _ = pods.delete(reader, &DeleteParams::default()).await;
-    let _ = pvcs.delete(claim, &DeleteParams::default()).await;
+    let _ = pods.delete(&reader, &DeleteParams::default()).await;
+    let _ = pvcs.delete(&claim, &DeleteParams::default()).await;
     let _ = restores
-        .delete(restore_name, &DeleteParams::default())
+        .delete(&restore_name, &DeleteParams::default())
         .await;
+}
+
+/// ADR-0005 §9 end-to-end (Immediate binding): a PVC whose `dataSourceRef` claims a
+/// populator `Restore` is filled via the prime-PVC/rebind handshake and binds carrying
+/// the snapshot's data (the seed source's `a.txt`).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn restore_populator_binds_pvc_and_restores_data() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    // Needs a populator-aware CSI provisioner whose external-provisioner defers to a
+    // populator `dataSourceRef` (the default local-path would bind the claim to an empty
+    // volume). The harness installs `csi-hostpath-sc` via the snapshot-stack step.
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+
+    ensure_seed(
+        &client,
+        "e2e-pop2-repo",
+        "e2e-pop2-policy",
+        "e2e-pop2-seed",
+        "populator2",
+    )
+    .await;
+
+    assert_populator_binds_and_restores(
+        &client,
+        CSI_STORAGE_CLASS,
+        "e2e-pop2-repo",
+        "e2e-pop2-seed",
+        "e2e-pop2",
+    )
+    .await;
+}
+
+/// ADR-0005 §9 end-to-end (WaitForFirstConsumer binding): the late-binding path of the
+/// populator handshake. The claim only gets a `selected-node` once the reader pod
+/// schedules it; the controller then pins the prime PVC to that node (the
+/// `consumer_storage_class_is_wffc` / `AwaitingPodSchedule` path in restore.rs) before
+/// restoring + rebinding. Reuses the `populator2` seed (restores are read-only and the
+/// tests run sequentially), with its own object names + the WFFC StorageClass.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn restore_populator_wffc_binds_pvc_and_restores_data() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS_WFFC).await {
+        return;
+    }
+
+    ensure_seed(
+        &client,
+        "e2e-pop2-repo",
+        "e2e-pop2-policy",
+        "e2e-pop2-seed",
+        "populator2",
+    )
+    .await;
+
+    assert_populator_binds_and_restores(
+        &client,
+        CSI_STORAGE_CLASS_WFFC,
+        "e2e-pop2-repo",
+        "e2e-pop2-seed",
+        "e2e-pop3",
+    )
+    .await;
 }
 
 /// `mode: ReadOnly` (ADR-0005 §11): a ReadOnly repository serves restores but the

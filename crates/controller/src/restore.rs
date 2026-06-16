@@ -100,6 +100,19 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
     }
 }
 
+/// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
+/// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
+/// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
+/// while the prime→consumer rebind is still pending, so it must fall through to
+/// [`drive_populator_restore`]. Pure.
+fn phase_is_terminal_at_guard(phase: RestorePhase, state: PopulatorState) -> bool {
+    match phase {
+        RestorePhase::Failed => true,
+        RestorePhase::Completed => state == PopulatorState::DirectTarget,
+        RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => false,
+    }
+}
+
 /// Map a `Restore` phase to its kstatus [`io::ReadyOutcome`] (ADR-0005 §2), so
 /// `kubectl wait --for=condition=Ready` and Flux/Argo health checks work on a
 /// `Restore` exactly like every other kopiur CRD. Pure + exhaustive: a new phase
@@ -246,13 +259,16 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     let name = restore.name_any();
     let api: Api<Restore> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    let state = populator_state(&restore.spec.target);
+
     // Already terminal: a Restore is one-shot. Once Completed/Failed there is
     // nothing left to do until the spec changes, so don't re-resolve, re-pin a
     // fresh timestamp, or re-write the phase — each of which would churn status and
     // self-trigger another reconcile (the same hot-loop class as the repo bug).
-    // Mirrors the Snapshot reconciler's terminal discipline.
+    // Mirrors the Snapshot reconciler's terminal discipline. (A `Completed` populator
+    // is NOT terminal here — see `phase_is_terminal_at_guard`.)
     match restore.status.as_ref().and_then(|s| s.phase) {
-        Some(phase @ (RestorePhase::Completed | RestorePhase::Failed)) => {
+        Some(phase) if phase_is_terminal_at_guard(phase, state) => {
             // The kstatus conditions come from the controller's transition patch
             // in `drive_direct_restore` — which the MOVER's own terminal `phase`
             // stamp races past in the common case (its in-cluster PATCH carries
@@ -288,7 +304,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             }
             return Ok(Action::requeue(std::time::Duration::from_secs(600)));
         }
-        None | Some(RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring) => {}
+        _ => {}
     }
 
     // §3: pin the resolved source kind to status so the SOURCE printer column shows
@@ -309,7 +325,6 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         .await?;
     }
 
-    let state = populator_state(&restore.spec.target);
     let on_missing = effective_on_missing(
         restore
             .spec
@@ -549,9 +564,12 @@ async fn drive_populator_restore(
     let populate_job = format!("{name}-populate");
 
     let phase = restore.status.as_ref().and_then(|s| s.phase);
-    // Terminal — and `finalize_populator` strips the rebind annotation, so the
-    // `our_rebound_pv` probe below would no longer recognize our PV. Short-circuit.
-    if phase == Some(RestorePhase::Completed) {
+    // Terminal only once the consumer is bound: the mover stamps `Completed` on finishing
+    // the prime PVC, but the rebind may still be pending. Once bound, `finalize_populator`
+    // has stripped the rebind annotation so the `our_rebound_pv` probe below would no
+    // longer recognize our PV — short-circuit to avoid recreating the prime. While
+    // `Completed` but not yet bound, fall through to issue/await the rebind.
+    if phase == Some(RestorePhase::Completed) && pvc_is_bound(&consumer) {
         return Ok(Action::requeue(std::time::Duration::from_secs(600)));
     }
 
@@ -2026,6 +2044,26 @@ mod tests {
             })),
             PopulatorState::DirectTarget
         );
+    }
+
+    #[test]
+    fn populator_completed_is_not_terminal_at_guard() {
+        use PopulatorState::{AwaitingClaim, DirectTarget};
+        use RestorePhase::{Completed, Failed, Pending, Resolving, Restoring};
+
+        // A populator `Completed` (mover done with the prime PVC, rebind still pending)
+        // must NOT be terminal at the guard, or the rebind never runs.
+        assert!(!phase_is_terminal_at_guard(Completed, AwaitingClaim));
+        // A direct restore writes the target itself, so `Completed` IS terminal.
+        assert!(phase_is_terminal_at_guard(Completed, DirectTarget));
+        // `Failed` is terminal regardless of dispatch model.
+        assert!(phase_is_terminal_at_guard(Failed, AwaitingClaim));
+        assert!(phase_is_terminal_at_guard(Failed, DirectTarget));
+        // In-flight phases are never terminal.
+        for p in [Pending, Resolving, Restoring] {
+            assert!(!phase_is_terminal_at_guard(p, AwaitingClaim));
+            assert!(!phase_is_terminal_at_guard(p, DirectTarget));
+        }
     }
 
     // --- kstatus Ready conditions (ADR-0005 §2) -----------------------------

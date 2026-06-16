@@ -183,7 +183,7 @@ kubectl annotate volumesnapshotclass csi-hostpath-snapclass \\
 echo "==> waiting for snapshot-controller + csi-hostpathplugin"
 kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=150s
 kubectl -n default     rollout status statefulset/csi-hostpathplugin --timeout=180s
-echo "==> CSI snapshot stack ready (storageclass csi-hostpath-sc, snapclass csi-hostpath-snapclass)"
+echo "==> CSI snapshot stack ready (storageclasses csi-hostpath-sc + csi-hostpath-sc-wffc, snapclass csi-hostpath-snapclass)"
 """
 
 [tasks.helm]
