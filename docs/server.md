@@ -63,19 +63,10 @@ form adds the block to a repository and takes the safe defaults (operator-minted
 credentials, `ClusterIP`):
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Repository
-metadata:
-    name: nas-primary
-    namespace: apps
-spec:
-    backend:
-        s3: { bucket: my-backups, endpoint: s3.amazonaws.com, region: us-east-1, auth: { secretRef: { name: nas-primary-creds } } }
-    encryption:
-        passwordSecretRef: { name: nas-primary-creds, key: KOPIA_PASSWORD }
-    server:
-        auth: { generate: {} } # operator mints UI credentials into an owned Secret
+--8<-- "deploy/examples/repository-server-ui-minimal.yaml"
 ```
+
+Apply it like any other manifest — `kubectl apply -f`, or through GitOps.
 
 ### What the operator creates for you
 
@@ -252,16 +243,7 @@ A `ClusterRepository` is cluster-scoped and has no implicit namespace, so its
 identical, flattened in):
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: ClusterRepository
-metadata:
-    name: platform
-spec:
-    # backend / encryption / allowedNamespaces …
-    server:
-        namespace: kopiur-system # required: where the server objects land
-        auth: { generate: {} }
-        service: { type: ClusterIP, port: 51515 }
+--8<-- "deploy/examples/clusterrepository-server-ui.yaml"
 ```
 
 Because a cluster-scoped object can't own namespaced children via an
@@ -332,12 +314,25 @@ When the server is disabled, `status.server` is cleared to null.
 
 ## Disabling it
 
-Remove the `spec.server` block (or patch it to null). The operator deletes the
-Deployment, Service, ConfigMap, and any generated Secret it owns:
+Delete the `spec.server` block from the `Repository` manifest and re-apply it.
+The operator deletes the Deployment, Service, ConfigMap, and any generated Secret
+it owns:
+
+```console
+$ kubectl apply -f your-repository.yaml   # the manifest with the spec.server block removed
+```
+
+/// note | Quick imperative form
+
+To tear it down without editing the manifest, patch `spec.server` to null directly:
 
 ```console
 $ kubectl patch repository nas-primary -n apps --type merge -p '{"spec":{"server":null}}'
 ```
+
+Re-apply your manifest afterward so your source of truth (especially under GitOps) doesn't put it back.
+
+///
 
 ## Full example
 

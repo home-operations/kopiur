@@ -1,0 +1,156 @@
+# Getting started — first-run bundle (docs/getting-started.md)
+#
+# The whole 15-minute guided first run as one apply-ready bundle:
+# namespace → throwaway PVC → credentials → Repository → SnapshotPolicy →
+# manual Snapshot → Restore → SnapshotSchedule. The getting-started page pulls
+# one stage at a time from this file (MkDocs snippet sections), but you can also
+# fill in the `REPLACE_ME`s and `kubectl apply -f` the whole thing — the
+# operator resolves the ordering.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# for docs/getting-started.md. They are plain YAML comments — the file stays
+# `kubectl apply -f`-able as-is.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+# --8<-- [end:namespace]
+---
+# --8<-- [start:pvc]
+# A throwaway PVC to follow along with. Skip this stage if you already have a
+# PVC with data in it — just point the SnapshotPolicy below at that name instead.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: demo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:pvc]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  # Must live in the SAME namespace as the data you back up — the mover Job
+  # loads it with `envFrom`, which is namespace-local.
+  namespace: demo
+type: Opaque
+stringData:
+  # Backend auth keys are read by well-known names from the referenced Secret.
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # Repository encryption password. Generate it (e.g. `openssl rand -base64 24`)
+  # and store it OUTSIDE the cluster too — lose it and the backups are
+  # unrecoverable; kopia cannot decrypt without it.
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: demo
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      # Optional: share one bucket across repos by giving each its own prefix.
+      prefix: demo/
+      # Omit for AWS (derived from region); REQUIRED for MinIO / RustFS / Ceph
+      # RGW and any other S3-compatible endpoint.
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds # the AWS_* keys from the secret stage
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD # which key in the Secret holds the password
+  # Initialize a brand-new kopia repository if the prefix is empty. Drop this
+  # block (or set false) to require that one already exists.
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: demo
+spec:
+  repository:
+    name: primary # kind defaults to Repository (same namespace)
+  sources:
+    - pvc:
+        name: app-data # the PVC to snapshot
+  # GFS retention is the ONLY thing that prunes successful backups.
+  retention:
+    keepDaily: 7 # "restore any day from the last week"
+    keepWeekly: 4 # "...any week from the last month"
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: app-data-manual- # let the API server pick a unique name
+  namespace: demo
+spec:
+  policyRef:
+    name: app-data # the recipe to invoke once, right now
+# --8<-- [end:snapshot]
+---
+# --8<-- [start:restore]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: app-data-verify
+  namespace: demo
+spec:
+  source:
+    # Object-store backends name an explicit snapshot: paste the Snapshot CR
+    # name from `kubectl kopiur snapshots list` (or the manual Snapshot above).
+    snapshotRef:
+      name: REPLACE_ME
+  target:
+    # A fresh PVC, so the verification never touches the original volume. The
+    # operator creates it; capacity is REQUIRED — it won't guess a size.
+    pvc:
+      name: app-data-restored
+      capacity: 1Gi
+      accessModes:
+        - ReadWriteOnce
+# --8<-- [end:restore]
+---
+# --8<-- [start:schedule]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: app-data-nightly
+  namespace: demo
+spec:
+  policyRef:
+    name: app-data # the recipe to invoke each firing
+  schedule:
+    # `H` = a deterministic per-schedule minute (hashed from the schedule's UID),
+    # so many schedules saying "nightly at 2" don't all fire at 02:00 sharp.
+    cron: "H 2 * * *"
+    # On top of H, spread each firing over a window.
+    jitter: 30m
+    # GitOps-friendly: applying this manifest does NOT take an immediate backup.
+    runOnCreate: false
+# --8<-- [end:schedule]

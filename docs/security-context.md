@@ -192,11 +192,17 @@ Anything that makes the mover's **effective** context elevated requires a per-na
 - `runAsNonRoot: false`
 - `privilegedMode: true`
 
-…and it evaluates the **resolved** context, so an inherited-from-root mover counts too. If the namespace hasn't opted in, the Backup/Restore is refused with a clear `MoverPermitted=False` condition and a Warning Event naming the exact fix:
+…and it evaluates the **resolved** context, so an inherited-from-root mover counts too. If the namespace hasn't opted in, the Backup/Restore is refused with a clear `MoverPermitted=False` condition and a Warning Event naming the fix. Opt the namespace in by applying a `Namespace` carrying the opt-in annotation:
+
+```yaml
+--8<-- "deploy/examples/privileged-mover-namespace.yaml"
+```
 
 ```console
-$ kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true
+$ kubectl apply -f privileged-mover-namespace.yaml
 ```
+
+…or imperatively: `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
 The operator watches namespaces, so the annotation takes effect within seconds —
 the blocked Snapshot/Restore proceeds without being re-applied.

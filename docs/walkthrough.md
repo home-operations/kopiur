@@ -37,8 +37,7 @@ The Helm install itself is two commands. The decisions worth making _consciously
 With the defaults chosen deliberately, install:
 
 ```console
-$ kubectl create namespace kopiur-system
-$ helm install kopiur deploy/helm/kopiur --namespace kopiur-system
+$ helm install kopiur deploy/helm/kopiur --namespace kopiur-system --create-namespace
 $ kubectl -n kopiur-system rollout status deploy/kopiur-controller
 $ kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 ```

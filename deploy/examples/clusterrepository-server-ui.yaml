@@ -1,0 +1,42 @@
+# Web UI on a cluster-scoped ClusterRepository (docs/server.md)
+#
+# A ClusterRepository has no implicit namespace, so its `spec.server` block
+# REQUIRES `namespace` — which namespace the server Deployment/Service/ConfigMap
+# (and any minted credential Secret) land in. The other server fields are
+# identical to the namespaced Repository form, flattened in.
+#
+# Because a cluster-scoped object can't own namespaced children via an
+# ownerReference, the controller tracks and cleans up the server objects with a
+# finalizer + labels. If the repo credentials Secret lives in a different
+# namespace than the server, the operator mirrors it next to the server pod
+# (envFrom can't cross namespaces).
+#
+# Requires installScope=cluster. Field shapes verified against crates/api:
+# externally-tagged `server.auth.generate`; `server.namespace` required here.
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: platform
+spec:
+  # backend / encryption / allowedNamespaces …
+  backend:
+    s3:
+      bucket: org-kopia-repo
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: platform-creds
+          namespace: kopiur-system # explicit ns required for cluster scope
+  encryption:
+    passwordSecretRef:
+      name: platform-creds
+      namespace: kopiur-system
+      key: KOPIA_PASSWORD
+  allowedNamespaces:
+    all: true
+  server:
+    namespace: kopiur-system # required: where the server objects land
+    auth: { generate: {} }
+    service: { type: ClusterIP, port: 51515 }

@@ -16,28 +16,15 @@ You already have a primary `Repository` and you want a durable copy elsewhere �
 
 ## Minimal manifest
 
+Just the `RepositoryReplication` CR (the destination `Secret` it references is in
+the full example below):
+
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: RepositoryReplication
-metadata:
-    name: nas-primary-offsite
-    namespace: billing
-spec:
-    sourceRef: # mirror FROM (kind defaults to Repository)
-        kind: Repository
-        name: nas-primary
-    destination: # mirror TO — exactly one backend; must differ from the source
-        s3:
-            bucket: offsite-mirror
-            region: us-west-2
-            auth: { secretRef: { name: offsite-mirror-creds } }
-    schedule:
-        cron: "0 5 * * *" # nightly, after backups land
-        jitter: 1h
-    suspend: false
+--8<-- "deploy/examples/19-repository-replication.yaml:replication"
 ```
 
-The full apply-ready manifest is [`deploy/examples/19-repository-replication.yaml`](examples.md#example-19--repository-replication).
+The full apply-ready manifest — including the destination-backend `Secret` — is
+[`deploy/examples/19-repository-replication.yaml`](examples.md#example-19--repository-replication).
 
 ## The fields you'll change
 

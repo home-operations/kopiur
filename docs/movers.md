@@ -80,19 +80,12 @@ If you run a shared `ClusterRepository` across more than a namespace or two, **u
 Set `spec.credentialProjection.enabled: true` on the **consumer** — the `SnapshotPolicy` (also on `Restore` and `Maintenance`), not the repository. The namespace owner opts in, rather than the shared repository pushing its creds everywhere. Before each mover run, Kopiur reads the referenced repository's credential Secret(s) from their source namespace and writes a copy into the mover Job's namespace — so the `envFrom` resolves without you placing anything there:
 
 ```yaml
-# on the SnapshotPolicy in your workload namespace (Restore/Maintenance take the same field)
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: SnapshotPolicy
-metadata:
-  name: my-data
-  namespace: media
-spec:
-  repository: { kind: ClusterRepository, name: shared-primary }
-  sources:
-    - pvc: { name: my-data }
-  credentialProjection:
-    enabled: true # off by default; flip this on to stop hand-copying Secrets
+--8<-- "deploy/examples/credential-projection-consumer.yaml"
 ```
+
+Apply it with `kubectl apply -f`. For the full three-part bundle (the
+`ClusterRepository` owner gate plus the consuming policy), see
+[Example 11 — Credential projection](examples.md#example-11--credential-projection).
 
 `Snapshot`s produced from this config (manual, scheduled, or discovered) inherit the setting.
 
@@ -123,13 +116,34 @@ To write Secrets into workload namespaces, the operator needs cluster-wide `secr
 
 ### Or manage the Secret yourself
 
-The self-managed default: place the credential Secret in each workload namespace by hand, with `kubectl`, a templating tool, or a secret-sync controller (External Secrets, Reflector, `kubernetes-replicator`). For example, copy it into the `media` namespace:
+The self-managed default: place the credential Secret in each workload namespace yourself. The declarative path is a plain `Secret` manifest applied into the workload namespace — same name and keys the repository's `auth.secretRef`/`encryption.passwordSecretRef` reference, but living where the mover runs:
+
+```yaml
+--8<-- "deploy/examples/workload-credential-secret.yaml"
+```
+
+```console
+$ kubectl apply -f deploy/examples/workload-credential-secret.yaml
+```
+
+You don't have to hand-author it, though. The intended paths for a shared `ClusterRepository` are:
+
+- **[Credential projection](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos)** (recommended) — one field on the consumer and the operator copies the Secret in for you, fresh each run. No manifest to maintain per namespace.
+- A **secret-sync controller** — [External Secrets](https://external-secrets.io), [Reflector](https://github.com/emberstack/kubernetes-reflector), or `kubernetes-replicator` — to mirror the source Secret into each workload namespace from your secret store.
+
+/// note | Ad-hoc one-liner
+
+For a quick, one-off copy from the operator namespace (no manifest, no sync controller), pipe the live Secret through `sed` to rewrite its namespace and re-apply:
 
 ```console
 $ kubectl get secret kopia-rustfs-creds -n kopiur-system -o yaml \
     | sed 's/namespace: kopiur-system/namespace: media/' \
     | kubectl apply -n media -f -
 ```
+
+Prefer projection or a sync controller for anything you'll maintain — this drifts the moment the source rotates.
+
+///
 
 When the Secret is missing — projection off and you haven't placed it, or projection on but the **source** Secret doesn't exist — the `Snapshot` does **not** silently hang. It stays `Pending` and reports exactly what's wrong:
 
@@ -162,11 +176,17 @@ $ kubectl get snapshots my-backup -n media \
  kopiur.home-operations.com/privileged-movers=true ..."}
 ```
 
-A cluster admin opts the namespace in:
+A cluster admin opts the namespace in by applying the annotated `Namespace`:
+
+```yaml
+--8<-- "deploy/examples/privileged-mover-namespace.yaml"
+```
 
 ```console
-$ kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true
+$ kubectl apply -f deploy/examples/privileged-mover-namespace.yaml
 ```
+
+Or imperatively: `kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true`.
 
 On the next reconcile `MoverPermitted` clears to `True` and the privileged mover runs. To revoke, remove the annotation (or drop the elevated `securityContext` from the `SnapshotPolicy`/`Restore`/`Maintenance`).
 
@@ -180,16 +200,16 @@ Reach for a privileged mover only when a workload genuinely needs it (e.g. an ap
 
 To back up a PVC in `media` to a shared `ClusterRepository` whose Secret lives in `kopiur-system`, with a root mover:
 
-1. **Credentials** — place the repo Secret in `media`:
+1. **Credentials** — place the repo Secret in `media` (or turn on [credential projection](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) and skip this step):
     ```console
-    $ kubectl get secret kopia-rustfs-creds -n kopiur-system -o yaml \
-        | sed 's/namespace: kopiur-system/namespace: media/' \
-        | kubectl apply -n media -f -
+    $ kubectl apply -f deploy/examples/workload-credential-secret.yaml
     ```
+    (See [the manifest](#or-manage-the-secret-yourself); or copy ad-hoc with `kubectl get secret … -o yaml | sed … | kubectl apply -f -`.)
 2. **Privilege opt-in** (only if the mover runs as root):
     ```console
-    $ kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true
+    $ kubectl apply -f deploy/examples/privileged-mover-namespace.yaml
     ```
+    (Or imperatively: `kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true`.)
 3. **Apply** your `SnapshotPolicy` + `Snapshot` (or `SnapshotSchedule`) in `media`. The controller mints `kopiur-mover` SA + RoleBinding, both gates pass, and the mover Job runs.
 4. **Watch it**:
     ```console

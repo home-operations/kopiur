@@ -16,23 +16,11 @@ All three are namespaced and live in the same namespace as the PVCs they back up
 
 ## SnapshotPolicy — the recipe
 
-A minimal recipe is a repository, a source, and a retention policy:
+A minimal recipe is a repository, a source, and a retention policy (the recipe
+stage of [example 01](examples.md#example-01--single-pvc-scheduled)):
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: SnapshotPolicy
-metadata:
-    name: postgres-data
-    namespace: billing
-spec:
-    repository:
-        name: primary # kind defaults to Repository (same namespace)
-    sources:
-        - pvc:
-              name: postgres-data
-    retention:
-        keepDaily: 14
-        keepWeekly: 4
+--8<-- "deploy/examples/01-single-pvc-scheduled.yaml:policy"
 ```
 
 ### Sources — what to back up
@@ -275,19 +263,10 @@ If the mover's **effective** securityContext runs as root (`runAsUser: 0`), sets
 
 ## Snapshot — one snapshot, the universal trigger
 
-You usually let a `SnapshotSchedule` create `Snapshot` CRs. To run one **now** — first-time test, ad-hoc snapshot before a risky change, or from external automation — create one yourself (see [example 06](examples.md#example-06--manual-one-shot-backup)):
+You usually let a `SnapshotSchedule` create `Snapshot` CRs. To run one **now** — first-time test, ad-hoc snapshot before a risky change, or from external automation — create one yourself ([example 06](examples.md#example-06--manual-one-shot-backup)). It carries a `policyRef` (which recipe to run) and optional `tags`; use `generateName` instead of `name` for repeatable ad-hoc one-shots:
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Snapshot
-metadata:
-    generateName: postgres-data-manual- # API server appends a unique suffix
-    namespace: billing
-spec:
-    policyRef:
-        name: postgres-data # which recipe to run
-    tags:
-        reason: pre-upgrade # arbitrary kopia snapshot tags
+--8<-- "deploy/examples/06-manual-backup.yaml:snapshot"
 ```
 
 Watch it move through its phases:
@@ -361,26 +340,16 @@ A `Snapshot` is **one-shot**: once it reaches `Succeeded` or `Failed`, the opera
 
 ## SnapshotSchedule — the cron
 
-A schedule binds a recipe to a cadence and creates `Snapshot` CRs (see [example 01](examples.md#example-01--single-pvc-scheduled)):
+A schedule binds a recipe to a cadence and creates `Snapshot` CRs (the schedule
+stage of [example 01](examples.md#example-01--single-pvc-scheduled)):
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: SnapshotSchedule
-metadata:
-    name: postgres-data-nightly
-    namespace: billing
-spec:
-    policyRef:
-        name: postgres-data
-    schedule:
-        cron: "H 2 * * *" # see "H" below
-        jitter: 30m
-        timezone: America/Los_Angeles # IANA tz; omit for the controller default
-        runOnCreate: false
-        suspend: false
-        concurrencyPolicy: Forbid
-    failedJobsHistoryLimit: 3
+--8<-- "deploy/examples/01-single-pvc-scheduled.yaml:schedule"
 ```
+
+The schedule stage above is minimal; the full set of knobs (`timezone`,
+`suspend`, `concurrencyPolicy`, `startingDeadlineSeconds`, `failedJobsHistoryLimit`)
+is described in the table below.
 
 ### The fields you'll change
 

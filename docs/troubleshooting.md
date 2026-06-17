@@ -73,10 +73,19 @@ The mover requests an elevated context but the namespace hasn't been granted it.
 # see the exact, actionable message (names the object + the annotation):
 $ kubectl get restore <name> -n <ns> \
     -o jsonpath='{.status.conditions[?(@.type=="MoverPermitted")].message}'
-
-# opt the namespace in (a cluster-admin decision):
-$ kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true
 ```
+
+Opt the namespace in (a cluster-admin decision) by applying a `Namespace` carrying the opt-in annotation:
+
+```yaml
+--8<-- "deploy/examples/privileged-mover-namespace.yaml"
+```
+
+```console
+$ kubectl apply -f privileged-mover-namespace.yaml
+```
+
+…or imperatively: `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
 …or drop the elevated `securityContext` / `podSecurityContext` / `privilegedMode` from the `spec.mover`. It clears to `MoverPermitted=True` on the next reconcile (~30s). Full detail in [Movers → Privileged movers](movers.md#privileged-movers).
 

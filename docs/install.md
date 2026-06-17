@@ -16,21 +16,18 @@ Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide
 ## Quickstart
 
 ```bash
-# 1. Create the operator namespace.
-kubectl create namespace kopiur-system
-
-# 2. Install the chart. No extra flags needed — the webhook cert is
-#    self-managed by default (no cert-manager required).
+# 1. Install the chart, creating the operator namespace. No extra flags needed
+#    — the webhook cert is self-managed by default (no cert-manager required).
 helm install kopiur deploy/helm/kopiur \
-  --namespace kopiur-system
+  --namespace kopiur-system --create-namespace
 
-# 3. Wait for rollout. (The webhook pod stays in ContainerCreating until the
+# 2. Wait for rollout. (The webhook pod stays in ContainerCreating until the
 #    controller mints its serving Secret — a few seconds after the controller
 #    becomes ready.)
 kubectl -n kopiur-system rollout status deploy/kopiur-controller
 kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 
-# 4. Confirm the 8 CRDs are registered.
+# 3. Confirm the 8 CRDs are registered.
 kubectl get crd -l app.kubernetes.io/part-of=kopiur
 ```
 

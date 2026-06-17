@@ -15,12 +15,30 @@
 # PromptCondition | Force.
 # Storage actually reclaimed is surfaced ONLY here, in status.{quick,full}
 # .lastContentReclaimedBytes (ADR §3.7/§4.5).
+#
+# On-demand run (declarative): the metadata.annotations below request an
+# out-of-band maintenance run the next time GitOps reconciles this manifest.
+# `run-requested` is an RFC3339 timestamp (a NEW value requests a new run;
+# re-applying the same value is a no-op once handled), `run-mode` is quick|full.
+# The operator routes it through the same mover/lease/single-flight path as a
+# scheduled slot. The imperative equivalent is `kubectl annotate maintenance …`.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/maintenance.md pulls this Maintenance on its own). Plain YAML comments —
+# the file stays `kubectl apply -f`-able as-is.
 ---
+# --8<-- [start:standalone]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Maintenance
 metadata:
   name: nas-primary-maintenance
   namespace: billing
+  annotations:
+    # Request an immediate FULL run on next apply. Bump the timestamp to request
+    # another; remove these to stop requesting on-demand runs (the crons keep
+    # firing regardless).
+    kopiur.home-operations.com/run-requested: "2026-01-01T00:00:00Z"
+    kopiur.home-operations.com/run-mode: full
 spec:
   repository:
     kind: Repository
@@ -48,3 +66,4 @@ spec:
     backoffLimit: 1
     activeDeadlineSeconds: 14400 # cap a RUNNING maintenance Job (4h)
     podStartupDeadlineSeconds: 300 # fail fast if the maintenance mover can't START in 5m (default 300)
+# --8<-- [end:standalone]

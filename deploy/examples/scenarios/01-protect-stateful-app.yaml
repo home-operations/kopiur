@@ -15,7 +15,14 @@
 # Field shapes verified against crates/api: backend is externally tagged
 # (backend.s3); hooks.beforeSnapshot/afterSnapshot entries are exactly one of
 # workloadExec | runJob | httpRequest; copyMethod is Snapshot|Clone|Direct.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/scenarios/protect-stateful-app.md pulls the verification Snapshot below on
+# its own). Plain YAML comments — the file stays `kubectl apply -f`-able as-is.
+# The trailing Snapshot is the "fire one backup by hand" verification step; it is
+# safe to apply alongside the chain (it just takes one extra snapshot now).
 ---
+# --8<-- [start:chain]
 apiVersion: v1
 kind: Secret
 metadata:
@@ -112,3 +119,18 @@ spec:
     cron: "H 2 * * *"
     jitter: 30m
     runOnCreate: false # GitOps-friendly: don't fire the instant it's applied
+# --8<-- [end:chain]
+---
+# --8<-- [start:manual-snapshot]
+# Verification: fire ONE backup by hand to confirm the whole chain (recipe →
+# mover → snapshot) before trusting the nightly schedule. generateName lets you
+# re-apply this repeatedly to take another test snapshot.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: postgres-data-test-
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+# --8<-- [end:manual-snapshot]

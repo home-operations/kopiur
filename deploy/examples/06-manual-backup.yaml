@@ -7,10 +7,17 @@
 # For scheduled/manual backups the spec carries `policyRef`. `deletionPolicy` is
 # a closed enum: Delete (default for produced) | Retain | Orphan (ADR §4.5).
 # `tags` are arbitrary kopia snapshot tags.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/backups.md pulls the trigger spec on its own). They are plain YAML
+# comments — the file stays `kubectl apply -f`-able as-is.
 ---
+# --8<-- [start:snapshot]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
+  # A fixed name here (idempotent re-apply); use `generateName: postgres-data-manual-`
+  # instead to let the API server append a unique suffix for ad-hoc one-shots.
   name: postgres-data-pre-migration
   namespace: billing
 spec:
@@ -31,3 +38,4 @@ spec:
     activeDeadlineSeconds: 7200 # hard wall-clock cap on a RUNNING mover (default: 48h backstop)
     podStartupDeadlineSeconds: 300 # fail fast if the mover can't START Running within 5m
     # (CreateContainerConfigError / ImagePullBackOff / Unschedulable) instead of hanging. Default 300.
+# --8<-- [end:snapshot]

@@ -1,0 +1,31 @@
+# Smallest web-UI form on a namespaced Repository (docs/server.md)
+#
+# Adding a `spec.server` block turns the kopia web UI on (there is no `enabled`
+# bool — presence is "on", absence is "off"). This is the minimal form: take the
+# safe defaults (operator-minted credentials, ClusterIP Service, port 51515).
+#
+# The Secret named here must already exist in this namespace (the repository's
+# backend auth + encryption password). For a complete server example with
+# HTTPRoute/NetworkPolicy templates see deploy/examples/25-repository-server-ui.yaml.
+#
+# Field shapes verified against crates/api: externally-tagged backend
+# (`backend.s3`), and `server.auth.generate` (externally-tagged auth enum).
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: apps
+spec:
+  backend:
+    s3:
+      {
+        bucket: my-backups,
+        endpoint: s3.amazonaws.com,
+        region: us-east-1,
+        auth: { secretRef: { name: nas-primary-creds } },
+      }
+  encryption:
+    passwordSecretRef: { name: nas-primary-creds, key: KOPIA_PASSWORD }
+  server:
+    auth: { generate: {} } # operator mints UI credentials into an owned Secret

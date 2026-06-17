@@ -1,0 +1,47 @@
+# Maintenance — tuned inline on the Repository (docs/maintenance.md)
+#
+# The simplest way to control maintenance: set `spec.maintenance` on the
+# Repository/ClusterRepository itself. Maintenance stays operator-managed (the
+# controller projects and owns a Maintenance for you), you just override the
+# schedule (or other knobs) instead of authoring a standalone Maintenance.
+#
+# This shows a filesystem (PVC-backed) repository, but the `spec.maintenance`
+# block is identical for every backend. Omit the block entirely and you get the
+# defaults (quick every 6h, full daily at 03:00); set `enabled: false` to opt out.
+#
+# Field shapes verified against crates/api: externally-tagged backend
+# (`backend.filesystem`); `schedule.quick`/`schedule.full` are CronSpec
+# { cron, jitter }.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-kopia
+  namespace: billing
+type: Opaque
+stringData:
+  # Filesystem backends need ONLY the repository encryption password.
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    filesystem:
+      path: /repo # mount path INSIDE the mover pod
+      volume:
+        pvc:
+          name: nas-primary # the PVC mounted read-write at `path`
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-kopia
+      key: KOPIA_PASSWORD
+  # Tune maintenance while keeping it operator-managed. Absent ⇒ the defaults.
+  maintenance:
+    enabled: true
+    schedule:
+      quick: { cron: "0 */6 * * *", jitter: 30m } # cheap, frequent: index compaction
+      full: { cron: "0 3 * * *", jitter: 1h } # heavy: GC + rewrite — reclaims storage

@@ -26,23 +26,28 @@ For the full picture — how Kopia dedups, the `username@hostname:path` identity
 - A storage backend kopia can reach. This guide uses **S3 / S3-compatible** (AWS S3, MinIO, RustFS, Ceph RGW…). Any of the [eight backends](repositories.md) works the same way — only the `Repository` changes.
 - A **PersistentVolumeClaim** with some data in it to back up. The walkthrough assumes one named `app-data` in a namespace called `demo`.
 
-/// note | No spare PVC?
+/// note | One bundle, applied once
 
-Create a throwaway one to follow along:
+Every manifest on this page is a section of a single apply-ready file, [`deploy/examples/getting-started.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/getting-started.yaml). Each step below shows its section so you understand what it does — but you don't apply them one at a time. Fill in the `REPLACE_ME` values (your backend keys and a generated `KOPIA_PASSWORD`), then apply the whole thing once:
 
 ```console
-$ kubectl create namespace demo
-$ kubectl -n demo apply -f - <<'EOF'
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: { name: app-data }
-spec:
-  accessModes: [ReadWriteOnce]
-  resources: { requests: { storage: 1Gi } }
-EOF
+$ kubectl apply -f deploy/examples/getting-started.yaml
 ```
 
-Mount it in a throwaway pod and write a file if you want to see real data move.
+Re-applying is idempotent, and the operator resolves the ordering for you — the `Snapshot` simply stays `Pending` until the `Repository` is `Ready`, then proceeds. So apply once now, then walk each step below to watch the pieces reconcile in turn. (The one exception is the manual `Snapshot` in Step 5, which uses `generateName` and so needs `kubectl create`, not `apply` — that step calls it out.)
+
+///
+
+/// note | No spare PVC?
+
+These two sections — at the top of the same bundle — create the `demo` namespace and a throwaway PVC to follow along:
+
+```yaml
+--8<-- "deploy/examples/getting-started.yaml:namespace"
+--8<-- "deploy/examples/getting-started.yaml:pvc"
+```
+
+You don't need a separate apply for them: they're applied along with everything else when you `kubectl apply -f deploy/examples/getting-started.yaml` in the credentials step below. Mount the PVC in a throwaway pod and write a file if you want to see real data move.
 
 ///
 
@@ -51,9 +56,8 @@ Mount it in a throwaway pod and write a file if you want to see real data move.
 Install the chart into its own namespace. By default the operator manages the webhook's serving certificate itself — **no cert-manager required**. (Prefer cert-manager or a hand-supplied cert? See [Installation → Webhook TLS](install.md#webhook-tls).)
 
 ```console
-$ kubectl create namespace kopiur-system
 $ helm install kopiur deploy/helm/kopiur \
-    --namespace kopiur-system
+    --namespace kopiur-system --create-namespace
 ```
 
 **Verify** the operator is up and the 8 CRDs are registered:
@@ -79,12 +83,24 @@ Eight CRDs and two ready Deployments means the operator is live.
 
 The mover Job that runs kopia reads two things from a Secret: your **backend access keys** and the **repository encryption password**. That Secret must live in the **same namespace as the data you back up** (`demo` here) — the mover loads it with `envFrom`, which is namespace-local. See [Movers, RBAC & credentials](movers.md) for the full why.
 
+Fill in your backend keys and a generated `KOPIA_PASSWORD` in this section of the bundle:
+
+```yaml
+--8<-- "deploy/examples/getting-started.yaml:secret"
+```
+
+This is the moment to apply the bundle — once the `REPLACE_ME` values are filled in, `kubectl apply -f deploy/examples/getting-started.yaml` creates the namespace, PVC, Secret, and every CR in one shot. The rest of the steps just watch each piece come up.
+
+/// note | Prefer to create it imperatively?
+
 ```console
 $ kubectl -n demo create secret generic repo-creds \
     --from-literal=AWS_ACCESS_KEY_ID='REPLACE_ME' \
     --from-literal=AWS_SECRET_ACCESS_KEY='REPLACE_ME' \
     --from-literal=KOPIA_PASSWORD="$(openssl rand -base64 24)"
 ```
+
+///
 
 /// warning | Save the KOPIA_PASSWORD
 
@@ -97,33 +113,12 @@ The `KOPIA_PASSWORD` encrypts the repository. **If you lose it, the backups are 
 Tell Kopiur where to store snapshots. `create.enabled: true` lets the operator _initialize_ a brand-new kopia repository in the bucket; drop it (or set `false`) to require that one already exists.
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Repository
-metadata:
-    name: primary
-    namespace: demo
-spec:
-    backend:
-        s3: # externally tagged — the bucket lives under `s3`
-            bucket: my-kopia-bucket
-            prefix: demo/ # optional: share one bucket across repos
-            endpoint: s3.us-east-1.amazonaws.com # omit for AWS default; set for MinIO/RustFS
-            region: us-east-1
-            auth:
-                secretRef:
-                    name: repo-creds # the backend keys from Step 2
-    encryption:
-        passwordSecretRef:
-            name: repo-creds
-            key: KOPIA_PASSWORD # which key in the Secret holds the password
-    create:
-        enabled: true # create the repo if the bucket is empty
+--8<-- "deploy/examples/getting-started.yaml:repository"
 ```
 
-Apply it, then **wait for `Ready`** — this is the gate everything else waits on:
+Once the bundle is applied, **wait for `Ready`** — this is the gate everything else waits on:
 
 ```console
-$ kubectl apply -f repository.yaml
 $ kubectl -n demo get repository primary -w
 NAME      PHASE          BACKEND   AGE
 primary   Initializing   S3        5s
@@ -143,24 +138,12 @@ $ kubectl -n demo describe repository primary    # see Conditions + Events
 Now describe _what_ to back up and _how long to keep it_. Retention is **GFS** (grandfather-father-son) and is the only thing that prunes successful backups.
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: SnapshotPolicy
-metadata:
-    name: app-data
-    namespace: demo
-spec:
-    repository:
-        name: primary # kind defaults to Repository (same namespace)
-    sources:
-        - pvc:
-              name: app-data # the PVC to snapshot
-    retention:
-        keepDaily: 7
-        keepWeekly: 4
+--8<-- "deploy/examples/getting-started.yaml:policy"
 ```
 
+It was applied with the bundle; confirm it's registered:
+
 ```console
-$ kubectl apply -f snapshotpolicy.yaml
 $ kubectl -n demo get snapshotpolicy
 NAME       REPOSITORY   AGE
 app-data   primary      3s
@@ -173,18 +156,13 @@ A `SnapshotPolicy` runs nothing yet — it's the recipe. Next we invoke it.
 Trigger one snapshot by creating a `Snapshot` that references the recipe:
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Snapshot
-metadata:
-    generateName: app-data-manual- # let the API server pick a unique name
-    namespace: demo
-spec:
-    policyRef:
-        name: app-data
+--8<-- "deploy/examples/getting-started.yaml:snapshot"
 ```
 
+This is the one resource you `create` rather than `apply`: it uses `generateName` (so every invocation gets a fresh, unique name like `app-data-manual-abc12`), and `kubectl apply` can't track a server-named object. Run `create` against the bundle — the namespace, Secret, and CRs already exist (so `kubectl` reports them unchanged), and the `Snapshot` is the one new object it mints:
+
 ```console
-$ kubectl create -f snapshot.yaml
+$ kubectl create -f deploy/examples/getting-started.yaml
 snapshot.kopiur.home-operations.com/app-data-manual-abc12 created
 
 $ kubectl -n demo get snapshots -w
@@ -207,25 +185,16 @@ If it stays `Pending` with no Job, the mover is blocked on a precondition (usual
 
 A backup you've never restored is a hope, not a backup. Restore the snapshot you just made into a **new** PVC so you can compare it without touching the original:
 
+This `Restore` section was applied with the bundle, but its `source.snapshotRef.name` is a placeholder until you point it at the `Snapshot` CR name from Step 5 (here `app-data-manual-abc12`):
+
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Restore
-metadata:
-    name: app-data-verify
-    namespace: demo
-spec:
-    source:
-        snapshotRef:
-            name: app-data-manual-abc12 # the Snapshot from Step 5
-    target:
-        pvc: # operator creates this PVC
-            name: app-data-restored
-            capacity: 1Gi
-            accessModes: [ReadWriteOnce]
+--8<-- "deploy/examples/getting-started.yaml:restore"
 ```
 
+Set that name, re-apply the bundle (re-applying is idempotent — only the changed `Restore` updates), then watch it come up:
+
 ```console
-$ kubectl apply -f restore.yaml
+$ kubectl apply -f deploy/examples/getting-started.yaml
 $ kubectl -n demo get restore -w
 NAME              PHASE        AGE
 app-data-verify   Resolving    2s
@@ -240,22 +209,12 @@ app-data-verify   Completed    37s
 Manual backups prove the pipeline; a `SnapshotSchedule` makes it routine. It creates `Snapshot` CRs on a cron, with deterministic jitter so replicas agree and load spreads.
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: SnapshotSchedule
-metadata:
-    name: app-data-nightly
-    namespace: demo
-spec:
-    policyRef:
-        name: app-data
-    schedule:
-        cron: "H 2 * * *" # "H" = a deterministic per-schedule minute, ~02:00 nightly
-        jitter: 30m # spread the start over a 30-minute window
-        runOnCreate: false # GitOps-friendly: don't fire the instant you apply this
+--8<-- "deploy/examples/getting-started.yaml:schedule"
 ```
 
+It was applied with the bundle; confirm it's registered and check the firing it pinned:
+
 ```console
-$ kubectl apply -f snapshotschedule.yaml
 $ kubectl -n demo get snapshotschedule
 NAME               CONFIG     SCHEDULE    SUSPENDED   AGE
 app-data-nightly   app-data   H 2 * * *   false       3s

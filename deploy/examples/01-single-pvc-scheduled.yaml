@@ -7,6 +7,10 @@
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/backups.md pulls the policy and schedule stages individually). They are
+# plain YAML comments — the file stays `kubectl apply -f`-able as-is.
 ---
 apiVersion: v1
 kind: Secret
@@ -53,6 +57,7 @@ spec:
       quick: { cron: "0 */6 * * *", jitter: 30m }
       full: { cron: "0 3 * * *", jitter: 1h }
 ---
+# --8<-- [start:policy]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -70,7 +75,9 @@ spec:
   retention:
     keepDaily: 14
     keepWeekly: 4
+# --8<-- [end:policy]
 ---
+# --8<-- [start:schedule]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
 metadata:
@@ -86,3 +93,4 @@ spec:
     jitter: 30m
     # GitOps-friendly default: do not fire immediately on create (ADR §4.1 / G3).
     runOnCreate: false
+# --8<-- [end:schedule]

@@ -178,11 +178,17 @@ spec:
 
 /// warning | An elevated restore mover needs the namespace to opt in
 
-A restore mover that runs as root (`runAsUser: 0`), with added capabilities, or `privilegedMode: true` — including one **inherited** from a root workload pod — is refused with `MoverPermitted=False` until the restore's namespace opts in, exactly like a backup:
+A restore mover that runs as root (`runAsUser: 0`), with added capabilities, or `privilegedMode: true` — including one **inherited** from a root workload pod — is refused with `MoverPermitted=False` until the restore's namespace opts in, exactly like a backup. Opt the namespace in by applying a `Namespace` carrying the opt-in annotation:
+
+```yaml
+--8<-- "deploy/examples/privileged-mover-namespace.yaml"
+```
 
 ```console
-$ kubectl annotate namespace billing kopiur.home-operations.com/privileged-movers=true
+$ kubectl apply -f privileged-mover-namespace.yaml
 ```
+
+…or imperatively: `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
 See [Permissions](permissions.md) for how to choose the UID/GID and when a privileged mover is warranted.
 

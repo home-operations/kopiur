@@ -1,0 +1,26 @@
+# Privileged-mover namespace opt-in (docs/permissions.md, docs/security-context.md)
+#
+# A privileged (or root) mover — `runAsUser: 0`, `privileged: true`,
+# `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot:
+# false`, or `privilegedMode: true` — is refused with a `MoverPermitted=False`
+# condition until the workload namespace is opted in. This Namespace carries the
+# opt-in annotation, so backups, restores, and maintenance in `media` may run an
+# elevated mover.
+#
+# This is the declarative form of the per-namespace admin decision; applying it
+# is equivalent to:
+#
+#   kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true
+#
+# Granting a namespace privileged movers is a CLUSTER-ADMIN action: the operator
+# mints a mover ServiceAccount in this namespace, and a tenant here could reuse
+# it at the mover's privilege. Apply it only for namespaces you trust to run
+# elevated workloads. Removing the annotation revokes the opt-in.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+  annotations:
+    # The opt-in. Any other value (or absence) leaves the namespace un-opted-in.
+    kopiur.home-operations.com/privileged-movers: "true"

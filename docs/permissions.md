@@ -137,11 +137,17 @@ spec:
         privilegedMode: true # also preserves UID/GID ownership on RESTORE
 ```
 
-A root (or otherwise elevated) mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace hasn't opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition telling you the exact command:
+A root (or otherwise elevated) mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace hasn't opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition. Opt the namespace in by applying a `Namespace` carrying the opt-in annotation:
+
+```yaml
+--8<-- "deploy/examples/privileged-mover-namespace.yaml"
+```
 
 ```console
-$ kubectl annotate namespace app kopiur.home-operations.com/privileged-movers=true
+$ kubectl apply -f privileged-mover-namespace.yaml
 ```
+
+…or imperatively: `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
 Anything that trips the "privileged" detector needs that opt-in: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`. Full detail and the revoke path are in [Movers → Privileged movers](movers.md#privileged-movers).
 

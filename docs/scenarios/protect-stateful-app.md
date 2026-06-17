@@ -41,25 +41,29 @@ the _after_ hook so the database never gets stuck in backup mode).
 ///
 
 ```yaml
---8<-- "deploy/examples/scenarios/01-protect-stateful-app.yaml"
+--8<-- "deploy/examples/scenarios/01-protect-stateful-app.yaml:chain"
 ```
 
 ## Verify it worked
 
-The `Repository` should reach `Ready`, then fire one backup by hand to confirm
-the whole chain (recipe → mover → snapshot) before trusting the schedule:
+The `Repository` should reach `Ready` first:
 
 ```console
 $ kubectl get repository -n billing
 NAME               PHASE   AGE
 postgres-primary   Ready   30s
+```
 
-$ kubectl create -f - <<'EOF'
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Snapshot
-metadata: { generateName: postgres-data-test-, namespace: billing }
-spec: { policyRef: { name: postgres-data } }
-EOF
+Then fire one backup by hand to confirm the whole chain (recipe → mover →
+snapshot) before trusting the schedule. This `Snapshot` manifest ships with the
+example (its `manual-snapshot` section):
+
+```yaml
+--8<-- "deploy/examples/scenarios/01-protect-stateful-app.yaml:manual-snapshot"
+```
+
+```console
+$ kubectl apply -f deploy/examples/scenarios/01-protect-stateful-app.yaml
 
 $ kubectl get snapshots -n billing -w
 NAME                       PHASE       ORIGIN   SNAPSHOT    AGE

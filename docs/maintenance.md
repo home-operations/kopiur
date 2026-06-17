@@ -38,20 +38,7 @@ There are three ways to control it, in increasing order of explicitness.
 Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the schedule (or other knobs) while keeping it operator-managed:
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Repository
-metadata:
-    name: nas-primary
-    namespace: billing
-spec:
-    backend: { filesystem: { path: /repo, volume: { pvc: { name: nas-primary } } } }
-    encryption:
-        passwordSecretRef: { name: nas-primary-kopia, key: KOPIA_PASSWORD }
-    maintenance:
-        enabled: true
-        schedule:
-            quick: { cron: "0 */6 * * *", jitter: 30m }
-            full: { cron: "0 3 * * *", jitter: 1h }
+--8<-- "deploy/examples/maintenance-inline-on-repository.yaml"
 ```
 
 `spec.maintenance` fields:
@@ -67,30 +54,10 @@ spec:
 
 ### 2. Author a standalone `Maintenance`
 
-For fine-grained control — a custom ownership identity or takeover policy — author a `Maintenance` directly. When one references a repository, the operator **defers to it and never creates a duplicate**, even if `spec.maintenance` is otherwise default-on.
+For fine-grained control — a custom ownership identity or takeover policy — author a `Maintenance` directly ([example 08](examples.md#example-08--maintenance)). When one references a repository, the operator **defers to it and never creates a duplicate**, even if `spec.maintenance` is otherwise default-on.
 
 ```yaml
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: Maintenance
-metadata:
-    name: nas-primary-maintenance
-    namespace: billing
-spec:
-    repository: { kind: Repository, name: nas-primary }
-    schedule:
-        quick: { cron: "0 */6 * * *", jitter: 30m }
-        full: { cron: "0 3 * * 0", jitter: 1h }
-        timezone: UTC
-    ownership:
-        owner: "kopia-operator/nas-primary"
-        takeoverPolicy: PromptCondition
-    mover:
-        resources:
-            requests: { cpu: 250m, memory: 1Gi }
-            limits: { cpu: "2", memory: 4Gi }
-    failurePolicy:
-        backoffLimit: 1
-        activeDeadlineSeconds: 14400
+--8<-- "deploy/examples/08-maintenance.yaml:standalone"
 ```
 
 ### Disabling maintenance
@@ -166,10 +133,30 @@ The warning is a symptom; the fix is to get maintenance compacting again. Check 
 ## Running maintenance on demand
 
 Maintenance normally fires on its quick/full crons, but you can request an
-out-of-band run at any time by stamping two annotations — the operator routes
-it through the **same** mover, ownership-lease, and single-flight path as the
-scheduled slots, so a manual run can never violate the one-job-per-repository
-guarantee:
+out-of-band run at any time by stamping two annotations on the `Maintenance` —
+the operator routes it through the **same** mover, ownership-lease, and
+single-flight path as the scheduled slots, so a manual run can never violate the
+one-job-per-repository guarantee.
+
+Declaratively (GitOps-friendly — set them in Git on the managed `Maintenance`,
+as in [example 08](examples.md#example-08--maintenance)):
+
+```yaml
+metadata:
+    annotations:
+        # A NEW value requests a new run; re-applying the same value is a no-op.
+        kopiur.home-operations.com/run-requested: "2026-01-01T00:00:00Z"
+        kopiur.home-operations.com/run-mode: full # quick (default when absent) | full
+```
+
+- `run-requested` is an RFC3339 timestamp. A **new** timestamp requests a new
+  run; re-applying the same value is a no-op once that request was handled.
+- `run-mode` is `quick` (the default when absent) or `full`.
+
+/// note | Imperative equivalent
+
+For a one-off run without editing Git, stamp the same two annotations with
+`kubectl` (`--overwrite` because the timestamp changes each time):
 
 ```console
 $ kubectl annotate maintenance nas-primary -n billing --overwrite \
@@ -177,9 +164,7 @@ $ kubectl annotate maintenance nas-primary -n billing --overwrite \
     kopiur.home-operations.com/run-mode=full
 ```
 
-- `run-requested` is an RFC3339 timestamp. A **new** timestamp requests a new
-  run; re-applying the same value is a no-op once that request was handled.
-- `run-mode` is `quick` (the default when absent) or `full`.
+///
 
 The outcome lands in `status.manualRun` (`requestedAt`, `mode`, `phase`:
 `Running`/`Succeeded`/`Failed`, `completedAt`). The
