@@ -47,6 +47,7 @@ spec:
   create:
     enabled: true
 ---
+# --8<-- [start:policy]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -72,6 +73,7 @@ spec:
         matchLabels:
           app.kubernetes.io/name: app # the workload that owns `app-data`
       container: app # optional; defaults to the pod's first container
+# --8<-- [end:policy]
 ---
 # ── The SAME knob works on a Restore ──────────────────────────────────────────
 # A Restore writes INTO a PVC, so it has the identical mover surface. Inheriting

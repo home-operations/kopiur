@@ -104,3 +104,50 @@ CRs may share names. `-f/--follow`, `--tail N`, and `--previous` behave like
 its pods are already garbage-collected, the plugin prints the tail the
 operator recorded in `status.logTail` (plus the structured failure block)
 and says so honestly — it never pretends rotated logs are complete.
+
+## Try it end-to-end
+
+Take a backup and restore it into a fresh PVC, end to end, with two commands.
+
+/// note | Prerequisite: the playground
+
+This arc runs against the shared CLI playground (`media` namespace, repository `nas`, policy `nightly`, seeded PVC). Apply it and install the plugin first — see [the playground setup](index.md#try-it-end-to-end).
+
+///
+
+**1. Back up now** and wait for it to finish:
+
+```console
+$ kubectl kopiur snapshot now --policy nightly -n media --wait
+snapshot.kopiur.home-operations.com/nightly-manual-20260611030012 created
+snapshot nightly-manual-20260611030012 succeeded: kopia id a1b2c3d4e5f6, 5.0 GiB, took 12s
+```
+
+The `succeeded:` line (exit 0) is the proof — kopia id, size, and duration of the run.
+
+**2. Restore that snapshot** into a brand-new PVC the operator creates for you:
+
+```console
+$ kubectl kopiur restore --from-snapshot nightly-manual-20260611030012 \
+    --create-pvc data-restored --size 10Gi -n media --wait
+restore.kopiur.home-operations.com/restore-nightly-manual-20260611030012 created
+restore restore-nightly-manual-20260611030012 completed: kopia id a1b2c3d4e5f6, 5.0 GiB / 2 files into pvc/data-restored
+```
+
+The `completed:` line (exit 0) reports the bytes and file count written **into pvc/data-restored**.
+
+**3. Confirm the restored PVC is real (deep)** — it exists and is `Bound`:
+
+```console
+$ kubectl -n media get pvc data-restored
+NAME            STATUS   VOLUME       CAPACITY   ACCESS MODES   AGE
+data-restored   Bound    pvc-9f3a…    10Gi       RWO            30s
+```
+
+Mount it in a throwaway pod and diff it against the source if you want the full round-trip proof.
+
+/// note | Illustrative output
+
+The kopia ids, sizes, durations, timestamps in the names, and the bound `VOLUME`/`AGE` vary per run. The load-bearing facts are the verbatim `succeeded:` / `completed:` line formats, exit 0, and `data-restored` reaching `Bound`.
+
+///

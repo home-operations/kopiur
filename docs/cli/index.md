@@ -68,6 +68,51 @@ $ mise run build
 $ install -m 0755 target/debug/kubectl-kopiur ~/.local/bin/kubectl-kopiur
 ```
 
+## Try it end-to-end
+
+Stand up a small playground the rest of the CLI pages build on, then prove the plugin can see it with `doctor`. The playground is one apply-ready bundle, [`deploy/examples/tryit/cli-playground.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/cli-playground.yaml): a `media` `Namespace`, a PVC seeded with a `config/app.yaml` file and a multi-MB blob, the backend Secret, an S3 `Repository` `nas`, and a `SnapshotPolicy` + `SnapshotSchedule` named `nightly`. It deliberately has **no `Snapshot`** — the other CLI arcs create those.
+
+This is the shared starting point. Every CLI page's "Try it end-to-end" assumes you have applied this bundle and the repository is `Ready`.
+
+**1. Apply the playground** (fill in the `AWS_*` + `KOPIA_PASSWORD` `REPLACE_ME`s first) and wait for the repository:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/cli-playground.yaml
+$ kubectl -n media wait --for=condition=Ready repository/nas --timeout=2m
+$ kubectl -n media wait --for=condition=complete job/seed-app-data --timeout=2m
+```
+
+**2. Install the plugin** (via [krew](#install)):
+
+```console
+$ kubectl krew index add kopiur https://github.com/home-operations/kopiur.git
+$ kubectl krew install kopiur/kopiur
+$ kubectl kopiur --version
+```
+
+**3. Prove the install with `doctor` (deep).** It exits **0** when all eight checks pass:
+
+```console
+$ kubectl kopiur doctor -n media
+  ok    CRDs installed
+  ok    controller running
+  ok    webhook running
+  ok    webhook admission (live dry-run probe)
+  ok    repositories ready
+  ok    credential secrets present
+  ok    no stuck snapshots/restores
+  ok    recent warning events
+
+8 check(s): 0 failed, 0 warning(s)
+
+$ echo $?
+0
+```
+
+A non-zero exit (and a `FAIL` line with `why:`/`fix:`) means something needs attention — see [`doctor`](operations.md#doctor) for the full check list and how a restricted kubeconfig degrades to warnings.
+
+From here, follow any CLI page's "Try it end-to-end" against this same `media` playground: [take a backup and restore it](backup-restore.md#try-it-end-to-end), [browse a snapshot's files](browse.md#try-it-end-to-end), [run day-2 operations](operations.md#try-it-end-to-end), or [migrate from VolSync](migrate-volsync.md#try-it-end-to-end).
+
 ## Global flags
 
 Every subcommand accepts the kubectl-alike connection and output flags:

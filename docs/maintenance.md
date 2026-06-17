@@ -33,6 +33,68 @@ billing     nas-primary   nas-primary   kopiur/billing/nas-primary     4h44m
 
 There are three ways to control it, in increasing order of explicitness.
 
+## Try it end-to-end
+
+Prove the default-managed model — *a `Maintenance` appears with nothing but a `Repository`* — and then force a run on demand. The bundle [`deploy/examples/tryit/maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/maintenance.yaml) is deliberately minimal: namespace, a repo PVC, a `KOPIA_PASSWORD` Secret, and a filesystem `Repository` — and **no** `Maintenance` resource. The operator projects one for you.
+
+The `Repository` below is the only CR in the bundle — note it carries no `spec.maintenance` block and there is no standalone `Maintenance`; the managed one is auto-projected the moment this repository is `Ready`:
+
+```yaml
+--8<-- "deploy/examples/tryit/maintenance.yaml:repository"
+```
+
+Fill in the single `REPLACE_ME` (`KOPIA_PASSWORD`) and apply once:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/maintenance.yaml
+$ kubectl -n kopiur-tryit wait --for=condition=Ready repository/primary --timeout=2m
+```
+
+**1. The managed `Maintenance` auto-appears.** You authored none — the operator created `primary` (named after the repository) with the default quick-6h / full-daily schedule:
+
+```console
+$ kubectl -n kopiur-tryit get maintenance
+NAME      REPOSITORY   OWNER                      AGE
+primary   primary      kopiur/kopiur-tryit/primary   20s
+```
+
+**2. Request a `full` run NOW.** Stamp the two on-demand annotations (`--overwrite` because the timestamp changes each time):
+
+```console
+$ kubectl annotate maintenance primary -n kopiur-tryit --overwrite \
+    kopiur.home-operations.com/run-requested="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    kopiur.home-operations.com/run-mode=full
+```
+
+**3. Prove the run completed (deep).** The outcome lands in `status.manualRun`:
+
+```console
+$ kubectl -n kopiur-tryit wait \
+    --for=jsonpath='{.status.manualRun.phase}'=Succeeded \
+    maintenance/primary --timeout=5m
+$ kubectl -n kopiur-tryit get maintenance primary \
+    -o jsonpath='{.status.manualRun}'
+{"requestedAt":"2026-06-17T14:05:00Z","mode":"full","phase":"Succeeded","completedAt":"2026-06-17T14:05:42Z"}
+```
+
+*(Illustrative timestamps.)*
+
+**4. Confirm the full clock advanced.** A `full` run also stamps `status.full.lastRunAt`:
+
+```console
+$ kubectl -n kopiur-tryit get maintenance primary \
+    -o jsonpath='{.status.full.lastRunAt}'
+2026-06-17T14:05:42Z    # illustrative
+```
+
+/// note | `lastContentReclaimedBytes` reads `0` even on a successful run
+
+`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `status.full.lastContentReclaimedBytes` is reported as `0` today even though the run does reclaim space. The field exists and round-trips; populating it precisely is a planned enhancement.
+
+///
+
+To tear down: `kubectl delete namespace kopiur-tryit`.
+
 ### 1. Tune it inline on the repository
 
 Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the schedule (or other knobs) while keeping it operator-managed:

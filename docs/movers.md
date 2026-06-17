@@ -216,6 +216,92 @@ To back up a PVC in `media` to a shared `ClusterRepository` whose Secret lives i
     $ kubectl get snapshots -n media -w        # Pending → Running → Succeeded
     ```
 
+## Try it end-to-end
+
+Prove the privileged-mover gate from a clean slate: a namespace that has **opted in**, a PVC seeded with **root-owned `0600`** files (data an unprivileged mover can't read), and a **root** `SnapshotPolicy`. The backup goes green and the mover pod really runs as UID `0` — and would have been refused without the opt-in.
+
+This is one apply-ready bundle, [`deploy/examples/tryit/movers-privileged.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/movers-privileged.yaml): the opted-in `media` `Namespace`, a PVC, a seed Job, an S3 `Repository`, a root-mover `SnapshotPolicy`, and a manual `Snapshot`.
+
+The opt-in is the load-bearing piece — without it the root Snapshot is refused with `MoverPermitted=False`:
+
+```yaml
+--8<-- "deploy/examples/tryit/movers-privileged.yaml:namespace"
+```
+
+The seed writes root-owned, owner-only files — the case that actually needs a root mover:
+
+```yaml
+--8<-- "deploy/examples/tryit/movers-privileged.yaml:seed"
+```
+
+And the policy runs the mover as root (`runAsUser: 0`, `runAsNonRoot: false`):
+
+```yaml
+--8<-- "deploy/examples/tryit/movers-privileged.yaml:policy"
+```
+
+**1. Fill in the credentials** (`AWS_*` keys + a `KOPIA_PASSWORD`) in the `secret` section, then apply the whole bundle — namespace, PVC, seed Job, Secret, Repository, and SnapshotPolicy in one shot:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/movers-privileged.yaml
+```
+
+**2. Wait for the repository and the seed**:
+
+```console
+$ kubectl -n media wait --for=condition=Ready repository/primary --timeout=2m
+$ kubectl -n media wait --for=condition=complete job/seed-app-data --timeout=2m
+```
+
+**3. Take the backup.** The `Snapshot` uses `generateName`, so `create` it (not `apply`):
+
+```console
+$ kubectl create -f deploy/examples/tryit/movers-privileged.yaml
+snapshot.kopiur.home-operations.com/app-data-manual-abc12 created
+
+$ kubectl -n media wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/app-data-manual-abc12 --timeout=5m
+```
+
+**4. Prove it (deep).** Confirm the privilege gate passed, the run succeeded, and the mover pod really ran as root:
+
+```console
+# the gate cleared because the namespace opted in:
+$ kubectl -n media get snapshot app-data-manual-abc12 \
+    -o jsonpath='{.status.conditions[?(@.type=="MoverPermitted")].status}{"\n"}'
+True
+
+# the mover Job is named after the Snapshot CR (no -snap suffix):
+$ kubectl -n media get snapshot app-data-manual-abc12 -o jsonpath='{.status.job.name}{"\n"}'
+app-data-manual-abc12
+
+# its pod, by the standard Job-managed selector:
+$ kubectl -n media get pods --selector=job-name=app-data-manual-abc12
+
+# the mover container's effective UID — 0 (root):
+$ kubectl -n media get pod <mover-pod> \
+    -o jsonpath='{.spec.containers[0].securityContext.runAsUser}{"\n"}'
+0
+```
+
+/// note | Illustrative names
+
+`app-data-manual-abc12` and `<mover-pod>` stand in for the server-generated names your run gets. Substitute the names `kubectl create` and `kubectl get pods` print.
+
+///
+
+**See it refuse without the opt-in.** Remove the annotation and re-run to watch the gate close:
+
+```console
+$ kubectl annotate namespace media kopiur.home-operations.com/privileged-movers-
+$ kubectl create -f deploy/examples/tryit/movers-privileged.yaml
+$ kubectl -n media get snapshot <new-name> \
+    -o jsonpath='{.status.conditions[?(@.type=="MoverPermitted")]}{"\n"}'
+{"type":"MoverPermitted","status":"False","reason":"PrivilegedMoverNotPermitted", ...}
+```
+
+Re-add the annotation (re-apply the bundle's `namespace` section, or `kubectl annotate … =true`) and the blocked Snapshot proceeds within seconds — no re-apply needed.
+
 ## Troubleshooting
 
 The mover preconditions surface on the `Snapshot`/`Restore` status as conditions **and** as `Warning` Events (visible in `kubectl describe`), so you never have to read controller logs to find out why a backup didn't start.

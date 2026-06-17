@@ -1,0 +1,210 @@
+# Try it end-to-end — mirror a repository to a second backend (docs/replication.md)
+#
+# A self-contained 3-2-1 mirror, all on filesystem PVCs (no cloud creds):
+#   - a SOURCE filesystem Repository (`primary`) on PVC `kopia-repo-src`
+#   - a seeded PVC + SnapshotPolicy + a real source Snapshot, so there are blobs
+#     to replicate (an empty repo would replicate nothing)
+#   - a DESTINATION filesystem on a SECOND PVC (`kopia-repo-dst`)
+#   - a RepositoryReplication that runs `kopia repository sync-to` on a cron
+#   - a `verify-mirror` Repository pointing at the destination PVC, so you can
+#     connect to the mirror and confirm the snapshot landed there
+#
+# There is NO on-demand annotation for replication (unlike Maintenance) — it runs
+# on its schedule. The cron here is `* * * * *` (every minute) purely so the demo
+# fires quickly; a real mirror would be nightly (e.g. `0 5 * * *`).
+#
+# Fill in the one REPLACE_ME (KOPIA_PASSWORD) and apply once. The same password is
+# reused for the destination and the verifier: `sync-to` copies blobs verbatim, so
+# the mirror has the SAME format and encryption material as the source —
+# destinationEncryption is omitted on purpose. The verify-mirror Repository points
+# at the SAME on-disk path the destination wrote (/repo on its PVC), so a plain
+# `kubectl apply` mirror is connectable as-is.
+#
+# Field shapes verified against crates/api (repository_replication.rs: sourceRef is
+# a RepositoryRef (kind defaults to Repository); destination is an externally-tagged
+# Backend; schedule={cron,jitter}; destinationEncryption optional; status.phase +
+# status.lastReplicated. externally-tagged backend.filesystem on every Repository).
+#
+# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
+# section markers for docs/replication.md. Plain YAML comments — applies as-is.
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-tryit
+# --8<-- [end:namespace]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: kopiur-tryit
+type: Opaque
+stringData:
+  # One password for source + mirror + verifier (a true mirror shares it).
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:source-repo]
+# The SOURCE repository: a filesystem Repository on its own PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo-src
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: kopiur-tryit
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo-src
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:source-repo]
+---
+# --8<-- [start:source-data]
+# Seed real data and take ONE source Snapshot, so the source repository has blobs
+# for replication to mirror.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-data
+  namespace: kopiur-tryit
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/docs
+              for i in $(seq 1 20); do
+                head -c 4096 /dev/urandom | base64 > /data/docs/file-$i.txt
+              done
+              echo "seeded $(ls /data/docs | wc -l) files"
+          volumeMounts:
+            - name: app-data
+              mountPath: /data
+      volumes:
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: app-data
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  repository:
+    name: primary
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-seed
+  namespace: kopiur-tryit
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:source-data]
+---
+# --8<-- [start:replication]
+# A second PVC to receive the mirror.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo-dst
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: RepositoryReplication
+metadata:
+  name: primary-mirror
+  namespace: kopiur-tryit
+spec:
+  # Mirror FROM the source repository above.
+  sourceRef:
+    kind: Repository
+    name: primary
+  # Mirror TO a filesystem destination on the second PVC. Exactly one backend,
+  # and it must DIFFER from the source — here a different PVC (different volume).
+  destination:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo-dst
+  # No destinationEncryption: the mirror reuses the source repo's password.
+  # Every minute so the demo fires quickly; a real mirror would be nightly.
+  schedule:
+    cron: "* * * * *"
+  suspend: false
+# --8<-- [end:replication]
+---
+# --8<-- [start:verify-mirror]
+# Connect to the DESTINATION to confirm the snapshot is mirrored there. This is a
+# read-only sanity check: it points at the same on-disk path the mirror wrote.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: verify-mirror
+  namespace: kopiur-tryit
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo-dst
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  # NO create block: the mirror already initialized this repository, so the
+  # verifier only CONNECTS to it (creating would error on a non-empty repo).
+# --8<-- [end:verify-mirror]

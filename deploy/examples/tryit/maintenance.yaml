@@ -1,0 +1,76 @@
+# Try it end-to-end — the managed Maintenance auto-appears (docs/maintenance.md)
+#
+# Deliberately MINIMAL: just a namespace, a repo PVC, a Secret, and a filesystem
+# Repository. There is NO standalone Maintenance in this file — the point is to
+# prove that maintenance is DEFAULT-MANAGED: the moment a Repository exists, the
+# operator projects an owned `Maintenance` CR (named `primary`, after the repo)
+# with the default quick-6h / full-daily schedule. The arc then stamps the
+# on-demand annotations to force a `full` run NOW and watches status.manualRun.
+#
+# Fill in the one REPLACE_ME (KOPIA_PASSWORD) and apply once:
+#   kubectl apply -f deploy/examples/tryit/maintenance.yaml
+#
+# Field shapes verified against crates/api (maintenance.rs: status.manualRun =
+# {requestedAt,mode,phase,completedAt}; status.{quick,full}.lastRunAt;
+# RepositoryMaintenanceSpec is default-on so the managed Maintenance is projected
+# without authoring one. On-demand annotations RUN_REQUESTED_ANNOTATION
+# `kopiur.home-operations.com/run-requested` (RFC3339) + RUN_MODE_ANNOTATION
+# `kopiur.home-operations.com/run-mode` values quick|full — consts.rs).
+#
+# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
+# section markers for docs/maintenance.md. Plain YAML comments — applies as-is.
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-tryit
+# --8<-- [end:namespace]
+---
+# --8<-- [start:repo-pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+# --8<-- [end:repo-pvc]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: kopiur-tryit
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+# A bare Repository. NOTE there is no `spec.maintenance` block and no standalone
+# Maintenance CR: maintenance is default-on, so the operator projects an owned
+# `Maintenance` named `primary` the moment this repository is Ready.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: kopiur-tryit
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]

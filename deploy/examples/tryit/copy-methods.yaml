@@ -1,0 +1,159 @@
+# Try it end-to-end — copyMethod: Snapshot (staged CSI copy) (docs/copy-methods.md)
+#
+# Proves a point-in-time `copyMethod: Snapshot` backup: Kopiur takes a CSI
+# VolumeSnapshot of the source PVC, stages a temporary PVC from it
+# (<snapshot-name>-src), and the mover reads THAT stage — never the live volume.
+# Because the Snapshot CR has a FIXED name (app-data-snapshot), the staged PVC is
+# deterministically named `app-data-snapshot-src`, so the arc can fetch it by name
+# while the backup is Running and confirm it is gone after success.
+#
+# PREREQUISITE — this is the one bundle that needs CSI: the source PVC must be
+# CSI-provisioned, the cluster must have the external-snapshotter (snapshot-controller
+# + VolumeSnapshot CRDs), and a VolumeSnapshotClass must exist for your driver.
+# Without it the backup fails fast with a clear condition (it never silently falls
+# back to a live read). Fill in BOTH REPLACE_ME values:
+#   - storageClassName: a CSI StorageClass that supports VolumeSnapshots
+#   - KOPIA_PASSWORD
+# Leave volumeSnapshotClassName unset to auto-pick your driver's default class.
+#
+# Field shapes verified against crates/api (snapshot_policy.rs spec.copyMethod is
+# a top-level CopyMethod enum {Direct,Snapshot,Clone}; snapshot.rs status.staged =
+# {copyMethod,volumeSnapshotName,pvcName,ready}; the staged PVC is <snapshot>-src;
+# externally-tagged backend.filesystem).
+#
+# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
+# section markers for docs/copy-methods.md. Plain YAML comments — applies as-is.
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-tryit
+# --8<-- [end:namespace]
+---
+# --8<-- [start:repo-pvc]
+# Backing store for the kopia repository (filesystem backend — no cloud creds).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+# --8<-- [end:repo-pvc]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: kopiur-tryit
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:app-data]
+# The source volume — MUST be CSI-provisioned so it can be VolumeSnapshotted.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: REPLACE_ME # a CSI StorageClass that supports VolumeSnapshots
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:app-data]
+---
+# --8<-- [start:seed]
+# Seed real data so the backup uploads non-zero bytes/files.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-data
+  namespace: kopiur-tryit
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/docs
+              for i in $(seq 1 20); do
+                head -c 4096 /dev/urandom | base64 > /data/docs/file-$i.txt
+              done
+              echo "seeded $(ls /data/docs | wc -l) files"
+          volumeMounts:
+            - name: app-data
+              mountPath: /data
+      volumes:
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:seed]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: kopiur-tryit
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  repository:
+    name: primary
+  # The load-bearing line: stage a CSI VolumeSnapshot instead of reading live.
+  copyMethod: Snapshot
+  # volumeSnapshotClassName: csi-...   # optional — omit to use the driver default
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+# A FIXED-name Snapshot (not generateName) so the staged PVC is deterministically
+# `app-data-snapshot-src` — apply this with `apply`, not `create`.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-snapshot
+  namespace: kopiur-tryit
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]

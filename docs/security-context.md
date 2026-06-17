@@ -287,6 +287,78 @@ Full, apply-ready example:
 
 The hardened default satisfies the `restricted` PSA profile, so unprivileged movers run anywhere. A **root/elevated** mover violates `restricted` — beyond Kopiur's own opt-in annotation, the namespace's PSA level (and any OpenShift SCC) must also permit it, or the pod won't schedule.
 
+## Try it end-to-end
+
+Prove [inherit-from-the-workload](#2-inherit-it-from-the-workload) end to end: a **running** Deployment whose container runs as UID `1000`, and a `SnapshotPolicy` that copies *that* identity onto the mover. The mover pod ends up running as `1000` — and you never wrote a UID on the policy.
+
+One apply-ready bundle, [`deploy/examples/tryit/inherit-security-context.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/inherit-security-context.yaml): the `app` `Namespace`, a PVC, a long-running `app` Deployment (the identity source), a Secret, an S3 `Repository`, an `inheritSecurityContextFrom` `SnapshotPolicy`, and a manual `Snapshot`.
+
+The workload is the identity source — `inheritSecurityContextFrom` needs a **live** pod to read from:
+
+```yaml
+--8<-- "deploy/examples/tryit/inherit-security-context.yaml:workload"
+```
+
+The policy points a label selector at it (no hard-coded UID):
+
+```yaml
+--8<-- "deploy/examples/tryit/inherit-security-context.yaml:policy"
+```
+
+**1. Fill in the credentials** (`AWS_*` + `KOPIA_PASSWORD`) in the `secret` section, then apply the bundle:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/inherit-security-context.yaml
+```
+
+**2. Wait for the workload to be Running first** — inherit reads a live pod, so the Deployment must be up before the Snapshot:
+
+```console
+$ kubectl -n app rollout status deploy/app --timeout=2m
+$ kubectl -n app wait --for=condition=Ready repository/app-primary --timeout=2m
+```
+
+**3. Take the backup** (the `Snapshot` uses `generateName`, so `create` it):
+
+```console
+$ kubectl create -f deploy/examples/tryit/inherit-security-context.yaml
+snapshot.kopiur.home-operations.com/app-data-manual-abc12 created
+
+$ kubectl -n app wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/app-data-manual-abc12 --timeout=5m
+```
+
+**4. Prove the inherited identity (deep).** The mover pod's UID equals the workload's, copied automatically:
+
+```console
+# what the WORKLOAD runs as:
+$ kubectl -n app get pod -l app.kubernetes.io/name=app \
+    -o jsonpath='{.items[0].spec.containers[?(@.name=="app")].securityContext.runAsUser}{"\n"}'
+1000
+
+# the mover Job is named after the Snapshot CR (no -snap suffix):
+$ kubectl -n app get snapshot app-data-manual-abc12 -o jsonpath='{.status.job.name}{"\n"}'
+app-data-manual-abc12
+
+# the MOVER pod's UID — also 1000, inherited, never set on the policy:
+$ kubectl -n app get pods --selector=job-name=app-data-manual-abc12
+$ kubectl -n app get pod <mover-pod> \
+    -o jsonpath='{.spec.containers[0].securityContext.runAsUser}{"\n"}'
+1000
+```
+
+/// note | Illustrative names
+
+`app-data-manual-abc12` and `<mover-pod>` stand in for the server-generated names your run gets. Substitute the names `kubectl create` / `kubectl get pods` print. The matching `1000` on both sides is the point — inherit copied the workload's identity.
+
+///
+
+/// tip | Scale the workload to zero and inherit fails loudly
+
+`kubectl -n app scale deploy/app --replicas=0`, then re-create the Snapshot: with no Running pod to read, the Snapshot is held with an actionable condition telling you exactly that — inherit is selection of a live pod, not a stored value. Scale back up and it proceeds.
+
+///
+
 ## Backup vs Restore at a glance
 
 | | Backup | Restore |
@@ -304,10 +376,10 @@ The hardened default satisfies the `restricted` PSA profile, so unprivileged mov
 After a run, confirm the mover's effective identity and that it actually moved data:
 
 ```console
-# the mover Job's name is on the owning Snapshot/Restore; find its pod from that:
+# the mover Job's name is on the owning Snapshot/Restore (named after the CR); find its pod from that:
 $ kubectl get snapshot <snapshot-name> -n app -o jsonpath='{.status.job.name}'
-app-data-manual-abc12-snap
-$ kubectl get pods -n app --selector=job-name=app-data-manual-abc12-snap
+app-data-manual-abc12
+$ kubectl get pods -n app --selector=job-name=app-data-manual-abc12
 
 # the container's effective UID (sanity-check it matches the data owner):
 $ kubectl get pod <mover-pod> -n app \

@@ -1,0 +1,162 @@
+# Try it end-to-end — a privileged (root) mover (docs/movers.md)
+#
+# A complete, self-contained arc that proves a ROOT mover runs only after the
+# namespace opts in. It creates:
+#   * a `media` Namespace carrying the privileged-movers opt-in annotation,
+#   * a PVC,
+#   * a one-shot seed Job that writes ROOT-owned `0600` files into it (data an
+#     unprivileged UID-65532 mover could NOT read — the case that needs root),
+#   * an S3 Repository,
+#   * a SnapshotPolicy whose mover runs as root (`runAsUser: 0`,
+#     `runAsNonRoot: false`), and
+#   * a `generateName` manual Snapshot to invoke it.
+#
+# Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
+#   kubectl apply -f deploy/examples/tryit/movers-privileged.yaml
+# (the manual Snapshot uses `generateName`, so create it with `kubectl create`).
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/movers.md. They are plain YAML comments — the file stays apply-ready.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`).
+---
+# --8<-- [start:namespace]
+# The privileged-mover opt-in. Without this annotation, the root Snapshot below
+# is REFUSED with a `MoverPermitted=False` condition until the namespace opts in.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+  annotations:
+    kopiur.home-operations.com/privileged-movers: "true"
+# --8<-- [end:namespace]
+---
+# --8<-- [start:pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:pvc]
+---
+# --8<-- [start:seed]
+# Seed the PVC with ROOT-owned, owner-only (0600) files — exactly the data an
+# unprivileged mover (UID 65532) gets "permission denied" on, so success here
+# proves the ROOT mover read it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-app-data
+  namespace: media
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      # Run the seed as root so the files it writes are root-owned 0600.
+      securityContext:
+        runAsUser: 0
+        runAsNonRoot: false
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/config
+              echo "owned by root, mode 0600" > /data/config/root-secret.key
+              head -c 2097152 /dev/urandom > /data/blob.bin   # ~2 MiB so stats are non-trivial
+              chown -R 0:0 /data
+              chmod 0600 /data/config/root-secret.key
+              ls -ln /data /data/config
+          volumeMounts:
+            - name: d
+              mountPath: /data
+      volumes:
+        - name: d
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:seed]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: media
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # Generate (e.g. `openssl rand -base64 24`) and store it OUTSIDE the cluster —
+  # lose it and the backups are unrecoverable.
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: media
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      prefix: media/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: media
+spec:
+  repository:
+    name: primary
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+  # ── Root mover (LAST RESORT) ─────────────────────────────────────────────────
+  # The data is root-owned 0600, so no unprivileged UID can read it. A root mover
+  # reads everything. This is ELEVATED — it requires the namespace opt-in above.
+  mover:
+    securityContext:
+      runAsUser: 0 # root — reads any file
+      runAsNonRoot: false # required: runAsNonRoot:true + runAsUser:0 is rejected by the kubelet
+    privilegedMode: true # also preserves UID/GID ownership on RESTORE
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: app-data-manual- # server-named — create with `kubectl create`, not apply
+  namespace: media
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]

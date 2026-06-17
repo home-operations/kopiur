@@ -1,0 +1,63 @@
+# Try it end-to-end — migrate a fork-kopia VolSync source (docs/cli/migrate-volsync.md)
+#
+# A complete, self-contained input for `kubectl kopiur migrate volsync`. It is a
+# perfectra1n/volsync FORK ReplicationSource (`spec.kopia`) plus the repository
+# Secret it references. The migrate command translates it into a kopiur
+# `Repository` + `SnapshotPolicy` (+ `SnapshotSchedule`), ADOPTING the existing
+# kopia repository in place — no `create` block, the Secret referenced where it
+# sits.
+#
+# This is INPUT for the CLI, not a kopiur manifest — you apply it so the plugin
+# has something to read:
+#   kubectl apply -f deploy/examples/tryit/volsync-source.yaml
+#   kubectl kopiur migrate volsync -n media --resolve-secrets          # dry-run
+#   kubectl kopiur migrate volsync -n media --resolve-secrets --apply  # apply
+#
+# Fill in the two `REPLACE_ME` backend keys and the EXISTING repository's
+# `KOPIA_PASSWORD` (the fork already initialized this repo — reuse its password).
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/cli/migrate-volsync.md. They are plain YAML comments.
+#
+# This file assumes the upstream VolSync CRDs and (for `--resolve-secrets`) S3
+# env names already match kopia's AWS_* keys, so the adopted Repository
+# references this Secret in place.
+---
+# --8<-- [start:secret]
+# The fork's repository Secret. KOPIA_REPOSITORY tells migrate which backend to
+# adopt; KOPIA_PASSWORD + AWS_* are referenced in place by the emitted Repository
+# (S3's AWS_* names already match kopia's, so no rename-Secret is needed).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: media-kopia-repo
+  namespace: media
+type: Opaque
+stringData:
+  KOPIA_REPOSITORY: "s3://my-kopia-bucket/media/"
+  KOPIA_PASSWORD: "REPLACE_ME" # the EXISTING repo password — reuse it, do not invent a new one
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  AWS_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
+# --8<-- [end:secret]
+---
+# --8<-- [start:source]
+# A minimal fork-kopia ReplicationSource. A minimal source is fully mappable and
+# passes `--strict`. `repository` names the Secret above; `spec.kopia` marks it
+# as the fork mover (vs upstream `spec.restic`).
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: media
+  namespace: media
+spec:
+  sourcePVC: app-data
+  trigger:
+    schedule: "0 2 * * *"
+  kopia:
+    repository: media-kopia-repo
+    copyMethod: Direct
+    retain:
+      daily: 7
+      weekly: 4
+# --8<-- [end:source]

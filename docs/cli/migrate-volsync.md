@@ -139,3 +139,69 @@ that context; `policyConfig` raw policy files are replaced by the typed
    then confirm the new snapshot lists under the same identity.
 5. Delete the fork's `KopiaMaintenance` objects and, when satisfied, the
    VolSync install — **not** the repository Secret.
+
+## Try it end-to-end
+
+Translate a fork-kopia VolSync source into kopiur manifests, review the accounting, apply it, and confirm the repository is adopted.
+
+/// note | Prerequisite: a fork-kopia source
+
+This arc reads one apply-ready input, [`deploy/examples/tryit/volsync-source.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/volsync-source.yaml): a fork-kopia `ReplicationSource` (`spec.kopia`) in `media` plus the repository Secret it references. It assumes the upstream VolSync CRDs are installed and `kubectl kopiur` is on your PATH (see the [playground setup](index.md#try-it-end-to-end) for the install).
+
+```yaml
+--8<-- "deploy/examples/tryit/volsync-source.yaml:source"
+```
+
+Fill in the `AWS_*` keys and the **existing** repo `KOPIA_PASSWORD` (the fork already initialized this repo — reuse its password), then apply the input:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/volsync-source.yaml
+```
+
+///
+
+**1. Dry-run the translation** — nothing is changed; the accounting prints on stderr:
+
+```console
+$ kubectl kopiur migrate volsync -n media --resolve-secrets
+kopia sources: REPOSITORY ADOPTED IN PLACE — all existing snapshots are preserved and the snapshot identity is pinned so history continues. KEEP the referenced VolSync Secret(s); retire the fork's KopiaMaintenance objects.
+
+  mapped      spec.sourcePVC -> SnapshotPolicy.spec.sources[0].pvc.name
+  mapped      spec.kopia.retain -> SnapshotPolicy.spec.retention
+  mapped      spec.trigger.schedule -> SnapshotSchedule.spec.schedule.cron
+  ...
+# (the kopiur Repository + SnapshotPolicy + SnapshotSchedule YAML on stdout)
+```
+
+Review the accounting — especially the pinned **`(fork snapshot identity)`** line — before applying. Every field the translator reads is `mapped`, `UNMAPPABLE`, or `ignored`; nothing is silently dropped.
+
+**2. Apply** when the accounting looks right — fork-kopia adopts the repository in place, so `--apply` works in one shot (no `REPLACE_ME` to fill):
+
+```console
+$ kubectl kopiur migrate volsync -n media --resolve-secrets --apply
+...
+applied Repository/media
+applied SnapshotPolicy/media
+applied SnapshotSchedule/media
+```
+
+**3. Confirm the repository is healthy (deep)** with `doctor`:
+
+```console
+$ kubectl kopiur doctor -n media | grep repositories
+  ok    repositories ready
+```
+
+**4. See the adopted history.** The fork's existing snapshots surface as `origin: discovered`:
+
+```console
+$ kubectl kopiur snapshots list --origin discovered -n media
+NAME                          POLICY  ORIGIN      PHASE      SNAPSHOT-ID   SIZE     FILES  START                 AGE
+media-20260601-020000         -       discovered  Succeeded  9f8e7d6c5b4a  4.7 GiB  982    2026-06-01T02:00:00Z  10d
+```
+
+/// note | Illustrative — discovered rows need a real fork repository
+
+The `--origin discovered` listing above is illustrative: it appears only once the catalog scan finds real snapshots in the adopted repository. Against an empty placeholder backend the table is empty until the fork's repo (with history) is reachable. The verbatim parts are the adoption banner, the `mapped`/`applied <kind>/<name>` line formats, and the `ok    repositories ready` doctor line.
+
+///

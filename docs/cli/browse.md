@@ -131,3 +131,88 @@ Deletes the session Job and its work-spec ConfigMap. When no session is open
 it says so and exits 0 — safe to run from cleanup scripts. Sessions are also
 labeled (`kopiur.home-operations.com/session=browse`) so a plain
 `kubectl delete job -l kopiur.home-operations.com/session=browse` works too.
+
+## Try it end-to-end
+
+Read a snapshot's files without restoring anything — list, `cat` a config file, `download` a blob, then poke around interactively.
+
+/// note | Prerequisite: the playground + one snapshot
+
+This arc runs against the shared CLI playground (`media` namespace, repository `nas`, a seeded PVC holding `config/app.yaml` and `movies.db`). Apply it and install the plugin first — see [the playground setup](index.md#try-it-end-to-end) — then take one snapshot so there's something to browse:
+
+```console
+$ kubectl kopiur snapshot now --policy nightly -n media --wait
+```
+
+///
+
+**1. List the snapshots** to get a name with a kopia snapshot ID:
+
+```console
+$ kubectl kopiur snapshots list -n media
+NAME                              POLICY   ORIGIN   PHASE      SNAPSHOT-ID   SIZE     FILES  START                 AGE
+nightly-manual-20260611030012     nightly  manual   Succeeded  a1b2c3d4e5f6  5.0 MiB  2      2026-06-11T03:00:12Z  1m
+```
+
+**2. List its files**, then read the config file straight to stdout:
+
+```console
+$ kubectl kopiur ls nightly-manual-20260611030012 -n media
+NAME        TYPE  SIZE     MODIFIED
+config/     dir   29 B     2026-06-11 03:00:10
+movies.db   file  5.0 MiB  2026-06-11 03:00:11
+
+$ kubectl kopiur cat nightly-manual-20260611030012 config/app.yaml -n media
+# demo config the CLI arcs read back
+name: media-app
+replicas: 1
+```
+
+**3. Download the blob** locally (verified against the snapshot's byte count):
+
+```console
+$ kubectl kopiur download nightly-manual-20260611030012 movies.db ./movies.db -n media
+downloading movies.db to ./movies.db…
+wrote 5242880 bytes to ./movies.db
+```
+
+**4. Browse interactively (deep).** The REPL reuses the warm session; `quit` ends it:
+
+```console
+$ kubectl kopiur browse nightly-manual-20260611030012 -n media
+browsing snapshot nightly-manual-20260611030012 (kopia a1b2c3d4e5f6) — read-only; `help` lists commands, `quit` leaves
+kopiur:/> help
+commands:
+  ls            list the current directory
+  cd <dir>      enter a directory (cd .. to go up)
+  cat <file>    print a file to stdout
+  get <file> [dest]  download a file
+  pwd           print the current path
+  help          this help
+  quit          leave (also: exit, q, ctrl-d)
+kopiur:/> ls
+NAME        TYPE  SIZE     MODIFIED
+config/     dir   29 B     2026-06-11 03:00:10
+movies.db   file  5.0 MiB  2026-06-11 03:00:11
+kopiur:/> cd config
+kopiur:/config> cat app.yaml
+# demo config the CLI arcs read back
+name: media-app
+replicas: 1
+kopiur:/config> get app.yaml ./app.yaml
+wrote 29 bytes to ./app.yaml
+kopiur:/config> quit
+```
+
+**5. Tidy up** the warm session early (it would expire by TTL anyway):
+
+```console
+$ kubectl kopiur session end nightly-manual-20260611030012 -n media
+session kopiur-browse-nas-1a2b3c4d ended (Job + work-spec ConfigMap deleted)
+```
+
+/// note | Illustrative output
+
+The kopia ids, sizes, timestamps, the session-pod suffix (`…-1a2b3c4d`), and the byte counts vary per run. The verbatim parts are the REPL banner, the `kopiur:<path>>` prompt, the `help` text, and the `wrote N bytes to …` / `session … ended` lines.
+
+///

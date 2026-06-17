@@ -103,3 +103,79 @@ durable pause, set `suspend: true` in Git instead — the plugin is for the
 interactive "stop the bleeding now" moment.
 
 ///
+
+## Try it end-to-end
+
+Walk the day-2 commands against a live install: a health overview, the diagnostic, the pause switch, and an out-of-band maintenance run.
+
+/// note | Prerequisite: the playground
+
+This arc runs against the shared CLI playground (`media` namespace, repository `nas`, policy + schedule `nightly`). Apply it and install the plugin first — see [the playground setup](index.md#try-it-end-to-end).
+
+///
+
+**1. One-screen health** with `status`:
+
+```console
+$ kubectl kopiur status -n media
+REPOSITORIES
+KIND        NAME  NAMESPACE  PHASE  BACKEND  MODE       SUSPENDED  MAINTENANCE
+Repository  nas   media      Ready  S3       ReadWrite  false      configured
+
+POLICIES
+NAME     NAMESPACE  REPOSITORY      SUSPENDED  LAST-SNAPSHOT  LAST-VERIFIED
+nightly  media      Repository/nas  false      -              -
+
+SCHEDULES
+NAME     NAMESPACE  SCHEDULE   SUSPENDED  LAST-FIRE  NEXT-FIRE             FAILURES
+nightly  media      H 2 * * *  false      -          2026-06-12T02:17:00Z  0
+
+IN FLIGHT: 0 snapshot(s), 0 restore(s)
+```
+
+**2. Diagnose** with `doctor` — exit 0 when everything is healthy:
+
+```console
+$ kubectl kopiur doctor -n media
+  ok    CRDs installed
+  ok    controller running
+  ok    webhook running
+  ok    webhook admission (live dry-run probe)
+  ok    repositories ready
+  ok    credential secrets present
+  ok    no stuck snapshots/restores
+  ok    recent warning events
+
+8 check(s): 0 failed, 0 warning(s)
+```
+
+**3. Pause and unpause** the schedule declaratively (idempotent — re-running prints `unchanged`):
+
+```console
+$ kubectl kopiur suspend schedule nightly -n media
+snapshotschedule.kopiur.home-operations.com/nightly suspended
+
+$ kubectl kopiur resume schedule nightly -n media
+snapshotschedule.kopiur.home-operations.com/nightly resumed
+```
+
+**4. Run maintenance out of band (deep)** — a full pass against the `nas` repository, waited to completion:
+
+```console
+$ kubectl kopiur maintenance run --repository nas --full -n media --wait
+maintenance.kopiur.home-operations.com/nas full run requested (2026-06-11T12:00:00Z)
+maintenance nas full run completed at 2026-06-11T12:01:42Z
+```
+
+The plugin stamps the `run-requested`/`run-mode` annotations on the operator-managed `Maintenance`, which runs it through the same lease + single-flight path as the cron slots. Confirm it landed in status:
+
+```console
+$ kubectl -n media get maintenance nas -o jsonpath='{.status.manualRun.phase}{"\n"}'
+Succeeded
+```
+
+/// note | Illustrative output
+
+The `NEXT-FIRE` time, the maintenance timestamps, and `LAST-SNAPSHOT`/`LAST-FIRE` (which read `-` until the first run) vary per install. The verbatim parts are the table headers, the `IN FLIGHT:` line, the doctor checks/footer, the suspend/resume lines, and the `requested (…)` / `completed at …` maintenance lines.
+
+///

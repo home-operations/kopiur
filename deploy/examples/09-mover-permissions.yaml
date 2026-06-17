@@ -102,6 +102,7 @@ spec:
   # THIS app's data is owned by a different UID, set just that field here — the
   # rest (fsGroup, cache, the hardened base) still comes from moverDefaults. A
   # partial override can only tighten; it never drops drop:[ALL]/seccomp.
+  # --8<-- [start:mover]
   mover:
     securityContext:
       runAsUser: 1000 # match the UID that owns THIS app's data (else inherit)
@@ -115,3 +116,4 @@ spec:
     #   runAsUser: 0           # root — reads any file
     #   runAsNonRoot: false
     # privilegedMode: true     # also preserves UID/GID ownership on RESTORE
+# --8<-- [end:mover]

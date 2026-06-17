@@ -1,0 +1,71 @@
+# Try it end-to-end — the kopia web UI on a Repository (docs/server.md)
+#
+# A complete, self-contained arc that turns on the kopia web UI and proves it
+# answers with HTTP basic-auth. It creates:
+#   * an `apps` Namespace,
+#   * the backend + encryption Secret the server pod loads, and
+#   * a Repository `nas-primary` with a minimal `spec.server` block (operator-
+#     minted credentials, ClusterIP Service, default port 51515).
+#
+# Once the Repository is Ready the operator materializes a `<repo>-kopia-ui`
+# Deployment/Service/ConfigMap and a `<repo>-kopia-ui-auth` Secret (keys
+# username/password). The doc port-forwards the Service and curls it to a `200`.
+#
+# Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
+#   kubectl apply -f deploy/examples/tryit/server-ui.yaml
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/server.md. They are plain YAML comments — the file stays apply-ready.
+#
+# Field shapes verified against crates/api: externally-tagged backend
+# (`backend.s3`), and `server.auth.generate` (externally-tagged auth enum).
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps
+# --8<-- [end:namespace]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: apps
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # Generate (e.g. `openssl rand -base64 24`) and store it OUTSIDE the cluster.
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: apps
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  # ── Turn on the web UI ────────────────────────────────────────────────────────
+  # Presence of `spec.server` is "on" (there is no `enabled` bool). The minimal
+  # form takes the safe defaults: operator-minted credentials into an owned
+  # Secret, a ClusterIP Service, port 51515.
+  server:
+    auth: { generate: {} }
+# --8<-- [end:repository]

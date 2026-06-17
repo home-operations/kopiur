@@ -1,0 +1,163 @@
+# Try it end-to-end — manual backup with real data (docs/backups.md)
+#
+# A fully self-contained backup arc: namespace -> a PVC to hold the kopia
+# repository -> credentials (KOPIA_PASSWORD only — filesystem backend needs no
+# cloud keys) -> a SECOND PVC for the data you back up -> a busybox seed Job that
+# writes real files into it (so the snapshot's status.stats.filesNew/bytesNew are
+# non-zero, not an empty backup) -> a filesystem Repository that the operator
+# initializes on the repo PVC -> a SnapshotPolicy (the recipe) -> a manual
+# Snapshot (the invocation).
+#
+# Fill in the one REPLACE_ME (KOPIA_PASSWORD) and apply once:
+#   kubectl apply -f deploy/examples/tryit/backups.yaml
+# then create the generateName Snapshot (see docs/backups.md "Try it end-to-end").
+#
+# Field shapes verified against crates/api (snapshot.rs SnapshotStats:
+# filesNew/bytesNew/sizeBytes; SnapshotInfo.kopiaSnapshotID, capital ID;
+# snapshot_policy.rs spec.{repository,sources,retention}; externally-tagged
+# backend.filesystem with a PVC-backed volume).
+#
+# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
+# section markers for docs/backups.md. They are plain YAML comments — the file
+# stays `kubectl apply -f`-able as-is.
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-tryit
+# --8<-- [end:namespace]
+---
+# --8<-- [start:repo-pvc]
+# Backing store for the kopia repository itself. ReadWriteOnce is fine for a
+# single-node try-out; a real shared filesystem repo would be ReadWriteMany.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+# --8<-- [end:repo-pvc]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  # Must live in the SAME namespace as the data you back up — the mover loads it
+  # with envFrom, which is namespace-local.
+  namespace: kopiur-tryit
+type: Opaque
+stringData:
+  # Filesystem backend needs ONLY the repository encryption password (no cloud
+  # keys). Generate one (`openssl rand -base64 24`) and store it OUTSIDE the
+  # cluster too — lose it and the backups are unrecoverable.
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:app-data]
+# The volume you actually back up.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:app-data]
+---
+# --8<-- [start:seed]
+# Write real files into app-data so the backup has something to upload. The arc
+# waits for this Job to complete before taking the Snapshot, so
+# status.stats.filesNew / bytesNew come back non-zero.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-data
+  namespace: kopiur-tryit
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/docs
+              for i in $(seq 1 20); do
+                head -c 4096 /dev/urandom | base64 > /data/docs/file-$i.txt
+              done
+              echo "seeded $(ls /data/docs | wc -l) files"
+          volumeMounts:
+            - name: app-data
+              mountPath: /data
+      volumes:
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:seed]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: kopiur-tryit
+spec:
+  backend:
+    # Filesystem backend: the operator mounts a PVC at `path` and kopia writes
+    # the repository there. No object-store keys required.
+    filesystem:
+      path: /repo # mount path INSIDE the mover pod
+      volume:
+        pvc:
+          name: kopia-repo
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  # Initialize a brand-new kopia repository on the empty PVC.
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  repository:
+    name: primary # kind defaults to Repository (same namespace)
+  sources:
+    - pvc:
+        name: app-data # the PVC the seed Job wrote into
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+# The invocation. generateName means every `kubectl create` mints a fresh unique
+# name (app-data-manual-xxxxx), so use `create`, not `apply`, for this one.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: app-data-manual-
+  namespace: kopiur-tryit
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]

@@ -107,12 +107,12 @@ A complete, apply-ready example (Repository + SnapshotPolicy with this block, pl
 Re-run the backup and confirm it actually read files, rather than silently snapshotting an empty/partial tree:
 
 ```console
-# the mover Job's exact name lives on the Snapshot:
+# the mover Job's exact name lives on the Snapshot (it's named after the Snapshot CR):
 $ kubectl get snapshot <snapshot-name> -n app -o jsonpath='{.status.job.name}'
-app-data-manual-abc12-snap
+app-data-manual-abc12
 
 # its pod (by the standard Job-managed pod label), then the container's effective UID:
-$ kubectl get pods -n app --selector=job-name=app-data-manual-abc12-snap
+$ kubectl get pods -n app --selector=job-name=app-data-manual-abc12
 $ kubectl get pod <mover-pod> -n app \
     -o jsonpath='{.spec.containers[0].securityContext.runAsUser}{"\n"}'
 1000
@@ -184,6 +184,72 @@ A restore writes files into the **target** PVC, so the same rules apply in rever
 - **`spec.options.ignorePermissionErrors`** (default `true`) lets a restore complete and _report_ permission problems via a condition rather than failing hard. Set it `false` to fail-closed when exact permissions matter.
 
 See [Restores → Mover, cache & failure policy](restores.md#mover-cache--failure-policy) for the full restore mover surface, and [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
+
+## Try it end-to-end
+
+See the UID-match fix work — and watch the classic anti-pattern fail — from a clean slate: a PVC seeded with files owned `1000:1000`, mode `0600` (readable **only** by UID 1000), backed up by a mover that runs as `runAsUser: 1000`. The backup reads the files (`status.stats.filesNew` is non-zero); the *default* mover (UID 65532) would "succeed" reading **zero**.
+
+One apply-ready bundle, [`deploy/examples/tryit/permissions-uid.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/permissions-uid.yaml): the `app` `Namespace`, a PVC, a seed Job, an S3 `Repository`, a UID-matched `SnapshotPolicy`, and a manual `Snapshot`.
+
+The seed writes owner-only files that only UID 1000 can read:
+
+```yaml
+--8<-- "deploy/examples/tryit/permissions-uid.yaml:seed"
+```
+
+The policy matches the mover to that owner:
+
+```yaml
+--8<-- "deploy/examples/tryit/permissions-uid.yaml:policy"
+```
+
+**1. Fill in the credentials** (`AWS_*` + `KOPIA_PASSWORD`) in the `secret` section, then apply the bundle:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/permissions-uid.yaml
+$ kubectl -n app wait --for=condition=Ready repository/app-primary --timeout=2m
+$ kubectl -n app wait --for=condition=complete job/seed-app-data --timeout=2m
+```
+
+**2. Take the backup** (the `Snapshot` uses `generateName`, so `create` it):
+
+```console
+$ kubectl create -f deploy/examples/tryit/permissions-uid.yaml
+snapshot.kopiur.home-operations.com/app-data-manual-abc12 created
+
+$ kubectl -n app wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/app-data-manual-abc12 --timeout=5m
+```
+
+**3. Prove it read real data (deep).** The matched UID means non-zero `filesNew`, and the mover pod ran as 1000:
+
+```console
+# illustrative stats — non-zero filesNew/bytesNew is the proof:
+$ kubectl -n app get snapshot app-data-manual-abc12 -o jsonpath='{.status.stats}{"\n"}'
+{"sizeBytes":2097640,"bytesNew":2097640,"filesNew":2, ...}
+
+# the mover Job is named after the Snapshot CR (no -snap suffix):
+$ kubectl -n app get snapshot app-data-manual-abc12 -o jsonpath='{.status.job.name}{"\n"}'
+app-data-manual-abc12
+
+# its pod's effective UID — 1000, matching the data owner:
+$ kubectl -n app get pods --selector=job-name=app-data-manual-abc12
+$ kubectl -n app get pod <mover-pod> \
+    -o jsonpath='{.spec.containers[0].securityContext.runAsUser}{"\n"}'
+1000
+```
+
+/// warning | The anti-pattern: the default UID reads nothing
+
+Drop the `mover` block (or set `runAsUser: 65532`) and re-run: the backup still ends **`Succeeded`**, but `status.stats.filesNew` reads **0** — the unprivileged mover got *permission denied* on every `0600` file and silently snapshotted an empty tree. A `Succeeded` snapshot with **zero files** is the canonical sign of a UID mismatch. Match the owning UID (above) or, if the data is owned by UIDs you can't match, reach for a [root mover](#when-you-cant-match-the-uid-the-root-mover).
+
+///
+
+/// note | Illustrative output
+
+The `status.stats` numbers and the `app-data-manual-abc12` / `<mover-pod>` names stand in for what your run produces. The shape and the **non-zero `filesNew`** are the point.
+
+///
 
 ## Troubleshooting
 

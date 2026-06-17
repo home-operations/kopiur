@@ -12,6 +12,72 @@ Everything on this page is automatic — there is nothing to install or enable. 
 | `ReadWriteOnce` (RWO) | ✅ mover **co-locates** onto the attach node automatically | ✅ | ✅ co-locates automatically |
 | `ReadWriteOncePod` (RWOP) | ⚠️ only while **no pod holds** the volume; a held volume fails fast with guidance | ✅ **works with no downtime** — recommended | ⚠️ only while no pod holds the volume |
 
+## Try it end-to-end
+
+Prove the headline RWOP claim — *back up a held `ReadWriteOncePod` volume with zero downtime* — with one self-contained bundle, [`deploy/examples/tryit/access-modes.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/access-modes.yaml): namespace, a filesystem `Repository` on a PVC, an RWOP `app-data` PVC, a long-running `holder` Deployment that mounts it (writing a marker first, then sleeping), a `copyMethod: Snapshot` policy, and a fixed-name `Snapshot`.
+
+The two pieces that make the RWOP point: the source PVC is `ReadWriteOncePod` (exclusive to a single pod cluster-wide)…
+
+```yaml
+--8<-- "deploy/examples/tryit/access-modes.yaml:app-data"
+```
+
+…and the policy uses `copyMethod: Snapshot`, so the mover reads a staged copy and never contends for that single-pod mount:
+
+```yaml
+--8<-- "deploy/examples/tryit/access-modes.yaml:policy"
+```
+
+/// warning | Prerequisite: CSI + the snapshot stack
+
+RWOP is CSI-only, and `copyMethod: Snapshot` needs the [external-snapshotter](https://kubernetes-csi.github.io/docs/snapshot-controller.html) plus a `VolumeSnapshotClass` for your driver (a driver new enough for RWOP almost always ships snapshots too). Fill in **both** `REPLACE_ME` values: `storageClassName` (a CSI class) and `KOPIA_PASSWORD`.
+
+///
+
+**1. Apply and wait — and note you do *not* scale the holder down.**
+
+```console
+$ kubectl apply -f deploy/examples/tryit/access-modes.yaml
+$ kubectl -n kopiur-tryit rollout status deploy/holder --timeout=2m
+$ kubectl -n kopiur-tryit wait --for=condition=Ready repository/primary --timeout=2m
+```
+
+**2. Confirm the holder owns the live volume before the backup.** It should be `Running` with `0` restarts:
+
+```console
+$ kubectl -n kopiur-tryit get pods -l app=holder
+NAME                      READY   STATUS    RESTARTS   AGE
+holder-7d9c8b6f4c-x2k9p   1/1     Running   0          30s
+```
+
+**3. Back it up *without* touching the holder, and read `status.staged` (deep).** The mover reads a staged copy, so the RWOP exclusivity is never violated:
+
+```console
+$ kubectl -n kopiur-tryit wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/app-data-snapshot --timeout=5m
+$ kubectl -n kopiur-tryit get snapshot app-data-snapshot \
+    -o jsonpath='{.status.staged.pvcName}'
+app-data-snapshot-src
+```
+
+The backup mounted `app-data-snapshot-src` (the staged copy), never the live `app-data`.
+
+**4. Confirm the holder never flinched.** Same pod, still `Running`, still `0` restarts:
+
+```console
+$ kubectl -n kopiur-tryit get pods -l app=holder
+NAME                      READY   STATUS    RESTARTS   AGE
+holder-7d9c8b6f4c-x2k9p   1/1     Running   0          6m
+```
+
+/// note | Contrast: `Direct` fails fast on a held RWOP volume
+
+Change the policy to `copyMethod: Direct` and re-run, and the backup **fails immediately** — a second pod (the mover) cannot mount an RWOP volume even on the same node — with the actionable message shown in [Backing up an RWOP volume with `Direct`](#backing-up-an-rwop-volume-with-direct--only-while-nothing-holds-it) below. That fast-fail is the point: Kopiur won't leave a mover stuck `Pending` forever.
+
+///
+
+To tear down: `kubectl delete namespace kopiur-tryit`.
+
 ## `ReadWriteMany` / `ReadOnlyMany` — nothing to think about
 
 The volume can be attached to many nodes and mounted by many pods at once. The mover schedules wherever the cluster likes, alongside your running app. No pinning, no restrictions.

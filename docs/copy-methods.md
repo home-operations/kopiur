@@ -32,6 +32,62 @@ Do you need a point-in-time, app-decoupled backup (e.g. a database)?
 
 ---
 
+## Try it end-to-end
+
+See `copyMethod: Snapshot` actually stage a CSI copy: the bundle [`deploy/examples/tryit/copy-methods.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/copy-methods.yaml) is self-contained — namespace, a filesystem `Repository` on a PVC, a CSI-provisioned `app-data` PVC, a seed Job, a `copyMethod: Snapshot` policy, and a **fixed-name** `Snapshot` (`app-data-snapshot`) so the staged PVC is deterministically `app-data-snapshot-src`.
+
+The load-bearing line is `copyMethod: Snapshot` on the policy — it tells the mover to read a staged CSI copy instead of the live volume:
+
+```yaml
+--8<-- "deploy/examples/tryit/copy-methods.yaml:policy"
+```
+
+/// warning | Prerequisite: this bundle needs the CSI snapshot stack
+
+`copyMethod: Snapshot` snapshots the source PVC, so the source must be **CSI-provisioned** and the cluster must have the [external-snapshotter](https://kubernetes-csi.github.io/docs/snapshot-controller.html) (the `snapshot-controller` + `VolumeSnapshot`/`VolumeSnapshotContent`/`VolumeSnapshotClass` CRDs) and a `VolumeSnapshotClass` whose `driver` matches your source's `StorageClass` provisioner. Fill in **both** `REPLACE_ME` values: `storageClassName` (a CSI class that supports snapshots) and `KOPIA_PASSWORD`. Leave `volumeSnapshotClassName` unset to auto-pick the driver's default class.
+
+///
+
+**1. Apply and wait for the prerequisites.**
+
+```console
+$ kubectl apply -f deploy/examples/tryit/copy-methods.yaml
+$ kubectl -n kopiur-tryit wait --for=condition=complete job/seed-data --timeout=2m
+$ kubectl -n kopiur-tryit wait --for=condition=Ready repository/primary --timeout=2m
+```
+
+**2. While the backup is `Running`, catch the staged PVC.** The mover reads `app-data-snapshot-src`, *not* the live `app-data`. Fetch it **by name** (not a label) while the snapshot is in flight:
+
+```console
+$ kubectl -n kopiur-tryit get snapshot app-data-snapshot -w &
+$ kubectl -n kopiur-tryit get pvc app-data-snapshot-src
+NAME                    STATUS   VOLUME   CAPACITY   ACCESS MODES   AGE
+app-data-snapshot-src   Bound    pvc-..   1Gi        RWO            6s
+```
+
+**3. After success, read `status.staged` (deep).** Wait for the terminal phase, then confirm the run staged a CSI copy and which PVC the mover mounted:
+
+```console
+$ kubectl -n kopiur-tryit wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/app-data-snapshot --timeout=5m
+$ kubectl -n kopiur-tryit get snapshot app-data-snapshot \
+    -o jsonpath='{.status.staged}'
+{"copyMethod":"Snapshot","volumeSnapshotName":"app-data-snapshot-...","pvcName":"app-data-snapshot-src","ready":true}
+```
+
+*(Illustrative: `volumeSnapshotName` is generated; the rest is exact.)*
+
+**4. Confirm the stage was reaped and the live PVC was never mounted.** Kopiur cleans up the staged objects on completion:
+
+```console
+$ kubectl -n kopiur-tryit get pvc app-data-snapshot-src
+Error from server (NotFound): persistentvolumeclaims "app-data-snapshot-src" not found
+```
+
+The live `app-data` PVC was never mounted by the mover — only the staged copy was. To tear down: `kubectl delete namespace kopiur-tryit`.
+
+---
+
 ## `Snapshot` — point-in-time CSI snapshot (opt-in)
 
 When a backup runs, Kopiur:

@@ -101,6 +101,77 @@ the server pod. The credentials still protect the UI; just don't expose the raw
 
 ///
 
+## Try it end-to-end
+
+Turn on the UI from a clean slate and prove it answers — `200` with auth, `401` without — without leaving the cluster. One apply-ready bundle, [`deploy/examples/tryit/server-ui.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/server-ui.yaml): the `apps` `Namespace`, the backend Secret, and a `Repository` `nas-primary` with the minimal `spec.server` block.
+
+```yaml
+--8<-- "deploy/examples/tryit/server-ui.yaml:repository"
+```
+
+**1. Fill in the credentials** (`AWS_*` + `KOPIA_PASSWORD`) in the `secret` section, then apply the bundle and wait for the repository to be `Ready` — the server objects materialize only once it is:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/server-ui.yaml
+$ kubectl -n apps wait --for=condition=Ready repository/nas-primary --timeout=2m
+```
+
+**2. Confirm the operator created the server objects (deep).** All named `nas-primary-kopia-ui*` and labeled for the instance:
+
+```console
+$ kubectl -n apps get deploy,svc,secret \
+    -l app.kubernetes.io/name=kopiur-server,app.kubernetes.io/instance=nas-primary
+NAME                                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nas-primary-kopia-ui  1/1     1            1           40s
+
+NAME                          TYPE        CLUSTER-IP     PORT(S)     AGE
+service/nas-primary-kopia-ui  ClusterIP   10.96.12.34    51515/TCP   40s
+
+NAME                              TYPE     DATA   AGE
+secret/nas-primary-kopia-ui-auth  Opaque   2      40s
+```
+
+A `1/1` Deployment, a Service on `51515`, and the `nas-primary-kopia-ui-auth` Secret (keys `username`/`password`) means the UI is up.
+
+**3. Read the minted credentials** from that Secret:
+
+```console
+$ kubectl -n apps get secret nas-primary-kopia-ui-auth \
+    -o jsonpath='{.data.username}' | base64 -d; echo
+kopia
+$ kubectl -n apps get secret nas-primary-kopia-ui-auth \
+    -o jsonpath='{.data.password}' | base64 -d; echo
+<illustrative — your minted password>
+```
+
+**4. Prove the UI answers (deep).** Port-forward the Service and curl it — `200` with the credentials, `401` without:
+
+```console
+$ kubectl -n apps port-forward svc/nas-primary-kopia-ui 51515:51515 &
+
+# with the credentials → 200:
+$ curl -su 'kopia:<password>' http://localhost:51515/ -o /dev/null -w '%{http_code}\n'
+200
+
+# without them → 401 (the UI never defaults to no-auth):
+$ curl -s http://localhost:51515/ -o /dev/null -w '%{http_code}\n'
+401
+```
+
+The server speaks plain HTTP **inside the pod** (the operator starts kopia with `--insecure`); TLS belongs at your ingress/LB, never the raw `Service`.
+
+/// note | Illustrative output
+
+The `CLUSTER-IP`, the minted password, and the `AGE`s vary per run — the load-bearing facts are the `1/1` `nas-primary-kopia-ui` Deployment, port `51515`, the `nas-primary-kopia-ui-auth` Secret, and `200`/`401`.
+
+///
+
+**Tear it down** by removing the `spec.server` block and re-applying — the operator deletes the Deployment, Service, ConfigMap, and the generated Secret it owns:
+
+```console
+$ kubectl -n apps patch repository nas-primary --type merge -p '{"spec":{"server":null}}'
+```
+
 ## Authentication
 
 `spec.server.auth` is an externally-tagged enum — you set exactly one of three

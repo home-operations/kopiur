@@ -1,0 +1,161 @@
+# Try it end-to-end — back up a held ReadWriteOncePod volume with no downtime
+# (docs/access-modes.md)
+#
+# Proves the RWOP story: a ReadWriteOncePod PVC can be mounted by exactly ONE pod
+# cluster-wide. A long-running `holder` Deployment keeps it mounted the whole time.
+# With `copyMethod: Snapshot` the mover NEVER touches the live volume — Kopiur
+# snapshots it at the storage layer and reads a staged copy — so the backup
+# succeeds while the holder stays Running with zero restarts. (Contrast:
+# `copyMethod: Direct` against the same held volume fails fast, because a second
+# pod cannot mount an RWOP volume even on the same node.)
+#
+# PREREQUISITE — RWOP is CSI-only, so the source PVC needs a CSI StorageClass, and
+# `copyMethod: Snapshot` needs the external-snapshotter + a VolumeSnapshotClass for
+# that driver (a driver new enough for RWOP almost always ships snapshots too).
+# Fill in BOTH REPLACE_ME values (storageClassName + KOPIA_PASSWORD).
+#
+# Field shapes verified against crates/api (accessModes ReadWriteOncePod;
+# snapshot_policy.rs spec.copyMethod=Snapshot; snapshot.rs status.staged.pvcName;
+# externally-tagged backend.filesystem).
+#
+# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
+# section markers for docs/access-modes.md. Plain YAML comments — applies as-is.
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-tryit
+# --8<-- [end:namespace]
+---
+# --8<-- [start:repo-pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kopia-repo
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+# --8<-- [end:repo-pvc]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: kopiur-tryit
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:app-data]
+# A ReadWriteOncePod source — exclusive to a single pod cluster-wide. CSI-only.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  accessModes: ["ReadWriteOncePod"]
+  storageClassName: REPLACE_ME # a CSI StorageClass (RWOP requires CSI)
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:app-data]
+---
+# --8<-- [start:holder]
+# The "application": holds the RWOP volume mounted for the whole demo. It writes a
+# marker file once, then sleeps — so there is real data to back up AND a running
+# pod proving the live volume is occupied while the backup runs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: holder
+  namespace: kopiur-tryit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: holder
+  template:
+    metadata:
+      labels:
+        app: holder
+    spec:
+      containers:
+        - name: holder
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/docs
+              for i in $(seq 1 20); do
+                head -c 4096 /dev/urandom | base64 > /data/docs/file-$i.txt
+              done
+              echo "holding the RWOP volume" && sleep 86400
+          volumeMounts:
+            - name: app-data
+              mountPath: /data
+      volumes:
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:holder]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: kopiur-tryit
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopia-repo
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-tryit
+spec:
+  repository:
+    name: primary
+  # Snapshot (not Direct) is what lets the backup run while `holder` keeps the
+  # RWOP volume mounted: the mover reads a staged copy, never the live volume.
+  copyMethod: Snapshot
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+# Fixed name so the staged PVC is `app-data-snapshot-src`. Apply (not create).
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-snapshot
+  namespace: kopiur-tryit
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]

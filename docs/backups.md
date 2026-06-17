@@ -14,6 +14,74 @@ Why split them? So you can re-run a recipe on demand without touching the schedu
 
 All three are namespaced and live in the same namespace as the PVCs they back up (that's where the mover Job runs — see [Movers, RBAC & credentials](movers.md)).
 
+## Try it end-to-end
+
+Want to watch a real backup move real data before reading the field reference? This one bundle is self-contained — namespace, a PVC for the kopia repository, a `KOPIA_PASSWORD` Secret, an `app-data` PVC, a busybox **seed Job** that writes files into it, a filesystem `Repository`, a `SnapshotPolicy`, and a manual `Snapshot`. No cloud credentials: the repository lives on a PVC, so the only thing to fill in is the password.
+
+The **recipe** (`SnapshotPolicy`) ties the seeded PVC to the repository and sets retention — this is the heart of what you're applying:
+
+```yaml
+--8<-- "deploy/examples/tryit/backups.yaml:policy"
+```
+
+The **seed Job** writes 20 files into `app-data` so the snapshot has real data to upload (otherwise `status.stats` would report zeros):
+
+```yaml
+--8<-- "deploy/examples/tryit/backups.yaml:seed"
+```
+
+/// note | One bundle, applied once
+
+Fill in the single `REPLACE_ME` (`KOPIA_PASSWORD`) in [`deploy/examples/tryit/backups.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/backups.yaml), then apply everything except the `generateName` Snapshot:
+
+```console
+$ kubectl apply -f deploy/examples/tryit/backups.yaml
+```
+
+`apply` skips the `generateName` Snapshot (a server-named object can't be tracked by `apply`) — you `create` that one in the last step.
+
+///
+
+**1. Wait for the seed Job and the Repository.** The seed Job writes 20 files into `app-data` so the backup has something to upload; the `Repository` initializes a fresh kopia repository on its PVC:
+
+```console
+$ kubectl -n kopiur-tryit wait --for=condition=complete job/seed-data --timeout=2m
+$ kubectl -n kopiur-tryit wait --for=condition=Ready repository/primary --timeout=2m
+```
+
+**2. Take the backup.** This is the one resource you `create` rather than `apply` — it uses `generateName`, so each create mints a fresh name:
+
+```console
+$ kubectl create -f deploy/examples/tryit/backups.yaml
+snapshot.kopiur.home-operations.com/app-data-manual-abc12 created
+
+$ kubectl -n kopiur-tryit get snapshots -w
+NAME                    PHASE       ORIGIN   SNAPSHOT    AGE
+app-data-manual-abc12   Pending     manual               2s
+app-data-manual-abc12   Running     manual               7s
+app-data-manual-abc12   Succeeded   manual   k8f3c1a90   44s
+```
+
+**3. Prove it backed up real data (deep).** `status.stats` must show non-zero `filesNew` and `bytesNew` — an empty backup would report zeros:
+
+```console
+$ kubectl -n kopiur-tryit get snapshot app-data-manual-abc12 \
+    -o jsonpath='{.status.stats}'
+{"sizeBytes":...,"bytesNew":...,"filesNew":20,"filesUnchanged":0}
+```
+
+*(Illustrative: byte/size figures vary; `filesNew` reflects the 20 seeded files.)* The Job's logs (`kubectl -n kopiur-tryit logs job/seed-data`) confirm 20 files were written.
+
+**4. Confirm the kopia snapshot exists.** `status.snapshot.kopiaSnapshotID` (capital `ID`) is the handle kopia stores the data under — its presence is the proof the snapshot is in your repository:
+
+```console
+$ kubectl -n kopiur-tryit get snapshot app-data-manual-abc12 \
+    -o jsonpath='{.status.snapshot.kopiaSnapshotID}'
+k8f3c1a90    # illustrative — your ID differs
+```
+
+To tear down: `kubectl delete namespace kopiur-tryit` (the `Snapshot` finalizer runs `kopia snapshot delete` first).
+
 ## SnapshotPolicy — the recipe
 
 A minimal recipe is a repository, a source, and a retention policy (the recipe

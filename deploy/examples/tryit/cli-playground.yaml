@@ -1,0 +1,155 @@
+# Try it end-to-end — the kubectl-kopiur playground (docs/cli/*)
+#
+# The shared base every CLI "Try it end-to-end" arc builds on. It is everything
+# the plugin needs EXCEPT a Snapshot — the CLI arcs create those themselves
+# (`snapshot now`, `restore`, `browse`, `maintenance run`, …). It creates:
+#   * a `media` Namespace,
+#   * a PVC,
+#   * a one-shot seed Job that writes a `config/app.yaml` file and a multi-MB
+#     blob so `snapshots list`/`ls`/`cat`/`download` have real content to show,
+#   * the backend + encryption Secret,
+#   * an S3 Repository `nas`,
+#   * a SnapshotPolicy `nightly`, and
+#   * a SnapshotSchedule `nightly`.
+#
+# Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
+#   kubectl apply -f deploy/examples/tryit/cli-playground.yaml
+#   kubectl -n media wait --for=condition=Ready repository/nas --timeout=2m
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/cli/*. They are plain YAML comments — the file stays apply-ready.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`).
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+# --8<-- [end:namespace]
+---
+# --8<-- [start:pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+# --8<-- [end:pvc]
+---
+# --8<-- [start:seed]
+# Seed real content so the browse/list arcs have something to show: a small text
+# file the docs `cat`, and a multi-MB blob the docs `download`. Owned by the
+# default mover UID (65532) so the default mover can read it without extra config.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-app-data
+  namespace: media
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/config
+              cat > /data/config/app.yaml <<'EOF'
+              # demo config the CLI arcs read back
+              name: media-app
+              replicas: 1
+              EOF
+              head -c 5242880 /dev/urandom > /data/movies.db   # ~5 MiB to download
+              ls -ln /data /data/config
+          volumeMounts:
+            - name: d
+              mountPath: /data
+      volumes:
+        - name: d
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:seed]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: media
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas
+  namespace: media
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      prefix: media/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: nightly
+  namespace: media
+spec:
+  repository:
+    name: nas
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+# --8<-- [end:policy]
+---
+# --8<-- [start:schedule]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: nightly
+  namespace: media
+spec:
+  policyRef:
+    name: nightly
+  schedule:
+    cron: "H 2 * * *" # deterministic per-schedule minute, hashed from the UID
+    jitter: 30m
+    runOnCreate: false # applying does NOT take an immediate backup
+# --8<-- [end:schedule]

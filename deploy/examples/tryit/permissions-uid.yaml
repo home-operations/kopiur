@@ -1,0 +1,164 @@
+# Try it end-to-end — match the mover UID to the data owner (docs/permissions.md)
+#
+# A complete, self-contained arc that proves the #1 permissions fix: the mover
+# must run as a UID that can READ the source. It creates:
+#   * an `app` Namespace,
+#   * a PVC,
+#   * a one-shot seed Job that writes files owned `1000:1000`, mode `0600`
+#     (owner-only — readable ONLY by UID 1000),
+#   * an S3 Repository,
+#   * a SnapshotPolicy whose mover runs as `runAsUser: 1000` (matching the owner),
+#     and
+#   * a `generateName` manual Snapshot to invoke it.
+#
+# With the matched UID the backup reads the data and `status.stats.filesNew` is
+# non-zero. The default mover (UID 65532) would "succeed" reading ZERO files —
+# the classic silent anti-pattern. The doc walks both outcomes.
+#
+# Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
+#   kubectl apply -f deploy/examples/tryit/permissions-uid.yaml
+# (the manual Snapshot uses `generateName`, so create it with `kubectl create`).
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/permissions.md. They are plain YAML comments — the file stays apply-ready.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`).
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+# --8<-- [end:namespace]
+---
+# --8<-- [start:pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:pvc]
+---
+# --8<-- [start:seed]
+# Seed the PVC with files owned 1000:1000, mode 0600 (owner-only). Only a mover
+# running as UID 1000 can read them — UID 65532 (the default) gets nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-app-data
+  namespace: app
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000 # make the fresh volume writable by GID 1000 so the seed can chown
+      containers:
+        - name: seed
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/config
+              echo "owner-only config readable only by uid 1000" > /data/config/app.yaml
+              head -c 2097152 /dev/urandom > /data/blob.bin   # ~2 MiB so stats are non-trivial
+              chmod 0600 /data/config/app.yaml
+              ls -ln /data /data/config
+          volumeMounts:
+            - name: d
+              mountPath: /data
+      volumes:
+        - name: d
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:seed]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: app
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: app-primary
+  namespace: app
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      prefix: app/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: app
+spec:
+  repository:
+    name: app-primary
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+  # ── Match the mover UID/GID to the data owner (1000:1000) ─────────────────────
+  # This is the fix: without it the default mover (UID 65532) cannot read the
+  # 0600 files and the backup "succeeds" with ZERO files. With it, the mover
+  # reads everything and status.stats.filesNew is non-zero.
+  mover:
+    securityContext:
+      runAsUser: 1000 # the UID that owns the data
+      runAsGroup: 1000 # the GID that owns the data
+      runAsNonRoot: true # keep the unprivileged guarantee
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: app-data-manual- # server-named — create with `kubectl create`, not apply
+  namespace: app
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]

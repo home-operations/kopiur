@@ -92,7 +92,7 @@ under `KOPIA_RCLONE_CONFIG`; the mover writes it to `rclone.conf` for you.
 ## The Repository
 
 ```yaml
---8<-- "deploy/examples/backends/rclone.yaml"
+--8<-- "deploy/examples/backends/rclone.yaml:repository"
 ```
 
 /// warning | rclone uses `configSecretRef`, not `auth`
@@ -126,10 +126,97 @@ The same `backend.rclone` stanza works on a cluster-scoped
 `configSecretRef` (and the `encryption.passwordSecretRef`) must carry an explicit
 `namespace:`, and the Secret must exist where the movers run — see [Movers](../movers.md).
 
-## Back up and restore against this repository
+## Try it end-to-end
 
-The lifecycle is backend-independent. Once `Ready`, add a `SnapshotPolicy` +
-`SnapshotSchedule` ([Backups & schedules](../backups.md),
+Prove this backend really takes a backup. The same example file carries a tiny
+smoke-test (a throwaway PVC + a `SnapshotPolicy` + a `Snapshot`) that targets the
+`rclone-primary` repository above, so you can go from "applied" to "a snapshot on
+my remote" in one arc.
+
+/// warning | Fill in the config first
+
+The smoke backup only goes green once `KOPIA_RCLONE_CONFIG` holds a **real**,
+working `rclone.conf` (validate it locally with `rclone ls <remote>:` first).
+With the `REPLACE_ME` token the `Repository` stalls at `Failed` (rclone can't
+reach the remote) and the `Snapshot` stays `Pending`.
+
+///
+
+**1. Apply the bundle** (namespace `backups`, Secret, Repository, and the
+smoke-test objects):
+
+```console
+$ kubectl apply -f deploy/examples/backends/rclone.yaml
+```
+
+**2. Wait for the repository to be `Ready`** — the gate everything else waits on:
+
+```console
+$ kubectl -n backups wait --for=condition=Ready repository/rclone-primary --timeout=2m
+repository.kopiur.home-operations.com/rclone-primary condition met
+```
+
+**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it
+(the namespace, Secret, Repository, PVC, and policy already exist and report
+unchanged — the `Snapshot` is the one new object):
+
+```console
+$ kubectl create -f deploy/examples/backends/rclone.yaml
+snapshot.kopiur.home-operations.com/smoke-now-abc12 created
+```
+
+**4. Watch it succeed:**
+
+```console
+$ kubectl -n backups get snapshots -w
+NAME              PHASE       ORIGIN   SNAPSHOT     AGE
+smoke-now-abc12   Pending     manual                2s
+smoke-now-abc12   Running     manual                7s
+smoke-now-abc12   Succeeded   manual   k1f1ec0a8    38s
+```
+
+(Output illustrative.) The `Snapshot` has no fixed `Succeeded` *condition*; to
+wait on it in a script, key on the phase:
+
+```console
+$ kubectl -n backups wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/smoke-now-abc12 --timeout=5m
+```
+
+**5. Deep proof — the data really moved.** `status.stats` shows non-zero
+`bytesNew`/`filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia
+snapshot ID on your remote:
+
+```console
+$ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.stats}'
+{"sizeBytes":4096,"bytesNew":1280,"filesNew":2,"filesUnchanged":0}
+
+$ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.snapshot.kopiaSnapshotID}'
+k1f1ec0a8
+```
+
+(Both outputs illustrative — sizes and the ID vary.) Non-zero `bytesNew` is the
+proof the backup uploaded real content through rclone.
+
+**6. Clean up** the smoke-test when you're done:
+
+```console
+$ kubectl -n backups delete snapshot --all       # finalizer also deletes the kopia snapshot
+$ kubectl -n backups delete snapshotpolicy smoke
+$ kubectl -n backups delete pvc smoke-data
+```
+
+/// warning | Deleting a Snapshot deletes its snapshot
+
+A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR
+runs `kopia snapshot delete` via a finalizer. Use `Retain` (or `Orphan`) to keep
+the data — see [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
+
+///
+
+From here the full lifecycle is backend-independent — only the `Repository`
+differs. Put it on a cron with a `SnapshotSchedule`
+([Backups & schedules](../backups.md),
 [Example 01](../examples.md#example-01--single-pvc-scheduled)) and restore by
 picking a `Snapshot` ([Restores](../restores.md),
 [Example 03](../examples.md#example-03--restore-by-picking-a-snapshot)).

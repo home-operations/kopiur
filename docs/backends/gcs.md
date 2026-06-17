@@ -69,7 +69,7 @@ and points kopia at the path. The secret never lands on kopia's argv.
 ## The Repository
 
 ```yaml
---8<-- "deploy/examples/backends/gcs.yaml"
+--8<-- "deploy/examples/backends/gcs.yaml:repository"
 ```
 
 ## Fields reference (`backend.gcs`)
@@ -123,10 +123,97 @@ The same `backend.gcs` stanza works on a cluster-scoped
 Secret reference must carry an explicit `namespace:` and the credential Secret
 must exist where the movers run — see [Movers](../movers.md).
 
-## Back up and restore against this repository
+## Try it end-to-end
 
-The lifecycle is backend-independent. Once `Ready`, add a `SnapshotPolicy` +
-`SnapshotSchedule` ([Backups & schedules](../backups.md),
+Prove this backend really takes a backup. The same example file carries a tiny
+smoke-test (a throwaway PVC + a `SnapshotPolicy` + a `Snapshot`) that targets the
+`gcs-primary` repository above, so you can go from "applied" to "a snapshot in my
+bucket" in one arc.
+
+/// warning | Fill in the credentials first
+
+The smoke backup only goes green once `KOPIA_GCS_CREDENTIALS` holds a **real**
+service-account key JSON. With the `REPLACE_ME` placeholders the `Repository`
+stalls at `Failed` (kopia can't reach the bucket) and the `Snapshot` stays
+`Pending`.
+
+///
+
+**1. Apply the bundle** (namespace `backups`, Secret, Repository, and the
+smoke-test objects):
+
+```console
+$ kubectl apply -f deploy/examples/backends/gcs.yaml
+```
+
+**2. Wait for the repository to be `Ready`** — the gate everything else waits on:
+
+```console
+$ kubectl -n backups wait --for=condition=Ready repository/gcs-primary --timeout=2m
+repository.kopiur.home-operations.com/gcs-primary condition met
+```
+
+**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it
+(the namespace, Secret, Repository, PVC, and policy already exist and report
+unchanged — the `Snapshot` is the one new object):
+
+```console
+$ kubectl create -f deploy/examples/backends/gcs.yaml
+snapshot.kopiur.home-operations.com/smoke-now-abc12 created
+```
+
+**4. Watch it succeed:**
+
+```console
+$ kubectl -n backups get snapshots -w
+NAME              PHASE       ORIGIN   SNAPSHOT     AGE
+smoke-now-abc12   Pending     manual                2s
+smoke-now-abc12   Running     manual                7s
+smoke-now-abc12   Succeeded   manual   k1f1ec0a8    38s
+```
+
+(Output illustrative.) The `Snapshot` has no fixed `Succeeded` *condition*; to
+wait on it in a script, key on the phase:
+
+```console
+$ kubectl -n backups wait --for=jsonpath='{.status.phase}'=Succeeded \
+    snapshot/smoke-now-abc12 --timeout=5m
+```
+
+**5. Deep proof — the data really moved.** `status.stats` shows non-zero
+`bytesNew`/`filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia
+snapshot ID in your bucket:
+
+```console
+$ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.stats}'
+{"sizeBytes":4096,"bytesNew":1280,"filesNew":2,"filesUnchanged":0}
+
+$ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.snapshot.kopiaSnapshotID}'
+k1f1ec0a8
+```
+
+(Both outputs illustrative — sizes and the ID vary.) Non-zero `bytesNew` is the
+proof the backup uploaded real content to GCS.
+
+**6. Clean up** the smoke-test when you're done:
+
+```console
+$ kubectl -n backups delete snapshot --all       # finalizer also deletes the kopia snapshot
+$ kubectl -n backups delete snapshotpolicy smoke
+$ kubectl -n backups delete pvc smoke-data
+```
+
+/// warning | Deleting a Snapshot deletes its snapshot
+
+A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR
+runs `kopia snapshot delete` via a finalizer. Use `Retain` (or `Orphan`) to keep
+the data — see [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
+
+///
+
+From here the full lifecycle is backend-independent — only the `Repository`
+differs. Put it on a cron with a `SnapshotSchedule`
+([Backups & schedules](../backups.md),
 [Example 01](../examples.md#example-01--single-pvc-scheduled)) and restore by
 picking a `Snapshot` ([Restores](../restores.md),
 [Example 03](../examples.md#example-03--restore-by-picking-a-snapshot)).

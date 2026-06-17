@@ -1,0 +1,180 @@
+# Try it end-to-end — inherit the mover UID/GID from a live workload
+# (docs/security-context.md)
+#
+# A complete, self-contained arc that proves `inheritSecurityContextFrom`: the
+# mover runs as whatever the app pod runs as, with no hard-coded UID to track.
+# It creates:
+#   * an `app` Namespace,
+#   * a PVC,
+#   * a long-running Deployment `app` (container `runAsUser: 1000`) that MOUNTS
+#     the PVC and writes 1000-owned data into it — `inheritSecurityContextFrom`
+#     needs a LIVE pod to read the identity from,
+#   * an S3 Repository,
+#   * a SnapshotPolicy whose mover inherits the security context from that
+#     Deployment by label selector, and
+#   * a `generateName` manual Snapshot to invoke it.
+#
+# Proof: the mover pod's container `runAsUser` equals the workload's (1000),
+# copied automatically — you never set it on the policy.
+#
+# Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
+#   kubectl apply -f deploy/examples/tryit/inherit-security-context.yaml
+# Wait for the Deployment to be Running FIRST (inherit reads a live pod), then
+# create the manual Snapshot with `kubectl create`.
+#
+# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
+# docs/security-context.md. They are plain YAML comments — the file stays
+# apply-ready.
+#
+# Field shapes verified against crates/api:
+#   spec.mover.inheritSecurityContextFrom : { podSelector: LabelSelector, container? }
+#   (externally-tagged backend: the bucket lives under `backend.s3`)
+---
+# --8<-- [start:namespace]
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+# --8<-- [end:namespace]
+---
+# --8<-- [start:pvc]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+# --8<-- [end:pvc]
+---
+# --8<-- [start:workload]
+# A live workload that runs as UID 1000 and mounts `app-data`. The mover will
+# COPY this pod's securityContext, so it must be Running before the Snapshot.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: app
+  labels:
+    app.kubernetes.io/name: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: app # the label inheritSecurityContextFrom selects on
+    spec:
+      securityContext:
+        fsGroup: 1000 # make the fresh volume writable by GID 1000
+      containers:
+        - name: app # the named container the policy inherits from
+          image: busybox:1.36
+          # Seed the volume once, then idle so the pod stays Running.
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /data/config
+              [ -f /data/config/app.yaml ] || echo "written as uid 1000" > /data/config/app.yaml
+              [ -f /data/blob.bin ] || head -c 2097152 /dev/urandom > /data/blob.bin
+              chmod 0600 /data/config/app.yaml
+              echo "seeded; idling"; sleep infinity
+          securityContext:
+            runAsUser: 1000 # ← the UID the mover will inherit
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: d
+              mountPath: /data
+      volumes:
+        - name: d
+          persistentVolumeClaim:
+            claimName: app-data
+# --8<-- [end:workload]
+---
+# --8<-- [start:secret]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: app
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME"
+# --8<-- [end:secret]
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: app-primary
+  namespace: app
+spec:
+  backend:
+    s3:
+      bucket: my-kopia-bucket
+      prefix: app/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+# --8<-- [end:repository]
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: app
+spec:
+  repository:
+    name: app-primary
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+  # ── Inherit the mover's UID/GID from the live workload ────────────────────────
+  # Copies the securityContext (container UID/GID + pod fsGroup) from the `app`
+  # Deployment's pod onto the mover. Mutually exclusive with `securityContext` —
+  # setting both is webhook-rejected. The selected pod must be Running.
+  mover:
+    inheritSecurityContextFrom:
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: app
+      container: app # optional; defaults to the pod's first container
+# --8<-- [end:policy]
+---
+# --8<-- [start:snapshot]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  generateName: app-data-manual- # server-named — create with `kubectl create`, not apply
+  namespace: app
+spec:
+  policyRef:
+    name: app-data
+# --8<-- [end:snapshot]
