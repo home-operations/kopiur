@@ -3,8 +3,8 @@ release:
   name: kopiur
   namespace: kopiur-system
 templates:
-  - role.yaml
-  - clusterrole.yaml
+  - role.tpl
+  - clusterrole.tpl
 tests:
   - it: namespaced scope renders a Role and no ClusterRole
     set:
@@ -15,13 +15,13 @@ tests:
     asserts:
       - hasDocuments:
           count: 1
-        template: role.yaml
+        template: role.tpl
       - isKind:
           of: Role
-        template: role.yaml
+        template: role.tpl
       - hasDocuments:
           count: 0
-        template: clusterrole.yaml
+        template: clusterrole.tpl
 
   # --- self-managed webhook TLS RBAC (webhook.tls.mode: self) ----------------
 
@@ -29,7 +29,7 @@ tests:
     set:
       installScope: cluster
       webhook.tls.mode: self
-    template: clusterrole.yaml
+    template: clusterrole.tpl
     asserts:
       - contains:
           path: rules
@@ -56,7 +56,7 @@ tests:
     set:
       installScope: cluster
       webhook.tls.mode: cert-manager
-    template: clusterrole.yaml
+    template: clusterrole.tpl
     asserts:
       - notContains:
           path: rules
@@ -70,7 +70,7 @@ tests:
     set:
       installScope: namespaced
       webhook.tls.mode: self
-    template: role.yaml
+    template: role.tpl
     asserts:
       # Role + ClusterRole + ClusterRoleBinding.
       - hasDocuments:
@@ -92,13 +92,13 @@ tests:
     asserts:
       - hasDocuments:
           count: 1
-        template: clusterrole.yaml
+        template: clusterrole.tpl
       - isKind:
           of: ClusterRole
-        template: clusterrole.yaml
+        template: clusterrole.tpl
       - hasDocuments:
           count: 0
-        template: role.yaml
+        template: role.tpl
 
   # --- credential projection + kopia web-UI server RBAC ----------------------
   #
@@ -112,7 +112,7 @@ tests:
   - it: "ClusterRole grants full secrets verbs + services + deployments (server RBAC)"
     set:
       installScope: cluster
-    template: clusterrole.yaml
+    template: clusterrole.tpl
     asserts:
       - contains:
           path: rules
@@ -137,7 +137,7 @@ tests:
     set:
       installScope: cluster
       secretProjection.enabled: true
-    template: clusterrole.yaml
+    template: clusterrole.tpl
     asserts:
       - contains:
           path: rules
@@ -150,7 +150,7 @@ tests:
     set:
       installScope: namespaced
       webhook.enabled: false
-    template: role.yaml
+    template: role.tpl
     asserts:
       - contains:
           path: rules

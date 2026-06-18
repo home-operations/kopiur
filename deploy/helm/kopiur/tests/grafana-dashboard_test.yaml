@@ -1,22 +1,22 @@
 suite: grafana-dashboard
 templates:
-  - grafana-dashboard.yaml
-  - grafana-dashboard-operator.yaml
+  - grafana-dashboard.tpl
+  - grafana-dashboard-operator.tpl
 tests:
   - it: renders nothing by default (ConfigMap path)
-    template: grafana-dashboard.yaml
+    template: grafana-dashboard.tpl
     asserts:
       - hasDocuments:
           count: 0
 
   - it: renders nothing by default (operator path)
-    template: grafana-dashboard-operator.yaml
+    template: grafana-dashboard-operator.tpl
     asserts:
       - hasDocuments:
           count: 0
 
   - it: ships the sidecar ConfigMap when enabled
-    template: grafana-dashboard.yaml
+    template: grafana-dashboard.tpl
     set:
       grafanaDashboard.enabled: true
     asserts:
@@ -34,7 +34,7 @@ tests:
           path: data["kopiur.json"]
 
   - it: does not ship the operator CR in sidecar mode
-    template: grafana-dashboard-operator.yaml
+    template: grafana-dashboard-operator.tpl
     set:
       grafanaDashboard.enabled: true
     asserts:
@@ -42,7 +42,7 @@ tests:
           count: 0
 
   - it: renders the GrafanaDashboard CR in operator mode
-    template: grafana-dashboard-operator.yaml
+    template: grafana-dashboard-operator.tpl
     set:
       grafanaDashboard.enabled: true
       grafanaDashboard.grafanaOperator.enabled: true
@@ -72,7 +72,7 @@ tests:
           path: spec.json
 
   - it: does not ship the sidecar ConfigMap in operator mode
-    template: grafana-dashboard.yaml
+    template: grafana-dashboard.tpl
     set:
       grafanaDashboard.enabled: true
       grafanaDashboard.grafanaOperator.enabled: true
@@ -81,7 +81,7 @@ tests:
           count: 0
 
   - it: sets the operator folder when provided
-    template: grafana-dashboard-operator.yaml
+    template: grafana-dashboard-operator.tpl
     set:
       grafanaDashboard.enabled: true
       grafanaDashboard.grafanaOperator.enabled: true
@@ -92,7 +92,7 @@ tests:
           value: Backups
 
   - it: places the CR in the override namespace
-    template: grafana-dashboard-operator.yaml
+    template: grafana-dashboard-operator.tpl
     set:
       grafanaDashboard.enabled: true
       grafanaDashboard.grafanaOperator.enabled: true
