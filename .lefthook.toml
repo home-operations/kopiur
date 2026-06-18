@@ -23,12 +23,11 @@ exclude = ["deploy/helm/kopiur/README.md", "docs/**"]
 [pre-commit.commands.format-json]
 exclude = ["deploy/helm/kopiur/values.schema.json"]
 
-# Helm chart templates are Go-templated YAML — a `{{- if -}}` guard on line 1 is
-# not valid standalone YAML, so oxfmt's parser errors out (exit 2). They can
-# never be fed to a YAML formatter; skip the whole templates/ dir.
+# Generated CRD manifests (xtask gen-crds) ship verbatim — keep the shared YAML
+# formatter off them so it doesn't reflow generated output. Chart templates are
+# now .tpl, so they no longer match the *.yaml glob and need no exclusion here.
 [pre-commit.commands.format-yaml]
 exclude = [
   "deploy/crds/*.yaml",
   "deploy/helm/kopiur/files/crds/*.yaml",
-  "deploy/helm/kopiur/templates/*.yaml",
 ]

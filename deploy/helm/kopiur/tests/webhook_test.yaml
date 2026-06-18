@@ -1,6 +1,6 @@
 suite: webhook
 templates:
-  - webhook-deployment.yaml
+  - webhook-deployment.tpl
 tests:
   - it: renders the webhook Deployment by default
     asserts:

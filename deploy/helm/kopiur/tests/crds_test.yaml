@@ -1,6 +1,6 @@
 suite: crds
 templates:
-  - install-crds.yaml
+  - install-crds.tpl
 tests:
   - it: renders the CRDs as templates by default
     asserts:

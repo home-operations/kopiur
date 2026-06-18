@@ -1,6 +1,6 @@
 suite: deployment
 templates:
-  - deployment.yaml
+  - deployment.tpl
 tests:
   - it: is the controller Deployment
     asserts:

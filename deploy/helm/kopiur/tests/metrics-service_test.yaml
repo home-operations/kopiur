@@ -1,6 +1,6 @@
 suite: metrics-service
 templates:
-  - metrics-service.yaml
+  - metrics-service.tpl
 tests:
   - it: renders the controller metrics Service by default
     asserts:

@@ -3,7 +3,7 @@ release:
   name: kopiur
   namespace: kopiur-system
 templates:
-  - browse-clusterrole.yaml
+  - browse-clusterrole.tpl
 tests:
   - it: is omitted by default (opt-in knob)
     asserts:
