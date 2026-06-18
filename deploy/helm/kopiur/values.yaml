@@ -153,22 +153,20 @@ controller:
   extraVolumes: []
   # -- Extra volume mounts on the controller container (pairs with extraVolumes).
   extraVolumeMounts: []
-  # -- Resource requests/limits for the controller pod.
-  # No CPU limit (CPU throttling on an operator only adds reconcile latency; the
-  # request reserves a fair share). The memory limit must cover the *burst* on
-  # startup/restart, not just steady state (~120Mi): on (re)start the controller
-  # reconciles every existing resource at once, spawning concurrent in-process
-  # `kopia` subprocesses (whose RSS counts against this container's cgroup) to
-  # list/connect a repository that may hold many snapshots. With the
-  # OpenTelemetry/OTLP stack linked in, 256Mi was too tight — the burst OOMKilled
-  # the controller, which then crash-looped (OOM -> restart -> re-reconcile burst
-  # -> OOM). 1Gi gives ample headroom. See crates/e2e/tests/lifecycle.rs.
+  # -- Resource requests for the controller pod.
+  # No limits by default. No CPU limit (CPU throttling on an operator only adds
+  # reconcile latency; the request reserves a fair share). No memory limit either:
+  # the controller's RSS can *burst* on startup/restart, not just steady state
+  # (~120Mi) — on (re)start it reconciles every existing resource at once, spawning
+  # concurrent in-process `kopia` subprocesses (whose RSS counts against this
+  # container's cgroup) to list/connect a repository that may hold many snapshots.
+  # A memory limit that doesn't cover that burst OOMKills the controller, which
+  # then crash-loops (OOM -> restart -> re-reconcile burst -> OOM). Set a limit
+  # only if you've measured your own ceiling. See crates/e2e/tests/lifecycle.rs.
   resources:
     requests:
       cpu: 50m
       memory: 128Mi
-    limits:
-      memory: 1Gi
   # -- Scheduling controls.
   nodeSelector: {}
   tolerations: []
@@ -209,15 +207,13 @@ webhook:
     labels: {}
     # -- The webhook serves a self-signed cert, so skip verification by default.
     insecureSkipVerify: true
-  # No CPU limit (see controller.resources). The webhook links the same
-  # OpenTelemetry/OTLP stack but does no kopia work, so it stays light; the
-  # generous memory limit is pure headroom.
+  # No limits by default (see controller.resources). The webhook links the same
+  # OpenTelemetry/OTLP stack but does no kopia work, so it stays light; only the
+  # requests are set to reserve a fair share.
   resources:
     requests:
       cpu: 25m
       memory: 64Mi
-    limits:
-      memory: 512Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}

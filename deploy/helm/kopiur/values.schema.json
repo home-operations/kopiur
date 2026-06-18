@@ -96,20 +96,8 @@
           "type": "integer"
         },
         "resources": {
-          "description": "Resource requests/limits for the controller pod.\nNo CPU limit (CPU throttling on an operator only adds reconcile latency; the\nrequest reserves a fair share). The memory limit must cover the *burst* on\nstartup/restart, not just steady state (~120Mi): on (re)start the controller\nreconciles every existing resource at once, spawning concurrent in-process\n`kopia` subprocesses (whose RSS counts against this container's cgroup) to\nlist/connect a repository that may hold many snapshots. With the\nOpenTelemetry/OTLP stack linked in, 256Mi was too tight — the burst OOMKilled\nthe controller, which then crash-looped (OOM -\u003e restart -\u003e re-reconcile burst\n-\u003e OOM). 1Gi gives ample headroom. See crates/e2e/tests/lifecycle.rs.",
+          "description": "Resource requests for the controller pod.\nNo limits by default. No CPU limit (CPU throttling on an operator only adds\nreconcile latency; the request reserves a fair share). No memory limit either:\nthe controller's RSS can *burst* on startup/restart, not just steady state\n(~120Mi) — on (re)start it reconciles every existing resource at once, spawning\nconcurrent in-process `kopia` subprocesses (whose RSS counts against this\ncontainer's cgroup) to list/connect a repository that may hold many snapshots.\nA memory limit that doesn't cover that burst OOMKills the controller, which\nthen crash-loops (OOM -\u003e restart -\u003e re-reconcile burst -\u003e OOM). Set a limit\nonly if you've measured your own ceiling. See crates/e2e/tests/lifecycle.rs.",
           "properties": {
-            "limits": {
-              "properties": {
-                "memory": {
-                  "default": "1Gi",
-                  "title": "memory",
-                  "type": "string"
-                }
-              },
-              "required": [],
-              "title": "limits",
-              "type": "object"
-            },
             "requests": {
               "properties": {
                 "cpu": {
@@ -766,20 +754,8 @@
           "type": "integer"
         },
         "resources": {
-          "description": "No CPU limit (see controller.resources). The webhook links the same\nOpenTelemetry/OTLP stack but does no kopia work, so it stays light; the\ngenerous memory limit is pure headroom.",
+          "description": "No limits by default (see controller.resources). The webhook links the same\nOpenTelemetry/OTLP stack but does no kopia work, so it stays light; only the\nrequests are set to reserve a fair share.",
           "properties": {
-            "limits": {
-              "properties": {
-                "memory": {
-                  "default": "512Mi",
-                  "title": "memory",
-                  "type": "string"
-                }
-              },
-              "required": [],
-              "title": "limits",
-              "type": "object"
-            },
             "requests": {
               "properties": {
                 "cpu": {
