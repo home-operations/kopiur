@@ -97,8 +97,12 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - ''
+  resources:
+  - secrets
+  verbs:
   - create
-  - update
   - patch
   - delete
 - apiGroups:

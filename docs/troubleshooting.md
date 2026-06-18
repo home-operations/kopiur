@@ -65,6 +65,21 @@ $ kubectl get snapshots <name> -n <ns> \
 - For a namespaced `Repository`, the repo and Secret are already together — nothing extra.
 - For a `ClusterRepository`, the credential Secret must reach each workload namespace. The easy fix: set [`credentialProjection.enabled: true`](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) on the `SnapshotPolicy`/`Restore`/`Maintenance` that uses it, so Kopiur copies it for you (off by default). Otherwise replicate it yourself. See [Movers → the credentials Secret](movers.md#the-credentials-secret).
 
+### A feature works in the CR but status shows `HTTP 403` (missing RBAC)
+
+Two features need the operator to **write Secrets**, and that RBAC is **off by default**. If you enable the feature in a CR but not the matching Helm flag, the resource's `.status` shows an actionable `403` naming the exact flag — the operator degrades cleanly and heals as soon as you grant it.
+
+| Status message mentions… | Set this Helm flag |
+| --- | --- |
+| a *projected credentials Secret* (`...-creds-N`) | `features.credentialProjection.enabled: true` |
+| a *kopia web-UI Secret* (`...-kopia-ui-auth` / `...-kopia-ui-repo-creds`) | `features.kopiaUi.enabled: true` |
+
+```console
+$ kubectl describe snapshotpolicy <name> -n <ns>   # or repository, for the kopia UI
+```
+
+Full guide: **[Feature permissions](feature-permissions.md)**.
+
 ### `MoverPermitted=False` — privileged mover not opted in
 
 The mover requests an elevated context but the namespace hasn't been granted it. This guards **`SnapshotPolicy`, `Restore`, and `Maintenance` alike** — and the *effective* (resolved) context is what's checked, so it also fires for an elevated context **inherited** from a workload pod. The detector trips on any of: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true` — at **either** the container (`mover.securityContext`) **or** pod (`mover.podSecurityContext`) level.

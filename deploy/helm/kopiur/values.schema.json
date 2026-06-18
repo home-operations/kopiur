@@ -144,6 +144,40 @@
       "title": "controller",
       "type": "object"
     },
+    "features": {
+      "description": "=============================================================================\nFeature permissions\n=============================================================================\nA few opt-in features need the operator to WRITE Secrets in the namespaces it\nmanages, so each grants extra RBAC. All are OFF by default (least privilege):\nthe chart does not hand out cluster-wide `secrets` write until you turn on the\nfeature you use. The flag names match the CRD fields that trigger them.\n\nSymptom → fix: if you enable the feature in a CR but forget the flag here, the\nresource's `.status` shows an actionable condition like\n  \"... (HTTP 403). ... Fix: set features.\u003cname\u003e.enabled: true ...\"\nSet the matching flag below and the operator heals on the next reconcile.\nSee docs/feature-permissions.md for the full mapping and security trade-offs.",
+      "properties": {
+        "credentialProjection": {
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Grant the operator `secrets` create+patch so `spec.credentialProjection`\nworks: the operator copies a repository's credential Secret(s) into each mover\nJob's namespace (the chief win is a shared ClusterRepository whose Secret is\npinned to one namespace). SECURITY TRADE-OFF: `create` cannot be scoped to a\nSecret name, so the operator can write a Secret in any namespace it manages.",
+              "title": "enabled",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "credentialProjection",
+          "type": "object"
+        },
+        "kopiaUi": {
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Grant the operator `secrets` create+patch+delete so `spec.server` (the\nkopia web-UI) works: it creates a generated-auth Secret, mirrors a\nClusterRepository's credentials into the server namespace, and deletes both on\nteardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any\nnamespace the operator manages.",
+              "title": "enabled",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "kopiaUi",
+          "type": "object"
+        }
+      },
+      "required": [],
+      "title": "features",
+      "type": "object"
+    },
     "fullnameOverride": {
       "default": "",
       "description": "Override the full release-qualified name (defaults to \"\u003crelease\u003e-kopiur\").",
@@ -587,20 +621,6 @@
       },
       "required": [],
       "title": "rbac",
-      "type": "object"
-    },
-    "secretProjection": {
-      "description": "=============================================================================\nCredential projection\n=============================================================================\nPer-repository `spec.credentialProjection.enabled` lets the operator copy a\nrepository's credential Secret(s) into each mover Job's namespace, so users with\nmany namespaces don't have to pre-create the Secret everywhere (the chief win is\na shared ClusterRepository whose Secret is pinned to one namespace). That\nrequires the operator to hold cluster-wide `secrets` create/patch.",
-      "properties": {
-        "enabled": {
-          "default": false,
-          "description": "Grant the operator `secrets` create+patch in its RBAC so per-repository\n`spec.credentialProjection` works. Default off — projection is itself opt-in\nper-repository (`spec.credentialProjection.enabled` defaults to false), so the\nchart does not hand out the broader RBAC until you actually use the feature.\nSECURITY TRADE-OFF: enabling this is a broader blast radius — `create` cannot\nbe scoped to a Secret name, so the operator can write a Secret in any namespace\nit manages. Leave false to keep `secrets` RBAC read-only (then any\nprojection-enabled repository surfaces an actionable 403 and you manage\ncredential Secrets yourself); set true once you opt a repository into projection.",
-          "title": "enabled",
-          "type": "boolean"
-        }
-      },
-      "required": [],
-      "title": "secretProjection",
       "type": "object"
     },
     "securityContext": {

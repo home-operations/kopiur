@@ -19,7 +19,7 @@ Two options:
   repository, set `credentialProjection.enabled: true` on the `Restore` and the
   operator copies the repository's Secret into `staging` for the run (owned by the
   `Restore`, garbage-collected with it). Needs the operator's Secret-projection RBAC
-  (Helm `secretProjection.enabled`, off by default).
+  (Helm `features.credentialProjection.enabled`, off by default).
 - **Place the Secret yourself.** Copy the repo's credential Secret into `staging`
   ahead of time and skip `credentialProjection`.
 

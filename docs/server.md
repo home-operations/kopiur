@@ -87,10 +87,20 @@ $ kubectl get deploy,svc,cm,secret -n apps \
 ```
 
 The controller manages `Deployments`/`Services`/`ConfigMaps`/`Secrets` for this
-feature; the RBAC for it ships with the chart (see
-[Installation](install.md#install-scope)). For a namespaced `Repository` the
-objects carry an `ownerReference` to the repository; a `ClusterRepository` cleans
-them up via a finalizer instead (see [ClusterRepository](#clusterrepository-server)).
+feature. For a namespaced `Repository` the objects carry an `ownerReference` to
+the repository; a `ClusterRepository` cleans them up via a finalizer instead (see
+[ClusterRepository](#clusterrepository-server)).
+
+/// warning | The server needs `features.kopiaUi.enabled` in the chart
+
+Writing the generated-auth `Secret` (and, for a `ClusterRepository`, the
+cross-namespace credentials mirror) needs cluster-wide `secrets`
+`create`/`patch`/`delete` — **off by default** (least privilege). Set
+`features.kopiaUi.enabled: true` in the Helm chart. Without it the repository's
+`.status` surfaces an actionable `403` naming the flag. See
+[Feature permissions](feature-permissions.md).
+
+///
 
 /// info | The server runs without in-pod TLS
 

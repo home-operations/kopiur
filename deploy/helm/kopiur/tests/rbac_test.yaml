@@ -100,18 +100,20 @@ tests:
           count: 0
         template: role.tpl
 
-  # --- credential projection + kopia web-UI server RBAC ----------------------
+  # --- per-feature secrets-write gating (least privilege) --------------------
   #
-  # The kopia web-UI server (spec.server) creates+deletes an operator-owned auth
-  # Secret and a cross-namespace credentials mirror, and manages a Deployment +
-  # Service. Because the feature is presence-driven per-Repository, secrets full
-  # verbs + services + deployments are granted unconditionally (mirrors the
-  # generated deploy/rbac/operator-{clusterrole,role}.yaml), independent of
-  # secretProjection.enabled.
+  # Secrets READ is always granted. Secrets WRITE is split per opt-in feature:
+  #   * features.credentialProjection.enabled → [create, patch]
+  #   * features.kopiaUi.enabled              → [create, patch, delete]
+  # Both default OFF, so the chart only grants what's enabled (services +
+  # deployments stay full-verbs — those are presence-driven, not gated here).
+  # webhook.enabled is forced false to isolate from the self-mode webhook-TLS
+  # `secrets [create]` rule.
 
-  - it: "ClusterRole grants full secrets verbs + services + deployments (server RBAC)"
+  - it: "default (no features) grants read-only secrets in the ClusterRole"
     set:
       installScope: cluster
+      webhook.enabled: false
     template: clusterrole.tpl
     asserts:
       - contains:
@@ -119,7 +121,20 @@ tests:
           content:
             apiGroups: [""]
             resources: [secrets]
-            verbs: [get, list, watch, create, update, patch, delete]
+            verbs: [get, list, watch]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch, delete]
+      # Services + deployments are NOT gated by these flags — still full verbs.
       - contains:
           path: rules
           content:
@@ -133,10 +148,11 @@ tests:
             resources: [deployments]
             verbs: [get, list, watch, create, update, patch, delete]
 
-  - it: "secret writes are independent of secretProjection in the ClusterRole"
+  - it: "features.credentialProjection adds [create, patch] but not delete (ClusterRole)"
     set:
       installScope: cluster
-      secretProjection.enabled: true
+      webhook.enabled: false
+      features.credentialProjection.enabled: true
     template: clusterrole.tpl
     asserts:
       - contains:
@@ -144,9 +160,68 @@ tests:
           content:
             apiGroups: [""]
             resources: [secrets]
-            verbs: [get, list, watch, create, update, patch, delete]
+            verbs: [get, list, watch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch, delete]
 
-  - it: "namespaced Role grants full secrets verbs + services + deployments (server RBAC)"
+  - it: "features.kopiaUi adds [create, patch, delete] (ClusterRole)"
+    set:
+      installScope: cluster
+      webhook.enabled: false
+      features.kopiaUi.enabled: true
+    template: clusterrole.tpl
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [get, list, watch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch, delete]
+
+  - it: "both features enabled grant read + both write rules (ClusterRole)"
+    set:
+      installScope: cluster
+      webhook.enabled: false
+      features.credentialProjection.enabled: true
+      features.kopiaUi.enabled: true
+    template: clusterrole.tpl
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [get, list, watch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch, delete]
+
+  - it: "default (no features) grants read-only secrets in the namespaced Role"
     set:
       installScope: namespaced
       webhook.enabled: false
@@ -157,7 +232,13 @@ tests:
           content:
             apiGroups: [""]
             resources: [secrets]
-            verbs: [get, list, watch, create, update, patch, delete]
+            verbs: [get, list, watch]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch]
       - contains:
           path: rules
           content:
@@ -170,3 +251,24 @@ tests:
             apiGroups: [apps]
             resources: [deployments]
             verbs: [get, list, watch, create, update, patch, delete]
+
+  - it: "both features enabled grant read + both write rules (namespaced Role)"
+    set:
+      installScope: namespaced
+      webhook.enabled: false
+      features.credentialProjection.enabled: true
+      features.kopiaUi.enabled: true
+    template: role.tpl
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [secrets]
+            verbs: [create, patch, delete]

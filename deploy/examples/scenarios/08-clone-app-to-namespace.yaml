@@ -39,7 +39,7 @@ spec:
       accessModes:
         - ReadWriteOnce
   # Copy the ClusterRepository's credential Secret into `staging` for this run
-  # (owned by this Restore, GC'd with it). Needs Helm secretProjection.enabled.
+  # (owned by this Restore, GC'd with it). Needs Helm features.credentialProjection.enabled.
   credentialProjection:
     enabled: true
   # Run as the staging app's UID so the cloned data is usable.

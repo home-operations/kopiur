@@ -181,7 +181,7 @@ Back up a NAS export directly: `source.nfs` names an NFS `server` + `path` inste
 
 ## Example 11 — Credential projection
 
-A shared `ClusterRepository` keeps its credential Secret in the operator namespace, but movers run in workload namespaces and load creds via namespace-local `envFrom` — so normally you copy that Secret into every namespace yourself. Setting `credentialProjection.enabled: true` on the **`SnapshotPolicy`** (also available on `Restore`/`Maintenance`) opts out of that chore: before each run the operator projects the repository's Secret into the mover's namespace, owned by the consuming `Snapshot`/`Restore`/`Maintenance` (garbage-collected with it) and refreshed from source each run. It's **off by default** (cross-namespace copying is opt-in) but is the **recommended** path for a shared repository spanning several namespaces. It needs the operator's cluster-wide `secrets` create/patch RBAC (Helm `secretProjection.enabled`, **off by default** — set it when you opt a consumer into projection); see [Movers, RBAC & credentials](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for the security trade-off.
+A shared `ClusterRepository` keeps its credential Secret in the operator namespace, but movers run in workload namespaces and load creds via namespace-local `envFrom` — so normally you copy that Secret into every namespace yourself. Setting `credentialProjection.enabled: true` on the **`SnapshotPolicy`** (also available on `Restore`/`Maintenance`) opts out of that chore: before each run the operator projects the repository's Secret into the mover's namespace, owned by the consuming `Snapshot`/`Restore`/`Maintenance` (garbage-collected with it) and refreshed from source each run. It's **off by default** (cross-namespace copying is opt-in) but is the **recommended** path for a shared repository spanning several namespaces. It needs the operator's cluster-wide `secrets` create/patch RBAC (Helm `features.credentialProjection.enabled`, **off by default** — set it when you opt a consumer into projection); see [Movers, RBAC & credentials](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for the security trade-off.
 
 ```yaml
 --8<-- "deploy/examples/11-credential-projection.yaml"
@@ -235,7 +235,7 @@ Restore a snapshot taken in one namespace **into another** — e.g. clone produc
 
 ## Example 17 — Restore from a shared repo (projection)
 
-Restoring from a shared `ClusterRepository` into a namespace that has never run a backup hits a chicken-and-egg: the mover loads the repo creds from a Secret in **its** namespace, which isn't there yet. `credentialProjection.enabled: true` has the operator copy the repository's Secret into the mover's namespace for the run (owned by the `Restore`, GC'd with it). Needs the operator's Secret-projection RBAC (Helm `secretProjection.enabled`).
+Restoring from a shared `ClusterRepository` into a namespace that has never run a backup hits a chicken-and-egg: the mover loads the repo creds from a Secret in **its** namespace, which isn't there yet. `credentialProjection.enabled: true` has the operator copy the repository's Secret into the mover's namespace for the run (owned by the `Restore`, GC'd with it). Needs the operator's Secret-projection RBAC (Helm `features.credentialProjection.enabled`).
 
 ```yaml
 --8<-- "deploy/examples/17-restore-shared-repo-projection.yaml"

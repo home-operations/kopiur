@@ -130,6 +130,17 @@ pub const CREDENTIALS_PROJECTED_REASON: &str = "Projected";
 /// `app.kubernetes.io/component=credentials` labels.
 pub const PROJECTED_FROM_ANNOTATION: &str = "kopiur.home-operations.com/projected-from";
 
+/// Helm value (chart `values.yaml`) that grants the operator `secrets` create/patch
+/// so credential projection (`spec.credentialProjection`) works. Surfaced verbatim in
+/// the actionable 403 error when a projection write is forbidden, so the message and
+/// the chart never drift. See `deploy/helm/kopiur/templates/{role,clusterrole}.tpl`.
+pub const CREDENTIAL_PROJECTION_FLAG: &str = "features.credentialProjection.enabled";
+/// Helm value that grants the operator `secrets` create/patch/delete so the kopia
+/// web-UI server (`spec.server`) works (generated-auth Secret + cross-namespace
+/// credentials mirror + teardown delete). Surfaced verbatim in the actionable 403
+/// error when a server Secret write is forbidden.
+pub const KOPIA_UI_FLAG: &str = "features.kopiaUi.enabled";
+
 /// Namespace annotation a cluster admin sets to allow elevated (root/privileged)
 /// movers in that namespace (ADR §4.11/§G16). Without it, a `SnapshotPolicy` whose
 /// `spec.mover` requests privilege is refused — a tenant could otherwise reuse the

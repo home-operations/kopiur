@@ -239,10 +239,10 @@ A restore mover loads the repository credentials via `envFrom` from a Secret **i
 spec:
     repository: { kind: ClusterRepository, name: platform-shared }
     credentialProjection:
-        enabled: true # off by default; needs Helm secretProjection.enabled
+        enabled: true # off by default; needs Helm features.credentialProjection.enabled
 ```
 
-It's **off by default** (cross-namespace Secret copying is opt-in) and needs the operator's Secret-projection RBAC (Helm `secretProjection.enabled`). The alternative is placing the Secret in the namespace yourself. See [Movers → credential projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos).
+It's **off by default** (cross-namespace Secret copying is opt-in) and needs the operator's Secret-projection RBAC (Helm `features.credentialProjection.enabled`). The alternative is placing the Secret in the namespace yourself. See [Movers → credential projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos).
 
 ## Field reference — every value, and when to change it
 

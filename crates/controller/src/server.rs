@@ -656,6 +656,33 @@ pub async fn reconcile_server(rc: &ServerReconcileCtx<'_>) -> crate::error::Resu
     }
 }
 
+/// Map a kopia web-UI Secret write/delete failure to an actionable error. A `403`
+/// means the operator lacks the `secrets` create/patch/delete RBAC the server
+/// feature needs (the generated-auth Secret, the cross-namespace credentials mirror,
+/// and their teardown delete); point the admin at the Helm toggle that grants it.
+/// Other errors pass through unchanged. Transient (re-driven once RBAC is fixed), so
+/// it surfaces on the repository's status condition rather than hard-stopping.
+fn map_server_secret_error(
+    e: crate::error::Error,
+    secret: &str,
+    namespace: &str,
+) -> crate::error::Error {
+    use crate::error::Error;
+    if let Error::Kube(kube::Error::Api(resp)) = &e
+        && resp.code == 403
+    {
+        return Error::MissingDependency(format!(
+            "the operator is not permitted to write the kopia web-UI Secret `{secret}` in \
+             namespace `{namespace}` (HTTP 403). The kopia web-UI server (`spec.server`) needs \
+             `secrets` create/patch/delete RBAC. Fix: set `{flag}: true` in the Helm chart \
+             (grants the operator ClusterRole those verbs), or remove `spec.server` from the \
+             repository.",
+            flag = crate::consts::KOPIA_UI_FLAG,
+        ));
+    }
+    e
+}
+
 async fn teardown_in(
     rc: &ServerReconcileCtx<'_>,
     namespace: &str,
@@ -663,16 +690,18 @@ async fn teardown_in(
     gen_secret: &str,
 ) -> crate::error::Result<()> {
     use crate::io;
-    // Deployment + Service + ConfigMap + the generated-auth Secret.
-    io::delete_server_objects(rc.client, namespace, name, Some(gen_secret)).await?;
+    // Deployment + Service + ConfigMap + the generated-auth Secret. A 403 here is the
+    // Secret delete (Deployment/Service/ConfigMap delete is always granted); map it to
+    // the actionable kopiaUi-flag hint.
+    io::delete_server_objects(rc.client, namespace, name, Some(gen_secret))
+        .await
+        .map_err(|e| map_server_secret_error(e, gen_secret, namespace))?;
     // The mirrored creds Secret (cluster-repo cross-namespace case) is operator-owned.
     if rc.is_cluster {
-        io::delete_secret_if_present(
-            rc.client,
-            namespace,
-            &mirrored_creds_secret_name(rc.instance),
-        )
-        .await?;
+        let mirror_name = mirrored_creds_secret_name(rc.instance);
+        io::delete_secret_if_present(rc.client, namespace, &mirror_name)
+            .await
+            .map_err(|e| map_server_secret_error(e, &mirror_name, namespace))?;
     }
     Ok(())
 }
@@ -762,7 +791,9 @@ async fn ensure_in(
             },
             ..Default::default()
         };
-        io::mirror_secret(rc.client, &rc.creds_src_namespace, &creds_secret, dst).await?;
+        io::mirror_secret(rc.client, &rc.creds_src_namespace, &creds_secret, dst)
+            .await
+            .map_err(|e| map_server_secret_error(e, &mirror_name, namespace))?;
         mirror_name
     } else {
         creds_secret
@@ -816,7 +847,9 @@ async fn ensure_in(
             secret.metadata.name.as_deref(),
             Some(password_secret.as_str())
         );
-        io::ensure_secret_once(rc.client, namespace, &secret).await?;
+        io::ensure_secret_once(rc.client, namespace, &secret)
+            .await
+            .map_err(|e| map_server_secret_error(e, password_secret, namespace))?;
     }
 
     let cm = build_server_config_map(&inputs)?;
@@ -899,6 +932,38 @@ async fn resolve_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_error(code: u16) -> crate::error::Error {
+        use kube::core::Status;
+        crate::error::Error::Kube(kube::Error::Api(Box::new(Status {
+            code,
+            message: "boom".into(),
+            reason: "Forbidden".into(),
+            ..Default::default()
+        })))
+    }
+
+    #[test]
+    fn server_secret_403_maps_to_rbac_toggle_hint() {
+        let mapped = map_server_secret_error(api_error(403), "nas-kopia-ui-auth", "backups");
+        match mapped {
+            crate::error::Error::MissingDependency(m) => {
+                assert!(m.contains("HTTP 403"), "message: {m}");
+                assert!(m.contains("features.kopiaUi.enabled: true"), "message: {m}");
+                assert!(m.contains("`nas-kopia-ui-auth`"), "message: {m}");
+                assert!(m.contains("`backups`"), "message: {m}");
+            }
+            other => panic!("expected MissingDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_secret_non_403_passes_through_unchanged() {
+        assert!(matches!(
+            map_server_secret_error(api_error(500), "nas-kopia-ui-auth", "backups"),
+            crate::error::Error::Kube(_)
+        ));
+    }
 
     fn inputs<'a>(ns: &'a str, auth: ResolvedAuth) -> ServerBuildInputs<'a> {
         ServerBuildInputs {
