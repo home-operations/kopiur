@@ -7,7 +7,7 @@
 # Secret into the mover's namespace for the run (owned by this Restore, GC'd with it)
 # — so you don't hand-place credentials in every recovery namespace.
 #
-# Requires the operator's Secret-projection RBAC: Helm `secretProjection.enabled`
+# Requires the operator's Secret-projection RBAC: Helm `features.credentialProjection.enabled`
 # (off by default). See docs/movers.md.
 #
 # Field shapes verified against crates/api: credentialProjection = { enabled }.

@@ -63,19 +63,33 @@ rules:
     resources:
       - events
     verbs: [create, patch]
-  # create+patch back the opt-in credential projection (spec.credentialProjection),
-  # gated by secretProjection.enabled; read-only otherwise. See the ClusterRole for
-  # the full rationale.
-  # Secrets: read repository credentials, create+patch the opt-in credential
-  # projection, AND create/patch/delete the operator-owned kopia web-UI auth Secret
-  # (spec.server Generate mode) + the cross-namespace credentials mirror. The server
-  # feature is presence-driven per-Repository, so the write verbs are granted
-  # unconditionally (a deliberate escalation — see the generated operator-role and the
-  # server addendum). Mirrors deploy/rbac/operator-role.yaml.
+  # Secrets READ is always required (the controller resolves repository credentials).
+  # The WRITE verbs are gated per opt-in feature for least privilege — the generated
+  # deploy/rbac/operator-role.yaml is the maximal "all features" set; the chart only
+  # grants what's enabled. A feature used without its flag surfaces an actionable 403
+  # in the resource's status (see crates/controller/src/io/creds.rs + server.rs).
   - apiGroups: [""]
     resources:
       - secrets
-    verbs: [get, list, watch, create, update, patch, delete]
+    verbs: [get, list, watch]
+  {{- if .Values.features.credentialProjection.enabled }}
+  # Credential projection (spec.credentialProjection): SSA-copy the repository Secret
+  # into each mover Job namespace. create is unscopable (per-Job name); no delete
+  # (projected copies carry an ownerRef and are reaped by GC).
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: [create, patch]
+  {{- end }}
+  {{- if .Values.features.kopiaUi.enabled }}
+  # kopia web-UI server (spec.server): create-once the generated-auth Secret, SSA the
+  # cross-namespace credentials mirror, and delete both on teardown / namespace
+  # migration (owner-ref GC can't reach a cluster-scoped owner's namespaced children).
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: [create, patch, delete]
+  {{- end }}
   # Services exposing the kopia web-UI server (spec.server).
   - apiGroups: [""]
     resources:

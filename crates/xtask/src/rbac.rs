@@ -177,22 +177,29 @@ fn workload_rules() -> Vec<PolicyRule> {
         // on create and the Event is silently dropped.
         rule(&[""], &["events".into()], &["create", "patch"]),
         rule(&["events.k8s.io"], &["events".into()], &["create", "patch"]),
-        // Secrets hold repository credentials. Read is always needed; create+patch
-        // back the opt-in credential projection (`spec.credentialProjection`), where
-        // the controller copies a repository's Secret(s) into each mover Job's
-        // namespace via server-side apply (a PATCH). `create` cannot be
-        // resourceName-scoped (the authorizer can't match a name at create time) and
-        // the projected name is per-Job, so this is necessarily unscoped. No
-        // `delete`: projected copies carry an ownerRef and are reaped by GC. The
-        // Helm chart gates create/patch behind `secretProjection.enabled`.
-        // Secrets: read repository credentials, create+patch the opt-in credential
-        // projection AND the operator-owned kopia web-UI auth Secret (`spec.server`
-        // Generate mode) + the cross-namespace credentials mirror for
-        // ClusterRepository servers, and `delete` them on server teardown / namespace
-        // migration (owner-ref GC can't reach a cluster-scoped owner's children).
-        // FULL_VERBS is a deliberate escalation over the previous read+create+patch
-        // grant (§ server addendum).
-        rule(&[""], &["secrets".into()], FULL_VERBS),
+        // Secrets READ is always required: the controller resolves repository
+        // credentials (KOPIA_PASSWORD + backend creds) on every reconcile.
+        rule(&[""], &["secrets".into()], &["get", "list", "watch"]),
+        // Secrets WRITE backs two opt-in features. This generated artifact is the
+        // maximal "all features on" set; the Helm chart gates each write
+        // INDEPENDENTLY behind a feature flag for least privilege:
+        //   1. Credential projection (`spec.credentialProjection`,
+        //      `features.credentialProjection.enabled`): the controller copies a
+        //      repository's Secret(s) into each mover Job's namespace via
+        //      server-side apply (a PATCH). `create` cannot be resourceName-scoped
+        //      (the authorizer can't match a name at create time) and the projected
+        //      name is per-Job, so this is necessarily unscoped. Needs create+patch;
+        //      NO delete — projected copies carry an ownerRef and are reaped by GC.
+        //   2. kopia web-UI server (`spec.server`, `features.kopiaUi.enabled`):
+        //      create-once the generated-auth Secret (Generate mode), SSA-patch the
+        //      cross-namespace credentials mirror for ClusterRepository servers, and
+        //      `delete` both on server teardown / namespace migration (owner-ref GC
+        //      can't reach a cluster-scoped owner's namespaced children).
+        // Union = create+patch+delete. There is deliberately NO `update`: every
+        // write site is an SSA PATCH, a create-once, or a delete — nothing updates a
+        // Secret in place. (The webhook-TLS rules below grant a separate, name-scoped
+        // `update` on the serving Secret only.)
+        rule(&[""], &["secrets".into()], &["create", "patch", "delete"]),
         // Services exposing the kopia web-UI server (`spec.server`).
         rule(&[""], &["services".into()], FULL_VERBS),
         // Mover Jobs and the kopia web-UI server Deployment (`spec.server`).

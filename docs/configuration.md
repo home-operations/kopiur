@@ -109,33 +109,38 @@ lifecycle from the release (GitOps), set `installCRDs: false` and apply
 
 ///
 
-## Credential projection RBAC
+## Feature permissions
+
+A couple of opt-in features need the operator to **write Secrets** in the
+namespaces it manages, so each is gated behind a Helm flag — the chart does
+**not** grant cluster-wide `secrets` write by default (least privilege). The flag
+names match the CRD field that triggers them.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:83:93"
+--8<-- "deploy/helm/kopiur/values.yaml:76:102"
 ```
 
-A `Repository`'s `spec.credentialProjection.enabled` lets the operator copy that
-repository's credential Secret(s) into each mover Job's namespace — the big win
-for a shared `ClusterRepository` whose Secret lives in one place. That requires
-the operator to hold cluster-wide `secrets` **create + patch**, which the chart
-does **not** grant by default.
+| CRD field you set… | …needs this Helm flag | Grants `secrets` |
+| --- | --- | --- |
+| `spec.credentialProjection` | `features.credentialProjection.enabled` | `create`, `patch` |
+| `spec.server` (kopia web-UI) | `features.kopiaUi.enabled` | `create`, `patch`, `delete` |
 
 /// warning | A real blast-radius trade-off
 
-`create` cannot be scoped to a Secret name, so enabling `secretProjection` lets
-the operator write a Secret in any namespace it manages. Leave it `false` to keep
-`secrets` RBAC read-only — a projection-enabled repository then surfaces an
-actionable 403 and you manage the credential Secrets yourself. Flip it to `true`
-only once you actually opt a repository into projection. See
-[Movers, RBAC & credentials](movers.md) and example 11.
+`create`/`delete` cannot be scoped to a Secret name, so enabling either flag lets
+the operator write (and, for `kopiaUi`, delete) a Secret in any namespace it
+manages. Leave them `false` to keep `secrets` RBAC read-only. If you enable the
+feature in a CR but forget the flag, the resource's `.status` surfaces an
+actionable `403` naming the exact flag to set. See
+[Feature permissions](feature-permissions.md) for the full mapping and the
+symptom→fix loop.
 
 ///
 
 ## ServiceAccount
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:98:104"
+--8<-- "deploy/helm/kopiur/values.yaml:121:127"
 ```
 
 Set `serviceAccount.create: false` to bring your own. The `annotations` map is
@@ -146,7 +151,7 @@ static credential Secret.
 ## Controller Deployment
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:109:157"
+--8<-- "deploy/helm/kopiur/values.yaml:132:194"
 ```
 
 The operator itself. The settings worth knowing:
@@ -159,19 +164,20 @@ The operator itself. The settings worth knowing:
   backend** reachable in-process (hostPath / NFS / PVC), so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath
   here.
-- **`resources`** — note there is intentionally **no CPU limit** (throttling an
-  operator only adds reconcile latency), and the **memory limit is deliberately
-  generous (1Gi)**.
+- **`resources`** — only **requests** are set by default; there are intentionally
+  **no limits** (the `limits` block ships commented out). Uncomment and tune it to
+  your own measured ceiling if you want them.
 
-/// note | Why the controller memory limit is 1Gi, not 256Mi
+/// note | Why the controller ships with no memory limit
 
 On (re)start the controller reconciles every existing resource at once, spawning
 concurrent in-process `kopia` subprocesses (whose RSS counts against this
 container's cgroup) to list/connect repositories that may hold many snapshots.
-With the OpenTelemetry stack linked in, 256Mi was too tight — the startup burst
-OOMKilled the controller, which then crash-looped (OOM → restart → re-reconcile
-burst → OOM). Size the limit for the burst, not steady state (~120Mi). See
-`crates/e2e/tests/lifecycle.rs`.
+That makes RSS **burst** well above steady state (~120Mi). A memory limit that
+doesn't cover the burst OOMKills the controller, which then crash-loops (OOM →
+restart → re-reconcile burst → OOM) — so the chart sets no limit by default. If
+you add one, size it for the burst, not steady state, and measure your own
+ceiling first. See `crates/e2e/tests/lifecycle.rs`.
 
 ///
 
@@ -190,7 +196,7 @@ The webhook is a **separate** Deployment + Service; the Service maps
 `443 → 8443`.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:164:201"
+--8<-- "deploy/helm/kopiur/values.yaml:201:239"
 ```
 
 - **`enabled`** — when `false`, validation falls back to the controller's
@@ -205,7 +211,7 @@ The webhook is a **separate** Deployment + Service; the Service maps
 ### Webhook TLS
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:202:232"
+--8<-- "deploy/helm/kopiur/values.yaml:240:270"
 ```
 
 The webhook **always** serves TLS (Kubernetes requires HTTPS for admission);
@@ -224,7 +230,7 @@ TLS](install.md#webhook-tls).
 ## Metrics & observability
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:237:293"
+--8<-- "deploy/helm/kopiur/values.yaml:275:331"
 ```
 
 All metrics are under the `kopiur_` namespace and served via a Prometheus **pull**
@@ -245,7 +251,7 @@ Prometheus Operator and Grafana:
 ## OpenTelemetry (OTLP)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:303:316"
+--8<-- "deploy/helm/kopiur/values.yaml:341:354"
 ```
 
 Off by default. Metrics are **always** available via the `/metrics` pull endpoint;
@@ -262,7 +268,7 @@ and a sample collector config.
 ## Logging
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:324:331"
+--8<-- "deploy/helm/kopiur/values.yaml:362:369"
 ```
 
 Controls the stdout (`kubectl logs`) logging every component writes. The
@@ -278,7 +284,7 @@ mover honors the same level and format.
 ## Pod security
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:337:351"
+--8<-- "deploy/helm/kopiur/values.yaml:375:388"
 ```
 
 Shared defaults for the controller and webhook pods: non-root **uid/gid 65534

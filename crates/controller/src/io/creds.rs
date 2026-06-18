@@ -450,9 +450,10 @@ fn map_projection_apply_error(e: Error, proj_name: &str, job_ns: &str) -> Error 
         return Error::MissingDependency(format!(
             "the operator is not permitted to write the projected credentials Secret \
              `{proj_name}` in namespace `{job_ns}` (HTTP 403). Credential projection needs \
-             cluster-wide `secrets` create/patch RBAC. Fix: set `secretProjection.enabled: true` \
+             cluster-wide `secrets` create/patch RBAC. Fix: set `{flag}: true` \
              in the Helm chart (grants the operator ClusterRole those verbs), or disable \
-             `spec.credentialProjection` on the repository and manage the Secret in `{job_ns}`."
+             `spec.credentialProjection` on the repository and manage the Secret in `{job_ns}`.",
+            flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
         ));
     }
     e
@@ -631,7 +632,7 @@ mod tests {
         match mapped {
             Error::MissingDependency(m) => {
                 assert!(m.contains("HTTP 403"));
-                assert!(m.contains("secretProjection.enabled: true"));
+                assert!(m.contains("features.credentialProjection.enabled: true"));
                 assert!(m.contains("`job-creds-0`"));
             }
             other => panic!("expected MissingDependency, got {other:?}"),

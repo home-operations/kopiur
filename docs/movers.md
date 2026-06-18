@@ -95,7 +95,7 @@ For a shared `ClusterRepository`, the consumer's `enabled: true` is **necessary 
 
 1. The repository owner sets `credentialProjection.allowed: true` on the `ClusterRepository` (default **false**).
 2. The consumer sets `credentialProjection.enabled: true` (above).
-3. The operator has the cluster-wide `secrets` RBAC (`secretProjection.enabled`, below).
+3. The operator has the cluster-wide `secrets` RBAC (`features.credentialProjection.enabled`, below).
 
 A namespaced `Repository` has no such gate — its repo and Secret co-reside, so projection there is a same-namespace no-op. See [Repositories → credentialProjection.allowed](repositories.md#credentialprojectionallowed--the-owner-gate-for-shared-creds).
 
@@ -110,7 +110,7 @@ How the projected copies behave:
 
 /// warning | Projection needs the operator's `secrets` create/patch RBAC
 
-To write Secrets into workload namespaces, the operator needs cluster-wide `secrets` `create`/`patch`. The Helm value `secretProjection.enabled` (**off by default**) grants it. Projection is itself opt-in per-consumer, so the chart withholds this broader RBAC until you set `secretProjection.enabled: true`. The trade-off: `create` cannot be scoped to a Secret name, so the operator can write a Secret in any namespace it manages. While it stays at the default `false`, `secrets` access is read-only — and a projection-enabled `SnapshotPolicy`/`Restore`/`Maintenance` surfaces an actionable `403` telling you to enable it. A projected copy in namespace `X` is readable by anything that can read Secrets in `X` — exactly as it would be if you placed it there yourself.
+To write Secrets into workload namespaces, the operator needs cluster-wide `secrets` `create`/`patch`. The Helm value `features.credentialProjection.enabled` (**off by default**) grants it. Projection is itself opt-in per-consumer, so the chart withholds this broader RBAC until you set `features.credentialProjection.enabled: true`. The trade-off: `create` cannot be scoped to a Secret name, so the operator can write a Secret in any namespace it manages. While it stays at the default `false`, `secrets` access is read-only — and a projection-enabled `SnapshotPolicy`/`Restore`/`Maintenance` surfaces an actionable `403` telling you to enable it. A projected copy in namespace `X` is readable by anything that can read Secrets in `X` — exactly as it would be if you placed it there yourself. See [Feature permissions](feature-permissions.md) for the full flag↔feature mapping.
 
 ///
 

@@ -190,6 +190,7 @@ nav:
       - Restores: restores.md
       - Repository replication: replication.md
       - Movers, RBAC & credentials: movers.md
+      - Feature permissions: feature-permissions.md
       - Permissions, UID & GID: permissions.md
       - Security context: security-context.md
       - Maintenance: maintenance.md

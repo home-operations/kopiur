@@ -16,13 +16,18 @@
 # (HOSTPATH_REPO / HOSTPATH_RO_REPO) and the uid with consts::MOVER_UID.
 installScope: cluster
 
-# Grant the operator cluster-wide `secrets` create/patch so per-resource
-# `spec.credentialProjection` works — exercised by crates/e2e tests/credential_projection.rs
-# (backup/restore/maintenance projection). The chart defaults this OFF (projection is
-# opt-in per resource), so the harness must opt in explicitly; without it those tests
-# see the actionable 403 instead of a projected Secret.
-secretProjection:
-  enabled: true
+# Feature permissions that grant the operator cluster-wide `secrets` write. Both
+# default OFF in the chart (least privilege), so the harness opts in explicitly:
+#   * credentialProjection — exercised by crates/e2e tests/credential_projection.rs
+#     (backup/restore/maintenance projection). Without it those tests see the
+#     actionable 403 instead of a projected Secret.
+#   * kopiaUi — grants the `spec.server` (kopia web-UI) secret writes, so a future
+#     server e2e isn't blocked by an RBAC 403.
+features:
+  credentialProjection:
+    enabled: true
+  kopiaUi:
+    enabled: true
 
 podSecurityContext:
   runAsNonRoot: true

@@ -73,24 +73,33 @@ installCRDs: true
 installScope: namespaced
 
 # =============================================================================
-# Credential projection
+# Feature permissions
 # =============================================================================
-# Per-repository `spec.credentialProjection.enabled` lets the operator copy a
-# repository's credential Secret(s) into each mover Job's namespace, so users with
-# many namespaces don't have to pre-create the Secret everywhere (the chief win is
-# a shared ClusterRepository whose Secret is pinned to one namespace). That
-# requires the operator to hold cluster-wide `secrets` create/patch.
-secretProjection:
-  # -- Grant the operator `secrets` create+patch in its RBAC so per-repository
-  # `spec.credentialProjection` works. Default off — projection is itself opt-in
-  # per-repository (`spec.credentialProjection.enabled` defaults to false), so the
-  # chart does not hand out the broader RBAC until you actually use the feature.
-  # SECURITY TRADE-OFF: enabling this is a broader blast radius — `create` cannot
-  # be scoped to a Secret name, so the operator can write a Secret in any namespace
-  # it manages. Leave false to keep `secrets` RBAC read-only (then any
-  # projection-enabled repository surfaces an actionable 403 and you manage
-  # credential Secrets yourself); set true once you opt a repository into projection.
-  enabled: false
+# A few opt-in features need the operator to WRITE Secrets in the namespaces it
+# manages, so each grants extra RBAC. All are OFF by default (least privilege):
+# the chart does not hand out cluster-wide `secrets` write until you turn on the
+# feature you use. The flag names match the CRD fields that trigger them.
+#
+# Symptom → fix: if you enable the feature in a CR but forget the flag here, the
+# resource's `.status` shows an actionable condition like
+#   "... (HTTP 403). ... Fix: set features.<name>.enabled: true ..."
+# Set the matching flag below and the operator heals on the next reconcile.
+# See docs/feature-permissions.md for the full mapping and security trade-offs.
+features:
+  credentialProjection:
+    # -- Grant the operator `secrets` create+patch so `spec.credentialProjection`
+    # works: the operator copies a repository's credential Secret(s) into each mover
+    # Job's namespace (the chief win is a shared ClusterRepository whose Secret is
+    # pinned to one namespace). SECURITY TRADE-OFF: `create` cannot be scoped to a
+    # Secret name, so the operator can write a Secret in any namespace it manages.
+    enabled: false
+  kopiaUi:
+    # -- Grant the operator `secrets` create+patch+delete so `spec.server` (the
+    # kopia web-UI) works: it creates a generated-auth Secret, mirrors a
+    # ClusterRepository's credentials into the server namespace, and deletes both on
+    # teardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any
+    # namespace the operator manages.
+    enabled: false
 
 # =============================================================================
 # Extra RBAC
@@ -167,6 +176,11 @@ controller:
     requests:
       cpu: 50m
       memory: 128Mi
+    # No limits are set by default. Uncomment and tune to your own measured
+    # ceiling if you want them (a memory limit below the startup burst OOM-loops
+    # the controller — see the note above):
+    # limits:
+    #   memory: 1Gi
   # -- Scheduling controls.
   nodeSelector: {}
   tolerations: []
@@ -214,6 +228,9 @@ webhook:
     requests:
       cpu: 25m
       memory: 64Mi
+    # No limits are set by default. Uncomment and tune if you want them:
+    # limits:
+    #   memory: 512Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}
