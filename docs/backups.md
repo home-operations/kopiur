@@ -235,13 +235,15 @@ Opt-in. When absent, nothing runs. When set, the operator runs a frequent blob-l
 ```yaml
 verification:
     quick: { cron: "0 4 * * *", jitter: 30m } # blob-level verify, often
-    deep: # scratch-restore the latest snapshot into an ephemeral PVC, rarely
+    deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
         schedule: { cron: "0 5 * * 0", jitter: 1h }
-        capacity: 100Gi
-        storageClassName: fast-ssd
+        capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
+        storageClassName: fast-ssd # StorageClass for that PVC (omit = cluster default)
     successExpr: "stats.files > 0 && stats.errors == 0" # CEL pass/fail predicate
     verifyFilesPercent: 10 # how much of each file `quick` reads fully
 ```
+
+Deep verify restores into a throwaway scratch volume, then discards it. `capacity` and `storageClassName` size and place that volume: **set `capacity`** and the operator provisions a fresh generic-ephemeral PVC (auto-deleted with the Job) of that size — size it to comfortably hold the restored snapshot; **omit `capacity`** and scratch falls back to a node-ephemeral `emptyDir` (zero-config, but bounded by node disk — fine for small snapshots). `storageClassName` only applies when `capacity` is set.
 
 `successExpr` is a CEL predicate (returns `bool`) over the verify result — environment `stats{files,bytes,errors}`, `snapshot`, and (deep only) `restored{files,checksumMatches}`. It is validated at admission, so a typo is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 

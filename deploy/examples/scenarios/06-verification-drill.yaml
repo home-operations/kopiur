@@ -48,11 +48,14 @@ spec:
     quick:
       cron: "0 4 * * *"
       jitter: 30m
-    # Deep: scratch-restore the latest snapshot into an ephemeral PVC, weekly.
+    # Deep: scratch-restore the latest snapshot into a throwaway volume, weekly.
     deep:
       schedule:
         cron: "0 5 * * 0"
         jitter: 1h
+      # capacity provisions a fresh ephemeral PVC (auto-deleted with the Job),
+      # sized to hold the restored snapshot. Omit it and scratch is a node-ephemeral
+      # emptyDir. storageClassName only applies when capacity is set (omit = default).
       capacity: 100Gi
       storageClassName: fast-ssd
     # CEL pass/fail over the result — a verify with 0 files or any error FAILS.

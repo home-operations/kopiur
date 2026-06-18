@@ -1328,6 +1328,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations: Default::default(),
         cache_volume,
+        scratch_volume: None,
         readiness_exec: None,
     };
     let cm = jobs::build_config_map(&inputs)?;
@@ -1869,6 +1870,7 @@ async fn delete_snapshot_via_job(
         annotations: Default::default(),
         // A one-shot finalizer delete: an ephemeral emptyDir cache is fine.
         cache_volume: Default::default(),
+        scratch_volume: None,
         readiness_exec: None,
     };
     let cm = jobs::build_config_map(&inputs)?;
@@ -2027,6 +2029,7 @@ async fn reconcile_pin(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations: Default::default(),
         cache_volume: Default::default(),
+        scratch_volume: None,
         readiness_exec: None,
     };
     let cm = jobs::build_config_map(&inputs)?;

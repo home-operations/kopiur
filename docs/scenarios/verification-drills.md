@@ -26,17 +26,22 @@ extra RBAC:
 spec:
     verification:
         quick: { cron: "0 4 * * *", jitter: 30m } # blob-level `kopia snapshot verify`, often
-        deep: # scratch-restore the latest snapshot to an ephemeral PVC, rarely
+        deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
             schedule: { cron: "0 5 * * 0", jitter: 1h }
-            capacity: 100Gi
-            storageClassName: fast-ssd
+            capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
+            storageClassName: fast-ssd # StorageClass for that PVC (omit = cluster default)
         successExpr: "stats.files > 0 && stats.errors == 0" # CEL pass/fail predicate
         verifyFilesPercent: 10 # how much of each file `quick` actually reads
 ```
 
 - **`quick`** is a cheap, frequent blob-level integrity check; **`deep`** is a rare
-  full scratch-restore into a throwaway PVC (then discarded). Schedule each
+  full scratch-restore into a throwaway volume (then discarded). Schedule each
   independently.
+- **`deep` scratch sizing** — set **`capacity`** to provision a fresh generic-ephemeral
+  PVC (auto-deleted with the Job), sized to hold the restored snapshot;
+  **`storageClassName`** places it (omit = cluster default). Omit `capacity` and
+  scratch is a node-ephemeral `emptyDir` — zero-config, but bounded by node disk, so
+  prefer a sized PVC for large snapshots.
 - **`successExpr`** is a CEL predicate over the result (`stats{files,bytes,errors}`,
   `snapshot`, and — deep only — `restored{files,checksumMatches}`) — it kills the
   silent "0 files" success. It is validated at admission, so a typo is rejected on

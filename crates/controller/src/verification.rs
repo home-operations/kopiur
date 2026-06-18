@@ -24,7 +24,7 @@ use k8s_openapi::api::batch::v1::Job;
 use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{SnapshotPolicy, Verification};
+use kopiur_api::{DeepVerification, SnapshotPolicy, Verification};
 use kopiur_mover::workspec::{
     DeepVerify, MoverOptions, MoverWorkSpec, Operation, QuickVerify, ResolvedIdentity, TargetRef,
     VerifyOp, VerifyTier,
@@ -36,12 +36,12 @@ use crate::consts::{
 use crate::context::Context;
 use crate::error::Result;
 use crate::io::{self, ResolvedRepository};
-use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
+use crate::jobs::{
+    self, CacheVolume, DEEP_SCRATCH_PATH, JobLimits, MoverJobInputs, VolumeMountSpec,
+};
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state, mover_pull_policy_pub};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
 
-/// Default ephemeral scratch path inside the deep-verify mover pod.
-const DEEP_SCRATCH_PATH: &str = "/scratch";
 /// How long a finished verify Job lingers before TTL-reaping.
 const VERIFY_JOB_TTL_SECS: i64 = 3600;
 /// Requeue while a verify Job is in flight.
@@ -357,6 +357,12 @@ async fn spawn_verify_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations,
         cache_volume: Default::default(),
+        // Deep verify restores into DEEP_SCRATCH_PATH; mount a writable volume there
+        // (sized PVC if `capacity` is set, else emptyDir). Quick verify needs none.
+        scratch_volume: match tier {
+            VerifyTierKind::Deep => verification.deep.as_ref().map(scratch_volume),
+            VerifyTierKind::Quick => None,
+        },
         readiness_exec: None,
     };
     let cm = jobs::build_config_map(&inputs)?;
@@ -414,6 +420,24 @@ pub fn build_verify_work_spec(
             .as_ref(),
         ),
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
+    }
+}
+
+/// Resolve the deep-verify scratch volume from `verification.deep`. Mirrors
+/// [`crate::cache::resolve_cache_volume`]'s capacity gate: a sized
+/// `capacity` provisions a fresh generic ephemeral volume (a PVC bound to the
+/// pod's lifetime, auto-GC'd, honoring `storageClassName`); an unset `capacity`
+/// falls back to an `emptyDir` (node-ephemeral, zero-config, writable by the
+/// non-root mover via the pod's `fsGroup`). Never `Pvc` — scratch is discarded
+/// after each run, so a persistent PVC would be wrong. Pure (no IO): unlike the
+/// cache there is no owned PVC to provision, so this is unit-testable directly.
+fn scratch_volume(deep: &DeepVerification) -> CacheVolume {
+    match deep.capacity.clone() {
+        Some(capacity) => CacheVolume::Ephemeral {
+            capacity,
+            storage_class: deep.storage_class_name.clone(),
+        },
+        None => CacheVolume::EmptyDir,
     }
 }
 
@@ -658,5 +682,55 @@ mod tests {
             },
             other => panic!("expected verify op, got {}", other.kind_str()),
         }
+    }
+
+    // --- scratch volume resolution (capacity gates emptyDir vs ephemeral PVC) ---
+
+    fn deep(capacity: Option<&str>, storage_class: Option<&str>) -> DeepVerification {
+        DeepVerification {
+            schedule: CronSpec {
+                cron: "0 5 * * 0".into(),
+                jitter: None,
+            },
+            storage_class_name: storage_class.map(Into::into),
+            capacity: capacity.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn scratch_volume_defaults_to_emptydir_when_capacity_unset() {
+        // Zero-config: the common "just enable deep verify" case. An emptyDir is
+        // writable by the non-root mover (like the kopia cache), fixing the
+        // original `mkdir /scratch: permission denied`.
+        assert_eq!(scratch_volume(&deep(None, None)), CacheVolume::EmptyDir);
+    }
+
+    #[test]
+    fn scratch_volume_storageclass_without_capacity_is_still_emptydir() {
+        // Mirrors resolve_cache_volume: capacity is the gate. storageClassName has
+        // no effect on an emptyDir, so without capacity we stay emptyDir.
+        assert_eq!(
+            scratch_volume(&deep(None, Some("openebs-hostpath"))),
+            CacheVolume::EmptyDir
+        );
+    }
+
+    #[test]
+    fn scratch_volume_with_capacity_is_a_sized_ephemeral_volume() {
+        assert_eq!(
+            scratch_volume(&deep(Some("50Gi"), Some("fast-ssd"))),
+            CacheVolume::Ephemeral {
+                capacity: "50Gi".into(),
+                storage_class: Some("fast-ssd".into()),
+            }
+        );
+        // capacity alone → cluster default storage class.
+        assert_eq!(
+            scratch_volume(&deep(Some("10Gi"), None)),
+            CacheVolume::Ephemeral {
+                capacity: "10Gi".into(),
+                storage_class: None,
+            }
+        );
     }
 }

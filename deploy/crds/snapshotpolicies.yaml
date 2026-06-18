@@ -11102,8 +11102,11 @@ spec:
                     properties:
                       capacity:
                         description: |-
-                          Size of the ephemeral scratch PVC (e.g. `10Gi`); absent uses a built-in
-                          default. Should comfortably hold the restored snapshot.
+                          Size of the ephemeral scratch PVC (e.g. `10Gi`). When set, the operator
+                          mounts a fresh generic-ephemeral PVC of this size at the scratch path
+                          (auto-deleted with the Job) — size it to comfortably hold the restored
+                          snapshot. When absent, scratch falls back to a node-ephemeral `emptyDir`
+                          (zero-config, but bounded by node disk).
                         nullable: true
                         type: string
                       schedule:
@@ -11124,7 +11127,9 @@ spec:
                         - cron
                         type: object
                       storageClassName:
-                        description: StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
+                        description: |-
+                          StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
+                          Only applies when `capacity` is set (an `emptyDir` has no StorageClass).
                         nullable: true
                         type: string
                     required:

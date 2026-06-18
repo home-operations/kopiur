@@ -852,6 +852,19 @@ async fn run_maintenance_flow(
     }
 }
 
+/// Probe that the deep-verify scratch path is a writable mount: create the dir
+/// tree (kopia's restore would otherwise `mkdir` it), then write and remove a
+/// sentinel file. Surfaces a missing or read-only scratch volume as an explicit
+/// [`MoverError::ScratchNotWritable`] before kopia turns it into an opaque
+/// `mkdir … permission denied`. The probe file is cleaned up on success; on
+/// failure the IO error carries the cause (NotFound / PermissionDenied / …).
+fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let probe = std::path::Path::new(path).join(".kopiur-writable");
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(&probe)
+}
+
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
 /// verify`) or deep (scratch-restore) tier, evaluate the optional CEL `successExpr`
 /// over the result, and PATCH the `SnapshotPolicy` `.status.lastVerified` on
@@ -924,6 +937,21 @@ async fn run_verify_flow(
                     }
                 },
             };
+            // Preflight: the scratch path must be a writable mount. Without it kopia's
+            // restore dies with a cryptic `mkdir /scratch: permission denied` (the
+            // non-root mover cannot create a dir under root-owned `/`). Probe first so
+            // a missing/read-only scratch mount is a clear, classified, actionable
+            // failure naming the fix, not an opaque kopia error.
+            if let Err(source) = probe_scratch_writable(&d.scratch_path) {
+                let err = MoverError::ScratchNotWritable {
+                    path: std::path::PathBuf::from(&d.scratch_path),
+                    uid: kopiur_api::common::MOVER_NONROOT_ID,
+                    source,
+                };
+                patch_verify_status(&spec.target_ref, &verify_failed_body(&err.to_string())).await;
+                error!(class = %err.kopia_class(), "deep verify scratch path not writable");
+                return Err(err);
+            }
             if let Err(e) = client.snapshot_restore(&id, &d.scratch_path).await {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
                 error!(class = %e.class(), "deep verify scratch-restore failed");
