@@ -84,7 +84,7 @@
           "type": "string"
         },
         "probePort": {
-          "default": 8080,
+          "default": 8081,
           "description": "Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).",
           "title": "probePort",
           "type": "integer"
@@ -407,7 +407,7 @@
           "type": "boolean"
         },
         "port": {
-          "default": 8080,
+          "default": 8081,
           "description": "Service port for /metrics.",
           "title": "port",
           "type": "integer"

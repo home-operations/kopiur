@@ -179,7 +179,7 @@ controller:
   podLabels: {}
   podAnnotations: {}
   # -- Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).
-  probePort: 8080
+  probePort: 8081
 
 # =============================================================================
 # Admission webhook
@@ -263,7 +263,7 @@ metrics:
   # -- Expose a Service for the controller's /metrics endpoint.
   enabled: true
   # -- Service port for /metrics.
-  port: 8080
+  port: 8081
   serviceMonitor:
     # -- Create a Prometheus-Operator ServiceMonitor. Requires the CRD to exist.
     enabled: false

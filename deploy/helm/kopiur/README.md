@@ -71,7 +71,7 @@ Disable the webhook entirely with `webhook.enabled=false` (validation then falls
 | controller.podAnnotations | object | `{}` |  |
 | controller.podLabels | object | `{}` | Extra pod labels / annotations. |
 | controller.priorityClassName | string | `""` | Pod-level priority class. |
-| controller.probePort | int | `8080` | Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics). |
+| controller.probePort | int | `8081` | Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics). |
 | controller.replicaCount | int | `1` | Number of controller replicas. >1 enables HA via leader election; only the elected leader reconciles, so deterministic jitter (ADR §4.1) keeps schedules identical across replicas and across failover. |
 | controller.resources | object | `{"limits":{"memory":"1Gi"},"requests":{"cpu":"50m","memory":"128Mi"}}` | Resource requests/limits for the controller pod. No CPU limit (CPU throttling on an operator only adds reconcile latency; the request reserves a fair share). The memory limit must cover the *burst* on startup/restart, not just steady state (~120Mi): on (re)start the controller reconciles every existing resource at once, spawning concurrent in-process `kopia` subprocesses (whose RSS counts against this container's cgroup) to list/connect a repository that may hold many snapshots. With the OpenTelemetry/OTLP stack linked in, 256Mi was too tight — the burst OOMKilled the controller, which then crash-looped (OOM -> restart -> re-reconcile burst -> OOM). 1Gi gives ample headroom. See crates/e2e/tests/lifecycle.rs. |
 | controller.streamingLists | bool | `false` | Opt-in: use the Kubernetes WatchList streaming-list API for the controller's cluster-wide watches, lowering peak memory during the initial resync by streaming pages instead of buffering them. Requires apiserver support (WatchList: beta in 1.32, GA in 1.34); leave off on older clusters. |
@@ -108,7 +108,7 @@ Disable the webhook entirely with `webhook.enabled=false` (validation then falls
 | logging.format | string | `"text"` | Console format: "text" (human-readable, default) or "json" (one structured object per line for Loki/ELK/Datadog). Unknown values degrade to text. |
 | logging.level | string | `""` | Log level / filter directive (RUST_LOG style: error|warn|info|debug|trace; per-target works too, e.g. "info,kopia=debug" to see kopia's own progress in mover logs). When empty, falls back to the deprecated `controller.logLevel`. |
 | metrics.enabled | bool | `true` | Expose a Service for the controller's /metrics endpoint. |
-| metrics.port | int | `8080` | Service port for /metrics. |
+| metrics.port | int | `8081` | Service port for /metrics. |
 | metrics.prometheusRule.backupStaleAfterSeconds | int | `172800` | Age (seconds) after which a SnapshotPolicy's last success is "stale". |
 | metrics.prometheusRule.enabled | bool | `false` | Create a Prometheus-Operator PrometheusRule with kopiur alerts. |
 | metrics.prometheusRule.labels | object | `{}` | Extra labels (e.g. to match your Prometheus ruleSelector). |

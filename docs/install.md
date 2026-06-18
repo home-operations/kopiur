@@ -129,7 +129,7 @@ Eight runnable walkthroughs live in `deploy/examples/`:
 
 ## Observability
 
-- The controller serves `/metrics`, `/healthz`, and `/readyz` on its probe port (`:8080`); the webhook serves `/metrics` on its TLS port. All metrics are under the `kopiur_` namespace.
+- The controller serves `/metrics`, `/healthz`, and `/readyz` on its probe port (`:8081`); the webhook serves `/metrics` on its TLS port. All metrics are under the `kopiur_` namespace.
 - `metrics.enabled=true` (default) creates a metrics `Service`.
 - `metrics.serviceMonitor.enabled=true` creates a Prometheus-Operator `ServiceMonitor` (requires the Prometheus-Operator CRDs); `metrics.prometheusRule.enabled=true` ships the kopiur alert rules.
 - `grafanaDashboard.enabled=true` ships the Grafana dashboard as a sidecar-discoverable `ConfigMap` (source: `deploy/dashboards/kopiur.json`). Set `grafanaDashboard.grafanaOperator.enabled=true` to instead render a [grafana-operator](https://grafana.github.io/grafana-operator/) `GrafanaDashboard` CR from the same JSON (use `grafanaDashboard.grafanaOperator.matchLabels` to select the Grafana instance).
