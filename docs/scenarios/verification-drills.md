@@ -18,7 +18,7 @@ end-to-end restore (and an app-level check on the restored data).
 
 ## Built-in verification (`SnapshotPolicy.spec.verification`)
 
-Kopiur has first-class, opt-in verification (ADR-0005 §4). Add a `verification`
+Kopiur has first-class, opt-in verification. Add a `verification`
 block to the recipe and the operator runs it on a schedule — no `CronJob`, no
 extra RBAC:
 

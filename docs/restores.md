@@ -12,7 +12,7 @@ spec:
     policy: { ... } # what to do if the snapshot is missing
 ```
 
-`source` **and** `target` are required (ADR-0005 §9); `options`/`policy` are optional with safe defaults.
+`source` **and** `target` are required; `options`/`policy` are optional with safe defaults.
 
 ///
 
@@ -113,12 +113,12 @@ Set `target.populator: {}` and the `Restore` becomes a **passive volume-populato
 
 ```yaml
 target:
-    populator: {} # explicit passive-populator mode (ADR-0005 §9)
+    populator: {} # explicit passive-populator mode
 ```
 
 /// warning | `target` is required — the empty-`target` form is gone
 
-As of ADR-0005 §9, a `Restore` with **no** `target` is rejected by the webhook. Populator intent must be the **explicit** `target.populator: {}` (not an omitted `target`). Also, `inheritSecurityContextFrom` is invalid in populator mode — there's no workload pod at provision time, so the webhook rejects it and points you at `moverDefaults` / an explicit `securityContext`.
+A `Restore` with **no** `target` is rejected by the webhook. Populator intent must be the **explicit** `target.populator: {}` (not an omitted `target`). Also, `inheritSecurityContextFrom` is invalid in populator mode — there's no workload pod at provision time, so the webhook rejects it and points you at `moverDefaults` / an explicit `securityContext`.
 
 ///
 

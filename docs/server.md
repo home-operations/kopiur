@@ -422,5 +422,4 @@ auth, plus commented `HTTPRoute` + `NetworkPolicy` templates):
 - [GitOps (Flux / Argo)](gitops.md) — deploying the field through a GitOps pipeline.
 - [`deploy/examples/25-repository-server-ui.yaml`](#full-example) — the apply-ready example above.
 - [`deploy/examples/26-repository-server-ui-readonly.yaml`](#read-only-ui) — the read-only-UI variant.
-- [ADR-0003 §4.14](adr/0003-kopiur-rust-operator.md) — the design rationale.
 </content>

@@ -2,7 +2,7 @@
 
 **Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Snapshot` CR by a finalizer + `deletionPolicy`.
 
-The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. For the high-level mental model start with [Concepts](concepts/how-kopia-works.md); see [ADR-0003](adr/0003-kopiur-rust-operator.md) for the full design.
+The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. For the high-level mental model start with [Concepts](concepts/how-kopia-works.md).
 
 /// warning | Alpha
 
@@ -37,4 +37,3 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 - **[Field reference](field-reference.md)** — every field of all 8 CRDs: type, default, immutability.
 - **[API reference (rustdoc)](api-reference.md)** — the generated Rust API docs for every crate in the workspace.
 - **[API conventions](dev/api-conventions.md)** and **[Observability](dev/observability.md)** — developer notes.
-- **[ADR-0003](adr/0003-kopiur-rust-operator.md)** — the canonical design document.

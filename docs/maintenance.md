@@ -287,4 +287,3 @@ $ kubectl get jobs -n billing -l app.kubernetes.io/component=maintenance
 
 - [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml) — a standalone `Maintenance`.
 - [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml) — inline `spec.maintenance`.
-- [ADR-0003 §4.5](adr/0003-kopiur-rust-operator.md) — the design rationale.

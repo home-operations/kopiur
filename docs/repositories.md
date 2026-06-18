@@ -113,11 +113,11 @@ spec:
     create:
         enabled: true # create the repo if it doesn't exist yet (default: false)
         # All of the below are consulted ONLY at creation time, then fixed forever
-        # (webhook- AND apiserver-immutable: editing them is rejected, ADR-0005 §7):
+        # (webhook- AND apiserver-immutable: editing them is rejected):
         encryption: AES256-GCM-HMAC-SHA256
         splitter: DYNAMIC-4M-BUZHASH
         hash: BLAKE2B-256-128
-        ecc: # Reed-Solomon parity guarding blobs against backend bit-rot (ADR-0005 §13(a))
+        ecc: # Reed-Solomon parity guarding blobs against backend bit-rot
             algorithm: REED-SOLOMON-CRC32
             overheadPercent: 2
 ```
@@ -191,7 +191,7 @@ A namespaced `Repository` materializes rows in its own namespace. A **`ClusterRe
 
 ## `moverDefaults` — one place to configure every mover
 
-A repository spawns movers for **everything** — bootstrap (connect/create), backup, restore, maintenance. `moverDefaults` is the single base they all inherit (ADR-0004 §1); a per-recipe `mover` block (on `SnapshotPolicy`/`Restore`/`Maintenance`) overlays it **field-wise** (the recipe wins, the default fills, the hardened security baseline sits underneath — so a partial override can only tighten, never drop `drop:[ALL]`/seccomp).
+A repository spawns movers for **everything** — bootstrap (connect/create), backup, restore, maintenance. `moverDefaults` is the single base they all inherit; a per-recipe `mover` block (on `SnapshotPolicy`/`Restore`/`Maintenance`) overlays it **field-wise** (the recipe wins, the default fills, the hardened security baseline sits underneath — so a partial override can only tighten, never drop `drop:[ALL]`/seccomp).
 
 ```yaml
 spec:
@@ -209,7 +209,7 @@ spec:
         tolerations: [{ key: backup, operator: Exists }]
         affinity: { ... }
         sourceColocation: { mode: Auto } # avoid RWO Multi-Attach (default Auto)
-        ttlSecondsAfterFinished: 3600 # finished mover Jobs self-GC (ADR-0005 §12)
+        ttlSecondsAfterFinished: 3600 # finished mover Jobs self-GC
         throttle: # cap kopia's bandwidth/ops so a run doesn't saturate the link
             uploadBytesPerSecond: 10485760
             downloadBytesPerSecond: 10485760
@@ -252,7 +252,7 @@ Co-location lets the mover read a **live** volume — that snapshot is crash-con
 
 ## `onNamespaceDelete` — what `kubectl delete ns` does to snapshots
 
-`Orphan` (default) or `Delete` (ADR-0005 §5). A backup tool must not make deleting a namespace a silent data-loss event, so the default is fail-safe:
+`Orphan` (default) or `Delete`. A backup tool must not make deleting a namespace a silent data-loss event, so the default is fail-safe:
 
 | Value | On namespace deletion |
 | --- | --- |
@@ -263,11 +263,11 @@ This is distinct from a single `kubectl delete snapshot`, which always honors th
 
 ## `mode` — ReadWrite or ReadOnly
 
-`mode: ReadWrite` (default) or `ReadOnly` (ADR-0005 §11). A `ReadOnly` repository connects read-only and serves **restores only** — the operator refuses backup Jobs and skips maintenance projection. Use it to decommission a backend or migrate between repositories without any risk of writes.
+`mode: ReadWrite` (default) or `ReadOnly`. A `ReadOnly` repository connects read-only and serves **restores only** — the operator refuses backup Jobs and skips maintenance projection. Use it to decommission a backend or migrate between repositories without any risk of writes.
 
 ## `suspend` — pause a repository
 
-`suspend: true` (ADR-0005 §14(e)) pauses connect/bootstrap and maintenance projection declaratively, without deleting the `Repository`. Surfaced via a condition. `suspend` is consistent across `Repository`/`ClusterRepository`/`SnapshotPolicy`/`RepositoryReplication`.
+`suspend: true` pauses connect/bootstrap and maintenance projection declaratively, without deleting the `Repository`. Surfaced via a condition. `suspend` is consistent across `Repository`/`ClusterRepository`/`SnapshotPolicy`/`RepositoryReplication`.
 
 ## `server` — the kopia web UI
 
@@ -346,7 +346,7 @@ Each `*Expr` is a CEL expression returning a **string**. CEL is sandboxed (no I/
 
 ### `credentialProjection.allowed` — the owner gate for shared creds
 
-By default a `ClusterRepository` will **not** let its credential Secret be projected into a foreign consumer namespace (`credentialProjection.allowed` defaults `false`, ADR-0005 §8). Projection is fail-closed: it requires the repository owner's `allowed: true` **and** the consumer's `credentialProjection.enabled: true` **and** the operator's `secrets` RBAC. A namespaced `Repository` has no such gate (its repo and Secret co-reside).
+By default a `ClusterRepository` will **not** let its credential Secret be projected into a foreign consumer namespace (`credentialProjection.allowed` defaults `false`). Projection is fail-closed: it requires the repository owner's `allowed: true` **and** the consumer's `credentialProjection.enabled: true` **and** the operator's `secrets` RBAC. A namespaced `Repository` has no such gate (its repo and Secret co-reside).
 
 ```yaml
 spec:

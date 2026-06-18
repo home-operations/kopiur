@@ -12,10 +12,10 @@ to the task-oriented guides — cross-checked against `crates/api` and the gener
   **bold** one is the default. Sub-objects link to their own table.
 - **Default** is the value when the field is absent. "—" means no default (the
   field is optional and simply unset). A value in `code` is materialized into the
-  stored object (visible in `kubectl explain`) per ADR-0005 §1.
+  stored object (visible in `kubectl explain`).
 - **Required** fields have no default and must be present, or admission fails.
 - **Immutable** fields are rejected on edit by the webhook *and* CRD
-  `x-kubernetes-validations` transition rules (ADR-0005 §7).
+  `x-kubernetes-validations` transition rules.
 - Externally-tagged unions (`backend`, `source`, `target`, `allowedNamespaces`,
   hooks) select a variant by **which key you set**, never a `kind:` field.
 
@@ -402,7 +402,7 @@ when the identity hostname names no allowed namespace. See
 ### ServerSpec
 
 `{ auth?, service?, resources?, securityContext?, namespace? }` — the optional
-kopia web-UI server (ADR-0003 §4.14). Presence enables it (**no `enabled` bool**).
+kopia web-UI server. Presence enables it (**no `enabled` bool**).
 `auth` is externally tagged — exactly one of `generate: { username? }` (default
 when `auth` is omitted; operator mints a `<repo>-kopia-ui-auth` Secret),
 `secretRef: { name, usernameKey, passwordKey }`, or `insecure: { acknowledgeInsecure
@@ -424,7 +424,6 @@ Externally tagged — exactly one of `list: [..]`, `selector: <LabelSelector>`, 
 
 `{ hostnameExpr?, usernameExpr? }` — **CEL** expressions returning strings, env
 `namespace`/`policyName`/`labels`/`annotations`, validated at admission, ~1 KiB cap.
-§5 (ADR-0004)
 
 ### Retention
 

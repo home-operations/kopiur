@@ -91,7 +91,7 @@ Apply it with `kubectl apply -f`. For the full three-part bundle (the
 
 /// warning | The repository owner must also allow it (`credentialProjection.allowed`)
 
-For a shared `ClusterRepository`, the consumer's `enabled: true` is **necessary but not sufficient** (ADR-0005 §8). Projection into a foreign namespace is **fail-closed** — it needs all three:
+For a shared `ClusterRepository`, the consumer's `enabled: true` is **necessary but not sufficient**. Projection into a foreign namespace is **fail-closed** — it needs all three:
 
 1. The repository owner sets `credentialProjection.allowed: true` on the `ClusterRepository` (default **false**).
 2. The consumer sets `credentialProjection.enabled: true` (above).

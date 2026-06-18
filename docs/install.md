@@ -6,11 +6,11 @@ Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide
 
 ## Prerequisites
 
-- **Kubernetes >= 1.24.** The deploy-or-restore volume-populator path (`Restore` + `PVC.spec.dataSourceRef`) relies on the `AnyVolumeDataSource` feature, available from 1.24 (ADR §4.7).
+- **Kubernetes >= 1.24.** The deploy-or-restore volume-populator path (`Restore` + `PVC.spec.dataSourceRef`) relies on the `AnyVolumeDataSource` feature, available from 1.24.
 - **Helm 3 or 4.**
 - A **kopia repository backend** you can reach: S3/MinIO, Azure Blob, GCS, B2, filesystem (PVC), SFTP, WebDAV, or rclone.
 - _(Optional)_ **cert-manager** — only if you prefer it to manage the admission webhook's certificate. **It is not required**: by default the operator manages the webhook cert itself (see [Webhook TLS](#webhook-tls)).
-- _(Optional)_ **volume-data-source-validator** — recommended alongside CSI populators so a malformed `dataSourceRef` is surfaced as an event rather than a silently-stuck PVC (ADR §4.7).
+- _(Optional)_ **volume-data-source-validator** — recommended alongside CSI populators so a malformed `dataSourceRef` is surfaced as an event rather than a silently-stuck PVC.
 - _(Optional)_ **Prometheus Operator** — if you want the chart's `ServiceMonitor`.
 
 ## Quickstart
@@ -154,5 +154,4 @@ helm uninstall kopiur -n kopiur-system                     # see CRD caution abo
 ## See also
 
 - Every chart value, walked through: [Helm chart values](configuration.md)
-- Design: [`docs/adr/0003-kopiur-rust-operator.md`](adr/0003-kopiur-rust-operator.md)
 - Chart values & modes: [`deploy/helm/kopiur/README.md`](https://github.com/home-operations/kopiur/blob/main/deploy/helm/kopiur/README.md)

@@ -6,7 +6,7 @@ controller never writes back into your `spec`, and cross-field invariants are
 validated in the apiserver (so CI catches them too). This page is the reference for
 those guarantees — `kubectl wait`, health checks, drift hygiene, and CI validation.
 
-## kstatus conditions + `observedGeneration` (ADR-0005 §2)
+## kstatus conditions + `observedGeneration`
 
 Every reconciled CRD exposes standard Kubernetes
 [`Condition`s](https://kubernetes.io/docs/reference/using-api/api-concepts/) and a
@@ -66,7 +66,7 @@ tenant namespace won't usefully reconcile until its `Repository` is `Ready`, and
 you can express that with a Flux `dependsOn` (on the Kustomization that contains the
 `Repository`) or an Argo sync-wave.
 
-## Materialized defaults — no diff-thrash (ADR-0005 §1)
+## Materialized defaults — no diff-thrash
 
 Fields whose default is unconditional now carry a real OpenAPI `default:` and are
 written into the stored object:
@@ -85,14 +85,14 @@ don't report an `OutOfSync` diff against a controller-set value. *Conditional*
 defaults (identity, `policy.onMissingSnapshot`) stay controller/webhook-resolved and
 pinned to **status**, never written into `spec`.
 
-## Status-only writes (ADR-0005 §14(d))
+## Status-only writes
 
 The controller writes only `.status`, **never** your `spec`. The pinned identity
 lives in `status.resolved.identity`; new fields default via OpenAPI, never by spec
 mutation. A write-back into spec would make Argo/Flux perpetually `OutOfSync` — so
 Kopiur doesn't do it. This is an invariant, not a best-effort.
 
-## managed-by + ownerReferences (ADR-0005 §14(c))
+## managed-by + ownerReferences
 
 Every object Kopiur creates carries `app.kubernetes.io/managed-by: kopiur` **and** an
 `ownerReference` to the CR that caused it:
@@ -117,14 +117,14 @@ resource.customizations.ignoreDifferences.all: |
 # special config: the children carry ownerReferences and are not in Git.
 ```
 
-## Suspend — one declarative pause (ADR-0005 §14(e))
+## Suspend — one declarative pause
 
 `suspend: true` is available consistently across `Repository`, `ClusterRepository`,
 `SnapshotPolicy`, `SnapshotSchedule` (`schedule.suspend`), and
 `RepositoryReplication`. Pause via Git, surfaced in a `SUSPENDED` print column where
 applicable. No imperative `kubectl` dance.
 
-## CRD-schema validation (`x-kubernetes-validations`, ADR-0005 §15)
+## CRD-schema validation (`x-kubernetes-validations`)
 
 Cross-field invariants are operator-authored CEL **in the CRD schema**, so they are
 enforced by the apiserver *and* by `kubeconform`/`flux build` in CI — not only by the
@@ -151,14 +151,14 @@ let `kubeconform` validate kopiur CRs without a cluster, and make
 
 ///
 
-## Webhook failure mode (ADR-0005 §14(f))
+## Webhook failure mode
 
 The admission webhook is scoped to kopiur kinds only, so a `failurePolicy: Fail`
 outage never wedges unrelated GitOps applies. **CRD applies bypass the webhook**, so
 a CRD-only sync-wave/`dependsOn` still bootstraps even during operator downtime —
 apply CRDs in an early wave so a CR never races ahead of its CRD.
 
-## The populator cutover caveat (ADR-0005 §14(h))
+## The populator cutover caveat
 
 A bound PVC's `dataSourceRef` is **immutable**. Migrating an existing app onto the
 volume-populator restore path (`target.populator`, see [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops))
@@ -171,4 +171,3 @@ cutover deliberately.
 - [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops) — the one-bundle GitOps pattern.
 - [Field reference](field-reference.md) — the conditions and status fields per kind.
 - [Observability](dev/observability.md) — metrics + the `resource_phase` gauge.
-- [ADR-0005 §14](adr/0005-crd-feature-improvements.md) — the full GitOps-citizen decision.

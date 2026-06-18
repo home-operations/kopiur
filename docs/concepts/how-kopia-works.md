@@ -107,4 +107,3 @@ For most homelab and single-team setups, one repository is the right call. Split
 - [Repositories & backends](../repositories.md) — configuring a `Repository`/`ClusterRepository` against each backend.
 - [Maintenance](../maintenance.md) — how Kopiur schedules and coordinates `kopia maintenance`.
 - [Kopia documentation](https://kopia.io/docs/) — the upstream engine, in depth.
-- [ADR-0003](../adr/0003-kopiur-rust-operator.md) — the canonical design record.

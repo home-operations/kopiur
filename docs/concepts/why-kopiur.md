@@ -1,6 +1,6 @@
 # Why Kopiur is designed this way
 
-Kopiur makes a handful of deliberate choices that differ from other Kubernetes backup operators. This page explains the **why** behind the CRD surface, so the field-by-field references read as obvious. It assumes you've met the Kopia primitives in [How Kopia works](how-kopia-works.md). The canonical, exhaustive rationale is [ADR-0003](../adr/0003-kopiur-rust-operator.md); this is the readable version.
+Kopiur makes a handful of deliberate choices that differ from other Kubernetes backup operators. This page explains the **why** behind the CRD surface, so the field-by-field references read as obvious. It assumes you've met the Kopia primitives in [How Kopia works](how-kopia-works.md). This page is the readable version of the design rationale.
 
 ## Recipe, invocation, schedule — three resources, not one
 
@@ -76,4 +76,3 @@ No design is free. Kopiur's choices come with costs we took on deliberately:
 - [How Kopia works](how-kopia-works.md) — the Kopia primitives these resources build on.
 - [Backups & schedules](../backups.md) and [Repositories & backends](../repositories.md) — the field references.
 - [API conventions](../dev/api-conventions.md) — the externally-tagged-enum rule and other type-safety conventions.
-- [ADR-0003](../adr/0003-kopiur-rust-operator.md) — the canonical design record.

@@ -68,7 +68,7 @@ each overridable per-image. Each image takes a `tag` (defaults to the chart's
 The mover image runs your data-protection Jobs. A floating `:latest` (or any
 mutable tag) means a re-pull could silently change what runs during a backup or
 restore. Set `image.mover.digest` to a `sha256:…` pin — when `digest` is set it
-**wins over `tag`** — so a Job is always byte-for-byte reproducible (ADR §G15).
+**wins over `tag`** — so a Job is always byte-for-byte reproducible.
 The same advice applies to the controller and webhook, but the mover is the one
 that touches your data.
 
@@ -88,7 +88,7 @@ Jobs, so a private registry only needs configuring once.
 | `namespaced` (default) | `Role` + `RoleBinding` | the release namespace only | **not** reconciled |
 | `cluster` | `ClusterRole` + `ClusterRoleBinding` | cluster-wide | reconciled |
 
-`namespaced` is the safer default (ADR §4.11). Switch to `cluster` when a
+`namespaced` is the safer default. Switch to `cluster` when a
 platform team runs one shared backup tier — a `ClusterRepository` that many
 tenant namespaces reference. `ClusterRepository` is a cluster-scoped kind, so a
 namespaced `Role` literally cannot reach it; that's why it's only reconciled in
@@ -153,11 +153,11 @@ The operator itself. The settings worth knowing:
 
 - **`replicaCount` + `leaderElection`** — run more than one replica for HA. Only
   the elected leader reconciles; Kopiur's deterministic jitter (derived from
-  `(scheduleUID, slot)`, ADR §4.1) keeps schedules identical across replicas and
+  `(scheduleUID, slot)`) keeps schedules identical across replicas and
   across failover, so HA never doubles or skews a scheduled backup.
 - **`extraVolumes` / `extraVolumeMounts`** — the way to make a **filesystem
   backend** reachable in-process (hostPath / NFS / PVC), so the controller can
-  run its short idempotent kopia ops (ADR §5.4). The e2e harness uses a hostPath
+  run its short idempotent kopia ops. The e2e harness uses a hostPath
   here.
 - **`resources`** — note there is intentionally **no CPU limit** (throttling an
   operator only adds reconcile latency), and the **memory limit is deliberately
@@ -186,7 +186,7 @@ both are set.
 
 ## Admission webhook
 
-The webhook is a **separate** Deployment + Service (ADR §5.3); the Service maps
+The webhook is a **separate** Deployment + Service; the Service maps
 `443 → 8443`.
 
 ```yaml
@@ -197,7 +197,7 @@ The webhook is a **separate** Deployment + Service (ADR §5.3); the Service maps
   defensive checks only. Not recommended; the webhook is what makes invalid
   states unrepresentable at admission time.
 - **`failurePolicy: Fail`** — fail-closed is the default and the right call for a
-  backup operator (ADR §7.2): if the webhook is down, reject the write rather than
+  backup operator: if the webhook is down, reject the write rather than
   silently admit an unvalidated `Snapshot`.
 - **`serviceMonitor`** — the webhook serves `/metrics` on its TLS port; scraping
   it needs `insecureSkipVerify` (it serves a self-signed cert by default).
@@ -283,8 +283,8 @@ mover honors the same level and format.
 
 Shared defaults for the controller and webhook pods: non-root **uid/gid 65534
 (nobody)**, `runAsNonRoot`, a `RuntimeDefault` seccomp profile, no privilege
-escalation, a read-only root filesystem, and all capabilities dropped (ADR
-§4.9/§4.11; the images are `distroless:nonroot`). These harden the operator
+escalation, a read-only root filesystem, and all capabilities dropped (the
+images are `distroless:nonroot`). These harden the operator
 itself.
 
 /// note | This is the operator's security context, not the mover's

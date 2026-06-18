@@ -209,7 +209,7 @@ The object **splitter** is not here — it is a repository property fixed at cre
 
 ### errorHandling — let a snapshot complete with errors
 
-The backup-side analog of restore's `ignorePermissionErrors` (ADR-0005 §13(b)). Each flag is off by default (kopia fails on the error); turn one on to let the snapshot finish anyway:
+The backup-side analog of restore's `ignorePermissionErrors`. Each flag is off by default (kopia fails on the error); turn one on to let the snapshot finish anyway:
 
 ```yaml
 errorHandling:
@@ -220,7 +220,7 @@ errorHandling:
 
 ### upload — parallelism
 
-kopia's upload policy (ADR-0005 §13(f)); both knobs optional (absent leaves kopia's default):
+kopia's upload policy; both knobs optional (absent leaves kopia's default):
 
 ```yaml
 upload:
@@ -230,7 +230,7 @@ upload:
 
 ### verification — prove the snapshots are restorable
 
-Opt-in (ADR-0005 §4). When absent, nothing runs. When set, the operator runs a frequent blob-level `kopia snapshot verify` (`quick`) and/or a rarer scratch-restore test (`deep`) on a cron, surfaces `status.lastVerified`, and (with `successExpr`) asserts the result is good:
+Opt-in. When absent, nothing runs. When set, the operator runs a frequent blob-level `kopia snapshot verify` (`quick`) and/or a rarer scratch-restore test (`deep`) on a cron, surfaces `status.lastVerified`, and (with `successExpr`) asserts the result is good:
 
 ```yaml
 verification:
@@ -247,7 +247,7 @@ verification:
 
 ### suspend — pause a recipe
 
-`suspend: true` makes the operator skip this `SnapshotPolicy` entirely — no retention prune, no backups created by schedules, no verification — without deleting it. Surfaced in the `SUSPENDED` printer column. (`suspend` is now also available on `Repository`/`ClusterRepository`/`RepositoryReplication`, ADR-0005 §14(e).)
+`suspend: true` makes the operator skip this `SnapshotPolicy` entirely — no retention prune, no backups created by schedules, no verification — without deleting it. Surfaced in the `SUSPENDED` printer column. (`suspend` is now also available on `Repository`/`ClusterRepository`/`RepositoryReplication`.)
 
 ### hooks — quiesce the app around the snapshot
 
@@ -363,7 +363,7 @@ Set it per-`Snapshot` (`spec.deletionPolicy`) or set the recipe-wide default wit
 
 ### `pin` — exempt a snapshot from retention
 
-`Snapshot.spec.pin: true` pins the underlying kopia snapshot so GFS retention **never** expires it (ADR-0005 §13(c)) — for a pre-migration or compliance hold. The reconciler applies a `kopia snapshot pin`; clearing the field removes the pin. `pin` is independent of `deletionPolicy`: `pin` governs **retention expiry**, `deletionPolicy` governs what happens to the snapshot when **this CR** is deleted.
+`Snapshot.spec.pin: true` pins the underlying kopia snapshot so GFS retention **never** expires it — for a pre-migration or compliance hold. The reconciler applies a `kopia snapshot pin`; clearing the field removes the pin. `pin` is independent of `deletionPolicy`: `pin` governs **retention expiry**, `deletionPolicy` governs what happens to the snapshot when **this CR** is deleted.
 
 ```yaml
 spec:
@@ -434,7 +434,7 @@ is described in the table below.
 
 ### `policyRef` or `policySelector` — one recipe or many
 
-A schedule targets recipes one of two **mutually exclusive** ways (exactly one is required, webhook-enforced — ADR-0005 §10):
+A schedule targets recipes one of two **mutually exclusive** ways (exactly one is required, webhook-enforced):
 
 - `policyRef: { name: postgres-data }` — a single `SnapshotPolicy` (the common case, shown above).
 - `policySelector` — a label selector over `SnapshotPolicy` objects in the schedule's namespace. Each matching policy gets a `Snapshot` per firing. "Back up everything tagged `tier=critical` nightly" becomes one object:

@@ -1,6 +1,6 @@
 # Repository replication
 
-A **`RepositoryReplication`** mirrors a repository's blobs to a **second backend** on a schedule — `kopia repository sync-to` wrapped as a Kubernetes resource (ADR-0005 §13(d)). It is the off-site copy that turns one repository into a 3-2-1 strategy: the same data on a second medium / in a second location.
+A **`RepositoryReplication`** mirrors a repository's blobs to a **second backend** on a schedule — `kopia repository sync-to` wrapped as a Kubernetes resource. It is the off-site copy that turns one repository into a 3-2-1 strategy: the same data on a second medium / in a second location.
 
 /// tip | When to reach for it
 
@@ -94,7 +94,7 @@ The full apply-ready manifest — including the destination-backend `Secret` —
 | `destinationEncryption` | A distinct password for the destination repository. **Omit it** to reuse the source repository's password — the common case for a true mirror, where `sync-to` copies blobs verbatim and the format (including encryption material) is identical. |
 | `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported, like a `SnapshotSchedule`). |
 | `mover` | Per-run mover overrides (resources, scheduling, security context). Inherits the source repository's `moverDefaults`. |
-| `suspend` | Pause replication without deleting the CR (ADR-0005 §14(e)). |
+| `suspend` | Pause replication without deleting the CR. |
 
 ## Watching it
 
@@ -104,7 +104,7 @@ NAME                  SOURCE        DESTINATION   SCHEDULE    LAST   AGE
 nas-primary-offsite   nas-primary   s3            0 5 * * *   8h     6d
 ```
 
-`status` surfaces `lastReplicated`, `nextScheduledAt`, and best-effort `lastReplicatedBytes`/`lastReplicatedBlobs`, plus standard `Ready`/`Reconciling`/`Stalled` conditions (ADR-0005 §2) for `kubectl wait`.
+`status` surfaces `lastReplicated`, `nextScheduledAt`, and best-effort `lastReplicatedBytes`/`lastReplicatedBlobs`, plus standard `Ready`/`Reconciling`/`Stalled` conditions for `kubectl wait`.
 
 ## See also
 

@@ -233,7 +233,7 @@ You created a **Repository** (where), a **SnapshotPolicy** (what), invoked it wi
 
 /// tip | Wait for `Ready` (kstatus / GitOps)
 
-Every reconciled CRD exposes standard `metav1.Condition`s (`Ready`, plus `Reconciling`/`Stalled`) and `status.observedGeneration` (ADR-0005 §2), so Flux `wait`/`healthChecks`, Argo CD health, and plain `kubectl wait` work natively:
+Every reconciled CRD exposes standard `metav1.Condition`s (`Ready`, plus `Reconciling`/`Stalled`) and `status.observedGeneration`, so Flux `wait`/`healthChecks`, Argo CD health, and plain `kubectl wait` work natively:
 
 ```console
 $ kubectl -n demo wait --for=condition=Ready repository/primary --timeout=2m
