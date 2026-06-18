@@ -37,6 +37,11 @@ pub const DEFAULT_MOVER_IMAGE: &str = "ghcr.io/home-operations/kopiur-mover:v0.1
 
 /// Path inside the mover pod where the work-spec ConfigMap is mounted.
 pub const WORK_SPEC_MOUNT: &str = "/etc/kopiur";
+/// Path inside the deep-verify mover pod the scratch-restore writes into. Part of
+/// the controller↔mover contract: the work-spec `scratch_path`, the Job's scratch
+/// `VolumeMount`, and the mover's writability preflight + restore target all
+/// reference this single constant so they can never drift (centralize-config).
+pub const DEEP_SCRATCH_PATH: &str = "/scratch";
 /// File name of the work spec within the mount.
 pub const WORK_SPEC_FILE: &str = "work-spec.json";
 /// Env var the mover reads for the work-spec path. Sourced from the mover
@@ -277,6 +282,15 @@ pub struct MoverJobInputs<'a> {
     /// generic ephemeral volume, or a persistent PVC). Resolved from the
     /// repository's `cacheDefaults` overlaid by the run's `mover.cache` (ADR §3.1).
     pub cache_volume: CacheVolume,
+    /// Writable scratch volume for the deep-verify scratch-restore, mounted
+    /// read-write at [`DEEP_SCRATCH_PATH`]. `Some` only for deep-verify runs
+    /// (`None` for every other mover op). Resolved from `verification.deep`'s
+    /// `capacity`/`storageClassName`: `EmptyDir` when unsized, a sized generic
+    /// ephemeral volume (a fresh PVC, auto-GC'd with the pod) when `capacity` is
+    /// set. Never `Pvc` — scratch must be fresh each run and is discarded. The
+    /// non-root mover can write it via the pod's `fsGroup` (an emptyDir like the
+    /// kopia cache is already writable; a fresh PVC is group-chowned on mount).
+    pub scratch_volume: Option<CacheVolume>,
     /// Exec command for a container `readinessProbe` (e.g.
     /// `["/usr/local/bin/kopiur-mover", "ready"]` for a browse-session pod whose
     /// caller waits for the read-only connect before exec'ing into it). `None`
@@ -398,6 +412,23 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
         mount_path: kopiur_kopia::env::DEFAULT_CACHE_DIR.to_string(),
         ..Default::default()
     });
+
+    // Deep-verify scratch: a writable volume at DEEP_SCRATCH_PATH the scratch-restore
+    // writes into. Without it, kopia's `mkdir /scratch` under root-owned `/` is denied
+    // for the non-root mover. Same renderer as the kopia cache (exhaustive match on
+    // CacheVolume), so a new variant must be handled in one place before it compiles.
+    if let Some(scratch) = &inputs.scratch_volume {
+        volumes.push(Volume {
+            name: "scratch".to_string(),
+            ..cache_volume_source(scratch)
+        });
+        volume_mounts.push(VolumeMount {
+            name: "scratch".to_string(),
+            mount_path: DEEP_SCRATCH_PATH.to_string(),
+            read_only: Some(false),
+            ..Default::default()
+        });
+    }
 
     if let Some(src) = &inputs.source_volume {
         volumes.push(src.to_volume("source"));
@@ -785,6 +816,7 @@ mod tests {
             passthrough_env: Vec::new(),
             annotations: Default::default(),
             cache_volume: CacheVolume::EmptyDir,
+            scratch_volume: None,
             readiness_exec: None,
         }
     }
@@ -1183,6 +1215,112 @@ mod tests {
             get(kopiur_kopia::env::CONFIG_PATH_ENV),
             format!("{base}/repository.config")
         );
+    }
+
+    // --- regression (#deep-verify scratch): the deep-verify scratch-restore writes
+    // into DEEP_SCRATCH_PATH, but the controller mounted nothing there, so kopia's
+    // restore died with `mkdir /scratch: permission denied` (the non-root mover
+    // cannot create a dir under root-owned `/`). The Job must mount a *writable*
+    // volume at DEEP_SCRATCH_PATH whenever scratch_volume is set. ---
+    #[test]
+    fn job_without_scratch_volume_mounts_no_scratch() {
+        // Default inputs (every non-deep-verify run): no scratch volume/mount.
+        let ws = sample_work_spec();
+        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert!(
+            !pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "scratch"),
+            "no scratch volume unless scratch_volume is set"
+        );
+        assert!(
+            !pod.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.name == "scratch"),
+            "no scratch mount unless scratch_volume is set"
+        );
+    }
+
+    #[test]
+    fn job_mounts_writable_scratch_volume_at_deep_scratch_path() {
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.scratch_volume = Some(CacheVolume::EmptyDir);
+        let job = build_job(&i);
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        // An emptyDir scratch volume is present...
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "scratch")
+            .expect("scratch volume missing");
+        assert!(
+            vol.empty_dir.is_some(),
+            "default scratch must be an emptyDir"
+        );
+
+        // ...mounted READ-WRITE at the shared scratch-path constant (keyed on the
+        // const, not a literal, so the mount can never drift from the work-spec /
+        // mover restore target).
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scratch")
+            .expect("scratch mount missing");
+        assert_eq!(mount.mount_path, DEEP_SCRATCH_PATH);
+        assert_eq!(
+            mount.read_only,
+            Some(false),
+            "scratch must be writable — the whole point of the fix"
+        );
+    }
+
+    #[test]
+    fn job_scratch_ephemeral_carries_capacity_and_storage_class() {
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.scratch_volume = Some(CacheVolume::Ephemeral {
+            capacity: "50Gi".into(),
+            storage_class: Some("fast-ssd".into()),
+        });
+        let job = build_job(&i);
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "scratch")
+            .expect("scratch volume missing");
+        let spec = vol
+            .ephemeral
+            .as_ref()
+            .and_then(|e| e.volume_claim_template.as_ref())
+            .map(|t| &t.spec)
+            .expect("scratch must be a generic ephemeral volume when sized");
+        assert_eq!(
+            spec.access_modes.as_deref(),
+            Some(["ReadWriteOnce".to_string()].as_slice())
+        );
+        assert_eq!(spec.storage_class_name.as_deref(), Some("fast-ssd"));
+        let request = spec
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("storage"))
+            .expect("storage request missing");
+        assert_eq!(request.0, "50Gi");
     }
 
     #[test]

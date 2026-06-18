@@ -648,6 +648,7 @@ async fn spawn_maintenance_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations,
         cache_volume,
+        scratch_volume: None,
         readiness_exec: None,
     };
 

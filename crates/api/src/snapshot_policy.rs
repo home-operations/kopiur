@@ -388,10 +388,14 @@ pub struct DeepVerification {
     /// Cron + jitter for the deep restore-test (e.g. weekly).
     pub schedule: CronSpec,
     /// StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
+    /// Only applies when `capacity` is set (an `emptyDir` has no StorageClass).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
-    /// Size of the ephemeral scratch PVC (e.g. `10Gi`); absent uses a built-in
-    /// default. Should comfortably hold the restored snapshot.
+    /// Size of the ephemeral scratch PVC (e.g. `10Gi`). When set, the operator
+    /// mounts a fresh generic-ephemeral PVC of this size at the scratch path
+    /// (auto-deleted with the Job) — size it to comfortably hold the restored
+    /// snapshot. When absent, scratch falls back to a node-ephemeral `emptyDir`
+    /// (zero-config, but bounded by node disk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
 }

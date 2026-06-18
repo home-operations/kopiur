@@ -1501,6 +1501,7 @@ async fn run_restore_mover(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations: Default::default(),
         cache_volume,
+        scratch_volume: None,
         readiness_exec: None,
     };
     let cm = jobs::build_config_map(&inputs)?;

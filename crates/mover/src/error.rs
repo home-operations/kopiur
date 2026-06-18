@@ -238,6 +238,27 @@ pub enum MoverError {
         source_path: String,
     },
 
+    /// The deep-verify scratch path is not writable by the mover, so the
+    /// scratch-restore would fail with a cryptic kopia `mkdir` error. Caught by a
+    /// preflight probe before kopia runs (the non-root mover cannot create a dir
+    /// under root-owned `/` unless a writable volume is mounted at the path).
+    #[error(
+        "deep verify scratch path {} is not writable by the mover (uid {uid}): {source}. The \
+         controller must mount a writable volume there — set verification.deep.capacity (and \
+         optionally storageClassName) to provision a sized ephemeral PVC, or leave them unset \
+         for an emptyDir",
+        .path.display()
+    )]
+    ScratchNotWritable {
+        /// The scratch path that could not be written ([`crate::jobs::DEEP_SCRATCH_PATH`]).
+        path: PathBuf,
+        /// The mover's UID (for the message; the hardened non-root default unless overridden).
+        uid: i64,
+        /// The underlying IO error from the writability probe.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The user's verification `successExpr` evaluated to `false`.
     #[error("verification successExpr evaluated false: {expr:?}")]
     SuccessExprFalse {
@@ -334,6 +355,7 @@ impl MoverError {
             | MoverError::CredentialWrite { .. }
             | MoverError::ReadyMarkerWrite { .. }
             | MoverError::VerifyNoSnapshot { .. }
+            | MoverError::ScratchNotWritable { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
@@ -509,6 +531,25 @@ mod tests {
         );
         assert!(msg.contains("writable by the mover's UID"), "{msg}");
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+    }
+
+    #[test]
+    fn scratch_not_writable_names_the_path_uid_and_fix_and_is_non_retryable() {
+        let err = MoverError::ScratchNotWritable {
+            path: PathBuf::from("/scratch"),
+            uid: 65532,
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let msg = err.to_string();
+        // what: the path and the running uid
+        assert!(msg.contains("/scratch"), "{msg}");
+        assert!(msg.contains("uid 65532"), "{msg}");
+        // fix: the actionable knobs the user/operator sets
+        assert!(msg.contains("verification.deep.capacity"), "{msg}");
+        assert!(msg.contains("emptyDir"), "{msg}");
+        // an environmental/config problem: a blind re-run won't help
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+        assert!(!err.retry_recommended());
     }
 
     #[test]

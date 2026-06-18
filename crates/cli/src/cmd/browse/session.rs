@@ -399,6 +399,7 @@ async fn create_session_job(
         passthrough_env: Vec::new(),
         annotations: Default::default(),
         cache_volume: Default::default(),
+        scratch_volume: None,
         readiness_exec: Some(vec![SESSION_MOVER_BIN.to_string(), "ready".to_string()]),
     };
 
