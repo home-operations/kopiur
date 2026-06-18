@@ -104,10 +104,10 @@ pub fn poll_interval() -> Duration {
 
 /// Scrape the controller's `/metrics` through the API server's Service-proxy
 /// subresource (no port-forward / `ws` feature needed). The chart names the
-/// controller metrics Service `kopiur-controller-metrics` on port 8080.
+/// controller metrics Service `kopiur-controller-metrics` on port 8081.
 pub async fn scrape_controller_metrics(client: &Client) -> anyhow::Result<String> {
     let path = format!(
-        "/api/v1/namespaces/{E2E_NAMESPACE}/services/kopiur-controller-metrics:8080/proxy/metrics"
+        "/api/v1/namespaces/{E2E_NAMESPACE}/services/kopiur-controller-metrics:8081/proxy/metrics"
     );
     let req = http::Request::get(path).body(Vec::new())?;
     Ok(client.request_text(req).await?)

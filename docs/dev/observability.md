@@ -41,7 +41,7 @@ helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
 
 | Component  | Endpoint                                                | Notes                                   |
 | ---------- | ------------------------------------------------------- | --------------------------------------- |
-| Controller | `GET /metrics`, `/healthz`, `/readyz` on `:8080` (axum) | probes hit the real health routes       |
+| Controller | `GET /metrics`, `/healthz`, `/readyz` on `:8081` (axum) | probes hit the real health routes       |
 | Webhook    | `GET /metrics` on its TLS port (8443)                   | plus `/healthz`, `/readyz`              |
 | Mover      | none (short-lived Job)                                  | OTLP **push** only; flushed before exit |
 
