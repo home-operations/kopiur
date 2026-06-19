@@ -194,6 +194,20 @@ pub const RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION: &str = "RestoreSecurity
 pub const HOOKS_SUCCEEDED_CONDITION: &str = "HooksSucceeded";
 /// Event `action` (remediation hint) for an aborting hook failure.
 pub const FIX_HOOK_ACTION: &str = "FixHookOrSetContinueOnFailure";
+
+/// `SnapshotPolicy` warn-only condition: the deep-verify scratch `storageClassName`
+/// (set on `verification.deep` or inherited from `moverDefaults.scratch`) is a silent
+/// no-op because no effective `capacity` is set — an `emptyDir` has no StorageClass.
+/// `True` = ignored, `False` = honored (the default consistent state). Deep verify
+/// still runs (on an `emptyDir`), so this never blocks.
+pub const SCRATCH_STORAGE_CLASS_IGNORED_CONDITION: &str = "ScratchStorageClassIgnored";
+/// `reason`/Event reason for [`SCRATCH_STORAGE_CLASS_IGNORED_CONDITION`] = `True`.
+pub const SCRATCH_STORAGE_CLASS_IGNORED_REASON: &str = "StorageClassIgnored";
+/// `reason` for [`SCRATCH_STORAGE_CLASS_IGNORED_CONDITION`] = `False`.
+pub const SCRATCH_STORAGE_CLASS_HONORED_REASON: &str = "StorageClassHonored";
+/// Event `action` (remediation hint) for the scratch storage-class no-op: set a
+/// capacity so a sized PVC is provisioned.
+pub const SET_SCRATCH_CAPACITY_ACTION: &str = "SetScratchCapacity";
 /// `action` for a `PermissionDenied` failure: make the repository path/PVC
 /// writable by the operator's UID.
 pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";

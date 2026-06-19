@@ -303,6 +303,48 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         "Reconciled",
         "SnapshotPolicy reconciled; retention enforced",
     );
+    // Warn-only: surface a deep-verify scratch `storageClassName` that is a silent
+    // no-op (set with no effective `capacity` → an `emptyDir`, which has no
+    // StorageClass). Folded into the SAME status patch as set_ready (single writer,
+    // no two-writer flip-flop) and upserted in place so it self-clears (True→False)
+    // when a capacity is added. The Warning Event fires only on the flip to True, so
+    // a steady Ignored state doesn't re-publish every reconcile.
+    let conditions = match config
+        .spec
+        .verification
+        .as_ref()
+        .and_then(|v| crate::verification::scratch_storage_class_state(&repo, v))
+    {
+        Some(state) => {
+            let was_ignored = existing
+                .iter()
+                .find(|c| c.type_ == crate::consts::SCRATCH_STORAGE_CLASS_IGNORED_CONDITION)
+                .is_some_and(|c| c.status == "True");
+            if state.ignored && !was_ignored {
+                io::publish_warning_event(
+                    ctx,
+                    config,
+                    crate::consts::SCRATCH_STORAGE_CLASS_IGNORED_REASON,
+                    crate::consts::SET_SCRATCH_CAPACITY_ACTION,
+                    &state.message,
+                )
+                .await;
+            }
+            io::upsert_condition(
+                &conditions,
+                crate::consts::SCRATCH_STORAGE_CLASS_IGNORED_CONDITION,
+                state.ignored,
+                if state.ignored {
+                    crate::consts::SCRATCH_STORAGE_CLASS_IGNORED_REASON
+                } else {
+                    crate::consts::SCRATCH_STORAGE_CLASS_HONORED_REASON
+                },
+                &state.message,
+                generation,
+            )
+        }
+        None => conditions,
+    };
     let mut status = serde_json::json!({
         "observedGeneration": generation,
         "conditions": conditions,

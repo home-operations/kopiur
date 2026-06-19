@@ -1950,6 +1950,28 @@ spec:
                         description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                         type: object
                     type: object
+                  scratch:
+                    description: |-
+                      Defaults for the deep-verification scratch (restore-test) volume, inherited by
+                      `SnapshotPolicy.spec.verification.deep` unless overridden there. Always
+                      ephemeral (no `mode`, unlike [`MoverDefaults::cache`]); `storageClassName`
+                      applies only when a `capacity` is set.
+                    nullable: true
+                    properties:
+                      capacity:
+                        description: |-
+                          Size of the ephemeral scratch PVC (e.g. `100Gi`) — size it to comfortably hold
+                          the restored snapshot. When absent (here and on `verification.deep`), scratch
+                          falls back to a node-ephemeral `emptyDir`.
+                        nullable: true
+                        type: string
+                      storageClassName:
+                        description: |-
+                          StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
+                          Only applies when `capacity` is set.
+                        nullable: true
+                        type: string
+                    type: object
                   securityContext:
                     description: |-
                       Container security-context base for every mover, merged *under* the recipe's

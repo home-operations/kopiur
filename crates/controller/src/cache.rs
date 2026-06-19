@@ -5,7 +5,8 @@
 //! cache identically (ADR §3.1).
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kopiur_api::common::{CacheDefaults, CacheVolumeMode};
+use kopiur_api::common::{CacheDefaults, CacheVolumeMode, ScratchDefaults};
+use kopiur_api::snapshot_policy::DeepVerification;
 use kopiur_kopia::CacheTuning;
 
 use crate::error::Result;
@@ -23,6 +24,31 @@ pub fn effective_cache(
     CacheDefaults::merge(
         repo.mover_defaults.as_ref().and_then(|m| m.cache.as_ref()),
         mover_cache,
+    )
+}
+
+/// The deep-verify **scratch** volume's **effective** config: the repository's
+/// `moverDefaults.scratch` (inherited base) overlaid field-by-field by the recipe's
+/// `verification.deep.{storageClassName,capacity}` (override). `None` when neither
+/// sets anything. The scratch sibling of [`effective_cache`] — pure and synchronous
+/// (scratch is always ephemeral, so there is never a persistent PVC to provision).
+pub fn effective_scratch(
+    repo: &ResolvedRepository,
+    deep: &DeepVerification,
+) -> Option<ScratchDefaults> {
+    // Only treat the recipe as an override when it actually sets a field, so a bare
+    // `verification.deep` (schedule only) leaves the repo default untouched and
+    // "nothing anywhere" collapses to `None`.
+    let recipe =
+        (deep.storage_class_name.is_some() || deep.capacity.is_some()).then(|| ScratchDefaults {
+            storage_class_name: deep.storage_class_name.clone(),
+            capacity: deep.capacity.clone(),
+        });
+    ScratchDefaults::merge(
+        repo.mover_defaults
+            .as_ref()
+            .and_then(|m| m.scratch.as_ref()),
+        recipe.as_ref(),
     )
 }
 
@@ -141,5 +167,54 @@ mod tests {
     fn no_cache_anywhere_is_kopia_defaults() {
         let repo = repo_with(None);
         assert!(cache_tuning(effective_cache(&repo, None).as_ref()).is_unset());
+    }
+
+    fn repo_with_scratch(scratch: Option<ScratchDefaults>) -> ResolvedRepository {
+        let mut repo = repo_with(None);
+        repo.mover_defaults = scratch.map(|s| kopiur_api::common::MoverDefaults {
+            scratch: Some(s),
+            ..Default::default()
+        });
+        repo
+    }
+
+    fn deep(storage_class: Option<&str>, capacity: Option<&str>) -> DeepVerification {
+        DeepVerification {
+            schedule: kopiur_api::common::CronSpec {
+                cron: "0 5 * * 0".into(),
+                jitter: None,
+            },
+            storage_class_name: storage_class.map(str::to_string),
+            capacity: capacity.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn effective_scratch_overlays_recipe_over_repo_defaults() {
+        let repo = repo_with_scratch(Some(ScratchDefaults {
+            storage_class_name: Some("fast-ssd".into()),
+            capacity: Some("100Gi".into()),
+        }));
+
+        // Bare verification.deep → repo defaults flow through.
+        let eff = effective_scratch(&repo, &deep(None, None)).unwrap();
+        assert_eq!(eff.storage_class_name.as_deref(), Some("fast-ssd"));
+        assert_eq!(eff.capacity.as_deref(), Some("100Gi"));
+
+        // Recipe overrides capacity only → storageClass still inherited.
+        let eff = effective_scratch(&repo, &deep(None, Some("200Gi"))).unwrap();
+        assert_eq!(eff.storage_class_name.as_deref(), Some("fast-ssd")); // repo
+        assert_eq!(eff.capacity.as_deref(), Some("200Gi")); // recipe
+
+        // Recipe overrides storageClass only → capacity still inherited.
+        let eff = effective_scratch(&repo, &deep(Some("slow-hdd"), None)).unwrap();
+        assert_eq!(eff.storage_class_name.as_deref(), Some("slow-hdd")); // recipe
+        assert_eq!(eff.capacity.as_deref(), Some("100Gi")); // repo
+    }
+
+    #[test]
+    fn effective_scratch_is_none_when_nothing_set() {
+        let repo = repo_with_scratch(None);
+        assert_eq!(effective_scratch(&repo, &deep(None, None)), None);
     }
 }

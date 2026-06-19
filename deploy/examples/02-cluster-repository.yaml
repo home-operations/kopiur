@@ -71,6 +71,16 @@ spec:
   # way (this is a degradation signal, not an outage). See docs/maintenance.md.
   health:
     indexBlobWarnThreshold: 1000
+  # Repo-wide mover defaults inherited by every mover this repo spawns. Here we set
+  # the deep-verification SCRATCH volume's size/class once, centrally — every tenant
+  # SnapshotPolicy that enables `verification.deep` inherits it (and can override it
+  # field-wise on its own `verification.deep`). `scratch` is the verify sibling of
+  # `cache`; unlike the cache it is always ephemeral (no `mode`) and discarded after
+  # each run. `storageClassName` only applies when a `capacity` is set.
+  moverDefaults:
+    scratch:
+      capacity: 100Gi
+      storageClassName: fast-ssd
 ---
 # In the tenant namespace — no need to know the secret name or platform details.
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -88,6 +98,14 @@ spec:
         name: postgres-data
   retention:
     keepDaily: 14
+  # Enable a weekly deep restore-test. No scratch capacity/class here — both are
+  # inherited from the ClusterRepository's `moverDefaults.scratch` (100Gi/fast-ssd).
+  verification:
+    deep:
+      schedule:
+        cron: "0 5 * * 0"
+        jitter: 1h
+    successExpr: "stats.files > 0 && stats.errors == 0"
 # Identity resolves to billing-postgres-data@billing:/pvc/postgres-data.
 ---
 # A SECOND tenant, in a different namespace, points at the SAME ClusterRepository.
