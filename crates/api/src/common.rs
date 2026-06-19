@@ -1081,8 +1081,16 @@ pub struct PodSelector {
 /// contexts (webhook/[`crate::validate::validate_mover`]-enforced). The resolved context
 /// enters [`resolve_mover`] as the *recipe layer*, so the hardened base still applies.
 ///
+/// **Backward compatibility:** the pre-enum **legacy** wire shape — a bare `PodSelector` at
+/// the top level (`{ podSelector: …, container?: … }`, the old `Option<PodSelector>` field) —
+/// is still accepted on input and normalized to [`Self::WorkloadSelector`], so manifests
+/// written before the enum rename keep applying. Output is always canonical
+/// (`workloadSelector`/`pvcConsumer`). The hand-written `Deserialize`/`JsonSchema` below carry
+/// this: the generated CRD's structural schema must ALSO permit the legacy shape, because the
+/// apiserver validates it before the controller deserializes.
+///
 /// Not `Eq`: `WorkloadSelector` embeds [`PodSelector`] → `LabelSelector` (`PartialEq` only).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum InheritSecurityContextFrom {
     /// Match the workload pod(s) by an explicit label selector and inherit the chosen
@@ -1096,6 +1104,82 @@ pub enum InheritSecurityContextFrom {
     /// pod may not exist yet, exactly like a populator), so restore must use
     /// `workloadSelector`.
     PvcConsumer(PvcConsumerInherit),
+}
+
+impl<'de> Deserialize<'de> for InheritSecurityContextFrom {
+    /// Accept the canonical externally-tagged shapes (`{ workloadSelector: … }`,
+    /// `{ pvcConsumer: … }`) AND the **legacy** bare-`PodSelector` shape
+    /// (`{ podSelector: …, container?: … }`), normalizing the latter to `WorkloadSelector`.
+    /// Goes through `serde_json::Value` (the cluster's path — kube uses serde_json) so the
+    /// three shapes are distinguished unambiguously by their top-level key.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("inheritSecurityContextFrom must be an object"))?;
+        if let Some(ws) = obj.get("workloadSelector") {
+            return serde_json::from_value(ws.clone())
+                .map(Self::WorkloadSelector)
+                .map_err(D::Error::custom);
+        }
+        if let Some(pc) = obj.get("pvcConsumer") {
+            return serde_json::from_value(pc.clone())
+                .map(Self::PvcConsumer)
+                .map_err(D::Error::custom);
+        }
+        // Legacy: a bare PodSelector at the top level → WorkloadSelector.
+        if obj.contains_key("podSelector") {
+            return serde_json::from_value::<PodSelector>(value.clone())
+                .map(Self::WorkloadSelector)
+                .map_err(D::Error::custom);
+        }
+        Err(D::Error::custom(
+            "inheritSecurityContextFrom must set exactly one of: workloadSelector, pvcConsumer, \
+             or (legacy) podSelector",
+        ))
+    }
+}
+
+impl JsonSchema for InheritSecurityContextFrom {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "InheritSecurityContextFrom".into()
+    }
+
+    /// A `oneOf` of THREE branches — the two canonical variants plus the legacy bare
+    /// `PodSelector` — so the generated CRD's structural schema accepts legacy manifests
+    /// (the apiserver validates against this before the controller's [`Deserialize`] runs).
+    /// Mirrors the externally-tagged shape kube's structural-schema rewriter expects
+    /// (per-branch `properties` + `required`); a new variant must be reflected here.
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let pod_selector = generator.subschema_for::<PodSelector>();
+        let pvc_consumer = generator.subschema_for::<PvcConsumerInherit>();
+        let label_selector = generator.subschema_for::<LabelSelector>();
+        schemars::json_schema!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["workloadSelector"],
+                    "properties": { "workloadSelector": pod_selector },
+                },
+                {
+                    "type": "object",
+                    "required": ["pvcConsumer"],
+                    "properties": { "pvcConsumer": pvc_consumer },
+                },
+                {
+                    // Legacy bare PodSelector (the pre-enum shape).
+                    "type": "object",
+                    "required": ["podSelector"],
+                    "properties": {
+                        "podSelector": label_selector,
+                        "container": { "type": "string", "nullable": true },
+                    },
+                },
+            ],
+        })
+    }
 }
 
 /// Tuning for [`InheritSecurityContextFrom::PvcConsumer`]. A sub-object (not a bare flag)
@@ -1983,6 +2067,70 @@ mod tests {
             Some(InheritSecurityContextFrom::PvcConsumer(PvcConsumerInherit { container }))
                 if container.as_deref() == Some("app"),
         ));
+    }
+
+    #[test]
+    fn inherit_security_context_from_accepts_the_legacy_pod_selector_shape() {
+        // Backward compat: the pre-enum bare-PodSelector shape (`{ podSelector, container }`)
+        // must still deserialize, normalized to WorkloadSelector, so old manifests keep working.
+        let legacy: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              podSelector:
+                matchLabels:
+                  app: pg
+              container: postgres
+            "#,
+        );
+        match legacy.inherit_security_context_from {
+            Some(InheritSecurityContextFrom::WorkloadSelector(s)) => {
+                assert_eq!(s.container.as_deref(), Some("postgres"));
+                assert_eq!(
+                    s.pod_selector
+                        .match_labels
+                        .as_ref()
+                        .and_then(|m| m.get("app")),
+                    Some(&"pg".to_string())
+                );
+            }
+            other => panic!("legacy podSelector must normalize to WorkloadSelector, got {other:?}"),
+        }
+
+        // Legacy without a container is also fine.
+        let legacy_no_container: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              podSelector:
+                matchLabels:
+                  app: pg
+            "#,
+        );
+        assert!(matches!(
+            legacy_no_container.inherit_security_context_from,
+            Some(InheritSecurityContextFrom::WorkloadSelector(_))
+        ));
+    }
+
+    #[test]
+    fn inherit_security_context_from_always_serializes_canonical() {
+        // Whatever shape came in, output is always the canonical externally-tagged form —
+        // a legacy-deserialized value re-serializes as `workloadSelector`, never `podSelector`.
+        let legacy: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              podSelector: { matchLabels: { app: pg } }
+            "#,
+        );
+        let json = serde_json::to_value(&legacy).unwrap();
+        let inherit = &json["inheritSecurityContextFrom"];
+        assert!(
+            inherit.get("workloadSelector").is_some(),
+            "must serialize canonically as workloadSelector: {inherit}"
+        );
+        assert!(
+            inherit.get("podSelector").is_none(),
+            "must NOT emit the legacy top-level podSelector key: {inherit}"
+        );
     }
 
     // --- §12 mover Job TTL precedence (recipe over default over built-in) ---

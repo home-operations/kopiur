@@ -164,6 +164,12 @@ $ kubectl get pod app-7c9d8f5b6-h2k4p -n app --show-labels
 
 How it resolves: the controller lists pods matching the selector, prefers a **Running** one, picks the named container (or the pod's first), and copies **that container's `securityContext` and the pod's pod-level `securityContext`** onto the mover. If no pod matches, the selector is empty, the named container is absent, or the pod sets *neither* a container nor a pod-level `securityContext`, the Backup/Restore is held with an actionable `MissingDependency`-style condition telling you exactly what to fix. The matched workload must be **running** so its identity can be read.
 
+/// note | Legacy shape is still accepted
+
+Before the enum, `inheritSecurityContextFrom` was a bare selector — `{ podSelector: …, container?: … }` — with no `workloadSelector`/`pvcConsumer` key. That **legacy shape still applies**: Kopiur accepts it and treats it exactly like `workloadSelector`. You don't have to migrate existing manifests, though new ones should prefer the explicit form. (Objects are always *stored* in the canonical `workloadSelector` shape.)
+
+///
+
 Two constraints to remember:
 
 - **Mutually exclusive with both `securityContext` and `podSecurityContext`.** Because inherit copies both levels, combining it with either explicit context is rejected by the admission webhook.

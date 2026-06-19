@@ -705,15 +705,46 @@ spec:
                           - workloadSelector
                         - required:
                           - pvcConsumer
+                        - required:
+                          - podSelector
                         properties:
+                          container:
+                            nullable: true
+                            type: string
+                          podSelector:
+                            description: A label selector is a label query over a set of resources. The result of matchLabels and matchExpressions are ANDed. An empty label selector matches all objects. A null label selector matches no objects.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
                           pvcConsumer:
                             description: |-
-                              **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
-                              backs up: the operator finds the pod(s) mounting the source claim and inherits
-                              their securityContext, so the mover's UID/GID matches the workload *by
-                              construction* — no hand-written selector. Meaningless on a restore (the consuming
-                              pod may not exist yet, exactly like a populator), so restore must use
-                              `workloadSelector`.
+                              Tuning for [`InheritSecurityContextFrom::PvcConsumer`]. A sub-object (not a bare flag)
+                              so future knobs slot in without an API break (ADR §4.11).
                             properties:
                               container:
                                 description: |-
@@ -724,9 +755,9 @@ spec:
                             type: object
                           workloadSelector:
                             description: |-
-                              Match the workload pod(s) by an explicit label selector and inherit the chosen
-                              container's `securityContext` plus the pod's `spec.securityContext`. Works for
-                              both backup and restore (restore inherits from the pod that will *read* the data).
+                              Selects workload pods by label. Reuses k8s-openapi `LabelSelector`. ADR §3.3 hooks.
+
+                              Not `Eq`: `LabelSelector` only implements `PartialEq`.
                             properties:
                               container:
                                 description: Which container within the matched pod; absent uses the first/only container.
