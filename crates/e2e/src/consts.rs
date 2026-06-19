@@ -55,6 +55,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "nsdel-orphan",
     "nsdel-delete",
     "pin",
+    "pinrestore",
     "populator",
     "populator2",
     "readonly",
