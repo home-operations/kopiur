@@ -62,6 +62,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "kstatus",
     "verify",
     "vfydeep",
+    "vfyinh",
     "repl-src",
     "repl-dst",
     "projgate",
