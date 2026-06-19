@@ -234,7 +234,15 @@ async fn handle_snapshot_policy(
         }
     }
 
-    Ok(resp)
+    // Best-effort, non-blocking securityContext-compatibility warning (the earliest surface).
+    let warnings = crate::secctx::backup_warnings(
+        client,
+        req.namespace.as_deref(),
+        spec.mover.as_ref(),
+        &spec.sources,
+    )
+    .await;
+    Ok(with_warnings(resp, warnings))
 }
 
 // --- Snapshot -----------------------------------------------------------------
@@ -360,7 +368,20 @@ async fn handle_restore(
         return Err(denial.into());
     }
 
-    Ok(resp)
+    // Best-effort, non-blocking restore-direction securityContext warning.
+    let target_pvc = match &spec.target {
+        api::restore::RestoreTarget::PvcRef(r) => Some(r.name.as_str()),
+        api::restore::RestoreTarget::Pvc(t) => Some(t.name.as_str()),
+        api::restore::RestoreTarget::Populator(_) => None,
+    };
+    let warnings = crate::secctx::restore_warnings(
+        client,
+        req.namespace.as_deref(),
+        spec.mover.as_ref(),
+        target_pvc,
+    )
+    .await;
+    Ok(with_warnings(resp, warnings))
 }
 
 // --- Maintenance ------------------------------------------------------------

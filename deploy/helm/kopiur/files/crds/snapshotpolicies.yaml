@@ -10530,45 +10530,77 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: 'Opt-in: copy security context from a live workload pod. ADR §4.11.'
+                    description: |-
+                      Opt-in: copy security context from a live workload pod instead of setting an
+                      explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
+                      Either name the workload by label (`workloadSelector`) or, on a **backup**
+                      source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
                     nullable: true
+                    oneOf:
+                    - required:
+                      - workloadSelector
+                    - required:
+                      - pvcConsumer
                     properties:
-                      container:
-                        description: Which container within the matched pod; absent uses the first/only container.
-                        nullable: true
-                        type: string
-                      podSelector:
-                        description: Label selector matching the workload pod(s) to read context/hooks from.
+                      pvcConsumer:
+                        description: |-
+                          **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
+                          backs up: the operator finds the pod(s) mounting the source claim and inherits
+                          their securityContext, so the mover's UID/GID matches the workload *by
+                          construction* — no hand-written selector. Meaningless on a restore (the consuming
+                          pod may not exist yet, exactly like a populator), so restore must use
+                          `workloadSelector`.
                         properties:
-                          matchExpressions:
-                            description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
-                            items:
-                              description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
-                              properties:
-                                key:
-                                  description: key is the label key that the selector applies to.
-                                  type: string
-                                operator:
-                                  description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
-                                  type: string
-                                values:
-                                  description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
-                                  items:
-                                    type: string
-                                  type: array
-                              required:
-                              - key
-                              - operator
-                              type: object
-                            type: array
-                          matchLabels:
-                            additionalProperties:
-                              type: string
-                            description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
-                            type: object
+                          container:
+                            description: |-
+                              Which container within the matched consumer pod to inherit from; absent uses the
+                              first/only container (same semantics as [`PodSelector::container`]).
+                            nullable: true
+                            type: string
                         type: object
-                    required:
-                    - podSelector
+                      workloadSelector:
+                        description: |-
+                          Match the workload pod(s) by an explicit label selector and inherit the chosen
+                          container's `securityContext` plus the pod's `spec.securityContext`. Works for
+                          both backup and restore (restore inherits from the pod that will *read* the data).
+                        properties:
+                          container:
+                            description: Which container within the matched pod; absent uses the first/only container.
+                            nullable: true
+                            type: string
+                          podSelector:
+                            description: Label selector matching the workload pod(s) to read context/hooks from.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                        required:
+                        - podSelector
+                        type: object
                     type: object
                   podSecurityContext:
                     description: |-

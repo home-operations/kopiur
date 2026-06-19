@@ -150,6 +150,27 @@ pub fn upsert_condition(
     observed_generation: Option<i64>,
 ) -> Vec<Condition> {
     let status_str = if status { "True" } else { "False" };
+    upsert_condition_status(
+        existing,
+        type_,
+        status_str,
+        reason,
+        message,
+        observed_generation,
+    )
+}
+
+/// Tri-state [`upsert_condition`]: takes the condition `status` string directly so a
+/// condition can be `"Unknown"` (the kstatus convention for "we can't tell yet"), not just
+/// `"True"`/`"False"`. Same order-stable, transition-time-preserving semantics.
+pub fn upsert_condition_status(
+    existing: &[Condition],
+    type_: &str,
+    status_str: &str,
+    reason: &str,
+    message: &str,
+    observed_generation: Option<i64>,
+) -> Vec<Condition> {
     let prior = existing.iter().find(|c| c.type_ == type_);
     let last_transition_time = match prior {
         Some(c) if c.status == status_str => c.last_transition_time.clone(),

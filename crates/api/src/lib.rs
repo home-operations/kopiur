@@ -24,6 +24,7 @@ pub mod identity;
 pub mod invariants;
 pub mod jitter;
 pub mod retention;
+pub mod secctx_compat;
 pub mod success_expr;
 pub mod validate;
 
@@ -33,10 +34,11 @@ pub use cluster_repository::{
     ClusterRepositoryStatus, IdentityDefaults,
 };
 pub use common::{
-    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, MoverDefaults, NamespaceDeletePolicy,
-    ObjectRef, PhaseLabel, PolicyRef, ResolvedMover, SourceColocation, SourceColocationMode,
-    hardened_security_context, merge_pod_security_context, merge_resources, merge_security_context,
-    resolve_mover,
+    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, InheritSecurityContextFrom,
+    MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel, PodSelector, PolicyRef,
+    PvcConsumerInherit, ResolvedMover, SourceColocation, SourceColocationMode,
+    effective_run_as_user, hardened_security_context, merge_pod_security_context, merge_resources,
+    merge_security_context, resolve_mover,
 };
 pub use maintenance::{
     LeaseAction, Maintenance, MaintenanceSchedule, MaintenanceSpec, MaintenanceStatus,

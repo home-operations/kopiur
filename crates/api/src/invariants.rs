@@ -59,9 +59,9 @@ fn root_uid_excludes_run_as_non_root(
     mut sc: SecurityContext,
     psc: Option<PodSecurityContext>,
 ) -> (SecurityContext, Option<PodSecurityContext>) {
-    let effective_run_as_user = sc
-        .run_as_user
-        .or_else(|| psc.as_ref().and_then(|p| p.run_as_user));
+    // Effective UID follows kubelet precedence (`container.runAsUser ?? pod.runAsUser`);
+    // share the single definition with `secctx_compat` so the two never fork.
+    let effective_run_as_user = crate::common::effective_run_as_user(Some(&sc), psc.as_ref());
     if effective_run_as_user != Some(0) {
         return (sc, psc);
     }

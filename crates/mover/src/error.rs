@@ -259,6 +259,37 @@ pub enum MoverError {
         source: std::io::Error,
     },
 
+    /// The backup source PVC is **wholly unreadable** by the mover: a readability preflight
+    /// sampled the mounted source tree as the mover's own UID and could read none of it. The
+    /// workload wrote the data as a different UID/GID; without matching it the backup would be
+    /// a *silently incomplete* snapshot (kopia skips unreadable files and can still
+    /// "succeed"). Caught before `snapshot create` so the failure is explicit and actionable.
+    #[error(
+        "backup source at {} is not readable by the mover (uid {mover_uid}): sampled {sampled} \
+         entries, none readable (e.g. {sample_path} owned by uid {owner_uid}:{owner_gid} mode \
+         {owner_mode:o}). The workload wrote this data as a different UID/GID — match the mover \
+         to it via mover.inheritSecurityContextFrom.pvcConsumer, or set \
+         mover.securityContext.runAsUser to the workload's UID. Refusing to take a \
+         silently-incomplete backup",
+        .path.display()
+    )]
+    SourceUnreadable {
+        /// The mounted source path that could not be read.
+        path: PathBuf,
+        /// The mover's effective UID (for the message).
+        mover_uid: u32,
+        /// How many entries were sampled (all unreadable).
+        sampled: usize,
+        /// A representative unreadable entry's path.
+        sample_path: String,
+        /// That entry's owner UID.
+        owner_uid: u32,
+        /// That entry's owner GID.
+        owner_gid: u32,
+        /// That entry's permission bits.
+        owner_mode: u32,
+    },
+
     /// The user's verification `successExpr` evaluated to `false`.
     #[error("verification successExpr evaluated false: {expr:?}")]
     SuccessExprFalse {
@@ -345,6 +376,10 @@ impl MoverError {
         match self {
             MoverError::Kopia { source, .. } => source.class(),
             MoverError::BootstrapFailed { class, .. } => *class,
+            // A source the mover can't read is exactly the runtime `PermissionDenied` the
+            // preflight pre-empts — classify it identically (non-retryable; needs a UID/GID
+            // fix, not a re-run).
+            MoverError::SourceUnreadable { .. } => KopiaErrorClass::PermissionDenied,
             MoverError::WorkSpecPathMissing
             | MoverError::WorkSpecRead { .. }
             | MoverError::WorkSpecParse { .. }
@@ -549,6 +584,30 @@ mod tests {
         assert!(msg.contains("emptyDir"), "{msg}");
         // an environmental/config problem: a blind re-run won't help
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+        assert!(!err.retry_recommended());
+    }
+
+    #[test]
+    fn source_unreadable_names_uids_and_the_fix_and_is_permission_denied() {
+        let err = MoverError::SourceUnreadable {
+            path: PathBuf::from("/pvc"),
+            mover_uid: 65532,
+            sampled: 1000,
+            sample_path: "/pvc/data/pg.conf".into(),
+            owner_uid: 999,
+            owner_gid: 999,
+            owner_mode: 0o600,
+        };
+        let msg = err.to_string();
+        // what: the path, the mover uid, the owner uid:gid
+        assert!(msg.contains("/pvc"), "{msg}");
+        assert!(msg.contains("uid 65532"), "{msg}");
+        assert!(msg.contains("999:999"), "{msg}");
+        // fix: the actionable remedies
+        assert!(msg.contains("pvcConsumer"), "{msg}");
+        assert!(msg.contains("runAsUser"), "{msg}");
+        // classified like the runtime EACCES it pre-empts: non-retryable.
+        assert_eq!(err.kopia_class(), KopiaErrorClass::PermissionDenied);
         assert!(!err.retry_recommended());
     }
 

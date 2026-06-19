@@ -84,6 +84,7 @@ spec:
     keepWeekly: 4
   mover:
     inheritSecurityContextFrom:
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: my-app
+      workloadSelector:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: my-app

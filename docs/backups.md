@@ -301,8 +301,9 @@ mover:
         fsGroup: 1000 # make a fresh restore volume writable by an unprivileged mover
         fsGroupChangePolicy: OnRootMismatch
     # inheritSecurityContextFrom:   # ...OR copy the securityContext from a live pod
-    #   podSelector: { matchLabels: { app: postgres } }
-    #   container: postgres          # optional; defaults to the pod's first container
+    #   pvcConsumer: {}              # backup: auto-derive from the pod mounting the source PVC
+    #   # ...or name it explicitly:
+    #   # workloadSelector: { podSelector: { matchLabels: { app: postgres } }, container: postgres }
     cache: # kopia cache for this recipe (overrides the repository's moverDefaults.cache)
         capacity: 16Gi # size of the cache volume
         storageClassName: fast-ssd # cache volume's StorageClass (omit = cluster default)

@@ -288,6 +288,23 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}
     }
+    // `pvcConsumer` derives the workload from a *backup source* PVC; a restore has no such
+    // source (it writes a target whose consumer may not exist yet), so it is backup-only.
+    if let Some(m) = &spec.mover
+        && matches!(
+            m.inherit_security_context_from,
+            Some(crate::common::InheritSecurityContextFrom::PvcConsumer(_))
+        )
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "restore.mover.inheritSecurityContextFrom.pvcConsumer".to_string(),
+            reason: "is only valid for a backup source — a restore has no source PVC to derive a \
+                     workload from (the pod that will consume the restored PVC may not exist yet). \
+                     Use inheritSecurityContextFrom.workloadSelector, or an explicit \
+                     mover.securityContext, instead"
+                .to_string(),
+        });
+    }
     if let Some(m) = &spec.mover {
         validate_mover(m, "Restore mover")?;
     }
@@ -2293,15 +2310,15 @@ mod tests {
     #[test]
     fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         use crate::common::ObjectRef;
-        use crate::common::{MoverSpec, PodSelector};
+        use crate::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
         use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 
         let inherit = || {
-            Some(PodSelector {
+            Some(InheritSecurityContextFrom::WorkloadSelector(PodSelector {
                 pod_selector: LabelSelector::default(),
                 container: None,
-            })
+            }))
         };
 
         // inherit + container securityContext → rejected.

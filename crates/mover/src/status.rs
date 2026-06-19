@@ -138,6 +138,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::ReadyMarkerWrite { .. }
             | MoverError::VerifyNoSnapshot { .. }
             | MoverError::ScratchNotWritable { .. }
+            | MoverError::SourceUnreadable { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }

@@ -40,9 +40,9 @@ use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
     HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
-    STAGING_WAITING_REASON,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SOURCE_STAGED_CONDITION,
+    SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -879,10 +879,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `inheritSecurityContextFrom`. Both the privileged-mover gate and the Job use it,
     // so an inherited root context is gated exactly like an explicit one.
     // The effective container + pod security contexts — explicit, or both inherited
-    // from a workload pod via `inheritSecurityContextFrom`.
-    let (effective_sc, effective_pod_sc) =
-        io::resolve_mover_security_contexts(&ctx.client, &namespace, config.spec.mover.as_ref())
-            .await?;
+    // from a workload pod via `inheritSecurityContextFrom`. The backup source PVC (if any)
+    // powers the `pvcConsumer` auto-derive mode.
+    let source_pvc = source_volume.as_ref().and_then(|v| match &v.source {
+        jobs::MountSource::Pvc { claim_name } => Some(claim_name.as_str()),
+        jobs::MountSource::Nfs { .. } => None,
+    });
+    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+        &ctx.client,
+        &namespace,
+        config.spec.mover.as_ref(),
+        source_pvc,
+    )
+    .await?;
     let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
@@ -988,6 +997,26 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             backup.meta().generation,
         );
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
+    }
+
+    // SecurityContext-compatibility heuristic (warn-only): can the mover's resolved
+    // identity read the source PVC's files? This runs on the backup-launch path (so it is
+    // naturally gated to a real run, not every reconcile) against the post-invariant
+    // resolved contexts. A `False` (near-certain mismatch) sets the
+    // `SecurityContextCompatible` condition + a once-per-transition advisory Event; the
+    // mover's runtime readability preflight is the authoritative check. Never fatal.
+    if let Some(claim) = source_pvc {
+        assess_backup_security_context(
+            ctx,
+            &api,
+            &name,
+            &namespace,
+            backup,
+            claim,
+            &resolved_mover.security_context,
+            resolved_mover.pod_security_context.as_ref(),
+        )
+        .await;
     }
 
     let owner = io::owner_ref_for(backup, "Snapshot")?;
@@ -2146,6 +2175,94 @@ async fn resolve_recipe(
     // exhaustively in the resolver (ADR §5.5).
     let repo = io::resolve_repository_ref(&ctx.client, &config.spec.repository, cfg_ns).await?;
     Ok((config, repo))
+}
+
+/// Best-effort securityContext-compatibility assessment for a backup source PVC. Lists the
+/// workload pods mounting `claim` (excluding kopiur movers), compares their identity to the
+/// mover's resolved one, and records the `SecurityContextCompatible` condition (+ a
+/// once-per-transition advisory Event on a near-certain mismatch). Never returns an error —
+/// the mover's runtime preflight is the authoritative readability check; this is a hint.
+#[allow(clippy::too_many_arguments)]
+async fn assess_backup_security_context(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    name: &str,
+    namespace: &str,
+    backup: &Snapshot,
+    claim: &str,
+    sc: &k8s_openapi::api::core::v1::SecurityContext,
+    psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
+) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+
+    let pods = match Api::<Pod>::namespaced(ctx.client.clone(), namespace)
+        .list(&ListParams::default())
+        .await
+    {
+        Ok(list) => list.items,
+        // Best-effort: a transient list failure must never derail the backup.
+        Err(e) => {
+            tracing::debug!(error = %e, %namespace, "securityContext compat: pod list failed; skipping");
+            return;
+        }
+    };
+    // Exclude kopiur mover pods (they mount the source PVC too — never assess against them).
+    let workloads: Vec<Pod> = pods
+        .into_iter()
+        .filter(|p| {
+            p.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(kopiur_api::consts::MANAGED_BY_LABEL))
+                .map(|v| v != kopiur_api::consts::MANAGED_BY_VALUE)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let mover = crate::secctx::mover_read_identity(sc, psc);
+    let identities = crate::secctx::workload_identities(&workloads, claim);
+    let verdict = kopiur_api::secctx_compat::assess_read_compat(&mover, &identities);
+    let decision = crate::secctx::backup_verdict(mover.uid, &verdict);
+
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = io::upsert_condition_status(
+        &existing,
+        SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+        decision.status,
+        decision.reason,
+        &decision.message,
+        backup.meta().generation,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    match io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        // Emit the advisory Event only on a real transition into the warn state.
+        Ok(true) if decision.warn => {
+            io::publish_warning_event(
+                ctx,
+                backup,
+                decision.reason,
+                crate::secctx::CompatVerdict::ACTION,
+                &decision.message,
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "securityContext compat: condition patch failed");
+        }
+    }
 }
 
 /// Build everything a backup run needs: the work spec, the source volume mount

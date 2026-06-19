@@ -268,7 +268,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` / `<mover-pod>` names
 | -------------------------------- | ----------------------------------------------------------------------------------- |
 | Default mover UID                | `65532` (distroless `nonroot`), `runAsNonRoot: true`; pod `fsGroup: 65532` so the kopia cache is writable on PVC-backed storage |
 | Set the mover UID/GID            | `SnapshotPolicy.spec.mover.securityContext.runAsUser` / `runAsGroup` (same on `Restore.spec.mover` / `Maintenance.spec.mover`) |
-| Inherit UID/GID from a workload  | `spec.mover.inheritSecurityContextFrom.podSelector` (mutually exclusive with `securityContext`) — see [Security context](security-context.md#2-inherit-it-from-the-workload) |
+| Inherit UID/GID from a workload  | `spec.mover.inheritSecurityContextFrom` — `pvcConsumer: {}` (backup: auto-derive from the PVC's consumer) or `workloadSelector` (by label; required on a Restore). Mutually exclusive with `securityContext` — see [Security context](security-context.md#2-inherit-it-from-the-workload) |
 | Mover cache size / warm cache    | `spec.mover.cache` (`capacity`, `storageClassName`, `mode: Ephemeral`/`Persistent`, `content`/`metadataCacheSizeMb`); inherits `Repository.spec.moverDefaults.cache` |
 | `fsGroup`                        | `spec.mover.podSecurityContext.fsGroup` — **defaults to `65532`** (keeps the cache writable); override to make a fresh restore volume writable by a mover running as a different UID |
 | Root / preserve-ownership        | `runAsUser: 0` + `privilegedMode: true` (needs the namespace opt-in)                |

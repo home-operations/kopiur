@@ -30,7 +30,7 @@ use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -1216,9 +1216,15 @@ async fn run_restore_mover(
     // and the Job use it, so an inherited root context is gated like an explicit one.
     // The effective container + pod security contexts — explicit, or both inherited
     // from a workload pod via `inheritSecurityContextFrom`.
-    let (effective_sc, effective_pod_sc) =
-        io::resolve_mover_security_contexts(&ctx.client, namespace, restore.spec.mover.as_ref())
-            .await?;
+    // Restore has no backup *source* PVC; `pvcConsumer` is backup-only (validator-rejected
+    // for restore), so pass None.
+    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+        &ctx.client,
+        namespace,
+        restore.spec.mover.as_ref(),
+        None,
+    )
+    .await?;
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
@@ -1306,6 +1312,22 @@ async fn run_restore_mover(
         );
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
     }
+
+    // Restore-direction securityContext heuristic (warn-only): will the FUTURE consumer of
+    // the target PVC be able to read what the mover writes? fsGroup IS load-bearing here
+    // (fresh read-write volume). Static/advisory — the consumer often doesn't exist yet, and
+    // there is no runtime layer for restore. Never fatal.
+    assess_restore_security_context(
+        ctx,
+        api,
+        name,
+        namespace,
+        restore,
+        target_pvc,
+        &resolved_mover.security_context,
+        resolved_mover.pod_security_context.as_ref(),
+    )
+    .await;
 
     let owner = io::owner_ref_for(restore, "Restore")?;
     let repo_ref = restore.spec.repository.as_ref();
@@ -1521,6 +1543,92 @@ struct ResolvedSource {
     kopia_snapshot_id: String,
     snapshot_ref: Option<kopiur_api::common::ObjectRef>,
     identity: Option<kopiur_api::common::ResolvedIdentity>,
+}
+
+/// Best-effort restore-direction securityContext assessment. Looks for a pod already
+/// consuming the target PVC `claim` (the future workload, when it exists), compares its
+/// identity to the mover's *write* identity, and records the
+/// `RestoreSecurityContextCompatible` condition (+ a once-per-transition advisory Event on a
+/// near-certain mismatch). Static/advisory: most restores have no consumer yet
+/// (`ConsumerAbsent` → `Unknown`). Never returns an error.
+#[allow(clippy::too_many_arguments)]
+async fn assess_restore_security_context(
+    ctx: &Context,
+    api: &Api<Restore>,
+    name: &str,
+    namespace: &str,
+    restore: &Restore,
+    claim: &str,
+    sc: &k8s_openapi::api::core::v1::SecurityContext,
+    psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
+) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+
+    let pods = match Api::<Pod>::namespaced(ctx.client.clone(), namespace)
+        .list(&ListParams::default())
+        .await
+    {
+        Ok(list) => list.items,
+        Err(e) => {
+            tracing::debug!(error = %e, %namespace, "restore securityContext compat: pod list failed; skipping");
+            return;
+        }
+    };
+    // The future consumer: a non-kopiur pod already mounting the target PVC (often none).
+    let consumer = kopiur_api::secctx_compat::pods_mounting_pvc(&pods, claim)
+        .into_iter()
+        .find(|p| {
+            p.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(kopiur_api::consts::MANAGED_BY_LABEL))
+                .map(|v| v != kopiur_api::consts::MANAGED_BY_VALUE)
+                .unwrap_or(true)
+        })
+        .map(kopiur_api::secctx_compat::workload_identity);
+
+    let mover = kopiur_api::secctx_compat::mover_write_identity(sc, psc);
+    let verdict = kopiur_api::secctx_compat::assess_restore_compat(&mover, consumer.as_ref());
+    let decision = crate::secctx::restore_verdict(&verdict);
+
+    let existing = restore
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = io::upsert_condition_status(
+        &existing,
+        RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+        decision.status,
+        decision.reason,
+        &decision.message,
+        restore.metadata.generation,
+    );
+    let current = serde_json::to_value(&restore.status).ok();
+    match io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        Ok(true) if decision.warn => {
+            io::publish_warning_event(
+                ctx,
+                restore,
+                decision.reason,
+                crate::secctx::CompatVerdict::ACTION,
+                &decision.message,
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "restore securityContext compat: condition patch failed");
+        }
+    }
 }
 
 /// Create the `target.pvc` PVC if it doesn't exist (idempotent). Deliberately

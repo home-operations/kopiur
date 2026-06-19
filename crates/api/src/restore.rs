@@ -576,7 +576,7 @@ policy: { onMissingSnapshot: Continue }
     fn restore_populator_rejects_inherit_security_context() {
         // ADR-0005 §9: inheritSecurityContextFrom is meaningless with a populator
         // target (no workload pod exists at provision time) — the validator rejects it.
-        use crate::common::{MoverSpec, PodSelector};
+        use crate::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
         use crate::validate::validate_restore;
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
         let spec = RestoreSpec {
@@ -592,10 +592,12 @@ policy: { onMissingSnapshot: Continue }
             policy: None,
             credential_projection: None,
             mover: Some(MoverSpec {
-                inherit_security_context_from: Some(PodSelector {
-                    pod_selector: LabelSelector::default(),
-                    container: None,
-                }),
+                inherit_security_context_from: Some(InheritSecurityContextFrom::WorkloadSelector(
+                    PodSelector {
+                        pod_selector: LabelSelector::default(),
+                        container: None,
+                    },
+                )),
                 ..Default::default()
             }),
             failure_policy: None,

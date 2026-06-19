@@ -157,15 +157,14 @@ spec:
     keepDaily: 7
     keepWeekly: 4
   # ── Inherit the mover's UID/GID from the live workload ────────────────────────
-  # Copies the securityContext (container UID/GID + pod fsGroup) from the `app`
-  # Deployment's pod onto the mover. Mutually exclusive with `securityContext` —
-  # setting both is webhook-rejected. The selected pod must be Running.
+  # `pvcConsumer: {}` auto-derives the pod that mounts the source PVC (`app-data`)
+  # and copies its securityContext (container UID/GID + pod fsGroup) onto the mover —
+  # no selector to maintain. Mutually exclusive with `securityContext`; the consuming
+  # pod must be Running. (To name the workload explicitly instead, use
+  # `workloadSelector: { podSelector: {...}, container: app }`.)
   mover:
     inheritSecurityContextFrom:
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: app
-      container: app # optional; defaults to the pod's first container
+      pvcConsumer: {}
 # --8<-- [end:policy]
 ---
 # --8<-- [start:snapshot]

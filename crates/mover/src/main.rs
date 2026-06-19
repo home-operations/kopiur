@@ -29,6 +29,7 @@ use kopiur_mover::bootstrap::{
 use kopiur_mover::credentials;
 use kopiur_mover::env::{KOPIA_BINARY, RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
+use kopiur_mover::preflight;
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::StatusUpdate;
 use kopiur_mover::workspec::{
@@ -371,6 +372,12 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
                         .map_err(kopia(KopiaOp::PolicySet))?;
                 }
             }
+            // Readability preflight — the ONE place a backup's permission compatibility can
+            // be *certainly* checked: we run as the resolved UID with the source mounted, so
+            // we just try to read it. A wholly-unreadable source would otherwise become a
+            // silently-incomplete snapshot; fail fast with the actionable fix instead. A
+            // partially-readable tree only warns (kopia records the skipped files).
+            preflight_source_readable(&op.source_path)?;
             let result = client
                 .snapshot_create(&op.source_path, &op.tags, Some(&override_source))
                 .await
@@ -863,6 +870,44 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     let probe = std::path::Path::new(path).join(".kopiur-writable");
     std::fs::write(&probe, b"")?;
     std::fs::remove_file(&probe)
+}
+
+/// Preflight a backup source for readability by the mover's own UID. A *wholly* unreadable
+/// source is refused with an actionable [`MoverError::SourceUnreadable`] (would otherwise be a
+/// silently-incomplete snapshot); a partially-readable one only logs a warning (kopia records
+/// the skipped files). Best-effort — an empty/short sample yields no verdict and proceeds.
+fn preflight_source_readable(source_path: &str) -> Result<()> {
+    let report =
+        preflight::sample_readability(std::path::Path::new(source_path), preflight::SAMPLE_LIMIT);
+    if report.is_clearly_unreadable() {
+        let (owner_uid, owner_gid, owner_mode) = report.sample_owner.unwrap_or((0, 0, 0));
+        let err = MoverError::SourceUnreadable {
+            path: PathBuf::from(source_path),
+            mover_uid: preflight::current_euid()
+                .unwrap_or(kopiur_api::common::MOVER_NONROOT_ID as u32),
+            sampled: report.sampled,
+            sample_path: report
+                .sample_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| source_path.to_string()),
+            owner_uid,
+            owner_gid,
+            owner_mode,
+        };
+        error!(class = %err.kopia_class(), "backup source not readable by the mover");
+        return Err(err);
+    }
+    if report.has_unreadable() {
+        warn!(
+            sampled = report.sampled,
+            unreadable = report.unreadable,
+            "some backup source files are not readable by the mover and will be SKIPPED — the \
+             snapshot will be incomplete; match the mover to the workload via \
+             mover.inheritSecurityContextFrom.pvcConsumer or a matching runAsUser to capture them"
+        );
+    }
+    Ok(())
 }
 
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot

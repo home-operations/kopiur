@@ -120,21 +120,37 @@ Full, apply-ready example:
 
 ### 2. Inherit it from the workload
 
-If you'd rather "run as **whatever the app runs as**" than track a UID, `inheritSecurityContextFrom` copies the security context from a live workload pod onto the mover — **both** the container `securityContext` (UID/GID) **and** the pod-level `securityContext` (e.g. `fsGroup`). This is the answer to *"back up / restore as the pod that mounts this PVC,"* at both levels.
+If you'd rather "run as **whatever the app runs as**" than track a UID, `inheritSecurityContextFrom` copies the security context from a live workload pod onto the mover — **both** the container `securityContext` (UID/GID) **and** the pod-level `securityContext` (e.g. `fsGroup`). This is the answer to *"back up / restore as the pod that mounts this PVC,"* at both levels. It is an **externally-tagged choice** — pick exactly one form:
+
+#### `pvcConsumer` — auto-derive from the source PVC (backup, recommended)
+
+On a **backup**, Kopiur can find the pod that mounts the source PVC for you and inherit its security context — no selector to write or keep in sync. The mover matches the workload **by construction**:
 
 ```yaml
 spec:
   mover:
     inheritSecurityContextFrom:
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: app # the workload that owns the PVC
-      container: app # optional; defaults to the pod's first container
+      pvcConsumer: {} # optionally: pvcConsumer: { container: app }
 ```
 
-/// note | You select the workload by label — Kubernetes can't look it up from the PVC
+The controller lists pods in the source namespace, finds the one mounting this snapshot's source PVC (excluding Kopiur's own mover pods), prefers a **Running** one, and copies its container + pod `securityContext` onto the mover. If no workload pod currently mounts the PVC (e.g. it's scaled to zero), the Backup is held with an actionable condition — scale the workload up, or switch to an explicit `securityContext`.
 
-There is no Kubernetes API to ask "which pod mounts PVC X" (pods aren't field-selectable by claim name). So `inheritSecurityContextFrom` takes a **label selector** and you point it at the workload that owns the PVC — typically the same labels the app already carries. This is selection, not auto-discovery. To find the right labels, list the pods that mount the claim and read their labels:
+`pvcConsumer` is **backup-only**: a Restore writes a *target* PVC whose consumer may not exist yet, so use `workloadSelector` (below) there. (The admission webhook rejects `pvcConsumer` on a Restore.)
+
+#### `workloadSelector` — name the workload by label (backup or restore)
+
+```yaml
+spec:
+  mover:
+    inheritSecurityContextFrom:
+      workloadSelector:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: app # the workload that owns the PVC
+        container: app # optional; defaults to the pod's first container
+```
+
+Use this on a **Restore** (inherit from the pod that will *read* the restored data), or on a backup when you'd rather pin the selection explicitly. To find the right labels, list the pods that mount the claim:
 
 ```console
 $ kubectl get pods -n app -o json \
@@ -145,8 +161,6 @@ app-7c9d8f5b6-h2k4p
 
 $ kubectl get pod app-7c9d8f5b6-h2k4p -n app --show-labels
 ```
-
-///
 
 How it resolves: the controller lists pods matching the selector, prefers a **Running** one, picks the named container (or the pod's first), and copies **that container's `securityContext` and the pod's pod-level `securityContext`** onto the mover. If no pod matches, the selector is empty, the named container is absent, or the pod sets *neither* a container nor a pod-level `securityContext`, the Backup/Restore is held with an actionable `MissingDependency`-style condition telling you exactly what to fix. The matched workload must be **running** so its identity can be read.
 
@@ -180,6 +194,27 @@ spec:
 A root mover widens the blast radius of the minted mover ServiceAccount. Reach for it only when you genuinely can't match the owning UID/GID. Most single-app PVCs back up fine as their app's UID.
 
 ///
+
+## Catching permission mismatches early
+
+A mover that can't read the data it's backing up is the classic footgun: the backup either fails with `permission denied` or — worse — **silently skips** the unreadable files and still reports success, leaving you with an *incomplete* snapshot. Kopiur catches this at three points, earliest first:
+
+1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match (no shared UID or group), the webhook attaches a non-blocking **warning** to the apply. It never blocks — it's a best-effort hint (it can't see file modes, and the workload may not be running yet).
+
+2. **On the first reconcile (status condition).** Each Backup carries a `SecurityContextCompatible` condition:
+   - `True` — provably fine (the mover is root, or its UID exactly matches the workload's).
+   - `Unknown` — undecidable from securityContext alone (the common case; file modes aren't visible to the operator).
+   - `False` — a near-certain mismatch, with the remedy in the message.
+
+   ```console
+   $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")]}'
+   ```
+
+   A Restore carries the analogous `RestoreSecurityContextCompatible` condition (will the *future* consumer be able to read what the mover writes — where `fsGroup` matching matters).
+
+3. **At runtime in the mover (the authoritative check).** Just before it snapshots, the mover — which runs **as** the resolved UID with the PVC mounted — samples the source tree and actually tries to read it. If it's **wholly unreadable**, the Backup fails fast with an actionable `PermissionDenied` error naming the workload's UID/GID and the fix, instead of taking a silently-incomplete snapshot. (A partially-readable tree only logs a warning; kopia records the skipped files.)
+
+The fix in every case is the same: match the mover to the workload — the easiest being `inheritSecurityContextFrom.pvcConsumer: {}` (above), or a matching `runAsUser`/`fsGroup`.
 
 ## Privileged and root movers
 
@@ -269,7 +304,8 @@ The clean answer is to **decouple the two**: read the source as the app's UID, w
     spec:
       mover:
         inheritSecurityContextFrom:
-          podSelector: { matchLabels: { app.kubernetes.io/name: my-app } }
+          workloadSelector:
+            podSelector: { matchLabels: { app.kubernetes.io/name: my-app } }
     ```
 
 Full, apply-ready example:
