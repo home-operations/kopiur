@@ -1079,7 +1079,20 @@ async fn restore_missing_snapshot_fail_vs_continue() {
     );
     // kstatus: deploy-or-restore completed cleanly → Ready.
     assert_eq!(condition_status(&s, "Ready"), "True", "status: {s}");
+    // Deploy-or-restore must actually PROVISION the empty volume, not just mark Completed:
+    // the operator-created `target.pvc` must now exist (the bug: it never was created).
+    let dst = format!("{cont_name}-dst");
+    let dst_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    assert!(
+        dst_pvcs
+            .get_opt(&dst)
+            .await
+            .expect("get target PVC")
+            .is_some(),
+        "deploy-or-restore must create the empty target PVC {dst}"
+    );
     cleanup_restore(&restores, cont_name).await;
+    let _ = dst_pvcs.delete(&dst, &DeleteParams::default()).await;
 
     // (c) explicit onMissingSnapshot: Fail overrides the fromPolicy default.
     let strict_name = "e2e-r-missing-strict";

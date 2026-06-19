@@ -285,6 +285,402 @@ async fn restore_populator_wffc_binds_pvc_and_restores_data() {
     .await;
 }
 
+/// The `Resolved` condition's reason on a Restore status, if present.
+fn resolved_reason(status: &serde_json::Value) -> Option<String> {
+    status["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["type"] == "Resolved")
+        .and_then(|c| c["reason"].as_str())
+        .map(str::to_string)
+}
+
+/// Shared body for the deploy-or-restore (`onMissingSnapshot: Continue`) populator
+/// regression: given an already-seeded EMPTY `policy` (a Ready repo with NO snapshot),
+/// create a populator `Restore` whose `fromPolicy` source resolves to nothing, a claiming
+/// PVC on `storage_class`, and a pod that writes+reads a file in the mount. With no
+/// snapshot the controller must STILL provision an empty volume (an empty prime PVC +
+/// rebind) so the claim BINDS and the pod runs — pre-fix the claim hung `Pending` forever
+/// ("Assuming an external populator will provision the volume"). Also asserts the
+/// no-snapshot decision is pinned to `status.resolved.resolution: NoSnapshot`, so a
+/// snapshot that appears later can never silently restore over the in-use volume.
+async fn assert_populator_continue_provisions_empty(
+    client: &kube::Client,
+    storage_class: &str,
+    policy: &str,
+    prefix: &str,
+) {
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restore_name = format!("{prefix}-restore");
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore_name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "source": { "fromPolicy": { "name": policy } },
+                    // explicit for clarity (it's also the fromPolicy default)
+                    "policy": { "onMissingSnapshot": "Continue" },
+                    "target": { "populator": {} }
+                }
+            })),
+        )
+        .await
+        .expect("create deploy-or-restore populator Restore");
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let claim = format!("{prefix}-data");
+    pvcs.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": claim, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": storage_class,
+                "resources": { "requests": { "storage": "1Gi" } },
+                "dataSourceRef": {
+                    "apiGroup": "kopiur.home-operations.com",
+                    "kind": "Restore",
+                    "name": restore_name,
+                }
+            }
+        })),
+    )
+    .await
+    .expect("create claiming PVC");
+
+    // The pod writes then reads a file in the empty mount: it schedules the claim (so a
+    // WaitForFirstConsumer class gets its `selected-node`) and can only run once the claim
+    // BINDS, so its success proves the empty volume was provisioned, rebound, and is usable.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let probe = format!("{prefix}-probe");
+    pods.create(
+        &PostParams::default(),
+        &builders::one_shot_pod(
+            E2E_NAMESPACE,
+            &probe,
+            &[
+                "sh",
+                "-c",
+                "echo ok > /mnt/probe && test \"$(cat /mnt/probe)\" = ok",
+            ],
+            &[(claim.as_str(), "/mnt")],
+        ),
+    )
+    .await
+    .expect("create probe pod");
+
+    wait::pod_succeeded(client, E2E_NAMESPACE, &probe)
+        .await
+        .expect("the claiming PVC binds to a fresh empty volume and is writable");
+    wait_phase(&restores, &restore_name, "Completed")
+        .await
+        .expect("the deploy-or-restore populator Restore reaches Completed");
+
+    let s = status_json(&restores, &restore_name).await;
+    assert_eq!(
+        s["resolved"]["resolution"],
+        serde_json::json!("NoSnapshot"),
+        "the no-snapshot decision must be pinned so a later snapshot can't retarget it: {s}"
+    );
+    assert_eq!(
+        resolved_reason(&s).as_deref(),
+        Some("NoSnapshotContinue"),
+        "status: {s}"
+    );
+
+    let _ = pods.delete(&probe, &DeleteParams::default()).await;
+    let _ = pvcs.delete(&claim, &DeleteParams::default()).await;
+    let _ = restores
+        .delete(&restore_name, &DeleteParams::default())
+        .await;
+}
+
+/// Deploy-or-restore, the user-reported regression (WaitForFirstConsumer, mirroring the
+/// reporter's `openebs-zfspv`): a populator `Restore` over a policy with NO snapshot +
+/// `onMissingSnapshot: Continue` must provision a FRESH EMPTY volume so the claiming PVC
+/// binds and the workload pod starts. Pre-fix the controller stamped the Restore
+/// `Completed` but returned before the populator handshake, leaving the PVC `Pending`
+/// forever. The pod scheduling the claim drives the WFFC `selected-node` path (the empty
+/// prime PVC is pinned to that node, provisioned pod-less, then rebound).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn restore_populator_continue_provisions_empty_volume_wffc() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS_WFFC).await {
+        return;
+    }
+
+    ensure_empty_policy(
+        &client,
+        "e2e-popempty-repo",
+        "e2e-popempty-policy",
+        "popempty",
+    )
+    .await;
+    assert_populator_continue_provisions_empty(
+        &client,
+        CSI_STORAGE_CLASS_WFFC,
+        "e2e-popempty-policy",
+        "e2e-popempty-wffc",
+    )
+    .await;
+}
+
+/// Deploy-or-restore, Immediate-binding variant: the empty prime PVC provisions as soon as
+/// it's created (no pod-schedule dance), so the claim binds without the WFFC `selected-node`
+/// step. Same invariant: a populator `Continue` with no snapshot comes up as an empty,
+/// usable volume.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn restore_populator_continue_provisions_empty_volume_immediate() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+
+    ensure_empty_policy(
+        &client,
+        "e2e-popempty-repo",
+        "e2e-popempty-policy",
+        "popempty",
+    )
+    .await;
+    assert_populator_continue_provisions_empty(
+        &client,
+        CSI_STORAGE_CLASS,
+        "e2e-popempty-policy",
+        "e2e-popempty-imm",
+    )
+    .await;
+}
+
+/// Deploy-or-restore for a DIRECT `target.pvc`: the same early-return also stranded an
+/// operator-created target PVC (it was never created when there was no snapshot). With the
+/// fix the controller creates the empty PVC and completes. Asserts the target PVC now
+/// exists and the Restore completes with the empty-volume reason (NOT "snapshot data was
+/// written"). No CSI provisioner needed — the default storage class provisions the PVC.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn restore_direct_pvc_continue_provisions_empty_volume() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    ensure_empty_policy(
+        &client,
+        "e2e-popempty-repo",
+        "e2e-popempty-policy",
+        "popempty",
+    )
+    .await;
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = "e2e-direct-empty";
+    let target_pvc = "e2e-direct-empty-dst";
+    let _ = restores.delete(name, &DeleteParams::default()).await;
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "source": { "fromPolicy": { "name": "e2e-popempty-policy" } },
+                    "policy": { "onMissingSnapshot": "Continue" },
+                    "target": { "pvc": { "name": target_pvc, "capacity": "1Gi" } }
+                }
+            })),
+        )
+        .await
+        .expect("create direct target.pvc deploy-or-restore Restore");
+
+    wait_phase(&restores, name, "Completed")
+        .await
+        .expect("direct deploy-or-restore must complete by provisioning an empty PVC");
+
+    // The operator-created target PVC must now exist (pre-fix it was never created).
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let created = pvcs
+        .get_opt(target_pvc)
+        .await
+        .expect("get target PVC")
+        .is_some();
+    assert!(
+        created,
+        "deploy-or-restore must provision the operator-created target PVC {target_pvc}"
+    );
+
+    let s = status_json(&restores, name).await;
+    assert_eq!(
+        resolved_reason(&s).as_deref(),
+        Some("NoSnapshotContinue"),
+        "the empty completion must keep the deploy-or-restore reason (not 'RestoreSucceeded'): {s}"
+    );
+
+    let _ = restores.delete(name, &DeleteParams::default()).await;
+    let _ = pvcs.delete(target_pvc, &DeleteParams::default()).await;
+}
+
+/// Data-safety: once deploy-or-restore comes up empty, the pinned `resolution: NoSnapshot`
+/// decision must hold even if a snapshot for the policy appears LATER — the controller must
+/// NOT re-resolve and restore over the (now bound, in-use) volume. Provisions the empty
+/// volume, then seeds a snapshot for the same policy, forces a Restore reconcile, and
+/// asserts the Restore stays `Completed`/`NoSnapshot` and the consumer keeps its same PV.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn restore_populator_continue_pins_decision_against_late_snapshot() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+
+    let policy = "e2e-popempty-policy";
+    ensure_empty_policy(&client, "e2e-popempty-repo", policy, "popempty").await;
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let prefix = "e2e-popempty-pin";
+    let restore_name = format!("{prefix}-restore");
+    let claim = format!("{prefix}-data");
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore_name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "source": { "fromPolicy": { "name": policy } },
+                    "policy": { "onMissingSnapshot": "Continue" },
+                    "target": { "populator": {} }
+                }
+            })),
+        )
+        .await
+        .expect("create populator Restore");
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    pvcs.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": claim, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": CSI_STORAGE_CLASS,
+                "resources": { "requests": { "storage": "1Gi" } },
+                "dataSourceRef": {
+                    "apiGroup": "kopiur.home-operations.com",
+                    "kind": "Restore",
+                    "name": restore_name,
+                }
+            }
+        })),
+    )
+    .await
+    .expect("create claiming PVC");
+
+    wait_phase(&restores, &restore_name, "Completed")
+        .await
+        .expect("empty volume provisioned + bound");
+    let bound_pv = wait_until(
+        &format!("{claim} bound to a PV"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(pvcs
+                .get_opt(&claim)
+                .await?
+                .and_then(|p| p.spec?.volume_name))
+        },
+    )
+    .await
+    .expect("the claim binds to a PV");
+
+    // Now a snapshot for the SAME policy appears (the app took its first backup).
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let late = format!("{prefix}-late-snap");
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                &late,
+                policy,
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+    wait_phase(&backups, &late, "Succeeded")
+        .await
+        .expect("a later snapshot for the policy now exists");
+
+    // Force the Restore to reconcile (its post-Completed requeue is long) by touching an
+    // annotation; the pinned NoSnapshot decision must make it a no-op — no re-resolve.
+    restores
+        .patch(
+            &restore_name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": { "e2e.kopiur/poke": "1" } }
+            })),
+        )
+        .await
+        .expect("poke the Restore to force a reconcile");
+
+    // Give the controller several reconcile cycles, then assert nothing retargeted.
+    for _ in 0..10 {
+        tokio::time::sleep(poll_interval()).await;
+        let s = status_json(&restores, &restore_name).await;
+        assert_eq!(s["phase"], serde_json::json!("Completed"), "status: {s}");
+        assert_eq!(
+            s["resolved"]["resolution"],
+            serde_json::json!("NoSnapshot"),
+            "the pinned decision must not flip to a snapshot: {s}"
+        );
+    }
+    let still = pvcs
+        .get(&claim)
+        .await
+        .expect("get claim")
+        .spec
+        .and_then(|s| s.volume_name);
+    assert_eq!(
+        still.as_deref(),
+        Some(bound_pv.as_str()),
+        "the consumer must keep its original empty PV — no destructive re-restore"
+    );
+
+    let _ = backups.delete(&late, &DeleteParams::default()).await;
+    let _ = pvcs.delete(&claim, &DeleteParams::default()).await;
+    let _ = restores
+        .delete(&restore_name, &DeleteParams::default())
+        .await;
+}
+
 /// `mode: ReadOnly` (ADR-0005 §11): a ReadOnly repository serves restores but the
 /// controller REFUSES backups against it. A Snapshot whose policy points at a ReadOnly
 /// repo must not produce a snapshot; a Restore against it works.

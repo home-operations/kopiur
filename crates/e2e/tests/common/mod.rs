@@ -466,3 +466,39 @@ pub async fn ensure_seed(client: &Client, repo: &str, policy: &str, backup: &str
         .await
         .expect("seed Snapshot Succeeded");
 }
+
+/// Like [`ensure_seed`] but with NO snapshot: a Ready filesystem `Repository` over an
+/// isolated, never-snapshotted `subpath` plus a `SnapshotPolicy`. A `fromPolicy` restore
+/// against `policy` therefore resolves to NO snapshot — the deploy-or-restore
+/// (`onMissingSnapshot: Continue`) case. Use a dedicated `subpath` so no other scenario's
+/// snapshot leaks into this policy's identity. Idempotent.
+pub async fn ensure_empty_policy(client: &Client, repo: &str, policy: &str, subpath: &str) {
+    ensure_repo(client, subpath).await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if repos.get_opt(repo).await.ok().flatten().is_none() {
+        let _ = repos
+            .create(
+                &PostParams::default(),
+                &cr(repository_json(repo, subpath, serde_json::json!({}))),
+            )
+            .await;
+    }
+    wait_phase(&repos, repo, "Ready")
+        .await
+        .expect("empty-policy repo Ready");
+    if policies.get_opt(policy).await.ok().flatten().is_none() {
+        let _ = policies
+            .create(
+                &PostParams::default(),
+                &cr(snapshot_policy_json(
+                    E2E_NAMESPACE,
+                    policy,
+                    "Repository",
+                    repo,
+                    serde_json::json!({}),
+                )),
+            )
+            .await;
+    }
+}
