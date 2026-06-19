@@ -312,6 +312,11 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "==> e2e tests FAILED (rc=$rc) — du
 # KOPIUR_E2E_TESTFILTER — libtest name-substring filter, kept AFTER `--`.
 BINS=""
 for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
+# KOPIUR_E2E_TESTSKIP — space-separated libtest name substrings to EXCLUDE, each
+# expanded to a `--skip <pat>` AFTER `--`. Lets one shard run a heavy test (e.g.
+# deep_verify) on its own fresh-node cluster while a sibling shard runs the rest.
+SKIPS=""
+for s in ${KOPIUR_E2E_TESTSKIP:-}; do SKIPS="$SKIPS --skip $s"; done
 # The CLI e2e (tests/cli.rs) runs the compiled kubectl-kopiur plugin binary as a
 # subprocess; build it here so the tests never race a stale/missing binary.
 echo "==> building kubectl-kopiur (CLI e2e subject)"
@@ -321,7 +326,7 @@ echo "==> running e2e tests${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
 # (e.g. the heavyweight NFS/server backend test) can't hide the pass/fail of the rest.
 # cargo still exits non-zero overall, so the trap + CI failure are unaffected.
 cargo test -p kopiur-e2e --features e2e $BINS --no-fail-fast -- \
-  --include-ignored --test-threads=1 --nocapture ${KOPIUR_E2E_TESTFILTER:-}
+  --include-ignored --test-threads=1 --nocapture $SKIPS ${KOPIUR_E2E_TESTFILTER:-}
 echo "==> e2e tests passed"
 '''
 

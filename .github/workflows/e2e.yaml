@@ -144,14 +144,20 @@ jobs:
           - shard: hooks-retention
             bins: "hooks retention policy_knobs"
             backends: true
-          # `verification` (deep-verify scratch-restores) and `replication`
-          # (repository sync-to) are the two heaviest cron-wait suites; bundling
-          # both onto one kind node tipped it into NodeNotReady under runner
-          # resource pressure (scheduler 500 → nothing schedules → bootstrap
-          # fails). Give each its own shard/cluster to cut peak pressure —
-          # reshape-async keeps just verification; replication splits out.
+          # The heaviest cron-wait suites each get their own kind node — bundling
+          # them tipped the single node into NodeNotReady under runner resource
+          # pressure (scheduler 500 → nothing schedules → bootstrap fails). The
+          # deep-verify scratch-restore is the single heaviest test, so it runs
+          # ALONE on a fresh node (its repo bootstrap was the one failing); the
+          # quick-verify tests stay in reshape-async (deep_verify skipped there),
+          # and replication gets its own shard too.
           - shard: reshape-async
             bins: "verification"
+            testskip: "deep_verify"
+            backends: false
+          - shard: verify-deep
+            bins: "verification"
+            testfilter: "deep_verify"
             backends: false
           - shard: replication
             bins: "replication"
@@ -223,6 +229,8 @@ jobs:
       - name: Run e2e tests
         env:
           KOPIUR_E2E_BINS: ${{ matrix.bins }}
+          KOPIUR_E2E_TESTFILTER: ${{ matrix.testfilter }}
+          KOPIUR_E2E_TESTSKIP: ${{ matrix.testskip }}
           KOPIUR_E2E_SKIP_BUILD: "1"
           # On a `csi: true` shard the stack is installed above, so a missing
           # csi-hostpath-sc is a setup failure — make the CSI-dependent tests
