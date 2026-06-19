@@ -1,16 +1,19 @@
 ---
 name: kopiur-design
-description: Design norms and locked decisions for the Kopiur Kopia-native Kubernetes backup operator (Rust/kube-rs). Use when adding or modifying CRD types, reconcilers, the admission webhook, the kopia client/mover, validators, or codegen in this repo — anything under crates/ or deploy/. Encodes the type-safety thesis, the externally-tagged-enum rule, k8s-openapi Eq constraints, the shared-validator pattern, retention/deletion semantics, and the build/test discipline so changes stay consistent with ADR-0003.
+description: Design norms and locked decisions for the Kopiur Kopia-native Kubernetes backup operator (Rust/kube-rs). Use when adding or modifying CRD types, reconcilers, the admission webhook, the kopia client/mover, validators, or codegen in this repo — anything under crates/ or deploy/. Encodes the type-safety thesis, the externally-tagged-enum rule, k8s-openapi Eq constraints, the shared-validator pattern, retention/deletion semantics, and the build/test discipline. The code is the source of truth for current behavior; this skill summarizes the norms.
 ---
 
 # Kopiur design norms & decisions
 
-Kopiur implements **ADR-0003** (`docs/adr/0003-kopiur-rust-operator.md`): a
-Kopia-native Kubernetes backup operator in Rust on `kube-rs`. Read ADR-0003 for
-intent; ADR-0001 §3.2–§3.7 for the authoritative CRD field surface; `CLAUDE.md`
-for the quick map; `docs/dev/api-conventions.md` for the encoding rulebook.
+Kopiur is a Kopia-native Kubernetes backup operator in Rust on `kube-rs`. The
+**source of truth for current behavior is the code**: the CRD types live in
+`crates/api/src/`, their generated schemas in `deploy/crds/`. Read
+`docs/dev/api-conventions.md` for the encoding rulebook and `CLAUDE.md` for the
+quick map. The ADRs (`docs/adr/`) are historical rationale — reach for one only
+to recover the _why_ behind a decision, not for current field names or behavior,
+which they may pre-date.
 
-## The thesis you must protect (ADR §5.5)
+## The thesis you must protect
 
 Invalid states are unrepresentable; reconcilers handle every variant. Concretely:
 
@@ -36,7 +39,7 @@ Invalid states are unrepresentable; reconcilers handle every variant. Concretely
    contains one (directly or transitively). Reuse these types — never re-declare
    them. The `schemars` feature is on for k8s-openapi so they derive `JsonSchema`.
 3. **`crates/api` has no controller-runtime deps.** No `tokio`, no
-   `kube::Client`. It's the shared types + pure logic crate (ADR §5.1). The
+   `kube::Client`. It's the shared types + pure logic crate. The
    webhook and controller both import its validators so validation is identical.
 4. **One validator, two callers.** Cross-field rules live in `api::validate` as
    pure functions returning a typed error; the webhook calls them at admission
@@ -48,19 +51,19 @@ Invalid states are unrepresentable; reconcilers handle every variant. Concretely
 
 ## Semantic decisions to honor
 
-- **Retention is GFS-only.** `BackupConfig.spec.retention` is the sole successful-
-  retention driver (operator prunes `Backup` CRs). Failures use a flat
-  `BackupSchedule.spec.failedJobsHistoryLimit`. There is deliberately **no**
-  `successfulJobsHistoryLimit`. (ADR §4.4 — resolves the onedr0p/bo0tzz split.)
-- **Snapshot lifecycle = CR lifecycle.** Every `Backup` carries the
+- **Retention is GFS-only.** `SnapshotPolicy.spec.retention` is the sole successful-
+  retention driver (operator prunes `Snapshot` CRs). Failures use a flat
+  `SnapshotSchedule.spec.failedJobsHistoryLimit`. There is deliberately **no**
+  `successfulJobsHistoryLimit`.
+- **Snapshot lifecycle = CR lifecycle.** Every `Snapshot` carries the
   `kopiur.home-operations.com/snapshot-cleanup` finalizer. `deletionPolicy`:
   `Delete` (default for produced) / `Retain` (FORCED for `origin: discovered`,
   webhook-rejected otherwise) / `Orphan`. Match all three exhaustively; the
   `kopiur.home-operations.com/skip-snapshot-cleanup` annotation is the repo-offline escape hatch.
 - **Identity** defaults to `username=name`, `hostname=namespace`,
-  `sourcePath=/pvc/<name>`; `ClusterRepository.identityDefaults` templates render
-  via `tera` at admission and are pinned to `status.resolved.identity` — never
-  re-rendered after admission.
+  `sourcePath=/pvc/<name>`; `ClusterRepository.identityDefaults` `*Expr` fields
+  evaluate as **CEL** at admission and are pinned to `status.resolved.identity` —
+  never re-rendered after admission.
 - **Scheduling**: wall-clock anchor (`cron(now)`), deterministic jitter seeded by
   `(scheduleUID, slot_start)` (no RNG — must be identical across HA replicas and
   restarts). `runOnCreate: false` and `concurrencyPolicy: Forbid` are defaults.
@@ -103,7 +106,7 @@ until it has, **at minimum**:
    that turns `source.nfs` into a mover volume mount) — extract it so it's
    callable without a cluster, then assert on its output.
 2. **An e2e scenario that exercises the feature end to end** against a live
-   operator and asserts the user-visible success condition (a `Backup` reaching
+   operator and asserts the user-visible success condition (a `Snapshot` reaching
    `Succeeded` with a real `kopiaSnapshotID`, a `Repository` `Ready`, a `Restore`
    `Completed`). If the feature needs a new piece of cluster infrastructure to
    test (an NFS server, an SFTP server, a new backend), **stand it up in the e2e
@@ -129,7 +132,7 @@ Pick the cheapest tier that actually exercises the broken path:
 
 1. **Hermetic unit test (preferred).** If the bug lives in a decision, extract that
    decision into a pure function and unit-test it — the codebase's "thin IO over a
-   tested pure fn" idiom (ADR §5.2/§5.4). Example: the "ClusterRepository refs are
+   tested pure fn" idiom. Example: the "ClusterRepository refs are
    ignored" bug (controller resolved every `repository` ref as a namespaced
    `Repository` regardless of `kind`) became `io::repo_lookup(&RepositoryRef, …) ->
 RepoLookup` with unit tests asserting `kind: ClusterRepository` maps to a
@@ -138,7 +141,7 @@ RepoLookup` with unit tests asserting `kind: ClusterRepository` maps to a
    operator (a reconcile that never reaches `Succeeded`, a missing dependency, an
    RBAC/SA gap, a dropped option), add a scenario to `crates/e2e/tests/lifecycle.rs`
    that reproduces the _exact_ user-visible symptom and asserts the success
-   condition (e.g. Backup reaching `Succeeded` with a real `kopiaSnapshotID`). Write
+   condition (e.g. a `Snapshot` reaching `Succeeded` with a real `kopiaSnapshotID`). Write
    the test so it would have _timed out / failed_ on the buggy code. See
    `cluster_repository_backup_lifecycle` for the template.
 3. Integration tier (`#[ignore]` + `--features integration`) for API-server

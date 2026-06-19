@@ -26,8 +26,8 @@ Every user-facing page must let a reader who has never seen Kopiur succeed at
 1. **Deploy** — how to install / apply this (Helm value, `kubectl apply`, scope,
    prerequisites). No "obviously you'd…" steps left implicit.
 2. **Use** — the mental model first. Kopiur separates the **recipe**
-   (`BackupConfig`) from the **invocation** (`Backup`) from the **schedule**
-   (`BackupSchedule`); say which one does what before showing fields.
+   (`SnapshotPolicy`) from the **invocation** (`Snapshot`) from the **schedule**
+   (`SnapshotSchedule`); say which one does what before showing fields.
 3. **Modify common values** — call out the handful of fields a real user
    actually changes (bucket/prefix/endpoint, secret names, cron + jitter,
    retention, identity, deletionPolicy) and what each does. Don't make readers
@@ -77,8 +77,8 @@ to, stop and make it a file under `deploy/examples/` instead. (Short inline
 ### Example manifest conventions (match the existing files)
 
 - Filename `NN-kebab-name.yaml`, `NN` zero-padded and ordered by complexity.
-- A top-of-file comment block: what it demonstrates, the ADR section it maps to,
-  and any "verified against crates/api" note for field shapes.
+- A top-of-file comment block: what it demonstrates, the CRD type/field it maps
+  to (verified against `crates/api`), and any caveats on field shapes.
 - `REPLACE_ME` for secrets the user must supply; a real-looking but obviously-
   placeholder value otherwise.
 - Inline comments on every non-obvious field — especially the "common values"

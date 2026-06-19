@@ -5,14 +5,17 @@ Guidance for Claude Code (and humans) working in this repository.
 ## What this is
 
 **Kopiur** is a Kopia-native Kubernetes backup operator written in **Rust** on
-[`kube-rs`](https://github.com/kube-rs/kube). It is the implementation of
-**ADR-0003** (`docs/adr/0003-kopiur-rust-operator.md`), which supersedes two
-earlier Go-flavored drafts (ADR-0001 onedr0p, ADR-0002 bo0tzz). Read ADR-0003
-first — it is the canonical source of truth for the CRD surface, UX, and design
-decisions — then **ADR-0004** (breaking kind/field renames; governs the CURRENT
-names) and **ADR-0005** (CRD feature improvements). ADR-0001 §3.2–§3.7 holds the
-field-by-field CRD YAML, but with pre-rename kind/field names — translate via
-ADR-0004.
+[`kube-rs`](https://github.com/kube-rs/kube).
+
+**Source of truth for how Kopiur behaves today is the code, not the ADRs.** For
+the _current_ CRD surface, field names, defaults, and behavior, read — in order
+of authority — the types under `crates/api/src/`, the generated schemas in
+`deploy/crds/`, the conventions in `docs/dev/`, and this file. The ADRs
+(`docs/adr/`) are **historical design rationale**: consult one only when you need
+the _why_ behind a decision, and treat anything in them about names/fields as
+possibly superseded (ADR-0004 renamed kinds/fields; ADR-0005 added features;
+ADR-0001/0002 are abandoned Go drafts). Don't cite an ADR section for a fact you
+can state from the code — point at the code.
 
 The operator exposes **8 CRDs** in API group `kopiur.home-operations.com`, version `v1alpha1`:
 `Repository` (ns), `ClusterRepository` (cluster), `SnapshotPolicy`, `Snapshot`,
@@ -22,7 +25,7 @@ It separates **recipe** (`SnapshotPolicy`) from **invocation** (`Snapshot`) from
 and ties a kopia snapshot's lifecycle to its `Snapshot` CR via a finalizer +
 `deletionPolicy`.
 
-## The one load-bearing idea: type-safety end-to-end (ADR §5.5)
+## The one load-bearing idea: type-safety end-to-end
 
 Every "exactly one of" surface in the CRDs is a Rust `enum`, so an invalid state
 is unrepresentable and reconcilers `match` exhaustively. A new variant cannot
@@ -46,13 +49,13 @@ crates/
   xtask/       Codegen: `cargo xtask gen-crds|gen-rbac|gen-all` → deploy/crds, deploy/rbac,
                deploy/helm/kopiur/files/{crds,dashboards}.
 deploy/        Generated CRDs + RBAC, Helm chart, example manifests.
-docs/adr/      Architecture Decision Records (0003 canonical; 0004 renames; 0005 features).
+docs/adr/      Architecture Decision Records — historical rationale only, may be stale on names.
 docs/dev/      Developer conventions (READ docs/dev/api-conventions.md before editing crates/api).
 ```
 
-The `api` ↔ `controller` split is deliberate (ADR §5.1): `kopiur-api` must stay
-free of `tokio`/`kube::Client` so downstream tools can depend on the types alone.
-Do not add controller-runtime dependencies to `crates/api`.
+The `api` ↔ `controller` split is deliberate: `kopiur-api` must stay free of
+`tokio`/`kube::Client` so downstream tools can depend on the types alone. Do not
+add controller-runtime dependencies to `crates/api`.
 
 ## Non-negotiable conventions (full detail in docs/dev/api-conventions.md)
 
@@ -64,28 +67,28 @@ Do not add controller-runtime dependencies to `crates/api`.
    `ResourceRequirements`, `SecurityContext`, `JobSpec`, `Condition`, …) — they
    are `PartialEq` only. Reuse these types; don't re-invent them.
 3. **Sub-objects, not leaf fields**, for every credential/policy/identity/schedule
-   surface, so future fields slot in without API breakage (ADR §4.11).
+   surface, so future fields slot in without API breakage.
 4. **Optionals**: `#[serde(default, skip_serializing_if = "Option::is_none")]`.
    Status always pins `resolved.*` values (identity resolved at admission, never
-   re-rendered — ADR §4.2).
+   re-rendered).
 5. **Tests parse YAML the cluster's way**: YAML → `serde_json::Value` → typed
    (see `crates/api/src/lib.rs::testutil::from_yaml`). Never `serde_yaml::from_str`
    directly into a typed value — serde_yaml 0.9 mis-encodes externally-tagged enums.
 
 ## Locked technical decisions
 
-| Concern             | Choice                                                                                                                                                                                                                                                                                                                        |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cron                | `croner` (deterministic `H`/jitter from `(scheduleUID, slot)`; wall-clock anchor)                                                                                                                                                                                                                                             |
-| Identity templating | **CEL** (`cel` 0.13; `*Expr` fields, ADR-0004 §5 / ADR-0005 §15 — replaced the former tera/Jinja2 approach), resolved at admission, pinned to status                                                                                                                                                                          |
-| Webhook server      | `axum` 0.8 + `rustls`; validators shared with controller via `api::validate`                                                                                                                                                                                                                                                  |
-| kopia invocation    | `tokio::process::Command`, JSON streamed line-by-line; long ops in mover, short idempotent ops in controller                                                                                                                                                                                                                  |
-| CRD/schema          | `kube::CustomResource` derive + `schemars` 1; CRDs generated by `xtask`, checked into `deploy/crds/`                                                                                                                                                                                                                          |
-| Observability       | `kopiur-telemetry` crate: instrument once on the OTel API → Prometheus pull (`/metrics`) + optional OTLP push; all metrics `kopiur_*`; OTLP env-gated/off by default; one span per reconcile. See `docs/dev/observability.md`                                                                                                 |
-| API version         | `v1alpha1` only; no conversion webhooks yet (ADR §8)                                                                                                                                                                                                                                                                          |
-| Retention           | GFS-only (`SnapshotPolicy.spec.retention`); failures bounded by flat `failedJobsHistoryLimit`; NO `successfulJobsHistoryLimit`                                                                                                                                                                                                |
-| Deletion            | `Snapshot` CR owns its kopia snapshot via finalizer; `deletionPolicy: Delete`(default produced) / `Retain`(forced for discovered) / `Orphan`                                                                                                                                                                                  |
-| Maintenance         | Default-managed: `Repository`/`ClusterRepository` `spec.maintenance` (default-on) is projected into an _owned_ `Maintenance` CR; an externally-authored `Maintenance` is always honored (never duplicated), even with `enabled: false`. ClusterRepo placement: `spec.maintenance.namespace` else `KOPIUR_NAMESPACE`. ADR §3.7 |
+| Concern             | Choice                                                                                                                                                                                                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cron                | `croner` (deterministic `H`/jitter from `(scheduleUID, slot)`; wall-clock anchor)                                                                                                                                                                                                                                    |
+| Identity templating | **CEL** (`cel` 0.13; `*Expr` fields), resolved at admission, pinned to status                                                                                                                                                                                                                                        |
+| Webhook server      | `axum` 0.8 + `rustls`; validators shared with controller via `api::validate`                                                                                                                                                                                                                                         |
+| kopia invocation    | `tokio::process::Command`, JSON streamed line-by-line; long ops in mover, short idempotent ops in controller                                                                                                                                                                                                         |
+| CRD/schema          | `kube::CustomResource` derive + `schemars` 1; CRDs generated by `xtask`, checked into `deploy/crds/`                                                                                                                                                                                                                 |
+| Observability       | `kopiur-telemetry` crate: instrument once on the OTel API → Prometheus pull (`/metrics`) + optional OTLP push; all metrics `kopiur_*`; OTLP env-gated/off by default; one span per reconcile. See `docs/dev/observability.md`                                                                                        |
+| API version         | `v1alpha1` only; no conversion webhooks yet                                                                                                                                                                                                                                                                          |
+| Retention           | GFS-only (`SnapshotPolicy.spec.retention`); failures bounded by flat `failedJobsHistoryLimit`; NO `successfulJobsHistoryLimit`                                                                                                                                                                                       |
+| Deletion            | `Snapshot` CR owns its kopia snapshot via finalizer; `deletionPolicy: Delete`(default produced) / `Retain`(forced for discovered) / `Orphan`                                                                                                                                                                         |
+| Maintenance         | Default-managed: `Repository`/`ClusterRepository` `spec.maintenance` (default-on) is projected into an _owned_ `Maintenance` CR; an externally-authored `Maintenance` is always honored (never duplicated), even with `enabled: false`. ClusterRepo placement: `spec.maintenance.namespace` else `KOPIUR_NAMESPACE`. |
 
 Pinned deps (Rust 1.95): `kube` 3.1, `k8s-openapi` 0.27 (feature `v1_33`,
 `schemars` on), `schemars` 1, `axum` 0.8, `croner` 2, `cel` 0.13.
@@ -114,9 +117,9 @@ harness) and use throwaway kind clusters.
 
 ## Working style here
 
-- This is a phased build (see the plan and `docs/adr/0003`). Land one milestone,
-  verify it (`cargo test` + `clippy` green), then start the next. Don't claim a
-  milestone done without showing the passing test output.
+- This is a phased build. Land one milestone, verify it (`cargo test` + `clippy`
+  green), then start the next. Don't claim a milestone done without showing the
+  passing test output.
 - When a milestone is large and well-specified, it's fine to delegate to a
   subagent — but always independently re-run `cargo test`/`clippy` before
   trusting the result.

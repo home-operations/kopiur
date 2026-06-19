@@ -135,9 +135,9 @@ behavior (a pure type change/refactor) — and then say so explicitly.
 
 Assert the **user-visible success condition**, not an intermediate detail:
 
-- A `Repository` reaching `Ready`; a `Backup` reaching `Succeeded` **with a real
+- A `Repository` reaching `Ready`; a `Snapshot` reaching `Succeeded` **with a real
   `kopiaSnapshotID`**; a `Restore` `Completed`; a schedule actually creating a
-  `Backup`; a finalizer deleting the snapshot; a `Maintenance` lease claimed.
+  `Snapshot`; a finalizer deleting the snapshot; a `Maintenance` lease claimed.
 - Use the `wait_phase(&api, name, "Succeeded")` pattern (poll status to a target
   phase with a timeout). A regression test must be written so it **times out /
   fails on the buggy code** and passes on the fix — see
@@ -151,8 +151,8 @@ When the assertion is "a metric is emitted," drive the real lifecycle, then
 
 - curl the controller `:8080/metrics` (and webhook `/metrics`); assert the
   expected families/labels are present with sane values
-  (`controller_reconciliations_total{kind=…} > 0`,
-  `kopiur_resource_phase{kind=Backup,phase=Succeeded} == 1`, backup
+  (`kopiur_controller_reconciliations_total{kind=…} > 0`,
+  `kopiur_resource_phase{kind=Snapshot,phase=Succeeded} == 1`, backup
   size/files/duration `> 0`, error/consecutive-failure counters reflect an
   induced failure).
 - Assert the body still **parses as valid Prometheus text** — a regression guard

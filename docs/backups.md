@@ -243,6 +243,28 @@ verification:
     verifyFilesPercent: 10 # how much of each file `quick` reads fully
 ```
 
+**Two tiers, because there are two different questions.** `quick` asks _"are the
+repository blobs and indexes intact?"_ — it runs `kopia snapshot verify`, reads
+metadata, and spot-checks a slice of file contents (`verifyFilesPercent`). It is
+cheap, so you run it often. `deep` asks the stronger question _"can I actually
+get my data back?"_ — it restores the latest snapshot into a throwaway volume,
+checks the result, and discards it. That is the closest thing to a real recovery,
+so you run it rarely. Schedule the two independently.
+
+/// note | Why `deep` is an object but `quick` is just a cron
+
+This asymmetry trips people up, so it's deliberate: `quick` is a bare cron
+(`{ cron, jitter }`) because an integrity check needs **nothing but a schedule**.
+`deep` is a nested object because a restore drill needs somewhere to restore _to_
+— so alongside its `schedule` it carries the scratch-volume knobs (`capacity`,
+`storageClassName`) that `quick` has no use for. Grouping the schedule and its
+storage under one `deep:` key keeps "deep verify is off" and "deep verify is on,
+configured like this" a single on/off unit, and gives future deep-only options a
+home without reshaping the API. The two tiers share `successExpr` and
+`status.lastVerified`; only `deep` has a scratch volume.
+
+///
+
 Deep verify restores into a throwaway scratch volume, then discards it. `capacity` and `storageClassName` size and place that volume: **set `capacity`** and the operator provisions a fresh generic-ephemeral PVC (auto-deleted with the Job) of that size — size it to comfortably hold the restored snapshot; **omit `capacity`** and scratch falls back to a node-ephemeral `emptyDir` (zero-config, but bounded by node disk — fine for small snapshots). `storageClassName` only applies when `capacity` is set — a class with no capacity is a no-op (an `emptyDir` has no StorageClass), which the operator surfaces as a `ScratchStorageClassIgnored` condition + Warning Event on the `SnapshotPolicy`.
 
 You can set the scratch size/class **once** at the repository level via [`moverDefaults.scratch`](repositories.md#moverdefaults--one-place-to-configure-every-mover) instead of repeating it on every policy; the `verification.deep` fields here override that repo default field-wise.
