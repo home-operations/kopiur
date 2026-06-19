@@ -107,6 +107,30 @@ pub async fn resolve_cache_volume(
     }
 }
 
+/// Resolve the **verification** mover's kopia cache volume from an effective cache
+/// config. Verify inherits `moverDefaults.cache` like every other mover, but — being
+/// a separate, infrequent lifecycle from backups — it must **never attach the
+/// `SnapshotPolicy`'s persistent (warm) cache PVC**: that PVC is `ReadWriteOnce` and
+/// owned by the backup path, so sharing it would risk a Multi-Attach race and entangle
+/// lifecycles. So `mode` is ignored here and the result is always per-run ephemeral:
+/// - a `capacity` (under either `Ephemeral` *or* `Persistent` mode) → a fresh sized
+///   generic ephemeral volume ([`CacheVolume::Ephemeral`], honoring `storageClassName`);
+/// - no `capacity` → an `emptyDir`.
+///
+/// Pure (no IO): unlike [`resolve_cache_volume`] there is never an owned PVC to
+/// provision, so this needs no client. The cache **budgets** are applied separately via
+/// [`cache_tuning`] in the verify work-spec, so volume + budgets share one
+/// [`effective_cache`] source.
+pub fn verify_cache_volume(effective: Option<&CacheDefaults>) -> CacheVolume {
+    match effective.and_then(|c| c.capacity.clone()) {
+        Some(capacity) => CacheVolume::Ephemeral {
+            capacity,
+            storage_class: effective.and_then(|c| c.storage_class_name.clone()),
+        },
+        None => CacheVolume::EmptyDir,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +240,51 @@ mod tests {
     fn effective_scratch_is_none_when_nothing_set() {
         let repo = repo_with_scratch(None);
         assert_eq!(effective_scratch(&repo, &deep(None, None)), None);
+    }
+
+    #[test]
+    fn verify_cache_volume_is_emptydir_without_capacity() {
+        // No effective cache, or budgets-only (no capacity) → emptyDir.
+        assert_eq!(verify_cache_volume(None), CacheVolume::EmptyDir);
+        assert_eq!(
+            verify_cache_volume(Some(&CacheDefaults {
+                metadata_cache_size_mb: Some(512),
+                ..Default::default()
+            })),
+            CacheVolume::EmptyDir
+        );
+    }
+
+    #[test]
+    fn verify_cache_volume_is_sized_ephemeral_with_capacity() {
+        assert_eq!(
+            verify_cache_volume(Some(&CacheDefaults {
+                capacity: Some("8Gi".into()),
+                storage_class_name: Some("fast-ssd".into()),
+                ..Default::default()
+            })),
+            CacheVolume::Ephemeral {
+                capacity: "8Gi".into(),
+                storage_class: Some("fast-ssd".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_cache_volume_coerces_persistent_to_ephemeral() {
+        // Verify must NEVER attach the backup's warm persistent PVC (RWO multi-attach):
+        // a Persistent cache is coerced to a fresh per-run sized ephemeral volume.
+        assert_eq!(
+            verify_cache_volume(Some(&CacheDefaults {
+                capacity: Some("16Gi".into()),
+                storage_class_name: Some("block".into()),
+                mode: Some(CacheVolumeMode::Persistent),
+                ..Default::default()
+            })),
+            CacheVolume::Ephemeral {
+                capacity: "16Gi".into(),
+                storage_class: Some("block".into()),
+            }
+        );
     }
 }

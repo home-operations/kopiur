@@ -306,16 +306,40 @@ pub fn job_pod_sc(job: &Job) -> Option<k8s_openapi::api::core::v1::PodSecurityCo
         .and_then(|p| p.security_context.clone())
 }
 
-/// The deep-verify scratch `Volume` (named `scratch`) from a Job's pod template, or
-/// `None` if the Job mounts no scratch volume. Used to assert how the scratch
-/// restore-test volume was provisioned (emptyDir vs sized ephemeral PVC + class).
-pub fn job_scratch_volume(job: &Job) -> Option<k8s_openapi::api::core::v1::Volume> {
+/// The named `Volume` from a Job's pod template, or `None` if absent. Used to assert
+/// how a mover volume was provisioned (emptyDir vs sized ephemeral PVC + class).
+pub fn job_named_volume(job: &Job, name: &str) -> Option<k8s_openapi::api::core::v1::Volume> {
     job.spec
         .as_ref()
         .and_then(|s| s.template.spec.as_ref())
         .and_then(|p| p.volumes.as_ref())
-        .and_then(|vols| vols.iter().find(|v| v.name == "scratch"))
+        .and_then(|vols| vols.iter().find(|v| v.name == name))
         .cloned()
+}
+
+/// The deep-verify scratch `Volume` (named `scratch`) — see [`job_named_volume`].
+pub fn job_scratch_volume(job: &Job) -> Option<k8s_openapi::api::core::v1::Volume> {
+    job_named_volume(job, "scratch")
+}
+
+/// The kopia cache `Volume` (named `kopia-cache`) — see [`job_named_volume`].
+pub fn job_cache_volume(job: &Job) -> Option<k8s_openapi::api::core::v1::Volume> {
+    job_named_volume(job, "kopia-cache")
+}
+
+/// The `(storageClassName, capacity)` of a `Volume`'s ephemeral `volumeClaimTemplate`,
+/// or `None` if the volume is not a sized ephemeral PVC (e.g. an `emptyDir`).
+pub fn ephemeral_class_and_capacity(
+    vol: &k8s_openapi::api::core::v1::Volume,
+) -> Option<(Option<String>, Option<String>)> {
+    let spec = &vol.ephemeral.as_ref()?.volume_claim_template.as_ref()?.spec;
+    let capacity = spec
+        .resources
+        .as_ref()
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|m| m.get("storage"))
+        .map(|q| q.0.clone());
+    Some((spec.storage_class_name.clone(), capacity))
 }
 
 /// Assert a rendered mover container securityContext STILL carries the hardened

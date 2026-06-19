@@ -303,7 +303,9 @@ async fn spawn_verify_job(
     let creds_secrets = creds.names;
 
     // The verify mover inherits the repository's moverDefaults (security context,
-    // placement, TTL) merged under the recipe's mover (ADR-0004 §1/§2).
+    // placement, resources, TTL, cache) merged under the recipe's mover (ADR-0004
+    // §1/§2). The cache *volume* is resolved separately below (verify never attaches
+    // the backup's persistent cache PVC); the cache *budgets* ride the work-spec.
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
         config
@@ -357,7 +359,17 @@ async fn spawn_verify_job(
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
         annotations,
-        cache_volume: Default::default(),
+        // Inherit moverDefaults.cache (overlaid by the recipe's mover.cache) for the
+        // kopia cache volume — but always per-run ephemeral, never the backup's warm
+        // persistent PVC (see `verify_cache_volume`). Same `effective_cache` source as
+        // the cache budgets in `build_verify_work_spec`.
+        cache_volume: crate::cache::verify_cache_volume(
+            crate::cache::effective_cache(
+                repo,
+                config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+            )
+            .as_ref(),
+        ),
         // Deep verify restores into DEEP_SCRATCH_PATH; mount a writable volume there
         // (sized PVC if `capacity` is set, else emptyDir). Quick verify needs none.
         scratch_volume: match tier {

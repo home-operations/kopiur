@@ -226,6 +226,12 @@ Set the UID/GID **once** on `moverDefaults.securityContext.runAsUser/runAsGroup`
 
 `moverDefaults.scratch` is the repo-level default for the **deep-verification** scratch volume (the throwaway restore target a `verification.deep` restore-test writes into, then discards). It's the scratch sibling of `cache`: a `SnapshotPolicy`'s `verification.deep.{capacity,storageClassName}` overlays it field-wise, so you set the scratch size/class **once** here instead of repeating it on every policy. Unlike the cache, scratch has **no `mode`** — it's always ephemeral and discarded after each run. `storageClassName` only applies when a `capacity` is set (an `emptyDir` has no StorageClass); a class with no effective capacity is a no-op and the operator flags it via the `ScratchStorageClassIgnored` condition on the `SnapshotPolicy`. See [verification](backups.md#verification--prove-the-snapshots-are-restorable).
 
+/// note | Verification movers inherit `moverDefaults` too
+
+The `quick`/`deep` verification movers a `SnapshotPolicy` spawns inherit the **whole** `moverDefaults` — security context, resources, scheduling, TTL, throttle, **and** the kopia `cache` (size/class + budgets) — exactly like backup and restore movers. The one exception: a `cache.mode: Persistent` is **coerced to a fresh per-run ephemeral cache** for verification, because a verify run must never attach the backup's warm `ReadWriteOnce` cache PVC (a Multi-Attach race). Set `moverDefaults.cache` once and your verifications are sized/placed without any per-policy config.
+
+///
+
 ### `sourceColocation`: avoid the RWO Multi-Attach error
 
 A `ReadWriteOnce` (RWO) PVC can only be **attached to one node at a time**, though it can be mounted by several pods **on that same node**. When your app pod already holds an RWO PVC on node A and Kopiur's mover lands on node B, the kubelet on B can't attach the volume and the mover pod is stuck with a `Multi-Attach error` (it never starts).
