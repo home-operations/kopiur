@@ -10,6 +10,15 @@ pub const FIELD_MANAGER: &str = "kubectl-kopiur";
 /// `tracing_subscriber::EnvFilter` expression. `-v`/`-vv` flags take precedence.
 pub const LOG_ENV: &str = "KOPIUR_LOG";
 
+/// Filename `migrate volsync --out-dir` writes shared (deduped) Repository and
+/// credential Secret objects to. The leading underscore cannot collide with a
+/// DNS-1123 ReplicationSource name (which is what per-source files are named).
+pub const MIGRATE_SHARED_FILE: &str = "_shared.yaml";
+
+/// Token meaning "read from stdin" for `migrate volsync -f`/`--secrets`,
+/// matching `kubectl -f -`.
+pub const STDIN_TOKEN: &str = "-";
+
 /// The plugin version: the release tag stamped at build time by CI
 /// (`KOPIUR_VERSION`), falling back to the workspace crate version for local
 /// builds. Mirrors how the operator images stamp `VERSION`.

@@ -26,12 +26,52 @@ $ kubectl kopiur migrate volsync -n media --resolve-secrets --apply
 | `--include-destinations` | Also translate ReplicationDestinations into `Restore`s. restic (and kopia without an identity): deploy-or-restore `fromPolicy` + `onMissingSnapshot: Continue`. kopia with `sourceIdentity` or `username`/`hostname`: a raw-identity restore (`source.identity`), no policy pairing needed. |
 | `--strict` | Exit 1 (emitting nothing) when any field has no kopiur equivalent. A minimal fork-kopia source is fully mappable and passes. |
 | `--apply` | Server-side-apply the translated objects. |
+| `-f, --filename PATH` | Read VolSync objects from a YAML file, a directory, or `-` (stdin) instead of the cluster — **no kubeconfig required**. Repeatable. See [Offline / GitOps mode](#offline--gitops-mode). |
+| `--secrets PATH` | In offline mode, resolve repository Secrets from plaintext Secret YAML on disk (file/dir/`-`). Repeatable; needs `--resolve-secrets`. |
+| `--from-cluster-secrets` | In offline mode, fetch the referenced Secrets from the live cluster instead of `--secrets`. |
+| `--out-dir DIR` | Write one YAML file per ReplicationSource (plus `_shared.yaml` for derived Repositories/Secrets) into `DIR` instead of stdout. |
+| `--force` | Allow `--out-dir` to overwrite existing files. |
 
 Every VolSync field the translator reads is accounted for on stderr as
 `mapped` (with the kopiur destination), `UNMAPPABLE` (with why and what to do
 instead — e.g. restic's `retain.within` has no kopia equivalent), or
 `ignored` (with why it isn't needed — e.g. `pruneIntervalDays`: kopiur
 maintenance is default-managed). Nothing is silently dropped.
+
+## Offline / GitOps mode
+
+If your VolSync objects live as YAML in a Git repository (not just in the
+cluster), point `migrate volsync` at the files with `-f`/`--filename` — a file,
+a directory (every `*.yaml`/`*.yml` in it), or `-` for stdin. With `-f`, the
+command reads **nothing from the cluster** unless you ask it to, so it needs no
+kubeconfig:
+
+```console
+$ kubectl kopiur migrate volsync -f ./apps/media/volsync.yaml --repository nas --out-dir ./apps/media/kopiur
+wrote 2 file(s) to ./apps/media/kopiur:
+  _shared.yaml
+  media-app.yaml
+```
+
+`--out-dir` writes **one file per ReplicationSource** (named after it), plus a
+`_shared.yaml` holding any derived `Repository`/credential Secrets shared across
+sources — ready to commit. Without `--out-dir`, the manifests stream to stdout as
+before. You can also pipe the cluster's objects through it:
+`kubectl get replicationsource -A -o yaml | kubectl kopiur migrate volsync -f - --repository nas` (a `kind: List` is unwrapped automatically).
+
+Credentials offline have three options (your SOPS-encrypted Secrets can't be read
+straight from Git):
+
+| You want | Use |
+|---|---|
+| Point policies at a kopiur `Repository` you author/migrate separately — no Secret reads | `--repository NAME` |
+| Derive the `Repository` from **plaintext** Secret YAML on disk | `--resolve-secrets --secrets ./secrets.yaml` |
+| Read VolSync from files but fetch Secrets from the **live** cluster (e.g. Flux already decrypted them) | `--resolve-secrets --from-cluster-secrets` |
+
+`--apply` is rejected with offline input — review the emitted files and
+`kubectl apply -f` them yourself. Each object's namespace comes from its own
+`metadata.namespace`; `-n` only supplies a fallback for namespace-less objects
+and never filters offline input.
 
 ## restic sources (upstream VolSync)
 
