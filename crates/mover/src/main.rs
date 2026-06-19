@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kopiur_api::{LeaseAction, lease_action};
-use kopiur_kopia::{ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MaintenanceMode};
+use kopiur_kopia::{
+    ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MaintenanceMode, SnapshotCreateResult,
+    SnapshotListEntry,
+};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -371,10 +374,17 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
                         .map_err(kopia(KopiaOp::PolicySet))?;
                 }
             }
-            let result = client
+            let mut result = client
                 .snapshot_create(&op.source_path, &op.tags, Some(&override_source))
                 .await
                 .map_err(kopia(KopiaOp::SnapshotCreate))?;
+            if let Err(e) = normalize_create_snapshot_id(client, &mut result).await {
+                warn!(
+                    class = %e.class(),
+                    stderr_tail = ?e.stderr_tail(),
+                    "could not verify created snapshot id against `snapshot list`; using `snapshot create --json` id"
+                );
+            }
             // kopia exits non-zero (→ a classified `PermissionDenied` failure above) when
             // unreadable files are FATAL. But under an `ignoreFileErrors`/`ignoreDirErrors`
             // policy it completes (exit 0) while still recording every skipped entry in
@@ -398,13 +408,23 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
+            let snapshot_id = normalize_restore_snapshot_id(client, spec, &op.snapshot_id)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        class = %e.class(),
+                        stderr_tail = ?e.stderr_tail(),
+                        "could not verify restore snapshot id against `snapshot list`; using requested id"
+                    );
+                    op.snapshot_id.clone()
+                });
             client
-                .snapshot_restore_with(&op.snapshot_id, &op.target_path, &op.restore_options())
+                .snapshot_restore_with(&snapshot_id, &op.target_path, &op.restore_options())
                 .await
                 .map_err(kopia(KopiaOp::SnapshotRestore))?;
             // Restore's terminal success phase is `Completed`, not `Succeeded`
             // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
-            Ok(StatusUpdate::completed(&op.snapshot_id, chrono::Utc::now()))
+            Ok(StatusUpdate::completed(&snapshot_id, chrono::Utc::now()))
         }
         Operation::SnapshotDelete(op) => {
             // Just delete the snapshot. Space reclamation (maintenance) is a
@@ -1034,6 +1054,82 @@ async fn run_verify_flow(
     Ok(())
 }
 
+/// Replace the `snapshot create --json` id with the manifest id reported by
+/// `snapshot list` for the same recorded source, newest-first. This makes the
+/// status handle restorable even if a kopia version ever reports a root/content
+/// object in the create result: restore/delete/pin all need the manifest id.
+async fn normalize_create_snapshot_id(
+    client: &KopiaClient,
+    result: &mut SnapshotCreateResult,
+) -> Result<(), KopiaError> {
+    let mut list = client.snapshot_list(Some(&result.source)).await?;
+    list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+    if let Some(id) = created_snapshot_manifest_id(result, &list)
+        && id != result.id
+    {
+        info!(
+            create_id = %result.id,
+            manifest_id = %id,
+            source = %result.source.identity(),
+            "using snapshot-list manifest id for created snapshot status"
+        );
+        result.id = id;
+    }
+    Ok(())
+}
+
+fn created_snapshot_manifest_id(
+    result: &SnapshotCreateResult,
+    list: &[SnapshotListEntry],
+) -> Option<String> {
+    if list.iter().any(|e| e.id == result.id) {
+        return Some(result.id.clone());
+    }
+    if let Some(root_obj) = result.root_entry.as_ref().map(|r| r.obj.as_str())
+        && let Some(entry) = list
+            .iter()
+            .find(|e| e.root_entry.as_ref().is_some_and(|r| r.obj == root_obj))
+    {
+        return Some(entry.id.clone());
+    }
+    list.iter()
+        .find(|e| e.start_time == result.start_time && e.end_time == result.end_time)
+        .map(|e| e.id.clone())
+}
+
+/// If the requested restore id comes from a legacy `Snapshot.status` that recorded
+/// a root/content object id, translate it back to the restorable manifest id by
+/// matching the current source's list entries.
+async fn normalize_restore_snapshot_id(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    requested: &str,
+) -> Result<String, KopiaError> {
+    let filter = kopiur_kopia::SnapshotSource {
+        host: spec.identity.hostname.clone(),
+        user_name: spec.identity.username.clone(),
+        path: spec.identity.source_path.clone(),
+    };
+    let mut list = client.snapshot_list(Some(&filter)).await?;
+    list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+    if list.iter().any(|e| e.id == requested) {
+        return Ok(requested.to_string());
+    }
+    if let Some(entry) = list
+        .into_iter()
+        .find(|e| e.root_entry.as_ref().is_some_and(|r| r.obj == requested))
+    {
+        warn!(
+            requested_id = %requested,
+            manifest_id = %entry.id,
+            source = %entry.source.identity(),
+            "restore snapshot id was a root object; using matching manifest id"
+        );
+        return Ok(entry.id);
+    }
+    Ok(requested.to_string())
+}
+
 /// The newest snapshot id for this run's identity, by source path (the kopia
 /// catalog records the path authoritatively; the pod's user/host differ).
 async fn resolve_latest_snapshot_id(
@@ -1579,6 +1675,50 @@ fn split_api_version(api_version: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_result(id: &str, root_obj: &str) -> SnapshotCreateResult {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "host": "h", "userName": "u", "path": "/data" },
+            "startTime": "2026-06-02T03:13:59Z",
+            "endTime": "2026-06-02T03:14:00Z",
+            "rootEntry": { "name": "data", "type": "d", "obj": root_obj }
+        }))
+        .expect("valid create result")
+    }
+
+    fn list_entry(id: &str, root_obj: &str) -> SnapshotListEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "host": "h", "userName": "u", "path": "/data" },
+            "startTime": "2026-06-02T03:13:59Z",
+            "endTime": "2026-06-02T03:14:00Z",
+            "rootEntry": { "name": "data", "type": "d", "obj": root_obj }
+        }))
+        .expect("valid list entry")
+    }
+
+    #[test]
+    fn created_snapshot_manifest_id_prefers_list_manifest_for_matching_root() {
+        let result = create_result("content-id", "root-1");
+        let list = vec![list_entry("manifest-id", "root-1")];
+
+        assert_eq!(
+            created_snapshot_manifest_id(&result, &list),
+            Some("manifest-id".to_string())
+        );
+    }
+
+    #[test]
+    fn created_snapshot_manifest_id_keeps_create_id_when_list_contains_it() {
+        let result = create_result("manifest-id", "root-1");
+        let list = vec![list_entry("manifest-id", "root-1")];
+
+        assert_eq!(
+            created_snapshot_manifest_id(&result, &list),
+            Some("manifest-id".to_string())
+        );
+    }
 
     #[test]
     fn split_api_version_grouped() {

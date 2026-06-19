@@ -14,12 +14,13 @@
 use std::sync::Arc;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::snapshot::Snapshot;
 use kopiur_api::{
-    OnMissingSnapshot, Restore, RestorePhase, RestoreSource, RestoreTarget, validate,
+    OnMissingSnapshot, Restore, RestorePhase, RestoreSource, RestoreTarget, SnapshotPhase, validate,
 };
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
@@ -338,13 +339,13 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // ADR §4.6: the resolution is pinned ONCE and never re-resolved — a restore
     // must not silently retarget when newer snapshots appear mid-flight. Reuse a
     // previously pinned id; resolve only while no pin exists yet.
-    let pinned_id = restore
-        .status
-        .as_ref()
-        .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.kopia_snapshot_id.clone());
-    let snapshot_id = if let Some(id) = pinned_id {
-        id
+    let pinned = restore.status.as_ref().and_then(|s| s.resolved.as_ref());
+    let resolved_source = if let Some(id) = pinned.and_then(|r| r.kopia_snapshot_id.clone()) {
+        ResolvedSource {
+            kopia_snapshot_id: id,
+            snapshot_ref: pinned.and_then(|r| r.snapshot_ref.clone()),
+            identity: pinned.and_then(|r| r.identity.clone()),
+        }
     } else {
         match resolve_snapshot(ctx, restore, &namespace).await? {
             Some(res) => {
@@ -370,7 +371,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 );
                 status["resolved"] = resolved;
                 io::patch_status(&api, &name, status).await?;
-                res.kopia_snapshot_id
+                res
             }
             None => {
                 // No snapshot matched. While the `waitTimeout` window (anchored at
@@ -486,10 +487,10 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
 
     match state {
         PopulatorState::DirectTarget => {
-            drive_direct_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
+            drive_direct_restore(ctx, restore, &api, &namespace, &name, &resolved_source).await
         }
         PopulatorState::AwaitingClaim => {
-            drive_populator_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, &resolved_source).await
         }
     }
 }
@@ -529,7 +530,7 @@ async fn drive_populator_restore(
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: &str,
+    source: &ResolvedSource,
 ) -> Result<Action> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
@@ -643,7 +644,7 @@ async fn drive_populator_restore(
         namespace,
         &populate_job,
         &prime_name,
-        snapshot_id,
+        source,
     )
     .await?
     {
@@ -995,7 +996,7 @@ async fn drive_direct_restore(
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: &str,
+    source: &ResolvedSource,
 ) -> Result<Action> {
     // Resolve the target PVC for the restore Job. DirectTarget is only reached for
     // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
@@ -1021,7 +1022,7 @@ async fn drive_direct_restore(
     // The Job is named after the Restore and writes into the explicit target PVC;
     // the helper creates/tracks it, the phase writes stay here.
     let phase = restore.status.as_ref().and_then(|s| s.phase);
-    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, snapshot_id).await? {
+    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, source).await? {
         MoverOutcome::Succeeded { duration_secs } => {
             if let Some(secs) = duration_secs {
                 ctx.metrics.set_restore_duration(namespace, name, secs);
@@ -1125,7 +1126,7 @@ async fn run_restore_mover(
     namespace: &str,
     job_name: &str,
     target_pvc: &str,
-    snapshot_id: &str,
+    source: &ResolvedSource,
 ) -> Result<MoverOutcome> {
     use k8s_openapi::api::batch::v1::Job;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
@@ -1409,11 +1410,21 @@ async fn run_restore_mover(
     }
     let creds_secrets = creds.names;
 
-    let identity = MoverIdentity {
-        username: "restore".into(),
-        hostname: namespace.to_string(),
-        source_path: target_path.clone(),
-    };
+    let identity = source
+        .identity
+        .as_ref()
+        .and_then(|i| {
+            i.source_path.as_ref().map(|source_path| MoverIdentity {
+                username: i.username.clone(),
+                hostname: i.hostname.clone(),
+                source_path: source_path.clone(),
+            })
+        })
+        .unwrap_or_else(|| MoverIdentity {
+            username: "restore".into(),
+            hostname: namespace.to_string(),
+            source_path: target_path.clone(),
+        });
     // Carry the Restore CRD's options (ADR §4.6) through to the mover so kopia
     // honors them. `None` lets kopia use its defaults.
     let (ignore_permission_errors, write_files_atomically) = restore
@@ -1432,7 +1443,7 @@ async fn run_restore_mover(
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Restore(RestoreOp {
-            snapshot_id: snapshot_id.to_string(),
+            snapshot_id: source.kopia_snapshot_id.clone(),
             target_path: target_path.clone(),
             ignore_permission_errors,
             write_files_atomically,
@@ -1528,7 +1539,7 @@ async fn run_restore_mover(
     let cm = jobs::build_config_map(&inputs)?;
     let job = jobs::build_job(&inputs);
     io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
-    tracing::info!(restore = %name, job = %job_name, %snapshot_id, "created restore mover Job");
+    tracing::info!(restore = %name, job = %job_name, snapshot_id = %source.kopia_snapshot_id, "created restore mover Job");
     // The Job is new; the CALLER writes the matching status (direct: MoverJobCreated;
     // populator: PopulatingPrimePvc) so each path keeps its own phase discipline.
     Ok(MoverOutcome::Running { created: true })
@@ -1542,6 +1553,108 @@ struct ResolvedSource {
     kopia_snapshot_id: String,
     snapshot_ref: Option<kopiur_api::common::ObjectRef>,
     identity: Option<kopiur_api::common::ResolvedIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicySnapshotCandidate {
+    kopia_snapshot_id: String,
+    identity: kopiur_api::common::ResolvedIdentity,
+    end_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// Succeeded `Snapshot` CRs are the controller's cache of concrete kopia
+/// manifest ids. Prefer them for `fromPolicy` resolution so filesystem
+/// `ClusterRepository` restores do not require the repository path (for example
+/// `/repo`) to be mounted into the controller pod; the mover job owns that mount.
+fn policy_snapshot_candidates_from_crs(
+    snapshots: Vec<Snapshot>,
+    policy_name: &str,
+    policy_namespace: &str,
+    identity: &kopiur_api::common::ResolvedIdentity,
+) -> Vec<PolicySnapshotCandidate> {
+    let mut out: Vec<_> = snapshots
+        .into_iter()
+        .filter_map(|snap| {
+            let snap_ns = snap
+                .namespace()
+                .unwrap_or_else(|| policy_namespace.to_string());
+            let pref = snap.spec.policy_ref.as_ref()?;
+            let pref_ns = pref.namespace.as_deref().unwrap_or(&snap_ns);
+            if pref.name != policy_name || pref_ns != policy_namespace {
+                return None;
+            }
+            let status = snap.status.as_ref()?;
+            if status.phase != Some(SnapshotPhase::Succeeded) {
+                return None;
+            }
+            let info = status.snapshot.as_ref()?;
+            if &info.identity != identity {
+                return None;
+            }
+            let end_time = status
+                .timing
+                .as_ref()
+                .and_then(|t| t.end_time.as_deref())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .or_else(|| {
+                    snap.metadata.creation_timestamp.as_ref().and_then(|t| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(t.0.as_second(), 0)
+                    })
+                })?;
+            Some(PolicySnapshotCandidate {
+                kopia_snapshot_id: info.kopia_snapshot_id.clone(),
+                identity: info.identity.clone(),
+                end_time,
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+    out
+}
+
+fn filter_policy_snapshot_candidates_as_of(
+    mut snapshots: Vec<PolicySnapshotCandidate>,
+    as_of: Option<&str>,
+) -> Result<Vec<PolicySnapshotCandidate>> {
+    let Some(s) = as_of else {
+        return Ok(snapshots);
+    };
+    let cutoff = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| {
+            Error::Validation(format!(
+                "source asOf {s:?} is not an RFC3339 timestamp; use e.g. \
+                 2026-05-01T00:00:00Z (the newest snapshot at or before this instant \
+                 is restored): {e}"
+            ))
+        })?
+        .with_timezone(&chrono::Utc);
+    snapshots.retain(|e| e.end_time <= cutoff);
+    Ok(snapshots)
+}
+
+fn pick_policy_snapshot_candidate(
+    snapshots: Vec<PolicySnapshotCandidate>,
+    offset: i64,
+) -> Option<PolicySnapshotCandidate> {
+    let idx = offset.max(0) as usize;
+    snapshots.into_iter().nth(idx)
+}
+
+async fn list_policy_snapshot_cr_candidates(
+    ctx: &Context,
+    namespace: &str,
+    policy_name: &str,
+    identity: &kopiur_api::common::ResolvedIdentity,
+) -> Result<Vec<PolicySnapshotCandidate>> {
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let snapshots = api.list(&ListParams::default()).await?.items;
+    Ok(policy_snapshot_candidates_from_crs(
+        snapshots,
+        policy_name,
+        namespace,
+        identity,
+    ))
 }
 
 /// Best-effort, **positive-only** restore-direction securityContext check. If a pod already
@@ -1695,7 +1808,7 @@ async fn resolve_snapshot(
                         name: r.name.clone(),
                         namespace: Some(ns.to_string()),
                     }),
-                    identity: None,
+                    identity: Some(s.identity),
                 }))
         }
         RestoreSource::Identity(id) => {
@@ -1745,6 +1858,18 @@ async fn resolve_snapshot(
                 cfg_ns,
                 repo.identity_defaults.as_ref(),
             )?;
+            let cr_snapshots =
+                list_policy_snapshot_cr_candidates(ctx, cfg_ns, &c.name, &identity).await?;
+            let cr_snapshots =
+                filter_policy_snapshot_candidates_as_of(cr_snapshots, c.as_of.as_deref())?;
+            if let Some(candidate) = pick_policy_snapshot_candidate(cr_snapshots, c.offset) {
+                return Ok(Some(ResolvedSource {
+                    kopia_snapshot_id: candidate.kopia_snapshot_id,
+                    snapshot_ref: None,
+                    identity: Some(candidate.identity),
+                }));
+            }
+
             let snapshots = list_for_identity(
                 ctx,
                 &repo,
@@ -2050,6 +2175,72 @@ mod tests {
             list_entry("k2", "2026-06-02T00:00:00Z"),
             list_entry("k1", "2026-06-01T00:00:00Z"),
         ]
+    }
+
+    fn policy_snapshot(name: &str, id: &str, end_time: &str) -> Snapshot {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Snapshot",
+            "metadata": { "name": name, "namespace": "ns", "creationTimestamp": end_time },
+            "spec": { "policyRef": { "name": "cfg" } },
+            "status": {
+                "phase": "Succeeded",
+                "snapshot": {
+                    "kopiaSnapshotID": id,
+                    "identity": { "username": "u", "hostname": "h", "sourcePath": "/data" }
+                },
+                "timing": { "endTime": end_time }
+            }
+        }))
+        .expect("valid Snapshot")
+    }
+
+    #[test]
+    fn from_policy_prefers_succeeded_snapshot_cr_manifest_ids() {
+        let identity = kopiur_api::common::ResolvedIdentity {
+            username: "u".into(),
+            hostname: "h".into(),
+            source_path: Some("/data".into()),
+        };
+        let mut wrong_policy = policy_snapshot("other", "ignored-policy", "2026-06-04T00:00:00Z");
+        wrong_policy.spec.policy_ref.as_mut().unwrap().name = "other".into();
+        let mut wrong_identity =
+            policy_snapshot("wrong-id", "ignored-identity", "2026-06-05T00:00:00Z");
+        wrong_identity
+            .status
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .identity
+            .source_path = Some("/other".into());
+
+        let picked = policy_snapshot_candidates_from_crs(
+            vec![
+                policy_snapshot("old", "manifest-old", "2026-06-01T00:00:00Z"),
+                policy_snapshot("new", "manifest-new", "2026-06-03T00:00:00Z"),
+                wrong_policy,
+                wrong_identity,
+            ],
+            "cfg",
+            "ns",
+            &identity,
+        );
+
+        assert_eq!(
+            picked
+                .iter()
+                .map(|e| e.kopia_snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            ["manifest-new", "manifest-old"]
+        );
+        let kept =
+            filter_policy_snapshot_candidates_as_of(picked, Some("2026-06-02T00:00:00Z")).unwrap();
+        assert_eq!(
+            pick_policy_snapshot_candidate(kept, 0).map(|e| e.kopia_snapshot_id),
+            Some("manifest-old".to_string())
+        );
     }
 
     #[test]
