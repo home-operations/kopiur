@@ -110,11 +110,25 @@ When `mover.inheritSecurityContextFrom` is set, the controller reads the live wo
 
 | Message contains… | Cause | Fix |
 | --- | --- | --- |
-| `no pod matches` | The label selector matches no pod in the namespace (the workload is scaled to zero, or the labels are wrong). | Scale the workload up so its identity can be read, or fix `podSelector.matchLabels`. |
-| `has no container` | `inheritSecurityContextFrom.container` names a container the pod doesn't have. | Fix the `container` name (omit it to take the pod's first container). |
+| `no pod matches` | The `workloadSelector` label selector matches no pod in the namespace (the workload is scaled to zero, or the labels are wrong). | Scale the workload up so its identity can be read, or fix `podSelector.matchLabels`. |
+| `no running workload pod mounts the backup source PVC` | `pvcConsumer` is set but no (non-kopiur) pod currently mounts the source PVC, so there's no consumer to derive the identity from. | Scale the workload that mounts the PVC up, or switch to `workloadSelector` / an explicit `mover.securityContext`. |
+| `has no container` | `inheritSecurityContextFrom…container` names a container the pod doesn't have. | Fix the `container` name (omit it to take the pod's first container). |
 | `sets no securityContext … to inherit` | The matched pod sets **neither** a container nor a pod-level `securityContext`. | Set one on the workload, or use an explicit `mover.securityContext` / `mover.podSecurityContext` instead. |
+| `pvcConsumer … is only valid for a backup source` | `pvcConsumer` was set on a `Restore` or `Maintenance` (rejected at admission). | Use `workloadSelector` (Restore) or an explicit `mover.securityContext`. |
 
 `securityContext` (or `podSecurityContext`) and `inheritSecurityContextFrom` are **mutually exclusive** — setting both is rejected at admission by the webhook.
+
+### Admission warning: securityContext likely can't read the source
+
+At `kubectl apply` time the webhook may attach a **non-blocking warning** (the apply still succeeds):
+
+```
+Warning: securityContext: the mover's UID likely cannot read the source PVC `app-data`
+(no shared UID or group with the workload that mounts it) — the backup may fail with
+permission denied or silently skip unreadable files.
+```
+
+It fires only when the recipe **explicitly pins** a `runAsUser` that shares no UID or group with the workload mounting `source.pvc`. It's **best-effort** — the webhook can't see file modes (the data may be world-readable) or `moverDefaults`, so it stays silent when the UID is image-determined. The authoritative checks come later: the `SecurityContextCompatible` condition at reconcile and kopia's own output at runtime (below). A `Restore` gets the analogous warning about its *target* PVC's future consumer. The fix is always the same — match the mover to the workload via `inheritSecurityContextFrom.pvcConsumer: {}` or a matching `runAsUser`/`fsGroup`.
 
 ## Backup runs but `Failed`
 
@@ -135,6 +149,22 @@ fix the cause (`kopiaErrorClass` names it: `AuthFailure` = wrong password,
 same `logTail`/`failure` fields appear on a failed `Restore`.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
+
+## Backup `Succeeded` but is **incomplete** (`filesFailed > 0`)
+
+By default an unreadable file is **fatal** — the backup fails loudly with `PermissionDenied` (above), so nothing is silent. But if you set an `errorHandling.ignoreFileErrors`/`ignoreDirErrors` policy, kopia **completes** the snapshot while *skipping* the files it couldn't read. Kopiur surfaces that so it isn't silent: the excluded count rides on `status.stats.filesFailed`, and the controller sets `SecurityContextCompatible=False` + a Warning Event.
+
+```console
+$ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.stats.filesFailed}'
+42
+$ kubectl get snapshot <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")].message}'
+the backup completed but 42 source entries could not be read and were EXCLUDED from the
+snapshot — it is INCOMPLETE. This is usually a UID/GID mismatch: match the mover to the
+workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching runAsUser…
+```
+
+This is the **certain** signal (kopia's own output, not a heuristic). The fix is the same as a permission mismatch — match the mover to the workload (`inheritSecurityContextFrom.pvcConsumer: {}`, or a matching `runAsUser`/`fsGroup`), then re-run. See [Security context → Catching permission mismatches early](security-context.md#catching-permission-mismatches-early).
 
 ## Backup (or Restore) `Failed` with `MoverPodWedged` — the pod couldn't start
 

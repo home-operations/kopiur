@@ -164,10 +164,10 @@ the whole `spec` is empty.
 | `observedGeneration` | int | kstatus. |
 | `snapshot` | {`kopiaSnapshotID`,`identity`} | The kopia artifact this CR owns. |
 | `timing` | {`startTime`,`endTime`,`durationSeconds`} | Run timing. |
-| `stats` | {`sizeBytes`,`bytesNew`,`filesNew`,`filesModified`,`filesUnchanged`} | From kopia JSON. |
+| `stats` | {`sizeBytes`,`bytesNew`,`filesNew`,`filesModified`,`filesUnchanged`,`filesFailed`?} | From kopia JSON. `filesFailed` is the count of source entries kopia **excluded** (couldn't read) — present and `> 0` only when an `errorHandling.ignoreFileErrors`/`ignoreDirErrors` policy let the snapshot complete despite unreadable files, i.e. the backup is **incomplete**. See [Security context → Catching permission mismatches early](security-context.md#catching-permission-mismatches-early). |
 | `job` | {`name`,`attempts`} | Mover Job (absent for discovered). |
 | `resolved` | {`repository`,`sources`[]} | Frozen recipe values at run time. |
-| `conditions` | []Condition | `SourcesQuiesced`, `SnapshotCreated`, … |
+| `conditions` | []Condition | `Ready` (kstatus), `SourcesQuiesced`, `SnapshotCreated`, `SourceStaged` (CSI), `CredentialsAvailable`, `MoverPermitted`, `HooksSucceeded`, `SecurityContextCompatible` (read-access; `True` when provably compatible, `False` only when `filesFailed > 0` — never a heuristic guess). |
 | `logTail` | string | Last output lines, written by the mover at the terminal transition — `Snapshot created: <id>` on success, the actionable error + kopia stderr tail on failure. Capped 4KiB; full logs in the Job pod. |
 | `failure` | {`kopiaErrorClass`,`message`,`stderrTail`?,`exitCode`?,`retryRecommended`} | Structured terminal-failure detail, written by the mover before it exits non-zero. §4.10 |
 | `pinned` | bool? | Observed kopia-side pin state (vs `spec.pin`). |
@@ -235,7 +235,7 @@ CRD validation).
 | `target` | {`pvcPrime`,`pvcRef`} | Resolved target. |
 | `timing` | {`startTime`,`endTime`} | — |
 | `progress` | {`bytesRestored`,`filesRestored`} | Live mover progress. |
-| `conditions` | []Condition | `Ready`/`Reconciling`/`Stalled`, reason text; `Resolved=False reason=WaitingForSnapshot` while a `policy.waitTimeout` window is open. |
+| `conditions` | []Condition | `Ready`/`Reconciling`/`Stalled`, reason text; `Resolved=False reason=WaitingForSnapshot` while a `policy.waitTimeout` window is open; `CredentialsAvailable`, `MoverPermitted`, `RestoreSecurityContextCompatible` (positive-only — `True` when the future consumer can read what the mover writes; advisory negatives are admission warnings). |
 | `logTail` | string | Last output lines, written by the mover at the terminal transition — `Restore completed: snapshot <id>` on success, the actionable error + kopia stderr tail on failure. Capped 4KiB. |
 | `failure` | {`kopiaErrorClass`,`message`,`stderrTail`?,`exitCode`?,`retryRecommended`} | Structured terminal-failure detail, written by the mover before it exits non-zero. §4.10 |
 
@@ -374,6 +374,13 @@ Per-recipe override (on `SnapshotPolicy`/`Restore`/`Maintenance`/`RepositoryRepl
 inheritSecurityContextFrom?, ttlSecondsAfterFinished? }`. `securityContext` and
 `inheritSecurityContextFrom` are mutually exclusive (webhook). Merges *over*
 `moverDefaults`; a partial override can only tighten the hardened baseline.
+
+`inheritSecurityContextFrom` is an **externally-tagged enum** — exactly one of:
+
+- **`workloadSelector: { podSelector: LabelSelector, container?: string }`** — copy the UID/GID from a live workload pod's container + pod `securityContext`, selected by label. Valid on **backup or restore**.
+- **`pvcConsumer: { container?: string }`** — auto-derive the workload from the pod mounting the **source PVC** (no selector). **Backup-source only**; the webhook **rejects it on a `Restore`** (and `Maintenance`), which have no backup source. Restore must use `workloadSelector`.
+
+Full treatment: [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
 
 ### CacheDefaults
 
