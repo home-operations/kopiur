@@ -59,6 +59,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "populator",
     "populator2",
     "popempty",
+    "popempty2",
     "readonly",
     "kstatus",
     "verify",

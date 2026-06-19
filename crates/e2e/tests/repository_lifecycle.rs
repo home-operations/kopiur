@@ -557,8 +557,11 @@ async fn restore_populator_continue_pins_decision_against_late_snapshot() {
         return;
     }
 
-    let policy = "e2e-popempty-policy";
-    ensure_empty_policy(&client, "e2e-popempty-repo", policy, "popempty").await;
+    // Own ISOLATED repo (popempty2): this test seeds a snapshot partway through, which
+    // shares the policy source's kopia identity — reusing the shared `popempty` repo would
+    // make it non-empty and break the sibling empty-volume tests depending on run order.
+    let policy = "e2e-popempty2-policy";
+    ensure_empty_policy(&client, "e2e-popempty2-repo", policy, "popempty2").await;
 
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let prefix = "e2e-popempty-pin";
