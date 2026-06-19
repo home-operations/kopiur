@@ -294,6 +294,13 @@ pub struct SnapshotStats {
     /// Count of files unchanged since the previous snapshot. ADR §3.4 status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_unchanged: Option<i64>,
+    /// Count of source entries kopia could **not** read and therefore EXCLUDED from the
+    /// snapshot (`rootEntry.summ.errors`), making it *incomplete*. Present (and `> 0`) only
+    /// when an `ignoreFileErrors`/`ignoreDirErrors` policy let the snapshot complete despite
+    /// unreadable files — the otherwise-silent partial-backup case. The controller surfaces
+    /// it as a warning condition + Event. Usually a UID/GID mismatch with the workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_failed: Option<i64>,
 }
 
 /// The mover Job backing a scheduled/manual `Snapshot`; absent for discovered. ADR §3.4 status.

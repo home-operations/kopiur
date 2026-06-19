@@ -1351,6 +1351,132 @@ fn inherit_errors_are_actionable() {
     );
 }
 
+// --- pvc_consumer_security_context_from_pods: discover the workload mounting a
+// backup source PVC, EXCLUDING kopiur mover pods, with a deterministic pick. ---
+
+#[cfg(test)]
+fn pod_mounting(
+    name: &str,
+    ns: &str,
+    phase: Option<&str>,
+    uid: Option<i64>,
+    claim: &str,
+    kopiur_managed: bool,
+) -> k8s_openapi::api::core::v1::Pod {
+    use k8s_openapi::api::core::v1::{
+        Container, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PodStatus, SecurityContext,
+        Volume,
+    };
+    use kube::core::ObjectMeta;
+    let labels = kopiur_managed.then(|| {
+        std::collections::BTreeMap::from([(
+            kopiur_api::consts::MANAGED_BY_LABEL.to_string(),
+            kopiur_api::consts::MANAGED_BY_VALUE.to_string(),
+        )])
+    });
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            labels,
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                security_context: uid.map(|u| SecurityContext {
+                    run_as_user: Some(u),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            volumes: Some(vec![Volume {
+                name: "data".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: claim.to_string(),
+                    read_only: None,
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        status: phase.map(|p| PodStatus {
+            phase: Some(p.to_string()),
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn pvc_consumer_inherits_from_the_mounting_workload() {
+    let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
+    let (csc, _) =
+        pvc_consumer_security_context_from_pods(&[workload], "pgdata", "db", None).unwrap();
+    assert_eq!(csc.unwrap().run_as_user, Some(999));
+}
+
+#[test]
+fn pvc_consumer_excludes_the_kopiur_mover_pod() {
+    // The mover pod ALSO mounts the source PVC; it must never be treated as the consumer
+    // (else the mover would inherit from itself). Only the real workload is eligible.
+    let mover = pod_mounting(
+        "mover-xyz",
+        "db",
+        Some("Running"),
+        Some(65532),
+        "pgdata",
+        true,
+    );
+    let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
+    let (csc, _) =
+        pvc_consumer_security_context_from_pods(&[mover, workload], "pgdata", "db", None).unwrap();
+    assert_eq!(csc.unwrap().run_as_user, Some(999));
+
+    // With ONLY the mover mounting it (workload scaled to zero) → actionable error, not
+    // a self-inherit.
+    let mover = pod_mounting(
+        "mover-xyz",
+        "db",
+        Some("Running"),
+        Some(65532),
+        "pgdata",
+        true,
+    );
+    let err = pvc_consumer_security_context_from_pods(&[mover], "pgdata", "db", None).unwrap_err();
+    assert!(
+        err.to_string().contains("no running workload pod mounts")
+            && err.to_string().contains("pgdata")
+    );
+}
+
+#[test]
+fn pvc_consumer_pick_is_deterministic() {
+    // Two Running consumers → the lexicographically smallest (namespace, name) wins,
+    // regardless of input order.
+    let a = pod_mounting("a-pod", "ns", Some("Running"), Some(1000), "data", false);
+    let b = pod_mounting("b-pod", "ns", Some("Running"), Some(2000), "data", false);
+    let (csc_fwd, _) =
+        pvc_consumer_security_context_from_pods(&[a.clone(), b.clone()], "data", "ns", None)
+            .unwrap();
+    let (csc_rev, _) =
+        pvc_consumer_security_context_from_pods(&[b, a], "data", "ns", None).unwrap();
+    assert_eq!(csc_fwd.unwrap().run_as_user, Some(1000));
+    assert_eq!(csc_rev.unwrap().run_as_user, Some(1000));
+}
+
+#[test]
+fn pvc_consumer_prefers_running_over_pending() {
+    let pending = pod_mounting("a-pod", "ns", Some("Pending"), Some(5), "data", false);
+    let running = pod_mounting("z-pod", "ns", Some("Running"), Some(1000), "data", false);
+    let (csc, _) =
+        pvc_consumer_security_context_from_pods(&[pending, running], "data", "ns", None).unwrap();
+    assert_eq!(
+        csc.unwrap().run_as_user,
+        Some(1000),
+        "a Running consumer beats a Pending one even with a larger (ns,name)"
+    );
+}
+
 // --- bootstrap_outcome: the (result, job state) pair classifies into an
 // exhaustive outcome whose success arm OWNS the result — the old code asserted
 // the "non-failure implies readable result" invariant with `.expect()`, which a

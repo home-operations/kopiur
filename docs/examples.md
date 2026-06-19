@@ -243,7 +243,7 @@ Restoring from a shared `ClusterRepository` into a namespace that has never run 
 
 ## Example 18 — Inherit the mover security context from a workload
 
-Instead of hard-coding the mover's UID/GID (example 09), `spec.mover.inheritSecurityContextFrom` copies the `securityContext` from a live workload pod onto the mover, so it runs as "whatever the app runs as." You select the workload by **label** (Kubernetes can't look up which pod mounts a PVC), and the same knob works on a `Restore`. Mutually exclusive with `securityContext`; an inherited *root* context is still gated by the `privileged-movers` opt-in. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
+Instead of hard-coding the mover's UID/GID (example 09), `spec.mover.inheritSecurityContextFrom` copies the `securityContext` from a live workload pod onto the mover, so it runs as "whatever the app runs as." On a **backup** the simplest form is `pvcConsumer: {}` — Kopiur auto-derives the pod mounting the source PVC; or name the workload by **label** with `workloadSelector` (required on a `Restore`, whose target consumer may not exist yet). Mutually exclusive with `securityContext`; an inherited *root* context is still gated by the `privileged-movers` opt-in. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
 
 ```yaml
 --8<-- "deploy/examples/18-inherit-security-context.yaml"

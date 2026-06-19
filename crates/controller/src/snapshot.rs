@@ -40,9 +40,10 @@ use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
     HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
-    STAGING_WAITING_REASON,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON, SOURCE_STAGED_CONDITION,
+    SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -574,6 +575,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 )
                 .await?;
             }
+            // Certain incompleteness signal: the mover recorded source entries kopia
+            // EXCLUDED (the ignore-file-errors path — an otherwise-silent partial backup).
+            // Flag it once-per-transition. Best-effort; never derails steady-state.
+            assess_completed_backup(ctx, &api, &name, backup).await;
             // Staged-source reap is normally done at the Succeeded transition;
             // re-issuing here covers a crash between the phase patch and the
             // cleanup (idempotent, no-op for Direct). BUT the mover stamps
@@ -879,10 +884,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `inheritSecurityContextFrom`. Both the privileged-mover gate and the Job use it,
     // so an inherited root context is gated exactly like an explicit one.
     // The effective container + pod security contexts — explicit, or both inherited
-    // from a workload pod via `inheritSecurityContextFrom`.
-    let (effective_sc, effective_pod_sc) =
-        io::resolve_mover_security_contexts(&ctx.client, &namespace, config.spec.mover.as_ref())
-            .await?;
+    // from a workload pod via `inheritSecurityContextFrom`. The backup source PVC (if any)
+    // powers the `pvcConsumer` auto-derive mode.
+    let source_pvc = source_volume.as_ref().and_then(|v| match &v.source {
+        jobs::MountSource::Pvc { claim_name } => Some(claim_name.as_str()),
+        jobs::MountSource::Nfs { .. } => None,
+    });
+    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+        &ctx.client,
+        &namespace,
+        config.spec.mover.as_ref(),
+        source_pvc,
+    )
+    .await?;
     let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
@@ -988,6 +1002,44 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             backup.meta().generation,
         );
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
+    }
+
+    // SecurityContext-compatibility (positive-only, best-effort): confirm `True` when the
+    // mover provably can read the source. `pvcConsumer` matches the source PVC's consumer by
+    // construction — set `True` directly without a second namespace pod LIST (the inherit
+    // resolver already listed). Otherwise assess against the live consumers. Never writes
+    // `False`/Event here — that comes certainly from `assess_completed_backup`.
+    if let Some(claim) = source_pvc {
+        let used_pvc_consumer = matches!(
+            config
+                .spec
+                .mover
+                .as_ref()
+                .and_then(|m| m.inherit_security_context_from.as_ref()),
+            Some(kopiur_api::common::InheritSecurityContextFrom::PvcConsumer(
+                _
+            ))
+        );
+        if used_pvc_consumer {
+            set_security_context_compatible(
+                &api,
+                &name,
+                backup,
+                "the mover inherited the source PVC consumer's securityContext (pvcConsumer), so \
+                 its UID/GID matches the workload by construction",
+            )
+            .await;
+        } else {
+            assess_backup_security_context(
+                &namespace,
+                backup,
+                claim,
+                &resolved_mover.security_context,
+                resolved_mover.pod_security_context.as_ref(),
+                ctx,
+            )
+            .await;
+        }
     }
 
     let owner = io::owner_ref_for(backup, "Snapshot")?;
@@ -2146,6 +2198,153 @@ async fn resolve_recipe(
     // exhaustively in the resolver (ADR §5.5).
     let repo = io::resolve_repository_ref(&ctx.client, &config.spec.repository, cfg_ns).await?;
     Ok((config, repo))
+}
+
+/// Best-effort, **positive-only** securityContext check for a backup source PVC. Lists the
+/// workload pods mounting `claim` and, when the mover is *provably* compatible (root, or an
+/// exact UID match with the workload), records `SecurityContextCompatible=True`. It NEVER
+/// writes `False` or emits an Event: a securityContext-only heuristic can't see file modes, so
+/// a UID mismatch is not proof of unreadability (world-readable data reads fine). The certain
+/// `False`+Event comes only from [`assess_completed_backup`] (kopia's own output); the
+/// advisory negative lives in the admission warning. Never returns an error.
+async fn assess_backup_security_context(
+    namespace: &str,
+    backup: &Snapshot,
+    claim: &str,
+    sc: &k8s_openapi::api::core::v1::SecurityContext,
+    psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
+    ctx: &Context,
+) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+
+    let pods = match Api::<Pod>::namespaced(ctx.client.clone(), namespace)
+        .list(&ListParams::default())
+        .await
+    {
+        Ok(list) => list.items,
+        // Best-effort: a transient list failure must never derail the backup.
+        Err(e) => {
+            tracing::debug!(error = %e, %namespace, "securityContext compat: pod list failed; skipping");
+            return;
+        }
+    };
+    let mover = kopiur_api::secctx_compat::mover_identity(sc, psc);
+    let identities = kopiur_api::secctx_compat::workload_identities(&pods, claim);
+    if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { .. } =
+        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities)
+    {
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+        set_security_context_compatible(
+            &api,
+            &backup.name_any(),
+            backup,
+            "the mover's UID can read the source (root, or an exact UID match with the workload)",
+        )
+        .await;
+    }
+    // Undecidable / likely-incompatible from securityContext alone → stay silent on the
+    // reconcile path (no false alarms). The mover verifies it for real at runtime.
+}
+
+/// Upsert `SecurityContextCompatible=True` on a Snapshot (idempotent, no Event — a positive
+/// confirmation, never an alarm).
+async fn set_security_context_compatible(
+    api: &Api<Snapshot>,
+    name: &str,
+    backup: &Snapshot,
+    message: &str,
+) {
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = io::upsert_condition(
+        &existing,
+        SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+        true,
+        SECURITY_CONTEXT_COMPATIBLE_REASON,
+        message,
+        backup.meta().generation,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    if let Err(e) = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        tracing::debug!(error = %e, %name, "securityContext compat: condition patch failed");
+    }
+}
+
+/// Post-run check (warn-only): a COMPLETED backup whose mover recorded excluded entries
+/// (`status.stats.filesFailed > 0`) is *incomplete* — kopia skipped unreadable source files
+/// under an ignore-file-errors policy. This is the certain runtime signal (kopia's own
+/// output), so it sets `SecurityContextCompatible=False` + a once-per-transition Warning
+/// Event with the actionable fix. Never returns an error.
+async fn assess_completed_backup(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    name: &str,
+    backup: &Snapshot,
+) {
+    let failed = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.stats.as_ref())
+        .and_then(|st| st.files_failed)
+        .unwrap_or(0);
+    if failed <= 0 {
+        return;
+    }
+    let msg = format!(
+        "the backup completed but {failed} source entr{} could not be read and were EXCLUDED \
+         from the snapshot — it is INCOMPLETE. This is usually a UID/GID mismatch: match the \
+         mover to the workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching \
+         runAsUser; otherwise fix the source file permissions",
+        if failed == 1 { "y" } else { "ies" },
+    );
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = io::upsert_condition(
+        &existing,
+        SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+        false,
+        SNAPSHOT_INCOMPLETE_REASON,
+        &msg,
+        backup.meta().generation,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    match io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        Ok(true) => {
+            io::publish_warning_event(
+                ctx,
+                backup,
+                SNAPSHOT_INCOMPLETE_REASON,
+                crate::consts::MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+                &msg,
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "incomplete-backup condition patch failed");
+        }
+    }
 }
 
 /// Build everything a backup run needs: the work spec, the source volume mount

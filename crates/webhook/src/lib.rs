@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod identity_collision;
 pub mod metrics;
 pub mod routes;
+pub mod secctx;
 pub mod tenancy;
 
 pub use routes::{AppState, app};

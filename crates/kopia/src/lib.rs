@@ -14,7 +14,7 @@ pub use client::{
 };
 pub use error::{KopiaError, KopiaErrorClass};
 pub use model::{
-    ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite,
+    ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite, EntryError,
     IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus,
     RootEntry, SnapshotCreateResult, SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo,
 };

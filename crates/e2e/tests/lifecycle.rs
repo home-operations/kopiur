@@ -776,7 +776,7 @@ async fn mover_inherits_security_context_from_workload_pod() {
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
-                    "podSelector": { "matchLabels": { "app": "e2e-inherit-workload" } }
+                    "workloadSelector": { "podSelector": { "matchLabels": { "app": "e2e-inherit-workload" } } }
                 }
             }
         }
@@ -955,7 +955,7 @@ async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
-                    "podSelector": { "matchLabels": { "app": "e2e-root-workload" } }
+                    "workloadSelector": { "podSelector": { "matchLabels": { "app": "e2e-root-workload" } } }
                 }
             }
         }

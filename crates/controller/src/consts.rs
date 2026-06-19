@@ -167,6 +167,28 @@ pub const STAGING_WAITING_REASON: &str = "WaitingForVolumeSnapshot";
 /// Event `action` (remediation hint) for a staging preflight failure: install the
 /// CSI snapshot stack / VolumeSnapshotClass, or set `copyMethod: Direct`.
 pub const FIX_SNAPSHOT_STACK_ACTION: &str = "InstallSnapshotStackOrUseDirect";
+/// `Snapshot` condition reporting whether the mover's resolved securityContext can read
+/// the backup **source** PVC (a securityContext-only heuristic; the mover's runtime
+/// readability preflight is the authoritative check). `True` = provably compatible (root
+/// mover / exact-UID match); `Unknown` = undecidable from the spec (the common case);
+/// `False` = a near-certain mismatch (carries the advisory remedy). Warn-only; never blocks.
+pub const SECURITY_CONTEXT_COMPATIBLE_CONDITION: &str = "SecurityContextCompatible";
+/// `reason` for [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`] = `True` (the positive confirmation
+/// — the only state the reconcile heuristic ever sets).
+pub const SECURITY_CONTEXT_COMPATIBLE_REASON: &str = "SecurityContextCompatible";
+/// `reason`/Event reason for [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`] = `False` when a backup
+/// COMPLETED but kopia (under an ignore-file-errors policy) excluded unreadable source entries
+/// — the *certain*, post-run signal that the snapshot is incomplete (`status.stats.filesFailed`).
+/// This is the only thing that ever sets the condition `False`.
+pub const SNAPSHOT_INCOMPLETE_REASON: &str = "SnapshotIncompleteUnreadableEntries";
+/// Event `action` (remediation hint) for a likely securityContext mismatch: match the
+/// mover to the workload via `inheritSecurityContextFrom.pvcConsumer` or a matching UID.
+pub const MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION: &str = "MatchWorkloadSecurityContext";
+/// `Restore` condition reporting whether the *future* consumer of the restore target PVC
+/// will be able to read what the mover writes (a securityContext-only heuristic; no runtime
+/// layer exists for restore since the consumer may not exist yet). Same tri-state semantics
+/// as [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`]; warn-only.
+pub const RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION: &str = "RestoreSecurityContextCompatible";
 /// `Snapshot` condition for `spec.hooks` execution (ADR §4.8) — `False` carries
 /// the failing hook's index, form, and actionable cause.
 pub const HOOKS_SUCCEEDED_CONDITION: &str = "HooksSucceeded";

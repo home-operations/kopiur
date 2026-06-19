@@ -14,7 +14,8 @@ use kube::api::{ListParams, PostParams};
 use kube::core::ObjectMeta;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::{MoverSpec, PodSelector};
+use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
+use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 
 use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
 use crate::error::{Error, Result};
@@ -411,16 +412,28 @@ pub fn inherited_security_context_from_pods(
         )));
     }
     // Prefer a Running pod; otherwise take the first match.
-    let pod = pods
-        .iter()
-        .find(|p| {
-            p.status
-                .as_ref()
-                .and_then(|s| s.phase.as_deref())
-                .map(|ph| ph == "Running")
-                .unwrap_or(false)
-        })
-        .unwrap_or(&pods[0]);
+    let pod = pods.iter().find(|p| pod_is_running(p)).unwrap_or(&pods[0]);
+    extract_inherited_contexts(pod, container, ns)
+}
+
+/// Whether a pod's `status.phase` is `Running`.
+fn pod_is_running(p: &Pod) -> bool {
+    p.status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .map(|ph| ph == "Running")
+        .unwrap_or(false)
+}
+
+/// Extract the inherited `(container, pod)` security contexts from one chosen workload
+/// pod: the named container's context (or the first container's), plus the pod-level
+/// `spec.securityContext`. Shared by `workloadSelector` and `pvcConsumer`. Errors when the
+/// named container is absent or the pod sets neither context.
+fn extract_inherited_contexts(
+    pod: &Pod,
+    container: Option<&str>,
+    ns: &str,
+) -> Result<InheritedContexts> {
     let containers = pod
         .spec
         .as_ref()
@@ -451,6 +464,72 @@ pub fn inherited_security_context_from_pods(
         )));
     }
     Ok((container_sc, pod_sc))
+}
+
+/// Resolve `inheritSecurityContextFrom.pvcConsumer` (backup sources only): find the
+/// workload pod(s) that mount the backup source PVC `claim` in `ns` and inherit one's
+/// security context — so the mover's UID/GID matches the workload *by construction*, with
+/// no hand-written selector. `Err(MissingDependency)` (transient, requeue) when there is no
+/// source PVC, or no non-kopiur pod currently mounts it.
+pub async fn resolve_pvc_consumer_security_context(
+    client: &kube::Client,
+    ns: &str,
+    source_pvc: Option<&str>,
+    container: Option<&str>,
+) -> Result<InheritedContexts> {
+    let claim = source_pvc.ok_or_else(|| {
+        Error::MissingDependency(
+            "mover.inheritSecurityContextFrom.pvcConsumer is only valid for a backup whose source \
+             is a single PVC — this run has no source PVC to derive the workload from; use \
+             workloadSelector or an explicit mover.securityContext instead"
+                .to_string(),
+        )
+    })?;
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let pods = api.list(&ListParams::default()).await?.items;
+    pvc_consumer_security_context_from_pods(&pods, claim, ns, container)
+}
+
+/// Pure core of [`resolve_pvc_consumer_security_context`]: from all pods in the namespace,
+/// pick the workload consuming `claim` and return its security contexts. **Excludes
+/// kopiur-managed pods** (the mover itself mounts the source PVC — it must never inherit
+/// from itself). Selection is deterministic: a `Running` consumer is preferred, ties broken
+/// by `(namespace, name)` so the same pod is chosen across reconciles. Pure (the `list` IO
+/// is the caller's) so the discovery/pick is unit-tested directly.
+pub fn pvc_consumer_security_context_from_pods(
+    pods: &[Pod],
+    claim: &str,
+    ns: &str,
+    container: Option<&str>,
+) -> Result<InheritedContexts> {
+    let mut consumers: Vec<&Pod> = pods
+        .iter()
+        .filter(|p| pod_mounts_claim(p, claim))
+        .filter(|p| !is_managed_by_kopiur(p))
+        .collect();
+    // Deterministic order: Running first, then lexicographic (namespace, name).
+    consumers.sort_by(|a, b| {
+        pod_is_running(b)
+            .cmp(&pod_is_running(a))
+            .then_with(|| pod_key(a).cmp(&pod_key(b)))
+    });
+    let pod = consumers.first().ok_or_else(|| {
+        Error::MissingDependency(format!(
+            "no running workload pod mounts the backup source PVC `{claim}` in namespace `{ns}` — \
+             mover.inheritSecurityContextFrom.pvcConsumer derives the mover's UID/GID from the pod \
+             that consumes this PVC, so that pod must be running; scale the workload up, or use an \
+             explicit mover.securityContext / workloadSelector instead"
+        ))
+    })?;
+    extract_inherited_contexts(pod, container, ns)
+}
+
+/// `(namespace, name)` key for deterministic pod ordering.
+fn pod_key(p: &Pod) -> (String, String) {
+    (
+        p.metadata.namespace.clone().unwrap_or_default(),
+        p.metadata.name.clone().unwrap_or_default(),
+    )
 }
 
 /// Ensure a controller-owned **persistent** kopia cache PVC named `name` exists in
@@ -511,14 +590,31 @@ pub async fn ensure_cache_pvc(
 /// unset (the Job builder then applies the hardened container default and no pod
 /// context). The result feeds BOTH the privileged-mover gate and the mover `Job`, so
 /// an inherited root context — container or pod — is gated exactly like an explicit one.
+///
+/// `source_pvc` is the backup source claim name, used only by the
+/// `inheritSecurityContextFrom.pvcConsumer` mode to discover the workload that mounts it;
+/// pass `None` for restore/maintenance movers (which have no backup source — `pvcConsumer`
+/// then fails with an actionable error, as it is backup-source-only).
 pub async fn resolve_mover_security_contexts(
     client: &kube::Client,
     ns: &str,
     mover: Option<&MoverSpec>,
+    source_pvc: Option<&str>,
 ) -> Result<InheritedContexts> {
     match mover {
         Some(m) => match &m.inherit_security_context_from {
-            Some(sel) => resolve_inherited_security_context(client, ns, sel).await,
+            Some(InheritSecurityContextFrom::WorkloadSelector(sel)) => {
+                resolve_inherited_security_context(client, ns, sel).await
+            }
+            Some(InheritSecurityContextFrom::PvcConsumer(pc)) => {
+                resolve_pvc_consumer_security_context(
+                    client,
+                    ns,
+                    source_pvc,
+                    pc.container.as_deref(),
+                )
+                .await
+            }
             None => Ok((m.security_context.clone(), m.pod_security_context.clone())),
         },
         None => Ok((None, None)),

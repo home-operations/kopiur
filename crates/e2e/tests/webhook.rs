@@ -83,7 +83,7 @@ fn mover_mutually_exclusive_backup_config(name: &str) -> SnapshotPolicy {
             "retention": { "keepLatest": 5 },
             "mover": {
                 "securityContext": { "runAsUser": 1000 },
-                "inheritSecurityContextFrom": { "podSelector": { "matchLabels": { "app": "x" } } }
+                "inheritSecurityContextFrom": { "workloadSelector": { "podSelector": { "matchLabels": { "app": "x" } } } }
             }
         }
     }))

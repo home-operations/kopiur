@@ -288,7 +288,15 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}
     }
+    // `pvcConsumer` derives the workload from a *backup source* PVC; a restore has no such
+    // source (it writes a target whose consumer may not exist yet), so it is backup-only.
     if let Some(m) = &spec.mover {
+        forbid_pvc_consumer(
+            m,
+            "restore",
+            "Use inheritSecurityContextFrom.workloadSelector (the pod that will read the restored \
+             data), or an explicit mover.securityContext, instead.",
+        )?;
         validate_mover(m, "Restore mover")?;
     }
     Ok(())
@@ -1335,6 +1343,26 @@ pub fn validate_replication_auth(
     }
 }
 
+/// `inheritSecurityContextFrom.pvcConsumer` derives the mover identity from a **backup
+/// source** PVC's consumer; a kind that has no backup source (Restore, Maintenance) must
+/// reject it at admission rather than fail at runtime. `field_prefix` names the owning kind
+/// (e.g. `"restore"`/`"maintenance"`), `instead` is the kind-appropriate remedy.
+fn forbid_pvc_consumer(mover: &MoverSpec, field_prefix: &str, instead: &str) -> ValidationResult {
+    if matches!(
+        mover.inherit_security_context_from,
+        Some(crate::common::InheritSecurityContextFrom::PvcConsumer(_))
+    ) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field_prefix}.mover.inheritSecurityContextFrom.pvcConsumer"),
+            reason: format!(
+                "is only valid for a backup source — there is no source PVC here to derive a \
+                 workload from. {instead}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Validate a `Maintenance` spec, accumulating all problems (ADR §3.7).
 pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     let mut errs = Vec::new();
@@ -1347,10 +1375,17 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     if let Err(e) = validate_cron(&spec.schedule.full.cron) {
         errs.push(e);
     }
-    if let Some(m) = &spec.mover
-        && let Err(e) = validate_mover(m, "Maintenance mover")
-    {
-        errs.push(e);
+    if let Some(m) = &spec.mover {
+        if let Err(e) = forbid_pvc_consumer(
+            m,
+            "maintenance",
+            "Use an explicit mover.securityContext instead.",
+        ) {
+            errs.push(e);
+        }
+        if let Err(e) = validate_mover(m, "Maintenance mover") {
+            errs.push(e);
+        }
     }
     if let Some(fp) = &spec.failure_policy
         && let Err(e) = validate_failure_policy(fp, "Maintenance")
@@ -2288,20 +2323,59 @@ mod tests {
         assert!(validate_backup_config(&nfs).is_empty());
     }
 
+    // --- pvcConsumer is backup-source-only: rejected on Restore AND Maintenance ---
+
+    #[test]
+    fn pvc_consumer_is_forbidden_on_non_backup_kinds() {
+        use crate::common::{InheritSecurityContextFrom, MoverSpec, PvcConsumerInherit};
+
+        // The shared guard powers both validate_restore and validate_maintenance.
+        let with_consumer = MoverSpec {
+            inherit_security_context_from: Some(InheritSecurityContextFrom::PvcConsumer(
+                PvcConsumerInherit::default(),
+            )),
+            ..Default::default()
+        };
+        let err = forbid_pvc_consumer(&with_consumer, "maintenance", "Use X.").unwrap_err();
+        match err {
+            ValidationError::InvalidFieldValue { field, reason } => {
+                assert_eq!(
+                    field,
+                    "maintenance.mover.inheritSecurityContextFrom.pvcConsumer"
+                );
+                assert!(reason.contains("backup source"), "{reason}");
+            }
+            other => panic!("expected InvalidFieldValue, got {other:?}"),
+        }
+
+        // workloadSelector and explicit contexts are fine on non-backup kinds.
+        let selector_ok = MoverSpec {
+            inherit_security_context_from: Some(InheritSecurityContextFrom::WorkloadSelector(
+                crate::common::PodSelector {
+                    pod_selector: Default::default(),
+                    container: None,
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(forbid_pvc_consumer(&selector_ok, "restore", "x").is_ok());
+        assert!(forbid_pvc_consumer(&MoverSpec::default(), "maintenance", "x").is_ok());
+    }
+
     // --- validate_mover: inheritSecurityContextFrom XOR explicit (container OR pod) ---
 
     #[test]
     fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         use crate::common::ObjectRef;
-        use crate::common::{MoverSpec, PodSelector};
+        use crate::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
         use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 
         let inherit = || {
-            Some(PodSelector {
+            Some(InheritSecurityContextFrom::WorkloadSelector(PodSelector {
                 pod_selector: LabelSelector::default(),
                 container: None,
-            })
+            }))
         };
 
         // inherit + container securityContext → rejected.

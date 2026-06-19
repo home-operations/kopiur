@@ -145,19 +145,11 @@ pub fn decide_colocation(
     }
 }
 
-/// Does this pod mount `claim_name` via a `persistentVolumeClaim` volume?
+/// Does this pod mount `claim_name` via a `persistentVolumeClaim` volume? Delegates to the
+/// canonical scanner in `kopiur_api::secctx_compat` so the colocation and securityContext-
+/// compatibility paths can never drift on what "mounts this claim" means.
 pub fn pod_mounts_claim(pod: &Pod, claim_name: &str) -> bool {
-    pod.spec
-        .as_ref()
-        .map(|s| s.volumes.as_deref().unwrap_or_default())
-        .unwrap_or_default()
-        .iter()
-        .any(|v| {
-            v.persistent_volume_claim
-                .as_ref()
-                .map(|pvc| pvc.claim_name == claim_name)
-                .unwrap_or(false)
-        })
+    kopiur_api::secctx_compat::pod_mounts_claim(pod, claim_name)
 }
 
 /// Pick the pod that best represents the volume's current holder: a `Running` mounter

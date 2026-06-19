@@ -589,9 +589,14 @@ async fn spawn_maintenance_job(
     // securityContext and ran NO privileged gate — both fixed here so a maintenance
     // mover is hardened/gated exactly like backup/restore (and inherits moverDefaults,
     // closing the drift the ClusterRepository hardcoded-context bug caused).
-    let (effective_sc, effective_pod_sc) =
-        io::resolve_mover_security_contexts(&ctx.client, namespace, maint.spec.mover.as_ref())
-            .await?;
+    // No backup source PVC for maintenance — `pvcConsumer` is not valid here.
+    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+        &ctx.client,
+        namespace,
+        maint.spec.mover.as_ref(),
+        None,
+    )
+    .await?;
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
         effective_sc.as_ref(),

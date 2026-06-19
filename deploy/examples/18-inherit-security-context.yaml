@@ -13,7 +13,9 @@
 # inherited *root* context is still elevated and needs the namespace opt-in.
 #
 # Field shapes verified against crates/api:
-#   spec.mover.inheritSecurityContextFrom : { podSelector: LabelSelector, container? }
+#   spec.mover.inheritSecurityContextFrom : exactly one of
+#       { workloadSelector: { podSelector: LabelSelector, container? } }  (backup or restore)
+#       { pvcConsumer: { container? } }                                   (backup source only)
 #   (externally-tagged backend: the bucket lives under `backend.s3`)
 ---
 apiVersion: v1
@@ -69,10 +71,18 @@ spec:
   # Do NOT also set `securityContext` here; the two are mutually exclusive.
   mover:
     inheritSecurityContextFrom:
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: app # the workload that owns `app-data`
-      container: app # optional; defaults to the pod's first container
+      # On a BACKUP source the simplest form is `pvcConsumer: {}` — the operator
+      # finds the pod that mounts `app-data` and inherits its securityContext, so the
+      # mover's UID/GID matches the workload by construction (no selector to maintain):
+      #
+      #   pvcConsumer: {}            # optionally: pvcConsumer: { container: app }
+      #
+      # Or name the workload explicitly with a label selector:
+      workloadSelector:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: app # the workload that owns `app-data`
+        container: app # optional; defaults to the pod's first container
 # --8<-- [end:policy]
 ---
 # ── The SAME knob works on a Restore ──────────────────────────────────────────
@@ -94,7 +104,10 @@ spec:
 #       name: app-data            # write back into the existing PVC
 #   mover:
 #     inheritSecurityContextFrom:
-#       podSelector:
-#         matchLabels:
-#           app.kubernetes.io/name: app
-#       container: app
+#       # On a RESTORE the consuming pod may not exist yet, so `pvcConsumer` does
+#       # not apply — name the future workload by label instead:
+#       workloadSelector:
+#         podSelector:
+#           matchLabels:
+#             app.kubernetes.io/name: app
+#         container: app

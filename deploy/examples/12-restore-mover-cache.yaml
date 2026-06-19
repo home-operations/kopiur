@@ -53,11 +53,13 @@ spec:
       fsGroupChangePolicy: OnRootMismatch # skip the recursive chown when already correct
     # Alternative to securityContext (set ONE, not both): copy the securityContext
     # from a live workload pod, so the restore always matches the app it feeds.
+    # On a Restore use workloadSelector (pvcConsumer is backup-source-only):
     # inheritSecurityContextFrom:
-    #   podSelector:
-    #     matchLabels:
-    #       app.kubernetes.io/name: postgres
-    #   container: postgres        # optional; defaults to the pod's first container
+    #   workloadSelector:
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: postgres
+    #     container: postgres        # optional; defaults to the pod's first container
     #
     # ── Root mover (LAST RESORT) ──────────────────────────────────────────────
     # `privilegedMode: true` (or runAsUser: 0) is ELEVATED — the restore namespace

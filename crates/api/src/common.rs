@@ -495,9 +495,12 @@ pub struct MoverSpec {
     /// Opt-in, namespace-gated; preserves UID/GID on restore. ADR §4.11/§G16.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged_mode: Option<bool>,
-    /// Opt-in: copy security context from a live workload pod. ADR §4.11.
+    /// Opt-in: copy security context from a live workload pod instead of setting an
+    /// explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
+    /// Either name the workload by label (`workloadSelector`) or, on a **backup**
+    /// source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherit_security_context_from: Option<PodSelector>,
+    pub inherit_security_context_from: Option<InheritSecurityContextFrom>,
     /// Per-recipe override of `moverDefaults.ttlSecondsAfterFinished` — the
     /// `Job.spec.ttlSecondsAfterFinished` for this recipe's mover Jobs so finished
     /// backup/restore Jobs self-GC. Recipe wins over the repo default; when neither
@@ -568,6 +571,24 @@ pub fn pod_security_context_is_elevated(
     psc: &k8s_openapi::api::core::v1::PodSecurityContext,
 ) -> bool {
     psc.run_as_user == Some(0) || psc.run_as_non_root == Some(false)
+}
+
+/// The **effective** `runAsUser` following kubelet precedence: the container
+/// `securityContext.runAsUser` if set, else the pod `securityContext.runAsUser`. `None`
+/// when neither pins a UID — the UID is then image-determined (the `USER` line) and
+/// unknowable from the spec.
+///
+/// This is the single definition of effective-UID precedence, shared by
+/// [`crate::invariants`] (INV-1, which keys "is root" on this) and
+/// [`crate::secctx_compat`] (which keys read-compatibility on it) so the two can never
+/// fork. "Is root" is `effective_run_as_user(..) == Some(0)` — never `runAsNonRoot`,
+/// which the invariants may flip.
+pub fn effective_run_as_user(
+    sc: Option<&SecurityContext>,
+    psc: Option<&PodSecurityContext>,
+) -> Option<i64> {
+    sc.and_then(|s| s.run_as_user)
+        .or_else(|| psc.and_then(|p| p.run_as_user))
 }
 
 /// The restricted-PSA-compatible **hardened** container security context (§4.11/G16):
@@ -1049,6 +1070,41 @@ pub struct PodSelector {
     /// Label selector matching the workload pod(s) to read context/hooks from.
     pub pod_selector: LabelSelector,
     /// Which container within the matched pod; absent uses the first/only container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+}
+
+/// Where the mover copies its security context from (instead of an explicit
+/// `securityContext`/`podSecurityContext`). **Externally tagged** — exactly one variant,
+/// so the source of the inherited identity is unambiguous and a `match` must handle every
+/// case (convention #1; NOT a bool + optional selector). Mutually exclusive with explicit
+/// contexts (webhook/[`crate::validate::validate_mover`]-enforced). The resolved context
+/// enters [`resolve_mover`] as the *recipe layer*, so the hardened base still applies.
+///
+/// Not `Eq`: `WorkloadSelector` embeds [`PodSelector`] → `LabelSelector` (`PartialEq` only).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum InheritSecurityContextFrom {
+    /// Match the workload pod(s) by an explicit label selector and inherit the chosen
+    /// container's `securityContext` plus the pod's `spec.securityContext`. Works for
+    /// both backup and restore (restore inherits from the pod that will *read* the data).
+    WorkloadSelector(PodSelector),
+    /// **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
+    /// backs up: the operator finds the pod(s) mounting the source claim and inherits
+    /// their securityContext, so the mover's UID/GID matches the workload *by
+    /// construction* — no hand-written selector. Meaningless on a restore (the consuming
+    /// pod may not exist yet, exactly like a populator), so restore must use
+    /// `workloadSelector`.
+    PvcConsumer(PvcConsumerInherit),
+}
+
+/// Tuning for [`InheritSecurityContextFrom::PvcConsumer`]. A sub-object (not a bare flag)
+/// so future knobs slot in without an API break (ADR §4.11).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PvcConsumerInherit {
+    /// Which container within the matched consumer pod to inherit from; absent uses the
+    /// first/only container (same semantics as [`PodSelector::container`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
 }
@@ -1879,6 +1935,54 @@ mod tests {
             resolve_mover(Some(&bare), None, None, None, None, None).source_colocation,
             SourceColocationMode::Auto,
         );
+    }
+
+    #[test]
+    fn inherit_security_context_from_parses_both_variants_the_cluster_way() {
+        // Externally tagged: { workloadSelector: {...} } vs { pvcConsumer: {...} }, parsed via
+        // YAML → serde_json::Value → typed (never serde_yaml, which mis-encodes external tags).
+        let selector: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              workloadSelector:
+                podSelector:
+                  matchLabels:
+                    app: pg
+                container: postgres
+            "#,
+        );
+        match selector.inherit_security_context_from {
+            Some(InheritSecurityContextFrom::WorkloadSelector(s)) => {
+                assert_eq!(s.container.as_deref(), Some("postgres"));
+            }
+            other => panic!("expected WorkloadSelector, got {other:?}"),
+        }
+
+        let consumer: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              pvcConsumer: {}
+            "#,
+        );
+        assert!(matches!(
+            consumer.inherit_security_context_from,
+            Some(InheritSecurityContextFrom::PvcConsumer(
+                PvcConsumerInherit { container: None }
+            )),
+        ));
+
+        let consumer_named: MoverSpec = crate::testutil::from_yaml(
+            r#"
+            inheritSecurityContextFrom:
+              pvcConsumer:
+                container: app
+            "#,
+        );
+        assert!(matches!(
+            consumer_named.inherit_security_context_from,
+            Some(InheritSecurityContextFrom::PvcConsumer(PvcConsumerInherit { container }))
+                if container.as_deref() == Some("app"),
+        ));
     }
 
     // --- §12 mover Job TTL precedence (recipe over default over built-in) ---

@@ -420,7 +420,7 @@ mod tests {
         let spec = json!({
             "source": { "fromPolicy": { "name": "pg" } },
             "target": { "populator": {} },
-            "mover": { "inheritSecurityContextFrom": { "podSelector": { "matchLabels": { "app": "pg" } } } }
+            "mover": { "inheritSecurityContextFrom": { "workloadSelector": { "podSelector": { "matchLabels": { "app": "pg" } } } } }
         });
         let body = review_body("Restore", "billing", "u", spec);
         let (_s, v) = post_review(body).await;
@@ -428,6 +428,24 @@ mod tests {
         let msg = v["response"]["status"]["message"].as_str().unwrap();
         assert!(
             msg.contains("inheritSecurityContextFrom") && msg.contains("populator"),
+            "msg was: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_pvc_consumer_inherit_is_denied_as_backup_only() {
+        // pvcConsumer derives from a backup SOURCE PVC; a restore has none → rejected.
+        let spec = json!({
+            "source": { "snapshotRef": { "name": "snap-1" } },
+            "target": { "pvcRef": { "name": "data" } },
+            "mover": { "inheritSecurityContextFrom": { "pvcConsumer": {} } }
+        });
+        let body = review_body("Restore", "billing", "u", spec);
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], false);
+        let msg = v["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("pvcConsumer") && msg.contains("backup source"),
             "msg was: {msg}"
         );
     }

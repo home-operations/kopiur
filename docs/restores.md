@@ -162,7 +162,7 @@ spec:
     mover:
         securityContext: { runAsUser: 1000, runAsGroup: 1000, ... } # CONTAINER: own the restored files
         podSecurityContext: { fsGroup: 1000 } # POD: make a fresh volume writable
-        # inheritSecurityContextFrom: { podSelector: {...} }        # ...or copy securityContext from a live pod
+        # inheritSecurityContextFrom: { workloadSelector: { podSelector: {...} } }  # ...or copy from a live pod (restore: use workloadSelector, not pvcConsumer)
         cache: { capacity: 16Gi, mode: Persistent, contentCacheSizeMb: 10000 }
     failurePolicy:
         backoffLimit: 4

@@ -565,7 +565,7 @@ async fn restore_inherits_security_context_from_workload_pod() {
                 name,
                 serde_json::json!({
                     "mover": { "inheritSecurityContextFrom": {
-                        "podSelector": { "matchLabels": { "app": "e2e-r-inherit" } }
+                        "workloadSelector": { "podSelector": { "matchLabels": { "app": "e2e-r-inherit" } } }
                     } }
                 }),
             )),

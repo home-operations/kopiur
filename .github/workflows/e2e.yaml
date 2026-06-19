@@ -147,6 +147,11 @@ jobs:
           - shard: reshape-async
             bins: "verification replication"
             backends: false
+          # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
+          # SecurityContextCompatible reconcile condition. Filesystem only.
+          - shard: security-context-compat
+            bins: "security_context_compat"
+            backends: false
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

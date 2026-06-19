@@ -375,6 +375,26 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
                 .snapshot_create(&op.source_path, &op.tags, Some(&override_source))
                 .await
                 .map_err(kopia(KopiaOp::SnapshotCreate))?;
+            // kopia exits non-zero (→ a classified `PermissionDenied` failure above) when
+            // unreadable files are FATAL. But under an `ignoreFileErrors`/`ignoreDirErrors`
+            // policy it completes (exit 0) while still recording every skipped entry in
+            // `rootEntry.summ.errors` — an otherwise-SILENT incomplete backup. Surface it:
+            // the count rides on `status.stats.filesFailed` (set in `succeeded_backup`) and
+            // the controller raises a warning condition + Event; log it here too.
+            let skipped = result.entry_errors();
+            if !skipped.is_empty() {
+                warn!(
+                    skipped = skipped.len(),
+                    sample_path = %skipped[0].path,
+                    sample_error = %skipped[0].error,
+                    "backup completed but {} source entr{} unreadable and EXCLUDED from the \
+                     snapshot (ignore-file-errors policy) — it is INCOMPLETE; match the mover to \
+                     the workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching \
+                     runAsUser to capture them",
+                    skipped.len(),
+                    if skipped.len() == 1 { "y was" } else { "ies were" },
+                );
+            }
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
