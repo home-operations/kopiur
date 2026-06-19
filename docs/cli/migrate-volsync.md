@@ -73,6 +73,54 @@ straight from Git):
 `metadata.namespace`; `-n` only supplies a fallback for namespace-less objects
 and never filters offline input.
 
+### Try it offline
+
+[`deploy/examples/tryit/volsync-offline.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/volsync-offline.yaml) is a GitOps-shaped bundle: two fork-kopia `ReplicationSource`s in the `apps` namespace plus the repository Secrets they reference. Nothing here touches a cluster — you can run the whole arc on your laptop with no kubeconfig.
+
+```yaml
+--8<-- "deploy/examples/tryit/volsync-offline.yaml:sources"
+```
+
+**1. Point the policies at an existing kopiur `Repository`** — the simplest path, no Secret reads at all:
+
+```console
+$ kubectl kopiur migrate volsync -f deploy/examples/tryit/volsync-offline.yaml --repository nas --out-dir ./migrated
+wrote 2 file(s) to ./migrated:
+  blog.yaml
+  forum.yaml
+```
+
+You get one file per source — `migrated/blog.yaml` and `migrated/forum.yaml` — each a `SnapshotPolicy` + `SnapshotSchedule` pointing at the `nas` repository, ready to commit.
+
+**2. Or derive the `Repository` from the Secrets** with `--resolve-secrets`. The Secrets live in the same bundle: `-f` reads only the `ReplicationSource`s and `--secrets` reads only the `Secret`s, so one file feeds both flags (in a real repo, decrypt your SOPS Secrets to a scratch file first):
+
+```yaml
+--8<-- "deploy/examples/tryit/volsync-offline.yaml:secrets"
+```
+
+```console
+$ kubectl kopiur migrate volsync -f deploy/examples/tryit/volsync-offline.yaml \
+    --resolve-secrets --secrets deploy/examples/tryit/volsync-offline.yaml --out-dir ./migrated --force
+wrote 3 file(s) to ./migrated:
+  _shared.yaml
+  blog.yaml
+  forum.yaml
+```
+
+Now `migrated/_shared.yaml` carries the two derived `Repository` objects (each **adopting** the fork repo in place — no `create` block, the Secret referenced where it sits), and the per-source files reference them. Fork-kopia has no password placeholder, so the result is apply-ready.
+
+/// tip | Already running against the cluster?
+
+Drop `--secrets` for `--from-cluster-secrets` and the same command reads the live Secrets instead — handy when Flux has already decrypted them into the cluster. Or pipe the cluster's objects straight in: `kubectl get replicationsource -A -o yaml | kubectl kopiur migrate volsync -f - --repository nas`.
+
+///
+
+**3. Review and apply.** `--apply` is refused offline by design; commit the files, or apply them yourself:
+
+```console
+$ kubectl apply -f ./migrated
+```
+
 ## restic sources (upstream VolSync)
 
 /// danger | Config translation ONLY — no data is migrated
