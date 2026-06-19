@@ -108,7 +108,7 @@ Short name `kopiasp`, plural `snapshotpolicies`. Print columns: `REPOSITORY`,
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `repository` | [RepositoryRef](#repositoryref) | **required** | The `Repository`/`ClusterRepository` to write to. |
-| `identity` | {`username`?,`hostname`?} | — | Override the resolved `username@hostname`. |
+| `identity` | {`username`?,`hostname`?} | — | Override the resolved `username@hostname`. Each component is shape-checked (no `@`/`:`/whitespace/control chars, ≤253 bytes); changing it after the policy has snapshots is rejected unless `kopiur.home-operations.com/allow-identity-change` is set. See [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath). |
 | `sources` | [][Source](#source) | — | What to back up (≥1, webhook-enforced). |
 | `copyMethod` | enum(`Snapshot`\|`Clone`\|**`Direct`**) | `Direct` | How the source is captured: `Direct` (live PVC, co-located — default, works anywhere), `Snapshot` (CSI VolumeSnapshot → staged PVC, opt-in), `Clone` (CSI clone → staged PVC, opt-in). See [Copy methods](copy-methods.md). |
 | `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` for `Snapshot`/`Clone`; unset auto-selects the source driver's default class. NFS sources reject it (nothing to snapshot). |

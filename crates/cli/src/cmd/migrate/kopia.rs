@@ -1573,6 +1573,35 @@ mod tests {
         assert_eq!(u, "app");
     }
 
+    #[test]
+    fn fork_sanitized_identity_always_passes_kopiur_validator() {
+        // Locks the invariant the gap-hunt flagged: the bug-for-bug builder.go
+        // sanitizer can never emit a username/hostname that kopiur's shape validator
+        // rejects, so a migrated SnapshotPolicy is never bounced at admission. (Only
+        // explicit fork overrides bypass sanitization — those a user must keep clean,
+        // exactly as the fork itself required.)
+        use kopiur_api::validate::validate_identity_component;
+        for (name, ns) in [
+            ("vs-app", "media"),
+            ("app.v2", "ns.prod"),
+            ("my_app", "my_ns"),
+            ("-_app_-", ""),
+            ("...", "..."),
+            (&"a".repeat(80), &"n".repeat(80)),
+            ("", ""),
+        ] {
+            let (u, h) = fork_identity(name, ns, None, None);
+            assert!(
+                validate_identity_component("username", &u).is_ok(),
+                "fork username {u:?} (from {name:?}) must pass the validator"
+            );
+            assert!(
+                validate_identity_component("hostname", &h).is_ok(),
+                "fork hostname {h:?} (from {ns:?}/{name:?}) must pass the validator"
+            );
+        }
+    }
+
     // --- backend parsing per scheme ---
 
     #[test]

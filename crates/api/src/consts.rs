@@ -63,6 +63,20 @@ pub const RUN_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/run-reque
 /// (see `kopiur_api::maintenance::ManualRunMode`).
 pub const RUN_MODE_ANNOTATION: &str = "kopiur.home-operations.com/run-mode";
 
+/// Acknowledges an intentional change to a `SnapshotPolicy`'s resolved kopia
+/// identity (`username@hostname`, or a source's path) on UPDATE. Without it, the
+/// webhook **rejects** an edit that would re-identify a policy with existing
+/// snapshot history, because new snapshots land under a new kopia source and the
+/// old history is orphaned (GFS retention treats them as separate sources and never
+/// prunes the old set). Any **non-empty** value acknowledges the re-identification
+/// for that admission (presence-only, mirroring [`SKIP_SNAPSHOT_CLEANUP_ANNOTATION`];
+/// a specific value isn't required because an edit can change more than one identity
+/// component at once, and the operator-resolved string is not something the author
+/// can pre-compute). Lives here because the operator and any GitOps/user automation
+/// must agree on it byte-for-byte.
+pub const ALLOW_IDENTITY_CHANGE_ANNOTATION: &str =
+    "kopiur.home-operations.com/allow-identity-change";
+
 /// The API version string for kopiur CRDs (used in mover `TargetRef`s and
 /// `kubectl -o name`-style output).
 pub const API_VERSION: &str = "kopiur.home-operations.com/v1alpha1";
@@ -159,6 +173,7 @@ mod tests {
             SESSION_REPO_LABEL,
             RUN_REQUESTED_ANNOTATION,
             RUN_MODE_ANNOTATION,
+            ALLOW_IDENTITY_CHANGE_ANNOTATION,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");
         }

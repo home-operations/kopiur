@@ -18,7 +18,7 @@
 
 #![cfg(all(unix, feature = "e2e"))]
 
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
 use k8s_openapi::api::admissionregistration::v1::{
@@ -26,6 +26,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 };
 use k8s_openapi::api::core::v1::Secret;
 
+use kopiur_api::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION;
 use kopiur_api::{Repository, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
 
@@ -174,6 +175,130 @@ async fn self_managed_webhook_tls_bootstraps_and_gates_admission() {
         "mover mutual-exclusivity rejection should come from the webhook, got: {msg}"
     );
     let _ = configs.delete(bad_mover, &DeleteParams::default()).await;
+}
+
+/// A SnapshotPolicy whose explicit `spec.identity.username` carries kopia's `@`
+/// delimiter — structurally a valid string, but the shared `validate_identity_component`
+/// rejects it (it would misparse `username@hostname`). Exercises the identity shape
+/// validator through admission.
+fn bad_identity_backup_config(name: &str) -> SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "any" },
+            "identity": { "username": "bad@user" },
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "retention": { "keepLatest": 5 }
+        }
+    }))
+    .expect("SnapshotPolicy JSON deserializes")
+}
+
+/// A spec-valid SnapshotPolicy with an explicit pinned identity, suspended so the
+/// reconciler doesn't churn it while we drive admission directly.
+fn identity_backup_config(name: &str, username: &str, hostname: &str) -> SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "any" },
+            "identity": { "username": username, "hostname": hostname },
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "retention": { "keepLatest": 5 },
+            "suspend": true
+        }
+    }))
+    .expect("SnapshotPolicy JSON deserializes")
+}
+
+/// The identity shape validator and the fork-on-edit guard run through the real
+/// admission webhook against a live API server. The fork case is the one thing unit
+/// tests can't prove: that the API server delivers `oldObject.status` (the pinned
+/// identity + history) to the webhook on UPDATE.
+#[tokio::test]
+#[ignore = "requires a kind cluster with the operator installed (mise //crates/e2e:test)"]
+async fn identity_shape_and_fork_guard_are_enforced_at_admission() {
+    let Some(world) = World::connect().await else {
+        return; // no cluster: graceful no-op
+    };
+    let client = world.client().clone();
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // 1. An identity component carrying kopia's '@' delimiter is rejected.
+    let bad = "webhook-bad-identity";
+    let _ = policies.delete(bad, &DeleteParams::default()).await;
+    let err = policies
+        .create(&PostParams::default(), &bad_identity_backup_config(bad))
+        .await
+        .expect_err("an identity username with '@' must be DENIED by the webhook");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
+        "identity shape rejection should come from the webhook, got: {msg}"
+    );
+    let _ = policies.delete(bad, &DeleteParams::default()).await;
+
+    // 2. Fork-on-edit guard. Create a pinned-identity policy, simulate history by
+    //    patching status (resolved identity + lastSuccessfulSnapshot), then attempt to
+    //    change the identity.
+    let name = "webhook-identity-fork";
+    let _ = policies.delete(name, &DeleteParams::default()).await;
+    policies
+        .create(
+            &PostParams::default(),
+            &identity_backup_config(name, "pg", "billing"),
+        )
+        .await
+        .expect("a valid pinned-identity policy is admitted");
+
+    let status = serde_json::json!({
+        "status": {
+            "resolved": { "identity": { "username": "pg", "hostname": "billing" } },
+            "lastSuccessfulSnapshot": "2026-01-01T00:00:00Z"
+        }
+    });
+    policies
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
+        .await
+        .expect("status patch (simulated history) applies");
+
+    // Guard against a false pass: the simulated history must actually be present before
+    // we test the UPDATE (the reconciler is suspended, but assert it didn't clear it).
+    let got = policies.get_status(name).await.expect("get status");
+    assert!(
+        got.status
+            .as_ref()
+            .and_then(|s| s.last_successful_snapshot.as_ref())
+            .is_some(),
+        "simulated history must be pinned before the UPDATE test"
+    );
+
+    // Changing the resolved identity (hostname) on a policy with history → DENIED.
+    let change = serde_json::json!({ "spec": { "identity": { "hostname": "payments" } } });
+    let err = policies
+        .patch(name, &PatchParams::default(), &Patch::Merge(&change))
+        .await
+        .expect_err("re-identifying a policy with history must be DENIED");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
+        "fork rejection should come from the webhook, got: {msg}"
+    );
+
+    // The same change WITH the acknowledgment annotation → ADMITTED.
+    let acked = serde_json::json!({
+        "metadata": { "annotations": { ALLOW_IDENTITY_CHANGE_ANNOTATION: "intentional" } },
+        "spec": { "identity": { "hostname": "payments" } }
+    });
+    policies
+        .patch(name, &PatchParams::default(), &Patch::Merge(&acked))
+        .await
+        .expect("an acknowledged re-identification must be ADMITTED");
+
+    let _ = policies.delete(name, &DeleteParams::default()).await;
 }
 
 /// True when every webhook in the ValidatingWebhookConfiguration carries a

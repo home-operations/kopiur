@@ -670,6 +670,165 @@ pub fn detect_identity_collision(
         .map(|e| e.name.clone())
 }
 
+// --- Identity shape validation (kopia username@hostname:path contract) -------
+
+/// Generous byte cap for a single identity component. kopia imposes none; this only
+/// bounds adversarial input (a hostname mirrors DNS's 253 here).
+const IDENTITY_MAX_LEN: usize = 253;
+
+/// The shape problem (if any) with a kopia identity `username`/`hostname` component.
+/// kopia (`snapshot.ParseSourceInfo`) splits a source on the **first** `@` and
+/// **first** `:` with no escaping, so an embedded delimiter silently reparses the
+/// identity into a *different* one; whitespace and ASCII control characters survive
+/// verbatim but make the identity un-typeable/un-findable on a later
+/// `snapshot list --source`. This is the minimal shape rule — NOT a character class;
+/// dots, dashes, slashes and unicode letters all pass.
+fn identity_char_problem(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("must not be empty".to_string());
+    }
+    if value.len() > IDENTITY_MAX_LEN {
+        return Some(format!(
+            "is {} bytes; the maximum is {IDENTITY_MAX_LEN}",
+            value.len()
+        ));
+    }
+    if value.contains('@') {
+        return Some("must not contain '@' (kopia's username/hostname delimiter)".to_string());
+    }
+    if value.contains(':') {
+        return Some("must not contain ':' (kopia's hostname/path delimiter)".to_string());
+    }
+    if let Some(c) = value.chars().find(|c| c.is_ascii_whitespace()) {
+        return Some(format!("must not contain whitespace (found {c:?})"));
+    }
+    if let Some(c) = value.chars().find(|c| c.is_ascii_control()) {
+        return Some(format!("must not contain control characters (found {c:?})"));
+    }
+    None
+}
+
+/// Validate a resolved kopia identity component (`username`/`hostname`). Shape-only
+/// (see [`identity_char_problem`]); `field` names the surface for the message. Called
+/// both from the static admission validator (on explicit overrides) and from
+/// [`crate::resolve_identity`] (on the fully-resolved value, covering CEL results and
+/// defaults), so a bad identity can never be pinned.
+pub fn validate_identity_component(field: &str, value: &str) -> ValidationResult {
+    match identity_char_problem(value) {
+        None => Ok(()),
+        Some(reason) => Err(ValidationError::IdentityComponentInvalid {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason,
+        }),
+    }
+}
+
+/// Validate a kopia identity `sourcePath` (the part after the first `:`). Lenient:
+/// spaces and `:` are allowed (only the first `:` is kopia's delimiter, and the rest
+/// is the path verbatim), but the path must be non-empty and free of newlines / ASCII
+/// control characters.
+pub fn validate_source_path(field: &str, value: &str) -> ValidationResult {
+    let reason = if value.is_empty() {
+        Some("must not be empty when set".to_string())
+    } else {
+        value
+            .chars()
+            .find(|c| c.is_ascii_control())
+            .map(|c| format!("must not contain control characters (found {c:?})"))
+    };
+    match reason {
+        None => Ok(()),
+        Some(reason) => Err(ValidationError::IdentitySourcePathInvalid {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason,
+        }),
+    }
+}
+
+// --- Fork-on-edit guard (re-identifying a policy with history orphans snapshots) ---
+
+/// Pure decision for the fork-on-edit guard on a `username@hostname` change. Returns
+/// `Some(IdentityWouldFork)` iff the policy has snapshot history, the change was not
+/// acknowledged, and the resolved identity actually differs. The webhook does the IO
+/// (read the old object's pinned identity + history, resolve the new identity) and
+/// calls this.
+///
+/// ```
+/// use kopiur_api::validate::detect_identity_fork;
+///
+/// // History + a real change + no ack → fork.
+/// assert!(detect_identity_fork("pg@billing", "pg@payments", true, false).is_some());
+/// // No history yet (e.g. typo fixed before the first backup) → allowed.
+/// assert!(detect_identity_fork("pg@billing", "pg@payments", false, false).is_none());
+/// // Acknowledged → allowed.
+/// assert!(detect_identity_fork("pg@billing", "pg@payments", true, true).is_none());
+/// // No actual change → allowed.
+/// assert!(detect_identity_fork("pg@billing", "pg@billing", true, false).is_none());
+/// ```
+pub fn detect_identity_fork(
+    old_identity: &str,
+    new_identity: &str,
+    has_history: bool,
+    acknowledged: bool,
+) -> Option<ValidationError> {
+    (has_history && !acknowledged && old_identity != new_identity).then(|| {
+        ValidationError::IdentityWouldFork {
+            old: old_identity.to_string(),
+            new: new_identity.to_string(),
+        }
+    })
+}
+
+/// The `(pvcName, effectivePath)` kopia would record for a PVC-addressed source: an
+/// explicit `sourcePathOverride`, else the `/pvc/<name>` default (mirrors
+/// [`crate::resolve_identity`]). `None` for non-PVC sources (selector/NFS), which the
+/// path-fork guard does not reason about — their data identity is the selection/export
+/// itself, not an editable per-source path.
+fn pvc_source_effective_path(source: &Source) -> Option<(String, String)> {
+    let name = source.pvc.as_ref()?.name.clone();
+    let path = source
+        .source_path_override
+        .clone()
+        .unwrap_or_else(|| format!("/pvc/{name}"));
+    Some((name, path))
+}
+
+/// Pure decision for the fork-on-edit guard on a per-source path change. A PVC's kopia
+/// source path is part of its identity, so changing `sourcePathOverride` on a PVC that
+/// already has history orphans that PVC's snapshots exactly as a username/hostname
+/// change would. Sources are matched across the edit by PVC name (paths are never
+/// CEL-driven, so an old-vs-new spec diff is complete); selector/NFS sources are out of
+/// scope. Returns the first offending change.
+pub fn detect_source_path_fork(
+    old: &SnapshotPolicySpec,
+    new: &SnapshotPolicySpec,
+    has_history: bool,
+    acknowledged: bool,
+) -> Option<ValidationError> {
+    if !has_history || acknowledged {
+        return None;
+    }
+    let old_paths: BTreeMap<String, String> = old
+        .sources
+        .iter()
+        .filter_map(pvc_source_effective_path)
+        .collect();
+    for source in &new.sources {
+        if let Some((name, new_path)) = pvc_source_effective_path(source)
+            && let Some(old_path) = old_paths.get(&name)
+            && *old_path != new_path
+        {
+            return Some(ValidationError::IdentityWouldFork {
+                old: old_path.clone(),
+                new: new_path,
+            });
+        }
+    }
+    None
+}
+
 /// A cron expression parses with the same parser the controller uses at runtime, so
 /// bad expressions are rejected at apply time, not at first reconcile (ADR §4.1).
 ///
@@ -722,6 +881,31 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     }
     for source in &spec.sources {
         if let Err(e) = validate_source(source) {
+            errs.push(e);
+        }
+    }
+    // Identity shape (kopia's username@hostname:path contract). The explicit
+    // overrides are validated here — client-free, so this runs on every admission
+    // even when the webhook has no kube client. CEL-resolved values and the
+    // name/namespace defaults are validated where they are resolved
+    // (`resolve_identity`), and again defensively at reconcile time.
+    if let Some(id) = &spec.identity {
+        if let Some(u) = &id.username
+            && let Err(e) = validate_identity_component("spec.identity.username", u)
+        {
+            errs.push(e);
+        }
+        if let Some(h) = &id.hostname
+            && let Err(e) = validate_identity_component("spec.identity.hostname", h)
+        {
+            errs.push(e);
+        }
+    }
+    for (i, source) in spec.sources.iter().enumerate() {
+        if let Some(p) = &source.source_path_override
+            && let Err(e) =
+                validate_source_path(&format!("spec.sources[{i}].sourcePathOverride"), p)
+        {
             errs.push(e);
         }
     }
@@ -3818,5 +4002,113 @@ server:
             )),
             "absent retention is the safe no-prune case and must not be flagged: {errs:?}"
         );
+    }
+
+    // --- identity shape validation ---
+
+    #[test]
+    fn identity_component_accepts_normal_values() {
+        for v in [
+            "postgres-data",
+            "billing",
+            "billing-postgres-data",
+            "team.prod",
+            "my_app",
+            "a",
+            "café", // unicode letters pass — shape-only, not a character class
+        ] {
+            assert!(
+                validate_identity_component("f", v).is_ok(),
+                "{v:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_component_rejects_kopia_delimiters_and_blanks() {
+        // The exact misparse/un-findability cases kopia's first-@/first-: parser hits.
+        for (v, why) in [
+            ("", "empty"),
+            ("a@b", "@ delimiter"),
+            ("ho:st", ": delimiter"),
+            ("has space", "whitespace"),
+            ("tab\there", "tab"),
+            ("line\nbreak", "newline"),
+            ("nul\0byte", "control char"),
+        ] {
+            let err = validate_identity_component("spec.identity.username", v).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::IdentityComponentInvalid { .. }),
+                "{v:?} ({why}) should be rejected, got {err:?}"
+            );
+        }
+        // Over the length cap.
+        let long = "a".repeat(IDENTITY_MAX_LEN + 1);
+        assert!(validate_identity_component("f", &long).is_err());
+    }
+
+    #[test]
+    fn source_path_is_lenient_but_rejects_empty_and_control() {
+        // Spaces and ':' are fine in a path (only the first ':' is kopia's delimiter).
+        assert!(validate_source_path("f", "/pvc/data").is_ok());
+        assert!(validate_source_path("f", "/mnt/My Files").is_ok());
+        assert!(validate_source_path("f", "/data:extra").is_ok());
+        // Empty-when-set and control chars are not.
+        assert!(validate_source_path("f", "").is_err());
+        assert!(validate_source_path("f", "/data\nx").is_err());
+    }
+
+    #[test]
+    fn backup_config_rejects_bad_identity_override_and_path() {
+        let mut spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+        );
+        spec.identity = Some(Identity {
+            username: Some("bad@user".into()),
+            hostname: Some("ok-host".into()),
+        });
+        spec.sources[0].source_path_override = Some("/data\nx".into());
+        let errs = validate_backup_config(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::IdentityComponentInvalid { field, .. } if field == "spec.identity.username")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::IdentitySourcePathInvalid { field, .. } if field == "spec.sources[0].sourcePathOverride")),
+            "{errs:?}"
+        );
+    }
+
+    // --- fork-on-edit detectors ---
+
+    #[test]
+    fn identity_fork_only_when_history_change_and_unacked() {
+        assert!(detect_identity_fork("pg@a", "pg@b", true, false).is_some());
+        assert!(detect_identity_fork("pg@a", "pg@b", false, false).is_none()); // no history
+        assert!(detect_identity_fork("pg@a", "pg@b", true, true).is_none()); // acked
+        assert!(detect_identity_fork("pg@a", "pg@a", true, false).is_none()); // no change
+    }
+
+    #[test]
+    fn source_path_fork_matches_by_pvc_name() {
+        let mk = |path_override: Option<&str>| -> SnapshotPolicySpec {
+            let mut s: SnapshotPolicySpec = crate::testutil::from_yaml(
+                "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+            );
+            s.sources[0].source_path_override = path_override.map(String::from);
+            s
+        };
+        // Default /pvc/data → explicit /data on the SAME pvc, with history, no ack → fork.
+        let old = mk(None);
+        let new = mk(Some("/data"));
+        assert!(detect_source_path_fork(&old, &new, true, false).is_some());
+        // Acked → allowed.
+        assert!(detect_source_path_fork(&old, &new, true, true).is_none());
+        // No history → allowed.
+        assert!(detect_source_path_fork(&old, &new, false, false).is_none());
+        // Same effective path (both default) → allowed.
+        assert!(detect_source_path_fork(&mk(None), &mk(None), true, false).is_none());
     }
 }

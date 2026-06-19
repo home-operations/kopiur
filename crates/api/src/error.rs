@@ -249,6 +249,64 @@ pub enum ValidationError {
         conflict: String,
     },
 
+    /// A kopia identity component (`username` or `hostname`) — whether an explicit
+    /// `spec.identity` override or the value an `identityDefaults` CEL expression
+    /// resolved to — contains a character that breaks kopia's
+    /// `username@hostname:path` contract. kopia parses a source on the **first** `@`
+    /// and **first** `:` with no escaping, so an embedded `@`, `:`, ASCII whitespace,
+    /// or control character silently misparses the identity into a *different* one
+    /// (or makes the snapshot un-findable on `snapshot list --source`). Rejected at
+    /// admission/resolution so it never reaches a mover Job. Shape-only — every other
+    /// character (dots, dashes, slashes, unicode letters) is allowed.
+    #[error(
+        "{field} {value:?} is not a valid kopia identity component: {reason} \
+         (kopia parses username@hostname:path on the first @ and first :, with no escaping)"
+    )]
+    IdentityComponentInvalid {
+        /// The offending field (e.g. `"spec.identity.username"` or `"resolved hostname"`).
+        field: String,
+        /// The rejected value.
+        value: String,
+        /// What's wrong (e.g. `"must not contain ':'"`).
+        reason: String,
+    },
+
+    /// A kopia identity `sourcePath` is malformed — empty, or it contains a newline
+    /// or an ASCII control character. The path is everything after the first `:` in
+    /// `username@hostname:path`; it may legitimately contain spaces and further `:`,
+    /// but not control characters, and must be non-empty when set.
+    #[error("{field} {value:?} is not a valid kopia source path: {reason}")]
+    IdentitySourcePathInvalid {
+        /// The offending field (e.g. `"spec.sources[0].sourcePathOverride"`).
+        field: String,
+        /// The rejected value.
+        value: String,
+        /// What's wrong and how to fix it.
+        reason: String,
+    },
+
+    /// An UPDATE to a `SnapshotPolicy` would change its resolved kopia identity
+    /// (`username@hostname`, or a source's path) while the policy already has snapshot
+    /// history. New snapshots would land under the new kopia source, orphaning the old
+    /// history — GFS retention treats them as separate sources and never prunes the
+    /// old set (a storage leak), and the new identity restarts retention from zero.
+    /// Rejected unless the change is acknowledged with the
+    /// `kopiur.home-operations.com/allow-identity-change` annotation
+    /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
+    #[error(
+        "this edit changes the policy's resolved kopia identity from {old:?} to {new:?}, but the \
+         policy already has snapshot history; new snapshots would orphan the old history (kopia \
+         treats them as a separate source and GFS retention never prunes the old set). To \
+         intentionally re-identify, set annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value)"
+    )]
+    IdentityWouldFork {
+        /// The previously-pinned identity (or source path).
+        old: String,
+        /// The new identity (or source path) this edit would resolve to.
+        new: String,
+    },
+
     /// A verification `successExpr` (ADR-0005 §4/§15) failed to **compile** (a
     /// syntax error, or it exceeds the length budget). Surfaced at admission.
     #[error("successExpr {expr:?} failed to compile: {reason} (check the CEL syntax)")]

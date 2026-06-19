@@ -76,6 +76,9 @@ identity:
 If you _don't_ match it, backups still succeed — but they start a brand-new
 lineage and re-upload a full copy instead of an incremental one.
 
+!!! tip "Adopting a perfectra1n/volsync **kopia** repo? Use `migrate volsync`, don't hand-write this"
+    Kopiur's *default* identity (`<policyName>@<namespace>:/pvc/<pvc>`) does **not** match what the volsync fork records (`<sanitized-name>@<sanitized-namespace>:/data`) — even the source path differs. Hand-adopting a fork repo without pinning the exact identity silently forks the history. [`kubectl kopiur migrate volsync`](../cli/migrate-volsync.md) computes the fork's identity for you (a bug-for-bug port of its sanitizer) and pins it, so history continues seamlessly. Reach for the manual identity match here only for a non-volsync writer.
+
 ## Verify adoption
 
 ```console
