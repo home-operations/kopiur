@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 
-use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
+use kopiur_api::{Repository, Snapshot, SnapshotPhase, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
 const CREDS_SECRET: &str = "kopia-creds";
@@ -243,12 +243,15 @@ async fn pvc_consumer_auto_derives_security_context() {
     .await;
 }
 
-/// Scenario (b): an explicit mover UID that shares neither UID nor group with the workload
-/// mounting the source PVC is flagged `SecurityContextCompatible=False` BEFORE the run — the
-/// early warning that prevents a surprise permission failure. Warn-only: the apply succeeds.
+/// Scenario (b): an explicit mover UID that doesn't match the source's owner but where the
+/// data is **world-readable** must NOT be falsely flagged — the backup completes and
+/// `SecurityContextCompatible` never goes `False`. A securityContext-only heuristic can't see
+/// file modes, so the reconcile path is positive-only; a `False` only ever comes from kopia
+/// actually excluding entries (`assess_completed_backup`). This is the regression test for the
+/// false-alarm the review caught.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn mismatched_mover_uid_is_flagged_incompatible() {
+async fn mismatched_mover_on_readable_data_is_not_falsely_flagged() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -258,19 +261,9 @@ async fn mismatched_mover_uid_is_flagged_incompatible() {
         .expect("provision filesystem fixtures");
     let client = world.client().clone();
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-
-    // Workload runs as uid 2600 with fsGroup 2600 (a group the hardened mover won't share).
-    pods.create(
-        &PostParams::default(),
-        &cr(workload_pod_json("e2e-scc-mismatch-pod", 2600, 2600)),
-    )
-    .await
-    .expect("create workload pod");
-    wait_pod_running(&pods, "e2e-scc-mismatch-pod").await;
 
     repos
         .create(
@@ -280,7 +273,8 @@ async fn mismatched_mover_uid_is_flagged_incompatible() {
         .await
         .expect("create Repository");
 
-    // Explicit mover UID 7777 — shares neither UID nor group with the uid-2600 workload.
+    // Explicit mover UID 7777 — doesn't match the (world-readable) e2e-src owner, but the data
+    // IS readable, so the backup must succeed WITHOUT a false SecurityContextCompatible=False.
     let policy = serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
         "kind": "SnapshotPolicy",
@@ -304,34 +298,33 @@ async fn mismatched_mover_uid_is_flagged_incompatible() {
         .await
         .expect("create Snapshot");
 
-    let (status, reason) = wait_until(
-        "SecurityContextCompatible=False (mismatch)",
+    // The backup of world-readable data must SUCCEED (the mismatched UID can still read it).
+    wait_until(
+        "backup Succeeded",
         default_timeout(),
         poll_interval(),
         || async {
-            let Some(b) = backups.get_opt("e2e-scc-mm-backup").await? else {
-                return Ok(None);
-            };
-            let cond = b
-                .status
-                .as_ref()
-                .and_then(|s| {
-                    s.conditions
-                        .iter()
-                        .find(|c| c.type_ == SECURITY_CONTEXT_COMPATIBLE)
-                })
-                .map(|c| (c.status.clone(), c.reason.clone()));
-            // Only resolve once the condition has settled on False.
-            Ok(cond.filter(|(s, _)| s == "False"))
+            Ok(backups.get_opt("e2e-scc-mm-backup").await?.filter(|b| {
+                b.status.as_ref().and_then(|s| s.phase) == Some(SnapshotPhase::Succeeded)
+            }))
         },
     )
     .await
-    .expect("a mover sharing no UID/group with the workload must be flagged incompatible");
+    .expect("a mismatched mover on world-readable data should still complete the backup");
 
-    assert_eq!(status, "False");
-    assert_eq!(
-        reason, "SecurityContextLikelyIncompatible",
-        "the reason must name the near-certain mismatch"
+    // ...and it must NOT have been falsely flagged incompatible.
+    let b = backups
+        .get("e2e-scc-mm-backup")
+        .await
+        .expect("read the Snapshot");
+    let false_flag = b.status.as_ref().is_some_and(|s| {
+        s.conditions
+            .iter()
+            .any(|c| c.type_ == SECURITY_CONTEXT_COMPATIBLE && c.status == "False")
+    });
+    assert!(
+        !false_flag,
+        "a successful backup of world-readable data must not carry SecurityContextCompatible=False"
     );
 
     cleanup(

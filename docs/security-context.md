@@ -201,15 +201,15 @@ A mover that can't read the data it's backing up is the classic footgun. By defa
 
 1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match (no shared UID or group), the webhook attaches a non-blocking **warning** to the apply. Best-effort — it can't see file modes, and the workload may not be running yet.
 
-2. **On reconcile (status condition).** A Backup carries a `SecurityContextCompatible` condition **only when it's actionable** (it stays off normal backups rather than adding noise):
-   - `True` — provably fine (the mover is root, or its UID exactly matches the workload's).
-   - `False` — either a near-certain UID/group mismatch detected up front, **or** (the certain signal) the completed backup actually excluded unreadable entries (see #3). The message carries the count and the remedy.
+2. **On reconcile (status condition).** A Backup's `SecurityContextCompatible` condition is **positive-only and certain** — it's never a guess:
+   - `True` — provably fine: the mover is root, its UID exactly matches the workload's, or it inherited the source PVC's consumer via `pvcConsumer`.
+   - `False` — set **only** by the certain post-run signal (#3): the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
 
    ```console
    $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")]}'
    ```
 
-   A Restore carries the analogous `RestoreSecurityContextCompatible` condition (will the *future* consumer be able to read what the mover writes — where `fsGroup` matching matters).
+   A Restore carries the analogous `RestoreSecurityContextCompatible` condition, which is positive-only (`True` when the future consumer can read what the mover writes — matching UID or a shared `fsGroup`). A restore has no certain runtime signal, so its advisory negative lives entirely in the apply-time admission warning.
 
 3. **From kopia's own output (the authoritative signal).** The mover doesn't re-walk the tree — kopia already reports exactly which entries it skipped. When a backup **completes with excluded entries** (the ignore-errors case), the mover records the count on `status.stats.filesFailed`, and the controller raises `SecurityContextCompatible=False` + a Warning **Event** naming the count and the fix. A *fatal* permission error needs no special handling — kopia exits non-zero and the run already fails as `PermissionDenied`.
 

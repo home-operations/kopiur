@@ -41,8 +41,9 @@ use crate::consts::{
     CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
     HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
     PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
-    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON, SOURCE_STAGED_CONDITION,
+    SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -1003,24 +1004,42 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
     }
 
-    // SecurityContext-compatibility heuristic (warn-only): can the mover's resolved
-    // identity read the source PVC's files? This runs on the backup-launch path (so it is
-    // naturally gated to a real run, not every reconcile) against the post-invariant
-    // resolved contexts. A `False` (near-certain mismatch) sets the
-    // `SecurityContextCompatible` condition + a once-per-transition advisory Event; the
-    // mover's runtime readability preflight is the authoritative check. Never fatal.
+    // SecurityContext-compatibility (positive-only, best-effort): confirm `True` when the
+    // mover provably can read the source. `pvcConsumer` matches the source PVC's consumer by
+    // construction — set `True` directly without a second namespace pod LIST (the inherit
+    // resolver already listed). Otherwise assess against the live consumers. Never writes
+    // `False`/Event here — that comes certainly from `assess_completed_backup`.
     if let Some(claim) = source_pvc {
-        assess_backup_security_context(
-            ctx,
-            &api,
-            &name,
-            &namespace,
-            backup,
-            claim,
-            &resolved_mover.security_context,
-            resolved_mover.pod_security_context.as_ref(),
-        )
-        .await;
+        let used_pvc_consumer = matches!(
+            config
+                .spec
+                .mover
+                .as_ref()
+                .and_then(|m| m.inherit_security_context_from.as_ref()),
+            Some(kopiur_api::common::InheritSecurityContextFrom::PvcConsumer(
+                _
+            ))
+        );
+        if used_pvc_consumer {
+            set_security_context_compatible(
+                &api,
+                &name,
+                backup,
+                "the mover inherited the source PVC consumer's securityContext (pvcConsumer), so \
+                 its UID/GID matches the workload by construction",
+            )
+            .await;
+        } else {
+            assess_backup_security_context(
+                &namespace,
+                backup,
+                claim,
+                &resolved_mover.security_context,
+                resolved_mover.pod_security_context.as_ref(),
+                ctx,
+            )
+            .await;
+        }
     }
 
     let owner = io::owner_ref_for(backup, "Snapshot")?;
@@ -2181,21 +2200,20 @@ async fn resolve_recipe(
     Ok((config, repo))
 }
 
-/// Best-effort securityContext-compatibility assessment for a backup source PVC. Lists the
-/// workload pods mounting `claim` (excluding kopiur movers), compares their identity to the
-/// mover's resolved one, and records the `SecurityContextCompatible` condition (+ a
-/// once-per-transition advisory Event on a near-certain mismatch). Never returns an error —
-/// the mover's runtime preflight is the authoritative readability check; this is a hint.
-#[allow(clippy::too_many_arguments)]
+/// Best-effort, **positive-only** securityContext check for a backup source PVC. Lists the
+/// workload pods mounting `claim` and, when the mover is *provably* compatible (root, or an
+/// exact UID match with the workload), records `SecurityContextCompatible=True`. It NEVER
+/// writes `False` or emits an Event: a securityContext-only heuristic can't see file modes, so
+/// a UID mismatch is not proof of unreadability (world-readable data reads fine). The certain
+/// `False`+Event comes only from [`assess_completed_backup`] (kopia's own output); the
+/// advisory negative lives in the admission warning. Never returns an error.
 async fn assess_backup_security_context(
-    ctx: &Context,
-    api: &Api<Snapshot>,
-    name: &str,
     namespace: &str,
     backup: &Snapshot,
     claim: &str,
     sc: &k8s_openapi::api::core::v1::SecurityContext,
     psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
+    ctx: &Context,
 ) {
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::ListParams;
@@ -2211,48 +2229,47 @@ async fn assess_backup_security_context(
             return;
         }
     };
-    // Exclude kopiur mover pods (they mount the source PVC too — never assess against them).
-    let workloads: Vec<Pod> = pods
-        .into_iter()
-        .filter(|p| {
-            p.metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(kopiur_api::consts::MANAGED_BY_LABEL))
-                .map(|v| v != kopiur_api::consts::MANAGED_BY_VALUE)
-                .unwrap_or(true)
-        })
-        .collect();
-
-    let mover = crate::secctx::mover_read_identity(sc, psc);
-    let identities = crate::secctx::workload_identities(&workloads, claim);
-    let verdict = kopiur_api::secctx_compat::assess_read_compat(&mover, &identities);
-    let decision = crate::secctx::backup_verdict(mover.uid, &verdict);
-
-    // Actionable-only: a securityContext-only check is `Unknown` for most backups (file
-    // modes aren't visible), so stamping that on every Snapshot is noise. Only record the
-    // condition when it says something — provably compatible (`True`) or a near-certain
-    // mismatch (`False`). The certain incompleteness signal comes post-run from kopia's own
-    // output (`assess_completed_backup`).
-    if decision.status == "Unknown" {
-        return;
+    let mover = kopiur_api::secctx_compat::mover_identity(sc, psc);
+    let identities = kopiur_api::secctx_compat::workload_identities(&pods, claim);
+    if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { .. } =
+        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities)
+    {
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+        set_security_context_compatible(
+            &api,
+            &backup.name_any(),
+            backup,
+            "the mover's UID can read the source (root, or an exact UID match with the workload)",
+        )
+        .await;
     }
+    // Undecidable / likely-incompatible from securityContext alone → stay silent on the
+    // reconcile path (no false alarms). The mover verifies it for real at runtime.
+}
 
+/// Upsert `SecurityContextCompatible=True` on a Snapshot (idempotent, no Event — a positive
+/// confirmation, never an alarm).
+async fn set_security_context_compatible(
+    api: &Api<Snapshot>,
+    name: &str,
+    backup: &Snapshot,
+    message: &str,
+) {
     let existing = backup
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
-    let conditions = io::upsert_condition_status(
+    let conditions = io::upsert_condition(
         &existing,
         SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-        decision.status,
-        decision.reason,
-        &decision.message,
+        true,
+        SECURITY_CONTEXT_COMPATIBLE_REASON,
+        message,
         backup.meta().generation,
     );
     let current = serde_json::to_value(&backup.status).ok();
-    match io::patch_status_if_changed(
+    if let Err(e) = io::patch_status_if_changed(
         api,
         name,
         current.as_ref(),
@@ -2260,21 +2277,7 @@ async fn assess_backup_security_context(
     )
     .await
     {
-        // Emit the advisory Event only on a real transition into the warn state.
-        Ok(true) if decision.warn => {
-            io::publish_warning_event(
-                ctx,
-                backup,
-                decision.reason,
-                crate::secctx::CompatVerdict::ACTION,
-                &decision.message,
-            )
-            .await;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::debug!(error = %e, %name, "securityContext compat: condition patch failed");
-        }
+        tracing::debug!(error = %e, %name, "securityContext compat: condition patch failed");
     }
 }
 
@@ -2332,7 +2335,7 @@ async fn assess_completed_backup(
                 ctx,
                 backup,
                 SNAPSHOT_INCOMPLETE_REASON,
-                crate::secctx::CompatVerdict::ACTION,
+                crate::consts::MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
                 &msg,
             )
             .await;

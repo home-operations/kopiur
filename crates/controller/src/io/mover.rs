@@ -15,8 +15,7 @@ use kube::core::ObjectMeta;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
-use kopiur_api::consts::{MANAGED_BY_LABEL, MANAGED_BY_VALUE};
-use kopiur_api::secctx_compat::pod_mounts_claim;
+use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 
 use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
 use crate::error::{Error, Result};
@@ -506,7 +505,7 @@ pub fn pvc_consumer_security_context_from_pods(
     let mut consumers: Vec<&Pod> = pods
         .iter()
         .filter(|p| pod_mounts_claim(p, claim))
-        .filter(|p| !is_kopiur_managed(p))
+        .filter(|p| !is_managed_by_kopiur(p))
         .collect();
     // Deterministic order: Running first, then lexicographic (namespace, name).
     consumers.sort_by(|a, b| {
@@ -531,17 +530,6 @@ fn pod_key(p: &Pod) -> (String, String) {
         p.metadata.namespace.clone().unwrap_or_default(),
         p.metadata.name.clone().unwrap_or_default(),
     )
-}
-
-/// Whether a pod carries the kopiur `managed-by` label — i.e. it is a mover pod (which
-/// mounts the source PVC and must be excluded from consumer discovery).
-fn is_kopiur_managed(p: &Pod) -> bool {
-    p.metadata
-        .labels
-        .as_ref()
-        .and_then(|l| l.get(MANAGED_BY_LABEL))
-        .map(|v| v == MANAGED_BY_VALUE)
-        .unwrap_or(false)
 }
 
 /// Ensure a controller-owned **persistent** kopia cache PVC named `name` exists in

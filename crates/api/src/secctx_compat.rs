@@ -289,6 +289,30 @@ pub fn pods_mounting_pvc<'a>(pods: &'a [Pod], claim_name: &str) -> Vec<&'a Pod> 
         .collect()
 }
 
+/// Whether a pod is a kopiur-managed object (carries `app.kubernetes.io/managed-by=kopiur`).
+/// A mover Job's pod mounts the source PVC too, so consumer-discovery and compatibility
+/// reasoning must exclude these — otherwise the mover would be compared against (or inherit
+/// from) itself. The single definition, shared by the controller and webhook.
+pub fn is_managed_by_kopiur(pod: &Pod) -> bool {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(crate::consts::MANAGED_BY_LABEL))
+        .map(|v| v == crate::consts::MANAGED_BY_VALUE)
+        .unwrap_or(false)
+}
+
+/// Build [`WorkloadIdentity`] for every **workload** pod mounting `claim_name` — i.e. those
+/// mounting the claim, minus kopiur-managed (mover) pods. The shared core for backup,
+/// restore, and webhook compatibility checks (one definition, no per-caller duplication).
+pub fn workload_identities(pods: &[Pod], claim_name: &str) -> Vec<WorkloadIdentity> {
+    pods_mounting_pvc(pods, claim_name)
+        .into_iter()
+        .filter(|p| !is_managed_by_kopiur(p))
+        .map(workload_identity)
+        .collect()
+}
+
 /// Assess whether a backup mover can read the source PVC's files, given the workload pods
 /// mounting it. See the module docs for the conservative posture; the result is deterministic
 /// (independent of `workloads` ordering).
@@ -638,6 +662,22 @@ mod tests {
         let found = pods_mounting_pvc(&pods, "wanted");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].metadata.name.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn workload_identities_excludes_kopiur_movers() {
+        // A kopiur mover pod mounts the source PVC too — it must never be treated as a
+        // workload (else the mover compares against / inherits from itself).
+        let workload = pod("pg-0", "db", Some(999), None, "data");
+        let mut mover = pod("mover-x", "db", Some(65532), None, "data");
+        mover.metadata.labels = Some(std::collections::BTreeMap::from([(
+            crate::consts::MANAGED_BY_LABEL.to_string(),
+            crate::consts::MANAGED_BY_VALUE.to_string(),
+        )]));
+        assert!(is_managed_by_kopiur(&mover) && !is_managed_by_kopiur(&workload));
+        let ids = workload_identities(&[mover, workload], "data");
+        assert_eq!(ids.len(), 1, "only the non-kopiur workload counts");
+        assert_eq!(ids[0].name, "pg-0");
     }
 
     // --- restore-direction ---

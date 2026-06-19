@@ -17,7 +17,6 @@ pub mod metrics;
 pub mod repository;
 pub mod repository_replication;
 pub mod restore;
-pub mod secctx;
 pub mod server;
 pub mod snapshot;
 pub mod snapshot_policy;

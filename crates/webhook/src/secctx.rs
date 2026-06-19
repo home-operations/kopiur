@@ -7,9 +7,7 @@
 //! and we stay silent. We warn only on a near-certain `LikelyIncompatible` verdict.
 
 use api::common::MoverSpec;
-use api::secctx_compat::{
-    self, MoverReadCompat, MoverWriteIdentity, RestoreWriteCompat, WorkloadIdentity,
-};
+use api::secctx_compat::{self, MoverReadCompat, MoverWriteIdentity, RestoreWriteCompat};
 use api::snapshot_policy::Source;
 use k8s_openapi::api::core::v1::Pod;
 use kopiur_api as api;
@@ -55,16 +53,11 @@ pub async fn backup_warnings(
         Ok(list) => list.items,
         Err(_) => return Vec::new(),
     };
-    // Exclude kopiur mover pods (they mount the source PVC too).
-    let workload_pods: Vec<Pod> = pods.into_iter().filter(|p| !is_kopiur_managed(p)).collect();
 
     let mut warnings = Vec::new();
     for claim in claims {
-        let identities: Vec<WorkloadIdentity> =
-            secctx_compat::pods_mounting_pvc(&workload_pods, claim)
-                .into_iter()
-                .map(secctx_compat::workload_identity)
-                .collect();
+        // `workload_identities` mounts-the-claim + excludes kopiur mover pods (shared core).
+        let identities = secctx_compat::workload_identities(&pods, claim);
         if let MoverReadCompat::LikelyIncompatible { .. } =
             secctx_compat::assess_read_compat(&mover_id, &identities)
         {
@@ -108,10 +101,9 @@ pub async fn restore_warnings(
         Ok(list) => list.items,
         Err(_) => return Vec::new(),
     };
-    let consumer = secctx_compat::pods_mounting_pvc(&pods, claim)
+    let consumer = secctx_compat::workload_identities(&pods, claim)
         .into_iter()
-        .find(|p| !is_kopiur_managed(p))
-        .map(secctx_compat::workload_identity);
+        .next();
     if let RestoreWriteCompat::LikelyIncompatible { .. } =
         secctx_compat::assess_restore_compat(&write_id, consumer.as_ref())
     {
@@ -123,15 +115,6 @@ pub async fn restore_warnings(
     } else {
         Vec::new()
     }
-}
-
-fn is_kopiur_managed(p: &Pod) -> bool {
-    p.metadata
-        .labels
-        .as_ref()
-        .and_then(|l| l.get(api::consts::MANAGED_BY_LABEL))
-        .map(|v| v == api::consts::MANAGED_BY_VALUE)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
