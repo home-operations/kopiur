@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 
-use kopiur_api::{Repository, Snapshot, SnapshotPhase, SnapshotPolicy};
+use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
 const CREDS_SECRET: &str = "kopia-creds";
@@ -243,15 +243,19 @@ async fn pvc_consumer_auto_derives_security_context() {
     .await;
 }
 
-/// Scenario (b): an explicit mover UID that doesn't match the source's owner but where the
-/// data is **world-readable** must NOT be falsely flagged — the backup completes and
-/// `SecurityContextCompatible` never goes `False`. A securityContext-only heuristic can't see
-/// file modes, so the reconcile path is positive-only; a `False` only ever comes from kopia
-/// actually excluding entries (`assess_completed_backup`). This is the regression test for the
-/// false-alarm the review caught.
+/// Scenario (b): an explicit mover UID that doesn't match the workload mounting the source
+/// must NOT be flagged `SecurityContextCompatible=False` up front. A securityContext-only
+/// heuristic can't see file modes (the data may be world-readable), so the reconcile path is
+/// positive-only — a `False` only ever comes from kopia *actually* excluding entries at
+/// runtime (`assess_completed_backup`). This is the regression test for the launch-time
+/// false-alarm the review caught. We assert the reconcile ran (the mover Job was created) and
+/// never wrote `False`; we deliberately do NOT require the backup to complete, since the mover
+/// UID also governs (filesystem) repo access, which is orthogonal to source readability.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn mismatched_mover_on_readable_data_is_not_falsely_flagged() {
+async fn mismatched_mover_is_not_flagged_false_up_front() {
+    use k8s_openapi::api::batch::v1::Job;
+
     let Some(world) = World::connect().await else {
         return;
     };
@@ -261,9 +265,21 @@ async fn mismatched_mover_on_readable_data_is_not_falsely_flagged() {
         .expect("provision filesystem fixtures");
     let client = world.client().clone();
 
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // A workload running as uid 2600 mounts the source PVC — so the up-front check has a real
+    // consumer to compare against (mover uid 7777 vs workload 2600: no shared UID or group).
+    pods.create(
+        &PostParams::default(),
+        &cr(workload_pod_json("e2e-scc-mismatch-pod", 2600, 2600)),
+    )
+    .await
+    .expect("create workload pod");
+    wait_pod_running(&pods, "e2e-scc-mismatch-pod").await;
 
     repos
         .create(
@@ -273,8 +289,6 @@ async fn mismatched_mover_on_readable_data_is_not_falsely_flagged() {
         .await
         .expect("create Repository");
 
-    // Explicit mover UID 7777 — doesn't match the (world-readable) e2e-src owner, but the data
-    // IS readable, so the backup must succeed WITHOUT a false SecurityContextCompatible=False.
     let policy = serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
         "kind": "SnapshotPolicy",
@@ -298,34 +312,36 @@ async fn mismatched_mover_on_readable_data_is_not_falsely_flagged() {
         .await
         .expect("create Snapshot");
 
-    // The backup of world-readable data must SUCCEED (the mismatched UID can still read it).
+    // Wait until the reconcile has launched the mover Job — the up-front compat check runs
+    // immediately before this, so by now it has had its say.
     wait_until(
-        "backup Succeeded",
+        "mover Job created",
         default_timeout(),
         poll_interval(),
-        || async {
-            Ok(backups.get_opt("e2e-scc-mm-backup").await?.filter(|b| {
-                b.status.as_ref().and_then(|s| s.phase) == Some(SnapshotPhase::Succeeded)
-            }))
-        },
+        || async { Ok(jobs.get_opt("e2e-scc-mm-backup").await?) },
     )
     .await
-    .expect("a mismatched mover on world-readable data should still complete the backup");
+    .expect("the mover Job should be created (the reconcile, incl. the compat check, has run)");
 
-    // ...and it must NOT have been falsely flagged incompatible.
-    let b = backups
-        .get("e2e-scc-mm-backup")
-        .await
-        .expect("read the Snapshot");
-    let false_flag = b.status.as_ref().is_some_and(|s| {
-        s.conditions
-            .iter()
-            .any(|c| c.type_ == SECURITY_CONTEXT_COMPATIBLE && c.status == "False")
-    });
-    assert!(
-        !false_flag,
-        "a successful backup of world-readable data must not carry SecurityContextCompatible=False"
-    );
+    // The up-front heuristic must NOT have flagged it `False` (it can't see file modes). Give a
+    // couple of reconcile cycles to be sure nothing writes a late `False`, then assert.
+    for _ in 0..5 {
+        let b = backups
+            .get("e2e-scc-mm-backup")
+            .await
+            .expect("read the Snapshot");
+        let false_flag = b.status.as_ref().is_some_and(|s| {
+            s.conditions
+                .iter()
+                .any(|c| c.type_ == SECURITY_CONTEXT_COMPATIBLE && c.status == "False")
+        });
+        assert!(
+            !false_flag,
+            "a UID mismatch must not be flagged SecurityContextCompatible=False up front \
+             (the data may be world-readable; only kopia's runtime output sets False)"
+        );
+        tokio::time::sleep(poll_interval()).await;
+    }
 
     cleanup(
         &client,
