@@ -356,36 +356,30 @@ async fn pinned_snapshot_restamps_id_and_restores_by_ref() {
         .await
         .expect("pinned Snapshot should reach Succeeded");
 
-    // The id recorded at create time (pre-pin).
-    let id_at_create = status_json(&backups, backup).await["snapshot"]["kopiaSnapshotID"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    assert!(
-        !id_at_create.is_empty(),
-        "the Succeeded Snapshot must record a kopia snapshot id"
-    );
-
-    // Once the pin reconciles, the id MUST re-stamp to the live (post-pin)
-    // manifest. Pre-fix it stayed == id_at_create and pointed at a deleted
-    // manifest. This is the core regression assertion.
+    // Wait for the pin to reconcile. We deliberately do NOT assert the id
+    // *changed* from its create-time value: kopia rewrites the manifest id on
+    // pin, but the pin Job reconciles in seconds, so the pre-pin window is racy
+    // to observe. The deterministic proof that the re-stamp landed correctly is
+    // the snapshotRef restore + finalizer delete below — both consume the stored
+    // id and would fail (kopia `object not found` / silent orphan) if it pointed
+    // at the deleted pre-pin manifest.
     wait_until(
-        "pinned snapshot id re-stamped to the live manifest after pin",
+        "pinned snapshot reconciled (status.pinned=true) with a recorded id",
         default_timeout(),
         poll_interval(),
         || async {
             let s = status_json(&backups, backup).await;
             let pinned = s["pinned"].as_bool().unwrap_or(false);
             let id = s["snapshot"]["kopiaSnapshotID"].as_str().unwrap_or("");
-            Ok((pinned && !id.is_empty() && id != id_at_create).then_some(()))
+            Ok((pinned && !id.is_empty()).then_some(()))
         },
     )
     .await
-    .expect("the pinned snapshot's kopiaSnapshotID must re-stamp after the pin rewrites it");
+    .expect("the pinned Snapshot should reconcile its pin and keep a recorded id");
 
-    // A snapshotRef restore of the pinned snapshot must Complete. Pre-fix the
-    // mover failed with kopia `object not found` because the recorded id was the
-    // deleted pre-pin manifest.
+    // A snapshotRef restore of the pinned snapshot must Complete — the core
+    // regression. Pre-fix the mover failed with kopia `object not found` because
+    // the recorded id was the deleted pre-pin manifest.
     restores
         .create(
             &PostParams::default(),
