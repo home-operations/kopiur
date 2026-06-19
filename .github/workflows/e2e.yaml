@@ -144,8 +144,17 @@ jobs:
           - shard: hooks-retention
             bins: "hooks retention policy_knobs"
             backends: true
+          # `verification` (deep-verify scratch-restores) and `replication`
+          # (repository sync-to) are the two heaviest cron-wait suites; bundling
+          # both onto one kind node tipped it into NodeNotReady under runner
+          # resource pressure (scheduler 500 → nothing schedules → bootstrap
+          # fails). Give each its own shard/cluster to cut peak pressure —
+          # reshape-async keeps just verification; replication splits out.
           - shard: reshape-async
-            bins: "verification replication"
+            bins: "verification"
+            backends: false
+          - shard: replication
+            bins: "replication"
             backends: false
           # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
           # SecurityContextCompatible reconcile condition. Filesystem only.
