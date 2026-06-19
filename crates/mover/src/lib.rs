@@ -6,7 +6,6 @@ pub mod credentials;
 pub mod env;
 pub mod error;
 pub mod jobs;
-pub mod preflight;
 pub mod repo_meta;
 pub mod serve;
 pub mod status;

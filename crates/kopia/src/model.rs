@@ -66,9 +66,29 @@ pub struct DirSummary {
     /// Newest mtime found in the tree.
     #[serde(default, rename = "maxTime")]
     pub max_time: Option<DateTime<Utc>>,
-    /// Count of entries that failed during the walk.
+    /// Count of entries that failed during the walk **as fatal errors**. NOTE: this is
+    /// `0` when the failures were *ignored* by an `ignore-file-errors`/`ignore-dir-errors`
+    /// policy — in that case the snapshot still completes (exit 0) but the entries are in
+    /// [`DirSummary::errors`], which is the reliable "what got skipped" signal.
     #[serde(default, rename = "numFailed")]
     pub num_failed: u64,
+    /// Per-entry errors kopia hit while walking the tree (e.g. `permission denied`).
+    /// Populated whether the errors were fatal (exit 1) OR ignored by policy (exit 0), so
+    /// this is how an otherwise-silent *incomplete* snapshot is detected.
+    #[serde(default)]
+    pub errors: Vec<EntryError>,
+}
+
+/// One `{path, error}` entry from a snapshot's `rootEntry.summ.errors`. Kopia records the
+/// source-relative path and the full error string for every entry it could not include.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryError {
+    /// Source-relative path of the entry that failed (e.g. `secret_dir`).
+    #[serde(default)]
+    pub path: String,
+    /// The full error string (e.g. `... permission denied`).
+    #[serde(default)]
+    pub error: String,
 }
 
 /// The `rootEntry` of a snapshot — the top directory object plus its summary.
@@ -182,6 +202,17 @@ impl SnapshotCreateResult {
             .and_then(|r| r.summary.as_ref())
             .map(|s| s.num_failed)
             .unwrap_or(0)
+    }
+
+    /// The per-entry errors kopia recorded (empty if none / absent). Non-empty even when
+    /// the errors were *ignored* by policy (exit 0) — the canonical signal that a snapshot
+    /// is **incomplete** (some source entries were skipped).
+    pub fn entry_errors(&self) -> &[EntryError] {
+        self.root_entry
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+            .map(|s| s.errors.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -513,6 +544,44 @@ pub struct IndexBlobEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_errors_parse_from_ignored_error_snapshot() {
+        // The exact shape kopia 0.23.1 emits when ignore-file-errors is set: exit 0,
+        // numFailed=0, but summ.errors[] still lists every skipped entry (verified
+        // empirically against a uid-2000 0600 tree snapshotted as uid 65532).
+        let json = r#"{
+            "id": "k1",
+            "source": {"host": "h", "userName": "u", "path": "/pvc"},
+            "startTime": "2026-06-02T03:13:59Z",
+            "endTime": "2026-06-02T03:14:00Z",
+            "rootEntry": {
+                "name": "pvc", "type": "d", "obj": "k1",
+                "summ": {"size": 7, "files": 2, "dirs": 2, "numFailed": 0, "errors": [
+                    {"path": "secret_dir", "error": "cannot create iterator: unable to read directory: open /pvc/secret_dir: permission denied"},
+                    {"path": "topsecret.txt", "error": "unable to open file: open /pvc/topsecret.txt: permission denied"}
+                ]}
+            }
+        }"#;
+        let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
+        // numFailed is 0 (errors were ignored by policy) — so the COUNT must come from
+        // entry_errors(), not error_count(), or the incomplete snapshot stays silent.
+        assert_eq!(r.error_count(), 0);
+        assert_eq!(r.entry_errors().len(), 2);
+        assert_eq!(r.entry_errors()[0].path, "secret_dir");
+        assert!(r.entry_errors()[1].error.contains("permission denied"));
+    }
+
+    #[test]
+    fn entry_errors_empty_on_clean_snapshot() {
+        let json = r#"{
+            "id": "k1", "source": {"host": "h", "userName": "u", "path": "/p"},
+            "startTime": "2026-06-02T03:13:59Z", "endTime": "2026-06-02T03:14:00Z",
+            "rootEntry": {"name": "p", "type": "d", "obj": "k1", "summ": {"size": 4096, "files": 12}}
+        }"#;
+        let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
+        assert!(r.entry_errors().is_empty());
+    }
 
     #[test]
     fn index_blob_list_counts_entries() {

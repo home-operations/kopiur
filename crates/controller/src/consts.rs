@@ -179,6 +179,10 @@ pub const SECURITY_CONTEXT_COMPATIBLE_REASON: &str = "SecurityContextCompatible"
 pub const SECURITY_CONTEXT_UNDETERMINED_REASON: &str = "SecurityContextUndetermined";
 /// `reason`/Event reason for [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`] = `False`.
 pub const SECURITY_CONTEXT_LIKELY_INCOMPATIBLE_REASON: &str = "SecurityContextLikelyIncompatible";
+/// `reason`/Event reason for [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`] = `False` when a backup
+/// COMPLETED but kopia (under an ignore-file-errors policy) excluded unreadable source entries
+/// — a *certain*, post-run signal that the snapshot is incomplete (`status.stats.filesFailed`).
+pub const SNAPSHOT_INCOMPLETE_REASON: &str = "SnapshotIncompleteUnreadableEntries";
 /// Event `action` (remediation hint) for a likely securityContext mismatch: match the
 /// mover to the workload via `inheritSecurityContextFrom.pvcConsumer` or a matching UID.
 pub const MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION: &str = "MatchWorkloadSecurityContext";

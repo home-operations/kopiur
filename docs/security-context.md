@@ -197,14 +197,13 @@ A root mover widens the blast radius of the minted mover ServiceAccount. Reach f
 
 ## Catching permission mismatches early
 
-A mover that can't read the data it's backing up is the classic footgun: the backup either fails with `permission denied` or — worse — **silently skips** the unreadable files and still reports success, leaving you with an *incomplete* snapshot. Kopiur catches this at three points, earliest first:
+A mover that can't read the data it's backing up is the classic footgun. By default kopia treats an unreadable file or directory as **fatal** — the backup fails loudly with `permission denied` (classified `PermissionDenied`), so nothing is silent. The dangerous case is when you've set an `ignoreFileErrors`/`ignoreDirErrors` policy: kopia then **completes** the snapshot while *skipping* the files it couldn't read, leaving you with a silently *incomplete* backup. Kopiur surfaces all of this:
 
-1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match (no shared UID or group), the webhook attaches a non-blocking **warning** to the apply. It never blocks — it's a best-effort hint (it can't see file modes, and the workload may not be running yet).
+1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match (no shared UID or group), the webhook attaches a non-blocking **warning** to the apply. Best-effort — it can't see file modes, and the workload may not be running yet.
 
-2. **On the first reconcile (status condition).** Each Backup carries a `SecurityContextCompatible` condition:
+2. **On reconcile (status condition).** A Backup carries a `SecurityContextCompatible` condition **only when it's actionable** (it stays off normal backups rather than adding noise):
    - `True` — provably fine (the mover is root, or its UID exactly matches the workload's).
-   - `Unknown` — undecidable from securityContext alone (the common case; file modes aren't visible to the operator).
-   - `False` — a near-certain mismatch, with the remedy in the message.
+   - `False` — either a near-certain UID/group mismatch detected up front, **or** (the certain signal) the completed backup actually excluded unreadable entries (see #3). The message carries the count and the remedy.
 
    ```console
    $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")]}'
@@ -212,7 +211,12 @@ A mover that can't read the data it's backing up is the classic footgun: the bac
 
    A Restore carries the analogous `RestoreSecurityContextCompatible` condition (will the *future* consumer be able to read what the mover writes — where `fsGroup` matching matters).
 
-3. **At runtime in the mover (the authoritative check).** Just before it snapshots, the mover — which runs **as** the resolved UID with the PVC mounted — samples the source tree and actually tries to read it. If it's **wholly unreadable**, the Backup fails fast with an actionable `PermissionDenied` error naming the workload's UID/GID and the fix, instead of taking a silently-incomplete snapshot. (A partially-readable tree only logs a warning; kopia records the skipped files.)
+3. **From kopia's own output (the authoritative signal).** The mover doesn't re-walk the tree — kopia already reports exactly which entries it skipped. When a backup **completes with excluded entries** (the ignore-errors case), the mover records the count on `status.stats.filesFailed`, and the controller raises `SecurityContextCompatible=False` + a Warning **Event** naming the count and the fix. A *fatal* permission error needs no special handling — kopia exits non-zero and the run already fails as `PermissionDenied`.
+
+   ```console
+   $ kubectl get snapshot pg-backup -o jsonpath='{.status.stats.filesFailed}'
+   $ kubectl get events --field-selector involvedObject.name=pg-backup
+   ```
 
 The fix in every case is the same: match the mover to the workload — the easiest being `inheritSecurityContextFrom.pvcConsumer: {}` (above), or a matching `runAsUser`/`fsGroup`.
 

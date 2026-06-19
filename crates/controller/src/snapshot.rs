@@ -41,8 +41,8 @@ use crate::consts::{
     CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
     HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
     PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SOURCE_STAGED_CONDITION,
-    SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
+    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -574,6 +574,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 )
                 .await?;
             }
+            // Certain incompleteness signal: the mover recorded source entries kopia
+            // EXCLUDED (the ignore-file-errors path — an otherwise-silent partial backup).
+            // Flag it once-per-transition. Best-effort; never derails steady-state.
+            assess_completed_backup(ctx, &api, &name, backup).await;
             // Staged-source reap is normally done at the Succeeded transition;
             // re-issuing here covers a crash between the phase patch and the
             // cleanup (idempotent, no-op for Direct). BUT the mover stamps
@@ -2225,6 +2229,15 @@ async fn assess_backup_security_context(
     let verdict = kopiur_api::secctx_compat::assess_read_compat(&mover, &identities);
     let decision = crate::secctx::backup_verdict(mover.uid, &verdict);
 
+    // Actionable-only: a securityContext-only check is `Unknown` for most backups (file
+    // modes aren't visible), so stamping that on every Snapshot is noise. Only record the
+    // condition when it says something — provably compatible (`True`) or a near-certain
+    // mismatch (`False`). The certain incompleteness signal comes post-run from kopia's own
+    // output (`assess_completed_backup`).
+    if decision.status == "Unknown" {
+        return;
+    }
+
     let existing = backup
         .status
         .as_ref()
@@ -2261,6 +2274,72 @@ async fn assess_backup_security_context(
         Ok(_) => {}
         Err(e) => {
             tracing::debug!(error = %e, %name, "securityContext compat: condition patch failed");
+        }
+    }
+}
+
+/// Post-run check (warn-only): a COMPLETED backup whose mover recorded excluded entries
+/// (`status.stats.filesFailed > 0`) is *incomplete* — kopia skipped unreadable source files
+/// under an ignore-file-errors policy. This is the certain runtime signal (kopia's own
+/// output), so it sets `SecurityContextCompatible=False` + a once-per-transition Warning
+/// Event with the actionable fix. Never returns an error.
+async fn assess_completed_backup(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    name: &str,
+    backup: &Snapshot,
+) {
+    let failed = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.stats.as_ref())
+        .and_then(|st| st.files_failed)
+        .unwrap_or(0);
+    if failed <= 0 {
+        return;
+    }
+    let msg = format!(
+        "the backup completed but {failed} source entr{} could not be read and were EXCLUDED \
+         from the snapshot — it is INCOMPLETE. This is usually a UID/GID mismatch: match the \
+         mover to the workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching \
+         runAsUser; otherwise fix the source file permissions",
+        if failed == 1 { "y" } else { "ies" },
+    );
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = io::upsert_condition(
+        &existing,
+        SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+        false,
+        SNAPSHOT_INCOMPLETE_REASON,
+        &msg,
+        backup.meta().generation,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    match io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        Ok(true) => {
+            io::publish_warning_event(
+                ctx,
+                backup,
+                SNAPSHOT_INCOMPLETE_REASON,
+                crate::secctx::CompatVerdict::ACTION,
+                &msg,
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "incomplete-backup condition patch failed");
         }
     }
 }

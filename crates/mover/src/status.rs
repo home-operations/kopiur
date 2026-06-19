@@ -27,9 +27,13 @@ use serde::{Deserialize, Serialize};
 /// empty. kopia's snapshot-create summary reports the snapshot's total size and
 /// file count, mapped to `sizeBytes`/`filesNew`.
 fn stats_from_result(r: &SnapshotCreateResult) -> SnapshotStats {
+    // Entries kopia couldn't read and EXCLUDED (only non-empty on the exit-0
+    // ignore-file-errors path; the fatal exit-1 path never reaches a success status).
+    let failed = r.entry_errors().len();
     SnapshotStats {
         size_bytes: Some(r.total_bytes() as i64),
         files_new: Some(r.file_count() as i64),
+        files_failed: (failed > 0).then_some(failed as i64),
         ..Default::default()
     }
 }
@@ -138,7 +142,6 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::ReadyMarkerWrite { .. }
             | MoverError::VerifyNoSnapshot { .. }
             | MoverError::ScratchNotWritable { .. }
-            | MoverError::SourceUnreadable { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
@@ -531,8 +534,34 @@ mod tests {
         );
         assert_eq!(u.stats.as_ref().unwrap().size_bytes, Some(42));
         assert_eq!(u.stats.as_ref().unwrap().files_new, Some(3));
+        // A clean snapshot has no excluded entries → filesFailed stays absent.
+        assert_eq!(u.stats.as_ref().unwrap().files_failed, None);
         assert!(u.timing.is_some());
         assert!(u.failure.is_none());
+    }
+
+    #[test]
+    fn succeeded_backup_surfaces_excluded_entry_count() {
+        // ignore-file-errors path: exit 0, numFailed 0, but summ.errors[] lists the
+        // skipped entries → the backup is incomplete and `filesFailed` carries the count.
+        let json = r#"{
+            "id":"snap2","source":{"host":"h","userName":"u","path":"/pvc"},
+            "startTime":"2026-06-02T03:13:59Z","endTime":"2026-06-02T03:14:00Z",
+            "rootEntry":{"name":"pvc","type":"d","obj":"k1","summ":{"size":7,"files":2,"numFailed":0,
+                "errors":[
+                    {"path":"secret_dir","error":"unable to read directory: permission denied"},
+                    {"path":"topsecret.txt","error":"unable to open file: permission denied"}
+                ]}}
+        }"#;
+        let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
+        let u = StatusUpdate::succeeded_backup(&r, ts());
+        assert_eq!(u.phase, "Succeeded");
+        assert_eq!(
+            u.stats.as_ref().unwrap().files_failed,
+            Some(2),
+            "the count of EXCLUDED source entries must ride on status.stats.filesFailed"
+        );
+        assert_eq!(u.as_patch_body()["status"]["stats"]["filesFailed"], 2);
     }
 
     #[test]
