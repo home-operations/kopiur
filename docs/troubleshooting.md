@@ -130,6 +130,14 @@ permission denied or silently skip unreadable files.
 
 It fires only when the recipe **explicitly pins** a `runAsUser` that shares no UID or group with the workload mounting `source.pvc`. It's **best-effort** — the webhook can't see file modes (the data may be world-readable) or `moverDefaults`, so it stays silent when the UID is image-determined. The authoritative checks come later: the `SecurityContextCompatible` condition at reconcile and kopia's own output at runtime (below). A `Restore` gets the analogous warning about its *target* PVC's future consumer. The fix is always the same — match the mover to the workload via `inheritSecurityContextFrom.pvcConsumer: {}` or a matching `runAsUser`/`fsGroup`.
 
+## `SnapshotPolicy` rejected at admission: identity
+
+| Symptom (at `kubectl apply`) | Cause | Fix |
+| --- | --- | --- |
+| `… is not a valid kopia identity component … (kopia parses username@hostname:path on the first @ and first :)` | A `spec.identity.username`/`hostname` (or an `identityDefaults` CEL expression's result) is empty or contains `@`, `:`, whitespace, or a control character. | Use a value that round-trips through kopia's `username@hostname:path` form — no `@`/`:`/whitespace. Dots, dashes, slashes, and unicode letters are fine. |
+| `… is not a valid kopia source path …` | A `sourcePathOverride` is empty or contains a newline / control character. | Set a non-empty path without control characters (spaces and `:` are allowed). |
+| `this edit changes the policy's resolved kopia identity from … to …, but the policy already has snapshot history` | You edited `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has already produced snapshots — the change would orphan the old kopia history. | If unintentional, revert the identity. If you really mean to re-identify, set `kopiur.home-operations.com/allow-identity-change` (any non-empty value) on the policy. See [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath). |
+
 ## Backup runs but `Failed`
 
 The mover Job ran and exhausted its retries (`failurePolicy.backoffLimit`). The error tail is on the `Snapshot`:

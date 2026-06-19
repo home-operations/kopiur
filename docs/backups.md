@@ -181,6 +181,20 @@ identity:
 
 (For a shared `ClusterRepository`, the repo can supply identity _CEL expressions_ so tenants get distinct identities automatically — see [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel). An explicit `identity` here always wins.)
 
+!!! warning "Identity strings must round-trip through kopia"
+    `username` and `hostname` form the `username@hostname:path` string kopia parses on the **first** `@` and **first** `:` — with no escaping. The webhook therefore rejects a `username`/`hostname` that is empty or contains `@`, `:`, whitespace, or a control character (a `sourcePathOverride` may contain spaces and `:`, but not control characters and not be empty). This is shape-only — dots, dashes, slashes, and unicode letters are all fine. Normal Kubernetes names and namespaces always pass; the rule only catches values that could never have worked.
+
+!!! warning "Changing a policy's identity after it has snapshots orphans the old history"
+    A snapshot's identity is its address in the repository. If you edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, new snapshots land under the new address and the old ones are orphaned: GFS retention treats them as a separate source and never prunes them, and the new identity restarts retention from zero. To stop silent data loss the webhook **rejects** such an edit. If the re-identification is intentional, acknowledge it with the annotation:
+
+    ```yaml
+    metadata:
+      annotations:
+        kopiur.home-operations.com/allow-identity-change: "intentional"  # any non-empty value
+    ```
+
+    Fixing the identity *before* the first successful snapshot is unrestricted (there is no history to orphan).
+
 ### compression, files & extraArgs — kopia tuning and ignores
 
 These map onto kopia's per-source policy and sit as **top-level** siblings of `retention` on the `SnapshotPolicy` spec:

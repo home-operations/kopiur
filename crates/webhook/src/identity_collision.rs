@@ -55,14 +55,14 @@ pub fn repo_key(repo: &RepositoryRef, owner_namespace: &str) -> String {
 /// `None` for a namespaced `Repository`. Returns `None` if an expression fails to
 /// resolve (the per-field validators already reject those; here we just skip the
 /// collision check for an unresolvable identity rather than panic).
-pub fn policy_identity_string(
+pub fn resolve_policy_identity(
     name: &str,
     namespace: &str,
     spec: &SnapshotPolicySpec,
     labels: Option<&BTreeMap<String, String>>,
     annotations: Option<&BTreeMap<String, String>>,
     defaults: Option<&IdentityDefaults>,
-) -> Option<String> {
+) -> Option<api::common::ResolvedIdentity> {
     let first = spec.sources.first();
     let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
     let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
@@ -78,14 +78,36 @@ pub fn policy_identity_string(
         default_source_path: nfs_source_path.as_deref(),
         source_path_override: source_path_override.as_deref(),
     };
-    api::resolve_identity(&inputs)
-        .ok()
+    api::resolve_identity(&inputs).ok()
+}
+
+/// As [`resolve_policy_identity`], formatted as kopia's `username@hostname[:path]`
+/// string for collision comparison.
+pub fn policy_identity_string(
+    name: &str,
+    namespace: &str,
+    spec: &SnapshotPolicySpec,
+    labels: Option<&BTreeMap<String, String>>,
+    annotations: Option<&BTreeMap<String, String>>,
+    defaults: Option<&IdentityDefaults>,
+) -> Option<String> {
+    resolve_policy_identity(name, namespace, spec, labels, annotations, defaults)
         .map(|r| api::identity_string(&r))
 }
 
 /// Look up the `identityDefaults` of the `ClusterRepository` a policy references, if
 /// any (`None` for a namespaced `Repository` or when the lookup fails). Cached by
 /// repo name so listing N policies that share a ClusterRepository does one get.
+/// Fetch the `identityDefaults` of the `ClusterRepository` a single policy
+/// references (no cache — for callers resolving one policy, e.g. the fork guard).
+pub(crate) async fn cluster_repo_defaults_for(
+    client: &Client,
+    repo: &RepositoryRef,
+) -> Option<IdentityDefaults> {
+    let mut cache = BTreeMap::new();
+    cluster_repo_defaults(client, repo, &mut cache).await
+}
+
 async fn cluster_repo_defaults(
     client: &Client,
     repo: &RepositoryRef,

@@ -126,6 +126,23 @@ fn decode_old_spec<T: serde::de::DeserializeOwned>(
     decode_spec(&old.data).ok()
 }
 
+/// Decode the OLD object's typed `status` `T` from an UPDATE admission request. The
+/// status subresource is part of the stored object the API server sends as
+/// `oldObject`, so it is present once the controller has written it. A missing
+/// `status` decodes from `{}` (every status field is optional), yielding the default —
+/// used by the fork-on-edit guard to read the previously-pinned identity + history.
+fn decode_old_status<T: serde::de::DeserializeOwned>(
+    req: &AdmissionRequest<DynamicObject>,
+) -> Option<T> {
+    let old = req.old_object.as_ref()?;
+    let status = old
+        .data
+        .get("status")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    serde_json::from_value(status).ok()
+}
+
 /// Apply a JSON patch to a response; a serialization failure is the typed
 /// [`AdmissionError::InternalPatch`] (fail closed at the dispatch choke point).
 fn with_patch(resp: AdmissionResponse, ops: Vec<PatchOperation>) -> AdmissionResult {
@@ -231,6 +248,34 @@ async fn handle_snapshot_policy(
                     conflict: collision.conflict,
                 },
             ]));
+        }
+    }
+
+    // Fork-on-edit guard: on UPDATE, reject a change that would re-identify a policy
+    // with existing snapshot history (orphaning the old kopia source) unless it is
+    // acknowledged with the allow-identity-change annotation. Reads the old object's
+    // pinned identity + history; degrades to allow when it can't decide confidently.
+    if req.operation == Operation::Update
+        && let (Some(old_spec), Some(old_status)) = (
+            decode_old_spec::<SnapshotPolicySpec>(req),
+            decode_old_status::<api::snapshot_policy::SnapshotPolicyStatus>(req),
+        )
+    {
+        let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
+        let ns = req.namespace.as_deref().unwrap_or_default();
+        if let Some(err) = crate::identity_fork::check_identity_fork(
+            client,
+            name,
+            ns,
+            &spec,
+            obj.metadata.labels.as_ref(),
+            obj.metadata.annotations.as_ref(),
+            &old_spec,
+            &old_status,
+        )
+        .await
+        {
+            return Err(AdmissionError::Invalid(vec![err]));
         }
     }
 
@@ -676,6 +721,145 @@ mod tests {
             resp.warnings.is_none(),
             "no spurious warnings: {:?}",
             resp.warnings
+        );
+    }
+
+    // --- identity hardening ----------------------------------------------------
+
+    #[tokio::test]
+    async fn create_with_bad_identity_override_is_rejected() {
+        // A '@' in an explicit username override would misparse — rejected at admission
+        // (client-free path, no cluster needed).
+        let spec = json!({
+            "repository": { "kind": "Repository", "name": "r" },
+            "identity": { "username": "bad@user" },
+            "sources": [ { "pvc": { "name": "data" } } ],
+        });
+        let req = admission_request("SnapshotPolicy", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(!resp.allowed, "bad identity override must be rejected");
+        assert!(
+            resp.result
+                .message
+                .contains("not a valid kopia identity component"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    /// Build an UPDATE `AdmissionRequest` for a `SnapshotPolicy`, with the new object
+    /// (spec + annotations) and the `oldObject` (spec + status) as the API server sends
+    /// them. Used by the fork-on-edit guard tests.
+    fn update_policy_request(
+        new_spec: Value,
+        new_annotations: Value,
+        old_spec: Value,
+        old_status: Value,
+    ) -> AdmissionRequest<DynamicObject> {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "test-uid",
+                "kind": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "kind": "SnapshotPolicy" },
+                "resource": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "resource": "snapshotpolicies" },
+                "name": "pg",
+                "namespace": "billing",
+                "operation": "UPDATE",
+                "userInfo": { "username": "tester" },
+                "object": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "SnapshotPolicy",
+                    "metadata": { "name": "pg", "namespace": "billing", "annotations": new_annotations },
+                    "spec": new_spec,
+                },
+                "oldObject": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "SnapshotPolicy",
+                    "metadata": { "name": "pg", "namespace": "billing" },
+                    "spec": old_spec,
+                    "status": old_status,
+                }
+            }
+        });
+        let review: kube::core::admission::AdmissionReview<DynamicObject> =
+            serde_json::from_value(review).unwrap();
+        review.try_into().unwrap()
+    }
+
+    fn source(path_override: Option<&str>) -> Value {
+        match path_override {
+            Some(p) => json!({ "pvc": { "name": "data" }, "sourcePathOverride": p }),
+            None => json!({ "pvc": { "name": "data" } }),
+        }
+    }
+
+    fn policy_spec(path_override: Option<&str>) -> Value {
+        json!({
+            "repository": { "kind": "Repository", "name": "r" },
+            "sources": [ source(path_override) ],
+        })
+    }
+
+    fn status_with_history(has_history: bool) -> Value {
+        let mut s = json!({
+            "resolved": { "identity": { "username": "pg", "hostname": "billing" } }
+        });
+        if has_history {
+            s["lastSuccessfulSnapshot"] = json!("2026-06-19T00:00:00Z");
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn source_path_fork_on_policy_with_history_is_rejected() {
+        // The PVC's effective path changes (/pvc/data → /data) on a policy that has
+        // produced snapshots. This path is pure (no CEL), so the guard fires with no
+        // client.
+        let req = update_policy_request(
+            policy_spec(Some("/data")),
+            json!({}),
+            policy_spec(None),
+            status_with_history(true),
+        );
+        let resp = dispatch(&req, None).await;
+        assert!(!resp.allowed, "path re-identification must be rejected");
+        assert!(
+            resp.result.message.contains("orphan the old history"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn source_path_fork_is_allowed_with_ack_annotation() {
+        let req = update_policy_request(
+            policy_spec(Some("/data")),
+            json!({ "kopiur.home-operations.com/allow-identity-change": "yes" }),
+            policy_spec(None),
+            status_with_history(true),
+        );
+        let resp = dispatch(&req, None).await;
+        assert!(
+            resp.allowed,
+            "acknowledged re-identification must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_path_change_is_allowed_without_history() {
+        // No successful snapshot yet → nothing to orphan → allowed (typo-fix case).
+        let req = update_policy_request(
+            policy_spec(Some("/data")),
+            json!({}),
+            policy_spec(None),
+            status_with_history(false),
+        );
+        let resp = dispatch(&req, None).await;
+        assert!(
+            resp.allowed,
+            "no-history edit must be allowed: {:?}",
+            resp.result.message
         );
     }
 }

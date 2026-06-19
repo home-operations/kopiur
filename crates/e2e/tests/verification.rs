@@ -149,15 +149,17 @@ async fn verification_deep_scratch_restore_stamps_last_verified() {
     );
 }
 
-/// Repo-level `moverDefaults.scratch` is inherited by a policy's `verification.deep`
-/// scratch PVC — set the scratch size/class ONCE on the `Repository`, leave
-/// `verification.deep` bare, and the spawned deep-verify Job's scratch volume must be
-/// a sized ephemeral PVC carrying the inherited `storageClassName` + `capacity`.
+/// The deep-verify mover inherits the repository's `moverDefaults` — set both the
+/// scratch (`moverDefaults.scratch`) and the kopia cache (`moverDefaults.cache`)
+/// size/class ONCE on the `Repository`, leave `verification.deep` bare, and the
+/// spawned deep-verify Job's `scratch` AND `kopia-cache` volumes must both be sized
+/// ephemeral PVCs carrying the inherited `storageClassName` + `capacity`.
 ///
 /// Regression guard for the inheritance wiring (`moverDefaults.scratch ⊂
-/// verification.deep`). Asserted at the **Job spec** level (no PVC provisioning
-/// required), so a synthetic StorageClass is fine and the test stays fast — we only
-/// enable `deep` (no `quick`) so the single verify Job is the deep one.
+/// verification.deep`, and `moverDefaults.cache` → verify cache volume). Asserted at
+/// the **Job spec** level (no PVC provisioning required), so synthetic StorageClasses
+/// are fine and the test stays fast — we only enable `deep` (no `quick`) so the single
+/// verify Job is the deep one.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn deep_verify_scratch_inherits_repo_mover_defaults() {
@@ -175,14 +177,23 @@ async fn deep_verify_scratch_inherits_repo_mover_defaults() {
     )
     .await;
 
-    // Scratch defaults set ONCE on the Repository (the user's "configure it centrally"
-    // ask). A synthetic class is fine — we assert the Job spec, not a bound PVC.
+    // Scratch + cache defaults set ONCE on the Repository (the user's "configure it
+    // centrally" ask). Synthetic classes are fine — we assert the Job spec, not bound
+    // PVCs. cache.mode: Persistent must be COERCED to a per-run ephemeral volume for
+    // verify (it must never attach the backup's warm RWO PVC).
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let repo_patch = serde_json::json!({
-        "spec": { "moverDefaults": { "scratch": {
-            "capacity": "1Gi",
-            "storageClassName": "e2e-scratch-class"
-        } } }
+        "spec": { "moverDefaults": {
+            "scratch": {
+                "capacity": "1Gi",
+                "storageClassName": "e2e-scratch-class"
+            },
+            "cache": {
+                "capacity": "2Gi",
+                "storageClassName": "e2e-cache-class",
+                "mode": "Persistent"
+            }
+        } }
     });
     repos
         .patch(
@@ -191,7 +202,7 @@ async fn deep_verify_scratch_inherits_repo_mover_defaults() {
             &Patch::Merge(&repo_patch),
         )
         .await
-        .expect("patch moverDefaults.scratch onto the Repository");
+        .expect("patch moverDefaults.scratch + moverDefaults.cache onto the Repository");
 
     // Enable ONLY deep verify, with a bare schedule — scratch size/class come entirely
     // from the inherited repo default.
@@ -224,31 +235,36 @@ async fn deep_verify_scratch_inherits_repo_mover_defaults() {
     .await
     .expect("a deep-verify Job should be spawned");
 
-    // The inherited capacity makes scratch a SIZED ephemeral PVC (not an emptyDir),
-    // and the storageClass/capacity are the repo defaults.
+    // The inherited capacities make BOTH the scratch and the kopia cache sized
+    // ephemeral PVCs (not emptyDirs), carrying the repo-default class + capacity.
     let scratch = job_scratch_volume(&job).expect("deep-verify Job must mount a 'scratch' volume");
-    let tmpl = scratch
-        .ephemeral
-        .as_ref()
-        .and_then(|e| e.volume_claim_template.as_ref())
-        .expect(
-            "inherited scratch capacity must make scratch a sized ephemeral PVC, not an emptyDir",
-        );
+    let (scratch_class, scratch_cap) = ephemeral_class_and_capacity(&scratch).expect(
+        "inherited scratch capacity must make scratch a sized ephemeral PVC, not an emptyDir",
+    );
     assert_eq!(
-        tmpl.spec.storage_class_name.as_deref(),
+        scratch_class.as_deref(),
         Some("e2e-scratch-class"),
         "scratch PVC must inherit moverDefaults.scratch.storageClassName"
     );
-    let storage = tmpl
-        .spec
-        .resources
-        .as_ref()
-        .and_then(|r| r.requests.as_ref())
-        .and_then(|m| m.get("storage"))
-        .map(|q| q.0.clone());
     assert_eq!(
-        storage.as_deref(),
+        scratch_cap.as_deref(),
         Some("1Gi"),
         "scratch PVC must inherit moverDefaults.scratch.capacity"
+    );
+
+    let cache = job_cache_volume(&job).expect("deep-verify Job must mount a 'kopia-cache' volume");
+    let (cache_class, cache_cap) = ephemeral_class_and_capacity(&cache).expect(
+        "inherited cache capacity must make the verify cache a sized EPHEMERAL PVC \
+         (a Persistent moverDefaults.cache is coerced to ephemeral for verify), not an emptyDir",
+    );
+    assert_eq!(
+        cache_class.as_deref(),
+        Some("e2e-cache-class"),
+        "verify cache PVC must inherit moverDefaults.cache.storageClassName"
+    );
+    assert_eq!(
+        cache_cap.as_deref(),
+        Some("2Gi"),
+        "verify cache PVC must inherit moverDefaults.cache.capacity"
     );
 }

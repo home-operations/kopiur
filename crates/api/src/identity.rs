@@ -236,6 +236,18 @@ pub fn resolve_identity(inputs: &IdentityInputs<'_>) -> ValidationResult<Resolve
             .or_else(|| inputs.default_source_path.map(String::from)),
     };
 
+    // Shape-check the fully-resolved identity, regardless of where each component came
+    // from (explicit override, CEL expression result, or the name/namespace/PVC
+    // default). kopia parses `username@hostname:path` on the first `@`/`:` with no
+    // escaping, so a component carrying a delimiter/whitespace/control char would
+    // silently misparse or become un-findable. Rejecting here means the controller
+    // never PINS a bad identity into status, and the webhook surfaces it at admission.
+    crate::validate::validate_identity_component("resolved username", &username)?;
+    crate::validate::validate_identity_component("resolved hostname", &hostname)?;
+    if let Some(p) = &source_path {
+        crate::validate::validate_source_path("resolved sourcePath", p)?;
+    }
+
     Ok(ResolvedIdentity {
         username,
         hostname,
@@ -437,6 +449,33 @@ mod tests {
             ..with
         };
         assert_eq!(identity_string(&without), "postgres-data@billing");
+    }
+
+    #[test]
+    fn resolve_rejects_override_with_kopia_delimiter() {
+        // An explicit override carrying kopia's '@' delimiter would misparse — rejected
+        // at resolution so the controller never pins it.
+        let ovr = Identity {
+            username: Some("bad@user".to_string()),
+            hostname: None,
+        };
+        let err = resolve_identity(&inputs("c", "n", Some(&ovr), None, Some("p"))).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::IdentityComponentInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_cel_result_with_delimiter() {
+        // A CEL expression that resolves to a string with ':' is caught at resolution
+        // (the static override validator can't see CEL results).
+        let d = defaults(None, Some("'a:b'"));
+        let err = resolve_identity(&inputs("c", "n", None, Some(&d), Some("p"))).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::IdentityComponentInvalid { .. }
+        ));
     }
 
     #[test]
