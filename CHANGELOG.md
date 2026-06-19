@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.9](https://github.com/home-operations/kopiur/compare/0.4.8...0.4.9) (2026-06-19)
+
+
+### Features
+
+* **docs:** add some more useful examples and documentation as well ([391598c](https://github.com/home-operations/kopiur/commit/391598c86b295c9ae3bce473b4f45f5063317749))
+* **docs:** also update docs to remove ADR references ([90d80ae](https://github.com/home-operations/kopiur/commit/90d80ae6041c14572b707adb81ae978284783cb4))
+* **docs:** update docs to avoid using `kubectl` everywhere ([a19d0d5](https://github.com/home-operations/kopiur/commit/a19d0d5bdcf47089b4138af1a5565552247a5f9c))
+* **helm:** let's...not set CPU or MEM limits on resources for now ([5ae3608](https://github.com/home-operations/kopiur/commit/5ae3608e338623132eb4f034ec30aa13b933ed1e))
+* move the controller monitoring port (metrics + health) to 8081 ([#130](https://github.com/home-operations/kopiur/issues/130)) ([6ef0b3f](https://github.com/home-operations/kopiur/commit/6ef0b3f708b26a0a0765ea43c0ff6242f2716166))
+* **rbac:** update RBAC settings on the Helm Chart ([#131](https://github.com/home-operations/kopiur/issues/131)) ([0d5d0ee](https://github.com/home-operations/kopiur/commit/0d5d0ee58b2657dfbffc73729e058f50b52edcc8))
+* **scratch:** mount an ephemeral pvc for use of the scratch dir ([#132](https://github.com/home-operations/kopiur/issues/132)) ([4e586a7](https://github.com/home-operations/kopiur/commit/4e586a78db3505137f06421f7e1fa9588300ab73))
+* **secctx:** validate mover↔workload securityContext compatibility ([#134](https://github.com/home-operations/kopiur/issues/134)) ([6e76716](https://github.com/home-operations/kopiur/commit/6e767160e8bf283acb969a6ac1e94f0ada993323))
+
+
+### Documentation
+
+* **secctx:** reference + troubleshooting for the securityContext-compat feature ([#136](https://github.com/home-operations/kopiur/issues/136)) ([0ab8457](https://github.com/home-operations/kopiur/commit/0ab8457584c5bfac4d31a62afe5ecddfdad67851))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.8 manifest ([4ac97a0](https://github.com/home-operations/kopiur/commit/4ac97a088d743f5cd9c5f86a1acf037134c5f9eb))
+* **mise:** update tool aqua:embarkstudios/cargo-deny (0.19.8 → 0.19.9) ([#118](https://github.com/home-operations/kopiur/issues/118)) ([ed66f18](https://github.com/home-operations/kopiur/commit/ed66f182637f15101b36c22c3b73ff992ba8e555))
+* **mise:** update tool helm (4.2.1 → 4.2.2) ([#127](https://github.com/home-operations/kopiur/issues/127)) ([16f6128](https://github.com/home-operations/kopiur/commit/16f6128f9d8e9b6fef259cb5f95f8cc983794ff0))
+
+
+### Code Refactoring
+
+* **chart:** rename templates to .tpl ([#129](https://github.com/home-operations/kopiur/issues/129)) ([9baba0b](https://github.com/home-operations/kopiur/commit/9baba0bca11e2b2e455155b80548d8b607d02718))
+
 ## [0.4.8](https://github.com/home-operations/kopiur/compare/0.4.7...0.4.8) (2026-06-16)
 
 
