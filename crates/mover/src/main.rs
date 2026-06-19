@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kopiur_api::common::ResolvedIdentity;
+use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
 use kopiur_kopia::{ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MaintenanceMode};
 use tokio::sync::Mutex;
@@ -29,11 +31,12 @@ use kopiur_mover::bootstrap::{
 use kopiur_mover::credentials;
 use kopiur_mover::env::{KOPIA_BINARY, RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
+use kopiur_mover::resolve::match_current_manifest;
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::StatusUpdate;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
-    Operation, ReplicateOp, VerifyOp, VerifyTier,
+    Operation, ReplicateOp, RestoreOp, SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier,
 };
 
 fn main() -> std::process::ExitCode {
@@ -398,27 +401,61 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
-            client
-                .snapshot_restore_with(&op.snapshot_id, &op.target_path, &op.restore_options())
+            // The recorded id can be STALE — kopia rewrites a snapshot's manifest
+            // id on pin (`UpdateSnapshot`), so a snapshotRef/identity restore of a
+            // pinned snapshot created before this fix points at a deleted manifest.
+            // On a not-found, self-heal by re-resolving the live id from the
+            // snapshot's stable identity (source path + start time).
+            let restored_id = restore_with_heal(client, op)
                 .await
                 .map_err(kopia(KopiaOp::SnapshotRestore))?;
             // Restore's terminal success phase is `Completed`, not `Succeeded`
             // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
-            Ok(StatusUpdate::completed(&op.snapshot_id, chrono::Utc::now()))
+            Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
         }
         Operation::SnapshotDelete(op) => {
-            // Just delete the snapshot. Space reclamation (maintenance) is a
+            // Delete the recorded snapshot. Space reclamation (maintenance) is a
             // separate concern owned by the Maintenance CRD, not the mover.
             client
                 .snapshot_delete(&op.snapshot_id)
                 .await
                 .map_err(kopia(KopiaOp::SnapshotDelete))?;
+            // The recorded id may be STALE (kopia rewrites the manifest id on pin):
+            // the delete above then hits the idempotent "no snapshots matched"
+            // no-op and the live pinned manifest would be ORPHANED under
+            // `deletionPolicy: Delete`. Re-resolve the live id by stable anchors
+            // and delete it too. No-op when the recorded id was already correct
+            // (the re-resolved id equals it / nothing matches).
+            if let Some(live) = resolve_live_id(client, &op.anchor).await
+                && live != op.snapshot_id
+            {
+                warn!(
+                    recorded = %op.snapshot_id,
+                    live = %live,
+                    "recorded snapshot id was stale (kopia rewrites the id on pin); \
+                     deleting the live manifest re-resolved from the snapshot's identity \
+                     to avoid orphaning it",
+                );
+                client
+                    .snapshot_delete(&live)
+                    .await
+                    .map_err(kopia(KopiaOp::SnapshotDelete))?;
+            }
             Ok(StatusUpdate::succeeded(chrono::Utc::now()))
         }
         Operation::SnapshotPin(op) => {
             // Reconcile kopia's pin state with Snapshot.spec.pin (ADR-0005 §13(c))
             // so kopia's own maintenance/expire honors the pin on object stores.
             // Idempotent: kopia treats a redundant add/remove as a no-op.
+            //
+            // kopia's pin/unpin REWRITES the manifest id (`UpdateSnapshot` saves a
+            // new manifest, deletes the old), so after the op we re-resolve the
+            // CURRENT id and report it back — otherwise status.snapshot.kopiaSnapshotID
+            // is left pointing at a deleted manifest (breaking snapshotRef restore
+            // and the finalizer delete). The start-time anchor is captured BEFORE
+            // the pin when the work spec didn't carry one, since the old id is gone
+            // afterward.
+            let anchor_start = pin_start_anchor(client, op).await;
             if op.pin {
                 client
                     .snapshot_pin(&op.snapshot_id, KOPIUR_PIN_NAME)
@@ -430,7 +467,21 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
                     .await
                     .map_err(kopia(KopiaOp::SnapshotPin))?;
             }
-            Ok(StatusUpdate::succeeded(chrono::Utc::now()))
+            match resolve_pinned_info(client, op, &spec.identity.source_path, anchor_start).await {
+                Some(info) => Ok(StatusUpdate::succeeded_pin(info, chrono::Utc::now())),
+                // Re-resolution was inconclusive (ambiguous match / list failed).
+                // The (un)pin itself SUCCEEDED, so never regress to a failure —
+                // just leave status.snapshot untouched and warn.
+                None => {
+                    warn!(
+                        snapshot_id = %op.snapshot_id,
+                        "snapshot (un)pin succeeded but the new manifest id could not be \
+                         re-resolved; status.snapshot.kopiaSnapshotID may be stale until the \
+                         next pin reconcile",
+                    );
+                    Ok(StatusUpdate::succeeded(chrono::Utc::now()))
+                }
+            }
         }
         // Bootstrap, Maintenance, and Verify are dispatched in `run()` before the
         // connect+execute path; they own their own connect lifecycle and never
@@ -452,6 +503,99 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
             unreachable!("BrowseSession is handled by run_browse_session_flow, not execute()")
         }
     }
+}
+
+/// Restore `op.snapshot_id`, self-healing a stale id. kopia rewrites a
+/// snapshot's manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
+/// restore of a snapshot pinned before this fix can name a deleted manifest. On
+/// a `NotFound`, re-resolve the live id from the snapshot's stable anchors and
+/// retry once. Returns the id actually restored (for `status.logTail`).
+async fn restore_with_heal(
+    client: &KopiaClient,
+    op: &RestoreOp,
+) -> std::result::Result<String, KopiaError> {
+    match client
+        .snapshot_restore_with(&op.snapshot_id, &op.target_path, &op.restore_options())
+        .await
+    {
+        Ok(()) => Ok(op.snapshot_id.clone()),
+        Err(e) if e.class() == KopiaErrorClass::NotFound => {
+            // Only heal when we have anchors AND they resolve to a DIFFERENT live
+            // id; otherwise the original not-found is the truthful error.
+            if let Some(live) = resolve_live_id(client, &op.anchor).await
+                && live != op.snapshot_id
+            {
+                warn!(
+                    stale = %op.snapshot_id,
+                    live = %live,
+                    "restore snapshot id not found; healing to the live manifest \
+                     re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
+                );
+                client
+                    .snapshot_restore_with(&live, &op.target_path, &op.restore_options())
+                    .await?;
+                return Ok(live);
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-resolve the CURRENT live manifest id for a snapshot from its stable
+/// anchors (source path + start time), via a fresh `snapshot list`. Returns
+/// `None` when there are no usable anchors, the list fails, or the match is
+/// ambiguous (so callers never act on the wrong snapshot).
+async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Option<String> {
+    if anchor.source_path.is_empty() {
+        return None;
+    }
+    let list = client.snapshot_list(None).await.ok()?;
+    match_current_manifest(&list, &anchor.source_path, anchor.start_instant()).map(|e| e.id.clone())
+}
+
+/// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
+/// spec normally carries it (`status.timing.startTime`); when it doesn't (older
+/// CRs), look it up from the still-present pre-pin manifest id, since the id is
+/// deleted once the pin rewrites the manifest.
+async fn pin_start_anchor(
+    client: &KopiaClient,
+    op: &SnapshotPinOp,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(t) = op.anchor.start_instant() {
+        return Some(t);
+    }
+    let list = client.snapshot_list(None).await.ok()?;
+    list.iter()
+        .find(|e| e.id == op.snapshot_id)
+        .map(|e| e.start_time)
+}
+
+/// After a pin/unpin, re-resolve the snapshot's CURRENT manifest id (kopia
+/// rewrote it) into a `SnapshotInfo` for `status.snapshot`. Matches on the
+/// snapshot's stable source path (anchor, else the resolved identity) plus the
+/// pre-pin start-time anchor. `None` when unresolvable or ambiguous.
+async fn resolve_pinned_info(
+    client: &KopiaClient,
+    op: &SnapshotPinOp,
+    fallback_source_path: &str,
+    start: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<SnapshotInfo> {
+    let source_path = if op.anchor.source_path.is_empty() {
+        fallback_source_path.to_string()
+    } else {
+        op.anchor.source_path.clone()
+    };
+    let list = client.snapshot_list(None).await.ok()?;
+    let entry = match_current_manifest(&list, &source_path, start)?;
+    Some(SnapshotInfo {
+        kopia_snapshot_id: entry.id.clone(),
+        identity: ResolvedIdentity {
+            username: entry.source.user_name.clone(),
+            hostname: entry.source.host.clone(),
+            source_path: Some(entry.source.path.clone()),
+        },
+    })
 }
 
 /// Drive a `BootstrapRepository` run: connect/create, write the result to the

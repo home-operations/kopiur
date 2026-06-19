@@ -311,6 +311,30 @@ impl StatusUpdate {
         }
     }
 
+    /// A successful snapshot-pin/unpin update that re-stamps `status.snapshot`
+    /// with the snapshot's CURRENT manifest id.
+    ///
+    /// kopia's `UpdateSnapshot` (what `snapshot pin`/`unpin` call) saves a NEW
+    /// manifest and deletes the old id, so the id recorded at create time is
+    /// stale the moment a snapshot is pinned. The pin mover re-resolves the live
+    /// id and reports it here so the finalizer delete and `snapshotRef` restore
+    /// target the live manifest, not a deleted one. Touches ONLY `status.snapshot`
+    /// (no `timing`/`stats`) so the Merge PATCH never disturbs create-time fields,
+    /// and `status.pinned` stays the controller's to write (disjoint subtrees ⇒
+    /// no two-writer churn). `logTail` is deterministic (no churn).
+    pub fn succeeded_pin(snapshot: SnapshotInfo, observed_at: DateTime<Utc>) -> Self {
+        let id = snapshot.kopia_snapshot_id.clone();
+        StatusUpdate {
+            phase: MoverPhase::Succeeded.as_str().to_string(),
+            observed_at,
+            snapshot: Some(snapshot),
+            timing: None,
+            stats: None,
+            failure: None,
+            log_tail: Some(format!("Snapshot pin reconciled: {id}")),
+        }
+    }
+
     /// A successful restore update with no stats. The Restore CRD's terminal
     /// success phase is `Completed` — NOT `Succeeded` (the Snapshot phase). Writing
     /// `Succeeded` here is rejected by the apiserver with a 422 (the enum forbids
@@ -562,6 +586,38 @@ mod tests {
             "the count of EXCLUDED source entries must ride on status.stats.filesFailed"
         );
         assert_eq!(u.as_patch_body()["status"]["stats"]["filesFailed"], 2);
+    }
+
+    #[test]
+    fn succeeded_pin_restamps_snapshot_id_only() {
+        // After a pin, kopia rewrote the manifest id; the pin update must carry
+        // the CURRENT id under the nested CRD shape so the finalizer delete and
+        // snapshotRef restore target the live manifest — and ONLY status.snapshot
+        // (no timing/stats) so the Merge PATCH never disturbs create-time fields,
+        // and status.pinned stays the controller's to write (no two-writer churn).
+        let info = SnapshotInfo {
+            kopia_snapshot_id: "b2037e14".into(),
+            identity: ResolvedIdentity {
+                username: "home-wyoming-whisper".into(),
+                hostname: "home".into(),
+                source_path: Some("/pvc/wyoming-whisper".into()),
+            },
+        };
+        let u = StatusUpdate::succeeded_pin(info, ts());
+        assert_eq!(u.phase, "Succeeded");
+        let body = u.as_patch_body();
+        assert_eq!(body["status"]["snapshot"]["kopiaSnapshotID"], "b2037e14");
+        assert_eq!(
+            body["status"]["snapshot"]["identity"]["sourcePath"],
+            "/pvc/wyoming-whisper"
+        );
+        // Disjoint subtrees: the pin update must NOT touch timing/stats/pinned.
+        assert!(u.timing.is_none());
+        assert!(u.stats.is_none());
+        assert!(body["status"].get("timing").is_none());
+        assert!(body["status"].get("stats").is_none());
+        assert!(body["status"].get("pinned").is_none());
+        assert!(u.failure.is_none());
     }
 
     #[test]

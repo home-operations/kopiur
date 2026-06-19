@@ -13,10 +13,10 @@ use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 
 use k8s_openapi::api::core::v1::Namespace;
-use kopiur_api::{ClusterRepository, Repository, Snapshot, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
-    E2E_NAMESPACE, Need, World, apply_secret, default_timeout, ensure_namespace, poll_interval,
-    wait_until,
+    E2E_NAMESPACE, Need, World, apply_secret, consts, default_timeout, ensure_namespace,
+    poll_interval, wait_until,
 };
 
 // ---------------------------------------------------------------------------
@@ -279,6 +279,147 @@ async fn pinned_snapshot_survives_gfs_prune() {
     let _ = backups
         .delete("e2e-pin-keep", &DeleteParams::default())
         .await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
+}
+
+// ---------------------------------------------------------------------------
+// Pinned snapshot: id re-stamp + restore-by-ref + delete-by-correct-id (#137)
+// ---------------------------------------------------------------------------
+
+/// Regression for #137: kopia rewrites a snapshot's MANIFEST id on pin
+/// (`UpdateSnapshot` saves a new manifest, deletes the old). Before the fix,
+/// `status.snapshot.kopiaSnapshotID` was stamped at create and never re-resolved
+/// after the pin, so it pointed at a DELETED manifest — breaking `snapshotRef`
+/// restore (`object not found`) and silently orphaning the live snapshot on
+/// `deletionPolicy: Delete`. This proves: (1) the id RE-STAMPS to the live
+/// manifest once the pin reconciles, (2) a `snapshotRef` restore of the pinned
+/// snapshot Completes, and (3) deleting it actually removes the live manifest
+/// (the finalizer releases).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn pinned_snapshot_restamps_id_and_restores_by_ref() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_repo(&client, "pinrestore").await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let repo = "e2e-pinrestore-repo";
+    let policy = "e2e-pinrestore-policy";
+    let backup = "e2e-pinrestore-backup";
+    let restore = "e2e-pinrestore-restore";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(repo, "pinrestore", serde_json::json!({}))),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, repo, "Ready").await.expect("repo Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                policy,
+                "Repository",
+                repo,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    // A PINNED snapshot with deletionPolicy: Delete (so the finalizer's
+    // delete-by-id path runs at teardown).
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                backup,
+                policy,
+                serde_json::json!({ "pin": true, "deletionPolicy": "Delete" }),
+            )),
+        )
+        .await
+        .expect("create pinned Snapshot");
+    wait_phase(&backups, backup, "Succeeded")
+        .await
+        .expect("pinned Snapshot should reach Succeeded");
+
+    // Wait for the pin to reconcile. We deliberately do NOT assert the id
+    // *changed* from its create-time value: kopia rewrites the manifest id on
+    // pin, but the pin Job reconciles in seconds, so the pre-pin window is racy
+    // to observe. The deterministic proof that the re-stamp landed correctly is
+    // the snapshotRef restore + finalizer delete below — both consume the stored
+    // id and would fail (kopia `object not found` / silent orphan) if it pointed
+    // at the deleted pre-pin manifest.
+    wait_until(
+        "pinned snapshot reconciled (status.pinned=true) with a recorded id",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&backups, backup).await;
+            let pinned = s["pinned"].as_bool().unwrap_or(false);
+            let id = s["snapshot"]["kopiaSnapshotID"].as_str().unwrap_or("");
+            Ok((pinned && !id.is_empty()).then_some(()))
+        },
+    )
+    .await
+    .expect("the pinned Snapshot should reconcile its pin and keep a recorded id");
+
+    // A snapshotRef restore of the pinned snapshot must Complete — the core
+    // regression. Pre-fix the mover failed with kopia `object not found` because
+    // the recorded id was the deleted pre-pin manifest.
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "repository": { "kind": "Repository", "name": repo },
+                    "source": { "snapshotRef": { "name": backup } },
+                    "target": { "pvcRef": { "name": consts::PVC_DST } }
+                }
+            })),
+        )
+        .await
+        .expect("create snapshotRef Restore");
+    wait_phase(&restores, restore, "Completed")
+        .await
+        .expect("snapshotRef restore of a pinned snapshot must reach Completed");
+
+    // Delete-by-correct-id: deleting the pinned Snapshot (deletionPolicy: Delete)
+    // must remove the LIVE manifest, so the finalizer releases. Pre-fix the
+    // finalizer ran `kopia snapshot delete <stale-id>`, hit the idempotent
+    // "no snapshots matched" no-op, released the finalizer, and ORPHANED the live
+    // pinned manifest.
+    let _ = restores.delete(restore, &DeleteParams::default()).await;
+    backups
+        .delete(backup, &DeleteParams::default())
+        .await
+        .expect("delete pinned Snapshot");
+    wait_until(
+        "pinned Snapshot finalizer released after deleting the live manifest",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(backups.get_opt(backup).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the pinned Snapshot's finalizer must release once the live manifest is deleted");
+
+    // Cleanup.
     let _ = policies.delete(policy, &DeleteParams::default()).await;
     let _ = repos.delete(repo, &DeleteParams::default()).await;
 }

@@ -252,6 +252,45 @@ impl CreateOptionsSpec {
     }
 }
 
+/// Stable identity anchors for re-resolving a snapshot's CURRENT manifest id.
+///
+/// kopia's `UpdateSnapshot` (pin/unpin) assigns a NEW manifest id and deletes
+/// the old one, so the id recorded at create time goes stale once a snapshot is
+/// pinned. A snapshot's source path and start time survive that rewrite, so the
+/// mover re-matches on them (see [`crate::resolve::match_current_manifest`]) to
+/// re-stamp `status.snapshot.kopiaSnapshotID` after a pin, and to self-heal a
+/// stale id at delete/restore time. All fields are optional so older work specs
+/// (and Snapshots with no recorded identity/timing) still round-trip and fall
+/// back to the previous behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotAnchor {
+    /// The snapshotted source path — the authoritative match key (the
+    /// mover-recorded user/host can differ from the resolved identity).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
+    /// RFC3339 start time recorded for this snapshot — the disambiguator when
+    /// several snapshots share `source_path`. Absent on older work specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+}
+
+impl SnapshotAnchor {
+    /// Whether this anchor carries nothing usable (so resolution falls back to
+    /// the stored id alone).
+    pub fn is_empty(&self) -> bool {
+        self.source_path.is_empty() && self.start_time.is_none()
+    }
+
+    /// The anchor's `start_time` parsed to a UTC instant, if present and valid.
+    pub fn start_instant(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.start_time
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+    }
+}
+
 /// Payload for a restore run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -261,6 +300,12 @@ pub struct RestoreOp {
     pub snapshot_id: String,
     /// Absolute path inside the mover pod to restore into (e.g. `/data`).
     pub target_path: String,
+    /// Stable identity anchors for the referenced snapshot, used to self-heal a
+    /// stale `snapshot_id` (kopia rewrites the manifest id on pin) when the
+    /// restore reports the id not found. Empty ⇒ no fallback (a raw
+    /// user-supplied id stays a hard failure).
+    #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
+    pub anchor: SnapshotAnchor,
     /// `--[no-]ignore-permission-errors` (Restore CRD `options`; kopia default
     /// true). `None` lets kopia use its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +325,7 @@ impl RestoreOp {
     /// let op = RestoreOp {
     ///     snapshot_id: "k1".into(),
     ///     target_path: "/data".into(),
+    ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
     ///     write_files_atomically: Some(true),
     /// };
@@ -302,6 +348,14 @@ impl RestoreOp {
 pub struct SnapshotDeleteOp {
     /// The snapshot manifest id to delete.
     pub snapshot_id: String,
+    /// Stable identity anchors for the snapshot, used to self-heal a stale
+    /// `snapshot_id`: kopia rewrites the manifest id on pin, so the finalizer's
+    /// recorded id can point at a deleted manifest while the real (pinned)
+    /// snapshot lives under a different id. Without this the idempotent
+    /// "no snapshots matched" path would silently ORPHAN the live snapshot under
+    /// `deletionPolicy: Delete`. Empty ⇒ delete by id only (old behavior).
+    #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
+    pub anchor: SnapshotAnchor,
 }
 
 /// Payload for a repository-bootstrap run.
@@ -424,6 +478,14 @@ pub struct SnapshotPinOp {
     pub snapshot_id: String,
     /// `true` → add the pin (exempt from expiry); `false` → remove it.
     pub pin: bool,
+    /// Stable identity anchors for the snapshot. kopia's pin/unpin rewrites the
+    /// manifest id (`UpdateSnapshot` saves a new manifest, deletes the old), so
+    /// after (un)pinning the mover re-lists and re-resolves the CURRENT id via
+    /// these anchors and reports it back, keeping
+    /// `status.snapshot.kopiaSnapshotID` pointing at the live manifest. Empty ⇒
+    /// the id is left as-is (older work specs).
+    #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
+    pub anchor: SnapshotAnchor,
 }
 
 /// The fixed pin name kopiur applies to a `Snapshot` whose `spec.pin` is set
@@ -1006,6 +1068,10 @@ mod tests {
             operation: Operation::Restore(RestoreOp {
                 snapshot_id: "abc123".into(),
                 target_path: "/data".into(),
+                anchor: SnapshotAnchor {
+                    source_path: "/pvc/db".into(),
+                    start_time: Some("2026-06-19T05:54:19Z".into()),
+                },
                 ignore_permission_errors: Some(true),
                 write_files_atomically: Some(false),
             }),
@@ -1041,6 +1107,7 @@ mod tests {
             version: 1,
             operation: Operation::SnapshotDelete(SnapshotDeleteOp {
                 snapshot_id: "todelete".into(),
+                anchor: SnapshotAnchor::default(),
             }),
             identity: sample_identity(),
             repository: RepositoryConnect::Filesystem {
@@ -1342,6 +1409,7 @@ mod tests {
         let op = RestoreOp {
             snapshot_id: "s".into(),
             target_path: "/data".into(),
+            anchor: SnapshotAnchor::default(),
             ignore_permission_errors: Some(false),
             write_files_atomically: Some(true),
         };
@@ -1349,12 +1417,13 @@ mod tests {
         assert_eq!(opts.ignore_permission_errors, Some(false));
         assert_eq!(opts.write_files_atomically, Some(true));
 
-        // Older wire payload without the option fields still deserializes
-        // (forward/backward compatible), mapping to kopia defaults (None).
+        // Older wire payload without the option/anchor fields still deserializes
+        // (forward/backward compatible), mapping to kopia defaults (None/empty).
         let json = r#"{"snapshotId":"s","targetPath":"/data"}"#;
         let parsed: RestoreOp = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.ignore_permission_errors, None);
         assert_eq!(parsed.restore_options().write_files_atomically, None);
+        assert!(parsed.anchor.is_empty());
     }
 
     #[test]
@@ -1580,6 +1649,10 @@ mod tests {
             operation: Operation::SnapshotPin(SnapshotPinOp {
                 snapshot_id: "k123".into(),
                 pin: true,
+                anchor: SnapshotAnchor {
+                    source_path: "/pvc/db".into(),
+                    start_time: Some("2026-06-19T05:54:19Z".into()),
+                },
             }),
             identity: sample_identity(),
             repository: RepositoryConnect::Filesystem {
@@ -1596,6 +1669,15 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["operation"]["snapshotPin"]["snapshotId"], "k123");
         assert_eq!(v["operation"]["snapshotPin"]["pin"], true);
+        // Anchors flow externally as camelCase under the op payload.
+        assert_eq!(
+            v["operation"]["snapshotPin"]["anchor"]["sourcePath"],
+            "/pvc/db"
+        );
+        // An old work spec without the anchor still deserializes (defaulted).
+        let legacy = r#"{"snapshotId":"k123","pin":false}"#;
+        let parsed: SnapshotPinOp = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.anchor.is_empty());
     }
 
     // --- §4 verify op ---

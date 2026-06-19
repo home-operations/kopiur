@@ -7,6 +7,7 @@ pub mod env;
 pub mod error;
 pub mod jobs;
 pub mod repo_meta;
+pub mod resolve;
 pub mod serve;
 pub mod status;
 pub mod workspec;

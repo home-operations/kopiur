@@ -32,7 +32,7 @@ use kopiur_api::snapshot::SnapshotPhase;
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
-    SnapshotDeleteOp, SnapshotOp, SnapshotPinOp, TargetRef,
+    SnapshotAnchor, SnapshotDeleteOp, SnapshotOp, SnapshotPinOp, TargetRef,
 };
 
 use crate::config;
@@ -1829,6 +1829,10 @@ async fn delete_snapshot_via_job(
         version: 1,
         operation: Operation::SnapshotDelete(SnapshotDeleteOp {
             snapshot_id: snapshot_id.to_string(),
+            // The recorded id can be stale (kopia rewrites the manifest id on
+            // pin); the mover re-resolves the live id by these anchors so a
+            // pinned snapshot isn't silently orphaned under deletionPolicy: Delete.
+            anchor: snapshot_anchor(backup),
         }),
         identity,
         repository: repository_connect(repo)?,
@@ -2011,6 +2015,9 @@ async fn reconcile_pin(
         operation: Operation::SnapshotPin(SnapshotPinOp {
             snapshot_id: snapshot_id.clone(),
             pin: matches!(action, PinAction::Pin),
+            // kopia rewrites the manifest id on (un)pin; the mover re-resolves
+            // the live id by these anchors and re-stamps status.snapshot.
+            anchor: snapshot_anchor(backup),
         }),
         identity,
         repository: repository_connect(&repo)?,
@@ -2104,7 +2111,12 @@ async fn finalize_succeeded(
     name: &str,
     namespace: &str,
 ) -> Result<()> {
-    // Try to resolve the snapshot id authoritatively for the filesystem backend.
+    // Best-effort: re-resolve the snapshot id for the filesystem backend. This is
+    // only a fallback — the authoritative `status.snapshot.kopiaSnapshotID` is
+    // (1) stamped by the mover at create and (2) re-stamped by the pin mover
+    // (kopia rewrites the id on pin). This in-process listing needs the repo
+    // mounted into the CONTROLLER, which is usually NOT the case; on failure we
+    // keep the mover-stamped create id and log the actionable hint.
     let snapshot = resolve_succeeded_snapshot(ctx, backup, namespace).await;
     // Base status carries the kstatus Ready conditions (ADR-0005 §2) so
     // `kubectl wait --for=condition=Ready` works on a Succeeded Snapshot.
@@ -2114,11 +2126,24 @@ async fn finalize_succeeded(
         "SnapshotCreated",
         "the kopia snapshot was created successfully",
     );
-    if let Ok(Some((id, identity))) = snapshot {
-        status["snapshot"] = serde_json::json!({
-            "kopiaSnapshotID": id,
-            "identity": identity,
-        });
+    match snapshot {
+        Ok(Some((id, identity))) => {
+            status["snapshot"] = serde_json::json!({
+                "kopiaSnapshotID": id,
+                "identity": identity,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                backup = %name,
+                error = %e,
+                "could not re-resolve the snapshot id in-process (the filesystem repo is not \
+                 mounted into the controller); keeping the mover-recorded create id. Mount the \
+                 repo into the controller to enable in-process resolution, or it self-corrects \
+                 on the next pin reconcile",
+            );
+        }
     }
     io::patch_status(api, name, status).await?;
     ctx.metrics
@@ -2463,6 +2488,24 @@ fn build_backup_run(
         });
 
     Ok((work_spec, source_volume, repo_volume, creds_secrets))
+}
+
+/// Stable identity anchors for a Snapshot's kopia manifest, read from its
+/// recorded status. kopia rewrites a snapshot's manifest id on pin, so the pin
+/// and delete movers re-resolve the live id by these anchors (source path +
+/// start time, both stable across the rewrite). Empty when the Snapshot has no
+/// recorded identity/timing yet (the mover then falls back to id-only behavior).
+fn snapshot_anchor(backup: &Snapshot) -> SnapshotAnchor {
+    let status = backup.status.as_ref();
+    SnapshotAnchor {
+        source_path: status
+            .and_then(|s| s.snapshot.as_ref())
+            .and_then(|s| s.identity.source_path.clone())
+            .unwrap_or_default(),
+        start_time: status
+            .and_then(|s| s.timing.as_ref())
+            .and_then(|t| t.start_time.clone()),
+    }
 }
 
 /// The hook plan summary carried on the work spec (`<index>:<form>` per hook) —
