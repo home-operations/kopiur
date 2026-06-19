@@ -317,6 +317,33 @@ pub struct MigrateVolsyncArgs {
     /// placeholder remains).
     #[arg(long)]
     pub apply: bool,
+
+    // --- offline / GitOps mode ---
+    /// Read VolSync objects from these YAML files (or directories, or `-` for
+    /// stdin) instead of the cluster. Repeatable; any value engages offline
+    /// mode (no kubeconfig required). Mirrors `kubectl -f`.
+    #[arg(short = 'f', long = "filename", value_name = "PATH")]
+    pub filename: Vec<PathBuf>,
+
+    /// Resolve repository Secrets from these plaintext Secret YAML files (or
+    /// directories, or `-`) in offline mode. Repeatable. Only meaningful with
+    /// --resolve-secrets and offline input (-f).
+    #[arg(long, value_name = "PATH", requires = "resolve_secrets")]
+    pub secrets: Vec<PathBuf>,
+
+    /// In offline mode, still fetch referenced Secrets from the LIVE cluster
+    /// (needs a kubeconfig). Alternative to --secrets.
+    #[arg(long, requires = "resolve_secrets", conflicts_with = "secrets")]
+    pub from_cluster_secrets: bool,
+
+    /// Write one YAML file per ReplicationSource (plus _shared.yaml for derived
+    /// Repositories/Secrets) into this directory instead of stdout.
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
+
+    /// Permit overwriting existing files in --out-dir.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Flags for `status`.

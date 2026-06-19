@@ -1,0 +1,98 @@
+# Try it OFFLINE — migrate VolSync into GitOps files (docs/cli/migrate-volsync.md)
+#
+# A GitOps-shaped INPUT for `kubectl kopiur migrate volsync -f` (offline mode).
+# TWO perfectra1n/volsync FORK ReplicationSources (`spec.kopia`) in the `apps`
+# namespace, plus the repository Secrets they reference. Unlike the live tryit
+# (volsync-source.yaml), this models what lives in a Git repo: you migrate it on
+# your laptop with NO cluster connection and commit the result.
+#
+# This is INPUT for the CLI, not a kopiur manifest. The migrate command reads it
+# from disk and writes one kopiur file per source to --out-dir:
+#
+#   # Point policies at an EXISTING kopiur Repository (no Secret reads at all):
+#   kubectl kopiur migrate volsync -f deploy/examples/tryit/volsync-offline.yaml \
+#     --repository nas --out-dir ./migrated
+#
+#   # Or derive the Repository from the plaintext Secrets in THIS SAME file
+#   # (`-f` reads only the ReplicationSources; `--secrets` reads only the
+#   # Secrets — so one bundle file feeds both flags):
+#   kubectl kopiur migrate volsync -f deploy/examples/tryit/volsync-offline.yaml \
+#     --resolve-secrets --secrets deploy/examples/tryit/volsync-offline.yaml \
+#     --out-dir ./migrated
+#
+# Result: ./migrated/blog.yaml, ./migrated/forum.yaml, and (with
+# --resolve-secrets) ./migrated/_shared.yaml carrying the derived Repositories.
+#
+# Fill in each REPLACE_ME backend key and the EXISTING repo KOPIA_PASSWORD (the
+# fork already initialized these repos — reuse their passwords). The
+# `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers; they
+# are plain YAML comments.
+---
+# --8<-- [start:sources]
+# Two fork-kopia ReplicationSources — one file per app comes out, named after
+# each source (blog.yaml, forum.yaml). `repository` names the Secret below.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: blog
+  namespace: apps
+spec:
+  sourcePVC: blog-data
+  trigger:
+    schedule: "0 2 * * *"
+  kopia:
+    repository: blog-kopia-repo # -> Secret blog-kopia-repo (below)
+    copyMethod: Direct
+    retain:
+      daily: 7
+      weekly: 4
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: forum
+  namespace: apps
+spec:
+  sourcePVC: forum-data
+  trigger:
+    schedule: "30 3 * * *"
+  kopia:
+    repository: forum-kopia-repo # -> Secret forum-kopia-repo (below)
+    copyMethod: Direct
+    retain:
+      daily: 14
+      monthly: 6
+# --8<-- [end:sources]
+---
+# --8<-- [start:secrets]
+# The repository Secrets, as plaintext for offline `--resolve-secrets --secrets`.
+# In a real GitOps repo these are SOPS-encrypted; decrypt them to a scratch file
+# for the migrate run, or skip them entirely with `--repository`/
+# `--from-cluster-secrets`. KOPIA_REPOSITORY picks the backend to ADOPT;
+# KOPIA_PASSWORD + AWS_* are referenced in place by the emitted Repository.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: blog-kopia-repo
+  namespace: apps
+type: Opaque
+stringData:
+  KOPIA_REPOSITORY: "s3://my-kopia-bucket/blog/"
+  KOPIA_PASSWORD: "REPLACE_ME" # the EXISTING repo password — reuse it
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  AWS_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: forum-kopia-repo
+  namespace: apps
+type: Opaque
+stringData:
+  KOPIA_REPOSITORY: "s3://my-kopia-bucket/forum/"
+  KOPIA_PASSWORD: "REPLACE_ME" # the EXISTING repo password — reuse it
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  AWS_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
+# --8<-- [end:secrets]

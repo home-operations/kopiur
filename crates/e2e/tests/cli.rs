@@ -1596,6 +1596,115 @@ async fn cli_migrate_volsync_kopia() {
     );
 }
 
+/// `migrate volsync` OFFLINE / GitOps mode, hybrid credentials: read the
+/// ReplicationSource from a YAML FILE (never applied to the cluster) while
+/// fetching its repository Secret from the LIVE cluster, and write one file per
+/// source to `--out-dir`. Proves the file-input + live-secret + file-output
+/// wiring end-to-end (the pure offline modes are hermetic unit tests).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn cli_migrate_volsync_offline_hybrid() {
+    use k8s_openapi::api::core::v1::Secret;
+    use kube::api::{Patch, PatchParams};
+
+    const HY_SECRET: &str = "vs-hybrid-secret";
+    const HY_RS: &str = "vs-hybrid-app";
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio])
+        .await
+        .expect("provision MinIO + buckets");
+    let client = world.client().clone();
+    ensure_volsync_crds(&client).await;
+
+    // The repository Secret lives in the cluster (as it would after Flux
+    // decrypted a SOPS Secret); the ReplicationSource does NOT — it stays a
+    // file, the GitOps source of truth.
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let params = PatchParams::apply("kopiur-e2e").force();
+    let secret: Secret = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": HY_SECRET, "namespace": E2E_NAMESPACE },
+        "stringData": {
+            "KOPIA_REPOSITORY": "s3://kopiur-hybrid",
+            "KOPIA_PASSWORD": kopiur_e2e::consts::KOPIA_PASSWORD,
+            "AWS_ACCESS_KEY_ID": kopiur_e2e::consts::MINIO_USER,
+            "AWS_SECRET_ACCESS_KEY": kopiur_e2e::consts::MINIO_PASS,
+            "AWS_S3_ENDPOINT": format!("http://{}", kopiur_e2e::consts::MINIO_ENDPOINT),
+            "AWS_REGION": "us-east-1"
+        }
+    }))
+    .unwrap();
+    secrets
+        .patch(HY_SECRET, &params, &Patch::Apply(&secret))
+        .await
+        .expect("apply hybrid kopia Secret");
+
+    // Write the ReplicationSource to a file (NOT the cluster).
+    let dir = std::env::temp_dir().join("kopiur-e2e-hybrid");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs_file = dir.join("source.yaml");
+    std::fs::write(
+        &rs_file,
+        format!(
+            "\
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata: {{ name: {HY_RS}, namespace: {E2E_NAMESPACE} }}
+spec:
+  sourcePVC: app-data
+  trigger: {{ schedule: \"0 3 * * *\" }}
+  kopia:
+    repository: {HY_SECRET}
+"
+        ),
+    )
+    .unwrap();
+    let out_dir = dir.join("out");
+
+    let out = run_cli(&[
+        "-n",
+        E2E_NAMESPACE,
+        "migrate",
+        "volsync",
+        "-f",
+        rs_file.to_str().unwrap(),
+        "--resolve-secrets",
+        "--from-cluster-secrets",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert!(out.success, "hybrid migrate failed: {}", out.stderr);
+
+    // _shared.yaml: a Repository adopting the fork repo in place (NO create
+    // block, password referenced not copied), built from the LIVE Secret.
+    let shared = std::fs::read_to_string(out_dir.join("_shared.yaml")).expect("_shared.yaml");
+    assert!(shared.contains("kind: Repository"), "{shared}");
+    assert!(shared.contains("bucket: kopiur-hybrid"), "{shared}");
+    assert!(shared.contains("passwordSecretRef"), "{shared}");
+    assert!(
+        !shared.contains("create:"),
+        "adopt-in-place: no create block: {shared}"
+    );
+    assert!(
+        !shared.contains(kopiur_e2e::consts::KOPIA_PASSWORD),
+        "the password value must never be copied into emitted YAML"
+    );
+
+    // One file per source carries the policy/schedule.
+    let app =
+        std::fs::read_to_string(out_dir.join(format!("{HY_RS}.yaml"))).expect("per-source file");
+    assert!(app.contains("kind: SnapshotPolicy"), "{app}");
+    assert!(app.contains("kind: SnapshotSchedule"), "{app}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Kill-on-drop guard for a background `kubectl port-forward`.
 struct PortForward(std::process::Child);
 impl Drop for PortForward {

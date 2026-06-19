@@ -29,6 +29,7 @@ use cli::{
 
 /// What a command hands back to the dispatcher: text for stdout (streaming
 /// commands write directly and return empty text) and the process exit code.
+#[derive(Debug)]
 pub struct CmdOutput {
     /// Final stdout payload.
     pub text: String,
@@ -61,6 +62,15 @@ fn init_tracing(verbose: u8) {
 /// `print!` in the crate — commands return their output so they stay testable.
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     init_tracing(cli.global.verbose);
+
+    // `migrate volsync` manages its own (optional) connection: offline file
+    // input needs no kubeconfig, so it must not connect up front.
+    if let Command::Migrate(MigrateCommand::Volsync(args)) = &cli.command {
+        let out = cmd::migrate::run(&cli.global, args).await?;
+        print!("{}", out.text);
+        return Ok(ExitCode::from(out.exit));
+    }
+
     let ctx = context::connect(&cli.global).await?;
     let output = cli.global.output;
     let out = match &cli.command {
@@ -82,7 +92,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Maintenance(MaintenanceCommand::Run(args)) => {
             cmd::maintenance::run(&ctx, args, chrono::Utc::now()).await?
         }
-        Command::Migrate(MigrateCommand::Volsync(args)) => cmd::migrate::run(&ctx, args).await?,
+        Command::Migrate(MigrateCommand::Volsync(_)) => {
+            unreachable!("migrate volsync is dispatched before connecting")
+        }
         Command::Status(args) => {
             CmdOutput::ok(cmd::status::run(&ctx, args, output, chrono::Utc::now()).await?)
         }
