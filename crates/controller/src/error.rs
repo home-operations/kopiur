@@ -84,6 +84,29 @@ pub enum Error {
         backend: &'static str,
     },
 
+    /// A `Restore` source needs an in-process kopia snapshot listing
+    /// (`fromPolicy` / `identity` without a pinned `snapshotID`) against a
+    /// FILESYSTEM repository whose path is not mounted into the controller pod.
+    /// Resolving "latest / offset / asOf" lists snapshots in-process, which
+    /// requires the controller to be able to read the repository — but the repo
+    /// volume is normally mounted only into the mover Jobs. Structural: the
+    /// deployment must mount the repo into the controller, or the spec must pin
+    /// the snapshot explicitly. Surfaced instead of letting the raw kopia
+    /// `stat <path>: no such file or directory` leak (actionable-error-messages).
+    #[error(
+        "cannot resolve the restore source by identity: the filesystem repository path \
+         '{path}' is not accessible to the controller. fromPolicy/identity resolution lists \
+         snapshots in-process, so the repository must be mounted into the CONTROLLER pod at \
+         '{path}' and the controller must run as a UID that can read it (controller.extraVolumes \
+         + extraVolumeMounts + podSecurityContext). Alternatively, restore by source.snapshotRef \
+         or pin source.identity.snapshotID, which need no controller mount"
+    )]
+    FilesystemResolutionUnmounted {
+        /// The repository's `backend.filesystem.path` (where the controller must
+        /// have the repo mounted to list in-process).
+        path: String,
+    },
+
     /// Self-managed webhook TLS setup failed on the **cluster IO** side: reading/
     /// writing the serving Secret or injecting `caBundle` into a webhook
     /// configuration ([`crate::webhook_tls`]). Transient — the webhook config or
@@ -171,7 +194,8 @@ impl Error {
             | Error::Serialization(_)
             | Error::InvalidSchedule(_)
             | Error::Invariant(_)
-            | Error::UnsupportedSourceResolution { .. } => ErrorClass::Structural,
+            | Error::UnsupportedSourceResolution { .. }
+            | Error::FilesystemResolutionUnmounted { .. } => ErrorClass::Structural,
         }
     }
 }

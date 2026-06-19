@@ -60,9 +60,30 @@ source:
 Whatever the source resolves to is written ONCE to `status.resolved.kopiaSnapshotID` and reused for the rest of the restore's life. New snapshots appearing mid-flight (a schedule firing) cannot change which snapshot this Restore writes.
 ///
 
-/// warning | `fromPolicy` needs a filesystem repository
+/// warning | `fromPolicy` / `identity`-without-`snapshotID` need the repo reachable by the **controller**
 
-Resolving "latest / `asOf` / `offset` for a policy" lists snapshots in-process, which requires a repository the controller can mount — **filesystem backends only**. On S3, Azure, GCS, B2, SFTP, WebDAV, and rclone, name the snapshot explicitly: `snapshotRef`, or `identity` with a pinned `snapshotID`. A `fromPolicy` restore against an object-store repository fails loudly with exactly that fix.
+Resolving "latest / `asOf` / `offset` for a policy" lists snapshots **in-process in the controller** (not in a mover Job), so the controller must be able to reach the repository:
+
+- **Object stores** (S3, Azure, GCS, B2, SFTP, WebDAV, rclone): not supported for in-process listing — name the snapshot explicitly with `snapshotRef`, or `identity` with a pinned `snapshotID`. A `fromPolicy` restore against an object-store repository fails loudly with exactly that fix.
+- **Filesystem repositories**: the repository must be mounted into the **controller** pod at the repository's `backend.filesystem.path`, and the controller must run as a UID/GID that can read it. By default only the mover Jobs mount the repo, so `fromPolicy`/`identity` resolution fails with an actionable error (`the filesystem repository path '…' is not accessible to the controller`) until you add the mount. `snapshotRef` and a pinned `identity.snapshotID` need **no** controller mount.
+
+Mount a filesystem repo into the controller via Helm (matching the NFS/PVC the repo lives on, here `/repo`):
+
+```yaml
+controller:
+    extraVolumes:
+        - name: repo
+          nfs: { server: nfs.example.com, path: /tank/kopiur }
+    extraVolumeMounts:
+        - name: repo
+          mountPath: /repo # == backend.filesystem.path
+podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1234 # a UID/GID that can read the repo
+    runAsGroup: 1234
+    fsGroup: 1234
+    fsGroupChangePolicy: OnRootMismatch
+```
 
 ///
 

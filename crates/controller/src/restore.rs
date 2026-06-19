@@ -23,7 +23,7 @@ use kopiur_api::{
 };
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
-    RestoreOp, TargetRef,
+    RestoreOp, SnapshotAnchor, TargetRef,
 };
 
 use crate::config;
@@ -1429,11 +1429,15 @@ async fn run_restore_mover(
         restore.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
     );
     let cache = crate::cache::cache_tuning(effective_cache.as_ref());
+    // Stable anchors so the mover can heal a stale pinned id (kopia rewrites the
+    // manifest id on pin). Read once here, where we still have the source ref.
+    let anchor = restore_source_anchor(ctx, restore, namespace).await;
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Restore(RestoreOp {
             snapshot_id: snapshot_id.to_string(),
             target_path: target_path.clone(),
+            anchor,
             ignore_permission_errors,
             write_files_atomically,
         }),
@@ -1542,6 +1546,55 @@ struct ResolvedSource {
     kopia_snapshot_id: String,
     snapshot_ref: Option<kopiur_api::common::ObjectRef>,
     identity: Option<kopiur_api::common::ResolvedIdentity>,
+}
+
+/// Stable identity anchors for the restore's snapshot, so the mover can
+/// self-heal a STALE pinned id: kopia rewrites a snapshot's manifest id on pin,
+/// so a `snapshotRef`/`identity` restore of a snapshot pinned before the
+/// re-stamp fix points at a deleted manifest. The anchors (source path + start
+/// time) survive the rewrite.
+///
+/// `snapshotRef` reads the referenced `Snapshot` CR's recorded status (which
+/// keeps the correct identity/timing even when its id went stale). `identity`/
+/// `fromPolicy` use the pinned `status.resolved.identity` source path
+/// (best-effort, no start time — those resolve from a live list at admission).
+/// Empty when nothing is recorded yet (the mover then restores by id only).
+async fn restore_source_anchor(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+) -> SnapshotAnchor {
+    if let RestoreSource::SnapshotRef(r) = &restore.spec.source {
+        let ns = r.namespace.as_deref().unwrap_or(namespace);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
+        if let Ok(Some(snap)) = api.get_opt(&r.name).await {
+            let st = snap.status.as_ref();
+            return SnapshotAnchor {
+                source_path: st
+                    .and_then(|s| s.snapshot.as_ref())
+                    .and_then(|s| s.identity.source_path.clone())
+                    .unwrap_or_default(),
+                start_time: st
+                    .and_then(|s| s.timing.as_ref())
+                    .and_then(|t| t.start_time.clone()),
+            };
+        }
+    }
+    let source_path = restore
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved.as_ref())
+        .and_then(|r| r.identity.as_ref())
+        .and_then(|i| i.source_path.clone())
+        .or_else(|| match &restore.spec.source {
+            RestoreSource::Identity(id) => id.source_path.clone(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    SnapshotAnchor {
+        source_path,
+        start_time: None,
+    }
 }
 
 /// Best-effort, **positive-only** restore-direction securityContext check. If a pod already
@@ -1695,7 +1748,9 @@ async fn resolve_snapshot(
                         name: r.name.clone(),
                         namespace: Some(ns.to_string()),
                     }),
-                    identity: None,
+                    // Record the referenced snapshot's identity (provenance, and
+                    // the source-path anchor used to self-heal a stale id).
+                    identity: Some(s.identity),
                 }))
         }
         RestoreSource::Identity(id) => {
@@ -1815,6 +1870,16 @@ async fn list_for_identity(
     let creds = io::repo_credentials(&repo.encryption);
     match &repo.backend {
         Backend::Filesystem(fs) => {
+            // Pre-flight the repo path: in-process listing connects kopia to
+            // `fs.path`, which only works if the repo volume is mounted into the
+            // CONTROLLER (it is normally mounted only into mover Jobs). Catch the
+            // missing mount here with an actionable error instead of letting the
+            // raw kopia `stat <path>: no such file or directory` leak (#137).
+            if !std::path::Path::new(&fs.path).is_dir() {
+                return Err(Error::FilesystemResolutionUnmounted {
+                    path: fs.path.clone(),
+                });
+            }
             let password = io::read_repo_password(&ctx.client, namespace, &creds).await?;
             let client = ctx.kopia.build([("KOPIA_PASSWORD".to_string(), password)]);
             client
