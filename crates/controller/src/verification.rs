@@ -24,7 +24,8 @@ use k8s_openapi::api::batch::v1::Job;
 use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{DeepVerification, SnapshotPolicy, Verification};
+use kopiur_api::common::ScratchDefaults;
+use kopiur_api::{SnapshotPolicy, Verification};
 use kopiur_mover::workspec::{
     DeepVerify, MoverOptions, MoverWorkSpec, Operation, QuickVerify, ResolvedIdentity, TargetRef,
     VerifyOp, VerifyTier,
@@ -360,7 +361,10 @@ async fn spawn_verify_job(
         // Deep verify restores into DEEP_SCRATCH_PATH; mount a writable volume there
         // (sized PVC if `capacity` is set, else emptyDir). Quick verify needs none.
         scratch_volume: match tier {
-            VerifyTierKind::Deep => verification.deep.as_ref().map(scratch_volume),
+            VerifyTierKind::Deep => verification
+                .deep
+                .as_ref()
+                .map(|deep| scratch_volume(crate::cache::effective_scratch(repo, deep).as_ref())),
             VerifyTierKind::Quick => None,
         },
         readiness_exec: None,
@@ -423,22 +427,68 @@ pub fn build_verify_work_spec(
     }
 }
 
-/// Resolve the deep-verify scratch volume from `verification.deep`. Mirrors
-/// [`crate::cache::resolve_cache_volume`]'s capacity gate: a sized
-/// `capacity` provisions a fresh generic ephemeral volume (a PVC bound to the
-/// pod's lifetime, auto-GC'd, honoring `storageClassName`); an unset `capacity`
-/// falls back to an `emptyDir` (node-ephemeral, zero-config, writable by the
-/// non-root mover via the pod's `fsGroup`). Never `Pvc` — scratch is discarded
+/// Resolve the deep-verify scratch volume from the **effective** scratch config
+/// (`moverDefaults.scratch` overlaid by `verification.deep`, via
+/// [`crate::cache::effective_scratch`]). Mirrors [`crate::cache::resolve_cache_volume`]'s
+/// capacity gate: a sized `capacity` provisions a fresh generic ephemeral volume (a
+/// PVC bound to the pod's lifetime, auto-GC'd, honoring `storageClassName`); an unset
+/// `capacity` falls back to an `emptyDir` (node-ephemeral, zero-config, writable by
+/// the non-root mover via the pod's `fsGroup`). Never `Pvc` — scratch is discarded
 /// after each run, so a persistent PVC would be wrong. Pure (no IO): unlike the
 /// cache there is no owned PVC to provision, so this is unit-testable directly.
-fn scratch_volume(deep: &DeepVerification) -> CacheVolume {
-    match deep.capacity.clone() {
+fn scratch_volume(effective: Option<&ScratchDefaults>) -> CacheVolume {
+    match effective.and_then(|s| s.capacity.clone()) {
         Some(capacity) => CacheVolume::Ephemeral {
             capacity,
-            storage_class: deep.storage_class_name.clone(),
+            storage_class: effective.and_then(|s| s.storage_class_name.clone()),
         },
         None => CacheVolume::EmptyDir,
     }
+}
+
+/// Whether a policy's deep-verify scratch `storageClassName` is a silent no-op
+/// (set, but with no effective `capacity`, so scratch is an `emptyDir` — which has
+/// no StorageClass), with the actionable message to surface. Computed from the
+/// **merged** `moverDefaults.scratch` + `verification.deep`
+/// (via [`crate::cache::effective_scratch`]). `None` when the policy has no
+/// `verification.deep` (nothing to report); `Some { ignored: false }` is the normal
+/// consistent state (so the condition self-clears `True`→`False` once a capacity is
+/// added — never an orphaned `True`).
+pub struct ScratchStorageClassState {
+    /// `true` ⇒ the storageClass is being ignored (no-op); `false` ⇒ honored/consistent.
+    pub ignored: bool,
+    /// Human-/machine-actionable message for the condition + Warning Event.
+    pub message: String,
+}
+
+/// See [`ScratchStorageClassState`].
+pub fn scratch_storage_class_state(
+    repo: &ResolvedRepository,
+    verification: &Verification,
+) -> Option<ScratchStorageClassState> {
+    let deep = verification.deep.as_ref()?;
+    let effective = crate::cache::effective_scratch(repo, deep);
+    let storage_class = effective
+        .as_ref()
+        .and_then(|s| s.storage_class_name.clone());
+    let has_capacity = effective
+        .as_ref()
+        .and_then(|s| s.capacity.as_ref())
+        .is_some();
+    Some(match (storage_class, has_capacity) {
+        (Some(sc), false) => ScratchStorageClassState {
+            ignored: true,
+            message: format!(
+                "deep-verify scratch storageClassName '{sc}' has no effect without a capacity \
+                 (an emptyDir has no StorageClass); set verification.deep.capacity or \
+                 moverDefaults.scratch.capacity to provision a sized PVC"
+            ),
+        },
+        _ => ScratchStorageClassState {
+            ignored: false,
+            message: "deep-verify scratch volume configuration is consistent".to_string(),
+        },
+    })
 }
 
 /// Resolve the recipe's source identity for the verify run (reuses the api kernel),
@@ -685,13 +735,11 @@ mod tests {
     }
 
     // --- scratch volume resolution (capacity gates emptyDir vs ephemeral PVC) ---
+    // The repo↔recipe merge itself is covered in `crate::cache` tests; here we test
+    // the capacity gate over the already-merged effective `ScratchDefaults`.
 
-    fn deep(capacity: Option<&str>, storage_class: Option<&str>) -> DeepVerification {
-        DeepVerification {
-            schedule: CronSpec {
-                cron: "0 5 * * 0".into(),
-                jitter: None,
-            },
+    fn scratch(capacity: Option<&str>, storage_class: Option<&str>) -> ScratchDefaults {
+        ScratchDefaults {
             storage_class_name: storage_class.map(Into::into),
             capacity: capacity.map(Into::into),
         }
@@ -701,8 +749,13 @@ mod tests {
     fn scratch_volume_defaults_to_emptydir_when_capacity_unset() {
         // Zero-config: the common "just enable deep verify" case. An emptyDir is
         // writable by the non-root mover (like the kopia cache), fixing the
-        // original `mkdir /scratch: permission denied`.
-        assert_eq!(scratch_volume(&deep(None, None)), CacheVolume::EmptyDir);
+        // original `mkdir /scratch: permission denied`. Also covers no effective
+        // config at all (None).
+        assert_eq!(scratch_volume(None), CacheVolume::EmptyDir);
+        assert_eq!(
+            scratch_volume(Some(&scratch(None, None))),
+            CacheVolume::EmptyDir
+        );
     }
 
     #[test]
@@ -710,7 +763,7 @@ mod tests {
         // Mirrors resolve_cache_volume: capacity is the gate. storageClassName has
         // no effect on an emptyDir, so without capacity we stay emptyDir.
         assert_eq!(
-            scratch_volume(&deep(None, Some("openebs-hostpath"))),
+            scratch_volume(Some(&scratch(None, Some("openebs-hostpath")))),
             CacheVolume::EmptyDir
         );
     }
@@ -718,7 +771,7 @@ mod tests {
     #[test]
     fn scratch_volume_with_capacity_is_a_sized_ephemeral_volume() {
         assert_eq!(
-            scratch_volume(&deep(Some("50Gi"), Some("fast-ssd"))),
+            scratch_volume(Some(&scratch(Some("50Gi"), Some("fast-ssd")))),
             CacheVolume::Ephemeral {
                 capacity: "50Gi".into(),
                 storage_class: Some("fast-ssd".into()),
@@ -726,11 +779,79 @@ mod tests {
         );
         // capacity alone → cluster default storage class.
         assert_eq!(
-            scratch_volume(&deep(Some("10Gi"), None)),
+            scratch_volume(Some(&scratch(Some("10Gi"), None))),
             CacheVolume::Ephemeral {
                 capacity: "10Gi".into(),
                 storage_class: None,
             }
+        );
+    }
+
+    fn deep_verification(storage_class: Option<&str>, capacity: Option<&str>) -> Verification {
+        Verification {
+            quick: None,
+            deep: Some(DeepVerification {
+                schedule: CronSpec {
+                    cron: "0 5 * * 0".into(),
+                    jitter: None,
+                },
+                storage_class_name: storage_class.map(Into::into),
+                capacity: capacity.map(Into::into),
+            }),
+            success_expr: None,
+            verify_files_percent: None,
+        }
+    }
+
+    #[test]
+    fn scratch_storage_class_state_flags_only_storageclass_without_capacity() {
+        let repo = sample_repo(); // no moverDefaults.scratch
+
+        // No verification.deep at all → no condition to surface.
+        assert!(
+            scratch_storage_class_state(&repo, &verification(Some("0 4 * * *"), None)).is_none()
+        );
+
+        // Zero-config deep (emptyDir) → honored (not ignored).
+        assert!(
+            !scratch_storage_class_state(&repo, &deep_verification(None, None))
+                .unwrap()
+                .ignored
+        );
+
+        // storageClass without capacity → ignored (the no-op the user must fix).
+        let st =
+            scratch_storage_class_state(&repo, &deep_verification(Some("fast-ssd"), None)).unwrap();
+        assert!(st.ignored);
+        assert!(st.message.contains("fast-ssd"));
+        assert!(st.message.contains("capacity"));
+
+        // storageClass + capacity → honored.
+        assert!(
+            !scratch_storage_class_state(&repo, &deep_verification(Some("fast-ssd"), Some("50Gi")))
+                .unwrap()
+                .ignored
+        );
+    }
+
+    #[test]
+    fn scratch_storage_class_state_honors_repo_supplied_capacity() {
+        // Repo-level moverDefaults.scratch.capacity makes a policy-only storageClass
+        // NOT a no-op — the merged result has a capacity. (Guards the webhook
+        // false-positive we deliberately avoid by validating post-merge.)
+        let mut repo = sample_repo();
+        repo.mover_defaults = Some(kopiur_api::common::MoverDefaults {
+            scratch: Some(ScratchDefaults {
+                storage_class_name: None,
+                capacity: Some("100Gi".into()),
+            }),
+            ..Default::default()
+        });
+        let st =
+            scratch_storage_class_state(&repo, &deep_verification(Some("fast-ssd"), None)).unwrap();
+        assert!(
+            !st.ignored,
+            "repo-supplied capacity should make the SC honored"
         );
     }
 }

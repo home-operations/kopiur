@@ -205,6 +205,9 @@ spec:
         cache: # kopia cache backing every mover (capacity/class/budgets)
             capacity: 10Gi
             storageClassName: fast-ssd
+        scratch: # default size/class for the deep-verify scratch (restore-test) PVC
+            capacity: 100Gi # inherited by SnapshotPolicy verification.deep
+            storageClassName: fast-ssd
         nodeSelector: { kubernetes.io/arch: amd64 }
         tolerations: [{ key: backup, operator: Exists }]
         affinity: { ... }
@@ -220,6 +223,8 @@ spec:
 Set the UID/GID **once** on `moverDefaults.securityContext.runAsUser/runAsGroup` (and `podSecurityContext.fsGroup`), and every mover the repository spawns — **including the bootstrap (connect/create) Job** — inherits it. That means a filesystem/NFS repository on a directory not owned by `65532` is bootstrappable with no special-case knob: the bootstrap mover runs as the UID you set here. A per-recipe `mover` block can still tighten any of these for an individual `SnapshotPolicy`/`Restore`/`Maintenance`. See [example 09](examples.md#example-09--mover-uidgid--permissions) and [Permissions](permissions.md).
 
 `podSecurityContext.fsGroup` already **defaults to `65532`** (the mover image's GID), so the operator-managed kopia cache is writable out of the box — you only set it here to match a non-default mover UID. Note `fsGroup` can't fix a root-squashed **NFS** cache StorageClass; keep `moverDefaults.cache` unset (node-local `emptyDir`) or use a block class for a sized cache (see [Security context](security-context.md#the-default-hardened-context)).
+
+`moverDefaults.scratch` is the repo-level default for the **deep-verification** scratch volume (the throwaway restore target a `verification.deep` restore-test writes into, then discards). It's the scratch sibling of `cache`: a `SnapshotPolicy`'s `verification.deep.{capacity,storageClassName}` overlays it field-wise, so you set the scratch size/class **once** here instead of repeating it on every policy. Unlike the cache, scratch has **no `mode`** — it's always ephemeral and discarded after each run. `storageClassName` only applies when a `capacity` is set (an `emptyDir` has no StorageClass); a class with no effective capacity is a no-op and the operator flags it via the `ScratchStorageClassIgnored` condition on the `SnapshotPolicy`. See [verification](backups.md#verification--prove-the-snapshots-are-restorable).
 
 ### `sourceColocation`: avoid the RWO Multi-Attach error
 

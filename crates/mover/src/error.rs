@@ -244,9 +244,9 @@ pub enum MoverError {
     /// under root-owned `/` unless a writable volume is mounted at the path).
     #[error(
         "deep verify scratch path {} is not writable by the mover (uid {uid}): {source}. The \
-         controller must mount a writable volume there — set verification.deep.capacity (and \
-         optionally storageClassName) to provision a sized ephemeral PVC, or leave them unset \
-         for an emptyDir",
+         controller must mount a writable volume there — set verification.deep.capacity (or \
+         moverDefaults.scratch.capacity), optionally with a storageClassName, to provision a \
+         sized ephemeral PVC, or leave them unset for an emptyDir",
         .path.display()
     )]
     ScratchNotWritable {

@@ -288,6 +288,54 @@ impl CacheDefaults {
     }
 }
 
+/// Repository-wide defaults for the deep-verification **scratch** volume — the
+/// throwaway restore target a `deep` restore-test writes into and then discards.
+/// Inherited by `SnapshotPolicy.spec.verification.deep` unless overridden there,
+/// the same `moverDefaults ⊂ recipe` field-wise overlay as [`CacheDefaults`].
+///
+/// Distinct from [`CacheDefaults`]: scratch is **always ephemeral** (auto-deleted
+/// with the verify Job), so unlike the cache it has no `mode` / persistent-PVC form.
+/// `storageClassName` only takes effect when `capacity` is set — an `emptyDir` has
+/// no StorageClass (the capacity gate, mirrored from the cache).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchDefaults {
+    /// StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
+    /// Only applies when `capacity` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+    /// Size of the ephemeral scratch PVC (e.g. `100Gi`) — size it to comfortably hold
+    /// the restored snapshot. When absent (here and on `verification.deep`), scratch
+    /// falls back to a node-ephemeral `emptyDir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<String>,
+}
+
+impl ScratchDefaults {
+    /// Overlay `over` onto `base` field-by-field — a value set in `over` wins,
+    /// otherwise `base`'s is kept. Resolves a deep-verify's effective scratch config
+    /// from the repository's `moverDefaults.scratch` (base) and the recipe's
+    /// `verification.deep.{storageClassName,capacity}` (override). Returns `None` only
+    /// when both are absent. Mirrors [`CacheDefaults::merge`].
+    pub fn merge(
+        base: Option<&ScratchDefaults>,
+        over: Option<&ScratchDefaults>,
+    ) -> Option<ScratchDefaults> {
+        match (base, over) {
+            (None, None) => None,
+            (Some(b), None) => Some(b.clone()),
+            (None, Some(o)) => Some(o.clone()),
+            (Some(b), Some(o)) => Some(ScratchDefaults {
+                storage_class_name: o
+                    .storage_class_name
+                    .clone()
+                    .or_else(|| b.storage_class_name.clone()),
+                capacity: o.capacity.clone().or_else(|| b.capacity.clone()),
+            }),
+        }
+    }
+}
+
 /// Bounds on materialization of `origin: discovered` `Snapshot` CRs. ADR §3.1 `catalog`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -889,6 +937,12 @@ pub struct MoverDefaults {
     /// kopia cache defaults (the former repository `cacheDefaults`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheDefaults>,
+    /// Defaults for the deep-verification scratch (restore-test) volume, inherited by
+    /// `SnapshotPolicy.spec.verification.deep` unless overridden there. Always
+    /// ephemeral (no `mode`, unlike [`MoverDefaults::cache`]); `storageClassName`
+    /// applies only when a `capacity` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchDefaults>,
     /// Pod `nodeSelector` for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
@@ -1404,6 +1458,62 @@ mod tests {
             CacheDefaults::default().effective_mode(),
             CacheVolumeMode::Ephemeral
         );
+    }
+
+    #[test]
+    fn scratch_defaults_merge_overlays_field_by_field() {
+        // Neither side → nothing to apply.
+        assert_eq!(ScratchDefaults::merge(None, None), None);
+
+        let repo = ScratchDefaults {
+            storage_class_name: Some("fast-ssd".into()),
+            capacity: Some("100Gi".into()),
+        };
+        // Only base → base verbatim.
+        assert_eq!(
+            ScratchDefaults::merge(Some(&repo), None),
+            Some(repo.clone())
+        );
+        // Only override → override verbatim.
+        let over_only = ScratchDefaults {
+            storage_class_name: Some("slow-hdd".into()),
+            capacity: None,
+        };
+        assert_eq!(
+            ScratchDefaults::merge(None, Some(&over_only)),
+            Some(over_only.clone())
+        );
+
+        // Override wins per-field; unset override fields fall back to base.
+        let recipe = ScratchDefaults {
+            storage_class_name: None,
+            capacity: Some("200Gi".into()),
+        };
+        let merged = ScratchDefaults::merge(Some(&repo), Some(&recipe)).unwrap();
+        assert_eq!(merged.storage_class_name.as_deref(), Some("fast-ssd")); // base
+        assert_eq!(merged.capacity.as_deref(), Some("200Gi")); // override
+
+        // Mixed the other way: storageClass from the recipe, capacity from the repo.
+        let recipe2 = ScratchDefaults {
+            storage_class_name: Some("fast-ssd".into()),
+            capacity: None,
+        };
+        let merged2 = ScratchDefaults::merge(Some(&repo), Some(&recipe2)).unwrap();
+        assert_eq!(merged2.storage_class_name.as_deref(), Some("fast-ssd"));
+        assert_eq!(merged2.capacity.as_deref(), Some("100Gi")); // base
+    }
+
+    #[test]
+    fn mover_defaults_scratch_round_trips() {
+        let yaml = r#"
+scratch:
+  storageClassName: fast-ssd
+  capacity: 100Gi
+"#;
+        let md: MoverDefaults = crate::testutil::from_yaml(yaml);
+        let scratch = md.scratch.expect("scratch present");
+        assert_eq!(scratch.storage_class_name.as_deref(), Some("fast-ssd"));
+        assert_eq!(scratch.capacity.as_deref(), Some("100Gi"));
     }
 
     // --- privileged-mover detection (ADR §4.11/§G16, namespace-gated). ---

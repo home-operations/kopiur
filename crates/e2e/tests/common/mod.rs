@@ -306,6 +306,18 @@ pub fn job_pod_sc(job: &Job) -> Option<k8s_openapi::api::core::v1::PodSecurityCo
         .and_then(|p| p.security_context.clone())
 }
 
+/// The deep-verify scratch `Volume` (named `scratch`) from a Job's pod template, or
+/// `None` if the Job mounts no scratch volume. Used to assert how the scratch
+/// restore-test volume was provisioned (emptyDir vs sized ephemeral PVC + class).
+pub fn job_scratch_volume(job: &Job) -> Option<k8s_openapi::api::core::v1::Volume> {
+    job.spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.volumes.as_ref())
+        .and_then(|vols| vols.iter().find(|v| v.name == "scratch"))
+        .cloned()
+}
+
 /// Assert a rendered mover container securityContext STILL carries the hardened
 /// `capabilities.drop:[ALL]` + `seccompProfile: RuntimeDefault` — the de-hardening
 /// regression guard (ADR-0004 §2): a partial `moverDefaults`/`mover` override must

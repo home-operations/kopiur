@@ -41,7 +41,11 @@ spec:
   PVC (auto-deleted with the Job), sized to hold the restored snapshot;
   **`storageClassName`** places it (omit = cluster default). Omit `capacity` and
   scratch is a node-ephemeral `emptyDir` — zero-config, but bounded by node disk, so
-  prefer a sized PVC for large snapshots.
+  prefer a sized PVC for large snapshots. A `storageClassName` with no `capacity` is a
+  no-op (an `emptyDir` has no StorageClass) — the operator flags it as a
+  `ScratchStorageClassIgnored` condition on the `SnapshotPolicy`. Set the size/class
+  once for all policies via `moverDefaults.scratch` on the repository; `verification.deep`
+  here overrides it field-wise.
 - **`successExpr`** is a CEL predicate over the result (`stats{files,bytes,errors}`,
   `snapshot`, and — deep only — `restored{files,checksumMatches}`) — it kills the
   silent "0 files" success. It is validated at admission, so a typo is rejected on

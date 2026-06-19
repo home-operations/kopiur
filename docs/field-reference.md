@@ -358,6 +358,7 @@ referrer's namespace (required on cluster-scoped CRs).
 | `podSecurityContext` | core/v1 PodSecurityContext | Pod SC base (notably `fsGroup`). |
 | `resources` | core/v1 ResourceRequirements | Mover container resources base. |
 | `cache` | [CacheDefaults](#cachedefaults) | kopia cache backing every mover. |
+| `scratch` | [ScratchDefaults](#scratchdefaults) | Default size/class for the deep-verification scratch (restore-test) volume; inherited by `verification.deep`. |
 | `nodeSelector` / `tolerations` / `affinity` | core/v1 | Pod scheduling for every mover. |
 | `sourceColocation` | {`mode`: `Auto`\|`Required`\|`Disabled`} | Pin an RWO source/destination mover to the node its PVC is attached to, avoiding a `Multi-Attach error`. Default `Auto`. See [Repositories](repositories.md#sourcecolocation-avoid-the-rwo-multi-attach-error). |
 | `ttlSecondsAfterFinished` | int | Finished mover Jobs self-GC (built-in default `3600`). §12 |
@@ -386,6 +387,18 @@ Full treatment: [Security context → Inherit it from the workload](security-con
 
 `{ capacity?, storageClassName?, metadataCacheSizeMb?, contentCacheSizeMb?,
 mode? }` — `mode` is `enum(`**`Ephemeral`**`|Persistent)`.
+
+### ScratchDefaults
+
+`{ storageClassName?, capacity? }` — repository-wide defaults for the **deep-verify
+scratch** volume (the throwaway restore target a `verification.deep` restore-test
+writes into, then discards). Inherited by `SnapshotPolicy.spec.verification.deep`
+field-wise (`moverDefaults.scratch ⊂ verification.deep`), the same overlay as
+`CacheDefaults`. Distinct from the cache: scratch is **always ephemeral** (no `mode`).
+`storageClassName` only takes effect when a `capacity` is set (the capacity gate — an
+`emptyDir` has no StorageClass); a storageClassName with no effective capacity is a
+no-op, surfaced as the `ScratchStorageClassIgnored` condition + a Warning Event on the
+`SnapshotPolicy`.
 
 ### CatalogBounds
 

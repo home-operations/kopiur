@@ -18,9 +18,10 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 
-use kopiur_api::SnapshotPolicy;
+use k8s_openapi::api::batch::v1::Job;
+use kopiur_api::{Repository, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
 /// Verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.quick` with an
@@ -145,5 +146,109 @@ async fn verification_deep_scratch_restore_stamps_last_verified() {
     .expect(
         "a passing deep verify must mount a writable /scratch (emptyDir) and stamp \
          status.lastVerified — failure here is the `mkdir /scratch: permission denied` regression",
+    );
+}
+
+/// Repo-level `moverDefaults.scratch` is inherited by a policy's `verification.deep`
+/// scratch PVC — set the scratch size/class ONCE on the `Repository`, leave
+/// `verification.deep` bare, and the spawned deep-verify Job's scratch volume must be
+/// a sized ephemeral PVC carrying the inherited `storageClassName` + `capacity`.
+///
+/// Regression guard for the inheritance wiring (`moverDefaults.scratch ⊂
+/// verification.deep`). Asserted at the **Job spec** level (no PVC provisioning
+/// required), so a synthetic StorageClass is fine and the test stays fast — we only
+/// enable `deep` (no `quick`) so the single verify Job is the deep one.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn deep_verify_scratch_inherits_repo_mover_defaults() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_seed(
+        &client,
+        "e2e-vfy-inh-repo",
+        "e2e-vfy-inh-policy",
+        "e2e-vfy-inh-seed",
+        "vfyinh",
+    )
+    .await;
+
+    // Scratch defaults set ONCE on the Repository (the user's "configure it centrally"
+    // ask). A synthetic class is fine — we assert the Job spec, not a bound PVC.
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repo_patch = serde_json::json!({
+        "spec": { "moverDefaults": { "scratch": {
+            "capacity": "1Gi",
+            "storageClassName": "e2e-scratch-class"
+        } } }
+    });
+    repos
+        .patch(
+            "e2e-vfy-inh-repo",
+            &PatchParams::default(),
+            &Patch::Merge(&repo_patch),
+        )
+        .await
+        .expect("patch moverDefaults.scratch onto the Repository");
+
+    // Enable ONLY deep verify, with a bare schedule — scratch size/class come entirely
+    // from the inherited repo default.
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policy_patch = serde_json::json!({
+        "spec": { "verification": { "deep": { "schedule": { "cron": "* * * * *" } } } }
+    });
+    policies
+        .patch(
+            "e2e-vfy-inh-policy",
+            &PatchParams::default(),
+            &Patch::Merge(&policy_patch),
+        )
+        .await
+        .expect("patch verification.deep onto the SnapshotPolicy");
+
+    // The only verify Job is the deep one (no quick configured). Wait for it to appear.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let selector = "app.kubernetes.io/component=verify,\
+                    kopiur.home-operations.com/verify=e2e-vfy-inh-policy";
+    let job = wait_until(
+        "deep-verify mover Job created",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let lp = ListParams::default().labels(selector);
+            Ok(jobs.list(&lp).await?.items.into_iter().next())
+        },
+    )
+    .await
+    .expect("a deep-verify Job should be spawned");
+
+    // The inherited capacity makes scratch a SIZED ephemeral PVC (not an emptyDir),
+    // and the storageClass/capacity are the repo defaults.
+    let scratch = job_scratch_volume(&job).expect("deep-verify Job must mount a 'scratch' volume");
+    let tmpl = scratch
+        .ephemeral
+        .as_ref()
+        .and_then(|e| e.volume_claim_template.as_ref())
+        .expect(
+            "inherited scratch capacity must make scratch a sized ephemeral PVC, not an emptyDir",
+        );
+    assert_eq!(
+        tmpl.spec.storage_class_name.as_deref(),
+        Some("e2e-scratch-class"),
+        "scratch PVC must inherit moverDefaults.scratch.storageClassName"
+    );
+    let storage = tmpl
+        .spec
+        .resources
+        .as_ref()
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|m| m.get("storage"))
+        .map(|q| q.0.clone());
+    assert_eq!(
+        storage.as_deref(),
+        Some("1Gi"),
+        "scratch PVC must inherit moverDefaults.scratch.capacity"
     );
 }
