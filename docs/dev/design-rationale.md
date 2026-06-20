@@ -63,35 +63,35 @@ array/string and rejects the CRD as over budget. 100 sources / 4096-byte paths a
 past any real use. The exactly-one-of rule is written as an integer **sum of
 `has()`-ternaries** rather than `filter().size()` precisely to stay inside that budget.
 
-### Embedded `core/v1` objects are `x-kubernetes-preserve-unknown-fields`
+### The hooks `jobSpec` is `x-kubernetes-preserve-unknown-fields`
 
 schemars inlines the *entire* structural schema of an embedded `k8s-openapi` type.
-A `JobSpec` drags in the full `PodSpec`; `SecurityContext`/`PodSecurityContext`/
-`ResourceRequirements`/`Affinity` each add tens of KB — and they appear on every
-`moverDefaults`/`mover`/`server` surface. Inlined, a single `SnapshotPolicy` CRD was
-~1.2 MB (95% of it the hooks `JobSpec`), and the whole bundle ~1.9 MB. That bloats
-Helm releases and breaks large-CRD apply paths — most sharply client-side
+The hooks `JobSpec` (`RunJobHook.jobSpec`) drags in the full `PodSpec`: inlined, it
+made a single `SnapshotPolicy` CRD ~1.2 MB — ~85% of the whole bundle — which bloats
+Helm releases and breaks large-CRD apply paths, most sharply client-side
 `kubectl apply`, whose `last-applied-configuration` annotation has a hard 256 KB
-limit, so a 1.2 MB CRD can't be applied at all.
+limit (a 1.2 MB CRD can't be applied at all).
 
-So these embedded `core/v1` object fields carry
+So `RunJobHook.jobSpec` carries
 `#[schemars(schema_with = "crate::schema::preserve_unknown_object")]`, which renders
-them as `{ type: object, x-kubernetes-preserve-unknown-fields: true }` instead of the
-inlined schema. This took the bundle from ~1.9 MB to ~280 KB (gzipped 259 KB → 38 KB).
+it as `{ type: object, x-kubernetes-preserve-unknown-fields: true }` instead of the
+inlined schema. That alone takes the bundle from ~1.9 MB to ~665 KB (gzipped
+259 KB → ~92 KB) and `snapshotpolicies` from ~1.26 MB to ~76 KB.
 
-The trade-off is deliberate and narrow: the **Rust field stays its concrete typed
-`k8s-openapi` type**, so kube still deserializes into it and Kopiur's own logic + the
-admission webhook (resource bounds, the `securityContext` invariants INV-1/INV-2,
-privileged-mover gating) still validate it. Only the *apiserver's structural
-validation of the object's internals* is relaxed — a typo inside a `securityContext`
-surfaces at the webhook / on deserialize rather than as an apiserver field-pruning
-error. This is the standard pattern for embedded `PodSpec`/`JobSpec` in CRDs, and it
-doesn't touch the type-safety thesis (which is about the externally-tagged enums, not
-the k8s schemas). The fields covered: mover `securityContext`/`podSecurityContext`/
-`resources`/`affinity` (`MoverSpec`/`MoverDefaults`), server
-`securityContext`/`podSecurityContext`/`resources` (`ServerSpec`), and the hooks
-`jobSpec` (`RunJobHook`). A regression test in `crates/xtask/tests/crds.rs` guards
-both the preserve-unknown rendering and a per-CRD size ceiling.
+The trade-off is contained: the **Rust field stays a concrete typed `JobSpec`**, so
+kube still deserializes into it (scalar type errors are still rejected at admission),
+and the apiserver structurally validates the *actual hook Job* when the controller
+creates it. Only **apply-time** structural validation of the `jobSpec` is deferred —
+a malformed hook spec fails at Job creation rather than at `SnapshotPolicy` apply.
+
+This is scoped to the `jobSpec` on purpose. The other embedded `core/v1` objects —
+mover/server `securityContext`, `podSecurityContext`, `resources`, `affinity` — are
+**left inlined** so the apiserver keeps validating them at apply time: each adds only
+tens of KB (the bundle is fine at ~92 KB gzipped), and for a backup operator the
+early, structural validation of security/resource settings is worth more than the
+saving. A regression test in `crates/xtask/tests/crds.rs`
+(`hooks_job_spec_renders_as_preserve_unknown_not_inlined`) guards both the
+preserve-unknown rendering of `jobSpec` and a size ceiling on `snapshotpolicies`.
 
 ### Immutability transition rules
 

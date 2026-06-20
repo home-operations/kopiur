@@ -83,41 +83,43 @@ fn bundle_contains_all_eight_crds() {
     }
 }
 
-/// Large embedded `core/v1` objects — the mover `securityContext`/`podSecurityContext`/
-/// `resources`/`affinity`, the server security context, and the hooks `jobSpec` — must
-/// render as opaque `x-kubernetes-preserve-unknown-fields` objects, NOT the fully-inlined
-/// k8s-openapi structural schema. Inlining the `JobSpec`/`PodSpec` schema bloated a single
-/// CRD past 1 MB (~85% of the bundle) and breaks large-CRD apply paths (e.g. client-side
-/// apply's 256 KB `last-applied-configuration` annotation limit). The Rust fields stay
-/// their concrete typed `k8s-openapi` types — only the apiserver's structural validation of
-/// the internals is relaxed. Regression guard for `kopiur_api::schema::preserve_unknown_object`.
+/// The hooks `jobSpec` (`RunJobHook`) must render as an opaque
+/// `x-kubernetes-preserve-unknown-fields` object, NOT the fully-inlined k8s-openapi
+/// `JobSpec`/`PodSpec` structural schema. Inlined, it dragged the whole `PodSpec` into the
+/// `SnapshotPolicy` CRD — ~1.2 MB, ~85% of the bundle — which breaks large-CRD apply paths
+/// (e.g. client-side apply's 256 KB `last-applied-configuration` annotation limit). The Rust
+/// field stays a concrete typed `JobSpec`, and the apiserver validates the actual hook Job at
+/// Job-creation time, so only apply-time structural validation of the spec is deferred.
+/// Regression guard for `kopiur_api::schema::preserve_unknown_object`.
+///
+/// Note: the smaller embedded `core/v1` objects (`securityContext`/`podSecurityContext`/
+/// `resources`/`affinity` on the mover/server) are deliberately left INLINED so the apiserver
+/// keeps validating them at apply time — only the outsized `jobSpec` is pruned.
 #[test]
-fn embedded_core_v1_objects_render_as_preserve_unknown_not_inlined() {
+fn hooks_job_spec_renders_as_preserve_unknown_not_inlined() {
     let artifacts = xtask::crds::artifacts().expect("generate CRD artifacts");
-
-    // The SnapshotPolicy hooks `jobSpec` was the worst offender (~1.2 MB inlined).
     let sp = crd_yaml(&artifacts, "snapshotpolicies");
+
+    // The hooks `jobSpec` is preserve-unknown ...
     assert!(
         sp.contains("x-kubernetes-preserve-unknown-fields: true"),
-        "snapshotpolicies must render embedded core/v1 objects as preserve-unknown"
+        "snapshotpolicies hooks `jobSpec` must render as preserve-unknown"
     );
-    // This description only appears when the full PodSpec `SecurityContext` is inlined.
+    // ... and the inlined `PodSpec` is gone. "Periodic probe of container" is a container/probe
+    // description that ONLY appears when the full PodSpec is inlined (not from a bare
+    // securityContext/resources/affinity), so it precisely catches a `jobSpec` re-inlining.
     assert!(
-        !sp.contains("AllowPrivilegeEscalation controls"),
-        "snapshotpolicies must NOT inline the k8s-openapi PodSpec/SecurityContext schema; \
-         annotate the embedded field with schema_with = preserve_unknown_object"
+        !sp.contains("Periodic probe of container"),
+        "snapshotpolicies must NOT inline the k8s-openapi JobSpec/PodSpec schema; annotate \
+         RunJobHook.job_spec with schema_with = preserve_unknown_object"
     );
 
-    // Size ceilings: with the embedded schemas pruned every CRD is small. Guard against a
-    // regression that re-inlines a PodSpec/JobSpec (which would ~10x the file). These bounds
-    // sit well above the current sizes (snapshotpolicies ~47 KB, repositories ~57 KB) but far
-    // below the inlined sizes (~1.2 MB / ~210 KB).
-    for (plural, max) in [("snapshotpolicies", 150_000), ("repositories", 100_000)] {
-        let bytes = crd_yaml(&artifacts, plural).len();
-        assert!(
-            bytes < max,
-            "{plural}.yaml is {bytes} bytes (>= {max}); did an embedded core/v1 schema get \
-             inlined again? See kopiur_api::schema::preserve_unknown_object"
-        );
-    }
+    // Size ceiling: pruned, the CRD is ~76 KB; with the `JobSpec` re-inlined it is ~1.2 MB.
+    // The bound sits well above the current size and far below the inlined size.
+    let bytes = sp.len();
+    assert!(
+        bytes < 300_000,
+        "snapshotpolicies.yaml is {bytes} bytes (>= 300_000); did the JobSpec/PodSpec schema \
+         get inlined again? See kopiur_api::schema::preserve_unknown_object"
+    );
 }
