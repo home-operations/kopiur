@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.4.10](https://github.com/home-operations/kopiur/compare/0.4.9...0.4.10) (2026-06-20)
+
+
+### Features
+
+* **crds:** eh, validate some more schemas ([d59e6aa](https://github.com/home-operations/kopiur/commit/d59e6aa04dfe09b03a5a990704fac641b628c06a))
+* **crds:** trim CRD descriptions to one sentence; move detail to docs ([#146](https://github.com/home-operations/kopiur/issues/146)) ([2ba82a6](https://github.com/home-operations/kopiur/commit/2ba82a6ed95e588cb1328da3ece27f054d7a2430))
+* **crds:** try to slim up the CRDs some more ([990fff4](https://github.com/home-operations/kopiur/commit/990fff4c895ea2d32400b6c50e727f877add060e))
+* **identity:** validate identity shape + guard re-identification on edit ([#141](https://github.com/home-operations/kopiur/issues/141)) ([2509680](https://github.com/home-operations/kopiur/commit/2509680ec5e1d305a947d8a5351402b629aecde7))
+* **migrate:** offline/GitOps mode for `migrate volsync` ([#143](https://github.com/home-operations/kopiur/issues/143)) ([605df1f](https://github.com/home-operations/kopiur/commit/605df1f5a272bfcde2edb791b0cc0970c2fb5b0c))
+* **scratch:** inherit deep-verify scratch defaults from moverDefaults.scratch ([#139](https://github.com/home-operations/kopiur/issues/139)) ([521f3b1](https://github.com/home-operations/kopiur/commit/521f3b13cc7435a6d04361d410a208dae4f2868b))
+
+
+### Bug Fixes
+
+* **restore:** provision empty volume on onMissingSnapshot=Continue ([#144](https://github.com/home-operations/kopiur/issues/144)) ([bc0d2ee](https://github.com/home-operations/kopiur/commit/bc0d2ee8492e4a7bf7bb4fafec916c1f9e38cf2b))
+* **restore:** re-resolve kopia snapshot id after pin; heal stale ids ([#137](https://github.com/home-operations/kopiur/issues/137)) ([#142](https://github.com/home-operations/kopiur/issues/142)) ([c17dace](https://github.com/home-operations/kopiur/commit/c17dace26c0aac5ef5ea7aa7ff96cf5f1785cfd1))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.9 manifest ([399a346](https://github.com/home-operations/kopiur/commit/399a346572cd089b25ba4120720436cf37b7318f))
+
+
+### Code Refactoring
+
+* split oversized files into modules + extract kopiur-migrate crate ([#145](https://github.com/home-operations/kopiur/issues/145)) ([1ed484d](https://github.com/home-operations/kopiur/commit/1ed484daf3e0e0f8882f2787de161e59b0141c23))
+
 ## [0.4.9](https://github.com/home-operations/kopiur/compare/0.4.8...0.4.9) (2026-06-19)
 
 
