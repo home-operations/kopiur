@@ -203,6 +203,15 @@ pub fn validate_repository_maintenance(
         if let Err(e) = validate_cron(&schedule.full.cron) {
             errs.push(e);
         }
+        for tz in [
+            schedule.timezone.as_deref(),
+            schedule.quick.timezone.as_deref(),
+            schedule.full.timezone.as_deref(),
+        ] {
+            if let Err(e) = validate_timezone(tz) {
+                errs.push(e);
+            }
+        }
     }
     if !cluster_scoped && let Some(ns) = &maintenance.namespace {
         errs.push(ValidationError::MaintenanceNamespaceOnNamespacedRepo {
@@ -473,6 +482,9 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
     if let Err(e) = validate_cron(&spec.schedule.cron) {
         errs.push(e);
     }
+    if let Err(e) = validate_timezone(spec.schedule.timezone.as_deref()) {
+        errs.push(e);
+    }
     if let Err(e) = validate_backend(&spec.destination) {
         errs.push(e);
     }
@@ -543,6 +555,15 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     }
     if let Err(e) = validate_cron(&spec.schedule.full.cron) {
         errs.push(e);
+    }
+    for tz in [
+        spec.schedule.timezone.as_deref(),
+        spec.schedule.quick.timezone.as_deref(),
+        spec.schedule.full.timezone.as_deref(),
+    ] {
+        if let Err(e) = validate_timezone(tz) {
+            errs.push(e);
+        }
     }
     if let Some(m) = &spec.mover {
         if let Err(e) = forbid_pvc_consumer(

@@ -824,10 +824,12 @@ fn build_managed_maintenance_for_cluster_repository_uses_overrides() {
             quick: CronSpec {
                 cron: "0 */2 * * *".into(),
                 jitter: None,
+                timezone: None,
             },
             full: CronSpec {
                 cron: "0 1 * * *".into(),
                 jitter: None,
+                timezone: None,
             },
             timezone: Some("UTC".into()),
         }),

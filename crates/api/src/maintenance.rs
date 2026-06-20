@@ -28,10 +28,12 @@ pub fn default_maintenance_schedule() -> MaintenanceSchedule {
         quick: CronSpec {
             cron: "0 */6 * * *".to_string(),
             jitter: Some("30m".to_string()),
+            timezone: None,
         },
         full: CronSpec {
             cron: "0 3 * * *".to_string(),
             jitter: Some("1h".to_string()),
+            timezone: None,
         },
         timezone: None,
     }

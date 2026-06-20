@@ -398,6 +398,19 @@ pub struct CronSpec {
     /// Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jitter: Option<String>,
+    /// IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses
+    /// the enclosing schedule's timezone, else the controller default (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// Resolve an optional IANA timezone name to a concrete zone, defaulting to UTC.
+/// An unparseable name falls back to UTC defensively — the admission webhook rejects
+/// bad names up front via `validate::validate_timezone`, so reconcile-time resolution
+/// should never see one.
+pub fn resolve_tz(name: Option<&str>) -> chrono_tz::Tz {
+    name.and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
 }
 
 impl RepositoryRef {

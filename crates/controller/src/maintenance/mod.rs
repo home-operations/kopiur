@@ -720,7 +720,13 @@ fn slot_for(
         MaintenanceMode::Full => &maint.spec.schedule.full,
     };
     let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
-    next_fire(&spec.cron, jitter, &seed, after)
+    // Per-cron `timezone` wins; else the schedule-level shared timezone; else UTC.
+    let tz = kopiur_api::common::resolve_tz(
+        spec.timezone
+            .as_deref()
+            .or(maint.spec.schedule.timezone.as_deref()),
+    );
+    next_fire(&spec.cron, jitter, &seed, after, tz)
 }
 
 /// Parse `status.<mode>.lastRunAt` (RFC3339) into a `DateTime<Utc>`.

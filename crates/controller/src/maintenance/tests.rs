@@ -16,10 +16,12 @@ fn maint_with(quick_cron: &str, full_cron: &str, status: Option<MaintenanceStatu
                 quick: CronSpec {
                     cron: quick_cron.into(),
                     jitter: None,
+                    timezone: None,
                 },
                 full: CronSpec {
                     cron: full_cron.into(),
                     jitter: None,
+                    timezone: None,
                 },
                 timezone: None,
             },

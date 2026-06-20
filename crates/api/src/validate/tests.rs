@@ -1133,6 +1133,35 @@ fn backup_schedule_aggregate_rejects_bad_cron() {
     );
 }
 
+#[test]
+fn backup_schedule_aggregate_rejects_bad_timezone() {
+    use crate::common::PolicyRef;
+    use crate::snapshot_schedule::ScheduleSpec;
+    let spec = SnapshotScheduleSpec {
+        policy_ref: Some(PolicyRef {
+            name: "c".into(),
+            namespace: None,
+        }),
+        policy_selector: None,
+        schedule: ScheduleSpec {
+            cron: "0 2 * * *".into(),
+            jitter: None,
+            timezone: Some("America/Chicgo".into()), // typo'd IANA name
+            run_on_create: false,
+            suspend: false,
+            concurrency_policy: Default::default(),
+            starting_deadline_seconds: None,
+        },
+        failed_jobs_history_limit: None,
+    };
+    let errs = validate_backup_schedule(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
+        "a typo'd timezone must be rejected at admission: {errs:?}"
+    );
+}
+
 // --- §10 policyRef XOR policySelector ---
 
 #[test]
@@ -1279,10 +1308,12 @@ fn repository_maintenance_bad_override_cron_is_rejected() {
             quick: CronSpec {
                 cron: "totally bad".into(),
                 jitter: None,
+                timezone: None,
             },
             full: CronSpec {
                 cron: "0 3 * * *".into(),
                 jitter: None,
+                timezone: None,
             },
             timezone: None,
         }),
@@ -1664,6 +1695,7 @@ fn replication_spec(
         schedule: CronSpec {
             cron: cron.into(),
             jitter: None,
+            timezone: None,
         },
         mover: None,
         suspend: false,

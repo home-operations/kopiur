@@ -24,7 +24,7 @@ use k8s_openapi::api::batch::v1::Job;
 use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::ScratchDefaults;
+use kopiur_api::common::{CronSpec, ScratchDefaults};
 use kopiur_api::{SnapshotPolicy, Verification};
 use kopiur_mover::workspec::{
     DeepVerify, MoverOptions, MoverWorkSpec, Operation, QuickVerify, ResolvedIdentity, TargetRef,
@@ -81,16 +81,13 @@ fn tier_after(last_verified: Option<DateTime<Utc>>) -> DateTime<Utc> {
     last_verified.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365))
 }
 
-/// The next cron slot for a verification `cron`/`jitter` strictly after `after`,
-/// seeded by the policy UID for a stable per-replica spread.
-fn slot_for(
-    seed: &str,
-    cron: &str,
-    jitter: Option<&str>,
-    after: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
-    let jitter = jitter.and_then(parse_go_duration);
-    next_fire(cron, jitter, seed, after)
+/// The next cron slot for a verification `CronSpec` strictly after `after`, seeded by
+/// the policy UID for a stable per-replica spread and evaluated in the cron's own
+/// `timezone` (absent ⇒ UTC).
+fn slot_for(seed: &str, spec: &CronSpec, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
+    let tz = kopiur_api::common::resolve_tz(spec.timezone.as_deref());
+    next_fire(&spec.cron, jitter, seed, after, tz)
 }
 
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
@@ -104,13 +101,13 @@ pub fn due_tier(
 ) -> Option<(VerifyTierKind, DateTime<Utc>)> {
     let after = tier_after(last_verified);
     if let Some(d) = &verification.deep
-        && let Ok(slot) = slot_for(seed, &d.schedule.cron, d.schedule.jitter.as_deref(), after)
+        && let Ok(slot) = slot_for(seed, &d.schedule, after)
         && now >= slot
     {
         return Some((VerifyTierKind::Deep, slot));
     }
     if let Some(q) = &verification.quick
-        && let Ok(slot) = slot_for(seed, &q.cron, q.jitter.as_deref(), after)
+        && let Ok(slot) = slot_for(seed, q, after)
         && now >= slot
     {
         return Some((VerifyTierKind::Quick, slot));
@@ -135,7 +132,7 @@ pub fn next_verify_wakeup(
     .into_iter()
     .flatten()
     {
-        if let Ok(slot) = slot_for(seed, &spec.cron, spec.jitter.as_deref(), after) {
+        if let Ok(slot) = slot_for(seed, spec, after) {
             earliest = Some(earliest.map_or(slot, |e| e.min(slot)));
         }
     }
@@ -562,11 +559,13 @@ mod tests {
             quick: quick.map(|c| CronSpec {
                 cron: c.into(),
                 jitter: None,
+                timezone: None,
             }),
             deep: deep.map(|c| DeepVerification {
                 schedule: CronSpec {
                     cron: c.into(),
                     jitter: None,
+                    timezone: None,
                 },
                 storage_class_name: None,
                 capacity: None,
@@ -806,6 +805,7 @@ mod tests {
                 schedule: CronSpec {
                     cron: "0 5 * * 0".into(),
                     jitter: None,
+                    timezone: None,
                 },
                 storage_class_name: storage_class.map(Into::into),
                 capacity: capacity.map(Into::into),
