@@ -358,6 +358,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 cluster_last_refresh_at(repo),
                 interval,
+                CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                 chrono::Utc::now(),
             ) {
                 let listing = client.snapshot_list(None).await?;
@@ -663,6 +664,7 @@ async fn bootstrap_cluster_via_mover(
                         repo.status.as_ref().and_then(|s| s.observed_generation),
                         cluster_last_refresh_at(repo),
                         interval,
+                        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                         chrono::Utc::now(),
                     )
                 {
@@ -701,6 +703,7 @@ async fn bootstrap_cluster_via_mover(
             repo.status.as_ref().and_then(|s| s.observed_generation),
             cluster_last_refresh_at(repo),
             CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
             chrono::Utc::now(),
         ))
     {
@@ -992,6 +995,7 @@ async fn finalize_cluster_bootstrap(
         repo.status.as_ref().and_then(|s| s.observed_generation),
         cluster_last_refresh_at(repo),
         interval,
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
         chrono::Utc::now(),
     ) {
         run_cluster_catalog_scan(

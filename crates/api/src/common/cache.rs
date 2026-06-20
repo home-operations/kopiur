@@ -108,7 +108,16 @@ pub struct CatalogBounds {
     /// How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain: Option<CatalogRetain>,
-    /// How often to re-scan the repository (Go-style duration; minimum `30s`, default `1h`).
+    /// Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
+    /// current (re-list snapshots; for object-store / volume-backed repos this recycles
+    /// the bootstrap Job every `refreshInterval`). **Off by default** — the repository
+    /// still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup
+    /// failure, but does not re-run on a timer. Enable it if you rely on discovered
+    /// snapshots reflecting changes made outside this operator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub periodic_refresh: bool,
+    /// How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum
+    /// `30s`, default `1h`). Inert unless `periodicRefresh` is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval: Option<String>,
     /// Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
@@ -117,10 +126,17 @@ pub struct CatalogBounds {
 }
 
 impl CatalogBounds {
-    /// The effective catalog re-scan cadence: `refreshInterval` when set and
-    /// parseable, else [`crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`].
-    /// (The webhook rejects an unparseable value, so the fallback only covers
-    /// objects admitted before the validator existed.)
+    /// Whether periodic re-scan is opted in (`catalog.periodicRefresh`). Off by
+    /// default, so a repository does not re-run its bootstrap Job on a timer.
+    pub fn periodic_refresh_enabled(catalog: Option<&Self>) -> bool {
+        catalog.is_some_and(|c| c.periodic_refresh)
+    }
+
+    /// The effective catalog re-scan cadence used **when `periodicRefresh` is on**:
+    /// `refreshInterval` when set and parseable, else
+    /// [`crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`]. (The webhook rejects an
+    /// unparseable value, so the fallback only covers objects admitted before the
+    /// validator existed.)
     pub fn effective_refresh_interval(catalog: Option<&Self>) -> std::time::Duration {
         catalog
             .and_then(|c| c.refresh_interval.as_deref())

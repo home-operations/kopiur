@@ -426,6 +426,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 last_refresh_at(repo),
                 interval,
+                CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                 chrono::Utc::now(),
             ) {
                 let listing = client.snapshot_list(None).await?;
@@ -598,6 +599,7 @@ async fn bootstrap_via_mover(
                         repo.status.as_ref().and_then(|s| s.observed_generation),
                         last_refresh_at(repo),
                         interval,
+                        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                         chrono::Utc::now(),
                     )
                 {
@@ -633,6 +635,7 @@ async fn bootstrap_via_mover(
             repo.status.as_ref().and_then(|s| s.observed_generation),
             last_refresh_at(repo),
             CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
             chrono::Utc::now(),
         ))
     {
@@ -986,6 +989,7 @@ async fn finalize_bootstrap(
         repo.status.as_ref().and_then(|s| s.observed_generation),
         last_refresh_at(repo),
         interval,
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
         chrono::Utc::now(),
     ) {
         run_catalog_scan(

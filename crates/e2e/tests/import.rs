@@ -587,7 +587,7 @@ async fn catalog_refresh_discovers_out_of_band_snapshots_and_never_duplicates_pr
                 "e2e-import-refresh",
                 "kopiur-import-refresh",
                 true,
-                Some(serde_json::json!({ "refreshInterval": "30s" })),
+                Some(serde_json::json!({ "periodicRefresh": true, "refreshInterval": "30s" })),
             )),
         )
         .await
