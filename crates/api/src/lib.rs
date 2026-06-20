@@ -24,6 +24,7 @@ pub mod identity;
 pub mod invariants;
 pub mod jitter;
 pub mod retention;
+pub mod schema;
 pub mod secctx_compat;
 pub mod success_expr;
 pub mod validate;

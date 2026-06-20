@@ -13,15 +13,18 @@ use std::collections::BTreeMap;
 pub struct MoverSpec {
     /// Resource requests/limits for the mover container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
     /// Override the repository's [`CacheDefaults`] for this recipe's movers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheDefaults>,
     /// Container security context for the mover; merged field-wise over the defaults and hardened base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub security_context: Option<k8s_openapi::api::core::v1::SecurityContext>,
     /// Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
     /// Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,12 +85,15 @@ pub struct SourceColocation {
 pub struct MoverDefaults {
     /// Container security-context base for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub security_context: Option<SecurityContext>,
     /// Pod security-context base (notably `fsGroup`) for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub pod_security_context: Option<PodSecurityContext>,
     /// Resource requests/limits base for the mover container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub resources: Option<ResourceRequirements>,
     /// kopia cache defaults for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +109,7 @@ pub struct MoverDefaults {
     pub tolerations: Option<Vec<Toleration>>,
     /// Pod affinity for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub affinity: Option<Affinity>,
     /// How a mover co-locates with its RWO PVC's node; defaults to [`SourceColocationMode::Auto`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
