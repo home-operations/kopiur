@@ -22,6 +22,11 @@ pub const REPOSITORY_WRITABLE_CONDITION: &str = "RepositoryWritable";
 /// repository (ADR-0005 §11).
 pub const REPOSITORY_READ_ONLY_REASON: &str = "RepositoryReadOnly";
 
+/// `reason` when a backup is held in `Pending` because its referenced repository
+/// is not `Ready` (backend unreachable). Mirrors the readiness gate Maintenance,
+/// `SnapshotPolicy`, and `RepositoryReplication` already apply.
+pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
+
 /// In-container mount path for an inline-NFS backup *source* whose server-side
 /// export is the NFSv4 pseudo-root (`/`). The export's server path and the
 /// container mount path are independent; reusing `/` as the mount path would
