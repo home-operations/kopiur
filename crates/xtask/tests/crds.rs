@@ -82,3 +82,42 @@ fn bundle_contains_all_eight_crds() {
         assert_eq!(crd.spec.group, "kopiur.home-operations.com");
     }
 }
+
+/// Large embedded `core/v1` objects — the mover `securityContext`/`podSecurityContext`/
+/// `resources`/`affinity`, the server security context, and the hooks `jobSpec` — must
+/// render as opaque `x-kubernetes-preserve-unknown-fields` objects, NOT the fully-inlined
+/// k8s-openapi structural schema. Inlining the `JobSpec`/`PodSpec` schema bloated a single
+/// CRD past 1 MB (~85% of the bundle) and breaks large-CRD apply paths (e.g. client-side
+/// apply's 256 KB `last-applied-configuration` annotation limit). The Rust fields stay
+/// their concrete typed `k8s-openapi` types — only the apiserver's structural validation of
+/// the internals is relaxed. Regression guard for `kopiur_api::schema::preserve_unknown_object`.
+#[test]
+fn embedded_core_v1_objects_render_as_preserve_unknown_not_inlined() {
+    let artifacts = xtask::crds::artifacts().expect("generate CRD artifacts");
+
+    // The SnapshotPolicy hooks `jobSpec` was the worst offender (~1.2 MB inlined).
+    let sp = crd_yaml(&artifacts, "snapshotpolicies");
+    assert!(
+        sp.contains("x-kubernetes-preserve-unknown-fields: true"),
+        "snapshotpolicies must render embedded core/v1 objects as preserve-unknown"
+    );
+    // This description only appears when the full PodSpec `SecurityContext` is inlined.
+    assert!(
+        !sp.contains("AllowPrivilegeEscalation controls"),
+        "snapshotpolicies must NOT inline the k8s-openapi PodSpec/SecurityContext schema; \
+         annotate the embedded field with schema_with = preserve_unknown_object"
+    );
+
+    // Size ceilings: with the embedded schemas pruned every CRD is small. Guard against a
+    // regression that re-inlines a PodSpec/JobSpec (which would ~10x the file). These bounds
+    // sit well above the current sizes (snapshotpolicies ~47 KB, repositories ~57 KB) but far
+    // below the inlined sizes (~1.2 MB / ~210 KB).
+    for (plural, max) in [("snapshotpolicies", 150_000), ("repositories", 100_000)] {
+        let bytes = crd_yaml(&artifacts, plural).len();
+        assert!(
+            bytes < max,
+            "{plural}.yaml is {bytes} bytes (>= {max}); did an embedded core/v1 schema get \
+             inlined again? See kopiur_api::schema::preserve_unknown_object"
+        );
+    }
+}

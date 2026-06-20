@@ -59,12 +59,15 @@ pub struct ServerSpec {
     pub service: Option<ServerService>,
     /// Resource requests/limits for the server pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub resources: Option<ResourceRequirements>,
     /// Override the hardened default container security context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub security_context: Option<SecurityContext>,
     /// Pod-level security context for the server pod (notably `supplementalGroups` for NFS exports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub pod_security_context: Option<PodSecurityContext>,
 }
 

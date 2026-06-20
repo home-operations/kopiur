@@ -411,6 +411,7 @@ pub struct WorkloadExecHook {
 #[serde(rename_all = "camelCase")]
 pub struct RunJobHook {
     /// The full Kubernetes `JobSpec` to run.
+    #[schemars(schema_with = "crate::schema::preserve_unknown_object")]
     pub job_spec: JobSpec,
     /// Max time to wait for the Job to complete (Go duration string).
     #[serde(default, skip_serializing_if = "Option::is_none")]
