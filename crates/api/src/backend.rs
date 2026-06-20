@@ -11,81 +11,36 @@ use crate::common::{SecretRef, TlsConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Credentials for a cloud object-store backend with an IAM plane (S3 / Azure /
-/// GCS): **exactly one of** a static-key Secret reference or a workload-identity
-/// binding. Both are `Option` because the forms share the `auth` key, so the
-/// exactly-one rule is webhook-enforced (`validate::validate_backend_auth`), like
-/// the snapshot `Source`. An absent `auth` is also legal — the well-known keys may
-/// ride the encryption-password Secret. Backends without cloud IAM (B2, SFTP,
-/// WebDAV) use [`SecretAuth`] instead, so a workload identity on them is
-/// unrepresentable. ADR §3.1 / §4.11.
+/// Credentials for a cloud object-store backend with an IAM plane (S3 / Azure / GCS).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendAuth {
-    /// Secret holding the backend's access credentials. The operator reads
-    /// well-known keys (e.g. `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for S3).
-    /// Mutually exclusive with `workloadIdentity`. ADR §3.1.
+    /// Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<SecretRef>,
-    /// Cloud workload identity: the mover Job runs as the named `ServiceAccount`
-    /// and authenticates via the cloud's federation (IRSA / EKS Pod Identity,
-    /// AKS Workload Identity, GKE Workload Identity) — no static keys in the
-    /// cluster. Mutually exclusive with `secretRef`. ADR §4.11.
+    /// Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_identity: Option<WorkloadIdentity>,
 }
 
-/// Cloud workload-identity binding (IRSA/EKS Pod Identity, AKS Workload
-/// Identity, GKE Workload Identity): the mover Job runs as a user-supplied
-/// Kubernetes `ServiceAccount` federated to the cloud IAM role/identity that
-/// grants backend access, instead of reading static keys from a Secret. The
-/// ServiceAccount must already exist in each namespace mover Jobs run in (the
-/// operator never creates it — its cloud annotations are the user's contract
-/// with the cloud webhook) and carries the cloud-specific annotation
-/// (`eks.amazonaws.com/role-arn`, `azure.workload.identity/client-id`,
-/// `iam.gke.io/gcp-service-account`). ADR §4.11.
+/// Cloud workload-identity binding: the mover runs as a federated `ServiceAccount`, not static keys.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadIdentity {
-    /// Name of the `ServiceAccount` the mover pod runs as, federated to the
-    /// cloud IAM role/identity that grants backend access. Resolved in the
-    /// mover Job's own namespace.
+    /// Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace.
     pub service_account_name: String,
 }
 
-/// Credentials for a backend **without** a cloud IAM plane (B2, SFTP, WebDAV):
-/// only a static Secret reference. A separate type from [`BackendAuth`] so a
-/// `workloadIdentity` on these backends is structurally unrepresentable — there
-/// is no cloud federation that could honor it. ADR §3.1 / §5.5.
+/// Credentials for a backend **without** a cloud IAM plane (B2, SFTP, WebDAV): static Secret only.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretAuth {
-    /// Secret holding the backend's access credentials, read by well-known keys
-    /// (e.g. `B2_KEY_ID`/`B2_KEY`, `KOPIA_SFTP_KEY_DATA`, `KOPIA_WEBDAV_USERNAME`).
+    /// Secret holding the backend's access credentials, read by well-known keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<SecretRef>,
 }
 
-/// The discriminated backend union. Exactly one variant by construction.
-///
-/// ## Representation choice
-///
-/// ADR-0003 §3.1 *sketches* this as `#[serde(tag = "kind")]` (a `kind: S3` inline
-/// discriminant). In practice an internally-tagged enum cannot produce a valid
-/// Kubernetes *structural* schema: kube's schema rewriter hoists `oneOf` branch
-/// properties to the root and requires the shared `kind` property to be identical
-/// across branches, but each variant needs a distinct `kind` const — a hard
-/// conflict. We therefore use serde's **externally-tagged** representation
-/// (`backend: { s3: {...} }`), which:
-///   * is exactly the YAML shape ADR-0001 §3.1 actually used (`backend.s3.bucket`);
-///   * generates a valid structural schema (a `oneOf` of distinct optional
-///     properties — kubectl enforces "exactly one backend");
-///   * preserves the ADR's type-safety thesis verbatim — this is still a Rust
-///     `enum`, a value is still exactly one variant, and reconcilers still
-///     `match` it exhaustively.
-///
-/// The webhook (`api::validate`) validates *content* (bucket-name format,
-/// credential-secret reachability) that the schema can't express.
+/// The discriminated backend union (`backend: { s3: {...} }`); exactly one variant by construction.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Backend {
@@ -145,7 +100,7 @@ impl Backend {
     }
 }
 
-/// S3 / S3-compatible object-store backend. ADR §3.1.
+/// S3 / S3-compatible object-store backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Backend {
@@ -162,7 +117,7 @@ pub struct S3Backend {
     /// S3 region. Required by AWS and some compatible providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    /// Access credentials (Secret ref / workload identity). ADR §3.1.
+    /// Access credentials (Secret ref / workload identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<BackendAuth>,
     /// TLS overrides for self-signed CAs or HTTP-only endpoints.
@@ -170,7 +125,7 @@ pub struct S3Backend {
     pub tls: Option<TlsConfig>,
 }
 
-/// Azure Blob Storage backend. ADR §3.1.
+/// Azure Blob Storage backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureBackend {
@@ -187,7 +142,7 @@ pub struct AzureBackend {
     pub auth: Option<BackendAuth>,
 }
 
-/// Google Cloud Storage backend. ADR §3.1.
+/// Google Cloud Storage backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GcsBackend {
@@ -201,7 +156,7 @@ pub struct GcsBackend {
     pub auth: Option<BackendAuth>,
 }
 
-/// Backblaze B2 backend. ADR §3.1.
+/// Backblaze B2 backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct B2Backend {
@@ -210,37 +165,23 @@ pub struct B2Backend {
     /// Object-name prefix within the bucket; empty/absent means the bucket root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    /// Access credentials (application key ID/key Secret). B2 has no cloud IAM
-    /// federation, so this is Secret-only.
+    /// Access credentials (application key ID/key Secret); Secret-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretAuth>,
 }
 
-/// Local-filesystem backend: kopia writes the repository to a path inside the
-/// mover pod. The path is populated by a [`RepoVolume`] the operator mounts — a
-/// `PersistentVolumeClaim` or an inline NFS export. ADR §3.1.
+/// Local-filesystem backend: kopia writes the repository to a path inside the mover pod.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FilesystemBackend {
     /// Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`).
     pub path: String,
-    /// What backs `path`. A PVC (`{ pvc: { name } }`) or an inline NFS export
-    /// (`{ nfs: { server, path } }`). Absent for a path already present on the
-    /// node/image (a `hostPath`/baked-in mount; mainly the e2e harness).
+    /// What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<RepoVolume>,
 }
 
-/// What backs a filesystem repository's mount path. Externally-tagged; exactly
-/// one variant. ADR §3.1.
-///
-/// Wire shape: `volume: { pvc: { name: "repo-pvc" } }` or
-/// `volume: { nfs: { server: "nas.lan", path: "/export/kopia" } }`.
-///
-/// kopia has no NFS backend — NFS is reached through the *filesystem* backend by
-/// mounting the export at `path`. Modeling it as a volume source (not a `Backend`
-/// variant) keeps that truth: the kopia connect spec is `Filesystem { path }`
-/// regardless, and the mover is transparent to how the path is mounted.
+/// What backs a filesystem repository's mount path (a PVC or an inline NFS export).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum RepoVolume {
@@ -260,7 +201,7 @@ impl RepoVolume {
     }
 }
 
-/// A `PersistentVolumeClaim` mounted into the mover pod. ADR §3.1.
+/// A `PersistentVolumeClaim` mounted into the mover pod.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PvcVolume {
@@ -268,9 +209,7 @@ pub struct PvcVolume {
     pub name: String,
 }
 
-/// An inline NFS export mounted directly into the mover pod — no PVC, no
-/// StorageClass. Used both as a filesystem-repo volume and as a backup source.
-/// ADR §3.1/§3.3.
+/// An inline NFS export mounted directly into the mover pod — no PVC, no StorageClass.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NfsVolume {
@@ -280,7 +219,7 @@ pub struct NfsVolume {
     pub path: String,
 }
 
-/// SFTP backend. ADR §3.1.
+/// SFTP backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SftpBackend {
@@ -294,26 +233,23 @@ pub struct SftpBackend {
     /// SSH username to connect as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Credentials (SSH private key / known-hosts) sourced from a Secret. SSH
-    /// has no cloud IAM federation, so this is Secret-only.
+    /// Credentials (SSH private key / known-hosts) sourced from a Secret; Secret-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretAuth>,
 }
 
-/// WebDAV backend. ADR §3.1.
+/// WebDAV backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WebDavBackend {
     /// WebDAV collection URL holding the kopia repository.
     pub url: String,
-    /// HTTP basic-auth credentials sourced from a Secret. WebDAV has no cloud
-    /// IAM federation, so this is Secret-only.
+    /// HTTP basic-auth credentials sourced from a Secret; Secret-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretAuth>,
 }
 
-/// rclone-remote backend; kopia shells out to `rclone` so any rclone-supported
-/// provider is reachable. ADR §3.1.
+/// rclone-remote backend; kopia shells out to `rclone` so any rclone-supported provider is reachable.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RcloneBackend {

@@ -32,69 +32,40 @@ spec:
         properties:
           spec:
             description: |-
-              A restore operation. `target` is **required** (ADR-0005 §9): explicit
-              `pvc`/`pvcRef`, or `populator: {}` for passive populator mode (consumed by a
-              PVC's `spec.dataSourceRef`). The empty-`target` form is removed. ADR §3.6/§4.7.
-              Desired state of a [`Restore`]: where to read from, where to write to, and how
-              to behave when the snapshot is missing. ADR §3.6/§4.6.
+              A restore operation from a snapshot/identity into a PVC, or a passive populator source.
+              Desired state of a Restore: where to read from, where to write to, and how to behave when the snapshot is missing.
             properties:
               credentialProjection:
-                description: |-
-                  Opt-in credential-Secret projection for this restore's mover (default off).
-                  When `enabled: true`, the operator copies the referenced repository's
-                  credential Secret(s) into the restore mover's namespace (a no-op when they
-                  already live there) — so restoring from a shared `ClusterRepository` into a
-                  fresh namespace need not pre-create the Secret there. ADR §4.11.
+                description: Opt-in copying of the repository's credential Secret(s) into the mover's namespace (default off).
                 nullable: true
                 properties:
                   enabled:
                     default: false
-                    description: |-
-                      When true, the operator copies the repository's credential Secret(s) into
-                      the namespace of each mover Job that uses this repository. Off by default.
+                    description: Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default.
                     type: boolean
                 type: object
               failurePolicy:
-                description: |-
-                  Mover `Job` retry/deadline limits (`backoffLimit`, `activeDeadlineSeconds`),
-                  mirroring `Snapshot.spec.failurePolicy`. Absent uses the ADR defaults.
+                description: Mover `Job` retry/deadline limits (`backoffLimit`, `activeDeadlineSeconds`).
                 nullable: true
                 properties:
                   activeDeadlineSeconds:
-                    description: |-
-                      Passed through to the mover `Job.spec.activeDeadlineSeconds` — wall-clock cap
-                      after which a still-running run is killed.
+                    description: Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
                     format: int64
                     nullable: true
                     type: integer
                   backoffLimit:
-                    description: |-
-                      Passed through to the mover `Job.spec.backoffLimit` — how many times a failed
-                      run is retried before the Job is marked failed.
+                    description: Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
                     format: int32
                     nullable: true
                     type: integer
                   podStartupDeadlineSeconds:
-                    description: |-
-                      How long (seconds) a mover **pod** may sit in a non-starting state — a container
-                      `CreateContainerConfigError` / `ImagePullBackOff` / `InvalidImageName`, or
-                      `Unschedulable` — before the controller fails the run with an actionable reason,
-                      rather than waiting out `active_deadline_seconds` (which can be many hours and
-                      is meant for *long-running*, not *wedged*, work). A wedged pod never reaches a
-                      terminal phase, so `backoffLimit` never trips — this is the only thing that bounds
-                      it. Unset uses the built-in [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`].
+                    description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               mover:
-                description: |-
-                  Per-run mover overrides for this restore's Job — resource requests/limits,
-                  kopia cache sizing, container `securityContext` (UID/GID match), `privilegedMode`,
-                  and `inheritSecurityContextFrom`. The same surface `SnapshotPolicy.spec.mover`
-                  gives a backup. An elevated context is namespace-gated exactly like a backup's
-                  (ADR §4.11/§G16); `securityContext` and `inheritSecurityContextFrom` are
-                  mutually exclusive.
+                description: Per-run mover overrides for this restore's Job (resources, cache, `securityContext`).
                 nullable: true
                 properties:
                   cache:
@@ -116,7 +87,7 @@ spec:
                         nullable: true
                         type: integer
                       mode:
-                        description: How a mover's kopia cache volume is provisioned. ADR §3.1.
+                        description: How a mover's kopia cache volume is provisioned.
                         enum:
                         - Ephemeral
                         - Persistent
@@ -128,11 +99,7 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: |-
-                      Opt-in: copy security context from a live workload pod instead of setting an
-                      explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
-                      Either name the workload by label (`workloadSelector`) or, on a **backup**
-                      source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
+                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
                     nullable: true
                     oneOf:
                     - required:
@@ -141,26 +108,15 @@ spec:
                       - pvcConsumer
                     properties:
                       pvcConsumer:
-                        description: |-
-                          **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
-                          backs up: the operator finds the pod(s) mounting the source claim and inherits
-                          their securityContext, so the mover's UID/GID matches the workload *by
-                          construction* — no hand-written selector. Meaningless on a restore (the consuming
-                          pod may not exist yet, exactly like a populator), so restore must use
-                          `workloadSelector`.
+                        description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
                         properties:
                           container:
-                            description: |-
-                              Which container within the matched consumer pod to inherit from; absent uses the
-                              first/only container (same semantics as [`PodSelector::container`]).
+                            description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
                             nullable: true
                             type: string
                         type: object
                       workloadSelector:
-                        description: |-
-                          Match the workload pod(s) by an explicit label selector and inherit the chosen
-                          container's `securityContext` plus the pod's `spec.securityContext`. Works for
-                          both backup and restore (restore inherits from the pod that will *read* the data).
+                        description: Inherit from workload pod(s) matched by an explicit label selector (backup or restore).
                         properties:
                           container:
                             description: Which container within the matched pod; absent uses the first/only container.
@@ -201,12 +157,7 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: |-
-                      Security context applied to the mover **pod** — notably `fsGroup`, which makes
-                      a freshly-provisioned volume group-writable so an unprivileged
-                      (`runAsUser != 0`) mover can populate it on **restore** without root. Distinct
-                      from the container-level [`MoverSpec::security_context`]; a pod-level
-                      `runAsUser: 0` / `runAsNonRoot: false` here is still gated as privileged.
+                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -336,7 +287,7 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated; preserves UID/GID on restore. ADR §4.11/§G16.
+                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
                     nullable: true
                     type: boolean
                   resources:
@@ -377,10 +328,7 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: |-
-                      Security context applied to the mover **container** (`runAsUser`/`runAsGroup`,
-                      capabilities, seccomp, …). Merged field-wise over `moverDefaults.securityContext`
-                      and the hardened base (ADR-0004 §2) — set only the fields you want to change.
+                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -485,35 +433,29 @@ spec:
                         type: object
                     type: object
                   ttlSecondsAfterFinished:
-                    description: |-
-                      Per-recipe override of `moverDefaults.ttlSecondsAfterFinished` — the
-                      `Job.spec.ttlSecondsAfterFinished` for this recipe's mover Jobs so finished
-                      backup/restore Jobs self-GC. Recipe wins over the repo default; when neither
-                      is set a built-in default applies ([`DEFAULT_JOB_TTL_SECONDS`]). ADR-0005 §12.
+                    description: Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               options:
-                description: kopia restore behavior (file deletion, permission/atomicity handling). ADR §4.6.
+                description: kopia restore behavior (file deletion, permission/atomicity handling).
                 nullable: true
                 properties:
                   enableFileDeletion:
-                    description: |-
-                      Delete files in the target that are not present in the snapshot (make the
-                      target an exact mirror). Off by default — additive restore is the safe default.
+                    description: Delete files in the target that are not present in the snapshot (exact mirror); off by default.
                     type: boolean
                   ignorePermissionErrors:
-                    description: Default true; surfaces a condition if any errors occurred. ADR §4.6.
+                    description: Continue past permission errors during restore (default true).
                     nullable: true
                     type: boolean
                   writeFilesAtomically:
-                    description: Default true. ADR §4.6.
+                    description: Write files atomically via a temp file + rename (default true).
                     nullable: true
                     type: boolean
                 type: object
               policy:
-                description: Missing-snapshot handling and wait timeout. ADR §4.6 (G7).
+                description: What to do when the referenced snapshot doesn't exist yet, and how long to wait.
                 nullable: true
                 properties:
                   onMissingSnapshot:
@@ -533,14 +475,12 @@ spec:
                     nullable: true
                     type: string
                   waitTimeout:
-                    description: |-
-                      How long to wait for the source snapshot to appear before giving up
-                      (Go-style duration string, e.g. `5m`).
+                    description: How long to wait for the source snapshot to appear before giving up (e.g. `5m`).
                     nullable: true
                     type: string
                 type: object
               repository:
-                description: Derived from `source` when omitted; REQUIRED only with `source.identity`. ADR §3.6/§4.6.
+                description: The repository to read from; derived from `source` when omitted, required only with `source.identity`.
                 nullable: true
                 properties:
                   kind:
@@ -561,7 +501,7 @@ spec:
                 - name
                 type: object
               source:
-                description: Exactly one source mode; webhook-enforced. ADR §3.6.
+                description: Where to read data from (snapshotRef, fromPolicy, or identity).
                 oneOf:
                 - required:
                   - snapshotRef
@@ -571,9 +511,7 @@ spec:
                   - identity
                 properties:
                   fromPolicy:
-                    description: |-
-                      A `SnapshotPolicy` CR — resolves via identity even with no `Snapshot` CR present
-                      (deploy-or-restore). Default `onMissingSnapshot: Continue`. ADR §4.6.
+                    description: A `SnapshotPolicy` CR, resolved via identity even with no `Snapshot` CR present (deploy-or-restore).
                     properties:
                       asOf:
                         description: Restore the newest snapshot at or before this RFC3339 timestamp (point-in-time).
@@ -588,19 +526,14 @@ spec:
                         type: string
                       offset:
                         default: 0
-                        description: |-
-                          0 = latest, 1 = previous, ... ADR §3.6.
-
-                          Carries a real OpenAPI `default: 0` (ADR-0005 §1): unconditional, so it
-                          materializes into the stored object / `kubectl explain` and GitOps stops
-                          diff-thrashing. A bare `i64` (not `Option`) so the default is never dropped.
+                        description: 'Which snapshot to pick: 0 = latest, 1 = previous, and so on.'
                         format: int64
                         type: integer
                     required:
                     - name
                     type: object
                   identity:
-                    description: A raw kopia identity (foreign writers / aged-out catalog). Requires `spec.repository`.
+                    description: A raw kopia identity (foreign writers / aged-out catalog); requires `spec.repository`.
                     properties:
                       asOf:
                         description: Restore the newest snapshot at or before this RFC3339 timestamp (point-in-time).
@@ -610,14 +543,12 @@ spec:
                         description: The kopia `hostname` to match.
                         type: string
                       offset:
-                        description: 0 = latest, 1 = previous, ... mutually exclusive with `snapshotID`/`asOf` in practice.
+                        description: 'Which snapshot to pick: 0 = latest, 1 = previous, and so on.'
                         format: int64
                         nullable: true
                         type: integer
                       snapshotID:
-                        description: |-
-                          Pin an exact kopia snapshot by ID. Renamed to match the ADR wire shape
-                          exactly (`snapshotID`, capital `ID`).
+                        description: Pin an exact kopia snapshot by ID.
                         nullable: true
                         type: string
                       sourcePath:
@@ -632,7 +563,7 @@ spec:
                     - username
                     type: object
                   snapshotRef:
-                    description: A `Snapshot` CR (scheduled, manual, or discovered — all the same kind). Default mode.
+                    description: A `Snapshot` CR (scheduled, manual, or discovered).
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -646,11 +577,7 @@ spec:
                     type: object
                 type: object
               target:
-                description: |-
-                  Where to restore to — **required** (ADR-0005 §9): `pvc` (operator creates),
-                  `pvcRef` (existing PVC), or `populator: {}` (passive populator mode, claimed
-                  via a PVC's `spec.dataSourceRef`). The former empty-`target` form is removed;
-                  a `Restore` with no `target` is now invalid (deserialization fails).
+                description: Where to write the restored data (pvc, pvcRef, or populator).
                 oneOf:
                 - required:
                   - pvc
@@ -660,10 +587,7 @@ spec:
                   - populator
                 properties:
                   populator:
-                    description: |-
-                      Passive populator mode: no workload target at provision time — the restore is
-                      claimed by a PVC's `spec.dataSourceRef` (ADR-0005 §9). An (empty) sub-object so
-                      future populator knobs slot in without API breakage.
+                    description: 'Passive populator mode: the restore is claimed by a PVC''s `spec.dataSourceRef`.'
                     type: object
                   pvc:
                     description: Operator creates the PVC.
@@ -709,7 +633,7 @@ spec:
             - message: exactly one of target.pvc, target.pvcRef, target.populator
               rule: '[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator)].filter(x, x).size() == 1'
           status:
-            description: Observed state of a [`Restore`], written by the controller/mover. ADR §3.6 status.
+            description: Observed state of a Restore, written by the controller/mover.
             nullable: true
             properties:
               conditions:
@@ -746,9 +670,7 @@ spec:
                   type: object
                 type: array
               failure:
-                description: |-
-                  Structured terminal-failure detail (kopia error class, stderr tail, retry
-                  hint), written by the mover before it exits non-zero. ADR §4.10.
+                description: Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
                 nullable: true
                 properties:
                   exitCode:
@@ -777,11 +699,7 @@ spec:
                 - retryRecommended
                 type: object
               logTail:
-                description: |-
-                  The last lines of the run's output, written by the mover at the terminal
-                  transition (success: the `Restore completed: snapshot <id>` line; failure:
-                  the actionable error + kopia stderr tail). Capped at
-                  [`crate::common::MAX_LOG_TAIL_BYTES`]; full logs live in the Job pod.
+                description: The last lines of the run's output, written by the mover at the terminal transition.
                 nullable: true
                 type: string
               observedGeneration:
@@ -790,7 +708,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: Lifecycle phase of a restore. Closed enum. ADR §3.6 status.
+                description: Lifecycle phase of a restore.
                 enum:
                 - Pending
                 - Resolving
@@ -815,7 +733,7 @@ spec:
                     type: integer
                 type: object
               resolved:
-                description: Pinned at admission; never re-resolved. ADR §3.6/§4.6.
+                description: The source resolved and pinned at admission; never re-resolved.
                 nullable: true
                 properties:
                   identity:
@@ -837,11 +755,7 @@ spec:
                     - username
                     type: object
                   kopiaSnapshotID:
-                    description: |-
-                      The exact kopia snapshot manifest id the source resolved to. Pinned once;
-                      subsequent reconciles restore THIS id even if newer snapshots appear, so a
-                      restore never silently retargets (ADR §4.6). Matches
-                      `Snapshot.status.snapshot.kopiaSnapshotID`.
+                    description: The exact kopia snapshot manifest id the source resolved to; pinned once.
                     nullable: true
                     type: string
                   pinnedAt:
@@ -870,15 +784,7 @@ spec:
                     - name
                     type: object
                   resolution:
-                    description: |-
-                      Which outcome the source resolution pinned. Closed enum so the decision is a
-                      single, exhaustively-matched value rather than an inferred combination of optional
-                      fields — `Snapshot` means a concrete snapshot was found (its details live in the
-                      sibling `kopiaSnapshotID`/`snapshotRef`/`identity` fields); `NoSnapshot` means the
-                      source matched nothing and `onMissingSnapshot: Continue` chose deploy-or-restore
-                      (the volume comes up empty). Pinned once and never re-resolved, exactly like a
-                      snapshot id, so a later-appearing snapshot can never silently retarget an
-                      already-provisioned volume (ADR §4.6).
+                    description: Which outcome the source resolution pinned, once and never re-resolved.
                     enum:
                     - Snapshot
                     - NoSnapshot
@@ -900,10 +806,7 @@ spec:
                     type: object
                 type: object
               sourceKind:
-                description: |-
-                  The pinned source kind (`RestoreSource::kind_str` — `SnapshotRef`/`FromPolicy`/
-                  `Identity`), set by the reconciler. Backs the `SOURCE` printer column so
-                  `kubectl get restores` shows where a restore reads from. ADR-0005 §3.
+                description: The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column.
                 nullable: true
                 type: string
               target:
@@ -911,7 +814,7 @@ spec:
                 nullable: true
                 properties:
                   pvcPrime:
-                    description: Populator handshake (passive / pvc-create modes). ADR §3.6.
+                    description: Populator handshake (passive / pvc-create modes).
                     nullable: true
                     type: string
                   pvcRef:

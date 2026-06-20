@@ -1,5 +1,6 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
+assertion_line: 30
 expression: "body(&artifacts, \"snapshots\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -37,22 +38,11 @@ spec:
         description: Auto-generated derived type for SnapshotSpec via `CustomResource`
         properties:
           spec:
-            description: |-
-              A single kopia snapshot represented as a Kubernetes object. ADR §3.4.
-
-              For `scheduled`/`manual` backups the spec carries `policyRef` (+ optional
-              overrides). For `discovered` backups the spec is empty — every field is optional.
+            description: A single kopia snapshot represented as a Kubernetes object.
             properties:
               deletionPolicy:
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-                  Shared by `SnapshotPolicy.spec.defaultDeletionPolicy` and `Snapshot.spec.deletionPolicy`.
-                  ADR-0003 §4.5 / ADR-0001 §4.5.
-
-                  The reconciler distinguishes the three cases with an exhaustive `match` — Rust
-                  enforces that any new variant added later must be handled in every match site,
-                  preventing the class of bug where a new policy slips into production without a
-                  corresponding reconcile branch.
 
                   ```
                   use kopiur_api::common::DeletionPolicy;
@@ -70,45 +60,30 @@ spec:
                 nullable: true
                 type: string
               failurePolicy:
-                description: Per-run failure controls passed to the mover `Job`. ADR §3.4 (G6).
+                description: Mover Job retry and deadline limits for this run.
                 nullable: true
                 properties:
                   activeDeadlineSeconds:
-                    description: |-
-                      Passed through to the mover `Job.spec.activeDeadlineSeconds` — wall-clock cap
-                      after which a still-running run is killed.
+                    description: Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
                     format: int64
                     nullable: true
                     type: integer
                   backoffLimit:
-                    description: |-
-                      Passed through to the mover `Job.spec.backoffLimit` — how many times a failed
-                      run is retried before the Job is marked failed.
+                    description: Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
                     format: int32
                     nullable: true
                     type: integer
                   podStartupDeadlineSeconds:
-                    description: |-
-                      How long (seconds) a mover **pod** may sit in a non-starting state — a container
-                      `CreateContainerConfigError` / `ImagePullBackOff` / `InvalidImageName`, or
-                      `Unschedulable` — before the controller fails the run with an actionable reason,
-                      rather than waiting out `active_deadline_seconds` (which can be many hours and
-                      is meant for *long-running*, not *wedged*, work). A wedged pod never reaches a
-                      terminal phase, so `backoffLimit` never trips — this is the only thing that bounds
-                      it. Unset uses the built-in [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`].
+                    description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               pin:
-                description: |-
-                  Pin this snapshot to exempt it from GFS retention (ADR-0005 §13(c)). When
-                  `true` the reconciler applies a kopia snapshot pin and the GFS pruner never
-                  selects it for deletion — for pre-migration / compliance holds. Clearing it
-                  removes the pin. Default `false`.
+                description: Exempt this snapshot from GFS retention.
                 type: boolean
               policyRef:
-                description: The recipe to run. Absent for `discovered` backups. ADR §3.4.
+                description: The `SnapshotPolicy` recipe to run; absent for `discovered` backups.
                 nullable: true
                 properties:
                   name:
@@ -124,7 +99,7 @@ spec:
               tags:
                 additionalProperties:
                   type: string
-                description: 'Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`). ADR §3.4.'
+                description: 'Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`).'
                 nullable: true
                 type: object
             type: object
@@ -133,9 +108,7 @@ spec:
             nullable: true
             properties:
               conditions:
-                description: |-
-                  Standard Kubernetes conditions (e.g. `SourcesQuiesced`, `SnapshotCreated`).
-                  ADR §3.4 status.
+                description: Standard Kubernetes conditions (e.g. `SourcesQuiesced`, `SnapshotCreated`).
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:
@@ -168,9 +141,7 @@ spec:
                   type: object
                 type: array
               failure:
-                description: |-
-                  Structured terminal-failure detail (kopia error class, stderr tail, retry
-                  hint), written by the mover before it exits non-zero. ADR §4.10.
+                description: Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
                 nullable: true
                 properties:
                   exitCode:
@@ -199,11 +170,7 @@ spec:
                 - retryRecommended
                 type: object
               hooks:
-                description: |-
-                  Hook-execution bookkeeping (ADR §4.8): completion timestamps the
-                  reconciler stamps so each hook list runs exactly once per Snapshot across
-                  requeues and controller restarts (hooks have side effects — quiesce,
-                  resume — that must not repeat).
+                description: Hook-execution bookkeeping so each hook list runs exactly once per Snapshot.
                 nullable: true
                 properties:
                   postCompletedAt:
@@ -216,30 +183,25 @@ spec:
                     type: string
                 type: object
               job:
-                description: Present for scheduled/manual; absent for discovered. ADR §3.4.
+                description: The mover Job backing this run; absent for discovered.
                 nullable: true
                 properties:
                   attempts:
-                    description: Number of attempts so far (bounded by `failurePolicy.backoffLimit`). ADR §3.4 status.
+                    description: Number of attempts so far (bounded by `failurePolicy.backoffLimit`).
                     format: int32
                     nullable: true
                     type: integer
                   name:
-                    description: Name of the mover `Job`. ADR §3.4 status.
+                    description: Name of the mover `Job`.
                     nullable: true
                     type: string
                 type: object
               logTail:
-                description: |-
-                  The last lines of the run's output, written by the mover at the terminal
-                  transition (success: the `Snapshot created: <id>` line; failure: the
-                  actionable error + kopia stderr tail). Capped at
-                  [`crate::common::MAX_LOG_TAIL_BYTES`]; full logs live in the Job pod.
-                  ADR §3.4/§4.10.
+                description: The last lines of the run's output, written by the mover at the terminal transition.
                 nullable: true
                 type: string
               observedGeneration:
-                description: '`metadata.generation` last reconciled, for staleness detection. ADR §3.4 status.'
+                description: '`metadata.generation` last reconciled, for staleness detection.'
                 format: int64
                 nullable: true
                 type: integer
@@ -287,20 +249,15 @@ spec:
                 nullable: true
                 type: string
               pinned:
-                description: |-
-                  The observed kopia-side pin state (ADR-0005 §13(c)): `Some(true)` once the
-                  operator has applied the pin, `Some(false)` once it has removed it, `None`
-                  before any pin reconcile. The reconciler compares `spec.pin` against this to
-                  decide whether to issue a `kopia snapshot pin`/`unpin`, so a redundant op is
-                  never spawned.
+                description: 'The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile.'
                 nullable: true
                 type: boolean
               resolved:
-                description: Frozen recipe values at run time (scheduled/manual). ADR §3.4.
+                description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true
                 properties:
                   repository:
-                    description: The repository this run targeted, frozen at run time. ADR §3.4 status.
+                    description: The repository this run targeted, frozen at run time.
                     nullable: true
                     properties:
                       kind:
@@ -321,27 +278,27 @@ spec:
                     - name
                     type: object
                   sources:
-                    description: The concrete PVCs + source paths backed up this run. ADR §3.4 status.
+                    description: The concrete PVCs + source paths backed up this run.
                     items:
-                      description: One resolved source backed up by a run — a concrete PVC and its kopia path. ADR §3.4 status.
+                      description: One resolved source backed up by a run — a concrete PVC and its kopia path.
                       properties:
                         pvc:
-                          description: '`namespace/name` of the PVC, as kopia sees it. ADR §3.4.'
+                          description: '`namespace/name` of the PVC, as kopia sees it.'
                           nullable: true
                           type: string
                         sourcePath:
-                          description: The source path kopia recorded for this PVC. ADR §3.4/§4.2.
+                          description: The source path kopia recorded for this PVC.
                           nullable: true
                           type: string
                       type: object
                     type: array
                 type: object
               snapshot:
-                description: The kopia artifact this CR represents. ADR §3.4.
+                description: The kopia artifact this CR represents.
                 nullable: true
                 properties:
                   identity:
-                    description: The `username@hostname:path` identity recorded for this snapshot. ADR §3.4/§4.2.
+                    description: The `username@hostname:path` identity recorded for this snapshot.
                     properties:
                       hostname:
                         description: The final `hostname` kopia records, fixed at admission.
@@ -358,23 +315,14 @@ spec:
                     - username
                     type: object
                   kopiaSnapshotID:
-                    description: |-
-                      kopia's snapshot ID — the handle the finalizer uses to delete content.
-
-                      Renamed to match the ADR wire shape exactly (`kopiaSnapshotID`, capital `ID`);
-                      serde's `camelCase` would otherwise produce `kopiaSnapshotId`.
+                    description: kopia's snapshot ID — the handle the finalizer uses to delete content.
                     type: string
                 required:
                 - identity
                 - kopiaSnapshotID
                 type: object
               staged:
-                description: |-
-                  The CSI staging objects the run created for `copyMethod: Snapshot`/`Clone`
-                  (ADR §3.3). Pinned once when the stage is provisioned so the reconciler can
-                  (a) reuse the same VolumeSnapshot/PVC across mover-Job retries idempotently
-                  and (b) reap them on the terminal transition. Absent for `Direct` (and NFS),
-                  which mount the live source with no staging.
+                description: 'The CSI staging objects the run created for `copyMethod: Snapshot`/`Clone`.'
                 nullable: true
                 properties:
                   copyMethod:
@@ -382,79 +330,68 @@ spec:
                     nullable: true
                     type: string
                   pvcName:
-                    description: |-
-                      Name of the staged `PersistentVolumeClaim` the mover mounts in place of the
-                      live source PVC.
+                    description: Name of the staged `PersistentVolumeClaim` the mover mounts in place of the live source PVC.
                     nullable: true
                     type: string
                   ready:
-                    description: |-
-                      `true` once the stage is ready for the mover (VolumeSnapshot `readyToUse` and
-                      the staged PVC applied). Before that the reconcile is still provisioning it.
+                    description: '`true` once the stage is ready for the mover.'
                     nullable: true
                     type: boolean
                   volumeSnapshotName:
-                    description: |-
-                      Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot`
-                      only; absent for `Clone`, which stages directly from the source PVC).
+                    description: 'Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only).'
                     nullable: true
                     type: string
                 type: object
               stats:
-                description: Byte/file counts parsed from kopia's JSON output. ADR §3.4 status.
+                description: Byte/file counts parsed from kopia's JSON output.
                 nullable: true
                 properties:
                   bytesNew:
-                    description: Bytes newly uploaded this run (after dedup/compression). ADR §3.4 status.
+                    description: Bytes newly uploaded this run (after dedup/compression).
                     format: int64
                     nullable: true
                     type: integer
                   filesFailed:
-                    description: |-
-                      Count of source entries kopia could **not** read and therefore EXCLUDED from the
-                      snapshot (`rootEntry.summ.errors`), making it *incomplete*. Present (and `> 0`) only
-                      when an `ignoreFileErrors`/`ignoreDirErrors` policy let the snapshot complete despite
-                      unreadable files — the otherwise-silent partial-backup case. The controller surfaces
-                      it as a warning condition + Event. Usually a UID/GID mismatch with the workload.
+                    description: Count of source entries kopia could not read and excluded, making the snapshot incomplete.
                     format: int64
                     nullable: true
                     type: integer
                   filesModified:
-                    description: Count of files changed since the previous snapshot. ADR §3.4 status.
+                    description: Count of files changed since the previous snapshot.
                     format: int64
                     nullable: true
                     type: integer
                   filesNew:
-                    description: Count of files new since the previous snapshot. ADR §3.4 status.
+                    description: Count of files new since the previous snapshot.
                     format: int64
                     nullable: true
                     type: integer
                   filesUnchanged:
-                    description: Count of files unchanged since the previous snapshot. ADR §3.4 status.
+                    description: Count of files unchanged since the previous snapshot.
                     format: int64
                     nullable: true
                     type: integer
                   sizeBytes:
-                    description: Total logical size of the snapshot in bytes. ADR §3.4 status.
+                    description: Total logical size of the snapshot in bytes.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               timing:
-                description: Start/end/duration of the snapshot run. ADR §3.4 status.
+                description: Start/end/duration of the snapshot run.
                 nullable: true
                 properties:
                   durationSeconds:
-                    description: Wall-clock duration in seconds. ADR §3.4 status.
+                    description: Wall-clock duration in seconds.
                     format: int64
                     nullable: true
                     type: integer
                   endTime:
-                    description: RFC3339 end time of the run. ADR §3.4 status.
+                    description: RFC3339 end time of the run.
                     nullable: true
                     type: string
                   startTime:
-                    description: RFC3339 start time of the run. ADR §3.4 status.
+                    description: RFC3339 start time of the run.
                     nullable: true
                     type: string
                 type: object

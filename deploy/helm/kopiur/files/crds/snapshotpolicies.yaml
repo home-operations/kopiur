@@ -37,70 +37,42 @@ spec:
         description: Auto-generated derived type for SnapshotPolicySpec via `CustomResource`
         properties:
           spec:
-            description: |-
-              *What* to back up: sources, identity, retention, policy, hooks. ADR §3.3.
-
-              Not `Eq`: transitively embeds k8s-openapi types via `mover` and `hooks` (`JobSpec`).
+            description: 'What to back up: sources, identity, retention, policy, hooks.'
             properties:
               compression:
-                description: Compression algorithm + per-extension opt-outs. ADR §3.3 (G12).
+                description: Compression algorithm + per-extension opt-outs.
                 nullable: true
                 properties:
                   compressor:
-                    description: kopia compressor name (e.g. `zstd`); absent leaves kopia's default. ADR §3.3.
+                    description: kopia compressor name (e.g. `zstd`); absent leaves kopia's default.
                     nullable: true
                     type: string
                   neverCompress:
-                    description: Filename globs to leave uncompressed (e.g. already-compressed media). ADR §3.3.
+                    description: Filename globs to leave uncompressed (e.g. already-compressed media).
                     items:
                       type: string
                     type: array
                 type: object
               copyMethod:
                 default: Direct
-                description: |-
-                  How the source volume is captured before kopia reads it: `Direct` (read the live
-                  PVC, the **default** — works on any storage), `Snapshot` (point-in-time CSI
-                  snapshot, opt-in), or `Clone` (CSI clone, opt-in). ADR §3.3 / [Copy methods].
-
-                  Carries a real OpenAPI `default: Direct` so it materializes into the stored object
-                  and `kubectl explain`, and GitOps engines stop diff-thrashing on a controller-set
-                  value. A bare value (not `Option`) so the default is never dropped by
-                  `skip_serializing_if`.
-
-                  [Copy methods]: https://github.com/home-operations/kopiur/blob/main/docs/copy-methods.md
+                description: 'How the source volume is captured before kopia reads it: `Direct` (default), `Snapshot`, or `Clone`.'
                 enum:
                 - Snapshot
                 - Clone
                 - Direct
                 type: string
               credentialProjection:
-                description: |-
-                  Opt-in credential-Secret projection for this recipe's backup movers
-                  (default off). When `enabled: true`, the operator copies the referenced
-                  repository's credential Secret(s) into the namespace where each backup
-                  mover runs (a no-op when they already live there) — so a workload backing
-                  up to a shared `ClusterRepository` need not pre-create the Secret in its
-                  own namespace. Inherited by `Snapshot`s produced from this config. ADR §4.11.
+                description: Opt-in credential-Secret projection into each backup mover's namespace (default off).
                 nullable: true
                 properties:
                   enabled:
                     default: false
-                    description: |-
-                      When true, the operator copies the repository's credential Secret(s) into
-                      the namespace of each mover Job that uses this repository. Off by default.
+                    description: Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default.
                     type: boolean
                 type: object
               defaultDeletionPolicy:
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-                  Shared by `SnapshotPolicy.spec.defaultDeletionPolicy` and `Snapshot.spec.deletionPolicy`.
-                  ADR-0003 §4.5 / ADR-0001 §4.5.
-
-                  The reconciler distinguishes the three cases with an exhaustive `match` — Rust
-                  enforces that any new variant added later must be handled in every match site,
-                  preventing the class of bug where a new policy slips into production without a
-                  corresponding reconcile branch.
 
                   ```
                   use kopiur_api::common::DeletionPolicy;
@@ -118,11 +90,7 @@ spec:
                 nullable: true
                 type: string
               errorHandling:
-                description: |-
-                  Backup-side error handling — the missing analog of restore's
-                  `ignorePermissionErrors`. Lets a snapshot complete-with-errors instead of
-                  failing outright (`--ignore-file-errors` / `--ignore-dir-errors` /
-                  `--ignore-unknown-types`). ADR-0005 §13(b).
+                description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
                 nullable: true
                 properties:
                   ignoreDirErrors:
@@ -136,24 +104,22 @@ spec:
                     type: boolean
                 type: object
               extraArgs:
-                description: Escape hatch for kopia flags not yet modeled. ADR §3.3 (G12).
+                description: Escape hatch for kopia flags not yet modeled.
                 items:
                   type: string
                 type: array
               files:
-                description: Paths/patterns kopia should skip while snapshotting. ADR §3.3 (G12).
+                description: Paths/patterns kopia should skip while snapshotting.
                 nullable: true
                 properties:
                   ignoreCacheDirs:
                     description: Honor `CACHEDIR.TAG`.
                     type: boolean
                   ignoreIdenticalSnapshots:
-                    description: 'fork issue #13.'
+                    description: Skip taking a new snapshot when the source is identical to the previous one.
                     type: boolean
                   ignoreRules:
-                    description: |-
-                      Filename/path globs to exclude from the snapshot (e.g. `*.tmp`,
-                      `*/cache/*`, `lost+found`). ADR §3.3.
+                    description: Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`, `lost+found`).
                     items:
                       type: string
                     type: array
@@ -178,13 +144,11 @@ spec:
                 nullable: true
                 type: string
               hooks:
-                description: Pre/post snapshot hooks that run in the workload, not the mover. ADR §4.8 (G13).
+                description: Pre/post snapshot hooks that run in the workload, not the mover.
                 nullable: true
                 properties:
                   afterSnapshot:
-                    description: |-
-                      Hooks run (in order) after the snapshot completes — e.g. resuming the
-                      workload. ADR §4.8.
+                    description: Hooks run (in order) after the snapshot completes — e.g. resuming the workload.
                     items:
                       description: |-
                         One of three hook forms. ADR §4.8.
@@ -223,39 +187,34 @@ spec:
                           description: Typed POST to a URL for cross-system orchestration.
                           properties:
                             body:
-                              description: Optional request body. ADR §4.8.
+                              description: Optional request body.
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed request does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed request does not abort the backup (default: abort).'
                               type: boolean
                             method:
-                              description: HTTP method (default `POST`). ADR §4.8.
+                              description: HTTP method (default `POST`).
                               nullable: true
                               type: string
                             timeout:
-                              description: Max time to wait for the response (Go duration string). ADR §4.8.
+                              description: Max time to wait for the response (Go duration string).
                               nullable: true
                               type: string
                             url:
-                              description: Target URL to call. ADR §4.8.
+                              description: Target URL to call.
                               type: string
                           required:
                           - url
                           type: object
                         runJob:
-                          description: |-
-                            Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
-
-                            Boxed: `RunJobHook` embeds a `JobSpec` (~2 KB), which would otherwise bloat
-                            every `Hook` (incl. the common `WorkloadExec`). `Box<T>` is transparent to
-                            serde, so the externally-tagged `{ runJob: {...} }` wire shape is unchanged.
+                          description: Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
                           properties:
                             continueOnFailure:
-                              description: 'If `true`, a failed Job does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed Job does not abort the backup (default: abort).'
                               type: boolean
                             jobSpec:
-                              description: The full Kubernetes `JobSpec` to run. ADR §4.8.
+                              description: The full Kubernetes `JobSpec` to run.
                               properties:
                                 activeDeadlineSeconds:
                                   description: Specifies the duration in seconds relative to the startTime that the job may be continuously active before the system tries to terminate it; value must be positive integer. If a Job is suspended (at creation or through an update), this timer will effectively be stopped and reset when the Job is resumed again.
@@ -5266,19 +5225,17 @@ spec:
                               - template
                               type: object
                             timeout:
-                              description: Max time to wait for the Job to complete (Go duration string). ADR §4.8.
+                              description: Max time to wait for the Job to complete (Go duration string).
                               nullable: true
                               type: string
                           required:
                           - jobSpec
                           type: object
                         workloadExec:
-                          description: |-
-                            `kubectl exec`-style into a matched workload pod/container (the default form,
-                            fork #22).
+                          description: '`kubectl exec`-style into a matched workload pod/container (the default form).'
                           properties:
                             command:
-                              description: Command + args to run inside the selected container. ADR §4.8.
+                              description: Command + args to run inside the selected container.
                               items:
                                 type: string
                               type: array
@@ -5287,7 +5244,7 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed hook does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed hook does not abort the backup (default: abort).'
                               type: boolean
                             podSelector:
                               description: Label selector matching the workload pod(s) to read context/hooks from.
@@ -5320,7 +5277,7 @@ spec:
                                   type: object
                               type: object
                             timeout:
-                              description: Max time to wait for the command (Go duration string, e.g. `2m`). ADR §4.8.
+                              description: Max time to wait for the command (Go duration string, e.g. `2m`).
                               nullable: true
                               type: string
                           required:
@@ -5329,9 +5286,7 @@ spec:
                       type: object
                     type: array
                   beforeSnapshot:
-                    description: |-
-                      Hooks run (in order) before the snapshot is taken — e.g. quiescing a
-                      database. ADR §4.8.
+                    description: Hooks run (in order) before the snapshot is taken — e.g. quiescing a database.
                     items:
                       description: |-
                         One of three hook forms. ADR §4.8.
@@ -5370,39 +5325,34 @@ spec:
                           description: Typed POST to a URL for cross-system orchestration.
                           properties:
                             body:
-                              description: Optional request body. ADR §4.8.
+                              description: Optional request body.
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed request does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed request does not abort the backup (default: abort).'
                               type: boolean
                             method:
-                              description: HTTP method (default `POST`). ADR §4.8.
+                              description: HTTP method (default `POST`).
                               nullable: true
                               type: string
                             timeout:
-                              description: Max time to wait for the response (Go duration string). ADR §4.8.
+                              description: Max time to wait for the response (Go duration string).
                               nullable: true
                               type: string
                             url:
-                              description: Target URL to call. ADR §4.8.
+                              description: Target URL to call.
                               type: string
                           required:
                           - url
                           type: object
                         runJob:
-                          description: |-
-                            Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
-
-                            Boxed: `RunJobHook` embeds a `JobSpec` (~2 KB), which would otherwise bloat
-                            every `Hook` (incl. the common `WorkloadExec`). `Box<T>` is transparent to
-                            serde, so the externally-tagged `{ runJob: {...} }` wire shape is unchanged.
+                          description: Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
                           properties:
                             continueOnFailure:
-                              description: 'If `true`, a failed Job does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed Job does not abort the backup (default: abort).'
                               type: boolean
                             jobSpec:
-                              description: The full Kubernetes `JobSpec` to run. ADR §4.8.
+                              description: The full Kubernetes `JobSpec` to run.
                               properties:
                                 activeDeadlineSeconds:
                                   description: Specifies the duration in seconds relative to the startTime that the job may be continuously active before the system tries to terminate it; value must be positive integer. If a Job is suspended (at creation or through an update), this timer will effectively be stopped and reset when the Job is resumed again.
@@ -10413,19 +10363,17 @@ spec:
                               - template
                               type: object
                             timeout:
-                              description: Max time to wait for the Job to complete (Go duration string). ADR §4.8.
+                              description: Max time to wait for the Job to complete (Go duration string).
                               nullable: true
                               type: string
                           required:
                           - jobSpec
                           type: object
                         workloadExec:
-                          description: |-
-                            `kubectl exec`-style into a matched workload pod/container (the default form,
-                            fork #22).
+                          description: '`kubectl exec`-style into a matched workload pod/container (the default form).'
                           properties:
                             command:
-                              description: Command + args to run inside the selected container. ADR §4.8.
+                              description: Command + args to run inside the selected container.
                               items:
                                 type: string
                               type: array
@@ -10434,7 +10382,7 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed hook does not abort the backup (default: abort). ADR §4.8.'
+                              description: 'If `true`, a failed hook does not abort the backup (default: abort).'
                               type: boolean
                             podSelector:
                               description: Label selector matching the workload pod(s) to read context/hooks from.
@@ -10467,7 +10415,7 @@ spec:
                                   type: object
                               type: object
                             timeout:
-                              description: Max time to wait for the command (Go duration string, e.g. `2m`). ADR §4.8.
+                              description: Max time to wait for the command (Go duration string, e.g. `2m`).
                               nullable: true
                               type: string
                           required:
@@ -10477,26 +10425,20 @@ spec:
                     type: array
                 type: object
               identity:
-                description: Identity overrides — what kopia records as `username@hostname:path`. ADR §3.3/§4.2.
+                description: Identity overrides — what kopia records as `username@hostname:path`.
                 nullable: true
                 properties:
                   hostname:
-                    description: |-
-                      Override the `hostname` portion of `username@hostname:path`; absent uses the
-                      resolved default (the repository's `identityDefaults` CEL expression, or the
-                      namespace). Used verbatim and pinned at admission (ADR §4.2).
+                    description: Override the `hostname` portion of `username@hostname:path`; absent uses the resolved default.
                     nullable: true
                     type: string
                   username:
-                    description: |-
-                      Override the `username` portion of `username@hostname:path`; absent uses the
-                      resolved default (the repository's `identityDefaults` CEL expression, or the
-                      object name). Used verbatim and pinned at admission (ADR §4.2).
+                    description: Override the `username` portion of `username@hostname:path`; absent uses the resolved default.
                     nullable: true
                     type: string
                 type: object
               mover:
-                description: Per-recipe mover overrides (resources, cache, security context). ADR §3.3.
+                description: Per-recipe mover overrides (resources, cache, security context).
                 nullable: true
                 properties:
                   cache:
@@ -10518,7 +10460,7 @@ spec:
                         nullable: true
                         type: integer
                       mode:
-                        description: How a mover's kopia cache volume is provisioned. ADR §3.1.
+                        description: How a mover's kopia cache volume is provisioned.
                         enum:
                         - Ephemeral
                         - Persistent
@@ -10530,11 +10472,7 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: |-
-                      Opt-in: copy security context from a live workload pod instead of setting an
-                      explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
-                      Either name the workload by label (`workloadSelector`) or, on a **backup**
-                      source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
+                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
                     nullable: true
                     oneOf:
                     - required:
@@ -10543,26 +10481,15 @@ spec:
                       - pvcConsumer
                     properties:
                       pvcConsumer:
-                        description: |-
-                          **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
-                          backs up: the operator finds the pod(s) mounting the source claim and inherits
-                          their securityContext, so the mover's UID/GID matches the workload *by
-                          construction* — no hand-written selector. Meaningless on a restore (the consuming
-                          pod may not exist yet, exactly like a populator), so restore must use
-                          `workloadSelector`.
+                        description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
                         properties:
                           container:
-                            description: |-
-                              Which container within the matched consumer pod to inherit from; absent uses the
-                              first/only container (same semantics as [`PodSelector::container`]).
+                            description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
                             nullable: true
                             type: string
                         type: object
                       workloadSelector:
-                        description: |-
-                          Match the workload pod(s) by an explicit label selector and inherit the chosen
-                          container's `securityContext` plus the pod's `spec.securityContext`. Works for
-                          both backup and restore (restore inherits from the pod that will *read* the data).
+                        description: Inherit from workload pod(s) matched by an explicit label selector (backup or restore).
                         properties:
                           container:
                             description: Which container within the matched pod; absent uses the first/only container.
@@ -10603,12 +10530,7 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: |-
-                      Security context applied to the mover **pod** — notably `fsGroup`, which makes
-                      a freshly-provisioned volume group-writable so an unprivileged
-                      (`runAsUser != 0`) mover can populate it on **restore** without root. Distinct
-                      from the container-level [`MoverSpec::security_context`]; a pod-level
-                      `runAsUser: 0` / `runAsNonRoot: false` here is still gated as privileged.
+                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -10738,7 +10660,7 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated; preserves UID/GID on restore. ADR §4.11/§G16.
+                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
                     nullable: true
                     type: boolean
                   resources:
@@ -10779,10 +10701,7 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: |-
-                      Security context applied to the mover **container** (`runAsUser`/`runAsGroup`,
-                      capabilities, seccomp, …). Merged field-wise over `moverDefaults.securityContext`
-                      and the hardened base (ADR-0004 §2) — set only the fields you want to change.
+                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -10887,17 +10806,13 @@ spec:
                         type: object
                     type: object
                   ttlSecondsAfterFinished:
-                    description: |-
-                      Per-recipe override of `moverDefaults.ttlSecondsAfterFinished` — the
-                      `Job.spec.ttlSecondsAfterFinished` for this recipe's mover Jobs so finished
-                      backup/restore Jobs self-GC. Recipe wins over the repo default; when neither
-                      is set a built-in default applies ([`DEFAULT_JOB_TTL_SECONDS`]). ADR-0005 §12.
+                    description: Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               repository:
-                description: Discriminated reference to a `Repository` or `ClusterRepository`. ADR §3.2.
+                description: Discriminated reference to a `Repository` or `ClusterRepository`.
                 properties:
                   kind:
                     default: Repository
@@ -10917,7 +10832,7 @@ spec:
                 - name
                 type: object
               retention:
-                description: GFS retention — enforced by the operator pruning `Snapshot` CRs. ADR §4.4.
+                description: GFS retention, enforced by the operator pruning `Snapshot` CRs.
                 nullable: true
                 properties:
                   keepAnnual:
@@ -10958,28 +10873,12 @@ spec:
                     type: integer
                 type: object
               sources:
-                description: |-
-                  What to back up. At least one source; webhook-enforced. ADR §3.3.
-
-                  `maxItems` is set so the apiserver can bound the cost of the per-item
-                  `x-kubernetes-validations` exactly-one-of rule on [`Source`] (CEL rule cost is
-                  `rule_cost × maxItems`; without a bound the apiserver assumes a huge array and
-                  rejects the CRD as over budget). 100 sources per recipe is far past any real
-                  use.
+                description: What to back up (at least one source; webhook-enforced).
                 items:
-                  description: |-
-                    A single backup source. `pvc`, `pvcSelector`, and `nfs` are mutually exclusive
-                    (webhook-enforced — NOT an enum, because the forms share the sibling
-                    `sourcePath*` keys and YAML lists them as optional siblings). ADR §3.3.
-
-                    §15: an operator-authored `x-kubernetes-validations` rule enforces exactly-one-of
-                    in the apiserver + CI, complementing `validate_source`.
+                  description: A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
                   properties:
                     nfs:
-                      description: |-
-                        An inline NFS export to back up directly — no PVC. Mounted read-only at the
-                        source path (default: the export's `path`). Mutually exclusive with
-                        `pvc`/`pvcSelector`. ADR §3.3.
+                      description: An inline NFS export to back up directly, mounted read-only. Mutually exclusive with `pvc`/`pvcSelector`.
                       nullable: true
                       properties:
                         path:
@@ -10993,25 +10892,21 @@ spec:
                       - server
                       type: object
                     pvc:
-                      description: Single PVC by name. Mutually exclusive with `pvcSelector`/`nfs`. ADR §3.3.
+                      description: Single PVC by name. Mutually exclusive with `pvcSelector`/`nfs`.
                       nullable: true
                       properties:
                         name:
-                          description: |-
-                            Name of the `PersistentVolumeClaim` to back up (in the `SnapshotPolicy`'s
-                            namespace). ADR §3.3.
+                          description: Name of the `PersistentVolumeClaim` to back up (in the `SnapshotPolicy`'s namespace).
                           type: string
                       required:
                       - name
                       type: object
                     pvcSelector:
-                      description: |-
-                        Label/namespace selector matching many PVCs (multi-PVC sources).
-                        Mutually exclusive with `pvc`/`nfs`. ADR §3.3/§5.4.
+                      description: Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`.
                       nullable: true
                       properties:
                         labelSelector:
-                          description: Standard Kubernetes label selector matching the PVCs to include. ADR §3.3/§5.4.
+                          description: Standard Kubernetes label selector matching the PVCs to include.
                           nullable: true
                           properties:
                             matchExpressions:
@@ -11042,28 +10937,18 @@ spec:
                               type: object
                           type: object
                         namespaceSelector:
-                          description: |-
-                            Restricts the search to specific namespaces; absent means the
-                            `SnapshotPolicy`'s own namespace. ADR §3.3/§5.4.
+                          description: Restricts the search to specific namespaces; absent means the policy's own namespace.
                           nullable: true
                           properties:
                             matchNames:
-                              description: |-
-                                Exact namespace names to search; empty means the `SnapshotPolicy`'s own
-                                namespace. ADR §3.3/§5.4.
+                              description: Exact namespace names to search; empty means the policy's own namespace.
                               items:
                                 type: string
                               type: array
                           type: object
                       type: object
                     sourcePathOverride:
-                      description: |-
-                        What kopia records as the source path (default `/pvc/<name>` for a PVC, or
-                        the NFS export `path` for an NFS source). ADR §3.3/§4.2.
-
-                        `maxLength` bounds the per-item cost of the exactly-one-of CEL rule on this
-                        struct (an unbounded string makes the apiserver assume a huge value and blow
-                        the rule's cost budget). A filesystem path is far shorter than 4096.
+                      description: What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
                       maxLength: 4096
                       nullable: true
                       type: string
@@ -11095,15 +10980,10 @@ spec:
                 maxItems: 100
                 type: array
               suspend:
-                description: |-
-                  Pause this recipe declaratively: a suspended `SnapshotPolicy` is skipped by
-                  schedules and by its own reconcile (no retention prune, no backup creation),
-                  surfaced via a condition/column. ADR-0005 §14(e).
+                description: Pause this recipe declaratively (schedules and reconcile skip a suspended policy).
                 type: boolean
               upload:
-                description: |-
-                  Upload parallelism (kopia's upload policy: `--max-parallel-snapshots`,
-                  `--max-parallel-file-reads`). ADR-0005 §13(f).
+                description: Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`).
                 nullable: true
                 properties:
                   maxParallelFileReads:
@@ -11118,88 +10998,57 @@ spec:
                     type: integer
                 type: object
               verification:
-                description: |-
-                  First-class backup verification (ADR-0005 §4). Opt-in: when absent, no
-                  verification runs (no behavior change). When set, the controller schedules
-                  periodic `kopia snapshot verify` (quick) and/or a scratch-restore test (deep),
-                  gated by an optional CEL `successExpr` predicate over the result, and surfaces
-                  `status.lastVerified`.
+                description: First-class backup verification; opt-in (absent ⇒ no verification runs).
                 nullable: true
                 properties:
                   deep:
-                    description: |-
-                      Schedule + knobs for the rarer scratch-restore restorability test. Absent ⇒
-                      no deep verification.
+                    description: Schedule + knobs for the rarer scratch-restore test; absent ⇒ no deep verification.
                     nullable: true
                     properties:
                       capacity:
-                        description: |-
-                          Size of the ephemeral scratch PVC (e.g. `10Gi`). When set, the operator
-                          mounts a fresh generic-ephemeral PVC of this size at the scratch path
-                          (auto-deleted with the Job) — size it to comfortably hold the restored
-                          snapshot. When absent, scratch falls back to a node-ephemeral `emptyDir`
-                          (zero-config, but bounded by node disk).
+                        description: Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`.
                         nullable: true
                         type: string
                       schedule:
                         description: Cron + jitter for the deep restore-test (e.g. weekly).
                         properties:
                           cron:
-                            description: |-
-                              The cron expression, parsed by `croner`. May contain an `H` placeholder for
-                              deterministic per-schedule jitter (ADR §3.7).
+                            description: The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
                             type: string
                           jitter:
-                            description: |-
-                              Optional deterministic jitter window as a Go-style duration string (e.g.
-                              `30m`), derived from `(scheduleUID, slot)` so it is stable across restarts.
+                            description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
                             nullable: true
                             type: string
                         required:
                         - cron
                         type: object
                       storageClassName:
-                        description: |-
-                          StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
-                          Only applies when `capacity` is set (an `emptyDir` has no StorageClass).
+                        description: StorageClass for the ephemeral scratch PVC; absent uses the cluster default (only with `capacity`).
                         nullable: true
                         type: string
                     required:
                     - schedule
                     type: object
                   quick:
-                    description: |-
-                      Schedule for the frequent blob-level `kopia snapshot verify`. Absent ⇒ no
-                      quick verification.
+                    description: Schedule for the frequent blob-level `kopia snapshot verify`; absent ⇒ no quick verification.
                     nullable: true
                     properties:
                       cron:
-                        description: |-
-                          The cron expression, parsed by `croner`. May contain an `H` placeholder for
-                          deterministic per-schedule jitter (ADR §3.7).
+                        description: The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
                         type: string
                       jitter:
-                        description: |-
-                          Optional deterministic jitter window as a Go-style duration string (e.g.
-                          `30m`), derived from `(scheduleUID, slot)` so it is stable across restarts.
+                        description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
                         nullable: true
                         type: string
                     required:
                     - cron
                     type: object
                   successExpr:
-                    description: |-
-                      A CEL pass/fail predicate over the verify result (ADR-0005 §15). Environment:
-                      `stats{files,bytes,errors}`, `snapshot`, and (deep only) `restored{files,
-                      checksumMatches}`. Returns a bool; when it evaluates `false` the verification
-                      run fails. Validated at admission (`validate_success_expr`). Applies to both
-                      tiers. Example: `"stats.files > 0 && stats.errors == 0"`.
+                    description: CEL pass/fail predicate over the verify result; applies to both tiers.
                     nullable: true
                     type: string
                   verifyFilesPercent:
-                    description: |-
-                      How many files `quick` verifies fully (`--verify-files-percent`); absent
-                      leaves kopia's default. Tuning knob for the quick tier.
+                    description: How many files `quick` verifies fully (`--verify-files-percent`); absent leaves kopia's default.
                     format: uint8
                     maximum: 255.0
                     minimum: 0.0
@@ -11207,22 +11056,18 @@ spec:
                     type: integer
                 type: object
               volumeSnapshotClassName:
-                description: |-
-                  `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source.
-                  ADR §3.3.
+                description: '`VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source.'
                 nullable: true
                 type: string
             required:
             - repository
             type: object
           status:
-            description: Observed state of a [`SnapshotPolicy`]. ADR §3.3 status.
+            description: Observed state of a `SnapshotPolicy`.
             nullable: true
             properties:
               conditions:
-                description: |-
-                  Standard Kubernetes conditions (e.g. `RepositoryReachable`,
-                  `GroupSnapshotSupported`). ADR §3.3 status.
+                description: Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:
@@ -11255,29 +11100,24 @@ spec:
                   type: object
                 type: array
               lastSuccessfulSnapshot:
-                description: |-
-                  RFC3339 timestamp of the most recent successful child `Snapshot` produced
-                  from this recipe. Backs the `LAST-SNAPSHOT` printer column and the
-                  `prometheusRule` staleness alert (ADR-0005 §3).
+                description: RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe.
                 nullable: true
                 type: string
               lastVerified:
-                description: |-
-                  RFC3339 timestamp of the most recent successful verification (any tier),
-                  ADR-0005 §4. Backs the `kopiur_snapshot_verified_timestamp_seconds` gauge.
+                description: RFC3339 timestamp of the most recent successful verification (any tier).
                 nullable: true
                 type: string
               observedGeneration:
-                description: '`metadata.generation` last reconciled, for staleness detection. ADR §3.3 status.'
+                description: '`metadata.generation` last reconciled, for staleness detection.'
                 format: int64
                 nullable: true
                 type: integer
               resolved:
-                description: What would be passed to kopia — pinned at admission. ADR §3.3/§4.2.
+                description: What would be passed to kopia — pinned at admission.
                 nullable: true
                 properties:
                   identity:
-                    description: The resolved `username@hostname` identity. ADR §3.3/§4.2.
+                    description: The resolved `username@hostname` identity.
                     nullable: true
                     properties:
                       hostname:
@@ -11295,38 +11135,36 @@ spec:
                     - username
                     type: object
                   sources:
-                    description: The concrete PVCs + source paths after selector expansion. ADR §3.3 status.
+                    description: The concrete PVCs + source paths after selector expansion.
                     items:
-                      description: One resolved source — a concrete PVC and the path kopia records for it. ADR §3.3 status.
+                      description: One resolved source — a concrete PVC and the path kopia records for it.
                       properties:
                         pvc:
-                          description: '`namespace/name` of the PVC, as kopia sees it. ADR §3.3 status.'
+                          description: '`namespace/name` of the PVC, as kopia sees it.'
                           nullable: true
                           type: string
                         sourcePath:
-                          description: The source path kopia records for this PVC. ADR §3.3/§4.2.
+                          description: The source path kopia records for this PVC.
                           nullable: true
                           type: string
                       type: object
                     type: array
                 type: object
               retention:
-                description: |-
-                  Summary of GFS retention pruning against this config's `Snapshot` CRs.
-                  ADR §3.3 status/§4.4.
+                description: Summary of GFS retention pruning against this config's `Snapshot` CRs.
                 nullable: true
                 properties:
                   activeSnapshotCount:
-                    description: CRs currently inside the GFS window. ADR §3.3 status.
+                    description: CRs currently inside the GFS window.
                     format: int64
                     nullable: true
                     type: integer
                   lastPruneAt:
-                    description: RFC3339 timestamp of the last prune pass. ADR §3.3 status.
+                    description: RFC3339 timestamp of the last prune pass.
                     nullable: true
                     type: string
                   lastPruneDeleted:
-                    description: Number of `Snapshot` CRs deleted by the last prune pass. ADR §3.3 status/§4.4.
+                    description: Number of `Snapshot` CRs deleted by the last prune pass.
                     format: int64
                     nullable: true
                     type: integer

@@ -44,26 +44,14 @@ use std::collections::BTreeMap;
 /// kopia's default server listen port; the resolved value is pinned to status.
 pub const DEFAULT_SERVER_PORT: u16 = 51515;
 
-/// Namespace-agnostic kopia web-UI server configuration. Embedded directly by
-/// `RepositorySpec.server`; wrapped (with a required `namespace`) by
-/// [`ClusterServerSpec`] for the cluster-scoped CRD.
-///
-/// Presence of `spec.server` means **enabled** — there is no `enabled` bool (it
-/// would create two ways to express "off"). Not `Eq`: embeds k8s-openapi
-/// `ResourceRequirements`/`SecurityContext` (`PartialEq` only).
+/// Namespace-agnostic kopia web-UI server configuration; presence of `spec.server` means enabled.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSpec {
-    /// UI authentication mode. Omitted ⇒ [`ServerAuth::Generate`] (resolved at
-    /// admission, pinned to `status.server.authMode`). **Never** defaults to no-auth.
+    /// UI authentication mode; omitted ⇒ [`ServerAuth::Generate`] (never no-auth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ServerAuth>,
-    /// Connect the server's repository **read-only** so the UI cannot create, delete, or
-    /// alter backups (browse + restore-download only). Omitted ⇒ `false`. A `Repository`
-    /// with `spec.mode: ReadOnly` forces this on regardless of the field; setting an
-    /// explicit `readOnly: false` on a `ReadOnly` repository is rejected (contradictory).
-    /// Read-only blocks *mutation*, not *reading*: the server still holds the decryption
-    /// key. Orthogonal to [`ServerSpec::auth`] — no-auth still needs `acknowledgeInsecure`.
+    /// Connect the server's repository read-only so the UI cannot mutate backups (browse + restore only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
     /// How the server is exposed as a Kubernetes `Service`.
@@ -75,25 +63,12 @@ pub struct ServerSpec {
     /// Override the hardened default container security context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_context: Option<SecurityContext>,
-    /// Pod-level security context for the server pod. The hardened base
-    /// (`fsGroup`) is applied first, then this is overlaid field-wise — the same
-    /// resolution movers get (ADR-0004 §2). Notably carries `supplementalGroups`
-    /// so the server can write a filesystem backend whose export is owned by a
-    /// shared GID: **`fsGroup` is silently a no-op on NFS** (the kubelet does not
-    /// recursively chown in-tree NFS mounts), so a group-writable export + a
-    /// supplemental group is the way to grant the long-lived server write access.
-    /// `PartialEq` only (embeds the k8s-openapi `PodSecurityContext`).
+    /// Pod-level security context for the server pod (notably `supplementalGroups` for NFS exports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<PodSecurityContext>,
 }
 
-/// `ClusterRepository`-only server config: a cluster-scoped server has no implicit
-/// namespace, so the target `namespace` is **required** (a cluster-scoped owner also
-/// cannot own the namespaced Deployment/Service via ownerReferences — the controller
-/// cleans them up via a finalizer + label selector instead).
-///
-/// The shared [`ServerSpec`] is flattened in, so the wire shape stays flat:
-/// `server: { namespace, auth, service, ... }`.
+/// `ClusterRepository`-only server config; the target `namespace` is required.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterServerSpec {
@@ -104,20 +79,15 @@ pub struct ClusterServerSpec {
     pub server: ServerSpec,
 }
 
-/// UI authentication mode. Externally-tagged; exactly one variant by construction.
-///
-/// `Eq` is fine here — none of the variants embed a k8s-openapi type.
+/// UI authentication mode; exactly one variant by construction.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum ServerAuth {
-    /// The operator mints random UI credentials into an owned `Secret` and pins the
-    /// reference to `status.server.generatedSecretRef`. The safe default.
+    /// The operator mints random UI credentials into an owned `Secret`; the safe default.
     Generate(GenerateAuth),
     /// The user supplies UI credentials via a `Secret` (`name` + the two keys).
     SecretRef(ServerSecretRef),
-    /// No UI authentication. Requires an explicit `acknowledgeInsecure: true`
-    /// (webhook-rejected otherwise) because it exposes full read/write/delete of the
-    /// repository with no login.
+    /// No UI authentication; requires an explicit `acknowledgeInsecure: true`.
     Insecure(InsecureAuth),
 }
 
@@ -132,8 +102,7 @@ impl ServerAuth {
     }
 }
 
-/// Marker payload for [`ServerAuth::Generate`]. Empty today; a sub-object so future
-/// knobs (username, rotation) slot in without an API break (ADR §4.11).
+/// Payload for [`ServerAuth::Generate`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateAuth {
@@ -142,8 +111,7 @@ pub struct GenerateAuth {
     pub username: Option<String>,
 }
 
-/// User-supplied UI credentials. All fields required so "keys are present" is a
-/// structural guarantee, not a runtime validator.
+/// User-supplied UI credentials.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSecretRef {
@@ -155,8 +123,7 @@ pub struct ServerSecretRef {
     pub password_key: String,
 }
 
-/// Payload for [`ServerAuth::Insecure`]; the acknowledgement lives *inside* the
-/// variant so it is unreachable unless no-auth is explicitly chosen.
+/// Payload for [`ServerAuth::Insecure`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InsecureAuth {
@@ -188,8 +155,7 @@ impl ServerService {
     }
 }
 
-/// Kubernetes `Service.spec.type`. A closed enum; variants serialize as Kubernetes'
-/// **exact** casing (so **no** `#[serde(rename_all)]` here — `clusterIp` would be wrong).
+/// Kubernetes `Service.spec.type`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum ServiceType {
     /// In-cluster only (default); routing to the outside is the user's job.
@@ -212,23 +178,20 @@ impl ServiceType {
     }
 }
 
-/// Status block for the kopia server, pinned by the reconciler. Never carries a
-/// password — only the resolved mode and (for `Generate`) the secret reference.
+/// Status block for the kopia server, pinned by the reconciler; never carries a password.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerStatus {
     /// In-cluster endpoint, `<service>.<namespace>.svc:<port>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    /// Namespace the server objects were last applied to. **Load-bearing**: lets the
-    /// reconciler detect a `server.namespace` change and delete the stale objects.
+    /// Namespace the server objects were last applied to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// Resolved auth mode discriminant (`Generate`/`SecretRef`/`Insecure`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
-    /// **Effective** read-only state of the served connection — `spec.mode: ReadOnly` OR
-    /// `spec.server.readOnly: true`. When `true` the UI cannot mutate the repository.
+    /// Effective read-only state of the served connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
     /// For `Generate` mode: the operator-owned Secret holding the UI credentials.

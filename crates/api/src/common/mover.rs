@@ -7,15 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Per-recipe mover overrides (resources, cache, security context). ADR §3.3.
-///
-/// These overlay the repository's [`MoverDefaults`] **field-wise** (recipe wins, the
-/// repo default fills, the hardened base underneath) via [`resolve_mover`] — they are
-/// merged, never replace-the-whole-context (ADR-0004 §2). A partial `securityContext`
-/// here can therefore only *tighten*; it never drops the hardened `drop:[ALL]`/seccomp.
-///
-/// Not `Eq`: embeds `k8s-openapi` types (`ResourceRequirements`, `SecurityContext`)
-/// which only implement `PartialEq`.
+/// Per-recipe mover overrides (resources, cache, security context).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MoverSpec {
@@ -25,31 +17,19 @@ pub struct MoverSpec {
     /// Override the repository's [`CacheDefaults`] for this recipe's movers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheDefaults>,
-    /// Security context applied to the mover **container** (`runAsUser`/`runAsGroup`,
-    /// capabilities, seccomp, …). Merged field-wise over `moverDefaults.securityContext`
-    /// and the hardened base (ADR-0004 §2) — set only the fields you want to change.
+    /// Container security context for the mover; merged field-wise over the defaults and hardened base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_context: Option<k8s_openapi::api::core::v1::SecurityContext>,
-    /// Security context applied to the mover **pod** — notably `fsGroup`, which makes
-    /// a freshly-provisioned volume group-writable so an unprivileged
-    /// (`runAsUser != 0`) mover can populate it on **restore** without root. Distinct
-    /// from the container-level [`MoverSpec::security_context`]; a pod-level
-    /// `runAsUser: 0` / `runAsNonRoot: false` here is still gated as privileged.
+    /// Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
-    /// Opt-in, namespace-gated; preserves UID/GID on restore. ADR §4.11/§G16.
+    /// Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged_mode: Option<bool>,
-    /// Opt-in: copy security context from a live workload pod instead of setting an
-    /// explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
-    /// Either name the workload by label (`workloadSelector`) or, on a **backup**
-    /// source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
+    /// Copy the UID/GID security context from a live workload instead of setting it explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_security_context_from: Option<InheritSecurityContextFrom>,
-    /// Per-recipe override of `moverDefaults.ttlSecondsAfterFinished` — the
-    /// `Job.spec.ttlSecondsAfterFinished` for this recipe's mover Jobs so finished
-    /// backup/restore Jobs self-GC. Recipe wins over the repo default; when neither
-    /// is set a built-in default applies ([`DEFAULT_JOB_TTL_SECONDS`]). ADR-0005 §12.
+    /// Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds_after_finished: Option<i64>,
 }
@@ -75,38 +55,19 @@ impl MoverSpec {
     }
 }
 
-/// How the mover pod co-locates with the node a `ReadWriteOnce` source/destination
-/// PVC is attached to, to avoid a Kubernetes **Multi-Attach error**.
-///
-/// A `ReadWriteOnce` (RWO) PVC can only be attached to one node at a time, but it
-/// *can* be mounted by multiple pods **on that same node**. When an app pod already
-/// holds an RWO PVC on node A and the mover lands on node B, the kubelet on B cannot
-/// attach the volume and the mover pod is stuck `Multi-Attach error`. The controller
-/// resolves the node the PVC is attached to (consuming pod → PV `nodeAffinity` →
-/// `VolumeAttachment`) and pins the mover there so it co-locates with the workload.
+/// How the mover co-locates with the node an RWO source/destination PVC is attached to.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum SourceColocationMode {
-    /// Pin an RWO PVC's mover to the node the PVC is attached to **when** that node
-    /// is discoverable; otherwise schedule freely (nothing holds the volume, so the
-    /// mover can attach it anywhere). `ReadWriteMany`/`ReadOnlyMany` are never pinned.
-    /// A `ReadWriteOncePod` PVC that is already held by a live pod fails with guidance
-    /// (a second pod cannot mount it even on the same node). The default — fixes the
-    /// Multi-Attach error with no configuration.
+    /// Pin to the attached node when discoverable, else schedule freely; the default.
     #[default]
     Auto,
-    /// Like `Auto`, but if an RWO PVC's node cannot be determined, **fail** the run
-    /// with an actionable error instead of scheduling freely. Use when an RWO source
-    /// must never be backed up from the wrong node.
+    /// Like `Auto`, but fail the run when an RWO PVC's node cannot be determined.
     Required,
-    /// Never compute a node pin; the mover uses only the explicit
-    /// `nodeSelector`/`affinity`/`tolerations`. The pre-fix behavior — an escape hatch
-    /// for topologies that manage placement themselves.
+    /// Never compute a node pin; use only the explicit `nodeSelector`/`affinity`/`tolerations`.
     Disabled,
 }
 
-/// Controls mover/source-PVC node co-location (RWO Multi-Attach avoidance). A
-/// sub-object (not a bare enum) so future knobs — e.g. a custom hostname label key
-/// for non-standard topologies — slot in without an API break (ADR §4.11).
+/// Controls mover/source-PVC node co-location (RWO Multi-Attach avoidance).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceColocation {
@@ -115,42 +76,23 @@ pub struct SourceColocation {
     pub mode: Option<SourceColocationMode>,
 }
 
-/// Repository-wide mover defaults inherited by **every** mover the repository spawns —
-/// bootstrap, backup, restore, maintenance — overridable per-recipe via `mover`
-/// (ADR-0004 §1). Replaces the former `cacheDefaults`: the cache lives at
-/// [`MoverDefaults::cache`] now.
-///
-/// `securityContext`/`podSecurityContext`/`resources`/`cache` resolve by **field-wise
-/// merge** (`hardened ⊂ moverDefaults ⊂ recipe`, ADR-0004 §2) via [`resolve_mover`];
-/// they are never replaced wholesale, so a repo-wide default composes with a partial
-/// per-recipe override. This is the single place a repository defines mover
-/// identity/hardening/resources/cache — closing the drift between maintenance and
-/// backup/restore movers and the bootstrap-mover gap (a filesystem/NFS repo on a
-/// non-`65532`-owned directory becomes bootstrappable with no special-case knob).
-///
-/// Not `Eq`: embeds `k8s-openapi` types (`SecurityContext`, `PodSecurityContext`,
-/// `ResourceRequirements`, `Toleration`, `Affinity`) which are `PartialEq` only.
+/// Repository-wide mover defaults inherited by every mover, overridable per-recipe via `mover`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MoverDefaults {
-    /// Container security-context base for every mover, merged *under* the recipe's
-    /// `mover.securityContext` and *over* the hardened default ([`hardened_security_context`]).
+    /// Container security-context base for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_context: Option<SecurityContext>,
-    /// Pod security-context base (notably `fsGroup`) for every mover, merged under the
-    /// recipe's `mover.podSecurityContext`.
+    /// Pod security-context base (notably `fsGroup`) for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<PodSecurityContext>,
     /// Resource requests/limits base for the mover container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
-    /// kopia cache defaults (the former repository `cacheDefaults`).
+    /// kopia cache defaults for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheDefaults>,
-    /// Defaults for the deep-verification scratch (restore-test) volume, inherited by
-    /// `SnapshotPolicy.spec.verification.deep` unless overridden there. Always
-    /// ephemeral (no `mode`, unlike [`MoverDefaults::cache`]); `storageClassName`
-    /// applies only when a `capacity` is set.
+    /// Defaults for the deep-verification scratch (restore-test) volume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<ScratchDefaults>,
     /// Pod `nodeSelector` for every mover.
@@ -162,19 +104,13 @@ pub struct MoverDefaults {
     /// Pod affinity for every mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity: Option<Affinity>,
-    /// How a mover co-locates with the node its RWO source/destination PVC is
-    /// attached to, to avoid a Multi-Attach error. Defaults to
-    /// [`SourceColocationMode::Auto`] when unset. ADR §3.7 / RWO multi-attach fix.
+    /// How a mover co-locates with its RWO PVC's node; defaults to [`SourceColocationMode::Auto`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_colocation: Option<SourceColocation>,
-    /// `Job.spec.ttlSecondsAfterFinished` for every mover Job, so finished
-    /// backup/restore/maintenance Jobs self-GC (ADR-0005 §12). A recipe's
-    /// `mover` can override it.
+    /// `Job.spec.ttlSecondsAfterFinished` for every mover Job so finished Jobs self-GC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds_after_finished: Option<i64>,
-    /// Repository throttle limits (`kopia repository throttle set`) applied by every
-    /// mover after it connects, so a run doesn't saturate the link / hammer the
-    /// object store. ADR-0005 §13(e).
+    /// Repository throttle limits applied by every mover after it connects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle: Option<Throttle>,
 }
@@ -185,8 +121,7 @@ pub struct MoverDefaults {
 /// their pods self-GC instead of lingering (ADR-0005 §12).
 pub const DEFAULT_JOB_TTL_SECONDS: i64 = 3600;
 
-/// Repository-wide throttling for a mover's kopia connection (ADR-0005 §13(e)).
-/// Each `None` leaves kopia's current limit. Maps to `kopia repository throttle set`.
+/// Repository-wide throttling for a mover's kopia connection; each `None` leaves kopia's current limit.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Throttle {
@@ -325,9 +260,7 @@ pub fn resolve_mover(
     }
 }
 
-/// Selects workload pods by label. Reuses k8s-openapi `LabelSelector`. ADR §3.3 hooks.
-///
-/// Not `Eq`: `LabelSelector` only implements `PartialEq`.
+/// Selects workload pods by label.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PodSelector {
@@ -338,37 +271,21 @@ pub struct PodSelector {
     pub container: Option<String>,
 }
 
-/// Where the mover copies its security context from (instead of an explicit
-/// `securityContext`/`podSecurityContext`). **Externally tagged** — exactly one variant,
-/// so the source of the inherited identity is unambiguous and a `match` must handle every
-/// case (convention #1; NOT a bool + optional selector). Mutually exclusive with explicit
-/// contexts (webhook/[`crate::validate::validate_mover`]-enforced). The resolved context
-/// enters [`resolve_mover`] as the *recipe layer*, so the hardened base still applies.
-///
-/// Not `Eq`: `WorkloadSelector` embeds [`PodSelector`] → `LabelSelector` (`PartialEq` only).
+/// Where the mover copies its security context from instead of an explicit context.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum InheritSecurityContextFrom {
-    /// Match the workload pod(s) by an explicit label selector and inherit the chosen
-    /// container's `securityContext` plus the pod's `spec.securityContext`. Works for
-    /// both backup and restore (restore inherits from the pod that will *read* the data).
+    /// Inherit from workload pod(s) matched by an explicit label selector (backup or restore).
     WorkloadSelector(PodSelector),
-    /// **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
-    /// backs up: the operator finds the pod(s) mounting the source claim and inherits
-    /// their securityContext, so the mover's UID/GID matches the workload *by
-    /// construction* — no hand-written selector. Meaningless on a restore (the consuming
-    /// pod may not exist yet, exactly like a populator), so restore must use
-    /// `workloadSelector`.
+    /// Backup sources only: auto-derive the workload from the PVC this snapshot backs up.
     PvcConsumer(PvcConsumerInherit),
 }
 
-/// Tuning for [`InheritSecurityContextFrom::PvcConsumer`]. A sub-object (not a bare flag)
-/// so future knobs slot in without an API break (ADR §4.11).
+/// Tuning for [`InheritSecurityContextFrom::PvcConsumer`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PvcConsumerInherit {
-    /// Which container within the matched consumer pod to inherit from; absent uses the
-    /// first/only container (same semantics as [`PodSelector::container`]).
+    /// Which container within the matched consumer pod to inherit from; absent uses the first/only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
 }

@@ -1,20 +1,17 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// How a mover's kopia cache volume is provisioned. ADR §3.1.
+/// How a mover's kopia cache volume is provisioned.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum CacheVolumeMode {
-    /// Cache lives only for the run: an inline generic ephemeral volume (when
-    /// `capacity` is set) or an `emptyDir`, provisioned and garbage-collected with
-    /// the mover `Job`. Fresh each run. The default.
+    /// Cache lives only for the run (ephemeral volume or `emptyDir`), fresh each run; the default.
     #[default]
     Ephemeral,
-    /// Cache persists across runs in a controller-owned PVC (a warm kopia cache).
-    /// `ReadWriteOnce`, so it assumes non-overlapping runs for a given owner.
+    /// Cache persists across runs in a controller-owned `ReadWriteOnce` PVC (a warm kopia cache).
     Persistent,
 }
 
-/// Cache defaults inherited by `Snapshot`/`Restore` movers unless overridden. ADR §3.1.
+/// kopia cache defaults inherited by every mover unless overridden per-recipe.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheDefaults {
@@ -30,8 +27,7 @@ pub struct CacheDefaults {
     /// kopia content cache budget in MiB (`--content-cache-size-mb`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_cache_size_mb: Option<i64>,
-    /// How the cache volume is provisioned (`Ephemeral` default, or `Persistent`
-    /// for a warm cache reused across runs). ADR §3.1.
+    /// How the cache volume is provisioned (`Ephemeral` default, or `Persistent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<CacheVolumeMode>,
 }
@@ -68,25 +64,14 @@ impl CacheDefaults {
     }
 }
 
-/// Repository-wide defaults for the deep-verification **scratch** volume — the
-/// throwaway restore target a `deep` restore-test writes into and then discards.
-/// Inherited by `SnapshotPolicy.spec.verification.deep` unless overridden there,
-/// the same `moverDefaults ⊂ recipe` field-wise overlay as [`CacheDefaults`].
-///
-/// Distinct from [`CacheDefaults`]: scratch is **always ephemeral** (auto-deleted
-/// with the verify Job), so unlike the cache it has no `mode` / persistent-PVC form.
-/// `storageClassName` only takes effect when `capacity` is set — an `emptyDir` has
-/// no StorageClass (the capacity gate, mirrored from the cache).
+/// Defaults for the deep-verification **scratch** volume — the throwaway restore-test target.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScratchDefaults {
-    /// StorageClass for the ephemeral scratch PVC; absent uses the cluster default.
-    /// Only applies when `capacity` is set.
+    /// StorageClass for the ephemeral scratch PVC; only applies when `capacity` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
-    /// Size of the ephemeral scratch PVC (e.g. `100Gi`) — size it to comfortably hold
-    /// the restored snapshot. When absent (here and on `verification.deep`), scratch
-    /// falls back to a node-ephemeral `emptyDir`.
+    /// Size of the ephemeral scratch PVC (e.g. `100Gi`); absent falls back to an `emptyDir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
 }
@@ -116,24 +101,17 @@ impl ScratchDefaults {
     }
 }
 
-/// Bounds on materialization of `origin: discovered` `Snapshot` CRs. ADR §3.1 `catalog`.
+/// Bounds on materialization of `origin: discovered` `Snapshot` CRs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogBounds {
-    /// How many discovered `Snapshot` CRs to keep materialized; bounds etcd footprint
-    /// for large repositories. Expiring a CR row never deletes the kopia snapshot
-    /// behind it (discovered snapshots are always `deletionPolicy: Retain`).
-    /// ADR §3.1/§4.5.
+    /// How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain: Option<CatalogRetain>,
-    /// How often to re-scan the repository for snapshots to materialize as (or
-    /// expire from) `origin: discovered` `Snapshot` CRs. Go-style duration
-    /// (`30s`, `5m`, `1h`); minimum `30s` (webhook-enforced), default `1h`.
+    /// How often to re-scan the repository (Go-style duration; minimum `30s`, default `1h`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval: Option<String>,
-    /// Where to materialize discovered `Snapshot`s whose identity hostname does not
-    /// map to an allowed namespace (ClusterRepository only; rejected on a namespaced
-    /// `Repository`, which always materializes into its own namespace). ADR §3.2.
+    /// Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_namespace: Option<String>,
 }
@@ -151,20 +129,14 @@ impl CatalogBounds {
     }
 }
 
-/// Bounds on the *number* of discovered `Snapshot` CRs kept materialized. ADR §3.1 `catalog.retain`.
+/// Bounds on the *number* of discovered `Snapshot` CRs kept materialized.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogRetain {
-    /// Keep the most-recent N discovered `Snapshot` CRs per `username@hostname:path`
-    /// identity (snapshots this cluster produced don't count against N). `0` disables
-    /// discovered-Snapshot materialization entirely; negative values are rejected by
-    /// the webhook. Rows beyond N are expired (the CR is deleted; the kopia snapshot
-    /// is untouched and stays restorable via `Restore.source.identity`).
+    /// Keep the most-recent N discovered `Snapshot` CRs per identity; `0` disables materialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_identity: Option<i64>,
-    /// Don't materialize (and expire) discovered `Snapshot` CRs for snapshots whose
-    /// end time is older than this many days. Minimum 1 (webhook-enforced). The
-    /// kopia snapshots themselves are untouched.
+    /// Expire discovered `Snapshot` CRs older than this many days (minimum 1); kopia snapshots untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_days: Option<i64>,
 }

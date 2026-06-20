@@ -38,16 +38,12 @@ spec:
         properties:
           spec:
             description: |-
-              Mirror a source repository's blobs to a destination backend on a schedule
-              (`kopia repository sync-to`), ADR-0005 §13(d).
+              Mirror a source repository's blobs to a destination backend on a schedule (`kopia repository sync-to`).
 
               Not `Eq`: `mover` transitively embeds k8s-openapi types.
             properties:
               destination:
-                description: |-
-                  The backend to mirror *to* (`kopia repository sync-to <destination>`).
-                  Exactly one backend by construction (the externally-tagged `Backend` enum,
-                  reused). Must differ from the source's backend (webhook-enforced).
+                description: The backend to mirror to; must differ from the source's backend (webhook-enforced).
                 oneOf:
                 - required:
                   - s3
@@ -74,37 +70,25 @@ spec:
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials. The operator reads
-                              well-known keys (e.g. `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for S3).
-                              Mutually exclusive with `workloadIdentity`. ADR §3.1.
+                            description: Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`).
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
                             - name
                             type: object
                           workloadIdentity:
-                            description: |-
-                              Cloud workload identity: the mover Job runs as the named `ServiceAccount`
-                              and authenticates via the cloud's federation (IRSA / EKS Pod Identity,
-                              AKS Workload Identity, GKE Workload Identity) — no static keys in the
-                              cluster. Mutually exclusive with `secretRef`. ADR §4.11.
+                            description: Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`).
                             nullable: true
                             properties:
                               serviceAccountName:
-                                description: |-
-                                  Name of the `ServiceAccount` the mover pod runs as, federated to the
-                                  cloud IAM role/identity that grants backend access. Resolved in the
-                                  mover Job's own namespace.
+                                description: Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace.
                                 type: string
                             required:
                             - serviceAccountName
@@ -128,24 +112,18 @@ spec:
                     description: Backblaze B2.
                     properties:
                       auth:
-                        description: |-
-                          Access credentials (application key ID/key Secret). B2 has no cloud IAM
-                          federation, so this is Secret-only.
+                        description: Access credentials (application key ID/key Secret); Secret-only.
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials, read by well-known keys
-                              (e.g. `B2_KEY_ID`/`B2_KEY`, `KOPIA_SFTP_KEY_DATA`, `KOPIA_WEBDAV_USERNAME`).
+                            description: Secret holding the backend's access credentials, read by well-known keys.
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
@@ -169,10 +147,7 @@ spec:
                         description: Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`).
                         type: string
                       volume:
-                        description: |-
-                          What backs `path`. A PVC (`{ pvc: { name } }`) or an inline NFS export
-                          (`{ nfs: { server, path } }`). Absent for a path already present on the
-                          node/image (a `hostPath`/baked-in mount; mainly the e2e harness).
+                        description: 'What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image.'
                         nullable: true
                         oneOf:
                         - required:
@@ -214,37 +189,25 @@ spec:
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials. The operator reads
-                              well-known keys (e.g. `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for S3).
-                              Mutually exclusive with `workloadIdentity`. ADR §3.1.
+                            description: Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`).
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
                             - name
                             type: object
                           workloadIdentity:
-                            description: |-
-                              Cloud workload identity: the mover Job runs as the named `ServiceAccount`
-                              and authenticates via the cloud's federation (IRSA / EKS Pod Identity,
-                              AKS Workload Identity, GKE Workload Identity) — no static keys in the
-                              cluster. Mutually exclusive with `secretRef`. ADR §4.11.
+                            description: Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`).
                             nullable: true
                             properties:
                               serviceAccountName:
-                                description: |-
-                                  Name of the `ServiceAccount` the mover pod runs as, federated to the
-                                  cloud IAM role/identity that grants backend access. Resolved in the
-                                  mover Job's own namespace.
+                                description: Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace.
                                 type: string
                             required:
                             - serviceAccountName
@@ -275,9 +238,7 @@ spec:
                             description: Name of the `Secret`.
                             type: string
                           namespace:
-                            description: |-
-                              Namespace of the `Secret`. Absent = same namespace as the referrer;
-                              required for cluster-scoped CRs (ADR §3.2).
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
                             nullable: true
                             type: string
                         required:
@@ -295,41 +256,29 @@ spec:
                     description: Amazon S3 or any S3-compatible object store (MinIO, RustFS, Ceph RGW, …).
                     properties:
                       auth:
-                        description: Access credentials (Secret ref / workload identity). ADR §3.1.
+                        description: Access credentials (Secret ref / workload identity).
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials. The operator reads
-                              well-known keys (e.g. `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for S3).
-                              Mutually exclusive with `workloadIdentity`. ADR §3.1.
+                            description: Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`).
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
                             - name
                             type: object
                           workloadIdentity:
-                            description: |-
-                              Cloud workload identity: the mover Job runs as the named `ServiceAccount`
-                              and authenticates via the cloud's federation (IRSA / EKS Pod Identity,
-                              AKS Workload Identity, GKE Workload Identity) — no static keys in the
-                              cluster. Mutually exclusive with `secretRef`. ADR §4.11.
+                            description: Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`).
                             nullable: true
                             properties:
                               serviceAccountName:
-                                description: |-
-                                  Name of the `ServiceAccount` the mover pod runs as, federated to the
-                                  cloud IAM role/identity that grants backend access. Resolved in the
-                                  mover Job's own namespace.
+                                description: Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace.
                                 type: string
                             required:
                             - serviceAccountName
@@ -359,9 +308,7 @@ spec:
                         nullable: true
                         properties:
                           caBundleRef:
-                            description: |-
-                              CA bundle (PEM) used to verify the endpoint's certificate, sourced from a
-                              `ConfigMap`. Preferred over `insecureSkipVerify` for self-signed endpoints.
+                            description: CA bundle (PEM) used to verify the endpoint's certificate, sourced from a `ConfigMap`.
                             nullable: true
                             properties:
                               configMapName:
@@ -374,16 +321,10 @@ spec:
                                 type: string
                             type: object
                           disableTls:
-                            description: |-
-                              Disable TLS entirely and talk plain HTTP. Maps to kopia's `--disable-tls`.
-                              Needed for HTTP-only endpoints (e.g. an in-cluster MinIO/RustFS service);
-                              kopia's S3 path otherwise assumes HTTPS. Off by default.
+                            description: Disable TLS entirely and talk plain HTTP; maps to kopia's `--disable-tls`.
                             type: boolean
                           insecureSkipVerify:
-                            description: |-
-                              Skip TLS certificate verification (still uses TLS). Maps to kopia's
-                              `--disable-tls-verification`. For self-signed endpoints; prefer
-                              `caBundleRef` in production.
+                            description: Skip TLS certificate verification (still uses TLS); maps to kopia's `--disable-tls-verification`.
                             type: boolean
                         type: object
                     required:
@@ -393,24 +334,18 @@ spec:
                     description: SFTP server.
                     properties:
                       auth:
-                        description: |-
-                          Credentials (SSH private key / known-hosts) sourced from a Secret. SSH
-                          has no cloud IAM federation, so this is Secret-only.
+                        description: Credentials (SSH private key / known-hosts) sourced from a Secret; Secret-only.
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials, read by well-known keys
-                              (e.g. `B2_KEY_ID`/`B2_KEY`, `KOPIA_SFTP_KEY_DATA`, `KOPIA_WEBDAV_USERNAME`).
+                            description: Secret holding the backend's access credentials, read by well-known keys.
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
@@ -442,24 +377,18 @@ spec:
                     description: WebDAV endpoint.
                     properties:
                       auth:
-                        description: |-
-                          HTTP basic-auth credentials sourced from a Secret. WebDAV has no cloud
-                          IAM federation, so this is Secret-only.
+                        description: HTTP basic-auth credentials sourced from a Secret; Secret-only.
                         nullable: true
                         properties:
                           secretRef:
-                            description: |-
-                              Secret holding the backend's access credentials, read by well-known keys
-                              (e.g. `B2_KEY_ID`/`B2_KEY`, `KOPIA_SFTP_KEY_DATA`, `KOPIA_WEBDAV_USERNAME`).
+                            description: Secret holding the backend's access credentials, read by well-known keys.
                             nullable: true
                             properties:
                               name:
                                 description: Name of the `Secret`.
                                 type: string
                               namespace:
-                                description: |-
-                                  Namespace of the `Secret`. Absent = same namespace as the referrer;
-                                  required for cluster-scoped CRs (ADR §3.2).
+                                description: Namespace of the `Secret`; absent = same namespace as the referrer.
                                 nullable: true
                                 type: string
                             required:
@@ -474,30 +403,21 @@ spec:
                     type: object
                 type: object
               destinationEncryption:
-                description: |-
-                  Encryption/password for the destination repository when it needs its own
-                  (e.g. a freshly-created mirror with a distinct password). Absent ⇒ the
-                  destination uses the **source** repository's password — the common case for a
-                  true mirror, where `sync-to` copies blobs verbatim and the format (including
-                  the encryption material) is identical. Document this in the example.
+                description: Encryption for the destination; omit to reuse the source repository password.
                 nullable: true
                 properties:
                   passwordSecretRef:
-                    description: Always a Secret ref; never inline. ADR §3.1.
+                    description: Repository password, always a Secret reference (never inline).
                     properties:
                       key:
-                        description: |-
-                          Which key inside the `Secret` to read. Defaults are documented per-field on
-                          the consuming struct.
+                        description: Which key inside the `Secret` to read.
                         nullable: true
                         type: string
                       name:
                         description: Name of the `Secret`.
                         type: string
                       namespace:
-                        description: |-
-                          Namespace of the `Secret`. Absent = same namespace as the referrer;
-                          required for cluster-scoped CRs which have no own namespace (ADR §3.2).
+                        description: Namespace of the `Secret`; absent = same namespace as the referrer.
                         nullable: true
                         type: string
                     required:
@@ -507,10 +427,7 @@ spec:
                 - passwordSecretRef
                 type: object
               mover:
-                description: |-
-                  Mover (Job pod) overrides for the replication run — resources, scheduling,
-                  security context. Inherits the source repository's `moverDefaults` underneath
-                  (ADR-0004 §1/§2).
+                description: Mover (Job pod) overrides for the replication run.
                 nullable: true
                 properties:
                   cache:
@@ -532,7 +449,7 @@ spec:
                         nullable: true
                         type: integer
                       mode:
-                        description: How a mover's kopia cache volume is provisioned. ADR §3.1.
+                        description: How a mover's kopia cache volume is provisioned.
                         enum:
                         - Ephemeral
                         - Persistent
@@ -544,11 +461,7 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: |-
-                      Opt-in: copy security context from a live workload pod instead of setting an
-                      explicit `securityContext`/`podSecurityContext` (mutually exclusive with both).
-                      Either name the workload by label (`workloadSelector`) or, on a **backup**
-                      source, auto-derive it from the PVC being backed up (`pvcConsumer`). ADR §4.11.
+                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
                     nullable: true
                     oneOf:
                     - required:
@@ -557,26 +470,15 @@ spec:
                       - pvcConsumer
                     properties:
                       pvcConsumer:
-                        description: |-
-                          **Backup sources only.** Auto-derive the workload pod from the PVC this snapshot
-                          backs up: the operator finds the pod(s) mounting the source claim and inherits
-                          their securityContext, so the mover's UID/GID matches the workload *by
-                          construction* — no hand-written selector. Meaningless on a restore (the consuming
-                          pod may not exist yet, exactly like a populator), so restore must use
-                          `workloadSelector`.
+                        description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
                         properties:
                           container:
-                            description: |-
-                              Which container within the matched consumer pod to inherit from; absent uses the
-                              first/only container (same semantics as [`PodSelector::container`]).
+                            description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
                             nullable: true
                             type: string
                         type: object
                       workloadSelector:
-                        description: |-
-                          Match the workload pod(s) by an explicit label selector and inherit the chosen
-                          container's `securityContext` plus the pod's `spec.securityContext`. Works for
-                          both backup and restore (restore inherits from the pod that will *read* the data).
+                        description: Inherit from workload pod(s) matched by an explicit label selector (backup or restore).
                         properties:
                           container:
                             description: Which container within the matched pod; absent uses the first/only container.
@@ -617,12 +519,7 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: |-
-                      Security context applied to the mover **pod** — notably `fsGroup`, which makes
-                      a freshly-provisioned volume group-writable so an unprivileged
-                      (`runAsUser != 0`) mover can populate it on **restore** without root. Distinct
-                      from the container-level [`MoverSpec::security_context`]; a pod-level
-                      `runAsUser: 0` / `runAsNonRoot: false` here is still gated as privileged.
+                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -752,7 +649,7 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated; preserves UID/GID on restore. ADR §4.11/§G16.
+                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
                     nullable: true
                     type: boolean
                   resources:
@@ -793,10 +690,7 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: |-
-                      Security context applied to the mover **container** (`runAsUser`/`runAsGroup`,
-                      capabilities, seccomp, …). Merged field-wise over `moverDefaults.securityContext`
-                      and the hardened base (ADR-0004 §2) — set only the fields you want to change.
+                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -901,38 +795,26 @@ spec:
                         type: object
                     type: object
                   ttlSecondsAfterFinished:
-                    description: |-
-                      Per-recipe override of `moverDefaults.ttlSecondsAfterFinished` — the
-                      `Job.spec.ttlSecondsAfterFinished` for this recipe's mover Jobs so finished
-                      backup/restore Jobs self-GC. Recipe wins over the repo default; when neither
-                      is set a built-in default applies ([`DEFAULT_JOB_TTL_SECONDS`]). ADR-0005 §12.
+                    description: Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
                     format: int64
                     nullable: true
                     type: integer
                 type: object
               schedule:
-                description: |-
-                  Cron + deterministic jitter for the replication runs (ADR §3.7 scheduling
-                  kernel, shared with `Maintenance`).
+                description: Cron and deterministic jitter for the replication runs.
                 properties:
                   cron:
-                    description: |-
-                      The cron expression, parsed by `croner`. May contain an `H` placeholder for
-                      deterministic per-schedule jitter (ADR §3.7).
+                    description: The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
                     type: string
                   jitter:
-                    description: |-
-                      Optional deterministic jitter window as a Go-style duration string (e.g.
-                      `30m`), derived from `(scheduleUID, slot)` so it is stable across restarts.
+                    description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
                     nullable: true
                     type: string
                 required:
                 - cron
                 type: object
               sourceRef:
-                description: |-
-                  The repository to mirror *from* — a `Repository` or `ClusterRepository`
-                  reference (ADR §3.2). Credentials/connect are resolved from it.
+                description: Reference to the `Repository` or `ClusterRepository` to mirror from.
                 properties:
                   kind:
                     default: Repository
@@ -952,10 +834,7 @@ spec:
                 - name
                 type: object
               suspend:
-                description: |-
-                  Pause this replication declaratively (ADR-0005 §14(e)): a suspended
-                  `RepositoryReplication` is skipped by its own reconcile (no sync runs),
-                  surfaced via a condition. Default `false`.
+                description: Pause this replication; a suspended replication runs no syncs (default `false`).
                 type: boolean
             required:
             - destination
@@ -963,11 +842,11 @@ spec:
             - sourceRef
             type: object
           status:
-            description: Observed state of a [`RepositoryReplication`]. ADR-0005 §13(d).
+            description: Observed state of a `RepositoryReplication`.
             nullable: true
             properties:
               conditions:
-                description: Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`). ADR-0005 §2.
+                description: Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`).
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:
@@ -1000,15 +879,11 @@ spec:
                   type: object
                 type: array
               destinationBackend:
-                description: |-
-                  The destination backend kind (mirror of `spec.destination` discriminant),
-                  for the `DESTINATION` print column.
+                description: The destination backend kind, for the `DESTINATION` print column.
                 nullable: true
                 type: string
               lastReplicated:
-                description: |-
-                  RFC3339 timestamp of the most recent successful replication run. Backs the
-                  `LAST` print column.
+                description: RFC3339 timestamp of the most recent successful replication run.
                 nullable: true
                 type: string
               lastReplicatedBlobs:

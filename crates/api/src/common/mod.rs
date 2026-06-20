@@ -39,37 +39,32 @@ pub trait PhaseLabel: Copy + PartialEq + 'static {
     fn label(&self) -> &'static str;
 }
 
-/// Reference to a key within a `Secret` in the same namespace as the referrer,
-/// unless `namespace` is given (required for cluster-scoped CRs — ADR §3.2).
+/// Reference to a key within a `Secret`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretKeyRef {
     /// Name of the `Secret`.
     pub name: String,
-    /// Namespace of the `Secret`. Absent = same namespace as the referrer;
-    /// required for cluster-scoped CRs which have no own namespace (ADR §3.2).
+    /// Namespace of the `Secret`; absent = same namespace as the referrer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    /// Which key inside the `Secret` to read. Defaults are documented per-field on
-    /// the consuming struct.
+    /// Which key inside the `Secret` to read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
 
-/// Reference to an entire `Secret` (the operator reads well-known keys from it,
-/// e.g. `AWS_ACCESS_KEY_ID`). See ADR §3.1 backend `auth.secretRef`.
+/// Reference to an entire `Secret` (the operator reads well-known keys from it).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretRef {
     /// Name of the `Secret`.
     pub name: String,
-    /// Namespace of the `Secret`. Absent = same namespace as the referrer;
-    /// required for cluster-scoped CRs (ADR §3.2).
+    /// Namespace of the `Secret`; absent = same namespace as the referrer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }
 
-/// Reference to a key within a `ConfigMap` (e.g. a CA bundle). ADR §3.1 `tls.caBundleRef`.
+/// Reference to a key within a `ConfigMap` (e.g. a CA bundle).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapKeyRef {
@@ -81,30 +76,22 @@ pub struct ConfigMapKeyRef {
     pub key: Option<String>,
 }
 
-/// TLS settings for object-store backends. ADR §3.1.
+/// TLS settings for object-store backends.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsConfig {
-    /// CA bundle (PEM) used to verify the endpoint's certificate, sourced from a
-    /// `ConfigMap`. Preferred over `insecureSkipVerify` for self-signed endpoints.
+    /// CA bundle (PEM) used to verify the endpoint's certificate, sourced from a `ConfigMap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle_ref: Option<ConfigMapKeyRef>,
-    /// Skip TLS certificate verification (still uses TLS). Maps to kopia's
-    /// `--disable-tls-verification`. For self-signed endpoints; prefer
-    /// `caBundleRef` in production.
+    /// Skip TLS certificate verification (still uses TLS); maps to kopia's `--disable-tls-verification`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub insecure_skip_verify: bool,
-    /// Disable TLS entirely and talk plain HTTP. Maps to kopia's `--disable-tls`.
-    /// Needed for HTTP-only endpoints (e.g. an in-cluster MinIO/RustFS service);
-    /// kopia's S3 path otherwise assumes HTTPS. Off by default.
+    /// Disable TLS entirely and talk plain HTTP; maps to kopia's `--disable-tls`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_tls: bool,
 }
 
-/// Which kind of repository a consumer CR references. ADR §3.2/§3.3.
-///
-/// This is a closed enum: a consumer's `repository.kind` is always exactly one
-/// of these two values, so reconcilers `match` it exhaustively.
+/// Which kind of repository a consumer CR references (`Repository` or `ClusterRepository`).
 ///
 /// ```
 /// use kopiur_api::common::RepositoryKind;
@@ -126,12 +113,7 @@ pub enum RepositoryKind {
     ClusterRepository,
 }
 
-/// Discriminated reference from a consumer CR (`SnapshotPolicy`, `Snapshot`,
-/// `Restore`, `Maintenance`) to a `Repository` or `ClusterRepository`. ADR §3.2.
-///
-/// When `kind == ClusterRepository`, `namespace` MUST be absent — enforced by the
-/// admission webhook (`api::validate`), since the type system cannot express
-/// "this field is forbidden only for one variant of a sibling field".
+/// Reference from a consumer CR to a `Repository` or `ClusterRepository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryRef {
@@ -145,71 +127,45 @@ pub struct RepositoryRef {
     pub namespace: Option<String>,
 }
 
-/// Repository encryption settings. A sub-object so future rotation fields
-/// (`rotation`, `previousPasswords`) slot in without breakage (ADR §4.11).
+/// Repository encryption settings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Encryption {
-    /// Always a Secret ref; never inline. ADR §3.1.
+    /// Repository password, always a Secret reference (never inline).
     pub password_secret_ref: SecretKeyRef,
 }
 
-/// Opt-in projection of a repository's credential `Secret`(s) into the namespace
-/// where each mover Job runs. **Default off.** ADR §3.1/§4.11.
-///
-/// Kopiur's baseline contract — like VolSync and K8up — is that the credential
-/// Secret already exists in the namespace where a mover runs (it loads creds via
-/// namespace-local `envFrom`). For a shared `ClusterRepository` whose Secret is
-/// pinned to one namespace, that means placing a copy in each consuming namespace.
-/// When `enabled`, the operator does that for you: before each run it reads the
-/// source Secret(s) and writes a kopiur-managed copy into the Job's namespace,
-/// owned by the consuming CR (garbage-collected with it) and refreshed from source
-/// every run. (Cross-namespace secret distribution is opt-in across the ecosystem;
-/// keeping it off by default preserves the namespace-as-trust-boundary posture.)
-///
-/// Even when enabled, projection is a no-op where the source Secret already lives
-/// in the Job's namespace (the common namespaced-`Repository` layout): there is
-/// nothing to copy, so the operator just verifies it is present. It only actually
-/// copies for the cross-namespace case (a shared `ClusterRepository`).
-///
-/// A sub-object (not a bare `bool`) so future knobs (key remapping, a copy-name
-/// template, immutability) slot in without API breakage (ADR §4.11).
+/// Opt-in projection of a repository's credential `Secret`(s) into each mover Job's namespace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialProjection {
-    /// When true, the operator copies the repository's credential Secret(s) into
-    /// the namespace of each mover Job that uses this repository. Off by default.
+    /// Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default.
     #[serde(default)]
     pub enabled: bool,
 }
 
-/// Behavior when the repository does not yet exist. ADR §3.1 `create`.
+/// Behavior when the repository does not yet exist.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBehavior {
-    /// Create the repository if it does not exist yet. Off by default, so a typo'd
-    /// backend can't silently spin up a brand-new empty repository.
+    /// Create the repository if it does not exist yet; off by default.
     #[serde(default)]
     pub enabled: bool,
-    /// kopia encryption algorithm for a freshly-created repository (e.g.
-    /// `AES256-GCM-HMAC-SHA256`); only consulted at creation time.
+    /// kopia encryption algorithm for a freshly-created repository (creation-time only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<String>,
-    /// kopia object splitter for a freshly-created repository; creation-time only.
+    /// kopia object splitter for a freshly-created repository (creation-time only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splitter: Option<String>,
-    /// kopia content hash algorithm for a freshly-created repository; creation-time only.
+    /// kopia content hash algorithm for a freshly-created repository (creation-time only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// Reed-Solomon ECC parity guarding repo blobs against backend bit-rot
-    /// (`kopia repository create --ecc=... --ecc-overhead-percent=...`). Creation-time
-    /// only and immutable post-create (ADR-0005 §13(a), gated by §7). ADR-0005 §13(a).
+    /// Reed-Solomon ECC parity for a freshly-created repository (creation-time only, immutable after).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecc: Option<Ecc>,
 }
 
-/// Reed-Solomon error-correcting-code parity for a freshly-created repository
-/// (ADR-0005 §13(a)). Both fields creation-time-fixed; immutable post-create (§7).
+/// Reed-Solomon error-correcting-code parity for a freshly-created repository.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Ecc {
@@ -221,7 +177,7 @@ pub struct Ecc {
     pub overhead_percent: Option<i64>,
 }
 
-/// GFS retention policy. The single successful-retention driver (ADR §4.4).
+/// GFS retention policy — how many snapshots to keep per time bucket.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Retention {
@@ -245,18 +201,14 @@ pub struct Retention {
     pub keep_annual: Option<u32>,
 }
 
-/// Identity overrides — what kopia records as `username@hostname:path`. ADR §3.3/§4.2.
+/// Identity overrides — what kopia records as `username@hostname:path`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
-    /// Override the `username` portion of `username@hostname:path`; absent uses the
-    /// resolved default (the repository's `identityDefaults` CEL expression, or the
-    /// object name). Used verbatim and pinned at admission (ADR §4.2).
+    /// Override the `username` portion of `username@hostname:path`; absent uses the resolved default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Override the `hostname` portion of `username@hostname:path`; absent uses the
-    /// resolved default (the repository's `identityDefaults` CEL expression, or the
-    /// namespace). Used verbatim and pinned at admission (ADR §4.2).
+    /// Override the `hostname` portion of `username@hostname:path`; absent uses the resolved default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 }
@@ -267,11 +219,7 @@ pub struct Identity {
 /// logs live in the mover Job's pod. ADR §3.4/§4.10.
 pub const MAX_LOG_TAIL_BYTES: usize = 4096;
 
-/// A structured terminal-failure block written by the mover to `status.failure`
-/// (ADR §4.10): the kopia error class, a human-readable message, the last
-/// stderr lines, and a retry recommendation. Defined in `kopiur-api` (not the
-/// mover) so the field names cannot drift from the CRD structural schema — a
-/// mismatched name is silently pruned by the API server.
+/// A structured terminal-failure block written by the mover to `status.failure`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureBlock {
@@ -290,7 +238,7 @@ pub struct FailureBlock {
     pub retry_recommended: bool,
 }
 
-/// Fully-resolved identity pinned into status; never re-rendered after admission. ADR §4.2.
+/// Fully-resolved identity pinned into status; never re-rendered after admission.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedIdentity {
@@ -303,25 +251,17 @@ pub struct ResolvedIdentity {
     pub source_path: Option<String>,
 }
 
-/// Per-run failure controls passed through to the mover `Job`. ADR §3.4/§4.10 (G6).
+/// Per-run failure controls passed through to the mover `Job`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FailurePolicy {
-    /// Passed through to the mover `Job.spec.backoffLimit` — how many times a failed
-    /// run is retried before the Job is marked failed.
+    /// Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_limit: Option<i32>,
-    /// Passed through to the mover `Job.spec.activeDeadlineSeconds` — wall-clock cap
-    /// after which a still-running run is killed.
+    /// Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_deadline_seconds: Option<i64>,
-    /// How long (seconds) a mover **pod** may sit in a non-starting state — a container
-    /// `CreateContainerConfigError` / `ImagePullBackOff` / `InvalidImageName`, or
-    /// `Unschedulable` — before the controller fails the run with an actionable reason,
-    /// rather than waiting out `active_deadline_seconds` (which can be many hours and
-    /// is meant for *long-running*, not *wedged*, work). A wedged pod never reaches a
-    /// terminal phase, so `backoffLimit` never trips — this is the only thing that bounds
-    /// it. Unset uses the built-in [`DEFAULT_POD_STARTUP_DEADLINE_SECONDS`].
+    /// Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_startup_deadline_seconds: Option<i64>,
 }
@@ -342,8 +282,7 @@ pub fn pod_startup_deadline_seconds(failure_policy: Option<&FailurePolicy>) -> i
         .unwrap_or(DEFAULT_POD_STARTUP_DEADLINE_SECONDS)
 }
 
-/// Reference to a `SnapshotPolicy` CR (used by `Snapshot.spec.policyRef` and
-/// `SnapshotSchedule.spec.policyRef`). May cross namespaces, subject to RBAC. ADR §3.4/§3.5.
+/// Reference to a `SnapshotPolicy` CR.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRef {
@@ -354,8 +293,7 @@ pub struct PolicyRef {
     pub namespace: Option<String>,
 }
 
-/// Generic name/namespace reference to another namespaced object — e.g. a `Snapshot`
-/// CR (`Restore.spec.source.snapshotRef`) or a PVC (`Restore.spec.target.pvcRef`). ADR §3.6.
+/// Generic name/namespace reference to another namespaced object (e.g. a `Snapshot` CR or PVC).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectRef {
@@ -367,13 +305,6 @@ pub struct ObjectRef {
 }
 
 /// Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-/// Shared by `SnapshotPolicy.spec.defaultDeletionPolicy` and `Snapshot.spec.deletionPolicy`.
-/// ADR-0003 §4.5 / ADR-0001 §4.5.
-///
-/// The reconciler distinguishes the three cases with an exhaustive `match` — Rust
-/// enforces that any new variant added later must be handled in every match site,
-/// preventing the class of bug where a new policy slips into production without a
-/// corresponding reconcile branch.
 ///
 /// ```
 /// use kopiur_api::common::DeletionPolicy;
@@ -386,28 +317,16 @@ pub struct ObjectRef {
 /// ```
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum DeletionPolicy {
-    /// Default for `origin: scheduled`/`manual`. Finalizer runs
-    /// `kopia snapshot delete <id>` then removes the finalizer.
+    /// Finalizer runs `kopia snapshot delete <id>` then removes the finalizer; default for produced snapshots.
     #[default]
     Delete,
-    /// Default for `origin: discovered`. CR is removed; snapshot stays.
-    /// Forced via webhook for discovered snapshots; cannot be overridden.
+    /// CR is removed; the kopia snapshot stays. Forced for discovered snapshots.
     Retain,
-    /// CR is removed without contacting the repository at all (escape hatch
-    /// for "the bucket is gone, just let me delete the CR"). Status records
-    /// `orphaned: true` for the snapshot ID before removal.
+    /// CR is removed without contacting the repository at all (escape hatch).
     Orphan,
 }
 
-/// What happens to a repository's snapshots when a consuming **namespace** is
-/// deleted. Closed enum, default `Orphan` (fail-safe). ADR-0005 §5.
-///
-/// A `kubectl delete ns` must not silently destroy off-site backup history (and
-/// must not hang the namespace teardown on N `kopia snapshot delete` calls). So the
-/// repository owner opts *in* to cascade-delete; the default releases ownership
-/// (removes the finalizer) without touching the snapshots. This is distinct from a
-/// single `kubectl delete snapshot`, which still honors that `Snapshot`'s own
-/// `deletionPolicy`.
+/// What happens to a repository's snapshots when a consuming **namespace** is deleted; default `Orphan`.
 ///
 /// ```
 /// use kopiur_api::common::NamespaceDeletePolicy;
@@ -419,20 +338,14 @@ pub enum DeletionPolicy {
 /// ```
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum NamespaceDeletePolicy {
-    /// Release ownership (remove the `Snapshot` finalizers) without deleting the
-    /// underlying kopia snapshots. The fail-safe default — `kubectl delete ns` keeps
-    /// history.
+    /// Release ownership without deleting the kopia snapshots; the fail-safe default.
     #[default]
     Orphan,
-    /// Cascade: when a namespace is deleted, the per-`Snapshot` `deletionPolicy`
-    /// applies (so produced snapshots are `kopia snapshot delete`d). Opt-in only.
+    /// Cascade: each `Snapshot`'s own `deletionPolicy` applies when the namespace is deleted.
     Delete,
 }
 
-/// Repository access mode (ADR-0005 §11). A `ReadOnly` repository serves restores
-/// only — no backups, no maintenance — for decommissioning a backend or migrating
-/// between repositories without risking writes. Maps to kopia's read-only
-/// connection. Closed enum, default `ReadWrite`.
+/// Repository access mode; `ReadOnly` serves restores only (no backups, no maintenance).
 ///
 /// ```
 /// use kopiur_api::common::RepositoryMode;
@@ -448,7 +361,7 @@ pub enum RepositoryMode {
     /// Normal read-write repository (default): backups, restores, maintenance.
     #[default]
     ReadWrite,
-    /// Read-only: restores only. Backup Jobs and maintenance are refused. §11.
+    /// Read-only: restores only. Backup Jobs and maintenance are refused.
     ReadOnly,
 }
 
@@ -476,16 +389,13 @@ pub(crate) fn default_namespace_delete_policy() -> NamespaceDeletePolicy {
     NamespaceDeletePolicy::Orphan
 }
 
-/// A single cron entry with optional deterministic jitter. Shared by `Maintenance`'s
-/// quick/full schedules. ADR §3.7. `jitter` is a Go-style duration string (e.g. `30m`).
+/// A single cron entry with optional deterministic jitter.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CronSpec {
-    /// The cron expression, parsed by `croner`. May contain an `H` placeholder for
-    /// deterministic per-schedule jitter (ADR §3.7).
+    /// The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
     pub cron: String,
-    /// Optional deterministic jitter window as a Go-style duration string (e.g.
-    /// `30m`), derived from `(scheduleUID, slot)` so it is stable across restarts.
+    /// Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jitter: Option<String>,
 }
