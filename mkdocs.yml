@@ -212,6 +212,18 @@ nav:
       - Clone an app into another namespace: scenarios/clone-app-to-namespace.md
   - Reference:
       - Field reference (all CRDs): field-reference.md
+      # navigation.indexes: reference/crds/index.md is the section landing (first child).
+      - CRD reference:
+          - reference/crds/index.md
+          - Repository: reference/crds/repository.md
+          - ClusterRepository: reference/crds/cluster-repository.md
+          - SnapshotPolicy: reference/crds/snapshot-policy.md
+          - Snapshot: reference/crds/snapshot.md
+          - SnapshotSchedule: reference/crds/snapshot-schedule.md
+          - Restore: reference/crds/restore.md
+          - Maintenance: reference/crds/maintenance.md
+          - RepositoryReplication: reference/crds/repository-replication.md
+          - Shared sub-objects: reference/crds/shared-types.md
       - RBAC reference: rbac.md
       - API reference (rustdoc): api-reference.md
   # Top-level entry → its own top-level item in the left sidebar, so the Rust API
@@ -222,6 +234,7 @@ nav:
   - Rust API ↗: /rustdoc/index.html
   - Developer:
       - API conventions: dev/api-conventions.md
+      - CRD design rationale: dev/design-rationale.md
       - Observability: dev/observability.md
       - Watches & reconcile triggers: dev/watch-and-reconcile.md
   - Architecture Decision Records:

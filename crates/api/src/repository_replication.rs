@@ -15,8 +15,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Mirror a source repository's blobs to a destination backend on a schedule
-/// (`kopia repository sync-to`), ADR-0005 §13(d).
+/// Mirror a source repository's blobs to a destination backend on a schedule (`kopia repository sync-to`).
 ///
 /// Not `Eq`: `mover` transitively embeds k8s-openapi types.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -37,31 +36,19 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryReplicationSpec {
-    /// The repository to mirror *from* — a `Repository` or `ClusterRepository`
-    /// reference (ADR §3.2). Credentials/connect are resolved from it.
+    /// Reference to the `Repository` or `ClusterRepository` to mirror from.
     pub source_ref: RepositoryRef,
-    /// The backend to mirror *to* (`kopia repository sync-to <destination>`).
-    /// Exactly one backend by construction (the externally-tagged `Backend` enum,
-    /// reused). Must differ from the source's backend (webhook-enforced).
+    /// The backend to mirror to; must differ from the source's backend (webhook-enforced).
     pub destination: Backend,
-    /// Encryption/password for the destination repository when it needs its own
-    /// (e.g. a freshly-created mirror with a distinct password). Absent ⇒ the
-    /// destination uses the **source** repository's password — the common case for a
-    /// true mirror, where `sync-to` copies blobs verbatim and the format (including
-    /// the encryption material) is identical. Document this in the example.
+    /// Encryption for the destination; omit to reuse the source repository password.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_encryption: Option<Encryption>,
-    /// Cron + deterministic jitter for the replication runs (ADR §3.7 scheduling
-    /// kernel, shared with `Maintenance`).
+    /// Cron and deterministic jitter for the replication runs.
     pub schedule: CronSpec,
-    /// Mover (Job pod) overrides for the replication run — resources, scheduling,
-    /// security context. Inherits the source repository's `moverDefaults` underneath
-    /// (ADR-0004 §1/§2).
+    /// Mover (Job pod) overrides for the replication run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover: Option<MoverSpec>,
-    /// Pause this replication declaratively (ADR-0005 §14(e)): a suspended
-    /// `RepositoryReplication` is skipped by its own reconcile (no sync runs),
-    /// surfaced via a condition. Default `false`.
+    /// Pause this replication; a suspended replication runs no syncs (default `false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
 }
@@ -111,7 +98,7 @@ impl crate::common::PhaseLabel for RepositoryReplicationPhase {
     }
 }
 
-/// Observed state of a [`RepositoryReplication`]. ADR-0005 §13(d).
+/// Observed state of a `RepositoryReplication`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryReplicationStatus {
@@ -121,12 +108,10 @@ pub struct RepositoryReplicationStatus {
     /// `metadata.generation` last reconciled, for staleness detection / kstatus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
-    /// The destination backend kind (mirror of `spec.destination` discriminant),
-    /// for the `DESTINATION` print column.
+    /// The destination backend kind, for the `DESTINATION` print column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_backend: Option<String>,
-    /// RFC3339 timestamp of the most recent successful replication run. Backs the
-    /// `LAST` print column.
+    /// RFC3339 timestamp of the most recent successful replication run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_replicated: Option<String>,
     /// RFC3339 timestamp of the next scheduled replication run (cron + jitter, pinned).
@@ -138,7 +123,7 @@ pub struct RepositoryReplicationStatus {
     /// Blobs replicated by the last successful run (best-effort).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_replicated_blobs: Option<i64>,
-    /// Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`). ADR-0005 §2.
+    /// Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }

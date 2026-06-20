@@ -12,9 +12,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// A kopia repository owned by one namespace: credentials, backend, encryption,
-/// and optional catalog-materialization bounds. Many `SnapshotPolicy`s / `Restore`s
-/// reference one. ADR §3.1.
+/// A kopia repository owned by one namespace, referenced by `SnapshotPolicy`s and `Restore`s.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "kopiur.home-operations.com",
@@ -50,73 +48,46 @@ use serde::{Deserialize, Serialize};
 ]))]
 #[serde(rename_all = "camelCase")]
 pub struct RepositorySpec {
-    /// Exactly one backend, enforced at the type level by the `Backend` enum. ADR §3.1.
+    /// Exactly one storage backend.
     pub backend: Backend,
-    /// Repository password, always a Secret reference. A sub-object so future
-    /// rotation fields slot in without API breakage. ADR §3.1/§4.11.
+    /// Repository password (a Secret reference).
     pub encryption: Encryption,
-    /// What to do when the repository does not yet exist. Absent/disabled means
-    /// it must already exist; enabled means the operator creates it with the
-    /// given encryption/splitter/hash algorithms. ADR §3.1.
+    /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
-    /// Mover defaults (security context, pod security context, resources, cache,
-    /// nodeSelector/tolerations/affinity, Job TTL) inherited by **every** mover this
-    /// repository spawns — bootstrap, backup, restore, maintenance — overridable
-    /// per-recipe via `mover` and merged field-wise (ADR-0004 §1/§2). Absorbs the
-    /// former `cacheDefaults` (now `moverDefaults.cache`).
+    /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
-    /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia
-    /// catalog, keeping etcd footprint sane for large repositories. ADR §3.1.
+    /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogBounds>,
-    /// Optional kopia web-UI server, exposed via a `Service` in this Repository's
-    /// own namespace. Presence means enabled. ADR §3.1 (server addendum).
+    /// Optional kopia web-UI server, exposed via a `Service` in this namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerSpec>,
-    /// Maintenance control. Default-managed: when absent or `enabled: true`, the
-    /// reconciler creates and owns a `Maintenance` CR for this repository in this
-    /// namespace. ADR §3.1/§3.7.
+    /// Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<RepositoryMaintenanceSpec>,
-    /// What happens to this repository's snapshots when a consuming **namespace** is
-    /// deleted: `Orphan` (default — keep history, release ownership) or `Delete`
-    /// (cascade per-`Snapshot` `deletionPolicy`). BREAKING default change in
-    /// ADR-0005 §5 — `kubectl delete ns` no longer destroys snapshots by default.
-    /// Carries a real OpenAPI `default: Orphan`.
+    /// What happens to this repository's snapshots when a consuming namespace is deleted.
     #[serde(default = "default_namespace_delete_policy")]
     #[schemars(default = "default_namespace_delete_policy")]
     pub on_namespace_delete: NamespaceDeletePolicy,
-    /// Access mode (ADR-0005 §11): `ReadWrite` (default) or `ReadOnly`. A `ReadOnly`
-    /// repository serves restores only — the reconciler refuses backup Jobs and skips
-    /// maintenance projection — for decommissioning/migration without write risk.
-    /// Carries a real OpenAPI `default: ReadWrite`.
+    /// Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
     pub mode: RepositoryMode,
-    /// Pause this repository declaratively (ADR-0005 §14(e)): a suspended repository
-    /// skips connect/bootstrap and maintenance projection. Surfaced via a condition.
+    /// Pause this repository: skip connect/bootstrap and maintenance projection.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
-    /// Repository health thresholds (ADR-0005 §13): tuning for the warnings the
-    /// reconciler raises about a degrading-but-still-usable repository (currently
-    /// the index-blob-count warning). A sub-object so future health knobs slot in
-    /// without API breakage. Absent uses the built-in defaults.
+    /// Repository health thresholds (tunes the index-blob-count warning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthSpec>,
 }
 
-/// Repository health thresholds (ADR-0005 §13). A sub-object on
-/// `Repository`/`ClusterRepository` `spec.health` so future health knobs slot in
-/// without API breakage. Shared by both kinds.
+/// Repository health thresholds, shared by `Repository` and `ClusterRepository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryHealthSpec {
-    /// Index-blob count above which the reconciler raises the `IndexBlobHealth`
-    /// condition + a Warning event (maintenance isn't compacting fast enough).
-    /// Absent uses [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`] (1000). `0` disables the
-    /// warning entirely; negative is rejected by the admission webhook.
+    /// Index-blob count above which the reconciler raises the `IndexBlobHealth` warning (`0` disables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_warn_threshold: Option<i64>,
 }
@@ -193,8 +164,7 @@ impl crate::common::PhaseLabel for RepositoryPhase {
     }
 }
 
-/// Observed state of a [`Repository`]. Carries resolved values pinned by the
-/// reconciler. ADR §3.1 status.
+/// Observed state of a `Repository`, carrying resolved values pinned by the reconciler.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryStatus {
@@ -205,9 +175,6 @@ pub struct RepositoryStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
     /// `resourceVersion` of the password Secret observed at the last connect attempt.
-    /// The terminal-failure hard-stop reopens when this changes, so editing the
-    /// Secret's *content* (which does NOT bump `metadata.generation`) re-triggers a
-    /// connect instead of parking the repository as `Failed` forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_credential_version: Option<String>,
     /// Kopia repository unique ID.
@@ -222,15 +189,15 @@ pub struct RepositoryStatus {
     /// Catalog-materialization status (how many discovered `Snapshot`s, last refresh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogStatus>,
-    /// Resolved kopia server endpoint/auth, pinned by the reconciler. ADR §3.1.
+    /// Resolved kopia server endpoint/auth, pinned by the reconciler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerStatus>,
-    /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`). ADR §3.1.
+    /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }
 
-/// Aggregate repository storage figures from the last catalog scan. ADR §3.1 status.
+/// Aggregate repository storage figures from the last catalog scan.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageStats {
@@ -243,16 +210,12 @@ pub struct StorageStats {
     /// RFC 3339 timestamp these stats were last observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed_at: Option<String>,
-    /// Number of content-index blobs (`kopia index list`) observed at the last
-    /// bootstrap. kopia compacts these during maintenance; an unbounded climb
-    /// means maintenance isn't keeping up. The reconciler raises the
-    /// `IndexBlobHealth` condition + a Warning event when this crosses
-    /// `spec.health.indexBlobWarnThreshold`. ADR-0005 §13.
+    /// Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_count: Option<i64>,
 }
 
-/// Status of catalog materialization for `origin: discovered` `Snapshot` CRs. ADR §3.1 status.
+/// Status of catalog materialization for `origin: discovered` `Snapshot` CRs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogStatus {

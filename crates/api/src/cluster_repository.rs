@@ -18,11 +18,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// A shared kopia repository referenceable from allow-listed namespaces. ADR §3.2.
-///
-/// Cluster-scoped: note the absence of `namespaced` in `#[kube(...)]`. Secret/config
-/// references in `backend`/`encryption` therefore MUST carry an explicit `namespace`
-/// (webhook-enforced — the type system cannot express that requirement here).
+/// A cluster-scoped kopia repository referenceable from allow-listed namespaces.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "kopiur.home-operations.com",
@@ -54,93 +50,59 @@ use serde::{Deserialize, Serialize};
 ]))]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterRepositorySpec {
-    /// Exactly one backend, enforced at the type level by the `Backend` enum. ADR §3.1.
+    /// Exactly one storage backend.
     pub backend: Backend,
-    /// Repository password, always a Secret reference. As this CR is cluster-scoped,
-    /// the ref MUST carry an explicit `namespace` (webhook-enforced). ADR §3.1/§3.2.
+    /// Repository password (a Secret reference that must carry an explicit `namespace`).
     pub encryption: Encryption,
-    /// What to do when the repository does not yet exist. Same semantics as
-    /// `Repository.spec.create`. ADR §3.1/§3.2.
+    /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
-    /// Mover defaults inherited by **every** mover this repository spawns — bootstrap,
-    /// consumer backup/restore, and maintenance — overridable per-recipe and merged
-    /// field-wise (ADR-0004 §1/§2). Absorbs the former `cacheDefaults`
-    /// (now `moverDefaults.cache`).
+    /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
-    /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia
-    /// catalog. For a shared repo this also picks where to land discovered snapshots
-    /// via `catalog.fallbackNamespace`. ADR §3.1/§3.2.
+    /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogBounds>,
-    /// Tenancy gate — webhook-enforced on every consumer CR. ADR §3.2.
+    /// Which namespaces are permitted to reference this repository.
     pub allowed_namespaces: AllowedNamespaces,
     /// Identity defaults (CEL `*Expr`) applied when consumers don't override.
-    /// ADR §3.2 / ADR-0004 §5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_defaults: Option<IdentityDefaults>,
-    /// Optional kopia web-UI server. Cluster-scoped, so the target `namespace` is
-    /// required (see [`ClusterServerSpec`]). Presence means enabled.
+    /// Optional kopia web-UI server (the target `namespace` is required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ClusterServerSpec>,
-    /// Maintenance control. Default-managed: when absent or `enabled: true`, the
-    /// reconciler creates and owns a `Maintenance` CR for this cluster repository.
-    /// As `Maintenance` is namespaced, `maintenance.namespace` selects where it
-    /// lands (defaulting to the operator's namespace). ADR §3.2/§3.7.
+    /// Maintenance control; `maintenance.namespace` selects where the owned `Maintenance` CR lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<RepositoryMaintenanceSpec>,
-    /// What happens to this repository's snapshots when a consuming **namespace** is
-    /// deleted: `Orphan` (default — keep history) or `Delete` (cascade). BREAKING
-    /// default change in ADR-0005 §5. Carries a real OpenAPI `default: Orphan`.
+    /// What happens to this repository's snapshots when a consuming namespace is deleted.
     #[serde(default = "default_namespace_delete_policy")]
     #[schemars(default = "default_namespace_delete_policy")]
     pub on_namespace_delete: NamespaceDeletePolicy,
-    /// Repository-owner gate for credential-Secret projection into a foreign consumer
-    /// namespace. **Default off** (`allowed: false`): a consumer's
-    /// `credentialProjection.enabled` is necessary but not sufficient — the
-    /// `ClusterRepository` owner must also allow it. BREAKING (ADR-0005 §8). A
-    /// namespaced `Repository` has no such gate (projection there is a same-namespace
-    /// no-op).
+    /// Repository-owner gate for projecting credential Secrets into a foreign consumer namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<ClusterRepoCredentialProjection>,
-    /// Access mode (ADR-0005 §11): `ReadWrite` (default) or `ReadOnly`. A `ReadOnly`
-    /// cluster repository serves restores only — backups and maintenance are refused.
-    /// Carries a real OpenAPI `default: ReadWrite`.
+    /// Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
     pub mode: RepositoryMode,
-    /// Pause this cluster repository declaratively (ADR-0005 §14(e)): skips
-    /// connect/bootstrap and maintenance projection. Surfaced via a condition.
+    /// Pause this cluster repository: skip connect/bootstrap and maintenance projection.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
-    /// Repository health thresholds (ADR-0005 §13), shared with `Repository` — see
-    /// [`RepositoryHealthSpec`]. Tunes the index-blob-count warning. Absent uses
-    /// the built-in defaults.
+    /// Repository health thresholds (tunes the index-blob-count warning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthSpec>,
 }
 
-/// The repository-OWNER side of credential projection on a `ClusterRepository`
-/// (ADR-0005 §8) — distinct from the consumer `credentialProjection.enabled` on a
-/// `SnapshotPolicy`/`Restore`. A sub-object (not a bare `bool`) so future knobs
-/// (allow-listed consumer namespaces, key remapping) slot in without API breakage.
+/// The repository-owner side of credential projection on a `ClusterRepository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterRepoCredentialProjection {
-    /// When `true`, the repository owner permits projecting this repository's
-    /// credential Secret(s) into a foreign consumer namespace (still requires the
-    /// consumer opt-in AND operator RBAC — fail-closed). Off by default.
+    /// When `true`, the owner permits projecting this repository's credential Secret(s) into a consumer namespace.
     #[serde(default)]
     pub allowed: bool,
 }
 
-/// The set of namespaces permitted to reference this `ClusterRepository`. ADR §3.2.
-///
-/// Externally-tagged: wire shape is `allowedNamespaces: { list: [...] }`,
-/// `{ selector: {...} }`, or `{ all: true }`. Exactly one variant by construction.
-///
-/// Not `Eq`: the `Selector` variant embeds `LabelSelector` (k8s-openapi, `PartialEq` only).
+/// The set of namespaces permitted to reference this `ClusterRepository` (exactly one of).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AllowedNamespaces {
@@ -148,7 +110,7 @@ pub enum AllowedNamespaces {
     List(Vec<String>),
     /// Match namespaces by label.
     Selector(LabelSelector),
-    /// Allow all namespaces (must be `true`; `false` is meaningless and rejected by webhook).
+    /// Allow all namespaces (must be `true`).
     All(bool),
 }
 
@@ -171,25 +133,19 @@ impl AllowedNamespaces {
     }
 }
 
-/// CEL expressions evaluated at admission to derive consumer identity when a
-/// `SnapshotPolicy` doesn't override (ADR-0004 §5). Each `*Expr` returns a string
-/// and is evaluated against the environment `namespace`, `policyName`, `labels`,
-/// `annotations` (the consuming `SnapshotPolicy`'s metadata). Sandboxed, no I/O;
-/// validated at admission so a typo/out-of-scope variable is rejected on apply.
+/// CEL expressions evaluated at admission to derive consumer identity when a `SnapshotPolicy` doesn't override.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityDefaults {
-    /// CEL expression for the kopia identity *hostname* (e.g. `"namespace"`).
-    /// Returns a string. ADR-0004 §5.
+    /// CEL expression for the kopia identity hostname (e.g. `"namespace"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_expr: Option<String>,
-    /// CEL expression for the kopia identity *username*
-    /// (e.g. `"namespace + '-' + policyName"`). Returns a string. ADR-0004 §5.
+    /// CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username_expr: Option<String>,
 }
 
-/// Mirrors `RepositoryStatus` (ADR §3.1) plus `allowedNamespaceCount`. ADR §3.2.
+/// Observed state of a `ClusterRepository`; mirrors `RepositoryStatus` plus `allowedNamespaceCount`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterRepositoryStatus {
@@ -200,9 +156,6 @@ pub struct ClusterRepositoryStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
     /// `resourceVersion` of the password Secret observed at the last connect attempt.
-    /// The terminal-failure hard-stop reopens when this changes, so editing the
-    /// Secret's *content* (which does NOT bump `metadata.generation`) re-triggers a
-    /// connect instead of parking the repository as `Failed` forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_credential_version: Option<String>,
     /// Kopia repository unique ID.
@@ -211,7 +164,7 @@ pub struct ClusterRepositoryStatus {
     /// Mirror of `spec.backend` discriminant for the print column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Number of namespaces currently resolved by `spec.allowedNamespaces`. ADR §3.2.
+    /// Number of namespaces currently resolved by `spec.allowedNamespaces`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_namespace_count: Option<i64>,
     /// Repository size and snapshot counts from the last catalog scan.
@@ -223,7 +176,7 @@ pub struct ClusterRepositoryStatus {
     /// Resolved kopia server endpoint/auth, pinned by the reconciler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerStatus>,
-    /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`). ADR §3.2.
+    /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }

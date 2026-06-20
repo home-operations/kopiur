@@ -34,25 +34,16 @@ spec:
         description: Auto-generated derived type for SnapshotScheduleSpec via `CustomResource`
         properties:
           spec:
-            description: |-
-              Cron + `policyRef`. One source of `Snapshot` CRs; pausing it doesn't affect
-              in-flight or completed runs. ADR §3.5.
+            description: Cron schedule that fires `Snapshot` CRs from a `SnapshotPolicy`.
             properties:
               failedJobsHistoryLimit:
-                description: |-
-                  Bounds *failed* `Snapshot` CRs from this schedule. Successful retention is
-                  GFS-driven on `SnapshotPolicy.spec.retention` — there is deliberately NO
-                  `successfulJobsHistoryLimit` (ADR-0003 §4.4, ADR-0001 §4.4).
+                description: Maximum number of failed `Snapshot` CRs from this schedule to retain.
                 format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
               policyRef:
-                description: |-
-                  The single `SnapshotPolicy` (recipe) this schedule invokes; resolved in the
-                  schedule's own namespace. ADR §3.5 separates recipe from schedule. **Mutually
-                  exclusive** with `policySelector` — exactly one is required (webhook-enforced,
-                  ADR-0005 §10). Optional at the type level so `policySelector` can be used instead.
+                description: The single `SnapshotPolicy` this schedule invokes; mutually exclusive with `policySelector`.
                 nullable: true
                 properties:
                   name:
@@ -66,11 +57,7 @@ spec:
                 - name
                 type: object
               policySelector:
-                description: |-
-                  Fan-out form (ADR-0005 §10): a label selector over `SnapshotPolicy` objects in
-                  the schedule's namespace. Each matching policy gets a `Snapshot` per firing
-                  ("back up everything tagged `tier=critical` nightly" in one object). **Mutually
-                  exclusive** with `policyRef`. Mirrors the `pvcSelector` pattern.
+                description: Label selector fanning out over `SnapshotPolicy` objects; mutually exclusive with `policyRef`.
                 nullable: true
                 properties:
                   matchExpressions:
@@ -101,50 +88,37 @@ spec:
                     type: object
                 type: object
               schedule:
-                description: Cron, jitter, timezone, and concurrency for the firing cadence. ADR §3.5.
+                description: Cron, jitter, timezone, and concurrency for the firing cadence.
                 properties:
                   concurrencyPolicy:
                     default: Forbid
-                    description: |-
-                      How to handle a firing while a prior run is still in flight. ADR §4.1.
-
-                      Carries a real OpenAPI `default: Forbid` (ADR-0005 §1) — unconditional, so it
-                      materializes into the stored object / `kubectl explain`.
+                    description: How to handle a firing while a prior run is still in flight (default `Forbid`).
                     enum:
                     - Forbid
                     - Allow
                     - Replace
                     type: string
                   cron:
-                    description: Cron expression with Jenkins-style `H` substitution. ADR §4.1 (G4).
+                    description: Cron expression with Jenkins-style `H` substitution.
                     type: string
                   jitter:
-                    description: Deterministic jitter (Go-style duration), derived from `(scheduleUID, slot)`. ADR §4.1.
+                    description: Deterministic jitter (Go-style duration), derived from `(scheduleUID, slot)`.
                     nullable: true
                     type: string
                   runOnCreate:
                     default: false
-                    description: |-
-                      GitOps-friendly default: do NOT fire immediately on create. ADR §4.1 (G3).
-
-                      Carries a real OpenAPI `default: false` (ADR-0005 §1) so it materializes into
-                      the stored object / `kubectl explain` and GitOps stops diff-thrashing. NOT
-                      `skip_serializing_if`-elided, so the materialized value round-trips.
+                    description: Whether to fire immediately on create (default `false`).
                     type: boolean
                   startingDeadlineSeconds:
-                    description: |-
-                      If a slot is missed by more than this many seconds (e.g. operator was
-                      down), skip it instead of firing late. ADR §4.1.
+                    description: If a slot is missed by more than this many seconds, skip it instead of firing late.
                     format: int64
                     nullable: true
                     type: integer
                   suspend:
-                    description: Skip future firings while true. ADR §5.9.
+                    description: Skip future firings while true.
                     type: boolean
                   timezone:
-                    description: |-
-                      IANA timezone the cron is evaluated in (e.g. `America/Los_Angeles`).
-                      Absent means the controller's configured default. ADR §4.1.
+                    description: IANA timezone the cron is evaluated in; absent uses the controller's default.
                     nullable: true
                     type: string
                 required:
@@ -157,11 +131,11 @@ spec:
             - message: exactly one of policyRef or policySelector
               rule: '[has(self.policyRef), has(self.policySelector)].filter(x, x).size() == 1'
           status:
-            description: 'Observed state of a `SnapshotSchedule`: pinned firing slots and failure run. ADR §3.5.'
+            description: 'Observed state of a `SnapshotSchedule`: pinned firing slots and failure run.'
             nullable: true
             properties:
               conditions:
-                description: Standard Kubernetes conditions surfacing schedule health. ADR §5 status conventions.
+                description: Standard Kubernetes conditions surfacing schedule health.
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:
@@ -194,19 +168,16 @@ spec:
                   type: object
                 type: array
               consecutiveFailures:
-                description: Count of back-to-back failed runs; resets on success. Drives alerting.
+                description: Count of back-to-back failed runs; resets on success.
                 format: int64
                 nullable: true
                 type: integer
               lastSchedule:
-                description: Most recent firing (cron + jitter, pinned). ADR §3.5.
+                description: Most recent firing (cron + jitter, pinned).
                 nullable: true
                 properties:
                   at:
-                    description: |-
-                      The RFC3339 instant this slot fired (or is scheduled to). Accepts the
-                      `scheduledAt` alias on the wire (see the struct docs) but always
-                      serializes back as `at`.
+                    description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
                     nullable: true
                     type: string
                   snapshotRef:
@@ -221,14 +192,11 @@ spec:
                     type: object
                 type: object
               lastSuccessfulSchedule:
-                description: The most recent firing whose `Snapshot` succeeded. ADR §3.5.
+                description: The most recent firing whose `Snapshot` succeeded.
                 nullable: true
                 properties:
                   at:
-                    description: |-
-                      The RFC3339 instant this slot fired (or is scheduled to). Accepts the
-                      `scheduledAt` alias on the wire (see the struct docs) but always
-                      serializes back as `at`.
+                    description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
                     nullable: true
                     type: string
                   snapshotRef:
@@ -247,10 +215,7 @@ spec:
                 nullable: true
                 properties:
                   at:
-                    description: |-
-                      The RFC3339 instant this slot fired (or is scheduled to). Accepts the
-                      `scheduledAt` alias on the wire (see the struct docs) but always
-                      serializes back as `at`.
+                    description: The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
                     nullable: true
                     type: string
                   snapshotRef:

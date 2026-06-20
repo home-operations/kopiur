@@ -9,9 +9,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// A restore operation. `target` is **required** (ADR-0005 §9): explicit
-/// `pvc`/`pvcRef`, or `populator: {}` for passive populator mode (consumed by a
-/// PVC's `spec.dataSourceRef`). The empty-`target` form is removed. ADR §3.6/§4.7.
+/// A restore operation from a snapshot/identity into a PVC, or a passive populator source.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "kopiur.home-operations.com",
@@ -34,59 +32,41 @@ use serde::{Deserialize, Serialize};
     "message": "exactly one of target.pvc, target.pvcRef, target.populator"
 }]))]
 #[serde(rename_all = "camelCase")]
-/// Desired state of a [`Restore`]: where to read from, where to write to, and how
-/// to behave when the snapshot is missing. ADR §3.6/§4.6.
+/// Desired state of a Restore: where to read from, where to write to, and how to behave when the snapshot is missing.
 pub struct RestoreSpec {
-    /// Derived from `source` when omitted; REQUIRED only with `source.identity`. ADR §3.6/§4.6.
+    /// The repository to read from; derived from `source` when omitted, required only with `source.identity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepositoryRef>,
-    /// Exactly one source mode; webhook-enforced. ADR §3.6.
+    /// Where to read data from (snapshotRef, fromPolicy, or identity).
     pub source: RestoreSource,
-    /// Where to restore to — **required** (ADR-0005 §9): `pvc` (operator creates),
-    /// `pvcRef` (existing PVC), or `populator: {}` (passive populator mode, claimed
-    /// via a PVC's `spec.dataSourceRef`). The former empty-`target` form is removed;
-    /// a `Restore` with no `target` is now invalid (deserialization fails).
+    /// Where to write the restored data (pvc, pvcRef, or populator).
     pub target: RestoreTarget,
-    /// kopia restore behavior (file deletion, permission/atomicity handling). ADR §4.6.
+    /// kopia restore behavior (file deletion, permission/atomicity handling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<RestoreOptions>,
-    /// Missing-snapshot handling and wait timeout. ADR §4.6 (G7).
+    /// What to do when the referenced snapshot doesn't exist yet, and how long to wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<RestorePolicy>,
-    /// Opt-in credential-Secret projection for this restore's mover (default off).
-    /// When `enabled: true`, the operator copies the referenced repository's
-    /// credential Secret(s) into the restore mover's namespace (a no-op when they
-    /// already live there) — so restoring from a shared `ClusterRepository` into a
-    /// fresh namespace need not pre-create the Secret there. ADR §4.11.
+    /// Opt-in copying of the repository's credential Secret(s) into the mover's namespace (default off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<CredentialProjection>,
-    /// Per-run mover overrides for this restore's Job — resource requests/limits,
-    /// kopia cache sizing, container `securityContext` (UID/GID match), `privilegedMode`,
-    /// and `inheritSecurityContextFrom`. The same surface `SnapshotPolicy.spec.mover`
-    /// gives a backup. An elevated context is namespace-gated exactly like a backup's
-    /// (ADR §4.11/§G16); `securityContext` and `inheritSecurityContextFrom` are
-    /// mutually exclusive.
+    /// Per-run mover overrides for this restore's Job (resources, cache, `securityContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover: Option<MoverSpec>,
-    /// Mover `Job` retry/deadline limits (`backoffLimit`, `activeDeadlineSeconds`),
-    /// mirroring `Snapshot.spec.failurePolicy`. Absent uses the ADR defaults.
+    /// Mover `Job` retry/deadline limits (`backoffLimit`, `activeDeadlineSeconds`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
 }
 
-/// Where to restore from. Externally-tagged; exactly one variant. ADR §3.6/§4.6.
-///
-/// Wire shape: `source: { snapshotRef: {...} }`, `{ fromPolicy: {...} }`, or
-/// `{ identity: {...} }`.
+/// Where to restore from; exactly one variant.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum RestoreSource {
-    /// A `Snapshot` CR (scheduled, manual, or discovered — all the same kind). Default mode.
+    /// A `Snapshot` CR (scheduled, manual, or discovered).
     SnapshotRef(ObjectRef),
-    /// A `SnapshotPolicy` CR — resolves via identity even with no `Snapshot` CR present
-    /// (deploy-or-restore). Default `onMissingSnapshot: Continue`. ADR §4.6.
+    /// A `SnapshotPolicy` CR, resolved via identity even with no `Snapshot` CR present (deploy-or-restore).
     FromPolicy(FromPolicy),
-    /// A raw kopia identity (foreign writers / aged-out catalog). Requires `spec.repository`.
+    /// A raw kopia identity (foreign writers / aged-out catalog); requires `spec.repository`.
     Identity(IdentitySource),
 }
 
@@ -114,8 +94,7 @@ impl RestoreSource {
     }
 }
 
-/// The `fromPolicy` source: resolve a snapshot via a `SnapshotPolicy`'s identity,
-/// even when no `Snapshot` CR exists yet (deploy-or-restore). ADR §4.6.
+/// The `fromPolicy` source: resolve a snapshot via a `SnapshotPolicy`'s identity, even when no `Snapshot` CR exists yet.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FromPolicy {
@@ -127,11 +106,7 @@ pub struct FromPolicy {
     /// Restore the newest snapshot at or before this RFC3339 timestamp (point-in-time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
-    /// 0 = latest, 1 = previous, ... ADR §3.6.
-    ///
-    /// Carries a real OpenAPI `default: 0` (ADR-0005 §1): unconditional, so it
-    /// materializes into the stored object / `kubectl explain` and GitOps stops
-    /// diff-thrashing. A bare `i64` (not `Option`) so the default is never dropped.
+    /// Which snapshot to pick: 0 = latest, 1 = previous, and so on.
     #[serde(default = "default_offset")]
     #[schemars(default = "default_offset")]
     pub offset: i64,
@@ -145,8 +120,7 @@ fn default_offset() -> i64 {
     0
 }
 
-/// The `identity` source: a raw kopia `username@hostname:path` identity for
-/// foreign writers or snapshots aged out of the catalog. Requires `spec.repository`.
+/// The `identity` source: a raw kopia `username@hostname:path` identity; requires `spec.repository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentitySource {
@@ -157,8 +131,7 @@ pub struct IdentitySource {
     /// The kopia source path to match; absent matches any path for the identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
-    /// Pin an exact kopia snapshot by ID. Renamed to match the ADR wire shape
-    /// exactly (`snapshotID`, capital `ID`).
+    /// Pin an exact kopia snapshot by ID.
     #[serde(
         default,
         rename = "snapshotID",
@@ -168,16 +141,12 @@ pub struct IdentitySource {
     /// Restore the newest snapshot at or before this RFC3339 timestamp (point-in-time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
-    /// 0 = latest, 1 = previous, ... mutually exclusive with `snapshotID`/`asOf` in practice.
+    /// Which snapshot to pick: 0 = latest, 1 = previous, and so on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
 }
 
-/// Where to restore to. Externally-tagged; exactly one variant. ADR §3.6 / ADR-0005 §9.
-///
-/// Wire shape: `target: { pvc: {...} }`, `{ pvcRef: {...} }`, or `{ populator: {} }`.
-/// The `populator` variant is **explicit** passive-populator mode (claimed via a
-/// PVC's `spec.dataSourceRef`); the former empty-`target` form is removed (ADR-0005 §9).
+/// Where to restore to; exactly one variant.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum RestoreTarget {
@@ -185,9 +154,7 @@ pub enum RestoreTarget {
     Pvc(PvcTemplate),
     /// Write into an existing PVC.
     PvcRef(ObjectRef),
-    /// Passive populator mode: no workload target at provision time — the restore is
-    /// claimed by a PVC's `spec.dataSourceRef` (ADR-0005 §9). An (empty) sub-object so
-    /// future populator knobs slot in without API breakage.
+    /// Passive populator mode: the restore is claimed by a PVC's `spec.dataSourceRef`.
     Populator(PopulatorTarget),
 }
 
@@ -215,13 +182,12 @@ impl RestoreTarget {
     }
 }
 
-/// Passive-populator target marker (ADR-0005 §9). An empty sub-object — its presence
-/// selects populator mode; fields slot in later without an API break. Wire: `{}`.
+/// Passive-populator target marker; its presence selects populator mode.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PopulatorTarget {}
 
-/// Template for a PVC the operator creates as the restore target. ADR §3.6.
+/// Template for a PVC the operator creates as the restore target.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PvcTemplate {
@@ -238,31 +204,29 @@ pub struct PvcTemplate {
     pub access_modes: Vec<String>,
 }
 
-/// kopia restore behavior knobs. ADR §4.6.
+/// kopia restore behavior knobs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreOptions {
-    /// Delete files in the target that are not present in the snapshot (make the
-    /// target an exact mirror). Off by default — additive restore is the safe default.
+    /// Delete files in the target that are not present in the snapshot (exact mirror); off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_file_deletion: bool,
-    /// Default true; surfaces a condition if any errors occurred. ADR §4.6.
+    /// Continue past permission errors during restore (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_permission_errors: Option<bool>,
-    /// Default true. ADR §4.6.
+    /// Write files atomically via a temp file + rename (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_files_atomically: Option<bool>,
 }
 
-/// How the restore reacts to a missing snapshot and how long it waits. ADR §4.6 (G7).
+/// How the restore reacts to a missing snapshot and how long it waits.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePolicy {
-    /// Default `Fail` for explicit sources; `Continue` for `fromPolicy`. ADR §4.6 (G7).
+    /// What to do when the resolved source matches no snapshot (`Fail`/`Continue`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_missing_snapshot: Option<OnMissingSnapshot>,
-    /// How long to wait for the source snapshot to appear before giving up
-    /// (Go-style duration string, e.g. `5m`).
+    /// How long to wait for the source snapshot to appear before giving up (e.g. `5m`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<String>,
 }
@@ -281,11 +245,11 @@ pub enum OnMissingSnapshot {
     /// Fail-closed; the default for explicit `snapshotRef`/`identity` sources.
     #[default]
     Fail,
-    /// Proceed (deploy-or-restore); the default for `fromPolicy`.
+    /// Proceed with an empty volume (deploy-or-restore); the default for `fromPolicy`.
     Continue,
 }
 
-/// Lifecycle phase of a restore. Closed enum. ADR §3.6 status.
+/// Lifecycle phase of a restore.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum RestorePhase {
     /// Admitted but not yet acted on; the default initial phase.
@@ -320,22 +284,20 @@ impl crate::common::PhaseLabel for RestorePhase {
     }
 }
 
-/// Observed state of a [`Restore`], written by the controller/mover. ADR §3.6 status.
+/// Observed state of a Restore, written by the controller/mover.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreStatus {
     /// Current lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<RestorePhase>,
-    /// The pinned source kind (`RestoreSource::kind_str` — `SnapshotRef`/`FromPolicy`/
-    /// `Identity`), set by the reconciler. Backs the `SOURCE` printer column so
-    /// `kubectl get restores` shows where a restore reads from. ADR-0005 §3.
+    /// The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_kind: Option<String>,
     /// `metadata.generation` last reconciled, so stale status is detectable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
-    /// Pinned at admission; never re-resolved. ADR §3.6/§4.6.
+    /// The source resolved and pinned at admission; never re-resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedRestore>,
     /// Resolved target details (the PVC written to / populator handshake).
@@ -350,26 +312,15 @@ pub struct RestoreStatus {
     /// Standard Kubernetes conditions carrying the human-readable status/reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
-    /// The last lines of the run's output, written by the mover at the terminal
-    /// transition (success: the `Restore completed: snapshot <id>` line; failure:
-    /// the actionable error + kopia stderr tail). Capped at
-    /// [`crate::common::MAX_LOG_TAIL_BYTES`]; full logs live in the Job pod.
+    /// The last lines of the run's output, written by the mover at the terminal transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_tail: Option<String>,
-    /// Structured terminal-failure detail (kopia error class, stderr tail, retry
-    /// hint), written by the mover before it exits non-zero. ADR §4.10.
+    /// Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<crate::common::FailureBlock>,
 }
 
-/// Which outcome the source resolution pinned. Closed enum so the decision is a
-/// single, exhaustively-matched value rather than an inferred combination of optional
-/// fields — `Snapshot` means a concrete snapshot was found (its details live in the
-/// sibling `kopiaSnapshotID`/`snapshotRef`/`identity` fields); `NoSnapshot` means the
-/// source matched nothing and `onMissingSnapshot: Continue` chose deploy-or-restore
-/// (the volume comes up empty). Pinned once and never re-resolved, exactly like a
-/// snapshot id, so a later-appearing snapshot can never silently retarget an
-/// already-provisioned volume (ADR §4.6).
+/// Which outcome the source resolution pinned, once and never re-resolved.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
 pub enum ResolutionOutcome {
     /// The source resolved to a concrete kopia snapshot (see `kopiaSnapshotID`).
@@ -378,19 +329,14 @@ pub enum ResolutionOutcome {
     NoSnapshot,
 }
 
-/// The source resolved and pinned at admission, so a restore never silently retargets. ADR §4.6.
+/// The source resolved and pinned at admission, so a restore never silently retargets.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedRestore {
-    /// Which outcome the resolution pinned (`Snapshot`/`NoSnapshot`). A legacy pin
-    /// written before this field existed leaves it `None` with `kopiaSnapshotID` set,
-    /// which is read as `Snapshot`.
+    /// Which outcome the resolution pinned (`Snapshot`/`NoSnapshot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionOutcome>,
-    /// The exact kopia snapshot manifest id the source resolved to. Pinned once;
-    /// subsequent reconciles restore THIS id even if newer snapshots appear, so a
-    /// restore never silently retargets (ADR §4.6). Matches
-    /// `Snapshot.status.snapshot.kopiaSnapshotID`.
+    /// The exact kopia snapshot manifest id the source resolved to; pinned once.
     #[serde(
         default,
         rename = "kopiaSnapshotID",
@@ -411,11 +357,11 @@ pub struct ResolvedRestore {
     pub identity: Option<ResolvedIdentity>,
 }
 
-/// Resolved restore target details written to status. ADR §3.6.
+/// Resolved restore target details written to status.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreTargetStatus {
-    /// Populator handshake (passive / pvc-create modes). ADR §3.6.
+    /// Populator handshake (passive / pvc-create modes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_prime: Option<String>,
     /// The PVC actually written to (created or pre-existing).
@@ -423,7 +369,7 @@ pub struct RestoreTargetStatus {
     pub pvc_ref: Option<ObjectRef>,
 }
 
-/// Start/end timestamps of a restore run. ADR §3.6 status.
+/// Start/end timestamps of a restore run.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreTiming {
@@ -435,7 +381,7 @@ pub struct RestoreTiming {
     pub end_time: Option<String>,
 }
 
-/// Live progress counters patched by the mover during a restore. ADR §3.6 status.
+/// Live progress counters patched by the mover during a restore.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreProgress {

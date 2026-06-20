@@ -23,8 +23,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Cron + `policyRef`. One source of `Snapshot` CRs; pausing it doesn't affect
-/// in-flight or completed runs. ADR §3.5.
+/// Cron schedule that fires `Snapshot` CRs from a `SnapshotPolicy`.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "kopiur.home-operations.com",
@@ -47,23 +46,15 @@ use serde::{Deserialize, Serialize};
 }]))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotScheduleSpec {
-    /// The single `SnapshotPolicy` (recipe) this schedule invokes; resolved in the
-    /// schedule's own namespace. ADR §3.5 separates recipe from schedule. **Mutually
-    /// exclusive** with `policySelector` — exactly one is required (webhook-enforced,
-    /// ADR-0005 §10). Optional at the type level so `policySelector` can be used instead.
+    /// The single `SnapshotPolicy` this schedule invokes; mutually exclusive with `policySelector`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<PolicyRef>,
-    /// Fan-out form (ADR-0005 §10): a label selector over `SnapshotPolicy` objects in
-    /// the schedule's namespace. Each matching policy gets a `Snapshot` per firing
-    /// ("back up everything tagged `tier=critical` nightly" in one object). **Mutually
-    /// exclusive** with `policyRef`. Mirrors the `pvcSelector` pattern.
+    /// Label selector fanning out over `SnapshotPolicy` objects; mutually exclusive with `policyRef`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_selector: Option<LabelSelector>,
-    /// Cron, jitter, timezone, and concurrency for the firing cadence. ADR §3.5.
+    /// Cron, jitter, timezone, and concurrency for the firing cadence.
     pub schedule: ScheduleSpec,
-    /// Bounds *failed* `Snapshot` CRs from this schedule. Successful retention is
-    /// GFS-driven on `SnapshotPolicy.spec.retention` — there is deliberately NO
-    /// `successfulJobsHistoryLimit` (ADR-0003 §4.4, ADR-0001 §4.4).
+    /// Maximum number of failed `Snapshot` CRs from this schedule to retain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_jobs_history_limit: Option<u32>,
 }
@@ -82,39 +73,30 @@ fn default_concurrency_policy() -> ConcurrencyPolicy {
     ConcurrencyPolicy::Forbid
 }
 
-/// Cron schedule with deterministic jitter, timezone, and concurrency controls. ADR §3.5/§4.1.
+/// Cron schedule with deterministic jitter, timezone, and concurrency controls.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleSpec {
-    /// Cron expression with Jenkins-style `H` substitution. ADR §4.1 (G4).
+    /// Cron expression with Jenkins-style `H` substitution.
     pub cron: String,
-    /// Deterministic jitter (Go-style duration), derived from `(scheduleUID, slot)`. ADR §4.1.
+    /// Deterministic jitter (Go-style duration), derived from `(scheduleUID, slot)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jitter: Option<String>,
-    /// IANA timezone the cron is evaluated in (e.g. `America/Los_Angeles`).
-    /// Absent means the controller's configured default. ADR §4.1.
+    /// IANA timezone the cron is evaluated in; absent uses the controller's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
-    /// GitOps-friendly default: do NOT fire immediately on create. ADR §4.1 (G3).
-    ///
-    /// Carries a real OpenAPI `default: false` (ADR-0005 §1) so it materializes into
-    /// the stored object / `kubectl explain` and GitOps stops diff-thrashing. NOT
-    /// `skip_serializing_if`-elided, so the materialized value round-trips.
+    /// Whether to fire immediately on create (default `false`).
     #[serde(default = "default_run_on_create")]
     #[schemars(default = "default_run_on_create")]
     pub run_on_create: bool,
-    /// Skip future firings while true. ADR §5.9.
+    /// Skip future firings while true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
-    /// How to handle a firing while a prior run is still in flight. ADR §4.1.
-    ///
-    /// Carries a real OpenAPI `default: Forbid` (ADR-0005 §1) — unconditional, so it
-    /// materializes into the stored object / `kubectl explain`.
+    /// How to handle a firing while a prior run is still in flight (default `Forbid`).
     #[serde(default = "default_concurrency_policy")]
     #[schemars(default = "default_concurrency_policy")]
     pub concurrency_policy: ConcurrencyPolicy,
-    /// If a slot is missed by more than this many seconds (e.g. operator was
-    /// down), skip it instead of firing late. ADR §4.1.
+    /// If a slot is missed by more than this many seconds, skip it instead of firing late.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starting_deadline_seconds: Option<i64>,
 }
@@ -134,7 +116,7 @@ pub struct ScheduleSpec {
 /// ```
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum ConcurrencyPolicy {
-    /// Skip the new run; surface a condition rather than pile up (default).
+    /// Skip the new run rather than let runs pile up (default).
     #[default]
     Forbid,
     /// Allow the new run to start alongside the in-flight one.
@@ -143,41 +125,35 @@ pub enum ConcurrencyPolicy {
     Replace,
 }
 
-/// Observed state of a `SnapshotSchedule`: pinned firing slots and failure run. ADR §3.5.
+/// Observed state of a `SnapshotSchedule`: pinned firing slots and failure run.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotScheduleStatus {
     /// The `metadata.generation` this status reflects, for staleness detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
-    /// Most recent firing (cron + jitter, pinned). ADR §3.5.
+    /// Most recent firing (cron + jitter, pinned).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_schedule: Option<ScheduleRef>,
     /// The next firing slot the controller has computed (cron + jitter, pinned).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_schedule: Option<ScheduleRef>,
-    /// The most recent firing whose `Snapshot` succeeded. ADR §3.5.
+    /// The most recent firing whose `Snapshot` succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_schedule: Option<ScheduleRef>,
-    /// Count of back-to-back failed runs; resets on success. Drives alerting.
+    /// Count of back-to-back failed runs; resets on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<i64>,
-    /// Standard Kubernetes conditions surfacing schedule health. ADR §5 status conventions.
+    /// Standard Kubernetes conditions surfacing schedule health.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }
 
-/// A pinned schedule slot and (optionally) the `Snapshot` it created. ADR §3.5.
-///
-/// `at`/`scheduledAt` are both accepted on the wire: ADR uses `scheduledAt` for
-/// `lastSchedule` and `at` for `next`/`lastSuccessful`. We model both as the single
-/// `at` field with a serde alias so either spelling round-trips.
+/// A pinned schedule slot and (optionally) the `Snapshot` it created.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRef {
-    /// The RFC3339 instant this slot fired (or is scheduled to). Accepts the
-    /// `scheduledAt` alias on the wire (see the struct docs) but always
-    /// serializes back as `at`.
+    /// The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias.
     #[serde(
         default,
         alias = "scheduledAt",
@@ -189,7 +165,7 @@ pub struct ScheduleRef {
     pub snapshot_ref: Option<SnapshotReference>,
 }
 
-/// A by-name reference to a `Snapshot` CR created by a schedule slot. ADR §3.5.
+/// A by-name reference to a `Snapshot` CR created by a schedule slot.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotReference {
