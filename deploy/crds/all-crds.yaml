@@ -18373,6 +18373,21 @@ spec:
                     required:
                     - name
                     type: object
+                  resolution:
+                    description: |-
+                      Which outcome the source resolution pinned. Closed enum so the decision is a
+                      single, exhaustively-matched value rather than an inferred combination of optional
+                      fields — `Snapshot` means a concrete snapshot was found (its details live in the
+                      sibling `kopiaSnapshotID`/`snapshotRef`/`identity` fields); `NoSnapshot` means the
+                      source matched nothing and `onMissingSnapshot: Continue` chose deploy-or-restore
+                      (the volume comes up empty). Pinned once and never re-resolved, exactly like a
+                      snapshot id, so a later-appearing snapshot can never silently retarget an
+                      already-provisioned volume (ADR §4.6).
+                    enum:
+                    - Snapshot
+                    - NoSnapshot
+                    nullable: true
+                    type: string
                   snapshotRef:
                     description: The concrete `Snapshot` CR the source resolved to, when applicable.
                     nullable: true

@@ -166,9 +166,17 @@ By default a restore is **additive** — it writes the snapshot's files and leav
 | Value      | Behavior                                                                      | Default for                                  |
 | ---------- | ----------------------------------------------------------------------------- | -------------------------------------------- |
 | `Fail`     | No matching snapshot ⇒ the restore fails.                                     | `snapshotRef` / `identity` (explicit sources). |
-| `Continue` | No matching snapshot ⇒ proceed without restoring (the volume comes up empty). | `fromPolicy`.                                |
+| `Continue` | No matching snapshot ⇒ provision a **fresh, empty** volume and complete.      | `fromPolicy`.                                |
 
 The defaults are the point: an _explicit_ restore that finds nothing is an error you want surfaced; a _deploy-or-restore_ that finds nothing should let the app start with a fresh volume.
+
+On `Continue` with no snapshot, Kopiur **actually provisions the empty volume** — it doesn't just mark the `Restore` complete. For `target.populator: {}` it provisions an empty prime PVC and rebinds it to the claiming PVC (so a workload pod can bind and start); for `target.pvc` it creates the empty PVC. The "no snapshot ⇒ empty" decision is **pinned to `status.resolved` (`resolution: NoSnapshot`) once and never re-resolved**, so a snapshot that appears *later* can never silently restore over a volume the app is already using — re-create the `Restore` if you want to pick up a new snapshot. The Restore reports `Completed` with `Resolved=True reason=NoSnapshotContinue`.
+
+/// note | Deploy-or-restore-to-empty needs a filesystem-backed repository
+
+The empty-volume path applies to `fromPolicy`/`identity` sources against a **filesystem** repository. For object-store backends (S3/Azure/GCS/B2), an in-controller source resolution isn't supported, so `fromPolicy` with no snapshot surfaces an error rather than coming up empty — use an explicit `snapshotRef`, or seed the first snapshot.
+
+///
 
 ### `waitTimeout` — wait before giving up
 

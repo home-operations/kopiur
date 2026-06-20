@@ -17,9 +17,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
+use kopiur_api::restore::ResolvedRestore;
 use kopiur_api::snapshot::Snapshot;
 use kopiur_api::{
-    OnMissingSnapshot, Restore, RestorePhase, RestoreSource, RestoreTarget, validate,
+    OnMissingSnapshot, ResolutionOutcome, Restore, RestorePhase, RestoreSource, RestoreTarget,
+    validate,
 };
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
@@ -98,6 +100,46 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
     match target {
         RestoreTarget::Populator(_) => PopulatorState::AwaitingClaim,
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => PopulatorState::DirectTarget,
+    }
+}
+
+/// The pinned source-resolution decision the reconcile loop acts on: a concrete
+/// snapshot id, or a deliberate "no snapshot, come up empty" (deploy-or-restore).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// The source resolved to (or was pinned to) this kopia snapshot id.
+    Snapshot(String),
+    /// `onMissingSnapshot: Continue` with no matching snapshot — provision an empty volume.
+    Empty,
+}
+
+/// The already-pinned resolution decision, or `None` when the source still has to be
+/// resolved. Pure + exhaustive, so the data-safety invariant (ADR §4.6: "pinned once,
+/// never re-resolved") lives in one testable place. Cases:
+/// - `resolution: NoSnapshot` pinned → [`Resolution::Empty`] (a later snapshot never retargets).
+/// - `kopiaSnapshotID` pinned (with or without the newer `resolution: Snapshot`, so a
+///   legacy pin written before that field existed still reads correctly) → [`Resolution::Snapshot`].
+/// - **No pin at all but the populator is already `Completed`**: the pre-fix buggy
+///   `Continue` arm stamped `Completed` without pinning anything. A snapshot-resolved
+///   populator ALWAYS pins before it can reach `Completed`, so `Completed` + unpinned ⟹ the
+///   decision was "empty". Treat it as [`Resolution::Empty`] and re-pin it on the next write
+///   — DO NOT re-resolve, or a snapshot that appeared after the original decision would
+///   silently restore over the (possibly already-bound, in-use) volume.
+/// - Otherwise → `None` (resolve now).
+fn pinned_decision(
+    resolved: Option<&ResolvedRestore>,
+    phase: Option<RestorePhase>,
+    state: PopulatorState,
+) -> Option<Resolution> {
+    match resolved {
+        Some(r) if r.resolution == Some(ResolutionOutcome::NoSnapshot) => Some(Resolution::Empty),
+        Some(r) => r.kopia_snapshot_id.clone().map(Resolution::Snapshot),
+        None if phase == Some(RestorePhase::Completed)
+            && state == PopulatorState::AwaitingClaim =>
+        {
+            Some(Resolution::Empty)
+        }
+        None => None,
     }
 }
 
@@ -335,26 +377,25 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         &restore.spec.source,
     );
 
-    // ADR §4.6: the resolution is pinned ONCE and never re-resolved — a restore
-    // must not silently retarget when newer snapshots appear mid-flight. Reuse a
-    // previously pinned id; resolve only while no pin exists yet.
-    let pinned_id = restore
-        .status
-        .as_ref()
-        .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.kopia_snapshot_id.clone());
-    let snapshot_id = if let Some(id) = pinned_id {
-        id
-    } else {
-        match resolve_snapshot(ctx, restore, &namespace).await? {
+    // ADR §4.6: the resolution is pinned ONCE and never re-resolved — a restore must
+    // not silently retarget when newer snapshots appear mid-flight. The pinned decision
+    // is a snapshot id OR a deliberate "no snapshot, deploy-or-restore" (`Resolution`);
+    // `pinned_decision` reads it (incl. legacy pins + the pre-fix stuck-populator
+    // back-fill), returning `None` only when the source still has to be resolved.
+    let resolved = restore.status.as_ref().and_then(|s| s.resolved.as_ref());
+    let phase = restore.status.as_ref().and_then(|s| s.phase);
+    let decision = match pinned_decision(resolved, phase, state) {
+        Some(d) => d,
+        None => match resolve_snapshot(ctx, restore, &namespace).await? {
             Some(res) => {
-                // Pin the FULL resolution (id + provenance + timestamp) exactly
-                // once; the no-pin check above makes this a single write, so it
-                // cannot churn status.
+                // Pin the FULL resolution (outcome + id + provenance + timestamp) exactly
+                // once; the no-pin check above makes this a single write, so it cannot
+                // churn status.
                 let mut resolved = serde_json::json!({
                     "kopiaSnapshotID": res.kopia_snapshot_id,
                     "pinnedAt": chrono::Utc::now().to_rfc3339(),
                 });
+                resolved["resolution"] = serde_json::to_value(ResolutionOutcome::Snapshot)?;
                 if let Some(r) = &res.snapshot_ref {
                     resolved["snapshotRef"] = serde_json::to_value(r)?;
                 }
@@ -370,7 +411,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 );
                 status["resolved"] = resolved;
                 io::patch_status(&api, &name, status).await?;
-                res.kopia_snapshot_id
+                Resolution::Snapshot(res.kopia_snapshot_id)
             }
             None => {
                 // No snapshot matched. While the `waitTimeout` window (anchored at
@@ -423,7 +464,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                     )));
                 }
                 // Window closed (or none configured): honor the closed enum exhaustively.
-                return match on_missing {
+                match on_missing {
                     OnMissingSnapshot::Fail => {
                         let msg = "no snapshot matched the restore source within the \
                                    waitTimeout window; fix spec.source (or create the missing \
@@ -449,47 +490,47 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                             ),
                         )
                         .await?;
-                        Err(Error::MissingDependency(
+                        return Err(Error::MissingDependency(
                             "no snapshot matched restore source".into(),
-                        ))
+                        ));
                     }
-                    OnMissingSnapshot::Continue => {
-                        // Deploy-or-restore: nothing to restore, complete cleanly.
-                        let msg = "no snapshot found; continuing without restoring \
-                                   (deploy-or-restore)";
-                        let conditions = io::upsert_condition(
-                            &existing_conditions(restore),
-                            "Resolved",
-                            true,
-                            "NoSnapshotContinue",
-                            msg,
-                            restore.metadata.generation,
-                        );
-                        io::patch_status(
-                            &api,
-                            &name,
-                            restore_ready_status_on(
-                                restore,
-                                &conditions,
-                                RestorePhase::Completed,
-                                "NoSnapshotContinue",
-                                msg,
-                            ),
-                        )
-                        .await?;
-                        Ok(Action::requeue(std::time::Duration::from_secs(600)))
-                    }
-                };
+                    // Deploy-or-restore: no snapshot, so the volume comes up empty. Do NOT
+                    // complete-and-return here — fall through to the target driver, which
+                    // provisions the empty volume (an empty prime PVC for a populator; an
+                    // empty `target.pvc` for a direct restore). The decision is pinned
+                    // below so a later-appearing snapshot never retargets it (ADR §4.6).
+                    OnMissingSnapshot::Continue => Resolution::Empty,
+                }
             }
-        }
+        },
+    };
+
+    // Pin the deploy-or-restore "no snapshot" decision exactly once. This durably records
+    // the choice (so a snapshot that appears later can never silently restore over the
+    // provisioned volume) AND back-fills the pre-fix stuck-populator state that
+    // `pinned_decision` inferred from a `Completed`+unpinned Restore. Idempotent: re-pinning
+    // an already-`NoSnapshot` resolution is a server-side no-op. A bare `{resolved}` merge
+    // patch leaves phase/conditions to the target driver below (the `Resolved` domain
+    // condition is stamped at the driver's empty completion).
+    if decision == Resolution::Empty
+        && resolved.and_then(|r| r.resolution) != Some(ResolutionOutcome::NoSnapshot)
+    {
+        let mut pin = serde_json::json!({ "pinnedAt": chrono::Utc::now().to_rfc3339() });
+        pin["resolution"] = serde_json::to_value(ResolutionOutcome::NoSnapshot)?;
+        io::patch_status(&api, &name, serde_json::json!({ "resolved": pin })).await?;
+    }
+
+    let snapshot_id = match &decision {
+        Resolution::Snapshot(id) => Some(id.as_str()),
+        Resolution::Empty => None,
     };
 
     match state {
         PopulatorState::DirectTarget => {
-            drive_direct_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
+            drive_direct_restore(ctx, restore, &api, &namespace, &name, snapshot_id).await
         }
         PopulatorState::AwaitingClaim => {
-            drive_populator_restore(ctx, restore, &api, &namespace, &name, &snapshot_id).await
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, snapshot_id).await
         }
     }
 }
@@ -523,13 +564,17 @@ async fn park_awaiting_claim(
 /// kubernetes-csi/lib-volume-populator). Each step keys off observed state so requeues
 /// are idempotent; the prime PV is set `Retain` before its PVC is deleted so the
 /// volume survives the swap.
+///
+/// `snapshot_id` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
+/// matching snapshot): the empty, freshly-provisioned prime PVC IS the result, so the
+/// mover is skipped and the empty prime is rebound straight to the claiming PVC.
 async fn drive_populator_restore(
     ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: &str,
+    snapshot_id: Option<&str>,
 ) -> Result<Action> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
@@ -587,17 +632,36 @@ async fn drive_populator_restore(
                 == Some(pv_name.as_str())
         {
             finalize_populator(ctx, namespace, &populate_job, &prime_name, Some(&pv_name)).await?;
-            io::patch_status(
-                api,
-                name,
+            // Branch the completion on whether there was a snapshot: a restore stamps
+            // `RestoreSucceeded`; deploy-or-restore (no snapshot) stamps `NoSnapshotContinue`
+            // + a `Resolved=True` domain condition so the empty outcome is self-describing.
+            let status = if snapshot_id.is_some() {
                 restore_ready_status(
                     restore,
                     RestorePhase::Completed,
                     crate::consts::RESTORE_POPULATED_REASON,
                     "populator: restored the snapshot into the claiming PVC and rebound the volume",
-                ),
-            )
-            .await?;
+                )
+            } else {
+                let msg = "populator: no snapshot found; provisioned an empty volume for the \
+                           claiming PVC (deploy-or-restore)";
+                let conditions = io::upsert_condition(
+                    &existing_conditions(restore),
+                    "Resolved",
+                    true,
+                    "NoSnapshotContinue",
+                    msg,
+                    restore.metadata.generation,
+                );
+                restore_ready_status_on(
+                    restore,
+                    &conditions,
+                    RestorePhase::Completed,
+                    "NoSnapshotContinue",
+                    msg,
+                )
+            };
+            io::patch_status(api, name, status).await?;
             return Ok(Action::requeue(std::time::Duration::from_secs(600)));
         }
         // Rebind issued; wait for the PV controller to bind our PV to the consumer.
@@ -624,8 +688,9 @@ async fn drive_populator_restore(
         return Ok(Action::requeue(std::time::Duration::from_secs(15)));
     }
 
-    // Provision the prime PVC (mirrors the claim's spec, no dataSourceRef), then run
-    // the restore mover into it.
+    // Provision the prime PVC (mirrors the claim's spec, no dataSourceRef). For a real
+    // restore, run the mover into it; for deploy-or-restore (no snapshot) the empty prime
+    // IS the result — skip the mover and rebind it straight to the consumer.
     ensure_prime_pvc(
         ctx,
         restore,
@@ -636,70 +701,97 @@ async fn drive_populator_restore(
     )
     .await?;
 
-    match run_restore_mover(
-        ctx,
-        restore,
-        api,
-        namespace,
-        &populate_job,
-        &prime_name,
-        snapshot_id,
-    )
-    .await?
-    {
-        MoverOutcome::Running { created } => {
-            let phase = restore.status.as_ref().and_then(|s| s.phase);
-            if created || phase != Some(RestorePhase::Restoring) {
-                io::patch_status(
-                    api,
-                    name,
-                    restore_ready_status(
-                        restore,
-                        RestorePhase::Restoring,
-                        "PopulatingPrimePvc",
-                        "populator: restoring the snapshot into the prime PVC",
-                    ),
-                )
-                .await?;
+    if let Some(snapshot_id) = snapshot_id {
+        match run_restore_mover(
+            ctx,
+            restore,
+            api,
+            namespace,
+            &populate_job,
+            &prime_name,
+            snapshot_id,
+        )
+        .await?
+        {
+            MoverOutcome::Running { created } => {
+                let phase = restore.status.as_ref().and_then(|s| s.phase);
+                if created || phase != Some(RestorePhase::Restoring) {
+                    io::patch_status(
+                        api,
+                        name,
+                        restore_ready_status(
+                            restore,
+                            RestorePhase::Restoring,
+                            "PopulatingPrimePvc",
+                            "populator: restoring the snapshot into the prime PVC",
+                        ),
+                    )
+                    .await?;
+                }
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
-            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-        }
-        MoverOutcome::Failed => {
-            let phase = restore.status.as_ref().and_then(|s| s.phase);
-            if phase != Some(RestorePhase::Failed) {
-                io::patch_status(
-                    api,
-                    name,
-                    restore_ready_status(
-                        restore,
-                        RestorePhase::Failed,
-                        "MoverJobFailed",
-                        "the populator restore mover Job failed; see the Job/pod logs, fix the \
-                         cause, and re-create the claiming PVC — a Failed Restore is terminal",
-                    ),
-                )
-                .await?;
+            MoverOutcome::Failed => {
+                let phase = restore.status.as_ref().and_then(|s| s.phase);
+                if phase != Some(RestorePhase::Failed) {
+                    io::patch_status(
+                        api,
+                        name,
+                        restore_ready_status(
+                            restore,
+                            RestorePhase::Failed,
+                            "MoverJobFailed",
+                            "the populator restore mover Job failed; see the Job/pod logs, fix \
+                             the cause, and re-create the claiming PVC — a Failed Restore is \
+                             terminal",
+                        ),
+                    )
+                    .await?;
+                }
+                return Ok(Action::requeue(std::time::Duration::from_secs(120)));
             }
-            return Ok(Action::requeue(std::time::Duration::from_secs(120)));
-        }
-        MoverOutcome::Wedged { message } => {
-            let phase = restore.status.as_ref().and_then(|s| s.phase);
-            if phase != Some(RestorePhase::Failed) {
-                io::patch_status(
-                    api,
-                    name,
-                    restore_ready_status(restore, RestorePhase::Failed, "MoverPodWedged", &message),
-                )
-                .await?;
+            MoverOutcome::Wedged { message } => {
+                let phase = restore.status.as_ref().and_then(|s| s.phase);
+                if phase != Some(RestorePhase::Failed) {
+                    io::patch_status(
+                        api,
+                        name,
+                        restore_ready_status(
+                            restore,
+                            RestorePhase::Failed,
+                            "MoverPodWedged",
+                            &message,
+                        ),
+                    )
+                    .await?;
+                }
+                return Ok(Action::requeue(std::time::Duration::from_secs(120)));
             }
-            return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+            MoverOutcome::Succeeded { .. } => {}
         }
-        MoverOutcome::Succeeded { .. } => {}
+    } else {
+        // Deploy-or-restore: no mover. Pin an observable in-flight phase once (so
+        // `kubectl get restore` shows progress, not a stale `Pending`, while the empty
+        // prime is rebound), then fall through to the rebind.
+        let phase = restore.status.as_ref().and_then(|s| s.phase);
+        if phase != Some(RestorePhase::Restoring) {
+            io::patch_status(
+                api,
+                name,
+                restore_ready_status(
+                    restore,
+                    RestorePhase::Restoring,
+                    "NoSnapshotContinue",
+                    "populator: no snapshot found; provisioning an empty volume \
+                     (deploy-or-restore)",
+                ),
+            )
+            .await?;
+        }
     }
 
-    // Mover done: hand the prime PV to the consumer, then requeue so the next pass
-    // observes the bind and finalizes. `rebind_prime_to_consumer` returns `false`
-    // (requeue soon) while the prime PV hasn't appeared yet.
+    // Mover done (or skipped for an empty volume): hand the prime PV to the consumer, then
+    // requeue so the next pass observes the bind and finalizes. `rebind_prime_to_consumer`
+    // returns `false` (requeue soon) while the prime PV hasn't appeared yet.
     if !rebind_prime_to_consumer(ctx, namespace, &prime_name, &consumer_name, &consumer_uid).await?
     {
         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
@@ -989,13 +1081,18 @@ async fn finalize_populator(
 
 /// Drive a restore-with-explicit-target: create the restore mover Job (writing
 /// into the target PVC), then track it to terminal.
+///
+/// `snapshot_id` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
+/// matching snapshot): the target PVC is still ensured (so `target.pvc` is provisioned
+/// empty rather than left missing), but the mover is skipped and the restore completes
+/// cleanly with a fresh, empty volume.
 async fn drive_direct_restore(
     ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: &str,
+    snapshot_id: Option<&str>,
 ) -> Result<Action> {
     // Resolve the target PVC for the restore Job. DirectTarget is only reached for
     // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
@@ -1004,7 +1101,8 @@ async fn drive_direct_restore(
         RestoreTarget::PvcRef(r) => r.name.clone(),
         // `target.pvc` means the operator CREATES the PVC (ADR §3.6) — without
         // this the mover Job references a claim nobody made and sits Pending
-        // forever (FailedScheduling: persistentvolumeclaim not found).
+        // forever (FailedScheduling: persistentvolumeclaim not found). This also
+        // provisions the empty volume for the deploy-or-restore (no-snapshot) case.
         RestoreTarget::Pvc(t) => {
             ensure_restore_target_pvc(ctx, namespace, t).await?;
             t.name.clone()
@@ -1018,9 +1116,42 @@ async fn drive_direct_restore(
         }
     };
 
+    let phase = restore.status.as_ref().and_then(|s| s.phase);
+
+    // Deploy-or-restore: no snapshot to write. The target PVC is ensured above (so a
+    // `target.pvc` comes up empty rather than missing); a `pvcRef` already exists. Stamp
+    // a terminal `Completed` via `restore_ready_status_on` (Ready=True) so the entry-guard
+    // heal does NOT clobber this message with "the snapshot data was written" — there is no
+    // mover here, so the controller is the sole writer (no two-writer race).
+    let Some(snapshot_id) = snapshot_id else {
+        if phase != Some(RestorePhase::Completed) {
+            let msg = "no snapshot found; provisioned an empty target volume (deploy-or-restore)";
+            let conditions = io::upsert_condition(
+                &existing_conditions(restore),
+                "Resolved",
+                true,
+                "NoSnapshotContinue",
+                msg,
+                restore.metadata.generation,
+            );
+            io::patch_status(
+                api,
+                name,
+                restore_ready_status_on(
+                    restore,
+                    &conditions,
+                    RestorePhase::Completed,
+                    "NoSnapshotContinue",
+                    msg,
+                ),
+            )
+            .await?;
+        }
+        return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+    };
+
     // The Job is named after the Restore and writes into the explicit target PVC;
     // the helper creates/tracks it, the phase writes stay here.
-    let phase = restore.status.as_ref().and_then(|s| s.phase);
     match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, snapshot_id).await? {
         MoverOutcome::Succeeded { duration_secs } => {
             if let Some(secs) = duration_secs {
@@ -2223,6 +2354,73 @@ mod tests {
             assert!(!phase_is_terminal_at_guard(p, AwaitingClaim));
             assert!(!phase_is_terminal_at_guard(p, DirectTarget));
         }
+    }
+
+    fn resolved_with(
+        resolution: Option<ResolutionOutcome>,
+        kopia_snapshot_id: Option<&str>,
+    ) -> ResolvedRestore {
+        ResolvedRestore {
+            resolution,
+            kopia_snapshot_id: kopia_snapshot_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
+        use PopulatorState::{AwaitingClaim, DirectTarget};
+        use RestorePhase::{Completed, Pending};
+
+        // A pinned `NoSnapshot` is always the deploy-or-restore Empty decision — even
+        // if a kopiaSnapshotID somehow co-exists, NoSnapshot wins (data-safety: a later
+        // snapshot must never retarget a volume that already came up empty).
+        assert_eq!(
+            pinned_decision(
+                Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
+                Some(Completed),
+                AwaitingClaim,
+            ),
+            Some(Resolution::Empty)
+        );
+
+        // A pinned snapshot id resolves to that id (with the explicit Snapshot outcome…).
+        assert_eq!(
+            pinned_decision(
+                Some(&resolved_with(
+                    Some(ResolutionOutcome::Snapshot),
+                    Some("k7")
+                )),
+                Some(Pending),
+                DirectTarget,
+            ),
+            Some(Resolution::Snapshot("k7".into()))
+        );
+        // …and a LEGACY pin (id present, `resolution` field absent) reads the same,
+        // so an in-flight restore pinned before this field existed keeps its target.
+        assert_eq!(
+            pinned_decision(
+                Some(&resolved_with(None, Some("k7"))),
+                Some(Pending),
+                DirectTarget,
+            ),
+            Some(Resolution::Snapshot("k7".into()))
+        );
+
+        // The pre-fix stuck populator: `Completed` with NOTHING pinned. A snapshot-
+        // resolved populator ALWAYS pins before Completed, so this unambiguously means
+        // the decision was "empty" — back-fill Empty, do NOT re-resolve.
+        assert_eq!(
+            pinned_decision(None, Some(Completed), AwaitingClaim),
+            Some(Resolution::Empty)
+        );
+        // The same shape on a DIRECT target is not a stuck populator (its `Completed`
+        // is terminal at the guard, so it never reaches here): require fresh resolution.
+        assert_eq!(pinned_decision(None, Some(Completed), DirectTarget), None);
+
+        // A fresh, un-pinned restore must resolve.
+        assert_eq!(pinned_decision(None, Some(Pending), AwaitingClaim), None);
+        assert_eq!(pinned_decision(None, None, DirectTarget), None);
     }
 
     // --- kstatus Ready conditions (ADR-0005 §2) -----------------------------

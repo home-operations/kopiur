@@ -52,8 +52,8 @@ pub use repository_replication::{
     RepositoryReplicationStatus,
 };
 pub use restore::{
-    OnMissingSnapshot, PopulatorTarget, Restore, RestorePhase, RestoreSource, RestoreSpec,
-    RestoreStatus, RestoreTarget,
+    OnMissingSnapshot, PopulatorTarget, ResolutionOutcome, Restore, RestorePhase, RestoreSource,
+    RestoreSpec, RestoreStatus, RestoreTarget,
 };
 pub use server::{
     ClusterServerSpec, ServerAuth, ServerService, ServerSpec, ServerStatus, ServiceType,

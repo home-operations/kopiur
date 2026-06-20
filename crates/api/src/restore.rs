@@ -362,10 +362,31 @@ pub struct RestoreStatus {
     pub failure: Option<crate::common::FailureBlock>,
 }
 
+/// Which outcome the source resolution pinned. Closed enum so the decision is a
+/// single, exhaustively-matched value rather than an inferred combination of optional
+/// fields — `Snapshot` means a concrete snapshot was found (its details live in the
+/// sibling `kopiaSnapshotID`/`snapshotRef`/`identity` fields); `NoSnapshot` means the
+/// source matched nothing and `onMissingSnapshot: Continue` chose deploy-or-restore
+/// (the volume comes up empty). Pinned once and never re-resolved, exactly like a
+/// snapshot id, so a later-appearing snapshot can never silently retarget an
+/// already-provisioned volume (ADR §4.6).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum ResolutionOutcome {
+    /// The source resolved to a concrete kopia snapshot (see `kopiaSnapshotID`).
+    Snapshot,
+    /// The source matched no snapshot; `Continue` chose an empty (deploy-or-restore) volume.
+    NoSnapshot,
+}
+
 /// The source resolved and pinned at admission, so a restore never silently retargets. ADR §4.6.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedRestore {
+    /// Which outcome the resolution pinned (`Snapshot`/`NoSnapshot`). A legacy pin
+    /// written before this field existed leaves it `None` with `kopiaSnapshotID` set,
+    /// which is read as `Snapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolutionOutcome>,
     /// The exact kopia snapshot manifest id the source resolved to. Pinned once;
     /// subsequent reconciles restore THIS id even if newer snapshots appear, so a
     /// restore never silently retargets (ADR §4.6). Matches
