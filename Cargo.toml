@@ -4,6 +4,7 @@ members = [
     "crates/api",
     "crates/cli",
     "crates/kopia",
+    "crates/migrate",
     "crates/telemetry",
     "crates/webhook",
     "crates/controller",
@@ -24,6 +25,7 @@ authors = ["kopiur contributors"]
 # Internal crates
 kopiur-api = { path = "crates/api" }
 kopiur-kopia = { path = "crates/kopia" }
+kopiur-migrate = { path = "crates/migrate" }
 kopiur-mover = { path = "crates/mover" }
 kopiur-telemetry = { path = "crates/telemetry" }
 

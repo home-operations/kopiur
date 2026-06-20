@@ -14,15 +14,17 @@
 //!   preserved, and the fork's snapshot identity pinned so history continues.
 
 pub mod io;
-pub mod kopia;
-pub mod translate;
-pub mod volsync_types;
 
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams};
 use kube::discovery::ApiResource;
+
+// The pure translation core lives in the `kopiur-migrate` crate. The bare
+// `kopia::`/`translate::`/`volsync_types::` paths used throughout this file
+// resolve through these aliases, so the call sites stay byte-identical.
+use kopiur_migrate::{kopia, translate, volsync_types};
 
 use crate::CmdOutput;
 use crate::cli::{GlobalArgs, MigrateVolsyncArgs};

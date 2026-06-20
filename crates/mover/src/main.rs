@@ -15,14 +15,12 @@
 //! intentionally thin and best-effort.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
-use kopiur_kopia::{ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MaintenanceMode};
-use tokio::sync::Mutex;
+use kopiur_kopia::{ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass};
 use tracing::{error, info, warn};
 
 use kopiur_mover::bootstrap::{
@@ -33,7 +31,11 @@ use kopiur_mover::env::{KOPIA_BINARY, RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
 use kopiur_mover::resolve::match_current_manifest;
 use kopiur_mover::serve::ServerWorkSpec;
-use kopiur_mover::status::StatusUpdate;
+use kopiur_mover::status::{
+    StatusReporter, StatusUpdate, lease_blocked_body, maintenance_failed_body,
+    maintenance_ran_body, replicate_failed_body, replicate_ok_body, split_api_version,
+    verify_failed_body, verify_ok_body,
+};
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
     Operation, ReplicateOp, RestoreOp, SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier,
@@ -1213,41 +1215,6 @@ fn count_files(dir: &str) -> Option<i64> {
     Some(count)
 }
 
-/// `{ "status": ... }` body for a successful verification: stamp `lastVerified`
-/// and a `Verified=True` condition.
-fn verify_ok_body(tier: &str, now: &chrono::DateTime<chrono::Utc>) -> serde_json::Value {
-    let ts = now.to_rfc3339();
-    serde_json::json!({
-        "status": {
-            "lastVerified": ts,
-            "conditions": [{
-                "type": "Verified",
-                "status": "True",
-                "reason": "VerificationSucceeded",
-                "message": format!("{tier} verification succeeded"),
-                "lastTransitionTime": ts,
-                "observedGeneration": 0,
-            }],
-        }
-    })
-}
-
-/// `{ "status": ... }` body for a failed verification: a `Verified=False` condition.
-fn verify_failed_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "conditions": [{
-                "type": "Verified",
-                "status": "False",
-                "reason": "VerificationFailed",
-                "message": message,
-                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": 0,
-            }],
-        }
-    })
-}
-
 /// PATCH a raw `{ "status": ... }` merge body onto the `SnapshotPolicy` `.status`
 /// (best-effort; logged on failure). Reuses the same dynamic-API pattern as
 /// [`patch_maintenance_status`].
@@ -1315,45 +1282,6 @@ async fn run_replicate_flow(
     Ok(())
 }
 
-/// `{ "status": ... }` body for a successful replication: stamp `lastReplicated`,
-/// the destination backend, phase `Succeeded`, and a `Ready=True` condition.
-fn replicate_ok_body(dest: &str, now: &chrono::DateTime<chrono::Utc>) -> serde_json::Value {
-    let ts = now.to_rfc3339();
-    serde_json::json!({
-        "status": {
-            "phase": "Succeeded",
-            "destinationBackend": dest,
-            "lastReplicated": ts,
-            "conditions": [{
-                "type": "Ready",
-                "status": "True",
-                "reason": "ReplicationSucceeded",
-                "message": format!("replicated to {dest}"),
-                "lastTransitionTime": ts,
-                "observedGeneration": 0,
-            }],
-        }
-    })
-}
-
-/// `{ "status": ... }` body for a failed replication: phase `Failed` + a
-/// `Ready=False` condition.
-fn replicate_failed_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "phase": "Failed",
-            "conditions": [{
-                "type": "Ready",
-                "status": "False",
-                "reason": "ReplicationFailed",
-                "message": message,
-                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": 0,
-            }],
-        }
-    })
-}
-
 /// PATCH a raw `{ "status": ... }` merge body onto the `RepositoryReplication`
 /// `.status` (best-effort; logged on failure). Reuses the dynamic-API pattern.
 async fn patch_replicate_status(target: &workspec::TargetRef, body: &serde_json::Value) {
@@ -1417,75 +1345,6 @@ async fn run_browse_session_flow(
         "browse session TTL elapsed; exiting"
     );
     Ok(())
-}
-
-/// `{ "status": ... }` body for a successful maintenance run. A full run also
-/// advances the quick clock (full subsumes quick). `lastContentReclaimedBytes`
-/// is `0`: `kopia maintenance run` emits no JSON, so the precise figure needs a
-/// `maintenance info` delta (tracked separately; the field round-trips).
-fn maintenance_ran_body(
-    op: &MaintenanceOp,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> serde_json::Value {
-    let ts = now.to_rfc3339();
-    let run = serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": 0 });
-    let mut status = serde_json::json!({
-        "ownership": { "owner": op.owner, "claimedAt": ts },
-        "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
-    });
-    match op.mode {
-        MaintenanceMode::Quick => {
-            status["quick"] = run;
-        }
-        MaintenanceMode::Full => {
-            status["quick"] = run.clone();
-            status["full"] = run;
-        }
-    }
-    serde_json::json!({ "status": status })
-}
-
-/// `{ "status": ... }` body when the lease is held by another owner (yield /
-/// prompt): record the observed holder and a `LeaseOwned=False` condition.
-fn lease_blocked_body(owner: &str, reason: &str, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "ownership": { "owner": owner },
-            "conditions": [lease_condition_body("False", reason, message, &chrono::Utc::now())],
-        }
-    })
-}
-
-/// `{ "status": ... }` body for a failed kopia maintenance call.
-fn maintenance_failed_body(e: &KopiaError) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "conditions": [lease_condition_body(
-                "False",
-                "MaintenanceFailed",
-                &format!("maintenance failed (class {}): {e}", e.class()),
-                &chrono::Utc::now(),
-            )],
-        }
-    })
-}
-
-/// A single `LeaseOwned` condition. The codebase uses a single-element
-/// `conditions` array (last-writer-wins for the salient state) for `Maintenance`.
-fn lease_condition_body(
-    status: &str,
-    reason: &str,
-    message: &str,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": kopiur_api::maintenance::LEASE_OWNED_CONDITION,
-        "status": status,
-        "reason": reason,
-        "message": message,
-        "lastTransitionTime": now.to_rfc3339(),
-        "observedGeneration": 0,
-    })
 }
 
 /// PATCH a raw `{ "status": ... }` merge body onto the `Maintenance` `.status`
@@ -1615,171 +1474,9 @@ fn build_client(spec: &MoverWorkSpec) -> KopiaClient {
     builder.build()
 }
 
-/// A thin, best-effort wrapper around the kube status PATCH. Kept separate from
-/// the pure mapping so `main`'s correctness lives in the unit-tested layers.
-/// When no cluster is reachable, status updates are logged instead.
-struct StatusReporter {
-    inner: Option<Arc<Mutex<KubeStatusReporter>>>,
-    target: workspec::TargetRef,
-}
-
-impl StatusReporter {
-    async fn try_new(spec: &MoverWorkSpec) -> Self {
-        let target = spec.target_ref.clone();
-        match KubeStatusReporter::try_new(&target).await {
-            Ok(r) => StatusReporter {
-                inner: Some(Arc::new(Mutex::new(r))),
-                target,
-            },
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "no kube client; status updates will be logged, not PATCHed"
-                );
-                StatusReporter {
-                    inner: None,
-                    target,
-                }
-            }
-        }
-    }
-
-    async fn report(&self, update: &StatusUpdate) {
-        match &self.inner {
-            Some(r) => {
-                let mut guard = r.lock().await;
-                if let Err(e) = guard.patch(update).await {
-                    warn!(error = %e, target = %self.target.name, "status PATCH failed");
-                }
-            }
-            None => {
-                info!(
-                    target = %self.target.name,
-                    phase = %update.phase,
-                    "status update (no cluster): {}",
-                    serde_json::to_string(update).unwrap_or_default()
-                );
-            }
-        }
-    }
-}
-
-/// The real kube PATCH path. Uses a dynamic API so the mover does not need to
-/// depend on the typed CRD structs (it PATCHes a merge body under `.status`).
-struct KubeStatusReporter {
-    api: kube::Api<kube::api::DynamicObject>,
-    kind: String,
-    namespace: String,
-    name: String,
-}
-
-impl KubeStatusReporter {
-    async fn try_new(target: &workspec::TargetRef) -> Result<Self> {
-        use kube::core::{ApiResource, GroupVersionKind};
-
-        let client =
-            kube::Client::try_default()
-                .await
-                .map_err(|source| MoverError::KubeClient {
-                    source: Box::new(source),
-                })?;
-        let (group, version) = split_api_version(&target.api_version);
-        let gvk = GroupVersionKind::gvk(&group, &version, &target.kind);
-        let ar = ApiResource::from_gvk(&gvk);
-        let api =
-            kube::Api::<kube::api::DynamicObject>::namespaced_with(client, &target.namespace, &ar);
-        Ok(KubeStatusReporter {
-            api,
-            kind: target.kind.clone(),
-            namespace: target.namespace.clone(),
-            name: target.name.clone(),
-        })
-    }
-
-    async fn patch(&mut self, update: &StatusUpdate) -> Result<()> {
-        use kube::api::{Patch, PatchParams};
-        let body = update.as_patch_body();
-        self.api
-            .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
-            .await
-            .map_err(|source| MoverError::StatusPatch {
-                kind: self.kind.clone(),
-                namespace: self.namespace.clone(),
-                name: self.name.clone(),
-                source: Box::new(source),
-            })?;
-        Ok(())
-    }
-}
-
-/// Split `group/version` (or bare `version`) into `(group, version)`.
-fn split_api_version(api_version: &str) -> (String, String) {
-    match api_version.split_once('/') {
-        Some((g, v)) => (g.to_string(), v.to_string()),
-        None => (String::new(), api_version.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_api_version_grouped() {
-        assert_eq!(
-            split_api_version("kopiur.home-operations.com/v1alpha1"),
-            (
-                "kopiur.home-operations.com".to_string(),
-                "v1alpha1".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn split_api_version_core() {
-        assert_eq!(split_api_version("v1"), (String::new(), "v1".to_string()));
-    }
-
-    fn maint_op(mode: MaintenanceMode) -> MaintenanceOp {
-        MaintenanceOp {
-            mode,
-            owner: "kopiur/prod/nas".into(),
-            takeover_policy: kopiur_api::TakeoverPolicy::Never,
-        }
-    }
-
-    #[test]
-    fn quick_run_advances_only_quick_clock() {
-        let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Quick), &now);
-        assert!(body["status"]["quick"]["lastRunAt"].is_string());
-        assert!(
-            body["status"]["full"].is_null(),
-            "a quick run must not stamp the full clock"
-        );
-        assert_eq!(body["status"]["ownership"]["owner"], "kopiur/prod/nas");
-    }
-
-    #[test]
-    fn full_run_subsumes_quick_clock() {
-        let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Full), &now);
-        // Full subsumes quick: both clocks advance so quick isn't immediately due.
-        assert!(body["status"]["full"]["lastRunAt"].is_string());
-        assert!(body["status"]["quick"]["lastRunAt"].is_string());
-        assert_eq!(
-            body["status"]["full"]["lastRunAt"],
-            body["status"]["quick"]["lastRunAt"]
-        );
-    }
-
-    #[test]
-    fn lease_blocked_records_observed_owner_and_false_condition() {
-        let body = lease_blocked_body("other/owner", "LeaseHeldByOther", "held");
-        assert_eq!(body["status"]["ownership"]["owner"], "other/owner");
-        assert_eq!(body["status"]["conditions"][0]["status"], "False");
-        assert_eq!(body["status"]["conditions"][0]["type"], "LeaseOwned");
-    }
 
     // --- maintenance-owner self-heal gate (connect-to-existing re-stamp) ---
 
