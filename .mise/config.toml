@@ -17,6 +17,12 @@ config_roots = ["crates/e2e"]
 [tools]
 rust = { version = "1.95.0", components = "rustfmt,clippy,llvm-tools-preview" }
 lefthook = "2.1.9"
+# `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
+# `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
+# npm backend uses mise's own node+npm and never falls through to a system
+# `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
+# `mise install` with `Cannot find module '/usr/bin/npm'`.
+node = "22"
 oxfmt = "0.55.0"
 zizmor = "1.25.2"
 helm = "4.2.2"

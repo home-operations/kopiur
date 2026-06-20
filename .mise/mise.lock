@@ -373,6 +373,45 @@ checksum = "sha256:1f29681dfbc36b9bdde52139cca6c4668ea4d51fd81e9127a3b78f49369db
 url = "https://github.com/evilmartians/lefthook/releases/download/v2.1.9/lefthook_2.1.9_Windows_x86_64.gz"
 provenance = "github-attestations"
 
+[[tools.node]]
+version = "22.23.0"
+backend = "core:node"
+
+[tools.node.options]
+compile = "true"
+
+[tools.node."platforms.linux-x64"]
+checksum = "sha256:535eeb608ca1e0b71d49a0e36991d449d5f935fbb04eca61677519b010cd673a"
+url = "https://nodejs.org/dist/v22.23.0/node-v22.23.0-linux-x64.tar.gz"
+
+[[tools.node]]
+version = "22.23.0"
+backend = "core:node"
+
+[tools.node."platforms.linux-arm64"]
+checksum = "sha256:0c96aa074abd109e0b5da8d10202a9bbcea9bcf9ddb587b20944f71b8f21f8c8"
+url = "https://nodejs.org/dist/v22.23.0/node-v22.23.0-linux-arm64.tar.gz"
+
+[tools.node."platforms.linux-arm64-musl"]
+checksum = "sha256:b554e3fd26b450bdc0d3a279f7de436018bd215ea17a323268c81749aa25cc71"
+url = "https://unofficial-builds.nodejs.org/download/release/v22.23.0/node-v22.23.0-linux-arm64-musl.tar.gz"
+
+[tools.node."platforms.linux-x64-musl"]
+checksum = "sha256:43b3a26b712ab2d7226acffbda47c65caa570e83bc7fbc8c59087f5515730997"
+url = "https://unofficial-builds.nodejs.org/download/release/v22.23.0/node-v22.23.0-linux-x64-musl.tar.gz"
+
+[tools.node."platforms.macos-arm64"]
+checksum = "sha256:e0f383a215dd3093de6d2c74f87056dc2306a2e09ad494cbffdba28f89046f56"
+url = "https://nodejs.org/dist/v22.23.0/node-v22.23.0-darwin-arm64.tar.gz"
+
+[tools.node."platforms.macos-x64"]
+checksum = "sha256:dc2ccab261fd70c347e4cc52085d8d226f471ccba1fc2a7252283949b31ca9f9"
+url = "https://nodejs.org/dist/v22.23.0/node-v22.23.0-darwin-x64.tar.gz"
+
+[tools.node."platforms.windows-x64"]
+checksum = "sha256:425a5bd68cc95e8eb16bcccd0a75081b48983fc6a26f67126bd4d6c7198231e8"
+url = "https://nodejs.org/dist/v22.23.0/node-v22.23.0-win-x64.zip"
+
 [[tools.oxfmt]]
 version = "0.55.0"
 backend = "npm:oxfmt"
