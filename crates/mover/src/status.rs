@@ -9,13 +9,20 @@
 //! by the API server. The actual kube PATCH lives in a thin function gated so
 //! tests don't need a client.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::restore::RestorePhase;
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{PhaseLabel, SnapshotStats, SnapshotTiming};
-use kopiur_kopia::{KopiaError, SnapshotCreateResult};
+use kopiur_kopia::{KopiaError, MaintenanceMode, SnapshotCreateResult};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use crate::error::{MoverError, Result};
+use crate::workspec::{self, MaintenanceOp, MoverWorkSpec};
 
 /// Map a kopia create result to the CRD `status.stats` shape (`SnapshotStats`).
 ///
@@ -392,6 +399,261 @@ impl StatusUpdate {
     }
 }
 
+/// `{ "status": ... }` body for a successful verification: stamp `lastVerified`
+/// and a `Verified=True` condition.
+pub fn verify_ok_body(tier: &str, now: &chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let ts = now.to_rfc3339();
+    serde_json::json!({
+        "status": {
+            "lastVerified": ts,
+            "conditions": [{
+                "type": "Verified",
+                "status": "True",
+                "reason": "VerificationSucceeded",
+                "message": format!("{tier} verification succeeded"),
+                "lastTransitionTime": ts,
+                "observedGeneration": 0,
+            }],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a failed verification: a `Verified=False` condition.
+pub fn verify_failed_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": "Verified",
+                "status": "False",
+                "reason": "VerificationFailed",
+                "message": message,
+                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                "observedGeneration": 0,
+            }],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a successful replication: stamp `lastReplicated`,
+/// the destination backend, phase `Succeeded`, and a `Ready=True` condition.
+pub fn replicate_ok_body(dest: &str, now: &chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let ts = now.to_rfc3339();
+    serde_json::json!({
+        "status": {
+            "phase": "Succeeded",
+            "destinationBackend": dest,
+            "lastReplicated": ts,
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": "ReplicationSucceeded",
+                "message": format!("replicated to {dest}"),
+                "lastTransitionTime": ts,
+                "observedGeneration": 0,
+            }],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a failed replication: phase `Failed` + a
+/// `Ready=False` condition.
+pub fn replicate_failed_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": {
+            "phase": "Failed",
+            "conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": "ReplicationFailed",
+                "message": message,
+                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                "observedGeneration": 0,
+            }],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a successful maintenance run. A full run also
+/// advances the quick clock (full subsumes quick). `lastContentReclaimedBytes`
+/// is `0`: `kopia maintenance run` emits no JSON, so the precise figure needs a
+/// `maintenance info` delta (tracked separately; the field round-trips).
+pub fn maintenance_ran_body(
+    op: &MaintenanceOp,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let ts = now.to_rfc3339();
+    let run = serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": 0 });
+    let mut status = serde_json::json!({
+        "ownership": { "owner": op.owner, "claimedAt": ts },
+        "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
+    });
+    match op.mode {
+        MaintenanceMode::Quick => {
+            status["quick"] = run;
+        }
+        MaintenanceMode::Full => {
+            status["quick"] = run.clone();
+            status["full"] = run;
+        }
+    }
+    serde_json::json!({ "status": status })
+}
+
+/// `{ "status": ... }` body when the lease is held by another owner (yield /
+/// prompt): record the observed holder and a `LeaseOwned=False` condition.
+pub fn lease_blocked_body(owner: &str, reason: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": {
+            "ownership": { "owner": owner },
+            "conditions": [lease_condition_body("False", reason, message, &chrono::Utc::now())],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a failed kopia maintenance call.
+pub fn maintenance_failed_body(e: &KopiaError) -> serde_json::Value {
+    serde_json::json!({
+        "status": {
+            "conditions": [lease_condition_body(
+                "False",
+                "MaintenanceFailed",
+                &format!("maintenance failed (class {}): {e}", e.class()),
+                &chrono::Utc::now(),
+            )],
+        }
+    })
+}
+
+/// A single `LeaseOwned` condition. The codebase uses a single-element
+/// `conditions` array (last-writer-wins for the salient state) for `Maintenance`.
+pub fn lease_condition_body(
+    status: &str,
+    reason: &str,
+    message: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": kopiur_api::maintenance::LEASE_OWNED_CONDITION,
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": now.to_rfc3339(),
+        "observedGeneration": 0,
+    })
+}
+
+/// A thin, best-effort wrapper around the kube status PATCH. Kept separate from
+/// the pure mapping so `main`'s correctness lives in the unit-tested layers.
+/// When no cluster is reachable, status updates are logged instead.
+pub struct StatusReporter {
+    inner: Option<Arc<Mutex<KubeStatusReporter>>>,
+    target: workspec::TargetRef,
+}
+
+impl StatusReporter {
+    /// Build a reporter for the work spec's target, falling back to a
+    /// log-only reporter when no kube client is reachable.
+    pub async fn try_new(spec: &MoverWorkSpec) -> Self {
+        let target = spec.target_ref.clone();
+        match KubeStatusReporter::try_new(&target).await {
+            Ok(r) => StatusReporter {
+                inner: Some(Arc::new(Mutex::new(r))),
+                target,
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "no kube client; status updates will be logged, not PATCHed"
+                );
+                StatusReporter {
+                    inner: None,
+                    target,
+                }
+            }
+        }
+    }
+
+    /// Report a status update — PATCHed to the cluster when a client is
+    /// available, otherwise logged (best-effort; PATCH failures are logged).
+    pub async fn report(&self, update: &StatusUpdate) {
+        match &self.inner {
+            Some(r) => {
+                let mut guard = r.lock().await;
+                if let Err(e) = guard.patch(update).await {
+                    warn!(error = %e, target = %self.target.name, "status PATCH failed");
+                }
+            }
+            None => {
+                info!(
+                    target = %self.target.name,
+                    phase = %update.phase,
+                    "status update (no cluster): {}",
+                    serde_json::to_string(update).unwrap_or_default()
+                );
+            }
+        }
+    }
+}
+
+/// The real kube PATCH path. Uses a dynamic API so the mover does not need to
+/// depend on the typed CRD structs (it PATCHes a merge body under `.status`).
+pub struct KubeStatusReporter {
+    api: kube::Api<kube::api::DynamicObject>,
+    kind: String,
+    namespace: String,
+    name: String,
+}
+
+impl KubeStatusReporter {
+    /// Build the dynamic-API reporter for `target`, erroring when no kube
+    /// client can be constructed.
+    pub async fn try_new(target: &workspec::TargetRef) -> Result<Self> {
+        use kube::core::{ApiResource, GroupVersionKind};
+
+        let client =
+            kube::Client::try_default()
+                .await
+                .map_err(|source| MoverError::KubeClient {
+                    source: Box::new(source),
+                })?;
+        let (group, version) = split_api_version(&target.api_version);
+        let gvk = GroupVersionKind::gvk(&group, &version, &target.kind);
+        let ar = ApiResource::from_gvk(&gvk);
+        let api =
+            kube::Api::<kube::api::DynamicObject>::namespaced_with(client, &target.namespace, &ar);
+        Ok(KubeStatusReporter {
+            api,
+            kind: target.kind.clone(),
+            namespace: target.namespace.clone(),
+            name: target.name.clone(),
+        })
+    }
+
+    /// PATCH the update's `.status` merge body onto the target object.
+    pub async fn patch(&mut self, update: &StatusUpdate) -> Result<()> {
+        use kube::api::{Patch, PatchParams};
+        let body = update.as_patch_body();
+        self.api
+            .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
+            .await
+            .map_err(|source| MoverError::StatusPatch {
+                kind: self.kind.clone(),
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+}
+
+/// Split `group/version` (or bare `version`) into `(group, version)`.
+pub fn split_api_version(api_version: &str) -> (String, String) {
+    match api_version.split_once('/') {
+        Some((g, v)) => (g.to_string(), v.to_string()),
+        None => (String::new(), api_version.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +981,62 @@ mod tests {
         // terminal transition — the status-churn rule).
         let body = StatusUpdate::running(ts()).as_patch_body();
         assert!(body["status"].get("logTail").is_none());
+    }
+
+    #[test]
+    fn split_api_version_grouped() {
+        assert_eq!(
+            split_api_version("kopiur.home-operations.com/v1alpha1"),
+            (
+                "kopiur.home-operations.com".to_string(),
+                "v1alpha1".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn split_api_version_core() {
+        assert_eq!(split_api_version("v1"), (String::new(), "v1".to_string()));
+    }
+
+    fn maint_op(mode: MaintenanceMode) -> MaintenanceOp {
+        MaintenanceOp {
+            mode,
+            owner: "kopiur/prod/nas".into(),
+            takeover_policy: kopiur_api::TakeoverPolicy::Never,
+        }
+    }
+
+    #[test]
+    fn quick_run_advances_only_quick_clock() {
+        let now = chrono::Utc::now();
+        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Quick), &now);
+        assert!(body["status"]["quick"]["lastRunAt"].is_string());
+        assert!(
+            body["status"]["full"].is_null(),
+            "a quick run must not stamp the full clock"
+        );
+        assert_eq!(body["status"]["ownership"]["owner"], "kopiur/prod/nas");
+    }
+
+    #[test]
+    fn full_run_subsumes_quick_clock() {
+        let now = chrono::Utc::now();
+        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Full), &now);
+        // Full subsumes quick: both clocks advance so quick isn't immediately due.
+        assert!(body["status"]["full"]["lastRunAt"].is_string());
+        assert!(body["status"]["quick"]["lastRunAt"].is_string());
+        assert_eq!(
+            body["status"]["full"]["lastRunAt"],
+            body["status"]["quick"]["lastRunAt"]
+        );
+    }
+
+    #[test]
+    fn lease_blocked_records_observed_owner_and_false_condition() {
+        let body = lease_blocked_body("other/owner", "LeaseHeldByOther", "held");
+        assert_eq!(body["status"]["ownership"]["owner"], "other/owner");
+        assert_eq!(body["status"]["conditions"][0]["status"], "False");
+        assert_eq!(body["status"]["conditions"][0]["type"], "LeaseOwned");
     }
 }

@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 kopiur-api = { workspace = true }
+# The pure VolSync→kopiur translation core for `migrate volsync` (kube-free);
+# the kube IO lives in cmd/migrate/{mod,io}.rs and calls into this crate.
+kopiur-migrate = { workspace = true }
 # The browse data-plane reuses the mover's pure Job/work-spec builders (the
 # session pod is a byte-identical mover Job) and the kopia client's typed
 # session surface (`SessionCmd`, `DirManifest`) for both transports.

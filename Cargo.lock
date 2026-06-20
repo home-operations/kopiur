@@ -1513,6 +1513,7 @@ dependencies = [
  "k8s-openapi",
  "kopiur-api",
  "kopiur-kopia",
+ "kopiur-migrate",
  "kopiur-mover",
  "kube",
  "rustls",
@@ -1588,6 +1589,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kopiur-migrate"
+version = "0.1.0"
+dependencies = [
+ "kopiur-api",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
