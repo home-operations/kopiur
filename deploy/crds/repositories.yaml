@@ -2294,6 +2294,12 @@ spec:
                   - type
                   type: object
                 type: array
+              lastReverifyAt:
+                description: |-
+                  Last reverify-request token honored from a `Snapshot`'s re-probe nudge
+                  (RFC3339); the loop guard that keeps each request a one-shot.
+                nullable: true
+                type: string
               observedGeneration:
                 description: '`metadata.generation` of the `spec` last reconciled; drives staleness detection.'
                 format: int64

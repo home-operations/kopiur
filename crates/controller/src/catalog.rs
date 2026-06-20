@@ -89,6 +89,33 @@ pub fn refresh_due(
     last.with_timezone(&Utc) + interval <= now
 }
 
+/// Whether a fresh reverify request should force a re-probe now, bypassing the
+/// refresh timer. Gated on the repo being `Ready` and the token differing from the
+/// last one honored (`status.lastReverifyAt`) — that comparison is the loop guard.
+pub fn reverify_due(token: Option<&str>, honored: Option<&str>, phase_ready: bool) -> bool {
+    phase_ready && token.is_some() && token != honored
+}
+
+/// Whether a `Snapshot` should (re)write the reverify-request annotation. Rate
+/// limited via the existing timestamp (shared across `Snapshot`s) so a wave of
+/// failures forces at most one re-probe per `min_interval`. Absent/unparseable ⇒ yes.
+pub fn should_request_reverify(
+    existing: Option<&str>,
+    now: DateTime<Utc>,
+    min_interval: std::time::Duration,
+) -> bool {
+    let Some(raw) = existing else {
+        return true;
+    };
+    let Ok(last) = DateTime::parse_from_rfc3339(raw) else {
+        return true;
+    };
+    let Ok(min_interval) = chrono::Duration::from_std(min_interval) else {
+        return true;
+    };
+    last.with_timezone(&Utc) + min_interval <= now
+}
+
 /// The steady-state requeue for a Ready repository: the usual 5 minutes, or the
 /// catalog refresh interval when the user asked for a faster re-scan cadence
 /// (otherwise a sub-5m `refreshInterval` would silently never fire on time).
@@ -824,6 +851,36 @@ mod tests {
         // Stale → due.
         let stale = (now - chrono::Duration::minutes(61)).to_rfc3339();
         assert!(refresh_due(Some(&stale), interval, now));
+    }
+
+    #[test]
+    fn reverify_due_honors_once_and_only_while_ready() {
+        // No request → never.
+        assert!(!reverify_due(None, None, true));
+        // Fresh request, Ready, never honored → force the re-probe.
+        assert!(reverify_due(Some("t1"), None, true));
+        // Already honored this exact token → no-op (the loop guard).
+        assert!(!reverify_due(Some("t1"), Some("t1"), true));
+        // A genuinely newer token re-fires.
+        assert!(reverify_due(Some("t2"), Some("t1"), true));
+        // Not Ready (already re-probing / Failed) → never force; the gate holds.
+        assert!(!reverify_due(Some("t2"), Some("t1"), false));
+    }
+
+    #[test]
+    fn should_request_reverify_rate_limits_on_the_existing_stamp() {
+        let now = Utc::now();
+        let min = std::time::Duration::from_secs(60);
+        // No prior request → request.
+        assert!(should_request_reverify(None, now, min));
+        // Unparseable → request (defensive).
+        assert!(should_request_reverify(Some("nope"), now, min));
+        // Within the window → skip (a wave of failures collapses to one re-probe).
+        let recent = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        assert!(!should_request_reverify(Some(&recent), now, min));
+        // Past the window → request again.
+        let old = (now - chrono::Duration::seconds(61)).to_rfc3339();
+        assert!(should_request_reverify(Some(&old), now, min));
     }
 
     #[test]

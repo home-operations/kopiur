@@ -601,6 +601,22 @@ async fn bootstrap_cluster_via_mover(
     let job_name = format!("{name}-bootstrap");
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &job_ns);
 
+    // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
+    // recycle/create gates below), stamping the token at create time as the loop guard.
+    let reverify_token = repo
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(crate::consts::REVERIFY_REQUESTED_ANNOTATION))
+        .map(String::as_str);
+    let reverify = catalog::reverify_due(
+        reverify_token,
+        repo.status
+            .as_ref()
+            .and_then(|s| s.last_reverify_at.as_deref()),
+        repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
+    );
+
     if let Some(job) = job_api.get_opt(&job_name).await? {
         let already_ready =
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
@@ -625,14 +641,16 @@ async fn bootstrap_cluster_via_mover(
             Some(success) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-                if catalog::bootstrap_recycle_due(
-                    already_ready,
-                    repo.metadata.generation,
-                    repo.status.as_ref().and_then(|s| s.observed_generation),
-                    cluster_last_refresh_at(repo),
-                    interval,
-                    chrono::Utc::now(),
-                ) {
+                if reverify
+                    || catalog::bootstrap_recycle_due(
+                        already_ready,
+                        repo.metadata.generation,
+                        repo.status.as_ref().and_then(|s| s.observed_generation),
+                        cluster_last_refresh_at(repo),
+                        interval,
+                        chrono::Utc::now(),
+                    )
+                {
                     tracing::debug!(repo = %name, "recycling finished bootstrap Job for a catalog refresh");
                     job_api
                         .delete(&job_name, &kube::api::DeleteParams::background())
@@ -661,14 +679,16 @@ async fn bootstrap_cluster_via_mover(
     // when a re-run is actually warranted (`bootstrap_create_due`: catalog refresh
     // due, or spec changed) — re-creating unconditionally would pin the refresh
     // cadence to the Job TTL instead of `catalog.refreshInterval`.
-    if !catalog::bootstrap_create_due(
-        repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
-        repo.metadata.generation,
-        repo.status.as_ref().and_then(|s| s.observed_generation),
-        cluster_last_refresh_at(repo),
-        CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
-        chrono::Utc::now(),
-    ) {
+    if !(reverify
+        || catalog::bootstrap_create_due(
+            repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
+            repo.metadata.generation,
+            repo.status.as_ref().and_then(|s| s.observed_generation),
+            cluster_last_refresh_at(repo),
+            CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+            chrono::Utc::now(),
+        ))
+    {
         return Ok(Action::requeue(catalog::reconcile_interval(
             repo.spec.catalog.as_ref(),
         )));
@@ -767,12 +787,13 @@ async fn bootstrap_cluster_via_mover(
     let cm = jobs::build_config_map(&inputs)?;
     let job = jobs::build_job(&inputs);
     io::apply_mover_objects(&ctx.client, &job_ns, &job_name, &cm, &job).await?;
-    io::patch_status(
-        api,
-        name,
-        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() }),
-    )
-    .await?;
+    // Stamp the reverify token (loop guard): this request is now honored.
+    let mut create_status =
+        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() });
+    if let Some(token) = reverify_token {
+        create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
+    }
+    io::patch_status(api, name, create_status).await?;
     tracing::info!(repo = %name, backend = backend.kind_str(), namespace = %job_ns, "launched ClusterRepository bootstrap Job");
     Ok(Action::requeue(Duration::from_secs(15)))
 }

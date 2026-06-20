@@ -1,5 +1,6 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Api;
+use kube::api::{Patch, PatchParams};
 
 use kopiur_api::backend::Backend;
 use kopiur_api::cluster_repository::IdentityDefaults;
@@ -234,6 +235,66 @@ pub async fn repository_ready(
             Ok(repo.status.and_then(|s| s.phase) == ready)
         }
     }
+}
+
+/// Stamp the reverify annotation (`now`, RFC3339) to request an immediate
+/// connectivity re-probe. Best-effort: skips a non-`Ready` repo (the gate already
+/// holds) and a request within the rate-limit window; a missing repo is a no-op.
+pub async fn request_repository_reverify(
+    client: &kube::Client,
+    repo_ref: &RepositoryRef,
+    default_ns: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    /// At most one forced re-probe per repository per this window.
+    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    let ready = Some(kopiur_api::RepositoryPhase::Ready);
+    let key = crate::consts::REVERIFY_REQUESTED_ANNOTATION;
+    let body = |ts: &str| {
+        Patch::Merge(serde_json::json!({
+            "metadata": { "annotations": { key: ts } }
+        }))
+    };
+    let pp = PatchParams::apply(super::apply::FIELD_MANAGER);
+    let stamp = now.to_rfc3339();
+
+    match repo_lookup(repo_ref, default_ns) {
+        RepoLookup::Namespaced { namespace, name } => {
+            let api: Api<Repository> = Api::namespaced(client.clone(), &namespace);
+            let Some(repo) = api.get_opt(&name).await? else {
+                return Ok(());
+            };
+            if repo.status.as_ref().and_then(|s| s.phase) != ready {
+                return Ok(());
+            }
+            let existing = repo.metadata.annotations.as_ref().and_then(|a| a.get(key));
+            if crate::catalog::should_request_reverify(
+                existing.map(String::as_str),
+                now,
+                MIN_INTERVAL,
+            ) {
+                api.patch(&name, &pp, &body(&stamp)).await?;
+            }
+        }
+        RepoLookup::Cluster { name } => {
+            let api: Api<ClusterRepository> = Api::all(client.clone());
+            let Some(repo) = api.get_opt(&name).await? else {
+                return Ok(());
+            };
+            if repo.status.as_ref().and_then(|s| s.phase) != ready {
+                return Ok(());
+            }
+            let existing = repo.metadata.annotations.as_ref().and_then(|a| a.get(key));
+            if crate::catalog::should_request_reverify(
+                existing.map(String::as_str),
+                now,
+                MIN_INTERVAL,
+            ) {
+                api.patch(&name, &pp, &body(&stamp)).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the named `Namespace` is being torn down — its `deletionTimestamp` is

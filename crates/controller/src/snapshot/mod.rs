@@ -349,6 +349,24 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         ),
                     )
                     .await?;
+                    // A failed backup may mean the backend went away: nudge the repository
+                    // to re-probe now so the gate engages without waiting for the catalog
+                    // refresh. Best-effort — a nudge error must not mask the failure above.
+                    if let Some(repo_ref) = backup
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.resolved.as_ref())
+                        .and_then(|r| r.repository.as_ref())
+                        && let Err(e) = io::request_repository_reverify(
+                            &ctx.client,
+                            repo_ref,
+                            &namespace,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        tracing::debug!(backup = %name, error = %e, "repository reverify nudge failed (ignored)");
+                    }
                 }
                 // The run is terminal (the Job exhausted its retries) — reap any CSI
                 // staging objects. No-op for Direct.

@@ -192,6 +192,10 @@ pub struct RepositoryStatus {
     /// Resolved kopia server endpoint/auth, pinned by the reconciler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerStatus>,
+    /// Last reverify-request token honored from a `Snapshot`'s re-probe nudge
+    /// (RFC3339); the loop guard that keeps each request a one-shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reverify_at: Option<String>,
     /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,

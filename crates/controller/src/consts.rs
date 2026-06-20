@@ -64,6 +64,11 @@ pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replica
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
 
+/// Annotation a `Snapshot` stamps (RFC3339) on its repository when a backup fails,
+/// requesting an immediate connectivity re-probe. Honored once via
+/// `status.lastReverifyAt`; rate-limited so a wave of failures forces one re-probe.
+pub const REVERIFY_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/reverify-requested-at";
+
 /// Condition reason when a `Maintenance` (managed or external) covers the repo.
 pub const MAINTENANCE_CONFIGURED_REASON: &str = "MaintenanceConfigured";
 /// `action` for the maintenance-configuration check Event.
