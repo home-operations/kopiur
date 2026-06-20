@@ -489,6 +489,12 @@ spec:
                         description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
                         nullable: true
                         type: string
+                      timezone:
+                        description: |-
+                          IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses
+                          the enclosing schedule's timezone, else the controller default (UTC).
+                        nullable: true
+                        type: string
                     required:
                     - cron
                     type: object
@@ -500,6 +506,12 @@ spec:
                         type: string
                       jitter:
                         description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
+                        nullable: true
+                        type: string
+                      timezone:
+                        description: |-
+                          IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses
+                          the enclosing schedule's timezone, else the controller default (UTC).
                         nullable: true
                         type: string
                     required:
