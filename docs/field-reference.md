@@ -402,9 +402,13 @@ no-op, surfaced as the `ScratchStorageClassIgnored` condition + a Warning Event 
 
 ### CatalogBounds
 
-`{ retain?: { perIdentity?, maxAgeDays? }, refreshInterval?, fallbackNamespace? }` —
-bounds materialized `discovered` `Snapshot`s. `refreshInterval` is the re-scan
-cadence (Go-style duration; default **`1h`**, minimum `30s`, webhook-enforced).
+`{ retain?: { perIdentity?, maxAgeDays? }, periodicRefresh?, refreshInterval?,
+fallbackNamespace? }` — bounds materialized `discovered` `Snapshot`s. An initial scan
+always runs (first bootstrap + on spec change); **`periodicRefresh`** (bool, default
+`false`) opts in to repeated re-scans so out-of-band snapshots keep appearing — off by
+default because each re-scan re-runs the bootstrap Job for object-store/volume-backed
+repos. `refreshInterval` is the re-scan cadence **when `periodicRefresh` is on** (Go-style
+duration; default **`1h`**, minimum `30s`, webhook-enforced; inert when off).
 `retain.perIdentity` keeps the newest N rows per `username@hostname:path` (`0`
 disables materialization; negative rejected); `retain.maxAgeDays` (≥ 1) drops
 rows for snapshots older than N days. Bounds expire **CR rows only — never kopia

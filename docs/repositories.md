@@ -166,7 +166,8 @@ How it behaves (all of this is automatic — there is nothing to install):
 
 - **Discovered means "not produced through this Repository CR".** Snapshots Kopiur itself takes via your `SnapshotPolicy`s already have their own `Snapshot` CRs and are never duplicated as discovered rows.
 - **Discovered rows are forced `deletionPolicy: Retain`.** Deleting a discovered `Snapshot` CR deletes only the CR — Kopiur **never** deletes a kopia snapshot it didn't create. (And because the row mirrors repository state, it reappears on the next refresh; to keep rows away permanently, bound them with `catalog.retain` below.)
-- **The scan repeats** every `catalog.refreshInterval` (default **1h**, minimum `30s`), so snapshots written out-of-band *after* adoption keep appearing — and rows whose snapshot was pruned repository-side are expired (the CR is removed). The interval is the *only* thing that drives re-scans: object-store repositories re-list by re-running their (self-cleaning) bootstrap Job, and a Job removed early by its `ttlSecondsAfterFinished` does **not** trigger an extra scan — set `refreshInterval: 24h` and you get one scan a day, regardless of the Job TTL.
+- **An initial scan always runs** (on first bootstrap and again on any spec change), so adopting a repository surfaces its existing history immediately.
+- **Repeated re-scanning is opt-in.** Set `catalog.periodicRefresh: true` to keep re-scanning every `catalog.refreshInterval` (default **1h**, minimum `30s`) so snapshots written out-of-band *after* adoption keep appearing — and rows whose snapshot was pruned repository-side are expired. **Off by default**, because for object-store / volume-backed repos each re-scan re-runs the (self-cleaning) bootstrap Job; leaving it off means the repository bootstraps once and isn't re-run on a timer. When on, the interval is the *only* thing that drives re-scans — a Job removed early by its `ttlSecondsAfterFinished` does **not** trigger an extra scan, so `refreshInterval: 24h` gives one scan a day regardless of the Job TTL.
 - **The row carries the real data**: the kopia snapshot ID, the foreign `username@hostname:path` identity, the snapshot's timing and logical size.
 
 The knobs, all under `spec.catalog`:
@@ -174,7 +175,8 @@ The knobs, all under `spec.catalog`:
 ```yaml
 spec:
     catalog:
-        refreshInterval: 1h # how often to re-scan (default 1h, min 30s)
+        periodicRefresh: true # opt in to repeated re-scans (default false = scan once)
+        refreshInterval: 1h # how often to re-scan when periodicRefresh is on (default 1h, min 30s)
         retain:
             perIdentity: 100 # keep the newest N rows per username@hostname:path (0 = no rows)
             maxAgeDays: 90 # no rows for snapshots older than this

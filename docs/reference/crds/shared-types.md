@@ -238,8 +238,12 @@ discovered snapshots are always `deletionPolicy: Retain`, and stay restorable vi
   per `username@hostname:path` identity (snapshots this cluster produced don't
   count; `0` disables discovered-Snapshot materialization entirely), and
   `maxAgeDays` expires discovered CRs older than N days (minimum 1).
-- **`refreshInterval`** — how often to re-scan the repository (Go-style duration
-  like `30s`/`5m`/`1h`; minimum `30s`, default `1h`).
+- **`periodicRefresh`** — opt in to repeated re-scans (bool, default `false`). An
+  initial scan always runs (first bootstrap + on any spec change); set this to keep
+  re-scanning so out-of-band snapshots keep appearing. Off by default because each
+  re-scan re-runs the bootstrap Job for object-store / volume-backed repos.
+- **`refreshInterval`** — how often to re-scan **when `periodicRefresh` is on**
+  (Go-style duration like `30s`/`5m`/`1h`; minimum `30s`, default `1h`; inert when off).
 - **`fallbackNamespace`** — where to materialize discovered `Snapshot`s whose
   identity hostname doesn't map to an allowed namespace (ClusterRepository only;
   rejected on a namespaced `Repository`, which always materializes into its own

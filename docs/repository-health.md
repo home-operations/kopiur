@@ -47,9 +47,11 @@ already applied — `Snapshot` was the only write path that skipped it.
   **in-process on every reconcile** — steady-state every 5 minutes, or immediately when a
   re-probe is requested. Detection here is prompt.
 - **Object-store and volume-backed filesystem** repos connect in a **short bootstrap
-  Job** (the controller can't reach the backend or mount the volume in-process). Their
-  `phase` is only refreshed when that Job is recycled on the **catalog refresh cadence
-  (`catalog.refreshInterval`, default `1h`)** — *or* on demand via the re-probe nudge below.
+  Job** (the controller can't reach the backend or mount the volume in-process). By
+  default they bootstrap **once** and are **not** re-probed on a timer — `phase` then
+  changes only on a spec change or via the re-probe nudge below. Opting in to
+  `catalog.periodicRefresh: true` recycles the bootstrap Job every
+  `catalog.refreshInterval` (default `1h`), which also re-probes connectivity proactively.
 
 ### Reactive re-probe (closing most of the latency window)
 
@@ -60,14 +62,15 @@ once (loop-guarded on `status.lastReverifyAt`) and flips to `Failed` if the back
 gone — at which point the gate suppresses all further Jobs.
 
 !!! warning "Known limitation: a one-Job detection window"
-    For object-store / volume-backed repositories, the gate reads `status.phase`, which
-    is only refreshed on the `catalog.refreshInterval` cadence (default `1h`). So at the
-    **onset** of an outage, **one** scheduled backup can still launch a doomed Job before
-    anything flips the phase. The reactive re-probe then engages within ~60s of that
-    first failure, so you get **one** doomed Job per outage instead of one per schedule
-    tick — not zero. Bare-path filesystem repos don't have this window (they re-probe
-    every reconcile). To tighten it for object stores, lower `catalog.refreshInterval`,
-    or see the active probe below.
+    For object-store / volume-backed repositories, the gate reads `status.phase`. By
+    default (`periodicRefresh` off) the phase isn't re-probed on a timer, so an outage
+    that begins between backups is detected when the **next** backup fails: that failure
+    fires the reactive re-probe, the phase flips to `Failed` within ~60s, and the gate
+    then suppresses every subsequent Job — **one** doomed Job per outage instead of one
+    per schedule tick, not zero. Bare-path filesystem repos don't have this window (they
+    re-probe every reconcile). To get proactive timed detection for object stores, enable
+    `catalog.periodicRefresh` (and tune `refreshInterval`) — at the cost of re-running
+    the bootstrap Job on that cadence — or see the active probe below.
 
 ## Not yet implemented — the stronger preflight
 

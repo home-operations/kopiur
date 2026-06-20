@@ -56,13 +56,14 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: false # adopt: the repo already exists, never re-initialize it
-  # Discovery knobs (all optional — these are the defaults made explicit, except
-  # retain, which is unbounded by default). The catalog re-scans the repository on
-  # this cadence, so snapshots the OLD tooling keeps writing during the migration
-  # window appear too; retain bounds the discovered Snapshot CR ROWS for very
-  # large histories (expiring a row never deletes the kopia snapshot behind it).
+  # Discovery knobs (all optional). An initial scan always runs on connect; here we
+  # opt in to PERIODIC re-scans so snapshots the OLD tooling keeps writing during the
+  # migration window keep appearing (off by default — each re-scan re-runs the
+  # bootstrap Job). retain bounds the discovered Snapshot CR ROWS for very large
+  # histories (expiring a row never deletes the kopia snapshot behind it).
   catalog:
-    refreshInterval: 1h # default 1h, minimum 30s
+    periodicRefresh: true # opt in to repeated re-scans (default false = scan once)
+    refreshInterval: 1h # cadence when periodicRefresh is on (default 1h, minimum 30s)
     retain:
       perIdentity: 100 # newest N rows per username@hostname:path
       maxAgeDays: 90 # no rows for snapshots older than this
