@@ -465,8 +465,10 @@ Externally tagged — `workloadExec` / `runJob` / `httpRequest`. Each carries
 
 `{ quick?: CronSpec, deep?: { schedule, storageClassName?, capacity? }, successExpr?,
 verifyFilesPercent? }` — `successExpr` is a CEL bool predicate over
-`stats{files,bytes,errors}`/`snapshot`/`restored{files,checksumMatches}`, validated
-at admission. §4
+`stats{files,bytes,errors}`/`snapshot`/`restored{files,checksumMatches}`/`tier`
+(`"quick"`|`"deep"`), validated at admission. For `quick`, `stats.files`/`stats.bytes`
+are filled from the verified snapshot's manifest (so `stats.files > 0` is meaningful);
+`restored` is deep-only. §4
 
 ### RestoreSource
 
@@ -503,8 +505,10 @@ alias on the wire). `snapshotRef` is `{ name }`.
 
 ### CronSpec
 
-`{ cron, jitter? }` — used by `Maintenance` quick/full, `Verification`, and
-`RepositoryReplication`.
+`{ cron, jitter?, timezone? }` — used by `Maintenance` quick/full, `Verification`, and
+`RepositoryReplication`. `timezone` is an IANA name (e.g. `America/Chicago`) the cron is
+evaluated in; absent uses the enclosing schedule's timezone, else UTC. Validated at
+admission.
 
 ### RunStatus
 
