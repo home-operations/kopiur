@@ -194,6 +194,7 @@ nav:
       - Permissions, UID & GID: permissions.md
       - Security context: security-context.md
       - Maintenance: maintenance.md
+      - Repository health & preflight: repository-health.md
       - Web UI (kopia server): server.md
       - Troubleshooting: troubleshooting.md
   # Scenarios = end-to-end, problem-driven walkthroughs (one apply-ready bundle
