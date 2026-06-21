@@ -158,14 +158,18 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             // logTail/failure/progress and the pinned resolution). Self-gated by
             // `kstatus_settled_for`, so a healed Restore never re-patches.
             if !kstatus_settled_for(restore, phase) {
-                let (reason, message) = if phase == RestorePhase::Completed {
-                    (
-                        "RestoreSucceeded",
-                        "the restore mover completed; the snapshot data was written \
-                         into the target",
+                let status = if phase == RestorePhase::Completed {
+                    // The mover wrote `phase: Completed` + `status.resolved` in one
+                    // PATCH, so `resolved` is observed here — distinguish a real
+                    // restore from a deploy-or-restore that came up empty.
+                    restore_success_status(
+                        restore,
+                        restore.status.as_ref().and_then(|s| s.resolved.as_ref()),
                     )
                 } else {
-                    (
+                    restore_ready_status(
+                        restore,
+                        phase,
                         "MoverJobFailed",
                         "the restore mover reported a terminal failure; see \
                          status.failure / status.logTail for the cause, fix it, and \
@@ -173,12 +177,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                          never retries",
                     )
                 };
-                io::patch_status(
-                    &api,
-                    &name,
-                    restore_ready_status(restore, phase, reason, message),
-                )
-                .await?;
+                io::patch_status(&api, &name, status).await?;
             }
             return Ok(Action::requeue(std::time::Duration::from_secs(600)));
         }
@@ -938,6 +937,47 @@ async fn finalize_populator(
     Ok(())
 }
 
+/// Terminal-success status for a DIRECT restore, distinguishing a real restore
+/// from a deploy-or-restore that resolved to no snapshot. The mover pins
+/// `resolution: NoSnapshot` for a deferred `Continue` that found nothing (it left
+/// the target empty), so reading it here lets the controller stamp the
+/// self-describing `Resolved=True NoSnapshotContinue` condition + an accurate
+/// message instead of falsely claiming data was written. Mirrors the populator
+/// finalize and the controller-side empty (`selection: None`) branch.
+fn restore_success_status(
+    restore: &Restore,
+    resolved: Option<&kopiur_api::restore::ResolvedRestore>,
+) -> serde_json::Value {
+    let empty =
+        resolved.and_then(|r| r.resolution) == Some(kopiur_api::ResolutionOutcome::NoSnapshot);
+    if empty {
+        let msg = "no snapshot matched the source; provisioned an empty target volume \
+                   (deploy-or-restore)";
+        let conditions = io::upsert_condition(
+            &existing_conditions(restore),
+            "Resolved",
+            true,
+            "NoSnapshotContinue",
+            msg,
+            restore.metadata.generation,
+        );
+        restore_ready_status_on(
+            restore,
+            &conditions,
+            RestorePhase::Completed,
+            "NoSnapshotContinue",
+            msg,
+        )
+    } else {
+        restore_ready_status(
+            restore,
+            RestorePhase::Completed,
+            "RestoreSucceeded",
+            "the restore mover completed; the snapshot data was written into the target",
+        )
+    }
+}
+
 /// Drive a restore-with-explicit-target: create the restore mover Job (writing
 /// into the target PVC), then track it to terminal.
 ///
@@ -1018,16 +1058,20 @@ async fn drive_direct_restore(
                 ctx.metrics.set_restore_duration(namespace, name, secs);
             }
             if phase != Some(RestorePhase::Completed) {
+                // A deferred (object-store/identity) resolution may have come up
+                // empty under `Continue`. The mover pins the outcome to
+                // status.resolved before its Job goes terminal, so a fresh read
+                // tells a real restore from a deploy-or-restore-empty — without it
+                // the success message would falsely claim "data was written".
+                let resolved = api
+                    .get_opt(name)
+                    .await?
+                    .and_then(|r| r.status)
+                    .and_then(|s| s.resolved);
                 io::patch_status(
                     api,
                     name,
-                    restore_ready_status(
-                        restore,
-                        RestorePhase::Completed,
-                        "RestoreSucceeded",
-                        "the restore mover Job completed; the snapshot data was \
-                         written into the target",
-                    ),
+                    restore_success_status(restore, resolved.as_ref()),
                 )
                 .await?;
             }
