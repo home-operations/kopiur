@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.11](https://github.com/home-operations/kopiur/compare/0.4.10...0.4.11) (2026-06-21)
+
+
+### Features
+
+* **dev:** oxfmt doesn't play nicely on fresh repo setup ([2907ed5](https://github.com/home-operations/kopiur/commit/2907ed50e65b04b7fd9522cfb0a9be131c59b187))
+* repository health fail-fast, cron timezones, and verification successExpr fixes ([#150](https://github.com/home-operations/kopiur/issues/150)) ([9068373](https://github.com/home-operations/kopiur/commit/90683739162f491011fc3272dbf1b08981b31bcb))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.10 manifest ([5616213](https://github.com/home-operations/kopiur/commit/56162139235910bfc456d34f5139aea29a9214c0))
+
 ## [0.4.10](https://github.com/home-operations/kopiur/compare/0.4.9...0.4.10) (2026-06-20)
 
 
