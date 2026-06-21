@@ -333,11 +333,12 @@ pub struct RestoreSelector {
     /// What to do when no snapshot matches once the wait window closes: `Fail`
     /// (exit non-zero) or `Continue` (leave the target empty — deploy-or-restore).
     pub on_missing: kopiur_api::restore::OnMissingSnapshot,
-    /// Seconds to keep re-listing for a matching snapshot before applying
-    /// `on_missing` (the `waitTimeout` window, now polled inside the Job). Bounded
-    /// by the Job's `activeDeadlineSeconds`. `None` ⇒ resolve once, no wait.
+    /// Absolute RFC3339 instant to keep re-listing until before applying
+    /// `on_missing` — the `waitTimeout` window, anchored by the controller at the
+    /// Restore's creation (NOT at Job start), so it matches the `snapshotRef` path
+    /// and is stable across pod retries. `None` ⇒ resolve once, no wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_timeout_secs: Option<i64>,
+    pub wait_deadline: Option<String>,
 }
 
 /// Payload for a restore run.

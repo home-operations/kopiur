@@ -106,7 +106,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
                 as_of: Some("2026-06-19T05:54:19Z".into()),
                 offset: 0,
                 on_missing: kopiur_api::restore::OnMissingSnapshot::Continue,
-                wait_timeout_secs: Some(300),
+                wait_deadline: Some("2026-06-19T06:00:00Z".into()),
             }),
             target_path: "/data".into(),
             anchor: SnapshotAnchor::default(),
@@ -138,7 +138,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
     assert_eq!(sel["username"], "restore");
     assert_eq!(sel["offset"], 0);
     assert_eq!(sel["onMissing"], "Continue");
-    assert_eq!(sel["waitTimeoutSecs"], 300);
+    assert_eq!(sel["waitDeadline"], "2026-06-19T06:00:00Z");
 }
 
 #[test]

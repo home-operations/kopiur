@@ -662,6 +662,43 @@ impl StatusReporter {
             }
         }
     }
+
+    /// Read the target's currently-pinned `status.resolved`, if any. Used by the
+    /// in-Job restore resolver to reuse a snapshot a PRIOR pod attempt already
+    /// pinned (deterministic across Job retries) instead of re-resolving "latest".
+    /// Best-effort: returns `None` when there's no client or the read fails.
+    pub async fn resolved(&self) -> Option<ResolvedRestore> {
+        let r = self.inner.as_ref()?;
+        let guard = r.lock().await;
+        match guard.read_resolved().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, target = %self.target.name, "status.resolved read failed");
+                None
+            }
+        }
+    }
+
+    /// Pin `resolved` to the target's `status.resolved` via a resolved-only merge
+    /// PATCH (no `phase`, so it never trips the Restore phase enum). The in-Job
+    /// resolver calls this BEFORE restoring so the chosen snapshot is durably
+    /// recorded — a retry reuses it, the controller adopts it (pin-once), and the
+    /// outcome survives a later failure of the terminal status PATCH. Best-effort.
+    pub async fn pin_resolved(&self, resolved: &ResolvedRestore) {
+        match &self.inner {
+            Some(r) => {
+                let mut guard = r.lock().await;
+                if let Err(e) = guard.pin_resolved(resolved).await {
+                    warn!(error = %e, target = %self.target.name, "status.resolved pin failed");
+                }
+            }
+            None => info!(
+                target = %self.target.name,
+                "status.resolved pin (no cluster): {}",
+                serde_json::to_string(resolved).unwrap_or_default()
+            ),
+        }
+    }
 }
 
 /// The real kube PATCH path. Uses a dynamic API so the mover does not need to
@@ -702,6 +739,44 @@ impl KubeStatusReporter {
     pub async fn patch(&mut self, update: &StatusUpdate) -> Result<()> {
         use kube::api::{Patch, PatchParams};
         let body = update.as_patch_body();
+        self.api
+            .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
+            .await
+            .map_err(|source| MoverError::StatusPatch {
+                kind: self.kind.clone(),
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// GET the target and deserialize its `status.resolved`, if present.
+    async fn read_resolved(&self) -> Result<Option<ResolvedRestore>> {
+        let obj = self
+            .api
+            .get_opt(&self.name)
+            .await
+            .map_err(|source| MoverError::StatusPatch {
+                kind: self.kind.clone(),
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(obj
+            .and_then(|o| {
+                o.data
+                    .get("status")
+                    .and_then(|s| s.get("resolved"))
+                    .cloned()
+            })
+            .and_then(|v| serde_json::from_value(v).ok()))
+    }
+
+    /// Resolved-only `.status` merge PATCH (no `phase`), pinning `status.resolved`.
+    async fn pin_resolved(&mut self, resolved: &ResolvedRestore) -> Result<()> {
+        use kube::api::{Patch, PatchParams};
+        let body = serde_json::json!({ "status": { "resolved": resolved } });
         self.api
             .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
             .await

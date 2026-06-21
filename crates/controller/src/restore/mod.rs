@@ -944,44 +944,52 @@ async fn finalize_populator(
     Ok(())
 }
 
-/// Terminal-success status for a DIRECT restore, distinguishing a real restore
-/// from a deploy-or-restore that resolved to no snapshot. The mover pins
-/// `resolution: NoSnapshot` for a deferred `Continue` that found nothing (it left
-/// the target empty), so reading it here lets the controller stamp the
-/// self-describing `Resolved=True NoSnapshotContinue` condition + an accurate
-/// message instead of falsely claiming data was written. Mirrors the populator
-/// finalize and the controller-side empty (`selection: None`) branch.
+/// Terminal-success status for a DIRECT restore, branching on the pinned
+/// `resolution`. The mover pins `Snapshot` (real restore) or `NoSnapshot` (a
+/// deferred `Continue` that found nothing and left the target empty) BEFORE the
+/// Job goes terminal, so the controller can stamp an accurate message:
+/// - `Snapshot` → `RestoreSucceeded`, "data was written";
+/// - `NoSnapshot` → self-describing `Resolved=True NoSnapshotContinue` + empty-volume message;
+/// - unknown (best-effort pin AND terminal PATCH both lost) → a NEUTRAL message
+///   that never falsely claims data was written. Mirrors the populator finalize.
 fn restore_success_status(
     restore: &Restore,
     resolved: Option<&kopiur_api::restore::ResolvedRestore>,
 ) -> serde_json::Value {
-    let empty =
-        resolved.and_then(|r| r.resolution) == Some(kopiur_api::ResolutionOutcome::NoSnapshot);
-    if empty {
-        let msg = "no snapshot matched the source; provisioned an empty target volume \
-                   (deploy-or-restore)";
-        let conditions = io::upsert_condition(
-            &existing_conditions(restore),
-            "Resolved",
-            true,
-            "NoSnapshotContinue",
-            msg,
-            restore.metadata.generation,
-        );
-        restore_ready_status_on(
-            restore,
-            &conditions,
-            RestorePhase::Completed,
-            "NoSnapshotContinue",
-            msg,
-        )
-    } else {
-        restore_ready_status(
+    match resolved.and_then(|r| r.resolution) {
+        Some(kopiur_api::ResolutionOutcome::NoSnapshot) => {
+            let msg = "no snapshot matched the source; provisioned an empty target volume \
+                       (deploy-or-restore)";
+            let conditions = io::upsert_condition(
+                &existing_conditions(restore),
+                "Resolved",
+                true,
+                "NoSnapshotContinue",
+                msg,
+                restore.metadata.generation,
+            );
+            restore_ready_status_on(
+                restore,
+                &conditions,
+                RestorePhase::Completed,
+                "NoSnapshotContinue",
+                msg,
+            )
+        }
+        Some(kopiur_api::ResolutionOutcome::Snapshot) => restore_ready_status(
             restore,
             RestorePhase::Completed,
             "RestoreSucceeded",
             "the restore mover completed; the snapshot data was written into the target",
-        )
+        ),
+        // Outcome unknown (the mover's best-effort status PATCHes were both lost):
+        // report completion truthfully without claiming data was written.
+        None => restore_ready_status(
+            restore,
+            RestorePhase::Completed,
+            "RestoreSucceeded",
+            "the restore mover Job completed; see status.logTail for what was restored",
+        ),
     }
 }
 
@@ -1807,8 +1815,10 @@ async fn resolve_snapshot(
 ) -> Result<Option<ResolveOutcome>> {
     use kopiur_api::common::{ObjectRef, ResolvedIdentity};
     // Selector policy is the same for both deferred arms: the per-mode default
-    // onMissing unless the spec overrides it, and the waitTimeout window in
-    // seconds (polled inside the mover Job).
+    // onMissing unless the spec overrides it, and the waitTimeout window as an
+    // ABSOLUTE deadline anchored at the Restore's creation (so the in-Job wait
+    // matches the snapshotRef path and is stable across pod retries), polled by
+    // the mover until that wall-clock instant.
     let on_missing = effective_on_missing(
         restore
             .spec
@@ -1817,13 +1827,17 @@ async fn resolve_snapshot(
             .and_then(|p| p.on_missing_snapshot),
         &restore.spec.source,
     );
-    let wait_timeout_secs = restore
+    let wait_deadline = restore
         .spec
         .policy
         .as_ref()
         .and_then(|p| p.wait_timeout.as_deref())
         .and_then(crate::snapshot_schedule::parse_go_duration)
-        .and_then(|d| i64::try_from(d.as_secs()).ok());
+        .and_then(|d| {
+            let created = restore.metadata.creation_timestamp.as_ref()?.0.as_second();
+            let secs = i64::try_from(d.as_secs()).ok()?;
+            chrono::DateTime::from_timestamp(created.checked_add(secs)?, 0).map(|t| t.to_rfc3339())
+        });
     match &restore.spec.source {
         RestoreSource::SnapshotRef(r) => {
             let ns = r.namespace.as_deref().unwrap_or(namespace);
@@ -1866,7 +1880,7 @@ async fn resolve_snapshot(
                 as_of: id.as_of.clone(),
                 offset: id.offset.unwrap_or(0),
                 on_missing,
-                wait_timeout_secs,
+                wait_deadline: wait_deadline.clone(),
             })))
         }
         RestoreSource::FromPolicy(c) => {
@@ -1890,7 +1904,7 @@ async fn resolve_snapshot(
                 as_of: c.as_of.clone(),
                 offset: c.offset,
                 on_missing,
-                wait_timeout_secs,
+                wait_deadline: wait_deadline.clone(),
             })))
         }
     }
