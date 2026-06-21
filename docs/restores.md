@@ -60,30 +60,11 @@ source:
 Whatever the source resolves to is written ONCE to `status.resolved.kopiaSnapshotID` and reused for the rest of the restore's life. New snapshots appearing mid-flight (a schedule firing) cannot change which snapshot this Restore writes.
 ///
 
-/// warning | `fromPolicy` / `identity`-without-`snapshotID` need the repo reachable by the **controller**
+/// note | `fromPolicy` / `identity`-without-`snapshotID` resolve "latest" on **every** backend
 
-Resolving "latest / `asOf` / `offset` for a policy" lists snapshots **in-process in the controller** (not in a mover Job), so the controller must be able to reach the repository:
+Resolving "latest / `asOf` / `offset` for a policy" lists the repository's snapshots **inside the restore mover Job**, which reaches every backend the same way a backup does — so this works on S3, Azure, GCS, B2, SFTP, WebDAV, rclone, and filesystem alike. No controller-side repo mount is needed.
 
-- **Object stores** (S3, Azure, GCS, B2, SFTP, WebDAV, rclone): not supported for in-process listing — name the snapshot explicitly with `snapshotRef`, or `identity` with a pinned `snapshotID`. A `fromPolicy` restore against an object-store repository fails loudly with exactly that fix.
-- **Filesystem repositories**: the repository must be mounted into the **controller** pod at the repository's `backend.filesystem.path`, and the controller must run as a UID/GID that can read it. By default only the mover Jobs mount the repo, so `fromPolicy`/`identity` resolution fails with an actionable error (`the filesystem repository path '…' is not accessible to the controller`) until you add the mount. `snapshotRef` and a pinned `identity.snapshotID` need **no** controller mount.
-
-Mount a filesystem repo into the controller via Helm (matching the NFS/PVC the repo lives on, here `/repo`):
-
-```yaml
-controller:
-    extraVolumes:
-        - name: repo
-          nfs: { server: nfs.example.com, path: /tank/kopiur }
-    extraVolumeMounts:
-        - name: repo
-          mountPath: /repo # == backend.filesystem.path
-podSecurityContext:
-    runAsNonRoot: true
-    runAsUser: 1234 # a UID/GID that can read the repo
-    runAsGroup: 1234
-    fsGroup: 1234
-    fsGroupChangePolicy: OnRootMismatch
-```
+If no matching snapshot exists yet, `onMissingSnapshot` applies (`Continue` comes up empty — deploy-or-restore; `Fail` fails the Restore). `waitTimeout` keeps the Job re-checking for the snapshot to appear before that decision — so it must be shorter than the Job's `failurePolicy.activeDeadlineSeconds` (the admission webhook enforces this when you set both).
 
 ///
 
@@ -172,11 +153,7 @@ The defaults are the point: an _explicit_ restore that finds nothing is an error
 
 On `Continue` with no snapshot, Kopiur **actually provisions the empty volume** — it doesn't just mark the `Restore` complete. For `target.populator: {}` it provisions an empty prime PVC and rebinds it to the claiming PVC (so a workload pod can bind and start); for `target.pvc` it creates the empty PVC. The "no snapshot ⇒ empty" decision is **pinned to `status.resolved` (`resolution: NoSnapshot`) once and never re-resolved**, so a snapshot that appears *later* can never silently restore over a volume the app is already using — re-create the `Restore` if you want to pick up a new snapshot. The Restore reports `Completed` with `Resolved=True reason=NoSnapshotContinue`.
 
-/// note | Deploy-or-restore-to-empty needs a filesystem-backed repository
-
-The empty-volume path applies to `fromPolicy`/`identity` sources against a **filesystem** repository. For object-store backends (S3/Azure/GCS/B2), an in-controller source resolution isn't supported, so `fromPolicy` with no snapshot surfaces an error rather than coming up empty — use an explicit `snapshotRef`, or seed the first snapshot.
-
-///
+The empty-volume path applies to `fromPolicy`/`identity` sources on **every** backend — the restore Job resolves the source in-place, so an object-store `fromPolicy` with no snapshot comes up empty under `Continue` just like a filesystem one.
 
 ### `waitTimeout` — wait before giving up
 

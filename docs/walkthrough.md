@@ -244,9 +244,9 @@ This `fromPolicy` source is what powers **deploy-or-restore**: the same manifest
 
 ///
 
-/// warning | `fromPolicy` needs a filesystem repository
+/// note | `fromPolicy` resolves "latest" on every backend
 
-Resolving "latest for a policy" lists snapshots in-process, which requires a repo the controller can mount — so it works for **filesystem** backends only. On S3 and the other object-store backends, name the snapshot explicitly (`snapshotRef` / `--from-snapshot`) or pin an exact ID via the [`identity` source](restores.md#identity--a-raw-kopia-identity); the operator fails loudly with that exact fix if you try.
+Resolving "latest for a policy" lists the repository's snapshots inside the restore Job, so it works on S3 and the other object-store backends just as it does on a filesystem repo — no controller-side repo mount needed. You can still name the snapshot explicitly (`snapshotRef` / `--from-snapshot`) or pin an exact ID via the [`identity` source](restores.md#identity--a-raw-kopia-identity) when you don't want "latest".
 
 ///
 

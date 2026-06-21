@@ -9,7 +9,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
 use kopiur_api::{OnMissingSnapshot, Restore, RestorePhase, RestoreSource, RestoreTarget};
 
-use crate::error::{Error, Result};
 use crate::io;
 
 /// Which source mode a restore uses, as a stable string (mirrors
@@ -186,30 +185,6 @@ pub(super) fn existing_conditions(restore: &Restore) -> Vec<Condition> {
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
 }
-/// Keep only snapshots taken at or before `asOf` (point-in-time selection,
-/// applied BEFORE `offset` so the two compose: "the previous one as of last
-/// Tuesday"). `None` keeps the full list. The webhook validates the format at
-/// admission; re-parsing here is defensive (one validator, two callers).
-pub(super) fn filter_as_of(
-    mut snapshots: Vec<kopiur_kopia::SnapshotListEntry>,
-    as_of: Option<&str>,
-) -> Result<Vec<kopiur_kopia::SnapshotListEntry>> {
-    let Some(s) = as_of else {
-        return Ok(snapshots);
-    };
-    let cutoff = chrono::DateTime::parse_from_rfc3339(s)
-        .map_err(|e| {
-            Error::Validation(format!(
-                "source asOf {s:?} is not an RFC3339 timestamp; use e.g. \
-                 2026-05-01T00:00:00Z (the newest snapshot at or before this instant \
-                 is restored): {e}"
-            ))
-        })?
-        .with_timezone(&chrono::Utc);
-    snapshots.retain(|e| e.end_time <= cutoff);
-    Ok(snapshots)
-}
-
 /// Seconds left in the `waitTimeout` window that started at the Restore's
 /// creation, or `None` when no (parseable) window is configured or it has
 /// elapsed. Pure, clock-free — unit-tested without a cluster.
@@ -221,12 +196,4 @@ pub fn wait_remaining_secs(
     let timeout = crate::snapshot_schedule::parse_go_duration(wait_timeout?)?;
     let deadline = created_epoch.saturating_add(timeout.as_secs().try_into().ok()?);
     (now_epoch < deadline).then(|| (deadline - now_epoch) as u64)
-}
-/// Pick the snapshot at `offset` (0 = newest) from a newest-first list.
-pub(super) fn pick_offset(
-    snapshots: Vec<kopiur_kopia::SnapshotListEntry>,
-    offset: i64,
-) -> Option<String> {
-    let idx = offset.max(0) as usize;
-    snapshots.into_iter().nth(idx).map(|e| e.id)
 }

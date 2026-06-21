@@ -53,9 +53,9 @@ fn backup_roundtrip() {
 #[test]
 fn restore_roundtrip() {
     let spec = MoverWorkSpec {
-        version: 1,
+        version: 2,
         operation: Operation::Restore(RestoreOp {
-            snapshot_id: "abc123".into(),
+            source: RestoreSelection::Snapshot("abc123".into()),
             target_path: "/data".into(),
             anchor: SnapshotAnchor {
                 source_path: "/pvc/db".into(),
@@ -88,6 +88,57 @@ fn restore_roundtrip() {
     };
     assert_eq!(roundtrip(&spec), spec);
     assert_eq!(spec.operation.kind_str(), "Restore");
+    // The externally-tagged source serializes under its own camelCase key.
+    let v = serde_json::to_value(&spec).unwrap();
+    assert_eq!(v["operation"]["restore"]["source"]["snapshot"], "abc123");
+}
+
+#[test]
+fn restore_resolve_source_roundtrips_and_wire_shape() {
+    // The in-Job (object-store) path: an unresolved selector instead of an id.
+    let spec = MoverWorkSpec {
+        version: 2,
+        operation: Operation::Restore(RestoreOp {
+            source: RestoreSelection::Resolve(RestoreSelector {
+                username: "restore".into(),
+                hostname: "prod".into(),
+                source_path: Some("/pvc/db".into()),
+                as_of: Some("2026-06-19T05:54:19Z".into()),
+                offset: 0,
+                on_missing: kopiur_api::restore::OnMissingSnapshot::Continue,
+                wait_timeout_secs: Some(300),
+            }),
+            target_path: "/data".into(),
+            anchor: SnapshotAnchor::default(),
+            ignore_permission_errors: None,
+            write_files_atomically: None,
+        }),
+        identity: sample_identity(),
+        repository: RepositoryConnect::S3 {
+            bucket: "backups".into(),
+            endpoint: None,
+            prefix: None,
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+        },
+        target_ref: TargetRef {
+            kind: "Restore".into(),
+            ..sample_target()
+        },
+        hook_plan: HookPlanSummary::default(),
+        options: MoverOptions::default(),
+        cache: Default::default(),
+        throttle: Default::default(),
+    };
+    assert_eq!(roundtrip(&spec), spec);
+    let v = serde_json::to_value(&spec).unwrap();
+    let sel = &v["operation"]["restore"]["source"]["resolve"];
+    assert_eq!(sel["username"], "restore");
+    assert_eq!(sel["offset"], 0);
+    assert_eq!(sel["onMissing"], "Continue");
+    assert_eq!(sel["waitTimeoutSecs"], 300);
 }
 
 #[test]
@@ -268,7 +319,7 @@ fn defaults_fill_in_when_absent() {
         "targetRef": {"apiVersion": "kopiur.home-operations.com/v1alpha1", "kind": "Snapshot", "name": "n", "namespace": "ns"}
     }"#;
     let spec: MoverWorkSpec = serde_json::from_str(json).unwrap();
-    assert_eq!(spec.version, 1);
+    assert_eq!(spec.version, 2);
     assert_eq!(spec.options.progress_interval_secs, 5);
     assert_eq!(spec.options.operation_timeout_secs, None);
     assert!(spec.hook_plan.pre.is_empty());
@@ -396,7 +447,7 @@ fn object_store_backends_convert_and_roundtrip() {
 fn restore_op_maps_options_and_defaults_absent() {
     // Options present → mapped onto the kopia client options.
     let op = RestoreOp {
-        snapshot_id: "s".into(),
+        source: RestoreSelection::Snapshot("s".into()),
         target_path: "/data".into(),
         anchor: SnapshotAnchor::default(),
         ignore_permission_errors: Some(false),
@@ -406,9 +457,9 @@ fn restore_op_maps_options_and_defaults_absent() {
     assert_eq!(opts.ignore_permission_errors, Some(false));
     assert_eq!(opts.write_files_atomically, Some(true));
 
-    // Older wire payload without the option/anchor fields still deserializes
-    // (forward/backward compatible), mapping to kopia defaults (None/empty).
-    let json = r#"{"snapshotId":"s","targetPath":"/data"}"#;
+    // A wire payload with just the source + path still deserializes (option/anchor
+    // fields default), mapping to kopia defaults (None/empty).
+    let json = r#"{"source":{"snapshot":"s"},"targetPath":"/data"}"#;
     let parsed: RestoreOp = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.ignore_permission_errors, None);
     assert_eq!(parsed.restore_options().write_files_atomically, None);

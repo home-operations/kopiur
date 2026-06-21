@@ -69,44 +69,6 @@ pub enum Error {
     #[error("invariant violated: {0}")]
     Invariant(String),
 
-    /// A `Restore` source needs an in-process kopia snapshot listing
-    /// (`fromPolicy` / `identity` without a pinned `snapshotID`) against a
-    /// backend the controller cannot list in-process. Structural: the spec must
-    /// change to a supported source form.
-    #[error(
-        "cannot resolve the restore source by identity: in-process snapshot listing is only \
-         implemented for filesystem-backed repositories (this repository's backend is \
-         '{backend}'). Use source.snapshotRef to pick a Snapshot CR, or pin the exact \
-         snapshot with source.identity.snapshotID"
-    )]
-    UnsupportedSourceResolution {
-        /// The repository backend kind the listing was attempted against.
-        backend: &'static str,
-    },
-
-    /// A `Restore` source needs an in-process kopia snapshot listing
-    /// (`fromPolicy` / `identity` without a pinned `snapshotID`) against a
-    /// FILESYSTEM repository whose path is not mounted into the controller pod.
-    /// Resolving "latest / offset / asOf" lists snapshots in-process, which
-    /// requires the controller to be able to read the repository — but the repo
-    /// volume is normally mounted only into the mover Jobs. Structural: the
-    /// deployment must mount the repo into the controller, or the spec must pin
-    /// the snapshot explicitly. Surfaced instead of letting the raw kopia
-    /// `stat <path>: no such file or directory` leak (actionable-error-messages).
-    #[error(
-        "cannot resolve the restore source by identity: the filesystem repository path \
-         '{path}' is not accessible to the controller. fromPolicy/identity resolution lists \
-         snapshots in-process, so the repository must be mounted into the CONTROLLER pod at \
-         '{path}' and the controller must run as a UID that can read it (controller.extraVolumes \
-         + extraVolumeMounts + podSecurityContext). Alternatively, restore by source.snapshotRef \
-         or pin source.identity.snapshotID, which need no controller mount"
-    )]
-    FilesystemResolutionUnmounted {
-        /// The repository's `backend.filesystem.path` (where the controller must
-        /// have the repo mounted to list in-process).
-        path: String,
-    },
-
     /// Self-managed webhook TLS setup failed on the **cluster IO** side: reading/
     /// writing the serving Secret or injecting `caBundle` into a webhook
     /// configuration ([`crate::webhook_tls`]). Transient — the webhook config or
@@ -193,9 +155,7 @@ impl Error {
             | Error::BlockedOnGrant(_)
             | Error::Serialization(_)
             | Error::InvalidSchedule(_)
-            | Error::Invariant(_)
-            | Error::UnsupportedSourceResolution { .. }
-            | Error::FilesystemResolutionUnmounted { .. } => ErrorClass::Structural,
+            | Error::Invariant(_) => ErrorClass::Structural,
         }
     }
 }
@@ -332,20 +292,6 @@ mod tests {
             Error::Invariant("no name".into()).class(),
             ErrorClass::Structural
         );
-    }
-
-    #[test]
-    fn unsupported_source_resolution_is_structural_and_message_names_the_fix() {
-        let err = Error::UnsupportedSourceResolution { backend: "s3" };
-        // Structural: only a spec change (snapshotRef / pinned snapshotID) fixes it,
-        // so it must not retry on the transient 30 s cadence.
-        assert_eq!(err.class(), ErrorClass::Structural);
-        // The message a human acts on: what failed, why, and both fixes.
-        let msg = err.to_string();
-        assert!(msg.contains("'s3'"), "{msg}");
-        assert!(msg.contains("filesystem-backed"), "{msg}");
-        assert!(msg.contains("source.snapshotRef"), "{msg}");
-        assert!(msg.contains("source.identity.snapshotID"), "{msg}");
     }
 
     #[test]

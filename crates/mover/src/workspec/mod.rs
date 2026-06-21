@@ -291,19 +291,67 @@ impl SnapshotAnchor {
     }
 }
 
+/// Which snapshot a restore run targets. Externally tagged (exactly one variant)
+/// so a restore is either pre-resolved by the controller or resolved in-Job —
+/// never both, and a new variant can't compile until every `match` handles it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestoreSelection {
+    /// A concrete kopia snapshot manifest id the controller already resolved
+    /// (from a `snapshotRef` Snapshot CR, or an explicit `identity.snapshotID`).
+    /// Self-heals a stale id via [`RestoreOp::anchor`].
+    Snapshot(String),
+    /// Resolve the snapshot in-Job by listing the repository for an identity and
+    /// picking newest/offset/asOf. This is what makes "restore the latest" work
+    /// for object stores: in-process listing only works for filesystem repos, so
+    /// `fromPolicy`/`identity`-without-id defer the listing to the mover, which
+    /// reaches every backend.
+    Resolve(RestoreSelector),
+}
+
+/// An unresolved restore source: list the repository for this kopia identity and
+/// pick a snapshot by `asOf` (point-in-time) then `offset` (0 = latest). Mirrors
+/// the `Restore` CRD's `fromPolicy`/`identity` selection so the mover resolves it
+/// exactly as the controller's filesystem path used to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreSelector {
+    /// The kopia `username` to match.
+    pub username: String,
+    /// The kopia `hostname` to match.
+    pub hostname: String,
+    /// The kopia source path to match; absent matches any path for the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Restore the newest snapshot at or before this RFC3339 instant (validated at
+    /// admission; the mover re-parses defensively).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// Which snapshot to pick: 0 = latest, 1 = previous, and so on.
+    #[serde(default)]
+    pub offset: i64,
+    /// What to do when no snapshot matches once the wait window closes: `Fail`
+    /// (exit non-zero) or `Continue` (leave the target empty — deploy-or-restore).
+    pub on_missing: kopiur_api::restore::OnMissingSnapshot,
+    /// Seconds to keep re-listing for a matching snapshot before applying
+    /// `on_missing` (the `waitTimeout` window, now polled inside the Job). Bounded
+    /// by the Job's `activeDeadlineSeconds`. `None` ⇒ resolve once, no wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_secs: Option<i64>,
+}
+
 /// Payload for a restore run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreOp {
-    /// The snapshot manifest id to restore from. Resolved by the controller
-    /// (browse-and-reference, not a timestamp).
-    pub snapshot_id: String,
+    /// Which snapshot to restore: a controller-resolved id, or an in-Job selector.
+    pub source: RestoreSelection,
     /// Absolute path inside the mover pod to restore into (e.g. `/data`).
     pub target_path: String,
     /// Stable identity anchors for the referenced snapshot, used to self-heal a
-    /// stale `snapshot_id` (kopia rewrites the manifest id on pin) when the
-    /// restore reports the id not found. Empty ⇒ no fallback (a raw
-    /// user-supplied id stays a hard failure).
+    /// stale id (kopia rewrites the manifest id on pin) when a
+    /// [`RestoreSelection::Snapshot`] restore reports the id not found. Empty ⇒ no
+    /// fallback; never set for [`RestoreSelection::Resolve`] (it lists fresh).
     #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
     pub anchor: SnapshotAnchor,
     /// `--[no-]ignore-permission-errors` (Restore CRD `options`; kopia default
@@ -320,10 +368,10 @@ impl RestoreOp {
     /// Translate the carried restore flags into the kopia client's options.
     ///
     /// ```
-    /// use kopiur_mover::workspec::RestoreOp;
+    /// use kopiur_mover::workspec::{RestoreOp, RestoreSelection};
     ///
     /// let op = RestoreOp {
-    ///     snapshot_id: "k1".into(),
+    ///     source: RestoreSelection::Snapshot("k1".into()),
     ///     target_path: "/data".into(),
     ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
@@ -1004,7 +1052,11 @@ impl ThrottleSpec {
 }
 
 fn default_spec_version() -> u32 {
-    1
+    // v2: RestoreOp carries `source: RestoreSelection` (was a bare `snapshot_id`)
+    // so object-store restores resolve "latest" in-Job. A work spec is written and
+    // read by a single controller+mover image pair per Job, so v1 and v2 never mix
+    // within one run — no cross-version deserializer is needed.
+    2
 }
 
 #[cfg(test)]
