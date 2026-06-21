@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
@@ -55,19 +56,26 @@ pub fn next_fire(
     jitter_window: Option<StdDuration>,
     seed: &str,
     after: DateTime<Utc>,
+    tz: Tz,
 ) -> Result<DateTime<Utc>> {
     let resolved = jitter::substitute_h(cron_expr, seed);
     let cron = croner::Cron::new(&resolved)
         .parse()
         .map_err(|e| Error::InvalidSchedule(format!("{resolved}: {e}")))?;
+    // Evaluate the cron in the target zone so a wall-clock field like `0 2 * * *`
+    // means 02:00 *there* (DST-correct), then convert the chosen instant back to UTC
+    // for storage/requeue. Jitter is a tz-independent offset on the resolved instant.
+    let after_local = after.with_timezone(&tz);
     let slot = cron
-        .find_next_occurrence(&after, false)
+        .find_next_occurrence(&after_local, false)
         .map_err(|e| Error::InvalidSchedule(format!("no next occurrence for {resolved}: {e}")))?;
     let offset = match jitter_window {
         Some(w) => jitter::offset(seed, slot.timestamp(), w),
         None => StdDuration::ZERO,
     };
-    Ok(slot + chrono::Duration::from_std(offset).unwrap_or_else(|_| chrono::Duration::zero()))
+    let slot =
+        slot + chrono::Duration::from_std(offset).unwrap_or_else(|_| chrono::Duration::zero());
+    Ok(slot.with_timezone(&Utc))
 }
 
 /// Whether a slot is due to fire at `now` (i.e. the scheduled time has arrived).
@@ -228,6 +236,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         .jitter
         .as_deref()
         .and_then(parse_go_duration);
+    let tz = kopiur_api::common::resolve_tz(schedule.spec.schedule.timezone.as_deref());
 
     // The previously-pinned slot (status.nextSchedule) is the one that may now be
     // due. If absent (first reconcile), compute the upcoming slot from now and
@@ -253,7 +262,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 .policy_ref
                 .as_ref()
                 .map(|_| scheduled_backup_name(&sched_name, slot));
-            let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now)?;
+            let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
             let (conditions, generation) = schedule_ready_status(schedule);
             io::patch_status(
                 &api,
@@ -276,7 +285,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     }
 
     // First reconcile (nextSchedule not yet pinned). Compute the upcoming slot.
-    let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now)?;
+    let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
 
     // Honor `runOnCreate`: fire one backup immediately instead of waiting for the
     // first cron slot. The run is anchored to the schedule's creation time (not
@@ -509,8 +518,8 @@ mod tests {
         // 02:00 daily, no jitter. From 2026-05-24T03:00 the next slot is the
         // following day's 02:00.
         let after = at(2026, 5, 24, 3, 0);
-        let a = next_fire("0 2 * * *", None, "uid-1", after).unwrap();
-        let b = next_fire("0 2 * * *", None, "uid-1", after).unwrap();
+        let a = next_fire("0 2 * * *", None, "uid-1", after, Tz::UTC).unwrap();
+        let b = next_fire("0 2 * * *", None, "uid-1", after, Tz::UTC).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, at(2026, 5, 25, 2, 0));
     }
@@ -519,7 +528,7 @@ mod tests {
     fn next_fire_applies_deterministic_jitter_within_window() {
         let after = at(2026, 5, 24, 3, 0);
         let window = StdDuration::from_secs(1800); // 30m
-        let fired = next_fire("0 2 * * *", Some(window), "uid-1", after).unwrap();
+        let fired = next_fire("0 2 * * *", Some(window), "uid-1", after, Tz::UTC).unwrap();
         let base = at(2026, 5, 25, 2, 0);
         let delta = (fired - base).num_seconds();
         assert!(
@@ -527,7 +536,7 @@ mod tests {
             "jittered fire {fired} must be within [base, base+30m); delta={delta}"
         );
         // Deterministic: same inputs reproduce the exact same fire time.
-        let again = next_fire("0 2 * * *", Some(window), "uid-1", after).unwrap();
+        let again = next_fire("0 2 * * *", Some(window), "uid-1", after, Tz::UTC).unwrap();
         assert_eq!(fired, again);
     }
 
@@ -536,15 +545,38 @@ mod tests {
         // `H 2 * * *` must parse (H resolved deterministically) and land at
         // some minute past 02:00.
         let after = at(2026, 5, 24, 3, 0);
-        let fired = next_fire("H 2 * * *", None, "uid-x", after).unwrap();
+        let fired = next_fire("H 2 * * *", None, "uid-x", after, Tz::UTC).unwrap();
         assert_eq!(fired.format("%H").to_string(), "02");
     }
 
     #[test]
     fn next_fire_rejects_bad_cron() {
         let after = at(2026, 5, 24, 3, 0);
-        let err = next_fire("totally bad", None, "uid", after).unwrap_err();
+        let err = next_fire("totally bad", None, "uid", after, Tz::UTC).unwrap_err();
         assert!(matches!(err, Error::InvalidSchedule(_)));
+    }
+
+    #[test]
+    fn next_fire_evaluates_cron_in_the_given_timezone() {
+        // `0 2 * * *` is "2am wall-clock". In America/Chicago during CDT (UTC-5,
+        // summer) the next 2am after 2026-05-24T03:00Z (= 2026-05-23 22:00 CDT) is
+        // 2026-05-24 02:00 CDT = 2026-05-24T07:00Z. UTC would have given 05-25 02:00Z.
+        let after = at(2026, 5, 24, 3, 0);
+        let chicago = next_fire("0 2 * * *", None, "uid-1", after, Tz::America__Chicago).unwrap();
+        assert_eq!(chicago, at(2026, 5, 24, 7, 0));
+        let utc = next_fire("0 2 * * *", None, "uid-1", after, Tz::UTC).unwrap();
+        assert_eq!(utc, at(2026, 5, 25, 2, 0));
+        assert_ne!(chicago, utc);
+    }
+
+    #[test]
+    fn next_fire_is_dst_correct_across_the_spring_forward() {
+        // US DST 2026 begins 2026-03-08 (clocks jump 02:00→03:00, CST→CDT). A 2am
+        // daily cron after 2026-03-07T12:00Z must land on a real instant: the
+        // 03-08 02:00 CST slot (= 08:00Z), not a skipped wall-clock time.
+        let after = at(2026, 3, 7, 12, 0);
+        let fired = next_fire("0 2 * * *", None, "uid-dst", after, Tz::America__Chicago).unwrap();
+        assert_eq!(fired, at(2026, 3, 8, 8, 0));
     }
 
     #[test]

@@ -21,8 +21,10 @@ flowchart TB
 Once the `Repository` connects, Kopiur materializes snapshots it didn't create as
 `Snapshot` CRs with `origin=discovered`, in the repository's namespace. Discovered
 backups are **forced to `deletionPolicy: Retain`** — Kopiur never deletes data it
-didn't create. The scan repeats every `catalog.refreshInterval` (default 1h), so
-snapshots the old tooling keeps writing during the migration window show up too;
+didn't create. The initial scan runs as soon as it connects; set
+`catalog.periodicRefresh: true` (off by default) to keep re-scanning every
+`catalog.refreshInterval` (default 1h) so snapshots the old tooling keeps writing
+during the migration window show up too;
 bound the rows with `catalog.retain` for very large histories (see
 [The catalog](../repositories.md#the-catalog--discovered-snapshots)). List them:
 

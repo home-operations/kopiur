@@ -1059,7 +1059,7 @@ async fn run_verify_flow(
 
     // Run the tier and collect the result environment for successExpr. A kopia
     // failure is terminal; a clean run yields the stats the predicate inspects.
-    let (stats, restored) = match &op.tier {
+    let (stats, restored, snapshot_id) = match &op.tier {
         VerifyTier::Quick(q) => {
             if let Err(e) = client.snapshot_verify(&q.to_kopia()).await {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
@@ -1070,18 +1070,32 @@ async fn run_verify_flow(
                 });
             }
             // kopia `snapshot verify` reports no machine-readable file/byte counts on
-            // stdout, so we conservatively report 0/0/0 for the predicate environment
-            // and rely on the exit code for the integrity verdict. (A future kopia
-            // JSON surface can populate real counts.)
-            (kopiur_api::VerifyStats::default(), None)
+            // its own, so derive the predicate environment from the snapshot manifest:
+            // a healthy quick verify of a non-empty snapshot then satisfies the common
+            // `stats.files > 0` predicate instead of always failing on a hardcoded 0.
+            // `errors` is 0 — a passing verify found no integrity errors. Best-effort:
+            // if the manifest can't be listed we fall back to 0/0/0 and the exit code
+            // remains the integrity verdict.
+            match resolve_latest_snapshot(client, spec).await {
+                Ok(Some(entry)) => (
+                    kopiur_api::VerifyStats {
+                        files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
+                        bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
+                        errors: 0,
+                    },
+                    None,
+                    Some(entry.id),
+                ),
+                _ => (kopiur_api::VerifyStats::default(), None, None),
+            }
         }
         VerifyTier::Deep(d) => {
             // Resolve the snapshot id to restore: the controller's choice, else the
             // newest snapshot for this identity.
             let id = match &d.snapshot_id {
                 Some(id) => id.clone(),
-                None => match resolve_latest_snapshot_id(client, spec).await {
-                    Ok(Some(id)) => id,
+                None => match resolve_latest_snapshot(client, spec).await {
+                    Ok(Some(entry)) => entry.id,
                     Ok(None) => {
                         let err = MoverError::VerifyNoSnapshot {
                             source_path: spec.identity.source_path.clone(),
@@ -1140,6 +1154,7 @@ async fn run_verify_flow(
                     files,
                     checksum_matches: true,
                 }),
+                Some(id),
             )
         }
     };
@@ -1147,11 +1162,15 @@ async fn run_verify_flow(
     // Evaluate the optional CEL successExpr over the result — killing the silent
     // "0 files" success when the user opted in.
     if let Some(expr) = &op.success_expr {
-        let snapshot = std::collections::BTreeMap::new();
+        let mut snapshot = std::collections::BTreeMap::new();
+        if let Some(id) = &snapshot_id {
+            snapshot.insert("id".to_string(), id.clone());
+        }
         let inputs = kopiur_api::SuccessExprInputs {
             stats,
             snapshot,
             restored,
+            tier: op.tier.kind_str().to_string(),
             _marker: std::marker::PhantomData,
         };
         match kopiur_api::eval_success_expr(expr, &inputs) {
@@ -1180,19 +1199,18 @@ async fn run_verify_flow(
     Ok(())
 }
 
-/// The newest snapshot id for this run's identity, by source path (the kopia
-/// catalog records the path authoritatively; the pod's user/host differ).
-async fn resolve_latest_snapshot_id(
+/// The newest snapshot for this run's identity, by source path (the kopia catalog
+/// records the path authoritatively; the pod's user/host differ). The full manifest
+/// entry is returned so callers can read both its id (deep-verify restore target) and
+/// its `stats` (quick-verify predicate environment).
+async fn resolve_latest_snapshot(
     client: &KopiaClient,
     spec: &MoverWorkSpec,
-) -> Result<Option<String>, KopiaError> {
+) -> Result<Option<kopiur_kopia::SnapshotListEntry>, KopiaError> {
     let mut list = client.snapshot_list(None).await?;
     list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
     let path = &spec.identity.source_path;
-    Ok(list
-        .into_iter()
-        .find(|e| e.source.path == *path)
-        .map(|e| e.id))
+    Ok(list.into_iter().find(|e| e.source.path == *path))
 }
 
 /// Best-effort recursive file count under `dir` for the deep-verify result

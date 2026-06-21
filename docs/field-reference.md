@@ -402,9 +402,13 @@ no-op, surfaced as the `ScratchStorageClassIgnored` condition + a Warning Event 
 
 ### CatalogBounds
 
-`{ retain?: { perIdentity?, maxAgeDays? }, refreshInterval?, fallbackNamespace? }` —
-bounds materialized `discovered` `Snapshot`s. `refreshInterval` is the re-scan
-cadence (Go-style duration; default **`1h`**, minimum `30s`, webhook-enforced).
+`{ retain?: { perIdentity?, maxAgeDays? }, periodicRefresh?, refreshInterval?,
+fallbackNamespace? }` — bounds materialized `discovered` `Snapshot`s. An initial scan
+always runs (first bootstrap + on spec change); **`periodicRefresh`** (bool, default
+`false`) opts in to repeated re-scans so out-of-band snapshots keep appearing — off by
+default because each re-scan re-runs the bootstrap Job for object-store/volume-backed
+repos. `refreshInterval` is the re-scan cadence **when `periodicRefresh` is on** (Go-style
+duration; default **`1h`**, minimum `30s`, webhook-enforced; inert when off).
 `retain.perIdentity` keeps the newest N rows per `username@hostname:path` (`0`
 disables materialization; negative rejected); `retain.maxAgeDays` (≥ 1) drops
 rows for snapshots older than N days. Bounds expire **CR rows only — never kopia
@@ -465,8 +469,10 @@ Externally tagged — `workloadExec` / `runJob` / `httpRequest`. Each carries
 
 `{ quick?: CronSpec, deep?: { schedule, storageClassName?, capacity? }, successExpr?,
 verifyFilesPercent? }` — `successExpr` is a CEL bool predicate over
-`stats{files,bytes,errors}`/`snapshot`/`restored{files,checksumMatches}`, validated
-at admission. §4
+`stats{files,bytes,errors}`/`snapshot`/`restored{files,checksumMatches}`/`tier`
+(`"quick"`|`"deep"`), validated at admission. For `quick`, `stats.files`/`stats.bytes`
+are filled from the verified snapshot's manifest (so `stats.files > 0` is meaningful);
+`restored` is deep-only. §4
 
 ### RestoreSource
 
@@ -503,8 +509,10 @@ alias on the wire). `snapshotRef` is `{ name }`.
 
 ### CronSpec
 
-`{ cron, jitter? }` — used by `Maintenance` quick/full, `Verification`, and
-`RepositoryReplication`.
+`{ cron, jitter?, timezone? }` — used by `Maintenance` quick/full, `Verification`, and
+`RepositoryReplication`. `timezone` is an IANA name (e.g. `America/Chicago`) the cron is
+evaluated in; absent uses the enclosing schedule's timezone, else UTC. Validated at
+admission.
 
 ### RunStatus
 

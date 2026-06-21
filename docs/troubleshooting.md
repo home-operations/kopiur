@@ -51,7 +51,20 @@ $ kubectl describe repository primary -n <ns>   # the condition message names th
 
 ## Backup (or Restore) stuck in `Pending` with no Job
 
-The mover is blocked on a precondition. The two common ones, both surfaced as conditions and `Warning` Events:
+The mover is blocked on a precondition. The common ones, all surfaced as conditions and `Warning` Events:
+
+### `RepositoryNotReady` — the repository backend is unreachable
+
+A `Snapshot` won't spawn a mover Job while its referenced `Repository`/`ClusterRepository` is not `Ready` (its backend is unreachable — e.g. a NAS that didn't come back after a power loss). Instead of a storm of pods that each only fail on `kopia repository connect`, the backup is held in `Pending` with reason `RepositoryNotReady` and resumes automatically once the repository reconnects.
+
+```console
+$ kubectl get snapshots <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
+# → "waiting for repository `nas` to become `Ready` before launching the backup…"
+$ kubectl get repository <repo> -n <ns>   # fix the backend; watch PHASE return to Ready
+```
+
+When a backup *does* fail because the backend went away mid-run, the operator nudges the repository to re-probe connectivity immediately (rather than waiting for the next catalog refresh), so the gate engages within ~60s instead of up to an hour.
 
 ### `CredentialsAvailable=False` — Secret missing in the workload namespace
 

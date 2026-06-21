@@ -351,7 +351,8 @@ fn slot_for(repl: &RepositoryReplication, after: DateTime<Utc>) -> Result<DateTi
         .jitter
         .as_deref()
         .and_then(parse_go_duration);
-    next_fire(&repl.spec.schedule.cron, jitter, &seed, after)
+    let tz = kopiur_api::common::resolve_tz(repl.spec.schedule.timezone.as_deref());
+    next_fire(&repl.spec.schedule.cron, jitter, &seed, after, tz)
 }
 
 /// Parse `status.lastReplicated` (RFC3339) into a `DateTime<Utc>`.
@@ -504,6 +505,7 @@ mod tests {
                 schedule: CronSpec {
                     cron: cron.into(),
                     jitter: None,
+                    timezone: None,
                 },
                 mover: None,
                 suspend: false,

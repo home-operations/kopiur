@@ -207,6 +207,7 @@ mod tests {
             schedule: kopiur_api::common::CronSpec {
                 cron: "0 5 * * 0".into(),
                 jitter: None,
+                timezone: None,
             },
             storage_class_name: storage_class.map(str::to_string),
             capacity: capacity.map(str::to_string),

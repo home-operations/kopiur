@@ -228,6 +228,29 @@ pub fn validate_cron(expr: &str) -> ValidationResult {
     }
 }
 
+/// Validate an optional IANA timezone name against the same `chrono-tz` database the
+/// controller uses at scheduling time, so a typo (e.g. `America/Chicgo`) is rejected at
+/// apply time rather than silently resolving to UTC at the next reconcile. `None` (use
+/// the controller default) is always valid.
+///
+/// ```
+/// use kopiur_api::validate::validate_timezone;
+///
+/// assert!(validate_timezone(None).is_ok());
+/// assert!(validate_timezone(Some("America/Chicago")).is_ok());
+/// assert!(validate_timezone(Some("UTC")).is_ok());
+/// assert!(validate_timezone(Some("America/Chicgo")).is_err());
+/// ```
+pub fn validate_timezone(name: Option<&str>) -> ValidationResult {
+    match name {
+        None => Ok(()),
+        Some(tz) if tz.parse::<chrono_tz::Tz>().is_ok() => Ok(()),
+        Some(tz) => Err(ValidationError::InvalidTimezone {
+            name: tz.to_string(),
+        }),
+    }
+}
+
 /// The shared `spec.server` rules the type system can't express (server addendum):
 ///   * `auth.insecure` requires `acknowledgeInsecure: true` — a no-auth server exposes
 ///     full read/read of the repository, so it must be explicit.

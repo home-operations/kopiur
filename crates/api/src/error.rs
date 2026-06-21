@@ -111,6 +111,15 @@ pub enum ValidationError {
         reason: String,
     },
 
+    /// A schedule's `timezone` is not a recognized IANA timezone name (e.g. a typo
+    /// like `America/Chicgo`), rejected at apply time rather than silently falling
+    /// back to UTC at reconcile.
+    #[error("invalid timezone {name:?}: not a recognized IANA timezone name")]
+    InvalidTimezone {
+        /// The timezone string that failed to parse.
+        name: String,
+    },
+
     /// Two fields that may not both be set were both set (e.g. a `Source` with
     /// both `pvc` and `pvcSelector`).
     #[error("fields {a:?} and {b:?} are mutually exclusive but both were set ({context})")]

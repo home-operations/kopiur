@@ -349,6 +349,24 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         ),
                     )
                     .await?;
+                    // A failed backup may mean the backend went away: nudge the repository
+                    // to re-probe now so the gate engages without waiting for the catalog
+                    // refresh. Best-effort — a nudge error must not mask the failure above.
+                    if let Some(repo_ref) = backup
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.resolved.as_ref())
+                        .and_then(|r| r.repository.as_ref())
+                        && let Err(e) = io::request_repository_reverify(
+                            &ctx.client,
+                            repo_ref,
+                            &namespace,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        tracing::debug!(backup = %name, error = %e, "repository reverify nudge failed (ignored)");
+                    }
                 }
                 // The run is terminal (the Job exhausted its retries) — reap any CSI
                 // staging objects. No-op for Direct.
@@ -472,6 +490,27 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             tracing::warn!(backup = %name, repository = %config.spec.repository.name, "refusing backup: repository is ReadOnly");
         }
         return Ok(Action::await_change());
+    }
+
+    // Don't launch a mover Job against an unreachable repository (`phase != Ready`):
+    // the pod would only fail on `kopia repository connect`. Hold the Snapshot in
+    // `Pending` and requeue until the repository's own reconcile marks it `Ready`.
+    // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
+    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
+        let current = serde_json::to_value(&backup.status).ok();
+        io::patch_status_if_changed(
+            &api,
+            &name,
+            current.as_ref(),
+            snapshot_ready_status(
+                backup,
+                SnapshotPhase::Pending,
+                crate::consts::REPOSITORY_NOT_READY_REASON,
+                &repository_not_ready_message(&config.spec.repository.name),
+            ),
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(15)));
     }
 
     let (work_spec, mut source_volume, repo_volume, _) =

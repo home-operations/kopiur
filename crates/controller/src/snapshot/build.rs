@@ -244,6 +244,15 @@ pub(super) fn readonly_backup_message(repo_name: &str) -> String {
     )
 }
 
+/// Message for a backup held in `Pending` because its repository is not `Ready`
+/// (backend unreachable). Pure so the text is unit-asserted.
+pub(super) fn repository_not_ready_message(repo_name: &str) -> String {
+    format!(
+        "waiting for repository `{repo_name}` to become `Ready` before launching the backup \
+         (its backend is unreachable); the backup proceeds once the repository reconnects."
+    )
+}
+
 /// Snapshot tags from the config + run metadata.
 fn tags_for(config: &SnapshotPolicy) -> BTreeMap<String, String> {
     let mut tags = BTreeMap::new();

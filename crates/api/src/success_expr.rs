@@ -21,6 +21,8 @@
 //! - `restored` — a map `{files, checksumMatches}` for the *deep* (scratch-restore)
 //!   tier. Present (possibly empty) so an expression that only references it under a
 //!   guard validates; a quick verify leaves it empty.
+//! - `tier` — the string `"quick"` or `"deep"`, so a single predicate can branch on
+//!   the tier (e.g. `tier == 'deep' ? restored.checksumMatches : stats.files > 0`).
 //!
 //! Each value is supplied by the mover from the real verify result and evaluated
 //! there; admission validation ([`validate_success_expr`]) trial-evaluates against a
@@ -66,6 +68,8 @@ pub struct SuccessExprInputs<'a> {
     pub snapshot: BTreeMap<String, String>,
     /// `restored.{files,checksumMatches}` for the deep tier; `None` for quick.
     pub restored: Option<RestoredStats>,
+    /// `tier`: `"quick"` or `"deep"`, so a predicate can branch on the verify tier.
+    pub tier: String,
     /// Lifetime tie so the struct can borrow string slices in future without churn.
     pub _marker: std::marker::PhantomData<&'a ()>,
 }
@@ -100,6 +104,7 @@ fn context<'a>(inputs: &SuccessExprInputs<'_>) -> Context<'a> {
     ]);
     let _ = ctx.add_variable("stats", &stats);
     let _ = ctx.add_variable("snapshot", &inputs.snapshot);
+    let _ = ctx.add_variable("tier", &inputs.tier);
     // `restored` is always present (possibly empty) so a guarded reference validates;
     // a quick verify leaves it empty rather than absent.
     match inputs.restored {
@@ -160,6 +165,7 @@ pub fn validate_success_expr(expr: &str) -> ValidationResult {
             files: 1,
             checksum_matches: true,
         }),
+        tier: "deep".to_string(),
         _marker: std::marker::PhantomData,
     };
     let ctx = context(&inputs);
@@ -194,6 +200,7 @@ mod tests {
             },
             snapshot: BTreeMap::from([("id".to_string(), "k1".to_string())]),
             restored: None,
+            tier: "quick".to_string(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -230,6 +237,28 @@ mod tests {
     }
 
     #[test]
+    fn tier_is_available_for_branching() {
+        // `inputs` is the quick tier; a tier-aware predicate must see it.
+        let i = inputs(5, 0);
+        assert_eq!(i.tier, "quick");
+        let expr = "tier == 'deep' ? restored.checksumMatches : stats.files > 0";
+        assert!(eval_success_expr(expr, &i).unwrap());
+        // The deep branch reads `restored` (empty for quick) only when tier=='deep'.
+        let mut d = inputs(5, 0);
+        d.tier = "deep".to_string();
+        d.restored = Some(RestoredStats {
+            files: 5,
+            checksum_matches: true,
+        });
+        assert!(eval_success_expr(expr, &d).unwrap());
+        d.restored = Some(RestoredStats {
+            files: 5,
+            checksum_matches: false,
+        });
+        assert!(!eval_success_expr(expr, &d).unwrap());
+    }
+
+    #[test]
     fn non_bool_result_is_an_error() {
         let err = eval_success_expr("stats.files", &inputs(1, 0)).unwrap_err();
         assert!(matches!(err, ValidationError::SuccessExprType { .. }));
@@ -248,6 +277,11 @@ mod tests {
         assert!(validate_success_expr("stats.files > 0 && stats.errors == 0").is_ok());
         assert!(validate_success_expr("restored.checksumMatches").is_ok());
         assert!(validate_success_expr("snapshot.id != ''").is_ok());
+        // A tier-aware predicate validates against the trial environment.
+        assert!(
+            validate_success_expr("tier == 'deep' ? restored.checksumMatches : stats.files > 0")
+                .is_ok()
+        );
         // Data-dependent map index on snapshot is tolerated.
         assert!(validate_success_expr("snapshot.id != '' && stats.errors == 0").is_ok());
     }

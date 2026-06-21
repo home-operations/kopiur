@@ -83,15 +83,21 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     // `successExpr` (ADR-0005 §15) must compile + trial-evaluate to a bool with no
     // out-of-scope variable — rejected at admission rather than at first verify run.
     if let Some(v) = &spec.verification {
-        if let Some(q) = &v.quick
-            && let Err(e) = validate_cron(&q.cron)
-        {
-            errs.push(e);
+        if let Some(q) = &v.quick {
+            if let Err(e) = validate_cron(&q.cron) {
+                errs.push(e);
+            }
+            if let Err(e) = validate_timezone(q.timezone.as_deref()) {
+                errs.push(e);
+            }
         }
-        if let Some(d) = &v.deep
-            && let Err(e) = validate_cron(&d.schedule.cron)
-        {
-            errs.push(e);
+        if let Some(d) = &v.deep {
+            if let Err(e) = validate_cron(&d.schedule.cron) {
+                errs.push(e);
+            }
+            if let Err(e) = validate_timezone(d.schedule.timezone.as_deref()) {
+                errs.push(e);
+            }
         }
         if let Some(expr) = &v.success_expr
             && let Err(e) = crate::success_expr::validate_success_expr(expr)
@@ -217,6 +223,9 @@ pub fn validate_backup_schedule(spec: &SnapshotScheduleSpec) -> Vec<ValidationEr
         errs.push(e);
     }
     if let Err(e) = validate_cron(&spec.schedule.cron) {
+        errs.push(e);
+    }
+    if let Err(e) = validate_timezone(spec.schedule.timezone.as_deref()) {
         errs.push(e);
     }
     errs

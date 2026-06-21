@@ -30,14 +30,18 @@
 //!
 //! ## Refresh cadence
 //!
-//! Scans run when `status.catalog.lastRefreshAt` is older than the effective
+//! An **initial** scan always runs — on first bootstrap and again on any spec
+//! change (the `generation != observedGeneration` arm of [`scan_due`] /
+//! [`bootstrap_recycle_due`]). **Repeated, timed** re-scans are **opt-in** via
+//! `spec.catalog.periodicRefresh` (off by default): when enabled, a scan runs once
+//! `status.catalog.lastRefreshAt` is older than the effective
 //! `spec.catalog.refreshInterval` (default
-//! [`kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`]) — see
-//! [`refresh_due`]. Gating the scan also gates the `lastRefreshAt` status write,
-//! so a Ready repository's status is byte-stable between refreshes (the
-//! status-churn rule). Object-store repositories re-list by recycling their
-//! finished bootstrap Job ([`bootstrap_recycle_due`]); bare-path filesystem
-//! repositories re-list in-process.
+//! [`kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`]) — see [`refresh_due`].
+//! With it off, a succeeded repository bootstraps once and is never recycled on a
+//! timer. Gating the scan also gates the `lastRefreshAt` status write, so a Ready
+//! repository's status is byte-stable between refreshes (the status-churn rule).
+//! Object-store repositories re-list by recycling their finished bootstrap Job
+//! ([`bootstrap_recycle_due`]); bare-path filesystem repositories re-list in-process.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -89,11 +93,45 @@ pub fn refresh_due(
     last.with_timezone(&Utc) + interval <= now
 }
 
-/// The steady-state requeue for a Ready repository: the usual 5 minutes, or the
-/// catalog refresh interval when the user asked for a faster re-scan cadence
-/// (otherwise a sub-5m `refreshInterval` would silently never fire on time).
+/// Whether a fresh reverify request should force a re-probe now, bypassing the
+/// refresh timer. Gated on the repo being `Ready` and the token differing from the
+/// last one honored (`status.lastReverifyAt`) — that comparison is the loop guard.
+pub fn reverify_due(token: Option<&str>, honored: Option<&str>, phase_ready: bool) -> bool {
+    phase_ready && token.is_some() && token != honored
+}
+
+/// Whether a `Snapshot` should (re)write the reverify-request annotation. Rate
+/// limited via the existing timestamp (shared across `Snapshot`s) so a wave of
+/// failures forces at most one re-probe per `min_interval`. Absent/unparseable ⇒ yes.
+pub fn should_request_reverify(
+    existing: Option<&str>,
+    now: DateTime<Utc>,
+    min_interval: std::time::Duration,
+) -> bool {
+    let Some(raw) = existing else {
+        return true;
+    };
+    let Ok(last) = DateTime::parse_from_rfc3339(raw) else {
+        return true;
+    };
+    let Ok(min_interval) = chrono::Duration::from_std(min_interval) else {
+        return true;
+    };
+    last.with_timezone(&Utc) + min_interval <= now
+}
+
+/// The steady-state requeue for a Ready repository: the usual 5 minutes, or — only
+/// when `periodicRefresh` is on — the catalog refresh interval when the user asked
+/// for a faster re-scan cadence (otherwise a sub-5m `refreshInterval` would silently
+/// never fire on time). With periodic refresh off, the interval is inert, so we stay
+/// at the 5-minute liveness cadence.
 pub fn reconcile_interval(catalog: Option<&CatalogBounds>) -> std::time::Duration {
-    std::time::Duration::from_secs(300).min(CatalogBounds::effective_refresh_interval(catalog))
+    let base = std::time::Duration::from_secs(300);
+    if CatalogBounds::periodic_refresh_enabled(catalog) {
+        base.min(CatalogBounds::effective_refresh_interval(catalog))
+    } else {
+        base
+    }
 }
 
 /// `true` when a *finished* bootstrap Job should be deleted so the next
@@ -107,6 +145,7 @@ pub fn bootstrap_recycle_due(
     observed_generation: Option<i64>,
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
+    periodic_enabled: bool,
     now: DateTime<Utc>,
 ) -> bool {
     if !phase_is_ready {
@@ -115,7 +154,9 @@ pub fn bootstrap_recycle_due(
     if generation != observed_generation {
         return true;
     }
-    refresh_due(last_refresh_at, interval, now)
+    // The timed refresh arm only fires when periodic refresh is opted in; otherwise a
+    // succeeded bootstrap is never recycled on a timer (one-time bootstrap semantics).
+    periodic_enabled && refresh_due(last_refresh_at, interval, now)
 }
 
 /// `true` when a fresh repository listing should actually be SCANNED into the
@@ -133,12 +174,15 @@ pub fn scan_due(
     observed_generation: Option<i64>,
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
+    periodic_enabled: bool,
     now: DateTime<Utc>,
 ) -> bool {
     if generation != observed_generation {
         return true;
     }
-    refresh_due(last_refresh_at, interval, now)
+    // The initial scan runs on the generation arm above (first reconcile, spec change);
+    // the timed re-scan only fires when periodic refresh is opted in.
+    periodic_enabled && refresh_due(last_refresh_at, interval, now)
 }
 
 /// `true` when the *no-Job* path may (re-)create the bootstrap Job. The finished
@@ -162,6 +206,7 @@ pub fn bootstrap_create_due(
     observed_generation: Option<i64>,
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
+    periodic_enabled: bool,
     now: DateTime<Utc>,
 ) -> bool {
     if !phase_is_ready {
@@ -173,6 +218,7 @@ pub fn bootstrap_create_due(
         observed_generation,
         last_refresh_at,
         interval,
+        periodic_enabled,
         now,
     )
 }
@@ -827,6 +873,36 @@ mod tests {
     }
 
     #[test]
+    fn reverify_due_honors_once_and_only_while_ready() {
+        // No request → never.
+        assert!(!reverify_due(None, None, true));
+        // Fresh request, Ready, never honored → force the re-probe.
+        assert!(reverify_due(Some("t1"), None, true));
+        // Already honored this exact token → no-op (the loop guard).
+        assert!(!reverify_due(Some("t1"), Some("t1"), true));
+        // A genuinely newer token re-fires.
+        assert!(reverify_due(Some("t2"), Some("t1"), true));
+        // Not Ready (already re-probing / Failed) → never force; the gate holds.
+        assert!(!reverify_due(Some("t2"), Some("t1"), false));
+    }
+
+    #[test]
+    fn should_request_reverify_rate_limits_on_the_existing_stamp() {
+        let now = Utc::now();
+        let min = std::time::Duration::from_secs(60);
+        // No prior request → request.
+        assert!(should_request_reverify(None, now, min));
+        // Unparseable → request (defensive).
+        assert!(should_request_reverify(Some("nope"), now, min));
+        // Within the window → skip (a wave of failures collapses to one re-probe).
+        let recent = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        assert!(!should_request_reverify(Some(&recent), now, min));
+        // Past the window → request again.
+        let old = (now - chrono::Duration::seconds(61)).to_rfc3339();
+        assert!(should_request_reverify(Some(&old), now, min));
+    }
+
+    #[test]
     fn bootstrap_recycle_requires_ready_and_fires_on_due_or_spec_change() {
         let now = Utc::now();
         let interval = std::time::Duration::from_secs(3600);
@@ -839,15 +915,18 @@ mod tests {
             Some(1),
             None,
             interval,
+            true,
             now
         ));
-        // Ready + spec changed → recycle even when fresh.
+        // Ready + spec changed → recycle even when fresh — independent of the
+        // periodic-refresh flag (a re-pointed backend must always re-bootstrap).
         assert!(bootstrap_recycle_due(
             true,
             Some(2),
             Some(1),
             Some(&fresh),
             interval,
+            false,
             now
         ));
         // Ready + same generation + fresh → keep the finished Job.
@@ -857,15 +936,28 @@ mod tests {
             Some(2),
             Some(&fresh),
             interval,
+            true,
             now
         ));
-        // Ready + same generation + stale → recycle for a fresh listing.
+        // Ready + same generation + stale + periodic ON → recycle for a fresh listing.
         assert!(bootstrap_recycle_due(
             true,
             Some(2),
             Some(2),
             Some(&stale),
             interval,
+            true,
+            now
+        ));
+        // Ready + same generation + stale + periodic OFF (default) → do NOT recycle
+        // on the timer: one-time bootstrap semantics.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&stale),
+            interval,
+            false,
             now
         ));
     }
@@ -880,16 +972,48 @@ mod tests {
         let now = Utc::now();
         let interval = std::time::Duration::from_secs(3600);
         let fresh = (now - chrono::Duration::minutes(5)).to_rfc3339();
-        // Spec changed (gen != observed) + fresh stamp → scan NOW.
-        assert!(scan_due(Some(3), Some(2), Some(&fresh), interval, now));
+        // Spec changed (gen != observed) + fresh stamp → scan NOW, regardless of the
+        // periodic-refresh flag (the initial/spec-change scan is always honored).
+        assert!(scan_due(
+            Some(3),
+            Some(2),
+            Some(&fresh),
+            interval,
+            false,
+            now
+        ));
         // Settled generation + fresh stamp → byte-stable, no scan (the
         // status-churn rule).
-        assert!(!scan_due(Some(3), Some(3), Some(&fresh), interval, now));
-        // Settled generation + stale stamp → the timed refresh still fires.
+        assert!(!scan_due(
+            Some(3),
+            Some(3),
+            Some(&fresh),
+            interval,
+            true,
+            now
+        ));
+        // Settled generation + stale stamp + periodic ON → the timed refresh fires.
         let stale = (now - chrono::Duration::minutes(61)).to_rfc3339();
-        assert!(scan_due(Some(3), Some(3), Some(&stale), interval, now));
-        // Never scanned → due regardless.
-        assert!(scan_due(Some(1), Some(1), None, interval, now));
+        assert!(scan_due(
+            Some(3),
+            Some(3),
+            Some(&stale),
+            interval,
+            true,
+            now
+        ));
+        // Settled generation + stale stamp + periodic OFF (default) → no timed re-scan.
+        assert!(!scan_due(
+            Some(3),
+            Some(3),
+            Some(&stale),
+            interval,
+            false,
+            now
+        ));
+        // Never scanned + periodic OFF → still no timed scan (the initial scan runs on
+        // the generation arm, not this timer).
+        assert!(!scan_due(Some(1), Some(1), None, interval, false, now));
     }
 
     // Regression guard for the TTL-reap loop: when the kube TTL controller
@@ -902,13 +1026,15 @@ mod tests {
         let interval = std::time::Duration::from_secs(3600);
         let fresh = (now - chrono::Duration::minutes(5)).to_rfc3339();
         let stale = (now - chrono::Duration::minutes(61)).to_rfc3339();
-        // Not Ready → always proceed (first bootstrap / failure retry).
+        // Not Ready → always proceed (first bootstrap / failure retry), regardless
+        // of the periodic flag.
         assert!(bootstrap_create_due(
             false,
             Some(1),
             None,
             None,
             interval,
+            false,
             now
         ));
         // Ready + same generation + fresh scan → HOLD: the reaped Job must not
@@ -919,33 +1045,47 @@ mod tests {
             Some(2),
             Some(&fresh),
             interval,
+            true,
             now
         ));
-        // Ready + refresh due → re-create for a fresh listing.
+        // Ready + refresh due + periodic ON → re-create for a fresh listing.
         assert!(bootstrap_create_due(
             true,
             Some(2),
             Some(2),
             Some(&stale),
             interval,
+            true,
             now
         ));
-        // Ready + spec changed → re-create even when fresh.
+        // Ready + refresh due + periodic OFF (default) → HOLD: no timed re-create.
+        assert!(!bootstrap_create_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&stale),
+            interval,
+            false,
+            now
+        ));
+        // Ready + spec changed → re-create even when fresh (independent of the flag).
         assert!(bootstrap_create_due(
             true,
             Some(3),
             Some(2),
             Some(&fresh),
             interval,
+            false,
             now
         ));
-        // Ready but never stamped (e.g. pre-catalog status) → defensive re-run.
+        // Ready but never stamped + periodic ON → defensive re-run.
         assert!(bootstrap_create_due(
             true,
             Some(2),
             Some(2),
             None,
             interval,
+            true,
             now
         ));
     }
@@ -1093,18 +1233,30 @@ mod tests {
             reconcile_interval(None),
             std::time::Duration::from_secs(300)
         );
-        let slow: CatalogBounds =
-            serde_json::from_value(serde_json::json!({ "refreshInterval": "2h" })).unwrap();
+        let slow: CatalogBounds = serde_json::from_value(
+            serde_json::json!({ "periodicRefresh": true, "refreshInterval": "2h" }),
+        )
+        .unwrap();
         assert_eq!(
             reconcile_interval(Some(&slow)),
             std::time::Duration::from_secs(300)
         );
-        // A faster refresh shortens the requeue so the cadence actually fires.
-        let fast: CatalogBounds =
-            serde_json::from_value(serde_json::json!({ "refreshInterval": "30s" })).unwrap();
+        // A faster refresh (with periodic ON) shortens the requeue so the cadence fires.
+        let fast: CatalogBounds = serde_json::from_value(
+            serde_json::json!({ "periodicRefresh": true, "refreshInterval": "30s" }),
+        )
+        .unwrap();
         assert_eq!(
             reconcile_interval(Some(&fast)),
             std::time::Duration::from_secs(30)
+        );
+        // Periodic refresh OFF (default): the interval is inert — stay at 5 minutes
+        // even with a fast `refreshInterval` set.
+        let fast_off: CatalogBounds =
+            serde_json::from_value(serde_json::json!({ "refreshInterval": "30s" })).unwrap();
+        assert_eq!(
+            reconcile_interval(Some(&fast_off)),
+            std::time::Duration::from_secs(300)
         );
     }
 

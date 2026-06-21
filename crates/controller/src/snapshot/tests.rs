@@ -24,6 +24,28 @@ fn readonly_repository_refuses_backup_writes() {
     assert!(msg.contains("ReadWrite"));
 }
 
+// --- Readiness gate: a not-Ready repository holds the backup in Pending ---
+
+#[test]
+fn not_ready_repository_holds_backup_pending() {
+    use crate::consts::REPOSITORY_NOT_READY_REASON;
+    use kopiur_api::common::PhaseLabel;
+    use kopiur_api::snapshot::SnapshotPhase;
+
+    // Pending is Reconciling (not Stalled), so the backup resumes on reconnect.
+    assert_eq!(
+        snapshot_ready_outcome(SnapshotPhase::Pending),
+        io::ReadyOutcome::Reconciling
+    );
+    assert_eq!(SnapshotPhase::Pending.label(), "Pending");
+    // The hold message names the repo; it's a wait, not a refusal.
+    let msg = repository_not_ready_message("nas");
+    assert!(msg.contains("nas"));
+    assert!(msg.contains("Ready"));
+    assert!(!msg.contains("refusing"));
+    assert_eq!(REPOSITORY_NOT_READY_REASON, "RepositoryNotReady");
+}
+
 // --- §13(c) pin decision (pure: spec.pin vs observed → pin/unpin/noop) ---
 
 #[test]

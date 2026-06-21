@@ -283,7 +283,17 @@ Deep verify restores into a throwaway scratch volume, then discards it. `capacit
 
 You can set the scratch size/class **once** at the repository level via [`moverDefaults.scratch`](repositories.md#moverdefaults--one-place-to-configure-every-mover) instead of repeating it on every policy; the `verification.deep` fields here override that repo default field-wise.
 
-`successExpr` is a CEL predicate (returns `bool`) over the verify result — environment `stats{files,bytes,errors}`, `snapshot`, and (deep only) `restored{files,checksumMatches}`. It is validated at admission, so a typo is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
+`successExpr` is a CEL predicate (returns `bool`) over the verify result. The environment is:
+
+- `stats{files,bytes,errors}` — for **both** tiers. `quick` has no machine-readable counts of its own, so the operator fills `stats.files`/`stats.bytes` from the verified snapshot's manifest and reports `errors: 0` on a passing run — so `stats.files > 0 && stats.errors == 0` works on `quick`, not just `deep`.
+- `snapshot` — snapshot metadata; `snapshot.id` is the verified snapshot's id.
+- `restored{files,checksumMatches}` — the scratch-restore result, **deep only** (empty for `quick`, so guard a deep-only reference with `tier`).
+- `tier` — `"quick"` or `"deep"`, so one predicate can branch per tier, e.g. `tier == 'deep' ? restored.checksumMatches : stats.files > 0`.
+
+It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
+
+!!! tip "A timezone for the verify crons"
+    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent ⇒ UTC.
 
 ### suspend — pause a recipe
 
