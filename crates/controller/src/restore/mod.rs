@@ -487,11 +487,18 @@ async fn drive_populator_restore(
             // stamps the empty message. A restore stamps `RestoreSucceeded`;
             // deploy-or-restore (no snapshot) stamps `NoSnapshotContinue` + a
             // `Resolved=True` domain condition so the empty outcome is self-describing.
-            let restored = restore
-                .status
-                .as_ref()
-                .and_then(|s| s.resolved.as_ref())
-                .and_then(|r| r.resolution)
+            // Re-read status.resolved fresh: for a deferred restore the mover pins it in
+            // its own terminal PATCH, which the cached `restore` (watch cache) may not yet
+            // reflect when a PVC/PV bind event triggers this finalize reconcile — the
+            // direct path guards the same race. Fall back to the cached value for the
+            // controller-pinned paths (which pin before dispatch).
+            let resolved = api
+                .get_opt(name)
+                .await?
+                .and_then(|r| r.status)
+                .and_then(|s| s.resolved)
+                .or_else(|| restore.status.as_ref().and_then(|s| s.resolved.clone()));
+            let restored = resolved.and_then(|r| r.resolution)
                 == Some(kopiur_api::ResolutionOutcome::Snapshot);
             let status = if restored {
                 restore_ready_status(

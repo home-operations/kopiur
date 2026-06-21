@@ -633,16 +633,23 @@ async fn resolve_and_restore(
             ));
         }
         // No match yet: keep waiting while the window stays open (and the next
-        // poll fits inside it). A poll that would overshoot the deadline breaks.
+        // until the deadline truly passes). Sleep the lesser of POLL and the time
+        // left, so a sub-POLL waitTimeout still waits (not zero) and a longer one
+        // isn't cut short by up to POLL.
         match deadline {
-            Some(d) if std::time::Instant::now() + POLL < d => {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    break;
+                }
+                let remaining = d - now;
                 info!(
                     identity = %filter.identity(),
                     "no snapshot matched the restore source yet; re-listing after a short wait",
                 );
-                tokio::time::sleep(POLL).await;
+                tokio::time::sleep(remaining.min(POLL)).await;
             }
-            _ => break,
+            None => break,
         }
     }
     // Window closed (or no wait configured): honor onMissingSnapshot exhaustively.
