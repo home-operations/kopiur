@@ -24,7 +24,7 @@ lefthook = "2.1.9"
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
 node = "22"
 oxfmt = "0.55.0"
-zizmor = "1.25.2"
+zizmor = "1.26.1"
 helm = "4.2.2"
 cosign = "3.1.1"
 kubectl = "1.36.2"
