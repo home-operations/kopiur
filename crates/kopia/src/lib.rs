@@ -5,6 +5,7 @@ pub mod client;
 pub mod env;
 pub mod error;
 pub mod model;
+pub mod selection;
 pub mod session;
 
 pub use client::{
@@ -18,4 +19,5 @@ pub use model::{
     IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus,
     RootEntry, SnapshotCreateResult, SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo,
 };
+pub use selection::{filter_as_of, pick_offset};
 pub use session::SessionCmd;

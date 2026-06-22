@@ -79,13 +79,13 @@ Only `--from-policy` defaults to `continue`, for deploy-or-restore.
 
 ///
 
-/// warning | Identity-based sources need a filesystem backend (today)
+/// note | Identity-based sources work on every backend
 The operator resolves `--from-policy` and un-pinned `--identity` sources by
-listing the repository's snapshots in-process, which is currently implemented
-only for **filesystem-backed** repositories. Against an object-store backend
-(S3/GCS/Azure/B2) the Restore stays `Pending` with an `InvalidSpec` warning
-event. Use `--from-snapshot` (any backend), or pin the exact snapshot with
-`--identity … --snapshot-id <ID>`.
+listing the repository's snapshots **inside the restore Job**, so picking
+"latest" (or `--as-of`/`--offset`) works the same on S3/GCS/Azure/B2/SFTP/
+WebDAV/rclone as on a filesystem repo — no controller-side repo mount needed.
+`--from-snapshot` and a pinned `--identity … --snapshot-id <ID>` still skip the
+listing entirely.
 
 ///
 

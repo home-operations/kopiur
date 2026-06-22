@@ -48,17 +48,43 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
             }
         }
     }
-    if let Some(wt) = spec.policy.as_ref().and_then(|p| p.wait_timeout.as_deref())
-        && crate::duration::parse_go_duration(wt).is_none()
-    {
-        return Err(ValidationError::InvalidFieldValue {
-            field: "restore.policy.waitTimeout".to_string(),
-            reason: format!(
-                "{wt:?} is not a valid Go-style duration; use a positive number with an \
-                 s/m/h suffix (e.g. 90s, 5m, 1h) — how long the restore waits for the \
-                 source snapshot to appear before applying onMissingSnapshot"
-            ),
-        });
+    if let Some(wt) = spec.policy.as_ref().and_then(|p| p.wait_timeout.as_deref()) {
+        let Some(wait) = crate::duration::parse_go_duration(wt) else {
+            return Err(ValidationError::InvalidFieldValue {
+                field: "restore.policy.waitTimeout".to_string(),
+                reason: format!(
+                    "{wt:?} is not a valid Go-style duration; use a positive number with an \
+                     s/m/h suffix (e.g. 90s, 5m, 1h) — how long the restore waits for the \
+                     source snapshot to appear before applying onMissingSnapshot"
+                ),
+            });
+        };
+        // For an object-store `fromPolicy`/`identity` restore the wait is polled
+        // INSIDE the mover Job, so it must fit within an explicit
+        // `activeDeadlineSeconds` (else the Job is killed mid-wait, before
+        // onMissingSnapshot applies). When the deadline is unset the controller's
+        // generous default (hours) always dwarfs a sane waitTimeout, so this only
+        // guards an explicit, too-small deadline. `snapshotRef` waits in the
+        // controller, but the same bound is harmless and keeps the rule simple.
+        if let Some(deadline) = spec
+            .failure_policy
+            .as_ref()
+            .and_then(|f| f.active_deadline_seconds)
+            && deadline > 0
+            && wait.as_secs() as i64 >= deadline
+        {
+            return Err(ValidationError::InvalidFieldValue {
+                field: "restore.policy.waitTimeout".to_string(),
+                reason: format!(
+                    "{wt:?} ({}s) must be shorter than failurePolicy.activeDeadlineSeconds \
+                     ({deadline}s): the wait for the source snapshot is polled inside the \
+                     restore Job, so a waitTimeout at or beyond the deadline would let the \
+                     Job be killed before onMissingSnapshot applies. Lower waitTimeout or \
+                     raise activeDeadlineSeconds.",
+                    wait.as_secs()
+                ),
+            });
+        }
     }
     match &spec.target {
         RestoreTarget::Pvc(t) if t.name.trim().is_empty() => {

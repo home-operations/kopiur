@@ -235,7 +235,7 @@ CRD validation).
 | `target` | {`pvcPrime`,`pvcRef`} | Resolved target. |
 | `timing` | {`startTime`,`endTime`} | — |
 | `progress` | {`bytesRestored`,`filesRestored`} | Live mover progress. |
-| `conditions` | []Condition | `Ready`/`Reconciling`/`Stalled`, reason text; `Resolved=False reason=WaitingForSnapshot` while a `policy.waitTimeout` window is open; `CredentialsAvailable`, `MoverPermitted`, `RestoreSecurityContextCompatible` (positive-only — `True` when the future consumer can read what the mover writes; advisory negatives are admission warnings). |
+| `conditions` | []Condition | `Ready`/`Reconciling`/`Stalled`, reason text; `Resolved=False reason=WaitingForSnapshot` while a `snapshotRef` `policy.waitTimeout` window is open (a `fromPolicy`/`identity` source waits inside the restore Job instead, shown as `Restoring`); `Resolved=True reason=NoSnapshotContinue` when a deploy-or-restore came up empty; `CredentialsAvailable`, `MoverPermitted`, `RestoreSecurityContextCompatible` (positive-only — `True` when the future consumer can read what the mover writes; advisory negatives are admission warnings). |
 | `logTail` | string | Last output lines, written by the mover at the terminal transition — `Restore completed: snapshot <id>` on success, the actionable error + kopia stderr tail on failure. Capped 4KiB. |
 | `failure` | {`kopiaErrorClass`,`message`,`stderrTail`?,`exitCode`?,`retryRecommended`} | Structured terminal-failure detail, written by the mover before it exits non-zero. §4.10 |
 

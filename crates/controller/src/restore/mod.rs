@@ -24,7 +24,7 @@ use kopiur_api::{
 };
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
-    RestoreOp, SnapshotAnchor, TargetRef,
+    RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor, TargetRef,
 };
 
 use crate::config;
@@ -45,14 +45,20 @@ pub use plan::*;
 
 #[cfg(test)]
 mod tests;
-/// The pinned source-resolution decision the reconcile loop acts on: a concrete
-/// snapshot id, or a deliberate "no snapshot, come up empty" (deploy-or-restore).
+/// The source-resolution decision the reconcile loop acts on: a concrete snapshot
+/// id (controller-resolved/pinned), a deliberate "no snapshot, come up empty"
+/// (deploy-or-restore), or a selector the MOVER resolves in-Job (object stores,
+/// where the controller can't list the backend in-process).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     /// The source resolved to (or was pinned to) this kopia snapshot id.
     Snapshot(String),
     /// `onMissingSnapshot: Continue` with no matching snapshot — provision an empty volume.
     Empty,
+    /// `fromPolicy`/`identity`-without-id on a backend the controller can't list
+    /// in-process: dispatch the restore Job with this selector and let the mover
+    /// resolve "latest"/offset/asOf (and pin `status.resolved` itself).
+    Deferred(RestoreSelector),
 }
 
 /// The already-pinned resolution decision, or `None` when the source still has to be
@@ -152,14 +158,18 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             // logTail/failure/progress and the pinned resolution). Self-gated by
             // `kstatus_settled_for`, so a healed Restore never re-patches.
             if !kstatus_settled_for(restore, phase) {
-                let (reason, message) = if phase == RestorePhase::Completed {
-                    (
-                        "RestoreSucceeded",
-                        "the restore mover completed; the snapshot data was written \
-                         into the target",
+                let status = if phase == RestorePhase::Completed {
+                    // The mover wrote `phase: Completed` + `status.resolved` in one
+                    // PATCH, so `resolved` is observed here — distinguish a real
+                    // restore from a deploy-or-restore that came up empty.
+                    restore_success_status(
+                        restore,
+                        restore.status.as_ref().and_then(|s| s.resolved.as_ref()),
                     )
                 } else {
-                    (
+                    restore_ready_status(
+                        restore,
+                        phase,
                         "MoverJobFailed",
                         "the restore mover reported a terminal failure; see \
                          status.failure / status.logTail for the cause, fix it, and \
@@ -167,12 +177,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                          never retries",
                     )
                 };
-                io::patch_status(
-                    &api,
-                    &name,
-                    restore_ready_status(restore, phase, reason, message),
-                )
-                .await?;
+                io::patch_status(&api, &name, status).await?;
             }
             return Ok(Action::requeue(std::time::Duration::from_secs(600)));
         }
@@ -216,7 +221,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     let decision = match pinned_decision(resolved, phase, state) {
         Some(d) => d,
         None => match resolve_snapshot(ctx, restore, &namespace).await? {
-            Some(res) => {
+            Some(ResolveOutcome::Pinned(res)) => {
                 // Pin the FULL resolution (outcome + id + provenance + timestamp) exactly
                 // once; the no-pin check above makes this a single write, so it cannot
                 // churn status.
@@ -242,6 +247,14 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 io::patch_status(&api, &name, status).await?;
                 Resolution::Snapshot(res.kopia_snapshot_id)
             }
+            // Object stores can't be listed in-process, so the controller resolves
+            // only the identity and defers snapshot selection to the mover Job. Do
+            // NOT pin here — the mover pins `status.resolved` once it resolves
+            // "latest"/offset/asOf (or NoSnapshot under Continue). The driver's
+            // job-exists guard makes re-dispatch across requeues idempotent while
+            // unpinned, so the pin-once invariant holds (a one-shot Restore is
+            // terminal after the Job, and never re-resolves).
+            Some(ResolveOutcome::Deferred(sel)) => Resolution::Deferred(sel),
             None => {
                 // No snapshot matched. While the `waitTimeout` window (anchored at
                 // the Restore's creation) is open, keep waiting instead of giving
@@ -349,17 +362,21 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         io::patch_status(&api, &name, serde_json::json!({ "resolved": pin })).await?;
     }
 
-    let snapshot_id = match &decision {
-        Resolution::Snapshot(id) => Some(id.as_str()),
+    // The mover work the decision dispatches: a concrete id, an in-Job selector, or
+    // nothing (deploy-or-restore empty volume). `None` is the only case that skips
+    // the mover entirely. Exhaustive so a new `Resolution` variant must be handled.
+    let selection = match &decision {
+        Resolution::Snapshot(id) => Some(RestoreSelection::Snapshot(id.clone())),
+        Resolution::Deferred(sel) => Some(RestoreSelection::Resolve(sel.clone())),
         Resolution::Empty => None,
     };
 
     match state {
         PopulatorState::DirectTarget => {
-            drive_direct_restore(ctx, restore, &api, &namespace, &name, snapshot_id).await
+            drive_direct_restore(ctx, restore, &api, &namespace, &name, selection.as_ref()).await
         }
         PopulatorState::AwaitingClaim => {
-            drive_populator_restore(ctx, restore, &api, &namespace, &name, snapshot_id).await
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, selection.as_ref()).await
         }
     }
 }
@@ -394,16 +411,18 @@ async fn park_awaiting_claim(
 /// are idempotent; the prime PV is set `Retain` before its PVC is deleted so the
 /// volume survives the swap.
 ///
-/// `snapshot_id` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
+/// `selection` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
 /// matching snapshot): the empty, freshly-provisioned prime PVC IS the result, so the
-/// mover is skipped and the empty prime is rebound straight to the claiming PVC.
+/// mover is skipped and the empty prime is rebound straight to the claiming PVC. A
+/// `Some` selection runs the mover into the prime (a deferred selector resolves in-Job,
+/// and may itself find no snapshot under `Continue` — then the prime stays empty).
 async fn drive_populator_restore(
     ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: Option<&str>,
+    selection: Option<&RestoreSelection>,
 ) -> Result<Action> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
@@ -461,10 +480,27 @@ async fn drive_populator_restore(
                 == Some(pv_name.as_str())
         {
             finalize_populator(ctx, namespace, &populate_job, &prime_name, Some(&pv_name)).await?;
-            // Branch the completion on whether there was a snapshot: a restore stamps
-            // `RestoreSucceeded`; deploy-or-restore (no snapshot) stamps `NoSnapshotContinue`
-            // + a `Resolved=True` domain condition so the empty outcome is self-describing.
-            let status = if snapshot_id.is_some() {
+            // Branch the completion on whether a snapshot was actually restored. Read the
+            // pinned outcome (the controller pins it for a concrete id; the mover pins it
+            // for a deferred selector, which may itself have found nothing under
+            // `Continue`) rather than `selection.is_some()`, so a deferred no-match also
+            // stamps the empty message. A restore stamps `RestoreSucceeded`;
+            // deploy-or-restore (no snapshot) stamps `NoSnapshotContinue` + a
+            // `Resolved=True` domain condition so the empty outcome is self-describing.
+            // Re-read status.resolved fresh: for a deferred restore the mover pins it in
+            // its own terminal PATCH, which the cached `restore` (watch cache) may not yet
+            // reflect when a PVC/PV bind event triggers this finalize reconcile — the
+            // direct path guards the same race. Fall back to the cached value for the
+            // controller-pinned paths (which pin before dispatch).
+            let resolved = api
+                .get_opt(name)
+                .await?
+                .and_then(|r| r.status)
+                .and_then(|s| s.resolved)
+                .or_else(|| restore.status.as_ref().and_then(|s| s.resolved.clone()));
+            let restored = resolved.and_then(|r| r.resolution)
+                == Some(kopiur_api::ResolutionOutcome::Snapshot);
+            let status = if restored {
                 restore_ready_status(
                     restore,
                     RestorePhase::Completed,
@@ -530,7 +566,7 @@ async fn drive_populator_restore(
     )
     .await?;
 
-    if let Some(snapshot_id) = snapshot_id {
+    if let Some(selection) = selection {
         match run_restore_mover(
             ctx,
             restore,
@@ -538,7 +574,7 @@ async fn drive_populator_restore(
             namespace,
             &populate_job,
             &prime_name,
-            snapshot_id,
+            selection,
         )
         .await?
         {
@@ -908,20 +944,70 @@ async fn finalize_populator(
     Ok(())
 }
 
+/// Terminal-success status for a DIRECT restore, branching on the pinned
+/// `resolution`. The mover pins `Snapshot` (real restore) or `NoSnapshot` (a
+/// deferred `Continue` that found nothing and left the target empty) BEFORE the
+/// Job goes terminal, so the controller can stamp an accurate message:
+/// - `Snapshot` → `RestoreSucceeded`, "data was written";
+/// - `NoSnapshot` → self-describing `Resolved=True NoSnapshotContinue` + empty-volume message;
+/// - unknown (best-effort pin AND terminal PATCH both lost) → a NEUTRAL message
+///   that never falsely claims data was written. Mirrors the populator finalize.
+fn restore_success_status(
+    restore: &Restore,
+    resolved: Option<&kopiur_api::restore::ResolvedRestore>,
+) -> serde_json::Value {
+    match resolved.and_then(|r| r.resolution) {
+        Some(kopiur_api::ResolutionOutcome::NoSnapshot) => {
+            let msg = "no snapshot matched the source; provisioned an empty target volume \
+                       (deploy-or-restore)";
+            let conditions = io::upsert_condition(
+                &existing_conditions(restore),
+                "Resolved",
+                true,
+                "NoSnapshotContinue",
+                msg,
+                restore.metadata.generation,
+            );
+            restore_ready_status_on(
+                restore,
+                &conditions,
+                RestorePhase::Completed,
+                "NoSnapshotContinue",
+                msg,
+            )
+        }
+        Some(kopiur_api::ResolutionOutcome::Snapshot) => restore_ready_status(
+            restore,
+            RestorePhase::Completed,
+            "RestoreSucceeded",
+            "the restore mover completed; the snapshot data was written into the target",
+        ),
+        // Outcome unknown (the mover's best-effort status PATCHes were both lost):
+        // report completion truthfully without claiming data was written.
+        None => restore_ready_status(
+            restore,
+            RestorePhase::Completed,
+            "RestoreSucceeded",
+            "the restore mover Job completed; see status.logTail for what was restored",
+        ),
+    }
+}
+
 /// Drive a restore-with-explicit-target: create the restore mover Job (writing
 /// into the target PVC), then track it to terminal.
 ///
-/// `snapshot_id` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
+/// `selection` is `None` for deploy-or-restore (`onMissingSnapshot: Continue` with no
 /// matching snapshot): the target PVC is still ensured (so `target.pvc` is provisioned
 /// empty rather than left missing), but the mover is skipped and the restore completes
-/// cleanly with a fresh, empty volume.
+/// cleanly with a fresh, empty volume. A `Some` selection is either a concrete id or an
+/// in-Job selector the mover resolves.
 async fn drive_direct_restore(
     ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    snapshot_id: Option<&str>,
+    selection: Option<&RestoreSelection>,
 ) -> Result<Action> {
     // Resolve the target PVC for the restore Job. DirectTarget is only reached for
     // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
@@ -952,7 +1038,7 @@ async fn drive_direct_restore(
     // a terminal `Completed` via `restore_ready_status_on` (Ready=True) so the entry-guard
     // heal does NOT clobber this message with "the snapshot data was written" — there is no
     // mover here, so the controller is the sole writer (no two-writer race).
-    let Some(snapshot_id) = snapshot_id else {
+    let Some(selection) = selection else {
         if phase != Some(RestorePhase::Completed) {
             let msg = "no snapshot found; provisioned an empty target volume (deploy-or-restore)";
             let conditions = io::upsert_condition(
@@ -981,22 +1067,26 @@ async fn drive_direct_restore(
 
     // The Job is named after the Restore and writes into the explicit target PVC;
     // the helper creates/tracks it, the phase writes stay here.
-    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, snapshot_id).await? {
+    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, selection).await? {
         MoverOutcome::Succeeded { duration_secs } => {
             if let Some(secs) = duration_secs {
                 ctx.metrics.set_restore_duration(namespace, name, secs);
             }
             if phase != Some(RestorePhase::Completed) {
+                // A deferred (object-store/identity) resolution may have come up
+                // empty under `Continue`. The mover pins the outcome to
+                // status.resolved before its Job goes terminal, so a fresh read
+                // tells a real restore from a deploy-or-restore-empty — without it
+                // the success message would falsely claim "data was written".
+                let resolved = api
+                    .get_opt(name)
+                    .await?
+                    .and_then(|r| r.status)
+                    .and_then(|s| s.resolved);
                 io::patch_status(
                     api,
                     name,
-                    restore_ready_status(
-                        restore,
-                        RestorePhase::Completed,
-                        "RestoreSucceeded",
-                        "the restore mover Job completed; the snapshot data was \
-                         written into the target",
-                    ),
+                    restore_success_status(restore, resolved.as_ref()),
                 )
                 .await?;
             }
@@ -1074,10 +1164,11 @@ enum MoverOutcome {
     Wedged { message: String },
 }
 
-/// Build + apply the restore mover Job named `job_name` (writing `snapshot_id` into
+/// Build + apply the restore mover Job named `job_name` (writing `selection` into
 /// `target_pvc`, mounted read-write at `/restore`) and report its [`MoverOutcome`].
 /// Idempotent: an existing Job is tracked to terminal, never re-applied. The caller
-/// owns the status/phase writes.
+/// owns the status/phase writes. `selection` is a concrete id (anchor-healed) or an
+/// in-Job selector the mover resolves.
 async fn run_restore_mover(
     ctx: &Context,
     restore: &Restore,
@@ -1085,7 +1176,7 @@ async fn run_restore_mover(
     namespace: &str,
     job_name: &str,
     target_pvc: &str,
-    snapshot_id: &str,
+    selection: &RestoreSelection,
 ) -> Result<MoverOutcome> {
     use k8s_openapi::api::batch::v1::Job;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
@@ -1390,12 +1481,16 @@ async fn run_restore_mover(
     );
     let cache = crate::cache::cache_tuning(effective_cache.as_ref());
     // Stable anchors so the mover can heal a stale pinned id (kopia rewrites the
-    // manifest id on pin). Read once here, where we still have the source ref.
-    let anchor = restore_source_anchor(ctx, restore, namespace).await;
+    // manifest id on pin). Only meaningful for a concrete id; a Resolve selector
+    // lists fresh in-Job, so it carries no anchor.
+    let anchor = match selection {
+        RestoreSelection::Snapshot(_) => restore_source_anchor(ctx, restore, namespace).await,
+        RestoreSelection::Resolve(_) => SnapshotAnchor::default(),
+    };
     let work_spec = MoverWorkSpec {
-        version: 1,
+        version: 2,
         operation: Operation::Restore(RestoreOp {
-            snapshot_id: snapshot_id.to_string(),
+            source: selection.clone(),
             target_path: target_path.clone(),
             anchor,
             ignore_permission_errors,
@@ -1492,7 +1587,13 @@ async fn run_restore_mover(
     let cm = jobs::build_config_map(&inputs)?;
     let job = jobs::build_job(&inputs);
     io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
-    tracing::info!(restore = %name, job = %job_name, %snapshot_id, "created restore mover Job");
+    let source_label = match selection {
+        RestoreSelection::Snapshot(id) => format!("snapshot {id}"),
+        RestoreSelection::Resolve(sel) => {
+            format!("resolve {}@{}", sel.username, sel.hostname)
+        }
+    };
+    tracing::info!(restore = %name, job = %job_name, source = %source_label, "created restore mover Job");
     // The Job is new; the CALLER writes the matching status (direct: MoverJobCreated;
     // populator: PopulatingPrimePvc) so each path keeps its own phase discipline.
     Ok(MoverOutcome::Running { created: true })
@@ -1506,6 +1607,19 @@ struct ResolvedSource {
     kopia_snapshot_id: String,
     snapshot_ref: Option<kopiur_api::common::ObjectRef>,
     identity: Option<kopiur_api::common::ResolvedIdentity>,
+}
+
+/// The outcome of resolving a restore source in the controller (ADR §4.6): a
+/// concrete snapshot the controller can pin now (`snapshotRef` / explicit id), or
+/// a selector handed to the mover Job because the backend can't be listed
+/// in-process (`fromPolicy` / `identity`-without-id). Exactly one — externally
+/// modeled as an enum so the reconcile core must handle both.
+#[derive(Debug, Clone)]
+enum ResolveOutcome {
+    /// Resolved here; pin `status.resolved` and dispatch with a concrete id.
+    Pinned(ResolvedSource),
+    /// Deferred to the mover; dispatch with this selector and let the mover pin.
+    Deferred(RestoreSelector),
 }
 
 /// Stable identity anchors for the restore's snapshot, so the mover can
@@ -1686,14 +1800,44 @@ async fn ensure_restore_target_pvc(
     }
 }
 
-/// Resolve the restore's source to a concrete kopia snapshot. Returns `None`
-/// when no snapshot matches (caller applies `waitTimeout` + `onMissingSnapshot`).
+/// Resolve the restore's source (ADR §4.6). `snapshotRef`/`identity.snapshotID`
+/// resolve to a concrete id the controller pins ([`ResolveOutcome::Pinned`]);
+/// `fromPolicy`/`identity`-without-id defer the by-identity snapshot listing to
+/// the mover Job ([`ResolveOutcome::Deferred`]) because in-process listing only
+/// works for filesystem repos, and the mover reaches every backend. Returns
+/// `None` ONLY for a `snapshotRef` whose `Snapshot` CR has no resolved snapshot
+/// yet (the caller applies `waitTimeout` + `onMissingSnapshot`); deferred sources
+/// never return `None` — the mover applies `onMissingSnapshot` in-Job.
 async fn resolve_snapshot(
     ctx: &Context,
     restore: &Restore,
     namespace: &str,
-) -> Result<Option<ResolvedSource>> {
+) -> Result<Option<ResolveOutcome>> {
     use kopiur_api::common::{ObjectRef, ResolvedIdentity};
+    // Selector policy is the same for both deferred arms: the per-mode default
+    // onMissing unless the spec overrides it, and the waitTimeout window as an
+    // ABSOLUTE deadline anchored at the Restore's creation (so the in-Job wait
+    // matches the snapshotRef path and is stable across pod retries), polled by
+    // the mover until that wall-clock instant.
+    let on_missing = effective_on_missing(
+        restore
+            .spec
+            .policy
+            .as_ref()
+            .and_then(|p| p.on_missing_snapshot),
+        &restore.spec.source,
+    );
+    let wait_deadline = restore
+        .spec
+        .policy
+        .as_ref()
+        .and_then(|p| p.wait_timeout.as_deref())
+        .and_then(crate::snapshot_schedule::parse_go_duration)
+        .and_then(|d| {
+            let created = restore.metadata.creation_timestamp.as_ref()?.0.as_second();
+            let secs = i64::try_from(d.as_secs()).ok()?;
+            chrono::DateTime::from_timestamp(created.checked_add(secs)?, 0).map(|t| t.to_rfc3339())
+        });
     match &restore.spec.source {
         RestoreSource::SnapshotRef(r) => {
             let ns = r.namespace.as_deref().unwrap_or(namespace);
@@ -1702,52 +1846,45 @@ async fn resolve_snapshot(
             Ok(backup
                 .and_then(|b| b.status)
                 .and_then(|s| s.snapshot)
-                .map(|s| ResolvedSource {
-                    kopia_snapshot_id: s.kopia_snapshot_id,
-                    snapshot_ref: Some(ObjectRef {
-                        name: r.name.clone(),
-                        namespace: Some(ns.to_string()),
-                    }),
-                    // Record the referenced snapshot's identity (provenance, and
-                    // the source-path anchor used to self-heal a stale id).
-                    identity: Some(s.identity),
+                .map(|s| {
+                    ResolveOutcome::Pinned(ResolvedSource {
+                        kopia_snapshot_id: s.kopia_snapshot_id,
+                        snapshot_ref: Some(ObjectRef {
+                            name: r.name.clone(),
+                            namespace: Some(ns.to_string()),
+                        }),
+                        // Record the referenced snapshot's identity (provenance, and
+                        // the source-path anchor used to self-heal a stale id).
+                        identity: Some(s.identity),
+                    })
                 }))
         }
         RestoreSource::Identity(id) => {
-            let identity = ResolvedIdentity {
+            // An explicit snapshot id wins — pin it directly. Otherwise defer the
+            // listing to the mover (works on every backend).
+            if let Some(sid) = &id.snapshot_id {
+                return Ok(Some(ResolveOutcome::Pinned(ResolvedSource {
+                    kopia_snapshot_id: sid.clone(),
+                    snapshot_ref: None,
+                    identity: Some(ResolvedIdentity {
+                        username: id.username.clone(),
+                        hostname: id.hostname.clone(),
+                        source_path: id.source_path.clone(),
+                    }),
+                })));
+            }
+            Ok(Some(ResolveOutcome::Deferred(RestoreSelector {
                 username: id.username.clone(),
                 hostname: id.hostname.clone(),
                 source_path: id.source_path.clone(),
-            };
-            // An explicit snapshot id wins; otherwise resolve via snapshot list.
-            if let Some(sid) = &id.snapshot_id {
-                return Ok(Some(ResolvedSource {
-                    kopia_snapshot_id: sid.clone(),
-                    snapshot_ref: None,
-                    identity: Some(identity),
-                }));
-            }
-            let repo = resolve_restore_repository(ctx, restore, namespace).await?;
-            let snapshots = list_for_identity(
-                ctx,
-                &repo,
-                namespace,
-                &id.username,
-                &id.hostname,
-                id.source_path.as_deref(),
-            )
-            .await?;
-            let snapshots = filter_as_of(snapshots, id.as_of.as_deref())?;
-            Ok(
-                pick_offset(snapshots, id.offset.unwrap_or(0)).map(|sid| ResolvedSource {
-                    kopia_snapshot_id: sid,
-                    snapshot_ref: None,
-                    identity: Some(identity),
-                }),
-            )
+                as_of: id.as_of.clone(),
+                offset: id.offset.unwrap_or(0),
+                on_missing,
+                wait_deadline: wait_deadline.clone(),
+            })))
         }
         RestoreSource::FromPolicy(c) => {
-            // Resolve identity from the SnapshotPolicy, then list newest/offset.
+            // Resolve the identity from the SnapshotPolicy, then defer the listing.
             use kopiur_api::SnapshotPolicy;
             let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
             let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
@@ -1760,82 +1897,16 @@ async fn resolve_snapshot(
                 cfg_ns,
                 repo.identity_defaults.as_ref(),
             )?;
-            let snapshots = list_for_identity(
-                ctx,
-                &repo,
-                namespace,
-                &identity.username,
-                &identity.hostname,
-                identity.source_path.as_deref(),
-            )
-            .await?;
-            let snapshots = filter_as_of(snapshots, c.as_of.as_deref())?;
-            Ok(pick_offset(snapshots, c.offset).map(|sid| ResolvedSource {
-                kopia_snapshot_id: sid,
-                snapshot_ref: None,
-                identity: Some(identity),
-            }))
+            Ok(Some(ResolveOutcome::Deferred(RestoreSelector {
+                username: identity.username,
+                hostname: identity.hostname,
+                source_path: identity.source_path,
+                as_of: c.as_of.clone(),
+                offset: c.offset,
+                on_missing,
+                wait_deadline: wait_deadline.clone(),
+            })))
         }
-    }
-}
-
-/// kopia snapshot list filtered to one identity (filesystem in-process path),
-/// newest-first.
-async fn list_for_identity(
-    ctx: &Context,
-    repo: &ResolvedRepository,
-    namespace: &str,
-    username: &str,
-    hostname: &str,
-    source_path: Option<&str>,
-) -> Result<Vec<kopiur_kopia::SnapshotListEntry>> {
-    use kopiur_api::backend::Backend;
-    let creds = io::repo_credentials(&repo.encryption);
-    match &repo.backend {
-        Backend::Filesystem(fs) => {
-            // Pre-flight the repo path: in-process listing connects kopia to
-            // `fs.path`, which only works if the repo volume is mounted into the
-            // CONTROLLER (it is normally mounted only into mover Jobs). Catch the
-            // missing mount here with an actionable error instead of letting the
-            // raw kopia `stat <path>: no such file or directory` leak (#137).
-            if !std::path::Path::new(&fs.path).is_dir() {
-                return Err(Error::FilesystemResolutionUnmounted {
-                    path: fs.path.clone(),
-                });
-            }
-            let password = io::read_repo_password(&ctx.client, namespace, &creds).await?;
-            let client = ctx.kopia.build([("KOPIA_PASSWORD".to_string(), password)]);
-            client
-                .repository_connect(
-                    &kopiur_kopia::ConnectSpec::Filesystem {
-                        path: fs.path.clone().into(),
-                    },
-                    kopiur_kopia::CacheTuning::default(),
-                )
-                .await?;
-            let filter = kopiur_kopia::SnapshotSource {
-                host: hostname.to_string(),
-                user_name: username.to_string(),
-                path: source_path.unwrap_or("").to_string(),
-            };
-            let mut list = client.snapshot_list(Some(&filter)).await?;
-            list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
-            Ok(list)
-        }
-        // In-process snapshot listing needs a locally mounted repo; object-store
-        // backends cannot be listed here. Fail LOUDLY with the fix (snapshotRef or
-        // a pinned snapshotID) instead of returning an empty list that would read
-        // as "no snapshots" and silently Continue/Fail. Exhaustive so a new
-        // backend must decide its resolution story before it compiles.
-        b @ (Backend::S3(_)
-        | Backend::Azure(_)
-        | Backend::Gcs(_)
-        | Backend::B2(_)
-        | Backend::Sftp(_)
-        | Backend::WebDav(_)
-        | Backend::Rclone(_)) => Err(Error::UnsupportedSourceResolution {
-            backend: b.kind_str(),
-        }),
     }
 }
 

@@ -44,6 +44,9 @@ pub enum KopiaOp {
     VerifyConnect,
     /// `snapshot verify` (quick tier).
     SnapshotVerify,
+    /// `snapshot list` while resolving an object-store restore source (the in-Job
+    /// `fromPolicy`/`identity` listing path).
+    RestoreSnapshotList,
     /// `snapshot list` while resolving the deep-verify restore candidate.
     DeepVerifySnapshotList,
     /// The deep-verify scratch restore.
@@ -74,6 +77,7 @@ impl KopiaOp {
             KopiaOp::MaintenanceRun => "maintenance run",
             KopiaOp::VerifyConnect => "verify connect",
             KopiaOp::SnapshotVerify => "snapshot verify",
+            KopiaOp::RestoreSnapshotList => "restore snapshot list",
             KopiaOp::DeepVerifySnapshotList => "deep verify snapshot list",
             KopiaOp::DeepVerifyRestore => "deep verify restore",
             KopiaOp::ReplicateConnect => "replication connect",
@@ -238,6 +242,29 @@ pub enum MoverError {
         source_path: String,
     },
 
+    /// An object-store restore selector matched NO snapshot once the wait window
+    /// closed and `onMissingSnapshot: Fail` was in effect. Terminal (a Failed
+    /// Restore never retries); the fix is to create the snapshot, widen
+    /// `source.asOf`/`offset`, or choose `Continue` to come up empty.
+    #[error(
+        "no snapshot matched the restore source ({identity}) within the wait window; create the \
+         snapshot, widen source.asOf/offset, or set onMissingSnapshot: Continue to come up empty"
+    )]
+    RestoreNoSnapshot {
+        /// The kopia identity the listing keyed on (`user@host:path`).
+        identity: String,
+    },
+
+    /// A restore selector's `asOf` was not a valid RFC3339 timestamp. The webhook
+    /// validates this at admission, so this is the defensive in-Job path.
+    #[error("restore source asOf {as_of:?} is not an RFC3339 timestamp: {message}")]
+    RestoreAsOfInvalid {
+        /// The offending value.
+        as_of: String,
+        /// The parse error text.
+        message: String,
+    },
+
     /// The deep-verify scratch path is not writable by the mover, so the
     /// scratch-restore would fail with a cryptic kopia `mkdir` error. Caught by a
     /// preflight probe before kopia runs (the non-root mover cannot create a dir
@@ -355,6 +382,8 @@ impl MoverError {
             | MoverError::CredentialWrite { .. }
             | MoverError::ReadyMarkerWrite { .. }
             | MoverError::VerifyNoSnapshot { .. }
+            | MoverError::RestoreNoSnapshot { .. }
+            | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
@@ -398,6 +427,7 @@ mod tests {
             KopiaOp::MaintenanceRun,
             KopiaOp::VerifyConnect,
             KopiaOp::SnapshotVerify,
+            KopiaOp::RestoreSnapshotList,
             KopiaOp::DeepVerifySnapshotList,
             KopiaOp::DeepVerifyRestore,
             KopiaOp::ReplicateConnect,

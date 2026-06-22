@@ -20,7 +20,10 @@ use std::time::Duration;
 use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
-use kopiur_kopia::{ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass};
+use kopiur_kopia::{
+    ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, SnapshotSource, filter_as_of,
+    pick_offset,
+};
 use tracing::{error, info, warn};
 
 use kopiur_mover::bootstrap::{
@@ -38,7 +41,8 @@ use kopiur_mover::status::{
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
-    Operation, ReplicateOp, RestoreOp, SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier,
+    Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor,
+    SnapshotPinOp, VerifyOp, VerifyTier,
 };
 
 fn main() -> std::process::ExitCode {
@@ -320,7 +324,7 @@ async fn execute(
     let interval = Duration::from_secs(spec.options.progress_interval_secs.max(1));
 
     // Spawn the operation as a future and tick progress alongside it.
-    let op = run_operation(client, spec);
+    let op = run_operation(client, spec, reporter);
     tokio::pin!(op);
 
     let mut ticker = tokio::time::interval(interval);
@@ -339,7 +343,11 @@ async fn execute(
 
 /// Dispatch on the operation kind. Exhaustive `match` — a new [`Operation`]
 /// variant fails to compile until handled (the project's type-safety thesis).
-async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<StatusUpdate> {
+async fn run_operation(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    reporter: &StatusReporter,
+) -> Result<StatusUpdate> {
     // Each kopia call is wrapped with the `KopiaOp` naming it, so a failure's
     // message/log always says *which* invocation failed.
     let kopia = |op: KopiaOp| move |source: KopiaError| MoverError::Kopia { op, source };
@@ -403,17 +411,30 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
-            // The recorded id can be STALE — kopia rewrites a snapshot's manifest
-            // id on pin (`UpdateSnapshot`), so a snapshotRef/identity restore of a
-            // pinned snapshot created before this fix points at a deleted manifest.
-            // On a not-found, self-heal by re-resolving the live id from the
-            // snapshot's stable identity (source path + start time).
-            let restored_id = restore_with_heal(client, op)
-                .await
-                .map_err(kopia(KopiaOp::SnapshotRestore))?;
-            // Restore's terminal success phase is `Completed`, not `Succeeded`
-            // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
-            Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
+            // Exactly one source kind (externally tagged): a controller-resolved id,
+            // or an in-Job selector to resolve here. Exhaustive — a new variant
+            // can't compile until handled.
+            match &op.source {
+                RestoreSelection::Snapshot(id) => {
+                    // The recorded id can be STALE — kopia rewrites a snapshot's
+                    // manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
+                    // restore of a snapshot pinned before this fix points at a deleted
+                    // manifest. On a not-found, self-heal by re-resolving the live id
+                    // from the snapshot's stable identity (source path + start time).
+                    let restored_id = restore_with_heal(client, op, id)
+                        .await
+                        .map_err(kopia(KopiaOp::SnapshotRestore))?;
+                    // Restore's terminal success phase is `Completed`, not `Succeeded`
+                    // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
+                    Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
+                }
+                // Object-store `fromPolicy`/`identity`-without-id: the controller
+                // can't list the backend in-process, so resolve "latest" (offset/asOf)
+                // here, where the mover reaches every backend.
+                RestoreSelection::Resolve(sel) => {
+                    resolve_and_restore(client, op, sel, reporter).await
+                }
+            }
         }
         Operation::SnapshotDelete(op) => {
             // Delete the recorded snapshot. Space reclamation (maintenance) is a
@@ -507,28 +528,30 @@ async fn run_operation(client: &KopiaClient, spec: &MoverWorkSpec) -> Result<Sta
     }
 }
 
-/// Restore `op.snapshot_id`, self-healing a stale id. kopia rewrites a
-/// snapshot's manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
-/// restore of a snapshot pinned before this fix can name a deleted manifest. On
-/// a `NotFound`, re-resolve the live id from the snapshot's stable anchors and
-/// retry once. Returns the id actually restored (for `status.logTail`).
+/// Restore `snapshot_id`, self-healing a stale id. kopia rewrites a snapshot's
+/// manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity restore of a
+/// pinned snapshot created before this fix can name a deleted manifest. On a
+/// `NotFound`, re-resolve the live id from the snapshot's stable anchors
+/// ([`RestoreOp::anchor`]) and retry once. Returns the id actually restored (for
+/// `status.logTail`).
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,
+    snapshot_id: &str,
 ) -> std::result::Result<String, KopiaError> {
     match client
-        .snapshot_restore_with(&op.snapshot_id, &op.target_path, &op.restore_options())
+        .snapshot_restore_with(snapshot_id, &op.target_path, &op.restore_options())
         .await
     {
-        Ok(()) => Ok(op.snapshot_id.clone()),
+        Ok(()) => Ok(snapshot_id.to_string()),
         Err(e) if e.class() == KopiaErrorClass::NotFound => {
             // Only heal when we have anchors AND they resolve to a DIFFERENT live
             // id; otherwise the original not-found is the truthful error.
             if let Some(live) = resolve_live_id(client, &op.anchor).await
-                && live != op.snapshot_id
+                && live != snapshot_id
             {
                 warn!(
-                    stale = %op.snapshot_id,
+                    stale = %snapshot_id,
                     live = %live,
                     "restore snapshot id not found; healing to the live manifest \
                      re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
@@ -541,6 +564,176 @@ async fn restore_with_heal(
             Err(e)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Resolve an object-store restore source in-Job and restore it. The controller
+/// can only list filesystem repos in-process, so `fromPolicy`/`identity`-without-id
+/// defer the listing here, where the mover reaches every backend.
+///
+/// Determinism + durability: a snapshot a PRIOR pod attempt already pinned to
+/// `status.resolved` is reused verbatim (so a Job retry never re-resolves to a
+/// different "latest"); a fresh resolution is pinned BEFORE the restore runs (so
+/// the choice survives a later terminal-PATCH failure and the controller adopts
+/// it as the pin-once record). When nothing matches yet, re-list until the
+/// `waitTimeout` deadline (an absolute instant the controller anchored at the
+/// Restore's creation) passes, then apply `onMissingSnapshot` — `Continue` leaves
+/// the target empty (deploy-or-restore), `Fail` errors.
+async fn resolve_and_restore(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    sel: &RestoreSelector,
+    reporter: &StatusReporter,
+) -> Result<StatusUpdate> {
+    use kopiur_api::restore::{ResolutionOutcome, ResolvedRestore};
+
+    let filter = SnapshotSource {
+        host: sel.hostname.clone(),
+        user_name: sel.username.clone(),
+        path: sel.source_path.clone().unwrap_or_default(),
+    };
+
+    // Reuse a snapshot a prior attempt of THIS Job already pinned, so a pod retry
+    // restores the same id rather than re-resolving "latest" to a snapshot that
+    // appeared since (the controller never pins the deferred path, so a non-empty
+    // resolved here can only be the mover's own pre-restore pin).
+    if let Some(prior) = reporter.resolved().await
+        && let Some(id) = prior.kopia_snapshot_id.as_deref()
+    {
+        info!(
+            snapshot = %id,
+            identity = %filter.identity(),
+            "reusing the snapshot pinned by a prior attempt; restoring",
+        );
+        let restored_id =
+            restore_with_heal(client, op, id)
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::SnapshotRestore,
+                    source,
+                })?;
+        let identity = prior.identity.unwrap_or_else(|| ResolvedIdentity {
+            username: sel.username.clone(),
+            hostname: sel.hostname.clone(),
+            source_path: sel.source_path.clone(),
+        });
+        return Ok(StatusUpdate::completed_resolved(
+            &restored_id,
+            identity,
+            chrono::Utc::now(),
+        ));
+    }
+
+    // The webhook validates `asOf` at admission; re-parse defensively here.
+    let cutoff = match sel.as_of.as_deref() {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| MoverError::RestoreAsOfInvalid {
+                    as_of: s.to_string(),
+                    message: e.to_string(),
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    // Absolute wall-clock deadline (anchored at the Restore's creation by the
+    // controller), so the wait matches the snapshotRef path and is stable across
+    // pod restarts. Defensive parse; unparseable ⇒ resolve once, no wait.
+    let deadline = sel
+        .wait_deadline
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    const POLL: Duration = Duration::from_secs(10);
+
+    loop {
+        let mut list = client
+            .snapshot_list(Some(&filter))
+            .await
+            .map_err(|source| MoverError::Kopia {
+                op: KopiaOp::RestoreSnapshotList,
+                source,
+            })?;
+        // Newest-first, then point-in-time filter, then offset (0 = latest).
+        list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+        let candidates = filter_as_of(list, cutoff);
+        if let Some(entry) = pick_offset(candidates, sel.offset) {
+            info!(
+                snapshot = %entry.id,
+                identity = %filter.identity(),
+                offset = sel.offset,
+                "resolved restore source to a snapshot; restoring",
+            );
+            let identity = ResolvedIdentity {
+                username: entry.source.user_name.clone(),
+                hostname: entry.source.host.clone(),
+                source_path: Some(entry.source.path.clone()),
+            };
+            // Pin the choice BEFORE restoring: a retry reuses it (above), the
+            // controller adopts it as pin-once, and it survives a failed terminal
+            // PATCH (best-effort; logged on failure).
+            reporter
+                .pin_resolved(&ResolvedRestore {
+                    resolution: Some(ResolutionOutcome::Snapshot),
+                    kopia_snapshot_id: Some(entry.id.clone()),
+                    identity: Some(identity.clone()),
+                    pinned_at: Some(chrono::Utc::now().to_rfc3339()),
+                    ..Default::default()
+                })
+                .await;
+            let restored_id = restore_with_heal(client, op, &entry.id)
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::SnapshotRestore,
+                    source,
+                })?;
+            return Ok(StatusUpdate::completed_resolved(
+                &restored_id,
+                identity,
+                chrono::Utc::now(),
+            ));
+        }
+        // No match yet: keep waiting until the deadline truly passes. Sleep the
+        // lesser of POLL and the time left, so a sub-POLL window still waits (not
+        // zero) and a longer one isn't cut short by up to POLL.
+        match deadline {
+            Some(d) => {
+                let now = chrono::Utc::now();
+                if now >= d {
+                    break;
+                }
+                let remaining = (d - now).to_std().unwrap_or(POLL).min(POLL);
+                info!(
+                    identity = %filter.identity(),
+                    "no snapshot matched the restore source yet; re-listing after a short wait",
+                );
+                tokio::time::sleep(remaining).await;
+            }
+            None => break,
+        }
+    }
+    // Window closed (or no wait configured): honor onMissingSnapshot exhaustively.
+    match sel.on_missing {
+        kopiur_api::restore::OnMissingSnapshot::Continue => {
+            info!(
+                identity = %filter.identity(),
+                "no snapshot matched the restore source; onMissingSnapshot=Continue — \
+                 leaving the target empty (deploy-or-restore)",
+            );
+            // Pin the empty outcome before completing, for the same durability/
+            // adoption reasons as the snapshot case.
+            reporter
+                .pin_resolved(&ResolvedRestore {
+                    resolution: Some(ResolutionOutcome::NoSnapshot),
+                    pinned_at: Some(chrono::Utc::now().to_rfc3339()),
+                    ..Default::default()
+                })
+                .await;
+            Ok(StatusUpdate::completed_empty(chrono::Utc::now()))
+        }
+        kopiur_api::restore::OnMissingSnapshot::Fail => Err(MoverError::RestoreNoSnapshot {
+            identity: filter.identity(),
+        }),
     }
 }
 

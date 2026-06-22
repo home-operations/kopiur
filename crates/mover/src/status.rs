@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use kopiur_api::common::ResolvedIdentity;
-use kopiur_api::restore::RestorePhase;
+use kopiur_api::restore::{ResolutionOutcome, ResolvedRestore, RestorePhase};
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{PhaseLabel, SnapshotStats, SnapshotTiming};
 use kopiur_kopia::{KopiaError, MaintenanceMode, SnapshotCreateResult};
@@ -148,6 +148,8 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::CredentialWrite { .. }
             | MoverError::ReadyMarkerWrite { .. }
             | MoverError::VerifyNoSnapshot { .. }
+            | MoverError::RestoreNoSnapshot { .. }
+            | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
@@ -274,6 +276,14 @@ pub struct StatusUpdate {
     /// [`kopiur_api::common::MAX_LOG_TAIL_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_tail: Option<String>,
+    /// The pinned restore resolution (CRD `status.resolved`), set ONLY when the
+    /// mover RESOLVED the source itself (object-store `fromPolicy`/`identity` — the
+    /// in-Job listing path). The controller never pins these (it can't list the
+    /// backend in-process), so the mover writes the outcome here for provenance.
+    /// Disjoint from the controller-written phase/conditions subtree, so the merge
+    /// PATCH never collides. Absent for controller-resolved restores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedRestore>,
 }
 
 impl StatusUpdate {
@@ -287,6 +297,7 @@ impl StatusUpdate {
             stats: None,
             failure: None,
             log_tail: None,
+            resolved: None,
         }
     }
 
@@ -301,6 +312,7 @@ impl StatusUpdate {
             stats: Some(stats_from_result(result)),
             failure: None,
             log_tail: Some(format!("Snapshot created: {}", result.id)),
+            resolved: None,
         }
     }
 
@@ -315,6 +327,7 @@ impl StatusUpdate {
             stats: None,
             failure: None,
             log_tail: None,
+            resolved: None,
         }
     }
 
@@ -339,6 +352,7 @@ impl StatusUpdate {
             stats: None,
             failure: None,
             log_tail: Some(format!("Snapshot pin reconciled: {id}")),
+            resolved: None,
         }
     }
 
@@ -357,6 +371,59 @@ impl StatusUpdate {
             stats: None,
             failure: None,
             log_tail: Some(format!("Restore completed: snapshot {snapshot_id}")),
+            resolved: None,
+        }
+    }
+
+    /// A successful restore the MOVER resolved (object-store `fromPolicy`/`identity`
+    /// in-Job path): same terminal `Completed` as [`StatusUpdate::completed`], but
+    /// it also pins `status.resolved` with the snapshot the selector resolved to,
+    /// since the controller couldn't list the backend in-process to pin it.
+    pub fn completed_resolved(
+        snapshot_id: &str,
+        identity: ResolvedIdentity,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        StatusUpdate {
+            phase: RestorePhase::Completed.label().to_string(),
+            observed_at,
+            snapshot: None,
+            timing: None,
+            stats: None,
+            failure: None,
+            log_tail: Some(format!("Restore completed: snapshot {snapshot_id}")),
+            resolved: Some(ResolvedRestore {
+                resolution: Some(ResolutionOutcome::Snapshot),
+                kopia_snapshot_id: Some(snapshot_id.to_string()),
+                identity: Some(identity),
+                pinned_at: Some(observed_at.to_rfc3339()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A successful deploy-or-restore where the selector matched NO snapshot and
+    /// `onMissingSnapshot: Continue` was in effect: the target is left empty and
+    /// `status.resolved` pins the `NoSnapshot` outcome so a later-appearing
+    /// snapshot can never silently retarget this Restore.
+    pub fn completed_empty(observed_at: DateTime<Utc>) -> Self {
+        StatusUpdate {
+            phase: RestorePhase::Completed.label().to_string(),
+            observed_at,
+            snapshot: None,
+            timing: None,
+            stats: None,
+            failure: None,
+            log_tail: Some(
+                "Restore completed: no snapshot matched the source; left the target \
+                 empty (deploy-or-restore)"
+                    .to_string(),
+            ),
+            resolved: Some(ResolvedRestore {
+                resolution: Some(ResolutionOutcome::NoSnapshot),
+                pinned_at: Some(observed_at.to_rfc3339()),
+                ..Default::default()
+            }),
         }
     }
 
@@ -373,6 +440,7 @@ impl StatusUpdate {
             stats: None,
             log_tail: Some(failure_log_tail(&failure)),
             failure: Some(failure),
+            resolved: None,
         }
     }
 
@@ -389,6 +457,7 @@ impl StatusUpdate {
             stats: None,
             log_tail: Some(failure_log_tail(&failure)),
             failure: Some(failure),
+            resolved: None,
         }
     }
 
@@ -593,6 +662,43 @@ impl StatusReporter {
             }
         }
     }
+
+    /// Read the target's currently-pinned `status.resolved`, if any. Used by the
+    /// in-Job restore resolver to reuse a snapshot a PRIOR pod attempt already
+    /// pinned (deterministic across Job retries) instead of re-resolving "latest".
+    /// Best-effort: returns `None` when there's no client or the read fails.
+    pub async fn resolved(&self) -> Option<ResolvedRestore> {
+        let r = self.inner.as_ref()?;
+        let guard = r.lock().await;
+        match guard.read_resolved().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, target = %self.target.name, "status.resolved read failed");
+                None
+            }
+        }
+    }
+
+    /// Pin `resolved` to the target's `status.resolved` via a resolved-only merge
+    /// PATCH (no `phase`, so it never trips the Restore phase enum). The in-Job
+    /// resolver calls this BEFORE restoring so the chosen snapshot is durably
+    /// recorded — a retry reuses it, the controller adopts it (pin-once), and the
+    /// outcome survives a later failure of the terminal status PATCH. Best-effort.
+    pub async fn pin_resolved(&self, resolved: &ResolvedRestore) {
+        match &self.inner {
+            Some(r) => {
+                let mut guard = r.lock().await;
+                if let Err(e) = guard.pin_resolved(resolved).await {
+                    warn!(error = %e, target = %self.target.name, "status.resolved pin failed");
+                }
+            }
+            None => info!(
+                target = %self.target.name,
+                "status.resolved pin (no cluster): {}",
+                serde_json::to_string(resolved).unwrap_or_default()
+            ),
+        }
+    }
 }
 
 /// The real kube PATCH path. Uses a dynamic API so the mover does not need to
@@ -633,6 +739,44 @@ impl KubeStatusReporter {
     pub async fn patch(&mut self, update: &StatusUpdate) -> Result<()> {
         use kube::api::{Patch, PatchParams};
         let body = update.as_patch_body();
+        self.api
+            .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
+            .await
+            .map_err(|source| MoverError::StatusPatch {
+                kind: self.kind.clone(),
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// GET the target and deserialize its `status.resolved`, if present.
+    async fn read_resolved(&self) -> Result<Option<ResolvedRestore>> {
+        let obj = self
+            .api
+            .get_opt(&self.name)
+            .await
+            .map_err(|source| MoverError::StatusPatch {
+                kind: self.kind.clone(),
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(obj
+            .and_then(|o| {
+                o.data
+                    .get("status")
+                    .and_then(|s| s.get("resolved"))
+                    .cloned()
+            })
+            .and_then(|v| serde_json::from_value(v).ok()))
+    }
+
+    /// Resolved-only `.status` merge PATCH (no `phase`), pinning `status.resolved`.
+    async fn pin_resolved(&mut self, resolved: &ResolvedRestore) -> Result<()> {
+        use kube::api::{Patch, PatchParams};
+        let body = serde_json::json!({ "status": { "resolved": resolved } });
         self.api
             .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
             .await
@@ -901,6 +1045,46 @@ mod tests {
         assert_eq!(
             body["status"]["logTail"],
             "Restore completed: snapshot k1f1ec0a8"
+        );
+    }
+
+    #[test]
+    fn completed_resolved_pins_status_resolved_for_in_job_resolution() {
+        // The object-store in-Job path: the mover resolved the snapshot itself, so
+        // it must pin status.resolved (the controller couldn't list the backend).
+        let identity = ResolvedIdentity {
+            username: "restore".into(),
+            hostname: "prod".into(),
+            source_path: Some("/pvc/db".into()),
+        };
+        let u = StatusUpdate::completed_resolved("k9", identity, ts());
+        assert_eq!(u.phase, "Completed");
+        let body = u.as_patch_body();
+        // The exact CRD `status.resolved` field names, or the API server prunes them.
+        assert_eq!(body["status"]["resolved"]["resolution"], "Snapshot");
+        assert_eq!(body["status"]["resolved"]["kopiaSnapshotID"], "k9");
+        assert_eq!(
+            body["status"]["resolved"]["identity"]["sourcePath"],
+            "/pvc/db"
+        );
+        assert!(body["status"]["resolved"]["pinnedAt"].is_string());
+        assert_eq!(body["status"]["logTail"], "Restore completed: snapshot k9");
+    }
+
+    #[test]
+    fn completed_empty_pins_no_snapshot_outcome() {
+        // Deploy-or-restore with no match under Continue: pin NoSnapshot so a
+        // later-appearing snapshot can never silently retarget the Restore.
+        let u = StatusUpdate::completed_empty(ts());
+        assert_eq!(u.phase, "Completed");
+        let body = u.as_patch_body();
+        assert_eq!(body["status"]["resolved"]["resolution"], "NoSnapshot");
+        assert!(body["status"]["resolved"].get("kopiaSnapshotID").is_none());
+        assert!(
+            body["status"]["logTail"]
+                .as_str()
+                .unwrap()
+                .contains("deploy-or-restore")
         );
     }
 

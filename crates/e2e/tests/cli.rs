@@ -575,13 +575,14 @@ async fn cli_snapshot_now_wait_logs_and_failure() {
     );
 }
 
-/// M3: the restore one-liner end-to-end, against what each backend supports:
+/// M3: the restore one-liner end-to-end, against every backend:
 /// - S3 repo + `--from-snapshot --create-pvc --wait`: real data round-trips
 ///   (reader pod proves the seeded bytes);
-/// - filesystem repo + `--from-policy`: identity-based resolution (the
-///   operator only implements in-process snapshot listing for filesystem
-///   backends — pairing fromPolicy with S3 leaves the Restore Pending with an
-///   InvalidSpec warning, which is how this test's first draft failed);
+/// - S3 repo + `--from-policy` (no snapshot id): identity-based resolution now
+///   works for object stores — the mover lists/picks "latest" in-Job — and the
+///   seeded bytes round-trip (the reported user scenario);
+/// - filesystem repo + `--from-policy`: identity-based resolution via the same
+///   in-Job mover path;
 /// - a missing `--from-snapshot` fails closed → exit 1.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
@@ -610,9 +611,12 @@ async fn cli_restore_from_policy_into_created_pvc() {
     delete_and_wait_gone(&restores, "e2e-cli-restore").await;
     delete_and_wait_gone(&restores, "e2e-cli-restore-fs").await;
     delete_and_wait_gone(&restores, "e2e-cli-restore-miss").await;
+    delete_and_wait_gone(&restores, "e2e-cli-restore-s3pol").await;
     delete_and_wait_gone(&pods, "e2e-cli-restored-reader").await;
+    delete_and_wait_gone(&pods, "e2e-cli-restored-s3pol-reader").await;
     delete_and_wait_gone(&pvcs, "e2e-cli-restored").await;
     delete_and_wait_gone(&pvcs, "e2e-cli-restored-fs").await;
+    delete_and_wait_gone(&pvcs, "e2e-cli-restored-s3pol").await;
 
     // A fresh snapshot of e2e-src (seeded with known bytes by node-seed).
     let out = run_cli(&[
@@ -757,6 +761,55 @@ async fn cli_restore_from_policy_into_created_pvc() {
         "fromPolicy completion summary: {}",
         out.stdout
     );
+
+    // --- fromPolicy against the S3 repo (the reported user scenario): no snapshot
+    // id given, so the mover resolves "latest" by identity in-Job — which only
+    // worked for filesystem before. `POLICY` (S3) already produced
+    // `e2e-cli-restore-src` above, so this resolves to it and the seeded bytes
+    // round-trip through a freshly created PVC.
+    let out = run_cli(&[
+        "-n",
+        E2E_NAMESPACE,
+        "restore",
+        "--from-policy",
+        POLICY,
+        "--create-pvc",
+        "e2e-cli-restored-s3pol",
+        "--size",
+        "1Gi",
+        "--name",
+        "e2e-cli-restore-s3pol",
+        "--wait",
+        "--timeout",
+        "5m",
+    ]);
+    assert!(
+        out.success,
+        "restore --from-policy (S3) failed: stdout={} stderr={}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout
+            .contains("restore e2e-cli-restore-s3pol completed: kopia id "),
+        "S3 fromPolicy completion summary: {}",
+        out.stdout
+    );
+    let reader = builders::one_shot_pod(
+        E2E_NAMESPACE,
+        "e2e-cli-restored-s3pol-reader",
+        &[
+            "sh",
+            "-c",
+            "grep -q 'hello kopiur e2e' /restore/a.txt && grep -q 'nested data' /restore/sub/b.txt",
+        ],
+        &[("e2e-cli-restored-s3pol", "/restore")],
+    );
+    pods.create(&PostParams::default(), &reader)
+        .await
+        .expect("create S3 fromPolicy reader pod");
+    kopiur_e2e::wait::pod_succeeded(&client, E2E_NAMESPACE, "e2e-cli-restored-s3pol-reader")
+        .await
+        .expect("S3 fromPolicy-restored PVC must contain the seeded bytes");
 
     // Restore error path: a snapshotRef that doesn't exist fails closed
     // (onMissingSnapshot defaults to Fail for explicit sources) → exit 1.

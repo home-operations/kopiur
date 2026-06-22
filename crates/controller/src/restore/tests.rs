@@ -88,69 +88,9 @@ fn source_mode_strings_match_each_variant() {
     assert_eq!(source_mode(&identity()), "Identity");
 }
 
-fn list_entry(id: &str, end_time: &str) -> kopiur_kopia::SnapshotListEntry {
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "source": { "host": "h", "userName": "u", "path": "/data" },
-        "startTime": end_time,
-        "endTime": end_time,
-    }))
-    .expect("valid SnapshotListEntry")
-}
-
-/// Three snapshots, newest-first (the order `list_for_identity` returns).
-fn three_snapshots() -> Vec<kopiur_kopia::SnapshotListEntry> {
-    vec![
-        list_entry("k3", "2026-06-03T00:00:00Z"),
-        list_entry("k2", "2026-06-02T00:00:00Z"),
-        list_entry("k1", "2026-06-01T00:00:00Z"),
-    ]
-}
-
-#[test]
-fn filter_as_of_keeps_snapshots_at_or_before_the_instant() {
-    // A cutoff between k2 and k3 drops k3 (newer than the instant); k2/k1 remain.
-    let kept = filter_as_of(three_snapshots(), Some("2026-06-02T12:00:00Z")).unwrap();
-    assert_eq!(
-        kept.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-        ["k2", "k1"]
-    );
-    // Exactly AT a snapshot's endTime keeps it ("at or before").
-    let kept = filter_as_of(three_snapshots(), Some("2026-06-02T00:00:00Z")).unwrap();
-    assert_eq!(kept.first().map(|e| e.id.as_str()), Some("k2"));
-    // Before everything → empty (caller applies onMissingSnapshot).
-    let kept = filter_as_of(three_snapshots(), Some("2026-05-01T00:00:00Z")).unwrap();
-    assert!(kept.is_empty());
-    // No asOf → untouched.
-    let kept = filter_as_of(three_snapshots(), None).unwrap();
-    assert_eq!(kept.len(), 3);
-}
-
-#[test]
-fn filter_as_of_rejects_non_rfc3339_with_actionable_message() {
-    let err = filter_as_of(three_snapshots(), Some("yesterday")).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("yesterday"), "{msg}");
-    assert!(msg.contains("RFC3339"), "{msg}");
-    assert!(msg.contains("2026-05-01T00:00:00Z"), "{msg}");
-}
-
-#[test]
-fn as_of_composes_with_offset() {
-    // "the previous one as of just after k2": asOf drops k3, offset 1 then
-    // steps past k2 to k1.
-    let kept = filter_as_of(three_snapshots(), Some("2026-06-02T12:00:00Z")).unwrap();
-    assert_eq!(pick_offset(kept, 1), Some("k1".to_string()));
-}
-
-#[test]
-fn pick_offset_zero_is_newest_and_out_of_range_is_none() {
-    assert_eq!(pick_offset(three_snapshots(), 0), Some("k3".to_string()));
-    assert_eq!(pick_offset(three_snapshots(), 2), Some("k1".to_string()));
-    assert_eq!(pick_offset(three_snapshots(), 3), None);
-    // A negative offset clamps to newest rather than panicking.
-    assert_eq!(pick_offset(three_snapshots(), -1), Some("k3".to_string()));
-}
+// `filter_as_of` / `pick_offset` (snapshot selection) moved to
+// `kopiur_kopia::selection` with their unit tests — both binaries share them and
+// only the mover resolves by-identity now.
 
 #[test]
 fn wait_remaining_counts_down_from_creation_and_closes() {
