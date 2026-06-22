@@ -274,7 +274,10 @@ async fn run() -> Result<()> {
                         match execute(&client, &spec, &reporter).await {
                             Ok(update) => {
                                 reporter.report(&update).await;
-                                info!(phase = %update.phase, "operation succeeded");
+                                info!(
+                                    phase = update.phase.as_deref().unwrap_or("done"),
+                                    "operation succeeded"
+                                );
                                 Ok(())
                             }
                             Err(e) => terminal_failure(&reporter, e).await,
@@ -335,7 +338,13 @@ async fn execute(
         tokio::select! {
             result = &mut op => return result,
             _ = ticker.tick() => {
-                reporter.report(&StatusUpdate::running(chrono::Utc::now())).await;
+                // A phase-less heartbeat: the controller owns every in-flight
+                // phase (and never reads the mover's), so asserting one here only
+                // risks a value the target CR's enum forbids — the Restore
+                // "Running" 422 this replaced.
+                reporter
+                    .report(&StatusUpdate::progress(chrono::Utc::now()))
+                    .await;
             }
         }
     }
