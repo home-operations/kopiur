@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.12](https://github.com/home-operations/kopiur/compare/0.4.11...0.4.12) (2026-06-22)
+
+
+### Features
+
+* **restore:** resolve "latest" for object-store backends in the mover Job ([#153](https://github.com/home-operations/kopiur/issues/153)) ([29fb2a4](https://github.com/home-operations/kopiur/commit/29fb2a4dc19c808f284dd5391da5fa19ef991718))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.11 manifest ([03c71d5](https://github.com/home-operations/kopiur/commit/03c71d516f84c490795502dff647cbf42d338330))
+* **mise:** Update tool zizmor (1.25.2 → 1.26.1) ([#151](https://github.com/home-operations/kopiur/issues/151)) ([a3536c5](https://github.com/home-operations/kopiur/commit/a3536c54987c6330584560808ab3e7879a5023be))
+
 ## [0.4.11](https://github.com/home-operations/kopiur/compare/0.4.10...0.4.11) (2026-06-21)
 
 
