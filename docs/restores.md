@@ -157,7 +157,9 @@ The empty-volume path applies to `fromPolicy`/`identity` sources on **every** ba
 
 ### `waitTimeout` — wait before giving up
 
-`waitTimeout` (a Go-style duration, e.g. `5m`) opens a grace window, anchored at the Restore's **creation**, during which "no matching snapshot yet" means *wait and re-check* (every ~15 s, surfacing `Resolved=False reason=WaitingForSnapshot` on the conditions) instead of giving up. `onMissingSnapshot` applies only once the window closes. Use it when the Restore may be applied before the thing that produces its snapshot — a schedule about to fire, a GitOps apply ordering, a populator claim racing the first backup.
+`waitTimeout` (a Go-style duration, e.g. `5m`) opens a grace window, anchored at the Restore's **creation**, during which "no matching snapshot yet" means *wait and re-check* instead of giving up. `onMissingSnapshot` applies only once the window closes. Use it when the Restore may be applied before the thing that produces its snapshot — a schedule about to fire, a GitOps apply ordering, a populator claim racing the first backup.
+
+Where the waiting happens depends on the source. A `snapshotRef` (waiting for the referenced `Snapshot` CR to gain an id) re-checks **in the controller** (~15 s, surfacing `Resolved=False reason=WaitingForSnapshot` on the conditions). A `fromPolicy`/`identity` source re-lists the repository **inside the restore Job** (the same mover run that does the restore, so it works on every backend) — the `Restore` shows `Restoring` for that window rather than a per-poll condition. Either way the window is measured from creation, so it's bounded even across controller restarts or Job pod retries. Because the wait runs inside the Job for the latter, `waitTimeout` must be shorter than the Job's `failurePolicy.activeDeadlineSeconds` — the admission webhook rejects a Restore that sets both with `waitTimeout` ≥ the deadline.
 
 ## Mover, cache & failure policy
 
