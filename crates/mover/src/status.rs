@@ -301,6 +301,24 @@ impl StatusUpdate {
         }
     }
 
+    /// A restore "in progress" update. The Restore CRD's in-flight phase is
+    /// `Restoring` — NOT `Running` (the Snapshot phase); writing `Running` here
+    /// is rejected by the apiserver with a 422 (the enum forbids it), so the
+    /// phase string is sourced from [`RestorePhase::Restoring`] to stay locked
+    /// to the CRD — mirroring [`StatusUpdate::completed`].
+    pub fn restoring(observed_at: DateTime<Utc>) -> Self {
+        StatusUpdate {
+            phase: RestorePhase::Restoring.label().to_string(),
+            observed_at,
+            snapshot: None,
+            timing: None,
+            stats: None,
+            failure: None,
+            log_tail: None,
+            resolved: None,
+        }
+    }
+
     /// A successful backup update from a kopia create result. `logTail` carries
     /// the documented `Snapshot created: <id>` line (ADR §3.4).
     pub fn succeeded_backup(result: &SnapshotCreateResult, observed_at: DateTime<Utc>) -> Self {
@@ -1046,6 +1064,23 @@ mod tests {
             body["status"]["logTail"],
             "Restore completed: snapshot k1f1ec0a8"
         );
+    }
+
+    #[test]
+    fn restore_in_flight_phase_is_restoring_not_running() {
+        // Regression: the mover's periodic progress update used `running()`
+        // ("Running"), but the Restore CRD enum only allows "Restoring", so the
+        // status PATCH was rejected 422 and every restore flooded the controller
+        // logs. The restore in-flight phase MUST match RestorePhase::Restoring.
+        let u = StatusUpdate::restoring(ts());
+        assert_eq!(u.phase, "Restoring");
+        assert_eq!(u.phase, RestorePhase::Restoring.label());
+        assert_ne!(u.phase, MoverPhase::Running.as_str());
+        // A progress update never sets terminal fields (the status-churn rule).
+        assert!(u.failure.is_none());
+        assert!(u.log_tail.is_none());
+        let body = u.as_patch_body();
+        assert_eq!(body["status"]["phase"], "Restoring");
     }
 
     #[test]

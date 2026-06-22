@@ -335,7 +335,12 @@ async fn execute(
         tokio::select! {
             result = &mut op => return result,
             _ = ticker.tick() => {
-                reporter.report(&StatusUpdate::running(chrono::Utc::now())).await;
+                let now = chrono::Utc::now();
+                let update = match &spec.operation {
+                    Operation::Restore(_) => StatusUpdate::restoring(now),
+                    _ => StatusUpdate::running(now),
+                };
+                reporter.report(&update).await;
             }
         }
     }
