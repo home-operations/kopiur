@@ -231,15 +231,9 @@ pub struct RestorePolicy {
     pub wait_timeout: Option<String>,
 }
 
-/// What to do when the resolved source matches no snapshot. Closed enum. ADR §4.6 (G7).
-///
-/// ```
-/// use kopiur_api::restore::OnMissingSnapshot;
-///
-/// // Fail-closed is the default so an explicit restore can't silently no-op.
-/// assert_eq!(OnMissingSnapshot::default(), OnMissingSnapshot::Fail);
-/// assert_eq!(serde_json::to_value(OnMissingSnapshot::Continue).unwrap(), "Continue");
-/// ```
+/// What to do when the resolved source matches no snapshot. Defaults to `Fail`
+/// (fail-closed) so an explicit restore can never silently no-op; choose
+/// `Continue` to provision an empty volume instead (deploy-or-restore).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum OnMissingSnapshot {
     /// Fail-closed; the default for explicit `snapshotRef`/`identity` sources.

@@ -1,5 +1,6 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
+assertion_line: 38
 expression: "body(&artifacts, \"repositoryreplications\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -64,6 +65,8 @@ spec:
                   - webDav
                 - required:
                   - rclone
+                - required:
+                  - gdrive
                 properties:
                   azure:
                     description: Azure Blob Storage.
@@ -226,6 +229,36 @@ spec:
                     required:
                     - bucket
                     type: object
+                  gdrive:
+                    description: |-
+                      Google Drive via kopia's native `gdrive` provider (service-account JSON).
+                      kopia marks this provider experimental / not maintained, and a native
+                      gdrive repository is not interchangeable with an rclone-backed Drive remote.
+                    properties:
+                      credentialsSecretRef:
+                        description: |-
+                          Secret holding the Google service-account JSON used to reach the folder,
+                          read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+                          falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+                          instance metadata).
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `Secret`.
+                            type: string
+                          namespace:
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      folderId:
+                        description: Google Drive folder ID that holds the kopia repository.
+                        type: string
+                    required:
+                    - folderId
+                    type: object
                   rclone:
                     description: |-
                       Any rclone remote (kopia shells out to `rclone`), broadening reach to
@@ -251,6 +284,14 @@ spec:
                         description: |-
                           rclone path in `remote:path` form (the remote name must exist in the
                           supplied rclone config).
+                        type: string
+                      startupTimeout:
+                        description: |-
+                          How long kopia waits for its embedded `rclone serve` to come up before
+                          failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+                          `15s`; raise it for slow remotes whose repository metadata/indexes load
+                          through the rclone/WebDAV bridge and take longer than the default budget.
+                        nullable: true
                         type: string
                     required:
                     - remotePath
@@ -915,18 +956,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: |-
-                  Lifecycle phase of a replication. Closed enum. ADR-0005 §13(d).
-
-                  ```
-                  use kopiur_api::repository_replication::RepositoryReplicationPhase;
-
-                  assert_eq!(RepositoryReplicationPhase::default(), RepositoryReplicationPhase::Pending);
-                  assert_eq!(
-                      serde_json::to_value(RepositoryReplicationPhase::Replicating).unwrap(),
-                      "Replicating"
-                  );
-                  ```
+                description: Lifecycle phase of a replication.
                 enum:
                 - Pending
                 - Replicating

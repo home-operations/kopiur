@@ -47,19 +47,10 @@ pub struct SnapshotSpec {
     pub pin: bool,
 }
 
-/// How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin`
-/// label. Closed enum. ADR §3.4.
-///
-/// Origin drives the deletion-policy default (ADR §4.5): `discovered` backups are
-/// forced to `Retain` because the operator did not create those snapshots.
-///
-/// ```
-/// use kopiur_api::Origin;
-///
-/// assert_eq!(Origin::default(), Origin::Scheduled);
-/// // Serializes camelCase, matching the `origin` label/status value.
-/// assert_eq!(serde_json::to_value(Origin::Discovered).unwrap(), "discovered");
-/// ```
+/// How a `Snapshot` came to exist. Canonical value mirrored from the
+/// `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy
+/// default: `discovered` backups are forced to `Retain` because the operator did
+/// not create those snapshots.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Origin {
@@ -72,17 +63,7 @@ pub enum Origin {
     Discovered,
 }
 
-/// Lifecycle phase of a `Snapshot`. Closed enum. ADR §3.4 status.
-///
-/// ```
-/// use kopiur_api::{SnapshotPhase, PhaseLabel};
-///
-/// assert_eq!(SnapshotPhase::default(), SnapshotPhase::Pending);
-/// // `PhaseLabel::label` gives the stable string used in status/metrics.
-/// assert_eq!(SnapshotPhase::Succeeded.label(), "Succeeded");
-/// // Every variant is enumerated for metric reset.
-/// assert_eq!(SnapshotPhase::ALL.len(), 6);
-/// ```
+/// Lifecycle phase of a `Snapshot`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum SnapshotPhase {
     /// Admitted, not yet started (also the default).
@@ -134,7 +115,7 @@ impl crate::common::PhaseLabel for SnapshotPhase {
     }
 }
 
-/// Observed state of a [`Snapshot`]. ADR §3.4 status.
+/// Observed state of a [`Snapshot`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotStatus {

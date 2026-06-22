@@ -61,6 +61,10 @@ pub enum Backend {
     /// Any rclone remote (kopia shells out to `rclone`), broadening reach to
     /// providers without a native kopia backend.
     Rclone(RcloneBackend),
+    /// Google Drive via kopia's native `gdrive` provider (service-account JSON).
+    /// kopia marks this provider experimental / not maintained, and a native
+    /// gdrive repository is not interchangeable with an rclone-backed Drive remote.
+    Gdrive(GdriveBackend),
 }
 
 impl Backend {
@@ -96,6 +100,7 @@ impl Backend {
             Backend::Sftp(_) => "Sftp",
             Backend::WebDav(_) => "WebDav",
             Backend::Rclone(_) => "Rclone",
+            Backend::Gdrive(_) => "Gdrive",
         }
     }
 }
@@ -260,4 +265,85 @@ pub struct RcloneBackend {
     /// `remote_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_secret_ref: Option<SecretRef>,
+    /// How long kopia waits for its embedded `rclone serve` to come up before
+    /// failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+    /// `15s`; raise it for slow remotes whose repository metadata/indexes load
+    /// through the rclone/WebDAV bridge and take longer than the default budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout: Option<String>,
+}
+
+/// Google Drive backend using kopia's native `gdrive` provider.
+///
+/// kopia marks this provider experimental / not maintained, so prefer a native
+/// object store where one is available. A native gdrive repository is not
+/// interchangeable with an rclone-backed Drive remote — the two lay out data
+/// differently and cannot read each other.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GdriveBackend {
+    /// Google Drive folder ID that holds the kopia repository.
+    pub folder_id: String,
+    /// Secret holding the Google service-account JSON used to reach the folder,
+    /// read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+    /// falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+    /// instance metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<SecretRef>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::from_yaml;
+
+    #[test]
+    fn gdrive_backend_round_trips() {
+        let b: Backend = from_yaml(
+            r#"
+gdrive:
+  folderId: 0ABCDEF
+  credentialsSecretRef: { name: gdrive-sa }
+"#,
+        );
+        match &b {
+            Backend::Gdrive(g) => {
+                assert_eq!(g.folder_id, "0ABCDEF");
+                assert_eq!(
+                    g.credentials_secret_ref.as_ref().map(|r| r.name.as_str()),
+                    Some("gdrive-sa")
+                );
+            }
+            other => panic!("expected gdrive, got {other:?}"),
+        }
+        assert_eq!(b.kind_str(), "Gdrive");
+        // Externally tagged, camelCase — the wire key is the variant, not `kind`.
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(json["gdrive"]["folderId"], "0ABCDEF");
+    }
+
+    #[test]
+    fn rclone_startup_timeout_round_trips() {
+        let b: Backend = from_yaml(
+            r#"
+rclone:
+  remotePath: "remote:bucket"
+  startupTimeout: 2m
+"#,
+        );
+        let Backend::Rclone(r) = &b else {
+            panic!("expected rclone, got {b:?}")
+        };
+        assert_eq!(r.remote_path, "remote:bucket");
+        assert_eq!(r.startup_timeout.as_deref(), Some("2m"));
+
+        // Absent startupTimeout stays None and is omitted on the wire.
+        let bare: Backend = from_yaml("rclone: { remotePath: \"remote:bucket\" }");
+        let Backend::Rclone(r) = &bare else {
+            panic!("expected rclone")
+        };
+        assert!(r.startup_timeout.is_none());
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json["rclone"].get("startupTimeout").is_none());
+    }
 }

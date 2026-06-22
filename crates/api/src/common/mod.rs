@@ -145,11 +145,17 @@ pub struct CredentialProjection {
 }
 
 /// Behavior when the repository does not yet exist.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBehavior {
-    /// Create the repository if it does not exist yet; off by default.
-    #[serde(default)]
+    /// Create the repository if it does not exist yet — on by default. Repository
+    /// create/connect is idempotent: pointing `create` at an already-initialized
+    /// repository just connects to it (it never re-creates or clobbers), so the
+    /// only effect of the default is that a genuinely-absent repository is
+    /// bootstrapped instead of erroring. Set `false` for a strictly read-only or
+    /// externally-managed repository the operator must never create.
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
     pub enabled: bool,
     /// kopia encryption algorithm for a freshly-created repository (creation-time only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +169,39 @@ pub struct CreateBehavior {
     /// Reed-Solomon ECC parity for a freshly-created repository (creation-time only, immutable after).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecc: Option<Ecc>,
+}
+
+impl Default for CreateBehavior {
+    /// Mirrors the serde/schema default: create-on-first-use is on.
+    fn default() -> Self {
+        CreateBehavior {
+            enabled: true,
+            encryption: None,
+            splitter: None,
+            hash: None,
+            ecc: None,
+        }
+    }
+}
+
+/// Whether the operator should create the repository when it does not yet exist.
+///
+/// Pure resolver shared by the controller and tests so the "absent means create"
+/// default cannot fork: an absent `spec.create` resolves to `true` (create on
+/// first use), and an explicit `create.enabled` is honored as written. Repository
+/// create/connect is idempotent, so create-on is the least-surprise default; set
+/// `create.enabled: false` to opt out.
+///
+/// ```
+/// use kopiur_api::common::{create_enabled, CreateBehavior};
+///
+/// assert!(create_enabled(None)); // absent → create on
+/// assert!(create_enabled(Some(&CreateBehavior::default())));
+/// let off = CreateBehavior { enabled: false, ..CreateBehavior::default() };
+/// assert!(!create_enabled(Some(&off)));
+/// ```
+pub fn create_enabled(create: Option<&CreateBehavior>) -> bool {
+    create.map(|c| c.enabled).unwrap_or(true)
 }
 
 /// Reed-Solomon error-correcting-code parity for a freshly-created repository.
@@ -305,16 +344,7 @@ pub struct ObjectRef {
 }
 
 /// Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-///
-/// ```
-/// use kopiur_api::common::DeletionPolicy;
-///
-/// // Produced backups default to deleting the snapshot with the CR.
-/// assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
-/// // Variants serialize to their bare PascalCase names (plain string enum).
-/// assert_eq!(serde_json::to_value(DeletionPolicy::Retain).unwrap(), "Retain");
-/// assert_eq!(serde_json::to_value(DeletionPolicy::Orphan).unwrap(), "Orphan");
-/// ```
+/// Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum DeletionPolicy {
     /// Finalizer runs `kopia snapshot delete <id>` then removes the finalizer; default for produced snapshots.

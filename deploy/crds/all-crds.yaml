@@ -59,6 +59,8 @@ spec:
                   - webDav
                 - required:
                   - rclone
+                - required:
+                  - gdrive
                 properties:
                   azure:
                     description: Azure Blob Storage.
@@ -221,6 +223,36 @@ spec:
                     required:
                     - bucket
                     type: object
+                  gdrive:
+                    description: |-
+                      Google Drive via kopia's native `gdrive` provider (service-account JSON).
+                      kopia marks this provider experimental / not maintained, and a native
+                      gdrive repository is not interchangeable with an rclone-backed Drive remote.
+                    properties:
+                      credentialsSecretRef:
+                        description: |-
+                          Secret holding the Google service-account JSON used to reach the folder,
+                          read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+                          falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+                          instance metadata).
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `Secret`.
+                            type: string
+                          namespace:
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      folderId:
+                        description: Google Drive folder ID that holds the kopia repository.
+                        type: string
+                    required:
+                    - folderId
+                    type: object
                   rclone:
                     description: |-
                       Any rclone remote (kopia shells out to `rclone`), broadening reach to
@@ -246,6 +278,14 @@ spec:
                         description: |-
                           rclone path in `remote:path` form (the remote name must exist in the
                           supplied rclone config).
+                        type: string
+                      startupTimeout:
+                        description: |-
+                          How long kopia waits for its embedded `rclone serve` to come up before
+                          failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+                          `15s`; raise it for slow remotes whose repository metadata/indexes load
+                          through the rclone/WebDAV bridge and take longer than the default budget.
+                        nullable: true
                         type: string
                     required:
                     - remotePath
@@ -400,6 +440,39 @@ spec:
                     - url
                     type: object
                 type: object
+              bootstrap:
+                description: |-
+                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
+                  repository the operator cannot reach in-process.
+                nullable: true
+                properties:
+                  failurePolicy:
+                    description: |-
+                      Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
+                      a connect may run before the Job is marked failed (default 120s); raise it
+                      for a slow backend — e.g. an rclone remote whose repository metadata and
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
+                      shape parity but is not honored by the bootstrap Job.
+                    nullable: true
+                    properties:
+                      activeDeadlineSeconds:
+                        description: Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      backoffLimit:
+                        description: Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
+                        format: int32
+                        nullable: true
+                        type: integer
+                      podStartupDeadlineSeconds:
+                        description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
+                        format: int64
+                        nullable: true
+                        type: integer
+                    type: object
+                type: object
               catalog:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
@@ -458,8 +531,14 @@ spec:
                         type: integer
                     type: object
                   enabled:
-                    default: false
-                    description: Create the repository if it does not exist yet; off by default.
+                    default: true
+                    description: |-
+                      Create the repository if it does not exist yet — on by default. Repository
+                      create/connect is idempotent: pointing `create` at an already-initialized
+                      repository just connects to it (it never re-creates or clobbers), so the
+                      only effect of the default is that a genuinely-absent repository is
+                      bootstrapped instead of erroring. Set `false` for a strictly read-only or
+                      externally-managed repository the operator must never create.
                     type: boolean
                   encryption:
                     description: kopia encryption algorithm for a freshly-created repository (creation-time only).
@@ -965,18 +1044,8 @@ spec:
                     type: object
                   takeoverPolicy:
                     description: |-
-                      What to do when another owner already holds the lease. Closed enum. ADR §3.7.
-
-                      ```
-                      use kopiur_api::TakeoverPolicy;
-
-                      // The safest default: never seize a lease another owner holds.
-                      assert_eq!(TakeoverPolicy::default(), TakeoverPolicy::Never);
-                      assert_eq!(
-                          serde_json::to_value(TakeoverPolicy::PromptCondition).unwrap(),
-                          serde_json::json!("PromptCondition"),
-                      );
-                      ```
+                      What to do when another owner already holds the lease. Defaults to `Never`
+                      (the safest: never seize a lease another owner holds).
                     enum:
                     - Never
                     - PromptCondition
@@ -2329,21 +2398,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: |-
-                  Lifecycle phase of a repository. ADR §3.1 status.
-
-                  A freshly admitted CR starts in the `#[default]` [`RepositoryPhase::Pending`]:
-
-                  ```
-                  use kopiur_api::repository::RepositoryPhase;
-
-                  assert_eq!(RepositoryPhase::default(), RepositoryPhase::Pending);
-                  // Serializes as a bare string (closed unit enum).
-                  assert_eq!(
-                      serde_json::to_value(RepositoryPhase::Ready).unwrap(),
-                      serde_json::json!("Ready")
-                  );
-                  ```
+                description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:
                 - Pending
                 - Initializing
@@ -2540,6 +2595,8 @@ spec:
                   - webDav
                 - required:
                   - rclone
+                - required:
+                  - gdrive
                 properties:
                   azure:
                     description: Azure Blob Storage.
@@ -2702,6 +2759,36 @@ spec:
                     required:
                     - bucket
                     type: object
+                  gdrive:
+                    description: |-
+                      Google Drive via kopia's native `gdrive` provider (service-account JSON).
+                      kopia marks this provider experimental / not maintained, and a native
+                      gdrive repository is not interchangeable with an rclone-backed Drive remote.
+                    properties:
+                      credentialsSecretRef:
+                        description: |-
+                          Secret holding the Google service-account JSON used to reach the folder,
+                          read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+                          falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+                          instance metadata).
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `Secret`.
+                            type: string
+                          namespace:
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      folderId:
+                        description: Google Drive folder ID that holds the kopia repository.
+                        type: string
+                    required:
+                    - folderId
+                    type: object
                   rclone:
                     description: |-
                       Any rclone remote (kopia shells out to `rclone`), broadening reach to
@@ -2727,6 +2814,14 @@ spec:
                         description: |-
                           rclone path in `remote:path` form (the remote name must exist in the
                           supplied rclone config).
+                        type: string
+                      startupTimeout:
+                        description: |-
+                          How long kopia waits for its embedded `rclone serve` to come up before
+                          failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+                          `15s`; raise it for slow remotes whose repository metadata/indexes load
+                          through the rclone/WebDAV bridge and take longer than the default budget.
+                        nullable: true
                         type: string
                     required:
                     - remotePath
@@ -2881,6 +2976,39 @@ spec:
                     - url
                     type: object
                 type: object
+              bootstrap:
+                description: |-
+                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
+                  repository the operator cannot reach in-process.
+                nullable: true
+                properties:
+                  failurePolicy:
+                    description: |-
+                      Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
+                      a connect may run before the Job is marked failed (default 120s); raise it
+                      for a slow backend — e.g. an rclone remote whose repository metadata and
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
+                      shape parity but is not honored by the bootstrap Job.
+                    nullable: true
+                    properties:
+                      activeDeadlineSeconds:
+                        description: Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      backoffLimit:
+                        description: Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
+                        format: int32
+                        nullable: true
+                        type: integer
+                      podStartupDeadlineSeconds:
+                        description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
+                        format: int64
+                        nullable: true
+                        type: integer
+                    type: object
+                type: object
               catalog:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
@@ -2939,8 +3067,14 @@ spec:
                         type: integer
                     type: object
                   enabled:
-                    default: false
-                    description: Create the repository if it does not exist yet; off by default.
+                    default: true
+                    description: |-
+                      Create the repository if it does not exist yet — on by default. Repository
+                      create/connect is idempotent: pointing `create` at an already-initialized
+                      repository just connects to it (it never re-creates or clobbers), so the
+                      only effect of the default is that a genuinely-absent repository is
+                      bootstrapped instead of erroring. Set `false` for a strictly read-only or
+                      externally-managed repository the operator must never create.
                     type: boolean
                   encryption:
                     description: kopia encryption algorithm for a freshly-created repository (creation-time only).
@@ -3468,18 +3602,8 @@ spec:
                     type: object
                   takeoverPolicy:
                     description: |-
-                      What to do when another owner already holds the lease. Closed enum. ADR §3.7.
-
-                      ```
-                      use kopiur_api::TakeoverPolicy;
-
-                      // The safest default: never seize a lease another owner holds.
-                      assert_eq!(TakeoverPolicy::default(), TakeoverPolicy::Never);
-                      assert_eq!(
-                          serde_json::to_value(TakeoverPolicy::PromptCondition).unwrap(),
-                          serde_json::json!("PromptCondition"),
-                      );
-                      ```
+                      What to do when another owner already holds the lease. Defaults to `Never`
+                      (the safest: never seize a lease another owner holds).
                     enum:
                     - Never
                     - PromptCondition
@@ -4843,21 +4967,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: |-
-                  Lifecycle phase of a repository. ADR §3.1 status.
-
-                  A freshly admitted CR starts in the `#[default]` [`RepositoryPhase::Pending`]:
-
-                  ```
-                  use kopiur_api::repository::RepositoryPhase;
-
-                  assert_eq!(RepositoryPhase::default(), RepositoryPhase::Pending);
-                  // Serializes as a bare string (closed unit enum).
-                  assert_eq!(
-                      serde_json::to_value(RepositoryPhase::Ready).unwrap(),
-                      serde_json::json!("Ready")
-                  );
-                  ```
+                description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:
                 - Pending
                 - Initializing
@@ -5014,18 +5124,10 @@ spec:
                     type: boolean
                 type: object
               defaultDeletionPolicy:
+                default: Delete
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-
-                  ```
-                  use kopiur_api::common::DeletionPolicy;
-
-                  // Produced backups default to deleting the snapshot with the CR.
-                  assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
-                  // Variants serialize to their bare PascalCase names (plain string enum).
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Retain).unwrap(), "Retain");
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Orphan).unwrap(), "Orphan");
-                  ```
+                  Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
                 enum:
                 - Delete
                 - Retain
@@ -5068,19 +5170,11 @@ spec:
                     type: array
                 type: object
               groupBy:
+                default: VolumeGroupSnapshot
                 description: |-
-                  Multi-PVC grouping strategy. Closed enum. ADR §4.9.
-
-                  Defaults to a consistent group snapshot; `None` must be set *explicitly* to
-                  accept independent per-PVC snapshots, because a silent per-PVC fallback would
-                  produce inconsistent backups (the data-integrity hazard ADR §4.9 guards against).
-
-                  ```
-                  use kopiur_api::GroupBy;
-
-                  assert_eq!(GroupBy::default(), GroupBy::VolumeGroupSnapshot);
-                  assert_eq!(serde_json::to_value(GroupBy::None).unwrap(), "None");
-                  ```
+                  Multi-PVC grouping strategy. Defaults to a consistent group snapshot across
+                  all PVCs; set `None` *explicitly* to accept independent per-PVC snapshots,
+                  because a silent per-PVC fallback would produce inconsistent backups.
                 enum:
                 - VolumeGroupSnapshot
                 - None
@@ -5094,30 +5188,9 @@ spec:
                     description: Hooks run (in order) after the snapshot completes — e.g. resuming the workload.
                     items:
                       description: |-
-                        One of three hook forms. ADR §4.8.
-
-                        Externally-tagged: wire shape is `{ workloadExec: {...} }`, `{ runJob: {...} }`,
-                        or `{ httpRequest: {...} }`. Exactly one variant by construction.
-
-                        Not `Eq`: `RunJob` embeds `JobSpec` (k8s-openapi, `PartialEq` only).
-
-                        ```
-                        use kopiur_api::snapshot_policy::{Hook, HttpRequestHook};
-
-                        // Construct directly — the type system guarantees exactly one variant.
-                        let hook = Hook::HttpRequest(HttpRequestHook {
-                            url: "https://example/notify".into(),
-                            method: Some("POST".into()),
-                            body: None,
-                            timeout: None,
-                            continue_on_failure: false,
-                        });
-                        assert_eq!(hook.kind_str(), "HttpRequest");
-
-                        // Externally tagged on the wire: `{ httpRequest: { url: ... } }`.
-                        let json = serde_json::to_value(&hook).unwrap();
-                        assert_eq!(json["httpRequest"]["url"], "https://example/notify");
-                        ```
+                        One of three hook forms. Externally-tagged: the wire shape is
+                        `{ workloadExec: {...} }`, `{ runJob: {...} }`, or `{ httpRequest: {...} }`,
+                        and exactly one form is present.
                       oneOf:
                       - required:
                         - workloadExec
@@ -5225,30 +5298,9 @@ spec:
                     description: Hooks run (in order) before the snapshot is taken — e.g. quiescing a database.
                     items:
                       description: |-
-                        One of three hook forms. ADR §4.8.
-
-                        Externally-tagged: wire shape is `{ workloadExec: {...} }`, `{ runJob: {...} }`,
-                        or `{ httpRequest: {...} }`. Exactly one variant by construction.
-
-                        Not `Eq`: `RunJob` embeds `JobSpec` (k8s-openapi, `PartialEq` only).
-
-                        ```
-                        use kopiur_api::snapshot_policy::{Hook, HttpRequestHook};
-
-                        // Construct directly — the type system guarantees exactly one variant.
-                        let hook = Hook::HttpRequest(HttpRequestHook {
-                            url: "https://example/notify".into(),
-                            method: Some("POST".into()),
-                            body: None,
-                            timeout: None,
-                            continue_on_failure: false,
-                        });
-                        assert_eq!(hook.kind_str(), "HttpRequest");
-
-                        // Externally tagged on the wire: `{ httpRequest: { url: ... } }`.
-                        let json = serde_json::to_value(&hook).unwrap();
-                        assert_eq!(json["httpRequest"]["url"], "https://example/notify");
-                        ```
+                        One of three hook forms. Externally-tagged: the wire shape is
+                        `{ workloadExec: {...} }`, `{ runJob: {...} }`, or `{ httpRequest: {...} }`,
+                        and exactly one form is present.
                       oneOf:
                       - required:
                         - workloadExec
@@ -5882,21 +5934,11 @@ spec:
                       nullable: true
                       type: string
                     sourcePathStrategy:
+                      default: PvcName
                       description: |-
-                        How a selector-matched PVC's source path is derived. Closed enum. ADR §3.3/§4.2.
-
-                        Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs
-                        and each needs a distinct kopia source path.
-
-                        ```
-                        use kopiur_api::SourcePathStrategy;
-
-                        assert_eq!(SourcePathStrategy::default(), SourcePathStrategy::PvcName);
-                        assert_eq!(
-                            serde_json::to_value(SourcePathStrategy::PvcNamespacedName).unwrap(),
-                            "PvcNamespacedName"
-                        );
-                        ```
+                        How a selector-matched PVC's source path is derived. Only relevant for
+                        `pvcSelector` sources, where one recipe expands to many PVCs and each needs a
+                        distinct kopia source path. Defaults to `PvcName`.
                       enum:
                       - PvcName
                       - PvcNamespacedName
@@ -6160,16 +6202,7 @@ spec:
               deletionPolicy:
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-
-                  ```
-                  use kopiur_api::common::DeletionPolicy;
-
-                  // Produced backups default to deleting the snapshot with the CR.
-                  assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
-                  // Variants serialize to their bare PascalCase names (plain string enum).
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Retain).unwrap(), "Retain");
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Orphan).unwrap(), "Orphan");
-                  ```
+                  Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
                 enum:
                 - Delete
                 - Retain
@@ -6221,7 +6254,7 @@ spec:
                 type: object
             type: object
           status:
-            description: Observed state of a [`Snapshot`]. ADR §3.4 status.
+            description: Observed state of a [`Snapshot`].
             nullable: true
             properties:
               conditions:
@@ -6324,19 +6357,10 @@ spec:
                 type: integer
               origin:
                 description: |-
-                  How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin`
-                  label. Closed enum. ADR §3.4.
-
-                  Origin drives the deletion-policy default (ADR §4.5): `discovered` backups are
-                  forced to `Retain` because the operator did not create those snapshots.
-
-                  ```
-                  use kopiur_api::Origin;
-
-                  assert_eq!(Origin::default(), Origin::Scheduled);
-                  // Serializes camelCase, matching the `origin` label/status value.
-                  assert_eq!(serde_json::to_value(Origin::Discovered).unwrap(), "discovered");
-                  ```
+                  How a `Snapshot` came to exist. Canonical value mirrored from the
+                  `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy
+                  default: `discovered` backups are forced to `Retain` because the operator did
+                  not create those snapshots.
                 enum:
                 - scheduled
                 - manual
@@ -6344,18 +6368,7 @@ spec:
                 nullable: true
                 type: string
               phase:
-                description: |-
-                  Lifecycle phase of a `Snapshot`. Closed enum. ADR §3.4 status.
-
-                  ```
-                  use kopiur_api::{SnapshotPhase, PhaseLabel};
-
-                  assert_eq!(SnapshotPhase::default(), SnapshotPhase::Pending);
-                  // `PhaseLabel::label` gives the stable string used in status/metrics.
-                  assert_eq!(SnapshotPhase::Succeeded.label(), "Succeeded");
-                  // Every variant is enumerated for metric reset.
-                  assert_eq!(SnapshotPhase::ALL.len(), 6);
-                  ```
+                description: Lifecycle phase of a `Snapshot`.
                 enum:
                 - Pending
                 - Running
@@ -7228,15 +7241,9 @@ spec:
                 properties:
                   onMissingSnapshot:
                     description: |-
-                      What to do when the resolved source matches no snapshot. Closed enum. ADR §4.6 (G7).
-
-                      ```
-                      use kopiur_api::restore::OnMissingSnapshot;
-
-                      // Fail-closed is the default so an explicit restore can't silently no-op.
-                      assert_eq!(OnMissingSnapshot::default(), OnMissingSnapshot::Fail);
-                      assert_eq!(serde_json::to_value(OnMissingSnapshot::Continue).unwrap(), "Continue");
-                      ```
+                      What to do when the resolved source matches no snapshot. Defaults to `Fail`
+                      (fail-closed) so an explicit restore can never silently no-op; choose
+                      `Continue` to provision an empty volume instead (deploy-or-restore).
                     enum:
                     - Fail
                     - Continue
@@ -8228,17 +8235,8 @@ spec:
                     type: string
                   mode:
                     description: |-
-                      Which maintenance kind a manual (annotation-requested) run performs. Closed
-                      enum; the wire values are the `run-mode` annotation values.
-
-                      ```
-                      use kopiur_api::maintenance::ManualRunMode;
-
-                      assert_eq!(ManualRunMode::default(), ManualRunMode::Quick);
-                      assert_eq!(ManualRunMode::parse("full"), Some(ManualRunMode::Full));
-                      assert_eq!(ManualRunMode::parse("FULL"), None); // exact, lowercase
-                      assert_eq!(serde_json::to_value(ManualRunMode::Quick).unwrap(), "quick");
-                      ```
+                      Which maintenance kind a manual (annotation-requested) run performs; the wire
+                      values are the `run-mode` annotation values. Defaults to `quick`.
                     enum:
                     - quick
                     - full
@@ -8374,6 +8372,8 @@ spec:
                   - webDav
                 - required:
                   - rclone
+                - required:
+                  - gdrive
                 properties:
                   azure:
                     description: Azure Blob Storage.
@@ -8536,6 +8536,36 @@ spec:
                     required:
                     - bucket
                     type: object
+                  gdrive:
+                    description: |-
+                      Google Drive via kopia's native `gdrive` provider (service-account JSON).
+                      kopia marks this provider experimental / not maintained, and a native
+                      gdrive repository is not interchangeable with an rclone-backed Drive remote.
+                    properties:
+                      credentialsSecretRef:
+                        description: |-
+                          Secret holding the Google service-account JSON used to reach the folder,
+                          read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+                          falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+                          instance metadata).
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `Secret`.
+                            type: string
+                          namespace:
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      folderId:
+                        description: Google Drive folder ID that holds the kopia repository.
+                        type: string
+                    required:
+                    - folderId
+                    type: object
                   rclone:
                     description: |-
                       Any rclone remote (kopia shells out to `rclone`), broadening reach to
@@ -8561,6 +8591,14 @@ spec:
                         description: |-
                           rclone path in `remote:path` form (the remote name must exist in the
                           supplied rclone config).
+                        type: string
+                      startupTimeout:
+                        description: |-
+                          How long kopia waits for its embedded `rclone serve` to come up before
+                          failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+                          `15s`; raise it for slow remotes whose repository metadata/indexes load
+                          through the rclone/WebDAV bridge and take longer than the default budget.
+                        nullable: true
                         type: string
                     required:
                     - remotePath
@@ -9225,18 +9263,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: |-
-                  Lifecycle phase of a replication. Closed enum. ADR-0005 §13(d).
-
-                  ```
-                  use kopiur_api::repository_replication::RepositoryReplicationPhase;
-
-                  assert_eq!(RepositoryReplicationPhase::default(), RepositoryReplicationPhase::Pending);
-                  assert_eq!(
-                      serde_json::to_value(RepositoryReplicationPhase::Replicating).unwrap(),
-                      "Replicating"
-                  );
-                  ```
+                description: Lifecycle phase of a replication.
                 enum:
                 - Pending
                 - Replicating

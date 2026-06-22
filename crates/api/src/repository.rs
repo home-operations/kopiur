@@ -2,7 +2,7 @@
 
 use crate::backend::Backend;
 use crate::common::{
-    CatalogBounds, CreateBehavior, Encryption, MoverDefaults, NamespaceDeletePolicy,
+    CatalogBounds, CreateBehavior, Encryption, FailurePolicy, MoverDefaults, NamespaceDeletePolicy,
     RepositoryMode, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
@@ -55,6 +55,10 @@ pub struct RepositorySpec {
     /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
+    /// Tuning for the one-shot bootstrap Job that connects/creates an object-store
+    /// repository the operator cannot reach in-process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapSpec>,
     /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
@@ -81,6 +85,22 @@ pub struct RepositorySpec {
     /// Repository health thresholds (tunes the index-blob-count warning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthSpec>,
+}
+
+/// Tuning for the one-shot bootstrap Job, shared by `Repository` and
+/// `ClusterRepository`. Bootstrap connects (or, with `create`, creates) an
+/// object-store repository the operator cannot reach in-process.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapSpec {
+    /// Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
+    /// a connect may run before the Job is marked failed (default 120s); raise it
+    /// for a slow backend — e.g. an rclone remote whose repository metadata and
+    /// indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+    /// `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
+    /// shape parity but is not honored by the bootstrap Job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_policy: Option<FailurePolicy>,
 }
 
 /// Repository health thresholds, shared by `Repository` and `ClusterRepository`.
@@ -116,20 +136,7 @@ pub fn resolve_index_blob_warn_threshold(health: Option<&RepositoryHealthSpec>) 
         .unwrap_or(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
 }
 
-/// Lifecycle phase of a repository. ADR §3.1 status.
-///
-/// A freshly admitted CR starts in the `#[default]` [`RepositoryPhase::Pending`]:
-///
-/// ```
-/// use kopiur_api::repository::RepositoryPhase;
-///
-/// assert_eq!(RepositoryPhase::default(), RepositoryPhase::Pending);
-/// // Serializes as a bare string (closed unit enum).
-/// assert_eq!(
-///     serde_json::to_value(RepositoryPhase::Ready).unwrap(),
-///     serde_json::json!("Ready")
-/// );
-/// ```
+/// Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum RepositoryPhase {
     /// Accepted by the API server but not yet reconciled.
@@ -267,6 +274,35 @@ suspend: true
         assert_eq!(json["suspend"], true);
         let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn bootstrap_failure_policy_round_trips() {
+        let spec: RepositorySpec = from_yaml(
+            r#"
+backend: { rclone: { remotePath: "mydrive:backups", startupTimeout: 2m } }
+encryption: { passwordSecretRef: { name: s } }
+bootstrap:
+  failurePolicy:
+    activeDeadlineSeconds: 600
+    backoffLimit: 1
+"#,
+        );
+        let fp = spec
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.failure_policy.as_ref())
+            .expect("bootstrap.failurePolicy");
+        assert_eq!(fp.active_deadline_seconds, Some(600));
+        assert_eq!(fp.backoff_limit, Some(1));
+        // Absent bootstrap stays None.
+        let bare: RepositorySpec = from_yaml(
+            r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+"#,
+        );
+        assert!(bare.bootstrap.is_none());
     }
 
     #[test]

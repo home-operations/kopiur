@@ -426,10 +426,21 @@ fn object_store_backends_convert_and_roundtrip() {
         (
             RepositoryConnect::Rclone {
                 remote_path: "r:bucket".into(),
+                startup_timeout: Some("2m".into()),
             },
             ConnectSpec::Rclone {
                 remote_path: "r:bucket".into(),
                 config_file: None,
+                startup_timeout: Some("2m".into()),
+            },
+        ),
+        (
+            RepositoryConnect::Gdrive {
+                folder_id: "fid".into(),
+            },
+            ConnectSpec::Gdrive {
+                folder_id: "fid".into(),
+                credentials_file: None,
             },
         ),
     ];

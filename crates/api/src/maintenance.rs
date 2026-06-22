@@ -98,18 +98,8 @@ pub struct Ownership {
     pub takeover_policy: TakeoverPolicy,
 }
 
-/// What to do when another owner already holds the lease. Closed enum. ADR §3.7.
-///
-/// ```
-/// use kopiur_api::TakeoverPolicy;
-///
-/// // The safest default: never seize a lease another owner holds.
-/// assert_eq!(TakeoverPolicy::default(), TakeoverPolicy::Never);
-/// assert_eq!(
-///     serde_json::to_value(TakeoverPolicy::PromptCondition).unwrap(),
-///     serde_json::json!("PromptCondition"),
-/// );
-/// ```
+/// What to do when another owner already holds the lease. Defaults to `Never`
+/// (the safest: never seize a lease another owner holds).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum TakeoverPolicy {
     /// Never take over a lease another owner holds (default, safest).
@@ -347,17 +337,8 @@ pub struct MaintenanceStatus {
     pub manual_run: Option<ManualRunStatus>,
 }
 
-/// Which maintenance kind a manual (annotation-requested) run performs. Closed
-/// enum; the wire values are the `run-mode` annotation values.
-///
-/// ```
-/// use kopiur_api::maintenance::ManualRunMode;
-///
-/// assert_eq!(ManualRunMode::default(), ManualRunMode::Quick);
-/// assert_eq!(ManualRunMode::parse("full"), Some(ManualRunMode::Full));
-/// assert_eq!(ManualRunMode::parse("FULL"), None); // exact, lowercase
-/// assert_eq!(serde_json::to_value(ManualRunMode::Quick).unwrap(), "quick");
-/// ```
+/// Which maintenance kind a manual (annotation-requested) run performs; the wire
+/// values are the `run-mode` annotation values. Defaults to `quick`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum ManualRunMode {
@@ -696,5 +677,14 @@ failurePolicy:
             "Force"
         );
         assert_eq!(TakeoverPolicy::default(), TakeoverPolicy::Never);
+    }
+
+    #[test]
+    fn manual_run_mode_parses_exact_lowercase_and_defaults_to_quick() {
+        assert_eq!(ManualRunMode::default(), ManualRunMode::Quick);
+        assert_eq!(ManualRunMode::parse("quick"), Some(ManualRunMode::Quick));
+        assert_eq!(ManualRunMode::parse("full"), Some(ManualRunMode::Full));
+        assert_eq!(ManualRunMode::parse("FULL"), None); // exact, lowercase only
+        assert_eq!(serde_json::to_value(ManualRunMode::Quick).unwrap(), "quick");
     }
 }

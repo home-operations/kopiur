@@ -23,7 +23,8 @@ Point as many backups as you can at **one** repository. Kopia deduplicates by co
 spec:
     backend: { <one of eight>: { ... } } # WHERE: storage. Exactly one backend.
     encryption: { passwordSecretRef: ... } # the kopia repo password (Secret ref)
-    create: { enabled: true, ecc: { ... } } # initialize the repo if absent (default: off)
+    create: { enabled: true, ecc: { ... } } # initialize the repo if absent (default: on)
+    bootstrap: { failurePolicy: { ... } } # tune the connect/create Job deadline + retries
     moverDefaults: { ... } # base config for EVERY mover (SC, resources, cache, ...)
     catalog: { ... } # bounds "discovered" snapshot materialization
     maintenance: { ... } # default-managed; see the Maintenance guide
@@ -73,6 +74,7 @@ The mover reads these **well-known keys** from the Secret you reference and feed
 | **SFTP**       | `KOPIA_SFTP_KEY_DATA`, `KOPIA_SFTP_KNOWN_HOSTS`                           | Key-based auth; the mover writes both to files (`--keyfile`/`--known-hosts`). See [SFTP](backends/sftp.md). |
 | **WebDAV**     | `KOPIA_WEBDAV_USERNAME`, `KOPIA_WEBDAV_PASSWORD`                          | HTTP basic auth, via `auth.secretRef`.                                                                      |
 | **rclone**     | `KOPIA_RCLONE_CONFIG` (the `rclone.conf`)                                 | Referenced by `backend.rclone.configSecretRef`, not `auth`.                                                 |
+| **gdrive**     | `KOPIA_GDRIVE_CREDENTIALS` (service-account JSON)                         | Native Google Drive; referenced by `backend.gdrive.credentialsSecretRef`. Experimental — see [Google Drive](backends/gdrive.md). |
 | **filesystem** | _(none — local path)_                                                     | Only `KOPIA_PASSWORD` is needed.                                                                            |
 
 /// note | ClusterRepository Secret references need a namespace
@@ -81,9 +83,9 @@ Because a `ClusterRepository` is cluster-scoped it has no namespace of its own, 
 
 ///
 
-## The eight backends
+## The nine backends
 
-Kopiur supports eight backends; each is selected by the `spec.backend.<key>` you set.
+Kopiur supports nine backends; each is selected by the `spec.backend.<key>` you set.
 
 | Backend                                                               | `spec.backend` key | Where it goes             |
 | --------------------------------------------------------------------- | ------------------ | ------------------------- |
@@ -95,6 +97,7 @@ Kopiur supports eight backends; each is selected by the `spec.backend.<key>` you
 | SFTP                                                                  | `sftp`             | a path on an SSH server   |
 | WebDAV                                                                | `webDav`           | a collection URL          |
 | rclone (everything else)                                              | `rclone`           | any rclone remote         |
+| Google Drive (native, experimental)                                   | `gdrive`           | a Drive folder            |
 
 /// tip | Per-backend setup lives on its own page
 
@@ -111,7 +114,7 @@ spec:
             name: repo-creds
             key: KOPIA_PASSWORD # which key inside the Secret holds the password
     create:
-        enabled: true # create the repo if it doesn't exist yet (default: false)
+        enabled: true # create the repo if it doesn't exist yet (default: true)
         # All of the below are consulted ONLY at creation time, then fixed forever
         # (webhook- AND apiserver-immutable: editing them is rejected):
         encryption: AES256-GCM-HMAC-SHA256
@@ -136,11 +139,11 @@ The `encryption.passwordSecretRef` is **not** in this set: you may rename or rep
 
 ///
 
-/// note | `create.enabled` is off by default — on purpose
+/// note | `create.enabled` defaults to **on** — and that's safe
 
-With creation disabled, a typo in `bucket`/`endpoint` surfaces as a connect failure instead of silently spinning up a brand-new empty repository at the wrong address. Enable it for a genuinely new repo; leave it off to require that one already exists.
+Repository create/connect is **idempotent**: every bootstrap *connects first* and only creates when the backend holds no repository yet (see [Safe by construction](#safe-by-construction)). So creating-on-first-use is the least-surprise default — a genuinely-absent repository is initialized instead of erroring, and pointing `create` at one that already exists just adopts it. Omitting `create` entirely (or `create: {}`) is the same as `create.enabled: true`.
 
-If the backend holds **no** repository yet and `create.enabled` is off, the `Repository`/`ClusterRepository` goes `Failed` with a `Bootstrapped=False`, `reason: RepositoryNotInitialized` condition whose message tells you exactly what to do — set `create.enabled: true` to initialize it, or point the backend at an existing repository. (This is distinct from a wrong-password connect, which fails `AuthFailure` and **never** recreates over the existing data — see [Safe by construction](#safe-by-construction) below.)
+Set **`create.enabled: false`** for a strictly read-only or externally-managed repository the operator must never create. With creation disabled, a typo in `bucket`/`endpoint` surfaces as a connect failure (`Bootstrapped=False`, `reason: RepositoryNotInitialized`) instead of spinning up a new empty repository — at the cost of opting in for every genuinely-new repo. (A wrong-password connect fails `AuthFailure` and **never** recreates over existing data — see [Safe by construction](#safe-by-construction) below.)
 
 ///
 
@@ -153,6 +156,33 @@ If the backend holds **no** repository yet and `create.enabled` is off, the `Rep
 - **No repository exists** → kopiur creates one (only because `create.enabled` is on). As a final backstop, kopia's own `repository create` refuses to overwrite an existing repository, so even a misclassified connect cannot clobber your data.
 
 So enabling `create.enabled` for a repository that turns out to already exist is safe: kopiur will adopt it, not re-initialize it.
+
+## `bootstrap` — tuning the connect/create Job
+
+Object-store and volume-backed repositories connect (and, with `create`, create) in a short-lived **bootstrap Job** the operator cannot run in-process. By default that Job is bounded to **120s** so a pod that never schedules (missing mover ServiceAccount, image-pull failure) becomes terminal-`Failed` and surfaces an actionable Event instead of hanging. A valid-but-slow backend can need longer — most commonly an [rclone](backends/rclone.md) remote whose metadata/indexes load through kopia's embedded `rclone serve` bridge.
+
+`spec.bootstrap.failurePolicy` reuses the same shape as a recipe's `failurePolicy`:
+
+```yaml
+spec:
+    bootstrap:
+        failurePolicy:
+            activeDeadlineSeconds: 600 # wall-clock cap for the bootstrap Job (default 120)
+            backoffLimit: 1 # retries before the Job is marked failed (default 2)
+```
+
+| Field                              | Default | What it controls                                                                 |
+| ---------------------------------- | ------- | -------------------------------------------------------------------------------- |
+| `failurePolicy.activeDeadlineSeconds` | `120`   | Wall-clock seconds before the bootstrap Job is killed and marked failed.        |
+| `failurePolicy.backoffLimit`       | `2`     | Pod retries before the Job is failed.                                            |
+
+/// note | `podStartupDeadlineSeconds` is not honored for bootstrap
+
+`failurePolicy` is the shared type, so it also carries `podStartupDeadlineSeconds` — but the bootstrap Job does not consume it (only backup/restore/maintenance movers do). Use `activeDeadlineSeconds` to bound a slow bootstrap.
+
+///
+
+For an rclone-specific connect that's slow *before* metadata even loads, also raise [`backend.rclone.startupTimeout`](backends/rclone.md#fields-reference-backendrclone) (kopia's wait for `rclone serve` to come up).
 
 ## The catalog — discovered snapshots
 

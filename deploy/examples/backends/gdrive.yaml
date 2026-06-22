@@ -1,0 +1,62 @@
+# Backend: Google Drive — kopia native `gdrive` provider (ADR-0003 §3.1)
+#
+# WARNING: kopia marks the `gdrive` provider EXPERIMENTAL / not maintained.
+# Prefer a native object store (S3/GCS/Azure/B2) where one is available. A native
+# gdrive repository is NOT interchangeable with an rclone-backed Drive remote:
+# the two lay out data differently and cannot read each other's repositories.
+#
+# Identifiers (folderId) live in the Repository spec; the Google service-account
+# key JSON lives in a Secret. The mover writes it to a file and passes
+# `--credentials-file` to kopia.
+#
+# Field shapes verified against crates/api: externally-tagged backend
+# (`backend.gdrive`).
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# for docs/backends/gdrive.md. They are plain YAML comments — the file stays
+# `kubectl apply -f`-able as-is.
+# --8<-- [start:repository]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gdrive-repo-creds
+  namespace: backups
+type: Opaque
+stringData:
+  # The full service-account key JSON, verbatim. The mover writes it to a file
+  # and passes `--credentials-file` to kopia. The key MUST be
+  # KOPIA_GDRIVE_CREDENTIALS (a valid env identifier) — a dotted key like
+  # `credentials.json` is dropped by Kubernetes envFrom.
+  KOPIA_GDRIVE_CREDENTIALS: |
+    {
+      "type": "service_account",
+      "project_id": "REPLACE_ME",
+      "private_key_id": "REPLACE_ME",
+      "private_key": "-----BEGIN PRIVATE KEY-----\nREPLACE_ME\n-----END PRIVATE KEY-----\n",
+      "client_email": "kopia@REPLACE_ME.iam.gserviceaccount.com",
+      "client_id": "REPLACE_ME",
+      "token_uri": "https://oauth2.googleapis.com/token"
+    }
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: gdrive-primary
+  namespace: backups
+spec:
+  backend:
+    gdrive:
+      # The Drive folder ID that holds the repository. Share this folder with the
+      # service account's client_email (above) as an Editor.
+      folderId: REPLACE_ME_FOLDER_ID
+      credentialsSecretRef:
+        name: gdrive-repo-creds # Secret carrying KOPIA_GDRIVE_CREDENTIALS above
+  encryption:
+    passwordSecretRef:
+      name: gdrive-repo-creds # may be the same Secret; it also carries KOPIA_PASSWORD
+      key: KOPIA_PASSWORD
+  # `create` now defaults to enabled (connect-or-create is idempotent); set
+  # `create.enabled: false` only for a strictly read-only / externally-managed repo.
+# --8<-- [end:repository]

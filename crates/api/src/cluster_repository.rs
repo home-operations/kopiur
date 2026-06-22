@@ -11,7 +11,9 @@ use crate::common::{
     RepositoryMode, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
-use crate::repository::{CatalogStatus, RepositoryHealthSpec, RepositoryPhase, StorageStats};
+use crate::repository::{
+    BootstrapSpec, CatalogStatus, RepositoryHealthSpec, RepositoryPhase, StorageStats,
+};
 use crate::server::{ClusterServerSpec, ServerStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
 use kube::CustomResource;
@@ -57,6 +59,10 @@ pub struct ClusterRepositorySpec {
     /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
+    /// Tuning for the one-shot bootstrap Job that connects/creates an object-store
+    /// repository the operator cannot reach in-process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapSpec>,
     /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,

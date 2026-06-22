@@ -43,16 +43,7 @@ spec:
               deletionPolicy:
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-
-                  ```
-                  use kopiur_api::common::DeletionPolicy;
-
-                  // Produced backups default to deleting the snapshot with the CR.
-                  assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
-                  // Variants serialize to their bare PascalCase names (plain string enum).
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Retain).unwrap(), "Retain");
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Orphan).unwrap(), "Orphan");
-                  ```
+                  Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
                 enum:
                 - Delete
                 - Retain
@@ -104,7 +95,7 @@ spec:
                 type: object
             type: object
           status:
-            description: Observed state of a [`Snapshot`]. ADR §3.4 status.
+            description: Observed state of a [`Snapshot`].
             nullable: true
             properties:
               conditions:
@@ -207,19 +198,10 @@ spec:
                 type: integer
               origin:
                 description: |-
-                  How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin`
-                  label. Closed enum. ADR §3.4.
-
-                  Origin drives the deletion-policy default (ADR §4.5): `discovered` backups are
-                  forced to `Retain` because the operator did not create those snapshots.
-
-                  ```
-                  use kopiur_api::Origin;
-
-                  assert_eq!(Origin::default(), Origin::Scheduled);
-                  // Serializes camelCase, matching the `origin` label/status value.
-                  assert_eq!(serde_json::to_value(Origin::Discovered).unwrap(), "discovered");
-                  ```
+                  How a `Snapshot` came to exist. Canonical value mirrored from the
+                  `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy
+                  default: `discovered` backups are forced to `Retain` because the operator did
+                  not create those snapshots.
                 enum:
                 - scheduled
                 - manual
@@ -227,18 +209,7 @@ spec:
                 nullable: true
                 type: string
               phase:
-                description: |-
-                  Lifecycle phase of a `Snapshot`. Closed enum. ADR §3.4 status.
-
-                  ```
-                  use kopiur_api::{SnapshotPhase, PhaseLabel};
-
-                  assert_eq!(SnapshotPhase::default(), SnapshotPhase::Pending);
-                  // `PhaseLabel::label` gives the stable string used in status/metrics.
-                  assert_eq!(SnapshotPhase::Succeeded.label(), "Succeeded");
-                  // Every variant is enumerated for metric reset.
-                  assert_eq!(SnapshotPhase::ALL.len(), 6);
-                  ```
+                description: Lifecycle phase of a `Snapshot`.
                 enum:
                 - Pending
                 - Running
