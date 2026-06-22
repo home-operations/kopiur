@@ -205,17 +205,19 @@ fn failure_log_tail(failure: &FailureBlock) -> String {
 
 /// The phase a mover run reports.
 ///
+/// Only the TERMINAL mover phases live here. There is deliberately no `Running`
+/// variant: the periodic heartbeat carries no phase (the controller owns every
+/// in-flight phase), so the mover can never emit a `"Running"` the target CR's
+/// enum forbids (the Restore 422). See [`StatusUpdate::progress`].
+///
 /// ```
 /// use kopiur_mover::status::MoverPhase;
 ///
-/// assert_eq!(MoverPhase::Running.as_str(), "Running");
 /// assert_eq!(MoverPhase::Succeeded.as_str(), "Succeeded");
 /// assert_eq!(MoverPhase::Failed.as_str(), "Failed");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoverPhase {
-    /// kopia is running.
-    Running,
     /// The operation completed successfully.
     Succeeded,
     /// The operation failed terminally.
@@ -226,7 +228,6 @@ impl MoverPhase {
     /// Stable string form for the CR status `phase` field.
     pub fn as_str(&self) -> &'static str {
         match self {
-            MoverPhase::Running => "Running",
             MoverPhase::Succeeded => "Succeeded",
             MoverPhase::Failed => "Failed",
         }
@@ -244,17 +245,26 @@ impl MoverPhase {
 /// use kopiur_mover::status::StatusUpdate;
 ///
 /// let observed_at: DateTime<Utc> = "2026-06-01T12:00:00Z".parse().unwrap();
-/// let update = StatusUpdate::running(observed_at);
-/// assert_eq!(update.phase, "Running");
+/// // The periodic heartbeat carries NO phase — the controller owns the
+/// // in-flight phase, so the mover never asserts one here.
+/// let update = StatusUpdate::progress(observed_at);
+/// assert_eq!(update.phase, None);
 ///
 /// let body = update.as_patch_body();
-/// assert_eq!(body["status"]["phase"], "Running");
+/// assert!(body["status"].get("phase").is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusUpdate {
-    /// Current phase.
-    pub phase: String,
+    /// Current phase, set ONLY by the terminal constructors. The periodic
+    /// progress heartbeat leaves it `None`: the controller owns every in-flight
+    /// phase (Snapshot→`Running`, Restore→`Restoring`, SnapshotDelete→`Deleting`)
+    /// and never reads the mover's, so writing a phase here only risks one the
+    /// target CR's enum forbids (the Restore `"Running"` 422). Omitted from the
+    /// PATCH when `None`, so the heartbeat never collides with the controller's
+    /// phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     /// When this update was produced.
     pub observed_at: DateTime<Utc>,
     /// The snapshot (CRD `status.snapshot`), once known. Nested `SnapshotInfo`
@@ -287,10 +297,19 @@ pub struct StatusUpdate {
 }
 
 impl StatusUpdate {
-    /// A "running / progress" update with the given timestamp.
-    pub fn running(observed_at: DateTime<Utc>) -> Self {
+    /// A periodic progress heartbeat. Deliberately carries NO `phase`: the
+    /// controller owns every in-flight phase and never reads the mover's, so
+    /// asserting one here only risks sending a value the target CR's enum forbids
+    /// (the original Restore `"Running"` 422). `logTail` stays unset — it is
+    /// written once, at the terminal transition (the status-churn rule).
+    ///
+    /// Note: the CRD has a `status.progress` (`RestoreProgress`) field for live
+    /// restore counters, but it is intentionally NOT populated here yet — kopia's
+    /// restore progress is CR-delimited, human-rounded text with no exact byte
+    /// total, so wiring it faithfully is tracked as a follow-up.
+    pub fn progress(observed_at: DateTime<Utc>) -> Self {
         StatusUpdate {
-            phase: MoverPhase::Running.as_str().to_string(),
+            phase: None,
             observed_at,
             snapshot: None,
             timing: None,
@@ -305,7 +324,7 @@ impl StatusUpdate {
     /// the documented `Snapshot created: <id>` line (ADR §3.4).
     pub fn succeeded_backup(result: &SnapshotCreateResult, observed_at: DateTime<Utc>) -> Self {
         StatusUpdate {
-            phase: MoverPhase::Succeeded.as_str().to_string(),
+            phase: Some(MoverPhase::Succeeded.as_str().to_string()),
             observed_at,
             snapshot: Some(snapshot_from_result(result)),
             timing: Some(timing_from_result(result)),
@@ -320,7 +339,7 @@ impl StatusUpdate {
     /// The Snapshot CRD's terminal success phase is `Succeeded`.
     pub fn succeeded(observed_at: DateTime<Utc>) -> Self {
         StatusUpdate {
-            phase: MoverPhase::Succeeded.as_str().to_string(),
+            phase: Some(MoverPhase::Succeeded.as_str().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -345,7 +364,7 @@ impl StatusUpdate {
     pub fn succeeded_pin(snapshot: SnapshotInfo, observed_at: DateTime<Utc>) -> Self {
         let id = snapshot.kopia_snapshot_id.clone();
         StatusUpdate {
-            phase: MoverPhase::Succeeded.as_str().to_string(),
+            phase: Some(MoverPhase::Succeeded.as_str().to_string()),
             observed_at,
             snapshot: Some(snapshot),
             timing: None,
@@ -364,7 +383,7 @@ impl StatusUpdate {
     /// restored, surfaced on `status.logTail`.
     pub fn completed(snapshot_id: &str, observed_at: DateTime<Utc>) -> Self {
         StatusUpdate {
-            phase: RestorePhase::Completed.label().to_string(),
+            phase: Some(RestorePhase::Completed.label().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -385,7 +404,7 @@ impl StatusUpdate {
         observed_at: DateTime<Utc>,
     ) -> Self {
         StatusUpdate {
-            phase: RestorePhase::Completed.label().to_string(),
+            phase: Some(RestorePhase::Completed.label().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -408,7 +427,7 @@ impl StatusUpdate {
     /// snapshot can never silently retarget this Restore.
     pub fn completed_empty(observed_at: DateTime<Utc>) -> Self {
         StatusUpdate {
-            phase: RestorePhase::Completed.label().to_string(),
+            phase: Some(RestorePhase::Completed.label().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -433,7 +452,7 @@ impl StatusUpdate {
     pub fn failed(err: &KopiaError, observed_at: DateTime<Utc>) -> Self {
         let failure = failure_block_from_kopia(err);
         StatusUpdate {
-            phase: MoverPhase::Failed.as_str().to_string(),
+            phase: Some(MoverPhase::Failed.as_str().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -450,7 +469,7 @@ impl StatusUpdate {
     pub fn failed_mover(err: &crate::error::MoverError, observed_at: DateTime<Utc>) -> Self {
         let failure = FailureBlock::from(err);
         StatusUpdate {
-            phase: MoverPhase::Failed.as_str().to_string(),
+            phase: Some(MoverPhase::Failed.as_str().to_string()),
             observed_at,
             snapshot: None,
             timing: None,
@@ -655,7 +674,7 @@ impl StatusReporter {
             None => {
                 info!(
                     target = %self.target.name,
-                    phase = %update.phase,
+                    phase = update.phase.as_deref().unwrap_or("progress"),
                     "status update (no cluster): {}",
                     serde_json::to_string(update).unwrap_or_default()
                 );
@@ -948,7 +967,7 @@ mod tests {
         }"#;
         let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
         let u = StatusUpdate::succeeded_backup(&r, ts());
-        assert_eq!(u.phase, "Succeeded");
+        assert_eq!(u.phase.as_deref(), Some("Succeeded"));
         // The snapshot MUST serialize as the nested CRD shape
         // `status.snapshot.kopiaSnapshotID`, or the API server prunes it (the bug
         // that left object-store backups Succeeded with no snapshot id).
@@ -985,7 +1004,7 @@ mod tests {
         }"#;
         let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
         let u = StatusUpdate::succeeded_backup(&r, ts());
-        assert_eq!(u.phase, "Succeeded");
+        assert_eq!(u.phase.as_deref(), Some("Succeeded"));
         assert_eq!(
             u.stats.as_ref().unwrap().files_failed,
             Some(2),
@@ -1010,7 +1029,7 @@ mod tests {
             },
         };
         let u = StatusUpdate::succeeded_pin(info, ts());
-        assert_eq!(u.phase, "Succeeded");
+        assert_eq!(u.phase.as_deref(), Some("Succeeded"));
         let body = u.as_patch_body();
         assert_eq!(body["status"]["snapshot"]["kopiaSnapshotID"], "b2037e14");
         assert_eq!(
@@ -1033,9 +1052,9 @@ mod tests {
         // was rejected 422 and every restore flooded the controller logs. The
         // restore terminal phase MUST match RestorePhase::Completed.
         let u = StatusUpdate::completed("k1f1ec0a8", ts());
-        assert_eq!(u.phase, "Completed");
-        assert_eq!(u.phase, RestorePhase::Completed.label());
-        assert_ne!(u.phase, MoverPhase::Succeeded.as_str());
+        assert_eq!(u.phase.as_deref(), Some("Completed"));
+        assert_eq!(u.phase.as_deref(), Some(RestorePhase::Completed.label()));
+        assert_ne!(u.phase.as_deref(), Some(MoverPhase::Succeeded.as_str()));
         assert!(u.failure.is_none());
         assert!(u.snapshot.is_none());
         let body = u.as_patch_body();
@@ -1058,7 +1077,7 @@ mod tests {
             source_path: Some("/pvc/db".into()),
         };
         let u = StatusUpdate::completed_resolved("k9", identity, ts());
-        assert_eq!(u.phase, "Completed");
+        assert_eq!(u.phase.as_deref(), Some("Completed"));
         let body = u.as_patch_body();
         // The exact CRD `status.resolved` field names, or the API server prunes them.
         assert_eq!(body["status"]["resolved"]["resolution"], "Snapshot");
@@ -1076,7 +1095,7 @@ mod tests {
         // Deploy-or-restore with no match under Continue: pin NoSnapshot so a
         // later-appearing snapshot can never silently retarget the Restore.
         let u = StatusUpdate::completed_empty(ts());
-        assert_eq!(u.phase, "Completed");
+        assert_eq!(u.phase.as_deref(), Some("Completed"));
         let body = u.as_patch_body();
         assert_eq!(body["status"]["resolved"]["resolution"], "NoSnapshot");
         assert!(body["status"]["resolved"].get("kopiaSnapshotID").is_none());
@@ -1094,16 +1113,35 @@ mod tests {
             context: "snapshot create result".into(),
         };
         let u = StatusUpdate::failed(&err, ts());
-        assert_eq!(u.phase, "Failed");
+        assert_eq!(u.phase.as_deref(), Some("Failed"));
         assert!(u.failure.is_some());
         assert_eq!(u.failure.unwrap().kopia_error_class, "Unknown");
     }
 
     #[test]
     fn patch_body_wraps_under_status() {
-        let u = StatusUpdate::running(ts());
+        let u = StatusUpdate::succeeded(ts());
         let body = u.as_patch_body();
-        assert_eq!(body["status"]["phase"], "Running");
+        assert_eq!(body["status"]["phase"], "Succeeded");
+    }
+
+    #[test]
+    fn progress_heartbeat_carries_no_phase() {
+        // Regression (the Restore "Running" 422): the periodic heartbeat used to
+        // hardcode phase: "Running", valid for SnapshotPhase but rejected by the
+        // RestorePhase enum, so every restore flooded the controller logs. The
+        // heartbeat MUST NOT assert a phase at all — the controller owns every
+        // in-flight phase — so the update can never be invalid for ANY CR.
+        let u = StatusUpdate::progress(ts());
+        assert_eq!(u.phase, None);
+        let body = u.as_patch_body();
+        assert!(
+            body["status"].get("phase").is_none(),
+            "the progress heartbeat must omit phase entirely"
+        );
+        // It also never sets terminal fields (the status-churn rule).
+        assert!(body["status"].get("logTail").is_none());
+        assert!(body["status"].get("failure").is_none());
     }
 
     #[test]
@@ -1163,7 +1201,7 @@ mod tests {
 
         // Progress updates never set logTail (it is written once, at the
         // terminal transition — the status-churn rule).
-        let body = StatusUpdate::running(ts()).as_patch_body();
+        let body = StatusUpdate::progress(ts()).as_patch_body();
         assert!(body["status"].get("logTail").is_none());
     }
 
