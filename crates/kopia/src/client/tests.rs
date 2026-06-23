@@ -232,15 +232,18 @@ fn webdav_rclone_gdrive_backend_args() {
         ConnectSpec::Rclone {
             remote_path: "r:bucket".into(),
             config_file: None,
+            startup_timeout: None,
         }
         .backend_args(),
         vec!["rclone", "--remote-path", "r:bucket"]
     );
-    // The materialized rclone.conf path is forwarded to rclone via --rclone-args.
+    // The materialized rclone.conf path is forwarded to rclone via --rclone-args,
+    // and the startup timeout is kopia's own connect flag (not an rclone arg).
     assert_eq!(
         ConnectSpec::Rclone {
             remote_path: "r:bucket".into(),
             config_file: Some("/var/cache/kopia/creds/rclone.conf".into()),
+            startup_timeout: Some("2m".into()),
         }
         .backend_args(),
         vec![
@@ -248,15 +251,32 @@ fn webdav_rclone_gdrive_backend_args() {
             "--remote-path",
             "r:bucket",
             // One token: a separate `--config=…` value would be misparsed as a flag.
-            "--rclone-args=--config=/var/cache/kopia/creds/rclone.conf"
+            "--rclone-args=--config=/var/cache/kopia/creds/rclone.conf",
+            "--rclone-startup-timeout=2m"
         ]
     );
     assert_eq!(
         ConnectSpec::Gdrive {
-            folder_id: "fid".into()
+            folder_id: "fid".into(),
+            credentials_file: None,
         }
         .backend_args(),
         vec!["gdrive", "--folder-id", "fid"]
+    );
+    // The materialized service-account JSON path is passed via --credentials-file.
+    assert_eq!(
+        ConnectSpec::Gdrive {
+            folder_id: "fid".into(),
+            credentials_file: Some("/var/cache/kopia/creds/gdrive-credentials.json".into()),
+        }
+        .backend_args(),
+        vec![
+            "gdrive",
+            "--folder-id",
+            "fid",
+            "--credentials-file",
+            "/var/cache/kopia/creds/gdrive-credentials.json"
+        ]
     );
 }
 
@@ -367,9 +387,11 @@ fn kind_str_covers_every_variant() {
         ConnectSpec::Rclone {
             remote_path: "r".into(),
             config_file: None,
+            startup_timeout: None,
         },
         ConnectSpec::Gdrive {
             folder_id: "f".into(),
+            credentials_file: None,
         },
         ConnectSpec::FromConfig {
             file: None,

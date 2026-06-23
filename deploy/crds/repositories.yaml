@@ -59,6 +59,8 @@ spec:
                   - webDav
                 - required:
                   - rclone
+                - required:
+                  - gdrive
                 properties:
                   azure:
                     description: Azure Blob Storage.
@@ -221,6 +223,36 @@ spec:
                     required:
                     - bucket
                     type: object
+                  gdrive:
+                    description: |-
+                      Google Drive via kopia's native `gdrive` provider (service-account JSON).
+                      kopia marks this provider experimental / not maintained, and a native
+                      gdrive repository is not interchangeable with an rclone-backed Drive remote.
+                    properties:
+                      credentialsSecretRef:
+                        description: |-
+                          Secret holding the Google service-account JSON used to reach the folder,
+                          read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia
+                          falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or
+                          instance metadata).
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `Secret`.
+                            type: string
+                          namespace:
+                            description: Namespace of the `Secret`; absent = same namespace as the referrer.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      folderId:
+                        description: Google Drive folder ID that holds the kopia repository.
+                        type: string
+                    required:
+                    - folderId
+                    type: object
                   rclone:
                     description: |-
                       Any rclone remote (kopia shells out to `rclone`), broadening reach to
@@ -246,6 +278,14 @@ spec:
                         description: |-
                           rclone path in `remote:path` form (the remote name must exist in the
                           supplied rclone config).
+                        type: string
+                      startupTimeout:
+                        description: |-
+                          How long kopia waits for its embedded `rclone serve` to come up before
+                          failing the connect, as a Go duration (e.g. `2m`). kopia's default is
+                          `15s`; raise it for slow remotes whose repository metadata/indexes load
+                          through the rclone/WebDAV bridge and take longer than the default budget.
+                        nullable: true
                         type: string
                     required:
                     - remotePath
@@ -400,6 +440,39 @@ spec:
                     - url
                     type: object
                 type: object
+              bootstrap:
+                description: |-
+                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
+                  repository the operator cannot reach in-process.
+                nullable: true
+                properties:
+                  failurePolicy:
+                    description: |-
+                      Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
+                      a connect may run before the Job is marked failed (default 120s); raise it
+                      for a slow backend — e.g. an rclone remote whose repository metadata and
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
+                      shape parity but is not honored by the bootstrap Job.
+                    nullable: true
+                    properties:
+                      activeDeadlineSeconds:
+                        description: Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      backoffLimit:
+                        description: Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed.
+                        format: int32
+                        nullable: true
+                        type: integer
+                      podStartupDeadlineSeconds:
+                        description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
+                        format: int64
+                        nullable: true
+                        type: integer
+                    type: object
+                type: object
               catalog:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
@@ -458,8 +531,14 @@ spec:
                         type: integer
                     type: object
                   enabled:
-                    default: false
-                    description: Create the repository if it does not exist yet; off by default.
+                    default: true
+                    description: |-
+                      Create the repository if it does not exist yet — on by default. Repository
+                      create/connect is idempotent: pointing `create` at an already-initialized
+                      repository just connects to it (it never re-creates or clobbers), so the
+                      only effect of the default is that a genuinely-absent repository is
+                      bootstrapped instead of erroring. Set `false` for a strictly read-only or
+                      externally-managed repository the operator must never create.
                     type: boolean
                   encryption:
                     description: kopia encryption algorithm for a freshly-created repository (creation-time only).
@@ -965,18 +1044,8 @@ spec:
                     type: object
                   takeoverPolicy:
                     description: |-
-                      What to do when another owner already holds the lease. Closed enum. ADR §3.7.
-
-                      ```
-                      use kopiur_api::TakeoverPolicy;
-
-                      // The safest default: never seize a lease another owner holds.
-                      assert_eq!(TakeoverPolicy::default(), TakeoverPolicy::Never);
-                      assert_eq!(
-                          serde_json::to_value(TakeoverPolicy::PromptCondition).unwrap(),
-                          serde_json::json!("PromptCondition"),
-                      );
-                      ```
+                      What to do when another owner already holds the lease. Defaults to `Never`
+                      (the safest: never seize a lease another owner holds).
                     enum:
                     - Never
                     - PromptCondition
@@ -2329,21 +2398,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: |-
-                  Lifecycle phase of a repository. ADR §3.1 status.
-
-                  A freshly admitted CR starts in the `#[default]` [`RepositoryPhase::Pending`]:
-
-                  ```
-                  use kopiur_api::repository::RepositoryPhase;
-
-                  assert_eq!(RepositoryPhase::default(), RepositoryPhase::Pending);
-                  // Serializes as a bare string (closed unit enum).
-                  assert_eq!(
-                      serde_json::to_value(RepositoryPhase::Ready).unwrap(),
-                      serde_json::json!("Ready")
-                  );
-                  ```
+                description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:
                 - Pending
                 - Initializing

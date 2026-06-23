@@ -109,9 +109,21 @@ Unlike the object-store backends, rclone references its config via
 | ----------------- | -------- | ------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `remotePath`      | yes      | —       | `mydrive:backups/kopia`   | rclone path in `remote:path` form. The part before `:` must match a `[section]` in the config; the part after is the folder. |
 | `configSecretRef` | no¹      | —       | `{ name: rclone-config }` | Secret holding the `rclone.conf` (under `KOPIA_RCLONE_CONFIG`). **Not** `auth`. A `ClusterRepository` adds `namespace:`.      |
+| `startupTimeout`  | no       | `15s`   | `2m`                      | How long kopia waits for its embedded `rclone serve` to come up before failing the connect (Go duration). Raise it for slow remotes whose metadata/indexes load through the rclone/WebDAV bridge. |
 
 ¹ Optional in the schema, but in practice required: rclone can't reach a remote
 without its config.
+
+/// tip | Bootstrap timing out on a slow remote?
+
+A valid rclone repository whose connect is slow (kopia starts `rclone serve
+webdav` and loads repo metadata through it) can trip the bootstrap Job's deadline
+before the connect finishes. Two independent knobs help: raise
+**`backend.rclone.startupTimeout`** (kopia's wait for `rclone serve`) and/or
+**`spec.bootstrap.failurePolicy.activeDeadlineSeconds`** (the bootstrap Job's
+wall-clock cap, default 120s) — see [Repositories](../repositories.md).
+
+///
 
 ## Customization — the values you actually change
 

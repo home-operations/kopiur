@@ -161,11 +161,19 @@ pub enum ConnectSpec {
         /// `--rclone-args=--config=<path>`. The mover materializes this from the
         /// config Secret at runtime; `None` uses rclone's default config lookup.
         config_file: Option<String>,
+        /// Go-duration value for kopia's `--rclone-startup-timeout` (how long to
+        /// wait for the embedded `rclone serve` to come up). `None` leaves kopia's
+        /// default (`15s`).
+        startup_timeout: Option<String>,
     },
     /// Google Drive backend.
     Gdrive {
         /// Drive folder id that holds the repository.
         folder_id: String,
+        /// Path to a Google service-account JSON inside the mover pod, passed as
+        /// `--credentials-file`. The mover materializes this from the credentials
+        /// Secret at runtime; `None` uses kopia's ambient credential lookup.
+        credentials_file: Option<String>,
     },
     /// Reconnect from a kopia configuration token/file (`repository connect
     /// from-config`). Exactly one of `file`/`token` is meaningful.
@@ -365,6 +373,7 @@ impl ConnectSpec {
             ConnectSpec::Rclone {
                 remote_path,
                 config_file,
+                startup_timeout,
             } => {
                 let mut a = vec!["rclone".into(), "--remote-path".into(), remote_path.clone()];
                 // Forward the rclone config path to the embedded rclone. Must be a
@@ -374,10 +383,20 @@ impl ConnectSpec {
                 if let Some(cfg) = config_file {
                     a.push(format!("--rclone-args=--config={cfg}"));
                 }
+                // kopia's own connect flag (not an rclone arg): how long to wait
+                // for the embedded `rclone serve` before failing the connect.
+                if let Some(t) = startup_timeout {
+                    a.push(format!("--rclone-startup-timeout={t}"));
+                }
                 a
             }
-            ConnectSpec::Gdrive { folder_id } => {
-                vec!["gdrive".into(), "--folder-id".into(), folder_id.clone()]
+            ConnectSpec::Gdrive {
+                folder_id,
+                credentials_file,
+            } => {
+                let mut a = vec!["gdrive".into(), "--folder-id".into(), folder_id.clone()];
+                opt(&mut a, "--credentials-file", credentials_file);
+                a
             }
             ConnectSpec::FromConfig { file, token } => {
                 let mut a = vec!["from-config".into()];

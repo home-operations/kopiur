@@ -295,7 +295,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         mover_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
+/// #         bootstrap: None, mover_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -344,6 +344,12 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
         errs.extend(validate_server(server, spec.mode));
     }
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "Repository") {
+        errs.push(e);
+    }
+    if let Some(b) = &spec.bootstrap
+        && let Some(fp) = &b.failure_policy
+        && let Err(e) = validate_failure_policy(fp, "Repository spec.bootstrap")
+    {
         errs.push(e);
     }
     errs
@@ -540,6 +546,7 @@ fn backend_target_key(backend: &crate::backend::Backend) -> String {
         Backend::Sftp(s) => format!("{}:{}", s.host, s.path),
         Backend::WebDav(w) => w.url.clone(),
         Backend::Rclone(r) => r.remote_path.clone(),
+        Backend::Gdrive(g) => g.folder_id.clone(),
     };
     format!("{kind}:{target}")
 }
@@ -632,6 +639,12 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         errs.extend(validate_server(&server.server, spec.mode));
     }
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "ClusterRepository") {
+        errs.push(e);
+    }
+    if let Some(b) = &spec.bootstrap
+        && let Some(fp) = &b.failure_policy
+        && let Err(e) = validate_failure_policy(fp, "ClusterRepository spec.bootstrap")
+    {
         errs.push(e);
     }
     errs

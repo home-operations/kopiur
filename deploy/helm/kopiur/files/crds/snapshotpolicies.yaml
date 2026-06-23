@@ -71,18 +71,10 @@ spec:
                     type: boolean
                 type: object
               defaultDeletionPolicy:
+                default: Delete
                 description: |-
                   Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
-
-                  ```
-                  use kopiur_api::common::DeletionPolicy;
-
-                  // Produced backups default to deleting the snapshot with the CR.
-                  assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
-                  // Variants serialize to their bare PascalCase names (plain string enum).
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Retain).unwrap(), "Retain");
-                  assert_eq!(serde_json::to_value(DeletionPolicy::Orphan).unwrap(), "Orphan");
-                  ```
+                  Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
                 enum:
                 - Delete
                 - Retain
@@ -125,19 +117,11 @@ spec:
                     type: array
                 type: object
               groupBy:
+                default: VolumeGroupSnapshot
                 description: |-
-                  Multi-PVC grouping strategy. Closed enum. ADR §4.9.
-
-                  Defaults to a consistent group snapshot; `None` must be set *explicitly* to
-                  accept independent per-PVC snapshots, because a silent per-PVC fallback would
-                  produce inconsistent backups (the data-integrity hazard ADR §4.9 guards against).
-
-                  ```
-                  use kopiur_api::GroupBy;
-
-                  assert_eq!(GroupBy::default(), GroupBy::VolumeGroupSnapshot);
-                  assert_eq!(serde_json::to_value(GroupBy::None).unwrap(), "None");
-                  ```
+                  Multi-PVC grouping strategy. Defaults to a consistent group snapshot across
+                  all PVCs; set `None` *explicitly* to accept independent per-PVC snapshots,
+                  because a silent per-PVC fallback would produce inconsistent backups.
                 enum:
                 - VolumeGroupSnapshot
                 - None
@@ -151,30 +135,9 @@ spec:
                     description: Hooks run (in order) after the snapshot completes — e.g. resuming the workload.
                     items:
                       description: |-
-                        One of three hook forms. ADR §4.8.
-
-                        Externally-tagged: wire shape is `{ workloadExec: {...} }`, `{ runJob: {...} }`,
-                        or `{ httpRequest: {...} }`. Exactly one variant by construction.
-
-                        Not `Eq`: `RunJob` embeds `JobSpec` (k8s-openapi, `PartialEq` only).
-
-                        ```
-                        use kopiur_api::snapshot_policy::{Hook, HttpRequestHook};
-
-                        // Construct directly — the type system guarantees exactly one variant.
-                        let hook = Hook::HttpRequest(HttpRequestHook {
-                            url: "https://example/notify".into(),
-                            method: Some("POST".into()),
-                            body: None,
-                            timeout: None,
-                            continue_on_failure: false,
-                        });
-                        assert_eq!(hook.kind_str(), "HttpRequest");
-
-                        // Externally tagged on the wire: `{ httpRequest: { url: ... } }`.
-                        let json = serde_json::to_value(&hook).unwrap();
-                        assert_eq!(json["httpRequest"]["url"], "https://example/notify");
-                        ```
+                        One of three hook forms. Externally-tagged: the wire shape is
+                        `{ workloadExec: {...} }`, `{ runJob: {...} }`, or `{ httpRequest: {...} }`,
+                        and exactly one form is present.
                       oneOf:
                       - required:
                         - workloadExec
@@ -282,30 +245,9 @@ spec:
                     description: Hooks run (in order) before the snapshot is taken — e.g. quiescing a database.
                     items:
                       description: |-
-                        One of three hook forms. ADR §4.8.
-
-                        Externally-tagged: wire shape is `{ workloadExec: {...} }`, `{ runJob: {...} }`,
-                        or `{ httpRequest: {...} }`. Exactly one variant by construction.
-
-                        Not `Eq`: `RunJob` embeds `JobSpec` (k8s-openapi, `PartialEq` only).
-
-                        ```
-                        use kopiur_api::snapshot_policy::{Hook, HttpRequestHook};
-
-                        // Construct directly — the type system guarantees exactly one variant.
-                        let hook = Hook::HttpRequest(HttpRequestHook {
-                            url: "https://example/notify".into(),
-                            method: Some("POST".into()),
-                            body: None,
-                            timeout: None,
-                            continue_on_failure: false,
-                        });
-                        assert_eq!(hook.kind_str(), "HttpRequest");
-
-                        // Externally tagged on the wire: `{ httpRequest: { url: ... } }`.
-                        let json = serde_json::to_value(&hook).unwrap();
-                        assert_eq!(json["httpRequest"]["url"], "https://example/notify");
-                        ```
+                        One of three hook forms. Externally-tagged: the wire shape is
+                        `{ workloadExec: {...} }`, `{ runJob: {...} }`, or `{ httpRequest: {...} }`,
+                        and exactly one form is present.
                       oneOf:
                       - required:
                         - workloadExec
@@ -939,21 +881,11 @@ spec:
                       nullable: true
                       type: string
                     sourcePathStrategy:
+                      default: PvcName
                       description: |-
-                        How a selector-matched PVC's source path is derived. Closed enum. ADR §3.3/§4.2.
-
-                        Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs
-                        and each needs a distinct kopia source path.
-
-                        ```
-                        use kopiur_api::SourcePathStrategy;
-
-                        assert_eq!(SourcePathStrategy::default(), SourcePathStrategy::PvcName);
-                        assert_eq!(
-                            serde_json::to_value(SourcePathStrategy::PvcNamespacedName).unwrap(),
-                            "PvcNamespacedName"
-                        );
-                        ```
+                        How a selector-matched PVC's source path is derived. Only relevant for
+                        `pvcSelector` sources, where one recipe expands to many PVCs and each needs a
+                        distinct kopia source path. Defaults to `PvcName`.
                       enum:
                       - PvcName
                       - PvcNamespacedName

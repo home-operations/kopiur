@@ -53,17 +53,7 @@ pub struct RepositoryReplicationSpec {
     pub suspend: bool,
 }
 
-/// Lifecycle phase of a replication. Closed enum. ADR-0005 §13(d).
-///
-/// ```
-/// use kopiur_api::repository_replication::RepositoryReplicationPhase;
-///
-/// assert_eq!(RepositoryReplicationPhase::default(), RepositoryReplicationPhase::Pending);
-/// assert_eq!(
-///     serde_json::to_value(RepositoryReplicationPhase::Replicating).unwrap(),
-///     "Replicating"
-/// );
-/// ```
+/// Lifecycle phase of a replication.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum RepositoryReplicationPhase {
     /// Admitted, not yet run (also the default).

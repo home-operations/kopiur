@@ -102,7 +102,28 @@ pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
             Some(auth) => validate_backend_auth(auth, "gcs backend"),
             None => Ok(()),
         },
-        Backend::B2(_) | Backend::Sftp(_) | Backend::WebDav(_) | Backend::Rclone(_) => Ok(()),
+        Backend::Rclone(r) => {
+            // kopia's `--rclone-startup-timeout` takes a Go duration; reject a
+            // malformed value at admission instead of failing every connect.
+            if let Some(t) = &r.startup_timeout
+                && crate::duration::parse_go_duration(t).is_none()
+            {
+                return Err(ValidationError::InvalidFieldValue {
+                    field: "rclone backend startupTimeout".to_string(),
+                    reason: format!("must be a Go duration like \"30s\" or \"2m\" (got {t:?})"),
+                });
+            }
+            Ok(())
+        }
+        Backend::Gdrive(g) => {
+            if g.folder_id.trim().is_empty() {
+                return Err(ValidationError::MissingRequiredField {
+                    field: "gdrive backend folderId".to_string(),
+                });
+            }
+            Ok(())
+        }
+        Backend::B2(_) | Backend::Sftp(_) | Backend::WebDav(_) => Ok(()),
     }
 }
 

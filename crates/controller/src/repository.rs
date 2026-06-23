@@ -218,12 +218,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                 .await
             {
-                let create_enabled = repo
-                    .spec
-                    .create
-                    .as_ref()
-                    .map(|c| c.enabled)
-                    .unwrap_or(false);
+                let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -646,12 +641,7 @@ async fn bootstrap_via_mover(
 
     // Build + apply the Job (ConfigMap carries the work spec; the result is
     // written back into the same ConfigMap under `result.json`).
-    let create_enabled = repo
-        .spec
-        .create
-        .as_ref()
-        .map(|c| c.enabled)
-        .unwrap_or(false);
+    let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
     let work_spec = bootstrap_work_spec(
         backend,
         name,
@@ -736,6 +726,15 @@ async fn bootstrap_via_mover(
         None,
         None,
     );
+    // spec.bootstrap.failurePolicy lets callers raise the deadline for a slow
+    // backend (e.g. an rclone remote whose connect loads metadata through the
+    // rclone/WebDAV bridge) or tune the retry budget; unset keeps the built-in
+    // bootstrap defaults.
+    let bootstrap_fp = repo
+        .spec
+        .bootstrap
+        .as_ref()
+        .and_then(|b| b.failure_policy.as_ref());
     let inputs = MoverJobInputs {
         name: &job_name,
         namespace,
@@ -748,9 +747,15 @@ async fn bootstrap_via_mover(
         // controller never finalizes and the repository hangs `Initializing` with
         // no Event. The deadline forces it terminal so `finalize_bootstrap` runs.
         limits: JobLimits {
-            active_deadline_seconds: Some(BOOTSTRAP_JOB_DEADLINE_SECS),
+            active_deadline_seconds: Some(
+                bootstrap_fp
+                    .and_then(|fp| fp.active_deadline_seconds)
+                    .unwrap_or(BOOTSTRAP_JOB_DEADLINE_SECS),
+            ),
+            backoff_limit: bootstrap_fp
+                .and_then(|fp| fp.backoff_limit)
+                .unwrap_or(JobLimits::default().backoff_limit),
             ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
-            ..JobLimits::default()
         },
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

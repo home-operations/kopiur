@@ -42,6 +42,9 @@ pub const SFTP_KNOWN_HOSTS_ENV: &str = "KOPIA_SFTP_KNOWN_HOSTS";
 pub const GCS_CREDENTIALS_ENV: &str = "KOPIA_GCS_CREDENTIALS";
 /// rclone `rclone.conf` contents, read from the config Secret → rclone `--config`.
 pub const RCLONE_CONFIG_ENV: &str = "KOPIA_RCLONE_CONFIG";
+/// Google Drive service-account key JSON, read from the credentials Secret →
+/// `--credentials-file`.
+pub const GDRIVE_CREDENTIALS_ENV: &str = "KOPIA_GDRIVE_CREDENTIALS";
 
 /// Filenames written under the staging dir. Stable so the (single-op) mover pod
 /// is deterministic and the paths are easy to reason about in logs.
@@ -49,6 +52,7 @@ const SFTP_KEY_FILE: &str = "sftp_key";
 const SFTP_KNOWN_HOSTS_FILE: &str = "known_hosts";
 const GCS_CREDS_FILE: &str = "gcs-credentials.json";
 const RCLONE_CONF_FILE: &str = "rclone.conf";
+const GDRIVE_CREDS_FILE: &str = "gdrive-credentials.json";
 
 /// Write any file-based backend credentials present in the environment into
 /// `staging_dir`, pointing the matching [`ConnectSpec`] field at the written
@@ -107,6 +111,18 @@ pub fn materialize_with(
                 *config_file = Some(path);
             }
         }
+        ConnectSpec::Gdrive {
+            credentials_file, ..
+        } => {
+            if let Some(path) = write_cred_file(
+                GDRIVE_CREDENTIALS_ENV,
+                staging_dir,
+                GDRIVE_CREDS_FILE,
+                lookup,
+            )? {
+                *credentials_file = Some(path);
+            }
+        }
         ConnectSpec::S3 {
             ambient_credentials,
             ..
@@ -134,7 +150,6 @@ pub fn materialize_with(
         | ConnectSpec::Azure { .. }
         | ConnectSpec::B2 { .. }
         | ConnectSpec::WebDav { .. }
-        | ConnectSpec::Gdrive { .. }
         | ConnectSpec::FromConfig { .. }
         | ConnectSpec::Server { .. } => {}
     }
@@ -325,6 +340,7 @@ mod tests {
         let mut spec = ConnectSpec::Rclone {
             remote_path: "remote:bucket".into(),
             config_file: None,
+            startup_timeout: None,
         };
         materialize(&mut spec, &dir).expect("materialize rclone");
         match &spec {
@@ -335,6 +351,34 @@ mod tests {
             other => panic!("expected rclone config_file, got {other:?}"),
         }
         unsafe { std::env::remove_var(RCLONE_CONFIG_ENV) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdrive_materializes_credentials_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tmp();
+        unsafe { std::env::set_var(GDRIVE_CREDENTIALS_ENV, "{\"type\":\"service_account\"}") };
+        let mut spec = ConnectSpec::Gdrive {
+            folder_id: "fid".into(),
+            credentials_file: None,
+        };
+        materialize(&mut spec, &dir).expect("materialize gdrive");
+        match &spec {
+            ConnectSpec::Gdrive {
+                credentials_file: Some(p),
+                ..
+            } => {
+                assert_eq!(
+                    std::fs::read_to_string(p).unwrap(),
+                    "{\"type\":\"service_account\"}"
+                );
+                let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "credential file must be 0600, got {mode:o}");
+            }
+            other => panic!("expected gdrive credentials_file, got {other:?}"),
+        }
+        unsafe { std::env::remove_var(GDRIVE_CREDENTIALS_ENV) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

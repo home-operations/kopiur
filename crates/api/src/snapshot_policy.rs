@@ -49,12 +49,14 @@ pub struct SnapshotPolicySpec {
     pub volume_snapshot_class_name: Option<String>,
     /// Multi-PVC consistency grouping; `None` opts into independent per-PVC snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_group_by")]
     pub group_by: Option<GroupBy>,
     /// GFS retention, enforced by the operator pruning `Snapshot` CRs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<Retention>,
     /// Default `deletionPolicy` for `Snapshot` CRs created against this config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "recipe_default_deletion_policy")]
     pub default_deletion_policy: Option<DeletionPolicy>,
     /// Compression algorithm + per-extension opt-outs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,7 @@ pub struct Source {
     pub source_path_override: Option<String>,
     /// How a `pvcSelector`-matched PVC's source path is derived (`pvcName` vs `pvcNamespacedName`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_source_path_strategy")]
     pub source_path_strategy: Option<SourcePathStrategy>,
 }
 
@@ -186,18 +189,9 @@ pub enum CopyMethod {
     Direct,
 }
 
-/// Multi-PVC grouping strategy. Closed enum. ADR §4.9.
-///
-/// Defaults to a consistent group snapshot; `None` must be set *explicitly* to
-/// accept independent per-PVC snapshots, because a silent per-PVC fallback would
-/// produce inconsistent backups (the data-integrity hazard ADR §4.9 guards against).
-///
-/// ```
-/// use kopiur_api::GroupBy;
-///
-/// assert_eq!(GroupBy::default(), GroupBy::VolumeGroupSnapshot);
-/// assert_eq!(serde_json::to_value(GroupBy::None).unwrap(), "None");
-/// ```
+/// Multi-PVC grouping strategy. Defaults to a consistent group snapshot across
+/// all PVCs; set `None` *explicitly* to accept independent per-PVC snapshots,
+/// because a silent per-PVC fallback would produce inconsistent backups.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum GroupBy {
     /// Consistent group snapshot across all PVCs (default for multi-PVC).
@@ -207,20 +201,16 @@ pub enum GroupBy {
     None,
 }
 
-/// How a selector-matched PVC's source path is derived. Closed enum. ADR §3.3/§4.2.
-///
-/// Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs
-/// and each needs a distinct kopia source path.
-///
-/// ```
-/// use kopiur_api::SourcePathStrategy;
-///
-/// assert_eq!(SourcePathStrategy::default(), SourcePathStrategy::PvcName);
-/// assert_eq!(
-///     serde_json::to_value(SourcePathStrategy::PvcNamespacedName).unwrap(),
-///     "PvcNamespacedName"
-/// );
-/// ```
+/// schemars default for `PvcSnapshotPolicy::group_by` — the consistent group
+/// snapshot. Returns the field's `Option` type so schemars emits the schema
+/// `default:` (`VolumeGroupSnapshot`) for `kubectl explain`.
+fn default_group_by() -> Option<GroupBy> {
+    Some(GroupBy::VolumeGroupSnapshot)
+}
+
+/// How a selector-matched PVC's source path is derived. Only relevant for
+/// `pvcSelector` sources, where one recipe expands to many PVCs and each needs a
+/// distinct kopia source path. Defaults to `PvcName`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum SourcePathStrategy {
     /// Path derived from the PVC name alone (default).
@@ -228,6 +218,19 @@ pub enum SourcePathStrategy {
     PvcName,
     /// Path derived from `<namespace>/<name>` to disambiguate same-named PVCs across namespaces.
     PvcNamespacedName,
+}
+
+/// schemars default for `PvcSnapshotPolicy::source_path_strategy` — `PvcName`.
+/// Returns the field's `Option` type so schemars emits the schema `default:`.
+fn default_source_path_strategy() -> Option<SourcePathStrategy> {
+    Some(SourcePathStrategy::PvcName)
+}
+
+/// schemars default for `PvcSnapshotPolicy::default_deletion_policy` — `Delete`,
+/// the deletion policy produced `Snapshot` CRs inherit. Returns the field's
+/// `Option` type so schemars emits the schema `default:`.
+fn recipe_default_deletion_policy() -> Option<crate::common::DeletionPolicy> {
+    Some(crate::common::DeletionPolicy::Delete)
 }
 
 /// Compression policy.
@@ -328,30 +331,9 @@ pub struct Hooks {
     pub after_snapshot: Vec<Hook>,
 }
 
-/// One of three hook forms. ADR §4.8.
-///
-/// Externally-tagged: wire shape is `{ workloadExec: {...} }`, `{ runJob: {...} }`,
-/// or `{ httpRequest: {...} }`. Exactly one variant by construction.
-///
-/// Not `Eq`: `RunJob` embeds `JobSpec` (k8s-openapi, `PartialEq` only).
-///
-/// ```
-/// use kopiur_api::snapshot_policy::{Hook, HttpRequestHook};
-///
-/// // Construct directly — the type system guarantees exactly one variant.
-/// let hook = Hook::HttpRequest(HttpRequestHook {
-///     url: "https://example/notify".into(),
-///     method: Some("POST".into()),
-///     body: None,
-///     timeout: None,
-///     continue_on_failure: false,
-/// });
-/// assert_eq!(hook.kind_str(), "HttpRequest");
-///
-/// // Externally tagged on the wire: `{ httpRequest: { url: ... } }`.
-/// let json = serde_json::to_value(&hook).unwrap();
-/// assert_eq!(json["httpRequest"]["url"], "https://example/notify");
-/// ```
+/// One of three hook forms. Externally-tagged: the wire shape is
+/// `{ workloadExec: {...} }`, `{ runJob: {...} }`, or `{ httpRequest: {...} }`,
+/// and exactly one form is present.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Hook {

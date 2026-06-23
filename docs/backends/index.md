@@ -37,6 +37,7 @@ A backend is chosen by **which key you set** (`backend.s3`, `backend.azure`, …
 | [SFTP](sftp.md)                         | Any server reachable over SSH/SFTP                           | `backend.sftp`       |
 | [WebDAV](webdav.md)                     | Nextcloud, Apache `mod_dav`, …                               | `backend.webDav`     |
 | [rclone](rclone.md)                     | Google Drive, OneDrive, Dropbox, and dozens more             | `backend.rclone`     |
+| [Google Drive (native)](gdrive.md)      | Google Drive via kopia's native `gdrive` (experimental)     | `backend.gdrive`     |
 
 ## How to use these pages
 
@@ -65,6 +66,7 @@ The mover reads these **exact** key names from the Secret you reference and feed
 | [SFTP](sftp.md)                | `KOPIA_SFTP_KEY_DATA`, `KOPIA_SFTP_KNOWN_HOSTS`                           | `backend.sftp`       |
 | [WebDAV](webdav.md)            | `KOPIA_WEBDAV_USERNAME`, `KOPIA_WEBDAV_PASSWORD`                          | `backend.webDav`     |
 | [rclone](rclone.md)            | `KOPIA_RCLONE_CONFIG` _(via `configSecretRef`)_                           | `backend.rclone`     |
+| [Google Drive](gdrive.md)      | `KOPIA_GDRIVE_CREDENTIALS` _(via `credentialsSecretRef`)_                 | `backend.gdrive`     |
 
 /// tip | Cloud clusters: workload identity instead of static keys
 
@@ -80,14 +82,15 @@ WebDAV) are Secret-only — they have no IAM plane to federate with.
 
 /// info | Env-delivered vs. file-delivered credentials
 
-Most backends authenticate via environment variables kopia reads directly — the mover loads the Secret with `envFrom`, so the keys above become env vars. Three backends need their credentials as **files** instead (kopia's SFTP/GCS/rclone flags have no env form, and a Secret key like `ssh-privatekey` isn't a valid env-var name so `envFrom` would silently drop it). For those, the mover reads a well-known env key and writes it to a private (`0600`) file, then points kopia at the path:
+Most backends authenticate via environment variables kopia reads directly — the mover loads the Secret with `envFrom`, so the keys above become env vars. Four backends need their credentials as **files** instead (kopia's SFTP/GCS/rclone/gdrive flags have no env form, and a Secret key like `ssh-privatekey` isn't a valid env-var name so `envFrom` would silently drop it). For those, the mover reads a well-known env key and writes it to a private (`0600`) file, then points kopia at the path:
 
-| Secret key               | Becomes                       | kopia flag           |
-| ------------------------ | ----------------------------- | -------------------- |
-| `KOPIA_SFTP_KEY_DATA`    | the SSH private key file      | `--keyfile`          |
-| `KOPIA_SFTP_KNOWN_HOSTS` | the `known_hosts` file        | `--known-hosts`      |
-| `KOPIA_GCS_CREDENTIALS`  | the service-account JSON file | `--credentials-file` |
-| `KOPIA_RCLONE_CONFIG`    | the `rclone.conf` file        | rclone `--config`    |
+| Secret key                 | Becomes                       | kopia flag           |
+| -------------------------- | ----------------------------- | -------------------- |
+| `KOPIA_SFTP_KEY_DATA`      | the SSH private key file      | `--keyfile`          |
+| `KOPIA_SFTP_KNOWN_HOSTS`   | the `known_hosts` file        | `--known-hosts`      |
+| `KOPIA_GCS_CREDENTIALS`    | the service-account JSON file | `--credentials-file` |
+| `KOPIA_RCLONE_CONFIG`      | the `rclone.conf` file        | rclone `--config`    |
+| `KOPIA_GDRIVE_CREDENTIALS` | the service-account JSON file | `--credentials-file` |
 
 You don't manage the files — just put the value under the right key; the secret never lands on kopia's argv.
 

@@ -93,6 +93,7 @@ let summary = match &backend {
     Backend::Sftp(_) => "sftp".into(),
     Backend::WebDav(_) => "webdav".into(),
     Backend::Rclone(_) => "rclone".into(),
+    Backend::Gdrive(_) => "gdrive".into(),
 };
 assert_eq!(summary, "s3://my-backups");
 

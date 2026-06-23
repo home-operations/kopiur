@@ -238,12 +238,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                 .await
             {
-                let create_enabled = repo
-                    .spec
-                    .create
-                    .as_ref()
-                    .map(|c| c.enabled)
-                    .unwrap_or(false);
+                let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -712,12 +707,7 @@ async fn bootstrap_cluster_via_mover(
         )));
     }
 
-    let create_enabled = repo
-        .spec
-        .create
-        .as_ref()
-        .map(|c| c.enabled)
-        .unwrap_or(false);
+    let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -768,6 +758,13 @@ async fn bootstrap_cluster_via_mover(
             mount_path: io::filesystem_repo_path(backend).unwrap_or_default(),
             read_only: false,
         });
+    // spec.bootstrap.failurePolicy lets callers raise the deadline for a slow
+    // backend or tune the retry budget; unset keeps the built-in defaults.
+    let bootstrap_fp = repo
+        .spec
+        .bootstrap
+        .as_ref()
+        .and_then(|b| b.failure_policy.as_ref());
     let inputs = MoverJobInputs {
         name: &job_name,
         namespace: &job_ns,
@@ -779,9 +776,15 @@ async fn bootstrap_cluster_via_mover(
         // image-pull failure) becomes terminal-`Failed` instead of hanging — then
         // `finalize_cluster_bootstrap` runs and surfaces a Warning Event.
         limits: JobLimits {
-            active_deadline_seconds: Some(BOOTSTRAP_JOB_DEADLINE_SECS),
+            active_deadline_seconds: Some(
+                bootstrap_fp
+                    .and_then(|fp| fp.active_deadline_seconds)
+                    .unwrap_or(BOOTSTRAP_JOB_DEADLINE_SECS),
+            ),
+            backoff_limit: bootstrap_fp
+                .and_then(|fp| fp.backoff_limit)
+                .unwrap_or(JobLimits::default().backoff_limit),
             ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
-            ..JobLimits::default()
         },
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

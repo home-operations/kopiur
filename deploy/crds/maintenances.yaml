@@ -604,17 +604,8 @@ spec:
                     type: string
                   mode:
                     description: |-
-                      Which maintenance kind a manual (annotation-requested) run performs. Closed
-                      enum; the wire values are the `run-mode` annotation values.
-
-                      ```
-                      use kopiur_api::maintenance::ManualRunMode;
-
-                      assert_eq!(ManualRunMode::default(), ManualRunMode::Quick);
-                      assert_eq!(ManualRunMode::parse("full"), Some(ManualRunMode::Full));
-                      assert_eq!(ManualRunMode::parse("FULL"), None); // exact, lowercase
-                      assert_eq!(serde_json::to_value(ManualRunMode::Quick).unwrap(), "quick");
-                      ```
+                      Which maintenance kind a manual (annotation-requested) run performs; the wire
+                      values are the `run-mode` annotation values. Defaults to `quick`.
                     enum:
                     - quick
                     - full

@@ -60,7 +60,8 @@ pub fn backend_tls_ca_configmap(backend: &Backend) -> Option<&str> {
         | Backend::Filesystem(_)
         | Backend::Sftp(_)
         | Backend::WebDav(_)
-        | Backend::Rclone(_) => None,
+        | Backend::Rclone(_)
+        | Backend::Gdrive(_) => None,
     }
 }
 
@@ -117,6 +118,10 @@ pub fn backend_to_repository_connect(backend: &Backend) -> RepositoryConnect {
         Backend::WebDav(w) => RepositoryConnect::WebDav { url: w.url.clone() },
         Backend::Rclone(r) => RepositoryConnect::Rclone {
             remote_path: r.remote_path.clone(),
+            startup_timeout: r.startup_timeout.clone(),
+        },
+        Backend::Gdrive(g) => RepositoryConnect::Gdrive {
+            folder_id: g.folder_id.clone(),
         },
     }
 }
@@ -233,8 +238,8 @@ mod tests {
     #[test]
     fn every_backend_maps_to_a_repository_connect() {
         use kopiur_api::backend::{
-            AzureBackend, B2Backend, FilesystemBackend, GcsBackend, RcloneBackend, S3Backend,
-            SftpBackend, WebDavBackend,
+            AzureBackend, B2Backend, FilesystemBackend, GcsBackend, GdriveBackend, RcloneBackend,
+            S3Backend, SftpBackend, WebDavBackend,
         };
         let cases = vec![
             Backend::Filesystem(FilesystemBackend {
@@ -279,6 +284,11 @@ mod tests {
             Backend::Rclone(RcloneBackend {
                 remote_path: "r:bucket".into(),
                 config_secret_ref: None,
+                startup_timeout: None,
+            }),
+            Backend::Gdrive(GdriveBackend {
+                folder_id: "fid".into(),
+                credentials_secret_ref: None,
             }),
         ];
         // Each maps without panicking and converts cleanly to a kopia ConnectSpec

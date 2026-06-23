@@ -312,6 +312,36 @@ fn filesystem_pvc_and_object_backends_need_no_content_check() {
     assert!(validate_backend(&s3).is_ok());
 }
 
+#[test]
+fn gdrive_requires_a_folder_id() {
+    use crate::backend::{Backend, GdriveBackend};
+    let ok = Backend::Gdrive(GdriveBackend {
+        folder_id: "0ABC".into(),
+        credentials_secret_ref: None,
+    });
+    assert!(validate_backend(&ok).is_ok());
+    let empty = Backend::Gdrive(GdriveBackend {
+        folder_id: "  ".into(),
+        credentials_secret_ref: None,
+    });
+    assert!(validate_backend(&empty).is_err());
+}
+
+#[test]
+fn rclone_startup_timeout_must_be_a_go_duration() {
+    use crate::backend::{Backend, RcloneBackend};
+    let mk = |t: Option<&str>| {
+        Backend::Rclone(RcloneBackend {
+            remote_path: "r:bucket".into(),
+            config_secret_ref: None,
+            startup_timeout: t.map(str::to_string),
+        })
+    };
+    assert!(validate_backend(&mk(Some("2m"))).is_ok());
+    assert!(validate_backend(&mk(None)).is_ok());
+    assert!(validate_backend(&mk(Some("soon"))).is_err());
+}
+
 // --- validate_backend_auth / workload identity ---
 
 fn s3_with_auth(auth: Option<crate::backend::BackendAuth>) -> crate::backend::Backend {
@@ -1005,6 +1035,7 @@ fn repository_inline_retention_hook_passes_today() {
             },
         },
         create: None,
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1251,6 +1282,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
             },
         },
         create: None,
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1343,6 +1375,7 @@ fn cluster_repository_rejects_all_false() {
             },
         },
         create: None,
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1376,6 +1409,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
             },
         },
         create: None,
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1429,6 +1463,7 @@ fn repo_spec_create(
             hash: hash.map(String::from),
             ecc: None,
         }),
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1484,6 +1519,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
             hash: None,
             ecc: None,
         }),
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,
@@ -1579,6 +1615,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
             hash: None,
             ecc: None,
         }),
+        bootstrap: None,
         mover_defaults: None,
         catalog: None,
         server: None,

@@ -23,6 +23,7 @@ pub fn backend_auth_secret_ref(backend: &Backend) -> Option<&crate::common::Secr
         Backend::Sftp(b) => b.auth.as_ref().and_then(|a| a.secret_ref.as_ref()),
         Backend::WebDav(b) => b.auth.as_ref().and_then(|a| a.secret_ref.as_ref()),
         Backend::Rclone(b) => b.config_secret_ref.as_ref(),
+        Backend::Gdrive(b) => b.credentials_secret_ref.as_ref(),
         Backend::Filesystem(_) => None,
     }
 }
@@ -71,6 +72,7 @@ pub fn backend_workload_identity(
         | Backend::Sftp(_)
         | Backend::WebDav(_)
         | Backend::Rclone(_)
+        | Backend::Gdrive(_)
         | Backend::Filesystem(_) => None,
     }
 }

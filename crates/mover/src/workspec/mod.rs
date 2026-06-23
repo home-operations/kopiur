@@ -775,6 +775,15 @@ pub enum RepositoryConnect {
     Rclone {
         /// Rclone `remote:path`.
         remote_path: String,
+        /// Go-duration for kopia's `--rclone-startup-timeout`; `None` leaves
+        /// kopia's default (`15s`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        startup_timeout: Option<String>,
+    },
+    /// Google Drive backend (kopia native `gdrive`).
+    Gdrive {
+        /// Drive folder id that holds the repository.
+        folder_id: String,
     },
 }
 
@@ -791,6 +800,7 @@ impl RepositoryConnect {
             RepositoryConnect::Sftp { .. } => "Sftp",
             RepositoryConnect::WebDav { .. } => "WebDav",
             RepositoryConnect::Rclone { .. } => "Rclone",
+            RepositoryConnect::Gdrive { .. } => "Gdrive",
         }
     }
 
@@ -866,11 +876,21 @@ impl RepositoryConnect {
                 known_hosts: None,
             },
             RepositoryConnect::WebDav { url } => ConnectSpec::WebDav { url: url.clone() },
-            RepositoryConnect::Rclone { remote_path } => ConnectSpec::Rclone {
+            RepositoryConnect::Rclone {
+                remote_path,
+                startup_timeout,
+            } => ConnectSpec::Rclone {
                 remote_path: remote_path.clone(),
                 // rclone.conf is materialized by the mover from the config Secret
                 // at runtime (see `crate::credentials`).
                 config_file: None,
+                startup_timeout: startup_timeout.clone(),
+            },
+            RepositoryConnect::Gdrive { folder_id } => ConnectSpec::Gdrive {
+                folder_id: folder_id.clone(),
+                // The service-account JSON path is materialized by the mover from
+                // the credentials Secret at runtime (see `crate::credentials`).
+                credentials_file: None,
             },
         }
     }

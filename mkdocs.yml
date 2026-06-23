@@ -184,6 +184,7 @@ nav:
           - SFTP: backends/sftp.md
           - WebDAV: backends/webdav.md
           - rclone: backends/rclone.md
+          - Google Drive (native): backends/gdrive.md
       - Backups & schedules: backups.md
       - Copy methods (Snapshot/Clone/Direct): copy-methods.md
       - PVC access modes & RWOP: access-modes.md
