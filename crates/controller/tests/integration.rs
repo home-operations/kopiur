@@ -85,6 +85,7 @@ fn sample_repository(name: &str) -> Repository {
                 },
             },
             create: None,
+            bootstrap: None,
             mover_defaults: None,
             catalog: None,
             maintenance: None,
