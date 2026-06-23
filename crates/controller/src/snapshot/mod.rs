@@ -497,18 +497,38 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `Pending` and requeue until the repository's own reconcile marks it `Ready`.
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
     //
-    // One fetch gathers the repository status (readiness) AND the live preflight
-    // inputs (repository + maintenance state), so the readiness gate and the
-    // preflight gate below share a single GET.
+    // Readiness — plus the live preflight inputs ONLY when a preflight block exists.
+    // The full gather clones the Maintenance informer store, so the common
+    // no-preflight backup keeps the cheap single-GET `repository_ready` path.
     let now = chrono::Utc::now();
-    let (pf_inputs, repo_ready) = io::gather_preflight_inputs(
-        &ctx.client,
-        &config.spec.repository,
-        &namespace,
-        &ctx.maintenance_store,
-        now,
-    )
-    .await?;
+    let has_preflight = config
+        .spec
+        .preflight
+        .as_ref()
+        .is_some_and(|p| !p.checks.is_empty());
+    let (pf_inputs, repo_ready) = if has_preflight {
+        // A cold Maintenance informer would make maintenance recency fail closed
+        // (has_run=false) and could spuriously fail a maintenance-gated preflight;
+        // hold briefly until the store has synced rather than evaluate stale state.
+        if !ctx
+            .maintenance_synced
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+        let (inputs, ready) = io::gather_preflight_inputs(
+            &ctx.client,
+            &config.spec.repository,
+            &namespace,
+            &ctx.maintenance_store,
+            now,
+        )
+        .await?;
+        (Some(inputs), ready)
+    } else {
+        let ready = io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await?;
+        (None, ready)
+    };
     if !repo_ready {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
@@ -532,27 +552,27 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // re-gated. A failing check holds the Snapshot `Pending` (`PreflightFailed`) and,
     // once `spec.preflight.timeout` elapses from `status.preflightSince`, fails it
     // (bounded so scheduled backups don't pile up `Pending` CRs).
-    if should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
-        && let Some(pf) = config
+    if has_preflight
+        && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
+        && let Some(pf_inputs) = pf_inputs.as_ref()
+    {
+        let pf = config
             .spec
             .preflight
             .as_ref()
-            .filter(|p| !p.checks.is_empty())
-    {
-        // First failing check (AND semantics); an evaluation error counts as failed.
+            .expect("has_preflight ⇒ Some");
+        // First failing check (AND semantics). Distinguish a check that returned
+        // `false` (precondition unmet) from one that ERRORED (couldn't be evaluated
+        // against live state) — the latter is a config/transient fault, surfaced
+        // distinctly so it's diagnosable from the CR, not silently merged into "unmet".
         let failed = pf.checks.iter().find_map(|c| {
-            match kopiur_api::eval_preflight_expr(&c.expr, &pf_inputs) {
+            match kopiur_api::eval_preflight_expr(&c.expr, pf_inputs) {
                 Ok(true) => None,
                 Ok(false) => Some((c, None)),
                 Err(e) => Some((c, Some(e))),
             }
         });
         if let Some((check, eval_err)) = failed {
-            if let Some(e) = &eval_err {
-                // Surface the CEL error in logs, NOT in status (a volatile message
-                // would defeat the change-guarded write and churn every 30s).
-                tracing::debug!(backup = %name, check = %check.name, error = %e, "preflight check failed to evaluate");
-            }
             // Resolve the timeout: absent ⇒ default; parsed-zero ⇒ indefinite.
             let timeout = match pf.timeout.as_deref() {
                 None => Some(crate::consts::DEFAULT_PREFLIGHT_TIMEOUT),
@@ -564,19 +584,29 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             };
             // Anchor the deadline on the FIRST failing reconcile (carried forward),
             // so the timeout budget covers preflight only, not the earlier
-            // repository-not-Ready wait.
-            let since = backup
+            // repository-not-Ready wait. Stamp it ONCE (only when newly failing) so a
+            // later reconcile can't push the deadline forward.
+            let prior_since = backup
                 .status
                 .as_ref()
-                .and_then(|s| s.preflight_since.clone())
-                .unwrap_or_else(|| now.to_rfc3339());
+                .and_then(|s| s.preflight_since.clone());
+            let newly_failing = prior_since.is_none();
+            let since = prior_since.unwrap_or_else(|| now.to_rfc3339());
             let expired = preflight_expired(Some(&since), timeout, now);
-            // Deterministic message (no CEL error text) so the guarded write is a
-            // true no-op while the same check keeps failing.
-            let msg = match &check.message {
-                Some(m) => format!("preflight check {:?} not satisfied: {m}", check.name),
-                None => format!("preflight check {:?} not satisfied", check.name),
+            // Deterministic message (no volatile CEL error text → no status churn).
+            // An eval error gets its own message and a WARN log carries the detail.
+            let msg = match (&eval_err, &check.message) {
+                (Some(_), _) => format!(
+                    "preflight check {:?} could not be evaluated against the current \
+                     repository/maintenance state (see operator logs)",
+                    check.name
+                ),
+                (None, Some(m)) => format!("preflight check {:?} not satisfied: {m}", check.name),
+                (None, None) => format!("preflight check {:?} not satisfied", check.name),
             };
+            if let Some(e) = &eval_err {
+                tracing::warn!(backup = %name, check = %check.name, error = %e, "preflight check could not be evaluated");
+            }
             let phase = if expired {
                 SnapshotPhase::Failed
             } else {
@@ -584,7 +614,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             };
             let mut status =
                 snapshot_ready_status(backup, phase, crate::consts::PREFLIGHT_FAILED_REASON, &msg);
-            status["preflightSince"] = serde_json::Value::String(since);
+            if newly_failing {
+                status["preflightSince"] = serde_json::Value::String(since);
+            }
             let current = serde_json::to_value(&backup.status).ok();
             io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
             return Ok(if expired {

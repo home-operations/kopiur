@@ -159,8 +159,11 @@ Each check is a CEL **bool** expression over two variables:
 | `repository.phase` | string | repository `status.phase` (`Ready`, …) |
 | `repository.ready` | bool | `phase == Ready` |
 | `repository.backendReachable` | bool | the [health probe](#backend-health-probe-opt-in)'s `BackendReachable` condition is `True` — **`true` when the probe is disabled** (no evidence of a fault) |
+| `repository.snapshotCountKnown` | bool | the snapshot count has been observed (guard `snapshotCount` checks with this) |
 | `repository.snapshotCount` | int | snapshots in the repository |
+| `repository.indexBlobCountKnown` | bool | the index-blob count has been observed |
 | `repository.indexBlobCount` | int | content-index blobs (maintenance-backlog signal) |
+| `repository.sizeBytesKnown` | bool | the repository size has been observed |
 | `repository.sizeBytes` | int | logical bytes under management (repository **total size**, *not* backend free space) |
 | `repository.lastHealthyKnown` | bool | a successful health probe has been recorded |
 | `repository.lastHealthyAgeSeconds` | int | seconds since the last successful probe |
@@ -169,12 +172,17 @@ Each check is a CEL **bool** expression over two variables:
 | `maintenance.hasRun` | bool | the repo's `Maintenance` has a recorded successful run (scheduled **or** manual run-now) |
 | `maintenance.lastSuccessAgeSeconds` | int | seconds since the most recent successful maintenance of any mode |
 
-!!! warning "Unknown values fail closed — guard freshness checks with `hasRun`/`*Known`"
-    Every age/count is `i64::MAX` ("infinitely old") when never observed, so a naive
-    freshness check like `maintenance.lastSuccessAgeSeconds < 604800` correctly **blocks**
-    the backup when maintenance has never run — rather than silently passing. Write the
-    intent explicitly with the boolean companion:
-    `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`.
+!!! warning "Unknown values — always pair with the `*Known`/`hasRun` companion bool"
+    An unobserved age/count/size is `i64::MAX`. For a **freshness** check
+    (`maintenance.lastSuccessAgeSeconds < 604800`) that fails *closed* — the unknown value
+    is "infinitely old", so the check blocks, which is what you want. But for a
+    **count/size** check the same sentinel fails *open*: `repository.snapshotCount > 0`
+    is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always
+    guard with the boolean companion so the unknown case fails closed:
+
+    - `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`
+    - `repository.snapshotCountKnown && repository.snapshotCount > 0`
+    - `repository.sizeBytesKnown && repository.sizeBytes < 1000000000000`
 
 !!! tip "Validation & the AND rule"
     Each `expr` is compiled and trial-evaluated **at admission** (`kubectl apply`), so a

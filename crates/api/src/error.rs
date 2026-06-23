@@ -367,9 +367,10 @@ pub enum ValidationError {
     /// `repository` and `maintenance` maps.
     #[error(
         "preflight check expression {expr:?} failed to evaluate: {reason} \
-         (available variables: repository.{{phase,ready,backendReachable,snapshotCount,\
-         indexBlobCount,sizeBytes,lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,\
-         lastReverifyAgeSeconds}}, maintenance.{{hasRun,lastSuccessAgeSeconds}})"
+         (available variables: repository.{{phase,ready,backendReachable,snapshotCountKnown,\
+         snapshotCount,indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,\
+         lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}}, \
+         maintenance.{{hasRun,lastSuccessAgeSeconds}})"
     )]
     PreflightExprEval {
         /// The offending CEL expression.

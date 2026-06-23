@@ -480,13 +480,15 @@ are filled from the verified snapshot's manifest (so `stats.files > 0` is meanin
 
 `{ checks: [{ name, expr, message? }], timeout? }` — opt-in CEL preconditions a backup
 must satisfy before its mover Job launches. Each `expr` is a CEL **bool** predicate over
-`repository.{phase,ready,backendReachable,snapshotCount,indexBlobCount,sizeBytes,
-lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
+`repository.{phase,ready,backendReachable,snapshotCountKnown,snapshotCount,
+indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,lastHealthyKnown,
+lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
 `maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission (compile +
 trial-evaluate + bool). All checks must pass; a failure holds the `Snapshot` in `Pending`
 (`PreflightFailed`) and, after `timeout` (Go-style duration, default `10m`; `0` = hold
-forever), transitions it to `Failed`. Ages are `i64::MAX` when never observed, so a naive
-freshness check fails closed — guard with `hasRun`/`*Known`. See
+forever), transitions it to `Failed`. Unobserved values are `i64::MAX`; always pair a
+count/size/age check with its `*Known`/`hasRun` companion so the unknown case fails closed
+(`repository.snapshotCountKnown && repository.snapshotCount > 0`). See
 [Repository health → Backup preflight](repository-health.md#backup-preflight-opt-in).
 
 ### RestoreSource

@@ -147,11 +147,12 @@ no preflight runs.
   the schedule's `failedJobsHistoryLimit`.
 
 The CEL environment exposes
-`repository.{phase,ready,backendReachable,snapshotCount,indexBlobCount,sizeBytes,
-lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
-`maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission. Unknown ages are
-`i64::MAX` ("infinitely old"), so a freshness check fails closed — guard it with
-`hasRun`/`*Known`. Example:
+`repository.{phase,ready,backendReachable,snapshotCountKnown,snapshotCount,
+indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,lastHealthyKnown,
+lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
+`maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission. Unobserved values are
+`i64::MAX`: a freshness (`< N`) check fails closed, but a count/size (`> N`) check fails
+*open*, so always pair it with the `*Known`/`hasRun` companion. Example:
 `"maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"`. See
 [Repository health → Backup preflight](../../repository-health.md#backup-preflight-opt-in).
 

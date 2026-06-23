@@ -82,10 +82,16 @@ pub struct PreflightInputs {
     /// or `true` when the condition is absent (the health probe is disabled, so
     /// there is no evidence the backend is down).
     pub backend_reachable: bool,
+    /// `repository.snapshotCountKnown` — the snapshot count has been observed.
+    pub snapshot_count_known: bool,
     /// `repository.snapshotCount` — `status.storageStats.snapshotCount`, [`UNKNOWN_AGE`] if unobserved.
     pub snapshot_count: i64,
+    /// `repository.indexBlobCountKnown` — the index-blob count has been observed.
+    pub index_blob_count_known: bool,
     /// `repository.indexBlobCount` — `status.storageStats.indexBlobCount`, [`UNKNOWN_AGE`] if unobserved.
     pub index_blob_count: i64,
+    /// `repository.sizeBytesKnown` — the repository size has been observed.
+    pub size_bytes_known: bool,
     /// `repository.sizeBytes` — `status.storageStats.totalSizeBytes`, [`UNKNOWN_AGE`] if unobserved.
     pub size_bytes: i64,
     /// `repository.lastHealthyKnown` — a successful health probe has been recorded.
@@ -111,8 +117,11 @@ impl Default for PreflightInputs {
             repository_phase: String::new(),
             repository_ready: false,
             backend_reachable: false,
+            snapshot_count_known: false,
             snapshot_count: UNKNOWN_AGE,
+            index_blob_count_known: false,
             index_blob_count: UNKNOWN_AGE,
+            size_bytes_known: false,
             size_bytes: UNKNOWN_AGE,
             last_healthy_known: false,
             last_healthy_age_seconds: UNKNOWN_AGE,
@@ -152,8 +161,11 @@ fn context<'a>(inputs: &PreflightInputs) -> Context<'a> {
         "phase": inputs.repository_phase,
         "ready": inputs.repository_ready,
         "backendReachable": inputs.backend_reachable,
+        "snapshotCountKnown": inputs.snapshot_count_known,
         "snapshotCount": inputs.snapshot_count,
+        "indexBlobCountKnown": inputs.index_blob_count_known,
         "indexBlobCount": inputs.index_blob_count,
+        "sizeBytesKnown": inputs.size_bytes_known,
         "sizeBytes": inputs.size_bytes,
         "lastHealthyKnown": inputs.last_healthy_known,
         "lastHealthyAgeSeconds": inputs.last_healthy_age_seconds,
@@ -202,8 +214,11 @@ pub fn validate_preflight_expr(expr: &str) -> ValidationResult {
         repository_phase: "Ready".to_string(),
         repository_ready: true,
         backend_reachable: true,
+        snapshot_count_known: true,
         snapshot_count: 1,
+        index_blob_count_known: true,
         index_blob_count: 1,
+        size_bytes_known: true,
         size_bytes: 1,
         last_healthy_known: true,
         last_healthy_age_seconds: 1,
@@ -240,8 +255,11 @@ mod tests {
             repository_phase: "Ready".to_string(),
             repository_ready: true,
             backend_reachable: true,
+            snapshot_count_known: true,
             snapshot_count: 12,
+            index_blob_count_known: true,
             index_blob_count: 5,
+            size_bytes_known: true,
             size_bytes: 4096,
             last_healthy_known: true,
             last_healthy_age_seconds: 60,
@@ -285,6 +303,28 @@ mod tests {
                 &i
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn unobserved_count_must_be_guarded_with_known() {
+        // A count sentinel of i64::MAX fails OPEN for a `> 0` check, so a naive
+        // "repo is populated" guard wrongly passes before the first catalog scan.
+        let mut i = ready_inputs();
+        i.snapshot_count_known = false;
+        i.snapshot_count = UNKNOWN_AGE;
+        assert!(
+            eval_preflight_expr("repository.snapshotCount > 0", &i).unwrap(),
+            "the count sentinel is i64::MAX, so an UNGUARDED > 0 check fails open"
+        );
+        // The `*Known` companion lets the user guard it explicitly (fail closed).
+        assert!(
+            !eval_preflight_expr(
+                "repository.snapshotCountKnown && repository.snapshotCount > 0",
+                &i
+            )
+            .unwrap(),
+            "guarding with snapshotCountKnown blocks when the count is unobserved"
         );
     }
 

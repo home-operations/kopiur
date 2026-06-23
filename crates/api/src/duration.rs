@@ -23,10 +23,14 @@ pub fn parse_go_duration(s: &str) -> Option<Duration> {
     } else {
         (s, 1)
     };
+    // `checked_mul` so an absurd value (`9999999999999999h`) returns `None` — the
+    // webhook then rejects it instead of panicking (debug) or wrapping to a garbage
+    // duration (release) on the unchecked multiply.
     num.trim()
         .parse::<u64>()
         .ok()
-        .map(|n| Duration::from_secs(n * mult))
+        .and_then(|n| n.checked_mul(mult))
+        .map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -43,5 +47,13 @@ mod tests {
         assert_eq!(parse_go_duration(""), None);
         assert_eq!(parse_go_duration("bogus"), None);
         assert_eq!(parse_go_duration("-5m"), None);
+        // Overflow on the unit multiply must be rejected, not panic/wrap.
+        assert_eq!(parse_go_duration("9999999999999999h"), None);
+        assert_eq!(parse_go_duration(&format!("{}m", u64::MAX)), None);
+        // A bare (unmultiplied) large second count still parses.
+        assert_eq!(
+            parse_go_duration(&u64::MAX.to_string()),
+            Some(Duration::from_secs(u64::MAX))
+        );
     }
 }

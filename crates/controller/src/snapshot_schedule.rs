@@ -231,14 +231,19 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     // Bound failure history: prune this schedule's oldest `Failed` Snapshots beyond
     // `failedJobsHistoryLimit` (GFS retention only prunes successes). Runs every
     // reconcile — a cheap labeled list — so a persistently-failing precondition or
-    // backend can't accumulate `Failed` CRs without limit.
-    prune_failed_history(
+    // backend can't accumulate `Failed` CRs without limit. Best-effort: a transient
+    // list/delete error here must NOT block firing the due backup, so log and proceed
+    // (the next reconcile retries the prune) rather than short-circuiting the slot.
+    if let Err(e) = prune_failed_history(
         ctx,
         &namespace,
         &sched_name,
         schedule.spec.failed_jobs_history_limit,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
+    }
 
     let seed = schedule.uid().unwrap_or_else(|| schedule.name_any());
     let now = Utc::now();
@@ -393,13 +398,23 @@ fn snapshot_terminal_time(s: &Snapshot) -> Option<DateTime<Utc>> {
 /// **Pure.** Names of the `Failed` snapshots to delete so at most `limit` (the
 /// newest, by terminal time) are retained. Skips snapshots already terminating.
 /// Mirrors `snapshot_policy::backups_to_delete` (GFS retention) but for failures.
+///
+/// **Data-safety:** never prunes a `Failed` snapshot that owns a kopia snapshot
+/// (`status.snapshot` set) — a backup can end `Failed` *after* its kopia snapshot
+/// was created (e.g. an `afterSnapshot` hook aborts), and deleting that CR under the
+/// default `Delete` policy would run `kopia snapshot delete` and destroy a real,
+/// recoverable backup. Those CRs are kept; only artifact-less failures (preflight,
+/// pre-snapshot errors) are history-bounded here.
 pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> Vec<String> {
     use kopiur_api::SnapshotPhase;
     let mut failed: Vec<&Snapshot> = snapshots
         .iter()
         .filter(|s| {
-            s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Failed)
+            let st = s.status.as_ref();
+            st.and_then(|s| s.phase) == Some(SnapshotPhase::Failed)
                 && s.metadata.deletion_timestamp.is_none()
+                // Never auto-delete a Failed snapshot that produced a kopia snapshot.
+                && st.and_then(|s| s.snapshot.as_ref()).is_none()
         })
         .collect();
     // Newest first; an unknown terminal time (`None`) sorts last (treated as oldest)
@@ -817,18 +832,36 @@ mod tests {
         // An already-terminating Failed snapshot is skipped (don't re-delete).
         let mut term = snap("term", SnapshotPhase::Failed, "2026-01-01T00:00:00Z");
         term.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+        // DATA-SAFETY: a Failed snapshot that produced a kopia snapshot (e.g. an
+        // afterSnapshot hook aborted after creation) must NEVER be pruned — deleting
+        // it would destroy a real backup. Even though it's the oldest, it stays.
+        let mut with_artifact = snap("kept", SnapshotPhase::Failed, "2025-12-31T00:00:00Z");
+        with_artifact.status.as_mut().unwrap().snapshot =
+            Some(kopiur_api::snapshot::SnapshotInfo {
+                kopia_snapshot_id: "kabc123".into(),
+                identity: kopiur_api::common::ResolvedIdentity {
+                    username: "u".into(),
+                    hostname: "h".into(),
+                    source_path: None,
+                },
+            });
 
-        let all = vec![a, b, c, ok, term];
-        // Keep the newest (c); prune the two older failures.
+        let all = vec![a, b, c, ok, term, with_artifact];
+        // Keep the newest (c); prune the two older artifact-less failures; the
+        // artifact-bearing "kept" is excluded entirely.
         let mut prune = failed_snapshots_to_prune(&all, 1);
         prune.sort();
         assert_eq!(prune, vec!["a".to_string(), "b".to_string()]);
-        // 0 → prune every (non-terminating) failure.
+        // 0 → prune every artifact-less, non-terminating failure (NOT "kept").
         let mut prune0 = failed_snapshots_to_prune(&all, 0);
         prune0.sort();
         assert_eq!(
             prune0,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(
+            !prune0.contains(&"kept".to_string()),
+            "a Failed snapshot owning a kopia snapshot must never be pruned"
         );
         // Limit ≥ count → no-op.
         assert!(failed_snapshots_to_prune(&all, 10).is_empty());
