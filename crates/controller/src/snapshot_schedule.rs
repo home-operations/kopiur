@@ -21,7 +21,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use kube::api::ListParams;
+use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
@@ -228,6 +228,18 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     let sched_name = schedule.name_any();
     let api: Api<SnapshotSchedule> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    // Bound failure history: prune this schedule's oldest `Failed` Snapshots beyond
+    // `failedJobsHistoryLimit` (GFS retention only prunes successes). Runs every
+    // reconcile — a cheap labeled list — so a persistently-failing precondition or
+    // backend can't accumulate `Failed` CRs without limit.
+    prune_failed_history(
+        ctx,
+        &namespace,
+        &sched_name,
+        schedule.spec.failed_jobs_history_limit,
+    )
+    .await?;
+
     let seed = schedule.uid().unwrap_or_else(|| schedule.name_any());
     let now = Utc::now();
     let jitter_window = schedule
@@ -361,6 +373,68 @@ async fn active_run_exists(ctx: &Context, namespace: &str, schedule: &str) -> Re
             Some(SnapshotPhase::Pending) | Some(SnapshotPhase::Running) | None
         ) && b.metadata.deletion_timestamp.is_none()
     }))
+}
+
+/// The terminal time used to order Failed snapshots for pruning: `status.timing.endTime`
+/// when present, else `metadata.creationTimestamp`. `None` only when neither is set.
+fn snapshot_terminal_time(s: &Snapshot) -> Option<DateTime<Utc>> {
+    s.status
+        .as_ref()
+        .and_then(|st| st.timing.as_ref())
+        .and_then(|t| t.end_time.as_deref())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .or_else(|| {
+            s.creation_timestamp()
+                .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
+        })
+}
+
+/// **Pure.** Names of the `Failed` snapshots to delete so at most `limit` (the
+/// newest, by terminal time) are retained. Skips snapshots already terminating.
+/// Mirrors `snapshot_policy::backups_to_delete` (GFS retention) but for failures.
+pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> Vec<String> {
+    use kopiur_api::SnapshotPhase;
+    let mut failed: Vec<&Snapshot> = snapshots
+        .iter()
+        .filter(|s| {
+            s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Failed)
+                && s.metadata.deletion_timestamp.is_none()
+        })
+        .collect();
+    // Newest first; an unknown terminal time (`None`) sorts last (treated as oldest)
+    // → pruned first.
+    failed.sort_by_key(|s| std::cmp::Reverse(snapshot_terminal_time(s)));
+    failed
+        .into_iter()
+        .skip(limit as usize)
+        .filter_map(|s| s.metadata.name.clone())
+        .collect()
+}
+
+/// Enforce `failedJobsHistoryLimit`: prune the schedule's oldest `Failed` Snapshots
+/// beyond the limit. Reuses the `SCHEDULE_LABEL` list and the GFS-prune delete idiom
+/// (delete the CR → its finalizer + `deletionPolicy` handle any kopia cleanup).
+async fn prune_failed_history(
+    ctx: &Context,
+    namespace: &str,
+    schedule: &str,
+    limit: Option<u32>,
+) -> Result<()> {
+    let limit = kopiur_api::consts::effective_failed_jobs_history_limit(limit);
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
+    let items = api.list(&lp).await?.items;
+    for name in failed_snapshots_to_prune(&items, limit) {
+        match api.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {
+                tracing::info!(schedule = %schedule, snapshot = %name, "pruned Failed Snapshot (failedJobsHistoryLimit)")
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the set of `SnapshotPolicy` targets a fire should create a `Snapshot`
@@ -706,5 +780,57 @@ mod tests {
         // Within deadline → fires.
         let now_ok = at(2026, 5, 24, 2, 5);
         assert!(should_create_backup(&spec, slot, now_ok, false));
+    }
+
+    #[test]
+    fn failed_snapshots_to_prune_keeps_newest_and_skips_non_failed() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use kopiur_api::snapshot::{SnapshotPhase, SnapshotStatus, SnapshotTiming};
+
+        fn snap(name: &str, phase: SnapshotPhase, end: &str) -> Snapshot {
+            let mut s = Snapshot::new(
+                name,
+                SnapshotSpec {
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    pin: false,
+                },
+            );
+            s.status = Some(SnapshotStatus {
+                phase: Some(phase),
+                timing: Some(SnapshotTiming {
+                    end_time: Some(end.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s
+        }
+
+        let a = snap("a", SnapshotPhase::Failed, "2026-01-01T01:00:00Z");
+        let b = snap("b", SnapshotPhase::Failed, "2026-01-01T02:00:00Z");
+        let c = snap("c", SnapshotPhase::Failed, "2026-01-01T03:00:00Z");
+        // A Succeeded snapshot must never be pruned by the failure limit.
+        let ok = snap("ok", SnapshotPhase::Succeeded, "2026-01-01T09:00:00Z");
+        // An already-terminating Failed snapshot is skipped (don't re-delete).
+        let mut term = snap("term", SnapshotPhase::Failed, "2026-01-01T00:00:00Z");
+        term.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+
+        let all = vec![a, b, c, ok, term];
+        // Keep the newest (c); prune the two older failures.
+        let mut prune = failed_snapshots_to_prune(&all, 1);
+        prune.sort();
+        assert_eq!(prune, vec!["a".to_string(), "b".to_string()]);
+        // 0 → prune every (non-terminating) failure.
+        let mut prune0 = failed_snapshots_to_prune(&all, 0);
+        prune0.sort();
+        assert_eq!(
+            prune0,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // Limit ≥ count → no-op.
+        assert!(failed_snapshots_to_prune(&all, 10).is_empty());
     }
 }

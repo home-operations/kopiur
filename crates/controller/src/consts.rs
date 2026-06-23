@@ -27,6 +27,15 @@ pub const REPOSITORY_READ_ONLY_REASON: &str = "RepositoryReadOnly";
 /// `SnapshotPolicy`, and `RepositoryReplication` already apply.
 pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
 
+/// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
+/// because a `SnapshotPolicy.spec.preflight` check is not satisfied. The backup
+/// never launches until every preflight check passes.
+pub const PREFLIGHT_FAILED_REASON: &str = "PreflightFailed";
+/// Default `spec.preflight.timeout` when unset: how long a `Snapshot` is held in
+/// `Pending` while a preflight check is unsatisfied before it transitions to
+/// `Failed`. Bounded so scheduled backups don't pile up `Pending` CRs.
+pub const DEFAULT_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// In-container mount path for an inline-NFS backup *source* whose server-side
 /// export is the NFSv4 pseudo-root (`/`). The export's server path and the
 /// container mount path are independent; reusing `/` as the mount path would

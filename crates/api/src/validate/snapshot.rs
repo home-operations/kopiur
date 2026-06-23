@@ -105,6 +105,41 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
+    // Preflight: the timeout must parse, check names must be unique + non-blank, and
+    // each check expression must compile + trial-evaluate to a bool with no
+    // out-of-scope variable — rejected at admission rather than at the first run.
+    if let Some(pf) = &spec.preflight {
+        if let Some(t) = &pf.timeout
+            && crate::duration::parse_go_duration(t).is_none()
+        {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: "spec.preflight.timeout".to_string(),
+                reason: format!(
+                    "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
+                     for the default (10m), or 0 to hold indefinitely"
+                ),
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, c) in pf.checks.iter().enumerate() {
+            let name = c.name.trim();
+            if name.is_empty() {
+                errs.push(ValidationError::MissingRequiredField {
+                    field: format!("spec.preflight.checks[{i}].name"),
+                });
+            } else if !seen.insert(name.to_string()) {
+                errs.push(ValidationError::InvalidFieldValue {
+                    field: format!("spec.preflight.checks[{i}].name"),
+                    reason: format!(
+                        "duplicate preflight check name {name:?}; names must be unique"
+                    ),
+                });
+            }
+            if let Err(e) = crate::preflight::validate_preflight_expr(&c.expr) {
+                errs.push(e);
+            }
+        }
+    }
     // Hooks (ADR §4.8): per-hook shape problems are caught at admission rather
     // than at the first backup run (where a quiesce hook failing on a typo would
     // abort the backup).

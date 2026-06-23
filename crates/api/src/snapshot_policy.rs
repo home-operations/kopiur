@@ -76,6 +76,11 @@ pub struct SnapshotPolicySpec {
     /// First-class backup verification; opt-in (absent ⇒ no verification runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+    /// Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒
+    /// no preflight). A failing check holds the `Snapshot` in `Pending`
+    /// (`PreflightFailed`) and, after `timeout`, fails it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<crate::preflight::PreflightSpec>,
     /// Pause this recipe declaratively (schedules and reconcile skip a suspended policy).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
@@ -879,6 +884,47 @@ verification:
             serde_json::to_value(&bare)
                 .unwrap()
                 .get("verification")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preflight_roundtrip_and_opt_in() {
+        // Preflight parses the cluster's way, round-trips, and is opt-in.
+        let yaml = r#"
+repository: { kind: Repository, name: r }
+sources: [ { pvc: { name: d } } ]
+preflight:
+  timeout: 10m
+  checks:
+    - name: maintenance-fresh
+      expr: "maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"
+      message: "maintenance must have run within 7d"
+    - name: backend-up
+      expr: "repository.backendReachable"
+"#;
+        let spec: SnapshotPolicySpec = from_yaml(yaml);
+        let pf = spec.preflight.as_ref().expect("preflight");
+        assert_eq!(pf.timeout.as_deref(), Some("10m"));
+        assert_eq!(pf.checks.len(), 2);
+        assert_eq!(pf.checks[0].name, "maintenance-fresh");
+        assert_eq!(pf.checks[1].expr, "repository.backendReachable");
+        assert!(pf.checks[1].message.is_none());
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["preflight"]["checks"][0]["name"], "maintenance-fresh");
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent ⇒ None (no behavior change).
+        let bare: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(bare.preflight.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("preflight")
                 .is_none()
         );
     }

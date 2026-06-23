@@ -55,7 +55,7 @@ wrong value surfaces as a connect-time error, not an admission rejection.
 | `observedGeneration` | int | Last reconciled `metadata.generation` (kstatus). |
 | `uniqueId` | string | kopia repository unique ID. |
 | `backend` | string | Backend discriminant (mirrors `spec.backend`), for the column. |
-| `storageStats` | {`snapshotCount`,`totalSize`,`lastObservedAt`} | From the last catalog scan. |
+| `storageStats` | {`snapshotCount`,`totalSize`,`totalSizeBytes`,`lastObservedAt`,`indexBlobCount`} | From the last catalog scan. `totalSizeBytes` is the integer form of `totalSize` (logical bytes under management); backup preflight reads it as `repository.sizeBytes`. |
 | `catalog` | {`discoveredBackupCount`,`lastRefreshAt`} | Catalog-materialization status. |
 | `conditions` | []Condition | `Ready`/`Reconciling`/`Stalled`, `Connected`, `MaintenanceOwned`, … |
 | `server` | [ServerStatus](#serverspec) | Present when `spec.server` is set: `endpoint` (`<svc>.<ns>.svc:<port>`), `namespace`, `authMode`, `generatedSecretRef`. Cleared when the server is disabled. |
@@ -121,6 +121,7 @@ Short name `kopiasp`, plural `snapshotpolicies`. Print columns: `REPOSITORY`,
 | `errorHandling` | {`ignoreFileErrors`,`ignoreDirErrors`,`ignoreUnknownTypes`} | all `false` | Let a snapshot complete-with-errors. §13(b) |
 | `upload` | {`maxParallelSnapshots`?,`maxParallelFileReads`?} | — | Upload parallelism. §13(f) |
 | `verification` | [Verification](#verification) | — | Opt-in restorability checks. §4 |
+| `preflight` | [Preflight](#preflight) | — | Opt-in CEL preconditions a backup must satisfy before it runs. |
 | `suspend` | bool | `false` | Skip this recipe entirely. §14(e) |
 | `hooks` | {`beforeSnapshot`[],`afterSnapshot`[]} of [Hook](#hook) | — | Pre/post-snapshot workload hooks. |
 | `mover` | [MoverSpec](#moverspec) | — | Per-recipe mover overrides (merged over `moverDefaults`). |
@@ -173,6 +174,7 @@ the whole `spec` is empty.
 | `pinned` | bool? | Observed kopia-side pin state (vs `spec.pin`). |
 | `hooks` | {`preCompletedAt`?,`postCompletedAt`?} | Hook-execution stamps — each list runs exactly once per Snapshot. §4.8 |
 | `staged` | {`copyMethod`,`volumeSnapshotName`?,`pvcName`?,`ready`?} | The CSI staging objects created for `copyMethod: Snapshot`/`Clone` (the VolumeSnapshot + staged PVC the mover read), reaped on completion. Absent for `Direct`/NFS. See [Copy methods](copy-methods.md). |
+| `preflightSince` | RFC3339 | When a `spec.preflight` check first failed (repo `Ready`) — the one-shot anchor for the preflight `timeout` deadline. |
 
 ---
 
@@ -190,7 +192,7 @@ webhook + CRD validation).
 | `policyRef` | [PolicyRef](#policyref) | — | A single `SnapshotPolicy`. Mutually exclusive with `policySelector`. |
 | `policySelector` | LabelSelector | — | Fan-out: many `SnapshotPolicy`s in this namespace. §10 |
 | `schedule` | [ScheduleSpec](#schedulespec) | **required** | Cron + jitter + concurrency. |
-| `failedJobsHistoryLimit` | uint | — | Bounds *failed* child `Snapshot`s. (No `successfulJobsHistoryLimit` — GFS only.) |
+| `failedJobsHistoryLimit` | uint | `10` | Max *failed* child `Snapshot`s the schedule keeps; the oldest beyond this are pruned each reconcile. `0` keeps none. (No `successfulJobsHistoryLimit` — GFS only.) |
 
 ### `status`
 
@@ -473,6 +475,19 @@ verifyFilesPercent? }` — `successExpr` is a CEL bool predicate over
 (`"quick"`|`"deep"`), validated at admission. For `quick`, `stats.files`/`stats.bytes`
 are filled from the verified snapshot's manifest (so `stats.files > 0` is meaningful);
 `restored` is deep-only. §4
+
+### Preflight
+
+`{ checks: [{ name, expr, message? }], timeout? }` — opt-in CEL preconditions a backup
+must satisfy before its mover Job launches. Each `expr` is a CEL **bool** predicate over
+`repository.{phase,ready,backendReachable,snapshotCount,indexBlobCount,sizeBytes,
+lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
+`maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission (compile +
+trial-evaluate + bool). All checks must pass; a failure holds the `Snapshot` in `Pending`
+(`PreflightFailed`) and, after `timeout` (Go-style duration, default `10m`; `0` = hold
+forever), transitions it to `Failed`. Ages are `i64::MAX` when never observed, so a naive
+freshness check fails closed — guard with `hasRun`/`*Known`. See
+[Repository health → Backup preflight](repository-health.md#backup-preflight-opt-in).
 
 ### RestoreSource
 

@@ -2520,6 +2520,16 @@ spec:
                     description: Human-readable total on-disk size (e.g. `412Gi`).
                     nullable: true
                     type: string
+                  totalSizeBytes:
+                    description: |-
+                      Logical bytes under management (the integer form of `total_size`): the sum,
+                      over each distinct snapshot source, of the most-recent snapshot's logical
+                      size. Exposed to backup preflight as `repository.sizeBytes`. This is
+                      repository *total size*, not backend free space (object stores don't report
+                      remaining capacity).
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               uniqueId:
                 description: Kopia repository unique ID.
@@ -5141,6 +5151,16 @@ spec:
                     description: Human-readable total on-disk size (e.g. `412Gi`).
                     nullable: true
                     type: string
+                  totalSizeBytes:
+                    description: |-
+                      Logical bytes under management (the integer form of `total_size`): the sum,
+                      over each distinct snapshot source, of the most-recent snapshot's logical
+                      size. Exposed to backup preflight as `repository.sizeBytes`. This is
+                      repository *total size*, not backend free space (object stores don't report
+                      remaining capacity).
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               uniqueId:
                 description: Kopia repository unique ID.
@@ -5896,6 +5916,48 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              preflight:
+                description: |-
+                  Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒
+                  no preflight). A failing check holds the `Snapshot` in `Pending`
+                  (`PreflightFailed`) and, after `timeout`, fails it.
+                nullable: true
+                properties:
+                  checks:
+                    description: |-
+                      Checks that must **all** pass (AND) before the backup launches. An empty
+                      list is an inert no-op (symmetric with `verification` absent).
+                    items:
+                      description: 'One named precondition: a CEL bool predicate over the preflight environment.'
+                      properties:
+                        expr:
+                          description: CEL bool predicate; the backup proceeds only when this evaluates `true`.
+                          type: string
+                        message:
+                          description: Optional human message surfaced alongside the check name when it blocks.
+                          nullable: true
+                          type: string
+                        name:
+                          description: |-
+                            Stable identifier surfaced in the `Snapshot`'s status when this check blocks
+                            (e.g. `maintenance-fresh`). Unique within the policy.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - expr
+                      - name
+                      type: object
+                    maxItems: 50
+                    type: array
+                  timeout:
+                    description: |-
+                      How long to hold a `Snapshot` in `Pending` while a check is unsatisfied
+                      before failing it (Go-style duration like `10m` or `1h`; default `10m`). A
+                      zero duration (`0`/`0s`) holds indefinitely (never fail on preflight).
+                    nullable: true
+                    type: string
+                type: object
               repository:
                 description: Discriminated reference to a `Repository` or `ClusterRepository`.
                 properties:
@@ -6486,6 +6548,14 @@ spec:
                 description: 'The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile.'
                 nullable: true
                 type: boolean
+              preflightSince:
+                description: |-
+                  RFC 3339 timestamp of the first reconcile where the repository was `Ready`
+                  but a `spec.preflight` check was failing. The one-shot anchor for the
+                  preflight `timeout` deadline (so the timeout budget covers preflight only,
+                  not the earlier repository-not-Ready wait). Cleared once the run launches.
+                nullable: true
+                type: string
               resolved:
                 description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true

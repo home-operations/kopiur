@@ -167,6 +167,20 @@ pub const MIN_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::
 /// from alarming on-call or nudging a destructive manual recreate.
 pub const DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD: i64 = 3;
 
+/// Default `SnapshotSchedule.spec.failedJobsHistoryLimit` when unset: how many
+/// `Failed` `Snapshot` CRs from a schedule to retain (the rest are pruned). Bounds
+/// failure history so a schedule firing against a persistently-failing precondition
+/// or backend doesn't accumulate `Failed` CRs forever. GFS retention applies only to
+/// successful snapshots, so this is the *only* bound on failures (ADR-0003). Part of
+/// the documented API contract, so it lives here, not in the controller.
+pub const DEFAULT_FAILED_JOBS_HISTORY_LIMIT: u32 = 10;
+
+/// The effective failed-history limit: `failedJobsHistoryLimit` when set, else
+/// [`DEFAULT_FAILED_JOBS_HISTORY_LIMIT`]. `Some(0)` keeps no failed snapshots.
+pub fn effective_failed_jobs_history_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

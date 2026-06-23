@@ -131,6 +131,30 @@ that maintenance ran. Opt-in: when absent, no verification runs. Two tiers:
   only) `restored{files,checksumMatches}`; returning `false` fails the run, killing
   the silent "0 files" success. Example: `"stats.files > 0 && stats.errors == 0"`.
 
+### `preflight`
+
+User-declared **CEL preconditions** a backup must satisfy before its mover Job
+launches — generalizing the built-in repository-readiness gate. Opt-in: when absent,
+no preflight runs.
+
+- `checks` — a list of `{ name, expr, message? }`. Each `expr` is a CEL **bool**
+  predicate; **all** must pass (AND) for the backup to launch. `name` is unique and
+  identifies the check in the `Snapshot`'s status; `message` is an optional human hint.
+- `timeout` — how long to hold the `Snapshot` in `Pending` while a check is unsatisfied
+  before failing it (Go-style duration; default `10m`; `0` holds indefinitely). The
+  clock starts when a check first fails with the repository `Ready`, so a slow-to-connect
+  repository doesn't consume the budget. The resulting `Failed` Snapshots are bounded by
+  the schedule's `failedJobsHistoryLimit`.
+
+The CEL environment exposes
+`repository.{phase,ready,backendReachable,snapshotCount,indexBlobCount,sizeBytes,
+lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
+`maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission. Unknown ages are
+`i64::MAX` ("infinitely old"), so a freshness check fails closed — guard it with
+`hasRun`/`*Known`. Example:
+`"maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"`. See
+[Repository health → Backup preflight](../../repository-health.md#backup-preflight-opt-in).
+
 ### `suspend`
 
 Pause this recipe declaratively. A suspended `SnapshotPolicy` is skipped by

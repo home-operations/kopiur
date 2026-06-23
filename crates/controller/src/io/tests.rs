@@ -897,6 +897,126 @@ fn maint_referencing(
 }
 
 #[test]
+fn repo_status_to_inputs_maps_fields_and_sentinels() {
+    use kopiur_api::preflight::UNKNOWN_AGE;
+    use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
+    let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T01:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let storage = StorageStats {
+        snapshot_count: Some(7),
+        total_size: None,
+        total_size_bytes: Some(4096),
+        last_observed_at: None,
+        index_blob_count: Some(3),
+    };
+    let health = RepositoryHealthStatus {
+        last_healthy_at: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    let conds = vec![Condition {
+        type_: "BackendReachable".into(),
+        status: "False".into(),
+        reason: "RepositoryVanished".into(),
+        message: "x".into(),
+        last_transition_time: Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+        ),
+        observed_generation: None,
+    }];
+    let inputs = repo_status_to_inputs(
+        Some(RepositoryPhase::Ready),
+        &conds,
+        Some(&storage),
+        Some(&health),
+        Some("2026-01-01T00:30:00Z"),
+        now,
+    );
+    assert_eq!(inputs.repository_phase, "Ready");
+    assert!(inputs.repository_ready);
+    assert!(!inputs.backend_reachable, "BackendReachable=False ⇒ false");
+    assert_eq!(inputs.snapshot_count, 7);
+    assert_eq!(inputs.index_blob_count, 3);
+    assert_eq!(inputs.size_bytes, 4096);
+    assert!(inputs.last_healthy_known);
+    assert_eq!(inputs.last_healthy_age_seconds, 3600);
+    assert!(inputs.last_reverify_known);
+    assert_eq!(inputs.last_reverify_age_seconds, 1800);
+
+    // Absent status ⇒ fail-closed sentinels; absent BackendReachable ⇒ reachable.
+    let empty = repo_status_to_inputs(None, &[], None, None, None, now);
+    assert!(!empty.repository_ready);
+    assert!(
+        empty.backend_reachable,
+        "no condition ⇒ no evidence of failure"
+    );
+    assert_eq!(empty.snapshot_count, UNKNOWN_AGE);
+    assert_eq!(empty.size_bytes, UNKNOWN_AGE);
+    assert!(!empty.last_healthy_known);
+    assert_eq!(empty.last_healthy_age_seconds, UNKNOWN_AGE);
+}
+
+#[test]
+fn maintenance_recency_takes_max_across_modes_and_matches() {
+    use kopiur_api::maintenance::{MaintenanceStatus, RunStatus};
+    use kopiur_api::preflight::UNKNOWN_AGE;
+    let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T02:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let mut m = maint_referencing(
+        "nas",
+        "apps",
+        ref_of(RepositoryKind::Repository, "nas", None),
+        Some(dummy_owner("Repository", "nas")),
+    );
+    m.status = Some(MaintenanceStatus {
+        // full handled at 00:00; quick *ran* at 01:30 (the most recent — e.g. a
+        // manual run-now, mover-written `lastRunAt`). Max ⇒ 30 min ago.
+        full: Some(RunStatus {
+            last_handled_at: Some("2026-01-01T00:00:00Z".into()),
+            ..Default::default()
+        }),
+        quick: Some(RunStatus {
+            last_run_at: Some("2026-01-01T01:30:00Z".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    // Unrelated repo — must be ignored.
+    let other = maint_referencing(
+        "other",
+        "apps",
+        ref_of(RepositoryKind::Repository, "different", None),
+        None,
+    );
+
+    let (has_run, age) = maintenance_recency(
+        vec![m.clone(), other],
+        RepositoryKind::Repository,
+        "nas",
+        Some("apps"),
+        now,
+    );
+    assert!(has_run);
+    assert_eq!(
+        age, 1800,
+        "max of full/quick lastRun/lastHandled = 01:30 ⇒ 30m"
+    );
+
+    // No matching Maintenance ⇒ fail-closed.
+    let (has_run, age) = maintenance_recency(
+        Vec::<Maintenance>::new(),
+        RepositoryKind::Repository,
+        "nas",
+        Some("apps"),
+        now,
+    );
+    assert!(!has_run);
+    assert_eq!(age, UNKNOWN_AGE);
+}
+
+#[test]
 fn classify_maintenance_distinguishes_managed_foreign_and_unrelated() {
     let managed = maint_referencing(
         "nas",

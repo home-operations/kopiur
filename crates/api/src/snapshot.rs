@@ -161,6 +161,12 @@ pub struct SnapshotStatus {
     /// The CSI staging objects the run created for `copyMethod: Snapshot`/`Clone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged: Option<StagedSources>,
+    /// RFC 3339 timestamp of the first reconcile where the repository was `Ready`
+    /// but a `spec.preflight` check was failing. The one-shot anchor for the
+    /// preflight `timeout` deadline (so the timeout budget covers preflight only,
+    /// not the earlier repository-not-Ready wait). Cleared once the run launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_since: Option<String>,
 }
 
 /// The CSI staging objects a backup created so kopia reads a point-in-time copy of the source PVC.

@@ -1303,13 +1303,12 @@ async fn run_catalog_scan(
     )
     .await?;
 
-    // Logical bytes under management is recorded directly from kopia's data
-    // (the status field is a human string, so the gauge bypasses it).
-    ctx.metrics.set_repo_size_bytes(
-        namespace,
-        repo_name,
-        logical_bytes_under_management(listing),
-    );
+    // Logical bytes under management is recorded directly from kopia's data, both as
+    // the metric gauge and as `storageStats.totalSizeBytes` (the integer form of the
+    // human `total_size`), which backup preflight reads as `repository.sizeBytes`.
+    let size_bytes = logical_bytes_under_management(listing);
+    ctx.metrics
+        .set_repo_size_bytes(namespace, repo_name, size_bytes);
 
     let api: Api<Repository> = Api::namespaced(ctx.client.clone(), namespace);
     io::patch_status(
@@ -1320,7 +1319,7 @@ async fn run_catalog_scan(
                 "discoveredBackupCount": outcome.discovered,
                 "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
             },
-            "storageStats": { "snapshotCount": total_snapshot_count },
+            "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),
     )
     .await?;

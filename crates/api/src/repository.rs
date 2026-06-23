@@ -318,6 +318,13 @@ pub struct StorageStats {
     /// Human-readable total on-disk size (e.g. `412Gi`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_size: Option<String>,
+    /// Logical bytes under management (the integer form of `total_size`): the sum,
+    /// over each distinct snapshot source, of the most-recent snapshot's logical
+    /// size. Exposed to backup preflight as `repository.sizeBytes`. This is
+    /// repository *total size*, not backend free space (object stores don't report
+    /// remaining capacity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size_bytes: Option<i64>,
     /// RFC 3339 timestamp these stats were last observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed_at: Option<String>,
@@ -454,11 +461,13 @@ health:
         let stats = StorageStats {
             snapshot_count: Some(12),
             total_size: None,
+            total_size_bytes: Some(442_000_000),
             last_observed_at: None,
             index_blob_count: Some(1448),
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["indexBlobCount"], 1448);
+        assert_eq!(json["totalSizeBytes"], 442_000_000_i64);
         let back: StorageStats = serde_json::from_value(json).unwrap();
         assert_eq!(back, stats);
     }

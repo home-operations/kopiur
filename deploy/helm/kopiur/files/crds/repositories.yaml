@@ -2520,6 +2520,16 @@ spec:
                     description: Human-readable total on-disk size (e.g. `412Gi`).
                     nullable: true
                     type: string
+                  totalSizeBytes:
+                    description: |-
+                      Logical bytes under management (the integer form of `total_size`): the sum,
+                      over each distinct snapshot source, of the most-recent snapshot's logical
+                      size. Exposed to backup preflight as `repository.sizeBytes`. This is
+                      repository *total size*, not backend free space (object stores don't report
+                      remaining capacity).
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               uniqueId:
                 description: Kopia repository unique ID.

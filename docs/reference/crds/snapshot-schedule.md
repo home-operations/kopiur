@@ -56,7 +56,7 @@ If a slot is missed by more than this many seconds (e.g. the operator was down),
 
 ### `failedJobsHistoryLimit`
 
-The maximum number of *failed* `Snapshot` CRs from this schedule to retain. There is deliberately **no** `successfulJobsHistoryLimit`: retention of successful snapshots is GFS-driven on the [`SnapshotPolicy`](snapshot-policy.md)'s `retention` block, not a flat count.
+The maximum number of *failed* `Snapshot` CRs from this schedule to retain (default `10`; `0` keeps none). The oldest failures beyond the limit are pruned each reconcile (newest kept, by completion time) — bounding failure history, including backups held back by a [`preflight`](snapshot-policy.md#preflight) check. There is deliberately **no** `successfulJobsHistoryLimit`: retention of successful snapshots is GFS-driven on the [`SnapshotPolicy`](snapshot-policy.md)'s `retention` block, not a flat count.
 
 ## `status`
 

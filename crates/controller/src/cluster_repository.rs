@@ -473,11 +473,8 @@ async fn run_cluster_catalog_scan(
 
     // Cluster-scoped: the metric namespace label is empty, matching the
     // phase/catalog gauges in `record_cluster_repository_status_metrics`.
-    ctx.metrics.set_repo_size_bytes(
-        "",
-        name,
-        crate::repository::logical_bytes_under_management(listing),
-    );
+    let size_bytes = crate::repository::logical_bytes_under_management(listing);
+    ctx.metrics.set_repo_size_bytes("", name, size_bytes);
 
     let api: Api<ClusterRepository> = Api::all(ctx.client.clone());
     io::patch_status(
@@ -488,7 +485,7 @@ async fn run_cluster_catalog_scan(
                 "discoveredBackupCount": outcome.discovered,
                 "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
             },
-            "storageStats": { "snapshotCount": total_snapshot_count },
+            "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),
     )
     .await?;

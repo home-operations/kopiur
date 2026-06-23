@@ -1067,6 +1067,7 @@ fn backup_config_aggregate_collects_multiple_errors() {
         error_handling: None,
         upload: None,
         verification: None,
+        preflight: None,
         suspend: false,
         hooks: None,
         mover: None,
@@ -1111,6 +1112,7 @@ fn backup_config_valid_spec_has_no_errors() {
         error_handling: None,
         upload: None,
         verification: None,
+        preflight: None,
         suspend: false,
         hooks: None,
         mover: None,
@@ -2454,6 +2456,69 @@ fn backup_config_rejects_keeps_nothing_retention_but_not_absent() {
             ValidationError::InvalidFieldValue { field, .. } if field == "spec.retention"
         )),
         "absent retention is the safe no-prune case and must not be flagged: {errs:?}"
+    );
+}
+
+// --- preflight validation ---
+
+#[test]
+fn backup_config_validates_preflight() {
+    // Valid preflight is accepted.
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  timeout: 10m\n  checks:\n\
+         \x20   - { name: a, expr: \"repository.ready\" }\n\
+         \x20   - { name: b, expr: \"maintenance.hasRun\" }\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+
+    // Bad timeout → rejected, names the field.
+    let bad_to: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  timeout: every-hour\n  checks: [ { name: a, expr: \"repository.ready\" } ]\n",
+    );
+    assert!(
+        validate_backup_config(&bad_to).iter().any(|e| matches!(
+            e, ValidationError::InvalidFieldValue { field, .. } if field == "spec.preflight.timeout"
+        )),
+        "{:?}",
+        validate_backup_config(&bad_to)
+    );
+
+    // Duplicate check name → rejected.
+    let dup: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  checks:\n\
+         \x20   - { name: same, expr: \"repository.ready\" }\n\
+         \x20   - { name: same, expr: \"maintenance.hasRun\" }\n",
+    );
+    assert!(
+        validate_backup_config(&dup).iter().any(|e| matches!(
+            e, ValidationError::InvalidFieldValue { field, .. } if field.starts_with("spec.preflight.checks[")
+        )),
+        "{:?}",
+        validate_backup_config(&dup)
+    );
+
+    // Bad expr (out-of-scope variable) → rejected.
+    let bad_expr: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  checks: [ { name: a, expr: \"bogus > 0\" } ]\n",
+    );
+    assert!(
+        validate_backup_config(&bad_expr)
+            .iter()
+            .any(|e| matches!(e, ValidationError::PreflightExprEval { .. })),
+        "{:?}",
+        validate_backup_config(&bad_expr)
     );
 }
 

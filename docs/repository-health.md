@@ -1,8 +1,9 @@
 # Repository health & preflight checks
 
 This page enumerates **every health/preflight check Kopiur runs today** — what each
-one does, where it surfaces, and what it gates — plus the **known limitation** of the
-current fail-fast design and the **planned** stronger preflight that is not yet built.
+one does, where it surfaces, and what it gates — including the opt-in **backend health
+probe** and the opt-in **CEL backup preflight** (user-declared preconditions a backup
+must satisfy before it runs).
 
 The mental model: Kopiur separates the **repository** (a first-class resource whose
 reconcile owns connectivity) from the **work** (`Snapshot`/`Restore`/`Maintenance`/…
@@ -16,6 +17,7 @@ re-testing the backend itself.
 |---|---|---|---|
 | **Connectivity probe** (`kopia repository connect`) | Repository reconcile | `status.phase` (`Pending`→`Initializing`→`Ready`/`Degraded`/`Failed`) + `Ready`/`Stalled` conditions | Everything downstream keys off `phase == Ready` |
 | **Readiness gate** (`repository_ready`) | `Snapshot`, `Maintenance`, `SnapshotPolicy`, `RepositoryReplication` reconcilers | `RepositoryNotReady` / `WaitingForRepository` reason, held in `Pending`/`Reconciling` | Building & launching the mover Job |
+| **Backup preflight** (opt-in, `spec.preflight`) | `Snapshot` reconcile (before launch) | `PreflightFailed` reason, held in `Pending` then `Failed` after `timeout` | User-declared CEL preconditions (e.g. maintenance freshness) before the backup Job runs |
 | **Reactive re-probe on failure** | `Snapshot` reconciler → repository | `reverify-requested-at` annotation → `status.lastReverifyAt` | Forces a fresh connectivity probe within ~60s of a failed backup |
 | **Backend health probe** (opt-in, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable`) + Warning Event + `kopiur_repository_health_probe_failures` | **Advisory** — proactively detects a wiped/unreachable backend; repo **stays `Ready`** (alert-only) |
 | **Credentials available** | Mover preflight | `CredentialsAvailable=False` + Warning Event | The mover starting (the credential Secret must exist in the workload namespace) |
@@ -123,34 +125,70 @@ Two failures are reported distinctly, because they demand different responses:
       list-after-delete race, a NAS reboot) from paging on-call. Any success resets
       the counter and clears the condition.
 
-## Not yet implemented — the stronger preflight
+## Backup preflight (opt-in)
 
-The current design is **reactive fail-fast** plus the opt-in probe above. One
-stronger form was discussed and intentionally deferred; this section is the design
-intent, not current behavior.
+The readiness gate above is a single hard-coded precondition: *the repository is
+`Ready`*. `spec.preflight` on a **`SnapshotPolicy`** generalizes that into
+**user-declared preconditions** — named CEL expressions that must **all** hold before
+a backup's mover Job launches. It's the same CEL engine `successExpr` and the identity
+`*Expr` fields use, evaluated by the operator at reconcile against **live repository +
+maintenance state**.
 
-!!! note "Status: design only"
-    Nothing in this section ships yet. It records *how* we'd build it so the choice
-    is deliberate when we do.
+```yaml
+--8<-- "deploy/examples/28-preflight-checks.yaml:preflight"
+```
 
-### CEL-configurable enumerated preflight (tuppr-style)
+The full apply-ready example (Secret + Repository + SnapshotPolicy + SnapshotSchedule):
+[`deploy/examples/28-preflight-checks.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/28-preflight-checks.yaml).
 
-Let a user declare arbitrary preconditions a backup must satisfy — expressed as CEL,
-the same engine `successExpr` and the identity `*Expr` fields use — evaluated before the
-Job is created (e.g. "the repository's last successful maintenance is < 7d old", "free
-space > X"). This generalizes the hard-coded gate into a user-extensible preflight.
+**How a failing check behaves.** A `Snapshot` whose preflight isn't satisfied is held in
+`Pending` with reason `PreflightFailed` (no mover Job is created). Once
+`spec.preflight.timeout` elapses (default `10m`; `0` holds forever), it transitions to
+`Failed` — bounded so a schedule firing against a never-met precondition doesn't pile up
+`Pending` CRs. The timeout clock starts when the check **first fails** (after the
+repository is `Ready`), not at Snapshot creation, so a slow-to-connect repository doesn't
+eat the budget. `Failed` preflight Snapshots are pruned by the schedule's
+[`failedJobsHistoryLimit`](#bounding-failed-snapshots).
 
-Implementation sketch:
+### The CEL environment
 
-- A `preflightExpr` (or list) on `SnapshotPolicy`, validated at admission exactly like
-  `successExpr` (compile + trial-evaluate + bool result; see
-  [verification](backups.md#verification--prove-the-snapshots-are-restorable)).
-- An environment exposing repository status (`phase`, `lastReverifyAt`, storage stats,
-  maintenance recency) and recent run history.
-- A failed predicate holds the `Snapshot` in `Pending` with a `PreflightFailed` reason,
-  symmetric with the existing readiness gate.
+Each check is a CEL **bool** expression over two variables:
 
-If you want this, open an issue (or ask) — it's additive to what's here.
+| Variable | Type | Meaning |
+|---|---|---|
+| `repository.phase` | string | repository `status.phase` (`Ready`, …) |
+| `repository.ready` | bool | `phase == Ready` |
+| `repository.backendReachable` | bool | the [health probe](#backend-health-probe-opt-in)'s `BackendReachable` condition is `True` — **`true` when the probe is disabled** (no evidence of a fault) |
+| `repository.snapshotCount` | int | snapshots in the repository |
+| `repository.indexBlobCount` | int | content-index blobs (maintenance-backlog signal) |
+| `repository.sizeBytes` | int | logical bytes under management (repository **total size**, *not* backend free space) |
+| `repository.lastHealthyKnown` | bool | a successful health probe has been recorded |
+| `repository.lastHealthyAgeSeconds` | int | seconds since the last successful probe |
+| `repository.lastReverifyKnown` | bool | a reverify has been recorded |
+| `repository.lastReverifyAgeSeconds` | int | seconds since the last reverify |
+| `maintenance.hasRun` | bool | the repo's `Maintenance` has a recorded successful run (scheduled **or** manual run-now) |
+| `maintenance.lastSuccessAgeSeconds` | int | seconds since the most recent successful maintenance of any mode |
+
+!!! warning "Unknown values fail closed — guard freshness checks with `hasRun`/`*Known`"
+    Every age/count is `i64::MAX` ("infinitely old") when never observed, so a naive
+    freshness check like `maintenance.lastSuccessAgeSeconds < 604800` correctly **blocks**
+    the backup when maintenance has never run — rather than silently passing. Write the
+    intent explicitly with the boolean companion:
+    `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`.
+
+!!! tip "Validation & the AND rule"
+    Each `expr` is compiled and trial-evaluated **at admission** (`kubectl apply`), so a
+    typo or non-bool expression is rejected up front, not at the first backup. Check
+    `name`s must be unique. All checks must pass; the first failing one names itself in
+    the Snapshot's `Ready` condition message (`kubectl describe snapshot`).
+
+### Bounding failed Snapshots
+
+GFS retention prunes only **successful** snapshots, so failures (including preflight
+`Failed`) are bounded separately by `SnapshotSchedule.spec.failedJobsHistoryLimit` — the
+maximum number of `Failed` Snapshots a schedule keeps (newest by completion time;
+default `10`, `0` keeps none). The oldest beyond the limit are deleted each reconcile.
+Manually-created (non-scheduled) Snapshots are one-offs and aren't affected.
 
 ## See also
 

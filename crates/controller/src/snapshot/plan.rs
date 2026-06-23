@@ -287,6 +287,32 @@ pub fn run_decision(phase: Option<SnapshotPhase>) -> RunDecision {
     }
 }
 
+/// Whether the preflight gate should run for a `Snapshot` in `phase`: only at first
+/// launch (`None`/`Pending`). A `Running` snapshot whose mover Job vanished resumes
+/// via the `run_decision == Run` path; re-evaluating preflight there could demote or
+/// fail an in-flight backup on a since-flipped check, so it is excluded.
+pub(super) fn should_run_preflight(phase: Option<SnapshotPhase>) -> bool {
+    matches!(phase, None | Some(SnapshotPhase::Pending))
+}
+
+/// Whether the preflight deadline has passed: `preflight_since + timeout <= now`.
+/// `timeout == None` ⇒ indefinite (never expires); `preflight_since == None` (the
+/// failure just started this reconcile) ⇒ not expired. Pure / clock-injected.
+pub(super) fn preflight_expired(
+    preflight_since: Option<&str>,
+    timeout: Option<std::time::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(t), Some(since)) = (
+        timeout,
+        preflight_since.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()),
+    ) else {
+        return false;
+    };
+    let elapsed = now - since.with_timezone(&chrono::Utc);
+    elapsed >= chrono::Duration::from_std(t).unwrap_or(chrono::Duration::MAX)
+}
+
 /// Build the `(phase, observedGeneration, conditions)` status JSON for a `Snapshot`
 /// reaching `phase`, deriving the kstatus Ready/Reconciling/Stalled conditions via
 /// [`snapshot_ready_outcome`] + [`io::set_ready`]. Existing conditions (e.g.

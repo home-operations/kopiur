@@ -496,7 +496,20 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the pod would only fail on `kopia repository connect`. Hold the Snapshot in
     // `Pending` and requeue until the repository's own reconcile marks it `Ready`.
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
-    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
+    //
+    // One fetch gathers the repository status (readiness) AND the live preflight
+    // inputs (repository + maintenance state), so the readiness gate and the
+    // preflight gate below share a single GET.
+    let now = chrono::Utc::now();
+    let (pf_inputs, repo_ready) = io::gather_preflight_inputs(
+        &ctx.client,
+        &config.spec.repository,
+        &namespace,
+        &ctx.maintenance_store,
+        now,
+    )
+    .await?;
+    if !repo_ready {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
@@ -511,6 +524,75 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(15)));
+    }
+
+    // Backup preflight (`spec.preflight`, opt-in): the user's CEL preconditions must
+    // all hold before the mover Job launches. Evaluated only at FIRST launch
+    // (`None`/`Pending`) — a `Running` snapshot whose Job vanished resumes, never
+    // re-gated. A failing check holds the Snapshot `Pending` (`PreflightFailed`) and,
+    // once `spec.preflight.timeout` elapses from `status.preflightSince`, fails it
+    // (bounded so scheduled backups don't pile up `Pending` CRs).
+    if should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
+        && let Some(pf) = config
+            .spec
+            .preflight
+            .as_ref()
+            .filter(|p| !p.checks.is_empty())
+    {
+        // First failing check (AND semantics); an evaluation error counts as failed.
+        let failed = pf.checks.iter().find_map(|c| {
+            match kopiur_api::eval_preflight_expr(&c.expr, &pf_inputs) {
+                Ok(true) => None,
+                Ok(false) => Some((c, None)),
+                Err(e) => Some((c, Some(e))),
+            }
+        });
+        if let Some((check, eval_err)) = failed {
+            if let Some(e) = &eval_err {
+                // Surface the CEL error in logs, NOT in status (a volatile message
+                // would defeat the change-guarded write and churn every 30s).
+                tracing::debug!(backup = %name, check = %check.name, error = %e, "preflight check failed to evaluate");
+            }
+            // Resolve the timeout: absent ⇒ default; parsed-zero ⇒ indefinite.
+            let timeout = match pf.timeout.as_deref() {
+                None => Some(crate::consts::DEFAULT_PREFLIGHT_TIMEOUT),
+                Some(s) => match kopiur_api::parse_go_duration(s) {
+                    Some(d) if d.is_zero() => None,
+                    Some(d) => Some(d),
+                    None => Some(crate::consts::DEFAULT_PREFLIGHT_TIMEOUT),
+                },
+            };
+            // Anchor the deadline on the FIRST failing reconcile (carried forward),
+            // so the timeout budget covers preflight only, not the earlier
+            // repository-not-Ready wait.
+            let since = backup
+                .status
+                .as_ref()
+                .and_then(|s| s.preflight_since.clone())
+                .unwrap_or_else(|| now.to_rfc3339());
+            let expired = preflight_expired(Some(&since), timeout, now);
+            // Deterministic message (no CEL error text) so the guarded write is a
+            // true no-op while the same check keeps failing.
+            let msg = match &check.message {
+                Some(m) => format!("preflight check {:?} not satisfied: {m}", check.name),
+                None => format!("preflight check {:?} not satisfied", check.name),
+            };
+            let phase = if expired {
+                SnapshotPhase::Failed
+            } else {
+                SnapshotPhase::Pending
+            };
+            let mut status =
+                snapshot_ready_status(backup, phase, crate::consts::PREFLIGHT_FAILED_REASON, &msg);
+            status["preflightSince"] = serde_json::Value::String(since);
+            let current = serde_json::to_value(&backup.status).ok();
+            io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
+            return Ok(if expired {
+                Action::await_change()
+            } else {
+                Action::requeue(Duration::from_secs(30))
+            });
+        }
     }
 
     let (work_spec, mut source_volume, repo_volume, _) =
