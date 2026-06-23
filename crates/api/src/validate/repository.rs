@@ -147,6 +147,42 @@ pub fn validate_repository_health(
             ),
         });
     }
+    if let Some(probe) = health.and_then(|h| h.probe.as_ref()) {
+        if let Some(raw) = probe.interval.as_deref() {
+            match crate::duration::parse_go_duration(raw) {
+                None => {
+                    return Err(ValidationError::InvalidFieldValue {
+                        field: format!("{context} health.probe.interval"),
+                        reason: format!(
+                            "{raw:?} is not a valid duration. Use a Go-style duration like 30s, \
+                             5m, or 1h; omit the field for the default (30m)"
+                        ),
+                    });
+                }
+                Some(d) if d < crate::consts::MIN_HEALTH_PROBE_INTERVAL => {
+                    return Err(ValidationError::InvalidFieldValue {
+                        field: format!("{context} health.probe.interval"),
+                        reason: format!(
+                            "{raw:?} is shorter than the 30s minimum. Each probe runs a mover \
+                             Job; use 30s or more (default 30m)"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(t) = probe.failure_threshold
+            && t < 1
+        {
+            return Err(ValidationError::InvalidFieldValue {
+                field: format!("{context} health.probe.failureThreshold"),
+                reason: format!(
+                    "must be >= 1 (got {t}); it is the number of consecutive failing probes \
+                     required before the warning is raised"
+                ),
+            });
+        }
+    }
     Ok(())
 }
 

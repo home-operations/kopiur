@@ -201,6 +201,11 @@ pub const BUCKETS: &[&str] = &[
     // (`auth.workloadIdentity`) round-trips through kopia's ambient credential
     // chain — the empty `--access-key=` flags resolve to anonymous in kind.
     WI_BUCKET,
+    // Backend health probe (crates/e2e/tests/health_probe.rs): a dedicated bucket
+    // that the test WIPES out-of-band after the Repository is Ready, to prove the
+    // opt-in probe raises RepositoryVanished without recreating. Isolated so the
+    // wipe can't clobber another scenario's repository.
+    "kopiur-health-probe",
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see

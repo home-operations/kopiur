@@ -13,7 +13,7 @@ pub use client::{
     PolicyArgs, RestoreOptions, ServerAuthMode, ServerStartSpec, ThrottleArgs, VerifyOptions,
     split_policy_scopes,
 };
-pub use error::{KopiaError, KopiaErrorClass};
+pub use error::{KopiaError, KopiaErrorClass, notfound_is_uninitialized};
 pub use model::{
     ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite, EntryError,
     IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus,

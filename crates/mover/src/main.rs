@@ -910,7 +910,18 @@ async fn run_bootstrap(
             //  - everything else (a repo exists we can't open — auth/locked; an
             //    access/permission problem; or auto_create on but blocked) ⇒ surface
             //    the real kopia class; recreating would mask it or risk a 2nd repo.
-            if !op.auto_create && e.class() == KopiaErrorClass::NotFound {
+            //
+            // A `NotFound` is only "uninitialized" when the backend answered and the
+            // format blob is absent (`repository not initialized`). A missing path /
+            // unbound mount also classifies `NotFound` ("no such file or directory")
+            // but is a backend/mount fault, NOT an empty repository — surface it as a
+            // real failure so the controller's health probe never misreads a
+            // mis-mounted volume as a vanished repository (and never nudges a recreate).
+            if !op.auto_create
+                && e.class() == KopiaErrorClass::NotFound
+                && e.stderr_tail()
+                    .is_some_and(kopiur_kopia::notfound_is_uninitialized)
+            {
                 return BootstrapResult::not_initialized();
             }
             return BootstrapResult::failed(&e);

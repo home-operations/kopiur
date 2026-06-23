@@ -585,6 +585,32 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  probe:
+                    description: |-
+                      Opt-in periodic backend health probe: re-connect a `Ready` repository on a
+                      timer to confirm the kopia repository still exists at the backend.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Turn the probe on. Off by default — existing repositories keep their
+                          current behavior until a user opts in.
+                        type: boolean
+                      failureThreshold:
+                        description: |-
+                          How many *consecutive* failing probes to require before raising the loud
+                          condition + event (default `3`). Debounces a single transient blip from
+                          alarming or nudging a destructive manual recreate. Any success resets it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      interval:
+                        description: |-
+                          How often to re-probe the backend (Go-style duration like `30m` or `1h`;
+                          minimum `30s`, default `30m`). Inert unless `enabled`.
+                        nullable: true
+                        type: string
+                    type: object
                 type: object
               maintenance:
                 description: Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR.
@@ -2386,6 +2412,32 @@ spec:
                   - type
                   type: object
                 type: array
+              health:
+                description: Backend health-probe state (`spec.health.probe`), when enabled.
+                nullable: true
+                properties:
+                  consecutiveProbeFailures:
+                    description: |-
+                      Consecutive failing probes accrued; reset to zero on any success. The loud
+                      condition is raised only once this reaches the failure threshold.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  firstFailureAt:
+                    description: RFC 3339 timestamp of the first failure in the current failing streak.
+                    nullable: true
+                    type: string
+                  lastHealthyAt:
+                    description: RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present).
+                    nullable: true
+                    type: string
+                  lastProbeAt:
+                    description: |-
+                      RFC 3339 timestamp of the last completed probe (success or failure); drives
+                      the `health_probe_due` timer so the probe re-fires on cadence.
+                    nullable: true
+                    type: string
+                type: object
               lastReverifyAt:
                 description: |-
                   Last reverify-request token honored from a `Snapshot`'s re-probe nudge
@@ -3130,6 +3182,32 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  probe:
+                    description: |-
+                      Opt-in periodic backend health probe: re-connect a `Ready` repository on a
+                      timer to confirm the kopia repository still exists at the backend.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Turn the probe on. Off by default — existing repositories keep their
+                          current behavior until a user opts in.
+                        type: boolean
+                      failureThreshold:
+                        description: |-
+                          How many *consecutive* failing probes to require before raising the loud
+                          condition + event (default `3`). Debounces a single transient blip from
+                          alarming or nudging a destructive manual recreate. Any success resets it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      interval:
+                        description: |-
+                          How often to re-probe the backend (Go-style duration like `30m` or `1h`;
+                          minimum `30s`, default `30m`). Inert unless `enabled`.
+                        nullable: true
+                        type: string
+                    type: object
                 type: object
               identityDefaults:
                 description: Identity defaults (CEL `*Expr`) applied when consumers don't override.
@@ -4955,6 +5033,32 @@ spec:
                   - type
                   type: object
                 type: array
+              health:
+                description: Backend health-probe state (`spec.health.probe`), when enabled.
+                nullable: true
+                properties:
+                  consecutiveProbeFailures:
+                    description: |-
+                      Consecutive failing probes accrued; reset to zero on any success. The loud
+                      condition is raised only once this reaches the failure threshold.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  firstFailureAt:
+                    description: RFC 3339 timestamp of the first failure in the current failing streak.
+                    nullable: true
+                    type: string
+                  lastHealthyAt:
+                    description: RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present).
+                    nullable: true
+                    type: string
+                  lastProbeAt:
+                    description: |-
+                      RFC 3339 timestamp of the last completed probe (success or failure); drives
+                      the `health_probe_due` timer so the probe re-fires on cadence.
+                    nullable: true
+                    type: string
+                type: object
               lastReverifyAt:
                 description: |-
                   Last reverify-request token honored from a `Snapshot`'s re-probe nudge

@@ -110,6 +110,79 @@ pub struct RepositoryHealthSpec {
     /// Index-blob count above which the reconciler raises the `IndexBlobHealth` warning (`0` disables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_warn_threshold: Option<i64>,
+    /// Opt-in periodic backend health probe: re-connect a `Ready` repository on a
+    /// timer to confirm the kopia repository still exists at the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<RepositoryHealthProbeSpec>,
+}
+
+/// Opt-in backend health probe, shared by `Repository` and `ClusterRepository`.
+///
+/// Once a repository reaches `Ready`, the operator trusts that pinned status and
+/// — for object-store / volume-backed backends — never re-checks the backend on
+/// its steady-state heartbeat. If the kopia repository is wiped or becomes
+/// unreachable, nothing notices until a backup runs and fails. Enabling this
+/// probe re-connects the backend every [`interval`](Self::interval) and surfaces
+/// the result as a condition + Warning event (the repository **stays `Ready`** —
+/// this is alert-only; it never auto-recreates and never pauses backups).
+///
+/// **Alert-only by design.** A wiped repository and a transient outage look alike,
+/// and silently recreating an empty repository over a real one destroys
+/// restorability — so the probe only *reports*. Acting on the alert (a deliberate
+/// re-create) is a human decision.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryHealthProbeSpec {
+    /// Turn the probe on. Off by default — existing repositories keep their
+    /// current behavior until a user opts in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
+    /// How often to re-probe the backend (Go-style duration like `30m` or `1h`;
+    /// minimum `30s`, default `30m`). Inert unless `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// How many *consecutive* failing probes to require before raising the loud
+    /// condition + event (default `3`). Debounces a single transient blip from
+    /// alarming or nudging a destructive manual recreate. Any success resets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<i64>,
+}
+
+impl RepositoryHealthProbeSpec {
+    /// Whether the backend health probe is opted in (`spec.health.probe.enabled`).
+    /// Off by default, so an existing `Ready` repository keeps its behavior.
+    pub fn enabled(health: Option<&RepositoryHealthSpec>) -> bool {
+        health
+            .and_then(|h| h.probe.as_ref())
+            .is_some_and(|p| p.enabled)
+    }
+
+    /// The effective probe cadence used **when the probe is enabled**:
+    /// `interval` when set and parseable, else [`DEFAULT_HEALTH_PROBE_INTERVAL`].
+    /// (The webhook rejects an unparseable value, so the fallback only covers
+    /// objects admitted before the validator existed.)
+    ///
+    /// [`DEFAULT_HEALTH_PROBE_INTERVAL`]: crate::consts::DEFAULT_HEALTH_PROBE_INTERVAL
+    pub fn effective_interval(health: Option<&RepositoryHealthSpec>) -> std::time::Duration {
+        health
+            .and_then(|h| h.probe.as_ref())
+            .and_then(|p| p.interval.as_deref())
+            .and_then(crate::duration::parse_go_duration)
+            .unwrap_or(crate::consts::DEFAULT_HEALTH_PROBE_INTERVAL)
+    }
+
+    /// The effective consecutive-failure threshold before the loud condition is
+    /// raised: `failureThreshold` when set (clamped to at least 1), else
+    /// [`DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD`].
+    ///
+    /// [`DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD`]: crate::consts::DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD
+    pub fn effective_failure_threshold(health: Option<&RepositoryHealthSpec>) -> i64 {
+        health
+            .and_then(|h| h.probe.as_ref())
+            .and_then(|p| p.failure_threshold)
+            .map(|t| t.max(1))
+            .unwrap_or(crate::consts::DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD)
+    }
 }
 
 /// Resolve the effective index-blob warning threshold from an optional
@@ -125,9 +198,9 @@ pub struct RepositoryHealthSpec {
 /// use kopiur_api::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD;
 ///
 /// assert_eq!(resolve_index_blob_warn_threshold(None), DEFAULT_INDEX_BLOB_WARN_THRESHOLD);
-/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(0) };
+/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(0), ..Default::default() };
 /// assert_eq!(resolve_index_blob_warn_threshold(Some(&h)), 0); // disabled
-/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(250) };
+/// let h = RepositoryHealthSpec { index_blob_warn_threshold: Some(250), ..Default::default() };
 /// assert_eq!(resolve_index_blob_warn_threshold(Some(&h)), 250);
 /// ```
 pub fn resolve_index_blob_warn_threshold(health: Option<&RepositoryHealthSpec>) -> i64 {
@@ -203,9 +276,36 @@ pub struct RepositoryStatus {
     /// (RFC3339); the loop guard that keeps each request a one-shot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reverify_at: Option<String>,
+    /// Backend health-probe state (`spec.health.probe`), when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RepositoryHealthStatus>,
     /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+/// Backend health-probe state, shared by `Repository` and `ClusterRepository`.
+/// Pinned by the reconciler when `spec.health.probe` is enabled so the next
+/// reconcile can tell whether a probe is due and how many consecutive failures
+/// have accrued (the debounce that keeps a transient blip from raising the loud
+/// `RepositoryVanished` / `BackendReachable=False` condition).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryHealthStatus {
+    /// RFC 3339 timestamp of the last completed probe (success or failure); drives
+    /// the `health_probe_due` timer so the probe re-fires on cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_at: Option<String>,
+    /// RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_healthy_at: Option<String>,
+    /// Consecutive failing probes accrued; reset to zero on any success. The loud
+    /// condition is raised only once this reaches the failure threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_probe_failures: Option<i64>,
+    /// RFC 3339 timestamp of the first failure in the current failing streak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failure_at: Option<String>,
 }
 
 /// Aggregate repository storage figures from the last catalog scan.
@@ -452,5 +552,52 @@ health:
         let default = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["properties"]["mode"]["default"];
         assert_eq!(default, "ReadWrite");
+    }
+
+    #[test]
+    fn health_probe_helpers_default_and_parse() {
+        use crate::consts::{
+            DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD, DEFAULT_HEALTH_PROBE_INTERVAL,
+        };
+        // Absent spec / absent probe ⇒ disabled, defaults.
+        assert!(!RepositoryHealthProbeSpec::enabled(None));
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_interval(None),
+            DEFAULT_HEALTH_PROBE_INTERVAL
+        );
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_failure_threshold(None),
+            DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD
+        );
+
+        // Parses Go-duration string from the wire, NOT a {secs,nanos} object.
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    enabled: true\n    interval: 45m\n    failureThreshold: 5\n",
+        );
+        assert!(RepositoryHealthProbeSpec::enabled(spec.health.as_ref()));
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_interval(spec.health.as_ref()),
+            std::time::Duration::from_secs(45 * 60)
+        );
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_failure_threshold(spec.health.as_ref()),
+            5
+        );
+        // `enabled: false` is skip-serialized (no stored-object churn).
+        let disabled: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    interval: 1h\n",
+        );
+        assert!(!RepositoryHealthProbeSpec::enabled(
+            disabled.health.as_ref()
+        ));
+        let json = serde_json::to_value(&disabled).unwrap();
+        assert!(
+            json["health"]["probe"].get("enabled").is_none(),
+            "enabled: false must be elided"
+        );
     }
 }

@@ -2322,6 +2322,7 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     // Negative is nonsensical → rejected with an actionable message.
     let bad = RepositoryHealthSpec {
         index_blob_warn_threshold: Some(-1),
+        ..Default::default()
     };
     let err = validate_repository_health(Some(&bad), "Repository").unwrap_err();
     let msg = err.to_string();
@@ -2335,7 +2336,8 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     assert!(
         validate_repository_health(
             Some(&RepositoryHealthSpec {
-                index_blob_warn_threshold: Some(0)
+                index_blob_warn_threshold: Some(0),
+                ..Default::default()
             }),
             "Repository"
         )
@@ -2344,13 +2346,66 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     assert!(
         validate_repository_health(
             Some(&RepositoryHealthSpec {
-                index_blob_warn_threshold: Some(2000)
+                index_blob_warn_threshold: Some(2000),
+                ..Default::default()
             }),
             "ClusterRepository"
         )
         .is_ok()
     );
     assert!(validate_repository_health(None, "Repository").is_ok());
+}
+
+#[test]
+fn repository_health_probe_interval_and_threshold_are_validated() {
+    use crate::repository::RepositoryHealthProbeSpec;
+
+    // Unparseable interval → rejected, names the field.
+    let bad = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("every-hour".to_string()),
+            failure_threshold: None,
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&bad), "Repository").unwrap_err();
+    assert!(err.to_string().contains("health.probe.interval"), "{err}");
+
+    // Below the 30s floor → rejected.
+    let too_fast = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("5s".to_string()),
+            failure_threshold: None,
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&too_fast), "ClusterRepository").unwrap_err();
+    assert!(err.to_string().contains("30s minimum"), "{err}");
+
+    // failureThreshold < 1 → rejected.
+    let bad_threshold = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: None,
+            failure_threshold: Some(0),
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&bad_threshold), "Repository").unwrap_err();
+    assert!(err.to_string().contains("failureThreshold"), "{err}");
+
+    // Valid probe (or omitted interval/threshold) is accepted.
+    let ok = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("30s".to_string()),
+            failure_threshold: Some(3),
+        }),
+        ..Default::default()
+    };
+    assert!(validate_repository_health(Some(&ok), "Repository").is_ok());
 }
 
 // --- retention keeps-nothing data-loss guard ---

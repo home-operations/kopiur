@@ -238,7 +238,13 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                 .await
             {
-                let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
+                // Part A: never auto-create over a once-`Ready` repository (pinned
+                // `uniqueId`) — a wiped/unreachable backend surfaces as a failure,
+                // never a silent fresh empty repo.
+                let create_enabled = health::auto_create_allowed(
+                    kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+                    repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+                );
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -628,6 +634,34 @@ async fn bootstrap_cluster_via_mover(
         repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
     );
 
+    // Backend health probe (`spec.health.probe`, opt-in) — mirrors the namespaced
+    // `Repository` path: a once-`Ready` ClusterRepository (pinned `uniqueId`) re-runs
+    // its bootstrap as a pure connect probe (Part A forces `auto_create=false`); the
+    // phase STAYS `Ready` and the outcome surfaces as the `BackendReachable` condition.
+    let bootstrapped_before = repo
+        .status
+        .as_ref()
+        .and_then(|s| s.unique_id.as_deref())
+        .is_some();
+    let probe_enabled =
+        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
+    let probe_due = health::health_probe_due(
+        bootstrapped_before,
+        probe_enabled,
+        repo.status
+            .as_ref()
+            .and_then(|s| s.health.as_ref())
+            .and_then(|h| h.last_probe_at.as_deref()),
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
+            repo.spec.health.as_ref(),
+        ),
+        chrono::Utc::now(),
+    );
+    let spec_changed =
+        repo.metadata.generation != repo.status.as_ref().and_then(|s| s.observed_generation);
+    let probe_run = probe_enabled && bootstrapped_before && !spec_changed;
+    let keep_ready_on_launch = probe_enabled && bootstrapped_before && !reverify && !spec_changed;
+
     if let Some(job) = job_api.get_opt(&job_name).await? {
         let already_ready =
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
@@ -679,7 +713,7 @@ async fn bootstrap_cluster_via_mover(
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
                 finalize_cluster_bootstrap(
-                    ctx, repo, name, &job_ns, &job_name, api, backend, success,
+                    ctx, repo, name, &job_ns, &job_name, api, backend, success, probe_run,
                 )
                 .await
             }
@@ -692,6 +726,7 @@ async fn bootstrap_cluster_via_mover(
     // due, or spec changed) — re-creating unconditionally would pin the refresh
     // cadence to the Job TTL instead of `catalog.refreshInterval`.
     if !(reverify
+        || probe_due
         || catalog::bootstrap_create_due(
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
             repo.metadata.generation,
@@ -702,12 +737,17 @@ async fn bootstrap_cluster_via_mover(
             chrono::Utc::now(),
         ))
     {
-        return Ok(Action::requeue(catalog::reconcile_interval(
-            repo.spec.catalog.as_ref(),
+        return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
+            repo,
         )));
     }
 
-    let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
+    // Part A: only a never-bootstrapped ClusterRepository (no pinned `uniqueId`)
+    // may carry `auto_create`; a once-`Ready` one re-runs as a pure connect probe.
+    let create_enabled = health::auto_create_allowed(
+        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+    );
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -808,9 +848,13 @@ async fn bootstrap_cluster_via_mover(
     let cm = jobs::build_config_map(&inputs)?;
     let job = jobs::build_job(&inputs);
     io::apply_mover_objects(&ctx.client, &job_ns, &job_name, &cm, &job).await?;
-    // Stamp the reverify token (loop guard): this request is now honored.
-    let mut create_status =
-        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() });
+    // Stamp the reverify token (loop guard): this request is now honored. A
+    // health-probe re-run keeps the phase `Ready` so backups/replication aren't paused.
+    let mut create_status = if keep_ready_on_launch {
+        serde_json::json!({ "backend": backend.kind_str() })
+    } else {
+        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() })
+    };
     if let Some(token) = reverify_token {
         create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
     }
@@ -877,6 +921,10 @@ async fn finalize_cluster_bootstrap(
     api: &Api<ClusterRepository>,
     backend: &Backend,
     job_succeeded: bool,
+    // True when this is a health-probe re-run of an already-`Ready` ClusterRepository
+    // (same spec): interpret the result as a probe (phase stays `Ready`) and consume
+    // the Job exactly once (deleted after processing).
+    probe_run: bool,
 ) -> Result<Action> {
     let result = read_cluster_bootstrap_result(ctx, job_ns, job_name).await?;
 
@@ -891,6 +939,15 @@ async fn finalize_cluster_bootstrap(
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
         io::BootstrapOutcome::Failed(failure) => {
+            // Health-probe failure on an already-`Ready` ClusterRepository: alert-only.
+            // Keep phase `Ready`, surface the debounced `BackendReachable` condition +
+            // Warning event, never auto-recreate.
+            if probe_run {
+                return finalize_cluster_probe_failure(
+                    ctx, repo, api, name, job_ns, job_name, &failure,
+                )
+                .await;
+            }
             let reason = failure.reason();
             let conditions =
                 cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
@@ -948,31 +1005,39 @@ async fn finalize_cluster_bootstrap(
         index_blob_event = upd.event;
         storage_stats["indexBlobCount"] = serde_json::json!(count);
     }
+    // A successful health probe: clear any prior failure debounce and stamp
+    // `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally — a probe run
+    // consumes its Job exactly once (deleted below), so this never re-runs.
+    let mut health_status = serde_json::Value::Null;
+    if probe_run {
+        let now = chrono::Utc::now().to_rfc3339();
+        let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
+        conditions = upd.conditions;
+        health_status = serde_json::to_value(&upd.health).unwrap_or_default();
+    }
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
     // re-write of identical status would bump `resourceVersion` and re-trigger
     // this reconciler through its own primary watch, in a tight loop.
+    let mut status_patch = serde_json::json!({
+        "phase": "Ready",
+        // Report the generation we just bootstrapped, so `observedGeneration` tracks
+        // `metadata.generation` after a successful first bootstrap (matching the
+        // already-bootstrapped path and the namespaced Repository). Without it a
+        // freshly-bootstrapped ClusterRepository shows no observedGeneration until the
+        // next spec change. (Fix originally from community PR #82, ChosenQuill.)
+        "observedGeneration": repo.metadata.generation,
+        "backend": backend.kind_str(),
+        "uniqueId": result.unique_id,
+        "allowedNamespaceCount": allowed_count,
+        "storageStats": storage_stats,
+        "conditions": conditions,
+    });
+    if !health_status.is_null() {
+        status_patch["health"] = health_status;
+    }
     let current = serde_json::to_value(&repo.status).ok();
-    io::patch_status_if_changed(
-        api,
-        name,
-        current.as_ref(),
-        serde_json::json!({
-            "phase": "Ready",
-            // Report the generation we just bootstrapped, so `observedGeneration` tracks
-            // `metadata.generation` after a successful first bootstrap (matching the
-            // already-bootstrapped path and the namespaced Repository). Without it a
-            // freshly-bootstrapped ClusterRepository shows no observedGeneration until the
-            // next spec change. (Fix originally from community PR #82, ChosenQuill.)
-            "observedGeneration": repo.metadata.generation,
-            "backend": backend.kind_str(),
-            "uniqueId": result.unique_id,
-            "allowedNamespaceCount": allowed_count,
-            "storageStats": storage_stats,
-            "conditions": conditions,
-        }),
-    )
-    .await?;
+    io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
     // Fire the Warning Event only on the transition into unhealthy. Non-blocking:
     // the cluster repository stays Ready.
     if let Some(w) = index_blob_event {
@@ -1036,9 +1101,118 @@ async fn finalize_cluster_bootstrap(
         .await;
     }
 
-    Ok(Action::requeue(catalog::reconcile_interval(
-        repo.spec.catalog.as_ref(),
+    // A probe consumes its Job exactly once (no lingering finished Job → no churn;
+    // the next probe is a fresh connect). Requeue on the probe cadence.
+    if probe_run {
+        delete_cluster_bootstrap_job(ctx, job_ns, job_name).await?;
+    }
+    Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
+        repo,
     )))
+}
+
+/// Health-probe failure on an already-`Ready` `ClusterRepository`: alert-only.
+/// Keeps the phase `Ready`, folds the debounced `BackendReachable` condition + (on
+/// a transition) a Warning event + metric, deletes the consumed Job, and requeues
+/// on the probe cadence. NEVER changes the phase and NEVER auto-recreates.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_cluster_probe_failure(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    api: &Api<ClusterRepository>,
+    name: &str,
+    job_ns: &str,
+    job_name: &str,
+    failure: &io::BootstrapFailure,
+) -> Result<Action> {
+    let kind = if failure.is_repository_absent() {
+        health::ProbeFailureKind::Vanished
+    } else {
+        health::ProbeFailureKind::Unreachable
+    };
+    let existing = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let upd = health::reconcile_probe_failure(
+        &existing,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        kind,
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
+            repo.spec.health.as_ref(),
+        ),
+        &now,
+        repo.metadata.generation,
+    );
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({
+            "phase": "Ready",
+            "health": upd.health,
+            "conditions": upd.conditions,
+        }),
+    )
+    .await?;
+    if let Some(w) = upd.event {
+        let kind_label = match kind {
+            health::ProbeFailureKind::Vanished => "vanished",
+            health::ProbeFailureKind::Unreachable => "unreachable",
+        };
+        ctx.metrics
+            .inc_health_probe_failure("", name, "ClusterRepository", kind_label);
+        if wrote {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+            tracing::warn!(repo = %name, reason = w.reason, "ClusterRepository health probe raised an alert");
+        }
+    }
+    delete_cluster_bootstrap_job(ctx, job_ns, job_name).await?;
+    Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
+        repo,
+    )))
+}
+
+/// Delete a finished cluster bootstrap Job + its result ConfigMap (in the creds
+/// Secret's namespace), tolerating a 404. Consumes a probe Job exactly once.
+async fn delete_cluster_bootstrap_job(ctx: &Context, job_ns: &str, job_name: &str) -> Result<()> {
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
+    match job_api
+        .delete(job_name, &kube::api::DeleteParams::background())
+        .await
+    {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), job_ns);
+    match cm_api
+        .delete(job_name, &kube::api::DeleteParams::default())
+        .await
+    {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    Ok(())
+}
+
+/// The steady-state requeue for a `ClusterRepository`, shortened to the
+/// health-probe cadence when the probe is enabled.
+fn cluster_probe_aware_reconcile_interval(repo: &ClusterRepository) -> Duration {
+    let base = catalog::reconcile_interval(repo.spec.catalog.as_ref());
+    if kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref()) {
+        base.min(
+            kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
+                repo.spec.health.as_ref(),
+            ),
+        )
+    } else {
+        base
+    }
 }
 
 /// Read the [`BootstrapResult`] the mover wrote into the work-spec ConfigMap (in

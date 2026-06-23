@@ -17,6 +17,7 @@ re-testing the backend itself.
 | **Connectivity probe** (`kopia repository connect`) | Repository reconcile | `status.phase` (`Pending`→`Initializing`→`Ready`/`Degraded`/`Failed`) + `Ready`/`Stalled` conditions | Everything downstream keys off `phase == Ready` |
 | **Readiness gate** (`repository_ready`) | `Snapshot`, `Maintenance`, `SnapshotPolicy`, `RepositoryReplication` reconcilers | `RepositoryNotReady` / `WaitingForRepository` reason, held in `Pending`/`Reconciling` | Building & launching the mover Job |
 | **Reactive re-probe on failure** | `Snapshot` reconciler → repository | `reverify-requested-at` annotation → `status.lastReverifyAt` | Forces a fresh connectivity probe within ~60s of a failed backup |
+| **Backend health probe** (opt-in, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable`) + Warning Event + `kopiur_repository_health_probe_failures` | **Advisory** — proactively detects a wiped/unreachable backend; repo **stays `Ready`** (alert-only) |
 | **Credentials available** | Mover preflight | `CredentialsAvailable=False` + Warning Event | The mover starting (the credential Secret must exist in the workload namespace) |
 | **Mover permitted** | Admission / reconcile | `MoverPermitted=False` | A privileged mover that wasn't opted in |
 | **Security-context compatibility** | Admission (advisory) + post-run | admission Warning + `SecurityContextCompatible=False` | Advisory — warns the mover UID likely can't read the source |
@@ -69,38 +70,70 @@ gone — at which point the gate suppresses all further Jobs.
     then suppresses every subsequent Job — **one** doomed Job per outage instead of one
     per schedule tick, not zero. Bare-path filesystem repos don't have this window (they
     re-probe every reconcile). To get proactive timed detection for object stores, enable
-    `catalog.periodicRefresh` (and tune `refreshInterval`) — at the cost of re-running
-    the bootstrap Job on that cadence — or see the active probe below.
+    the [backend health probe](#backend-health-probe-opt-in) below (or
+    `catalog.periodicRefresh`, at the cost of re-running the bootstrap Job on that cadence).
+
+## Backend health probe (opt-in)
+
+`spec.health.probe` opts a Repository (or ClusterRepository) into a **periodic
+backend re-connect** so a wiped or unreachable repository is detected proactively —
+without waiting for the next backup to fail. It closes the detection window above
+for object-store and volume-backed repositories.
+
+```yaml
+--8<-- "deploy/examples/27-repository-health-probe.yaml:health"
+```
+
+The full apply-ready example (Secret + Repository):
+[`deploy/examples/27-repository-health-probe.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/27-repository-health-probe.yaml).
+
+**It is alert-only by design.** The repository **stays `Ready`** while the probe
+runs and even when it raises an alert — so backups and replication are never
+paused. The outcome surfaces three ways, never as a phase flip:
+
+- a `BackendReachable` **condition** (`True` healthy; `False` with reason
+  `RepositoryVanished` or `BackendUnreachable`),
+- a **Warning Event** (`kubectl describe`), fired once per episode (after the
+  debounce, and again if the failure *reason* escalates),
+- the `kopiur_repository_health_probe_failures{kind,namespace,name,outcome}` metric.
+
+Two failures are reported distinctly, because they demand different responses:
+
+| Alert | Means | What to do |
+|---|---|---|
+| `RepositoryVanished` | backend **reachable**, kopia repository **absent** (format blob gone) | Verify the backend is *truly* empty before any re-create (see warning below) |
+| `BackendUnreachable` | backend unreachable, mount/path missing, or auth/lock failed | Fix the backend / credentials / volume; **not** a wipe |
+
+!!! warning "kopiur never auto-recreates a repository it once trusted"
+    A wiped repository and a transient outage look alike, and silently creating a
+    fresh empty repository over a real one destroys restorability. So
+    `create.enabled` governs the **first** bootstrap only — once a repository has
+    been `Ready` (it carries a pinned `status.uniqueId`), kopiur will **never**
+    recreate it, even on a `RepositoryVanished` alert. Re-creating is always a
+    deliberate human action. And a `RepositoryVanished` alert means the *format
+    blob* is gone — **data blobs may still remain** and be recoverable, so verify
+    the backend is genuinely empty (and that no other Repository points at the same
+    backend) before you act.
+
+!!! tip "Tuning"
+    - `interval` — how often to re-connect (Go-style duration; min `30s`, default
+      `30m`). Each probe runs a short connect, so leave it long for metered stores.
+    - `failureThreshold` — consecutive failing probes required before the alert
+      fires (default `3`). Debounces a single transient blip (an S3
+      list-after-delete race, a NAS reboot) from paging on-call. Any success resets
+      the counter and clears the condition.
 
 ## Not yet implemented — the stronger preflight
 
-The current design is **reactive fail-fast**, deliberately scoped (it adds no standing
-Jobs and re-uses the repository's existing connectivity probe). Two stronger forms were
-discussed and intentionally deferred; this section is the design intent, not current
-behavior.
+The current design is **reactive fail-fast** plus the opt-in probe above. One
+stronger form was discussed and intentionally deferred; this section is the design
+intent, not current behavior.
 
 !!! note "Status: design only"
-    Nothing in this section ships yet. It records *how* we'd build a proactive preflight
-    so the choice is deliberate when we do.
+    Nothing in this section ships yet. It records *how* we'd build it so the choice
+    is deliberate when we do.
 
-### 1. Active periodic connectivity probe
-
-Have the controller proactively run a lightweight `kopia repository connect` (it already
-ships the kopia binary) on a short cadence for object-store backends — which need only
-network + credentials, no volume mount — and flip `phase` *before* the next scheduled
-Job. This converts "one doomed Job per outage" into "zero" for those backends.
-
-Implementation sketch:
-
-- A short idempotent connect probe in the repository reconcile (ADR §5.4 already permits
-  short idempotent ops in the controller), gated to object-store backends and bounded by
-  a dedicated `health.probeInterval` (default off / conservative) so it doesn't hammer
-  metered object stores.
-- Keep the result on the existing `phase` machine — no new condition vocabulary.
-- Volume-backed filesystem repos still can't be probed in-process (no mount); they keep
-  the reactive path.
-
-### 2. CEL-configurable enumerated preflight (tuppr-style)
+### CEL-configurable enumerated preflight (tuppr-style)
 
 Let a user declare arbitrary preconditions a backup must satisfy — expressed as CEL,
 the same engine `successExpr` and the identity `*Expr` fields use — evaluated before the
@@ -117,7 +150,7 @@ Implementation sketch:
 - A failed predicate holds the `Snapshot` in `Pending` with a `PreflightFailed` reason,
   symmetric with the existing readiness gate.
 
-If you want either of these, open an issue (or ask) — they're additive to what's here.
+If you want this, open an issue (or ask) — it's additive to what's here.
 
 ## See also
 
