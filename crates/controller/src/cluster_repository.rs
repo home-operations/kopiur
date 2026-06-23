@@ -659,7 +659,10 @@ async fn bootstrap_cluster_via_mover(
     );
     let spec_changed =
         repo.metadata.generation != repo.status.as_ref().and_then(|s| s.observed_generation);
-    let probe_run = probe_enabled && bootstrapped_before && !spec_changed;
+    // `!reverify`: a reverify nudge keeps its strict semantics (flip to `Failed` on a
+    // connect failure) and is never downgraded to an alert-only probe. The probe is a
+    // separate, timer-driven concern (`probe_due`).
+    let probe_run = probe_enabled && bootstrapped_before && !spec_changed && !reverify;
     let keep_ready_on_launch = probe_enabled && bootstrapped_before && !reverify && !spec_changed;
 
     if let Some(job) = job_api.get_opt(&job_name).await? {
@@ -680,13 +683,17 @@ async fn bootstrap_cluster_via_mover(
                 }
                 Ok(Action::requeue(Duration::from_secs(15)))
             }
-            // Finished — unless the result is stale (catalog refresh due, or the
-            // spec changed since it was taken), in which case recycle the Job so
-            // the next reconcile re-runs the bootstrap for a fresh `snapshot list`.
+            // Finished — unless the result is stale (catalog refresh due, the spec
+            // changed, or a health probe is due since it was taken), in which case
+            // recycle the Job so the next reconcile re-runs the bootstrap for a FRESH
+            // connect. `probe_due` is essential — without it the first probe would
+            // re-read the lingering first-bootstrap result and report healthy without
+            // ever re-connecting.
             Some(success) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
+                    || probe_due
                     || catalog::bootstrap_recycle_due(
                         already_ready,
                         repo.metadata.generation,
@@ -1009,11 +1016,26 @@ async fn finalize_cluster_bootstrap(
     // `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally — a probe run
     // consumes its Job exactly once (deleted below), so this never re-runs.
     let mut health_status = serde_json::Value::Null;
+    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned `uniqueId` so
+    // a backend re-initialized at the old location by another party (same password)
+    // can't silently overwrite it on a successful connect.
+    let mut pinned_unique_id: Option<String> = None;
     if probe_run {
         let now = chrono::Utc::now().to_rfc3339();
         let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
         conditions = upd.conditions;
-        health_status = serde_json::to_value(&upd.health).unwrap_or_default();
+        // Explicit-null patch so the merge clears the failure counters (a `None`
+        // would be elided and leave the prior streak, re-firing on the next failure).
+        health_status = health::probe_success_health_patch(&now);
+        if let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
+            if result.unique_id.as_deref() != Some(pinned) {
+                tracing::warn!(
+                    repo = %name, pinned, observed = ?result.unique_id,
+                    "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+                );
+            }
+            pinned_unique_id = Some(pinned.to_string());
+        }
     }
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
@@ -1035,6 +1057,9 @@ async fn finalize_cluster_bootstrap(
     });
     if !health_status.is_null() {
         status_patch["health"] = health_status;
+    }
+    if let Some(pinned) = pinned_unique_id {
+        status_patch["uniqueId"] = serde_json::Value::String(pinned);
     }
     let current = serde_json::to_value(&repo.status).ok();
     io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;

@@ -271,6 +271,21 @@ pub fn reconcile_probe_success(
     }
 }
 
+/// The `status.health` merge-patch fragment for a **successful** probe. Emits
+/// explicit JSON `null` for the two failure-debounce fields so an RFC 7386 merge
+/// patch actually CLEARS them: a `None` would be `skip_serializing_if`-elided and
+/// leave the prior failing streak in the stored object, which re-fires the loud
+/// alert on the very next single failure (defeating `failureThreshold`). Use this
+/// instead of serializing [`reconcile_probe_success`]'s `health` directly.
+pub fn probe_success_health_patch(now: &str) -> serde_json::Value {
+    serde_json::json!({
+        "lastProbeAt": now,
+        "lastHealthyAt": now,
+        "consecutiveProbeFailures": serde_json::Value::Null,
+        "firstFailureAt": serde_json::Value::Null,
+    })
+}
+
 /// Fold a **failing** probe into the health state, applying the consecutive-failure
 /// debounce: the loud `BackendReachable=False` condition (and its Warning event)
 /// is raised only once `failure_threshold` consecutive failures have accrued, so a
@@ -687,5 +702,27 @@ mod tests {
         assert_eq!(upd.health.first_failure_at, None);
         assert_eq!(upd.health.last_healthy_at.as_deref(), Some(now.as_str()));
         assert!(upd.event.is_none());
+    }
+
+    #[test]
+    fn probe_success_health_patch_emits_explicit_nulls_to_clear_the_debounce() {
+        // The patch MUST carry explicit JSON `null` for the two debounce fields:
+        // status is written with a JSON merge-patch (RFC 7386), and an omitted key
+        // leaves the prior failing streak in place — which would re-fire the loud
+        // alert on the very next single failure, defeating `failureThreshold`.
+        let now = t(200).to_rfc3339();
+        let patch = probe_success_health_patch(&now);
+        assert_eq!(patch["lastProbeAt"].as_str(), Some(now.as_str()));
+        assert_eq!(patch["lastHealthyAt"].as_str(), Some(now.as_str()));
+        assert!(
+            patch["consecutiveProbeFailures"].is_null(),
+            "must be explicit null so the merge clears it, got {:?}",
+            patch["consecutiveProbeFailures"]
+        );
+        assert!(
+            patch["firstFailureAt"].is_null(),
+            "must be explicit null so the merge clears it, got {:?}",
+            patch["firstFailureAt"]
+        );
     }
 }
