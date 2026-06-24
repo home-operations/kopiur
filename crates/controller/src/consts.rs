@@ -27,6 +27,20 @@ pub const REPOSITORY_READ_ONLY_REASON: &str = "RepositoryReadOnly";
 /// `SnapshotPolicy`, and `RepositoryReplication` already apply.
 pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
 
+/// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
+/// because a `SnapshotPolicy.spec.preflight` check is not satisfied. The backup
+/// never launches until every preflight check passes.
+pub const PREFLIGHT_FAILED_REASON: &str = "PreflightFailed";
+/// `reason` when a preflight-gated backup is held in `Pending` because the
+/// `Maintenance` informer cache has not finished its initial sync yet (so
+/// maintenance recency can't be trusted). Surfaced so a never-syncing informer
+/// (e.g. missing RBAC on `Maintenance`) is diagnosable instead of a silent stall.
+pub const PREFLIGHT_WAITING_REASON: &str = "WaitingForPreflightData";
+/// Default `spec.preflight.timeout` when unset: how long a `Snapshot` is held in
+/// `Pending` while a preflight check is unsatisfied before it transitions to
+/// `Failed`. Bounded so scheduled backups don't pile up `Pending` CRs.
+pub const DEFAULT_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// In-container mount path for an inline-NFS backup *source* whose server-side
 /// export is the NFSv4 pseudo-root (`/`). The export's server path and the
 /// container mount path are independent; reusing `/` as the mount path would
@@ -233,6 +247,31 @@ pub const REPOSITORY_NOT_INITIALIZED_REASON: &str = "RepositoryNotInitialized";
 /// `action` (remediation hint) for [`REPOSITORY_NOT_INITIALIZED_REASON`]: enable
 /// repository creation (or point at an existing repository).
 pub const ENABLE_CREATE_ACTION: &str = "EnableRepositoryCreate";
+
+/// Condition type for the opt-in backend health probe (`spec.health.probe`).
+/// `True` = the last probe reached the backend and the kopia repository is
+/// present; `False` with reason [`REPOSITORY_VANISHED_REASON`] or
+/// [`BACKEND_UNREACHABLE_REASON`] = the debounced probe found a problem.
+/// NON-BLOCKING: the repository stays `Ready` and backups/replication keep
+/// running — this is an *alert*, never an outage gate (mirrors
+/// [`INDEX_BLOB_HEALTH_CONDITION`]). Wire-visible.
+pub const BACKEND_REACHABLE_CONDITION: &str = "BackendReachable";
+/// `reason` on [`BACKEND_REACHABLE_CONDITION`] when the probe succeeded.
+pub const BACKEND_REACHABLE_REASON: &str = "Reachable";
+/// `reason` (condition + Warning event) when the probe found the backend
+/// **reachable but the kopia repository absent** (format blob gone) for a
+/// repository that was previously `Ready` — a candidate *vanished* repository.
+/// Distinct from [`REPOSITORY_NOT_INITIALIZED_REASON`] precisely so the
+/// dangerous "set spec.create.enabled: true" advice is NEVER shown for a wipe.
+pub const REPOSITORY_VANISHED_REASON: &str = "RepositoryVanished";
+/// `reason` when the probe could not confirm an empty repository — the backend is
+/// unreachable, the mount/path is missing, or credentials/lock failed. NOT a
+/// wipe; kopiur never acts on it.
+pub const BACKEND_UNREACHABLE_REASON: &str = "BackendUnreachable";
+/// `action` for [`REPOSITORY_VANISHED_REASON`]: a human must verify the backend is
+/// truly empty (data blobs may still remain) before any deliberate re-create.
+/// kopiur deliberately does NOT auto-recreate.
+pub const VERIFY_BACKEND_ACTION: &str = "VerifyBackendBeforeRecreate";
 
 // Every reconcile error is surfaced as a Warning Event on the failing object
 // (via `error_policy_for` → `io::reconcile_failure_event`), so a failure is

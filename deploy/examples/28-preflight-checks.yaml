@@ -1,0 +1,116 @@
+# Example 28 — Backup preflight (CEL preconditions before a backup runs)
+#
+# `spec.preflight` on a SnapshotPolicy declares named CEL preconditions that must
+# ALL hold before a backup's mover Job launches. A failing check holds the Snapshot
+# in `Pending` (reason `PreflightFailed`) and, once `timeout` elapses, fails it —
+# bounded so a persistently-unmet precondition doesn't pile up `Pending` CRs (the
+# `Failed` ones are pruned by the schedule's `failedJobsHistoryLimit`).
+#
+# It is symmetric with the built-in repository-readiness gate, but user-extensible.
+# Evaluated by the operator at reconcile against LIVE repository + maintenance state:
+#
+#   repository.{phase,ready,backendReachable,
+#               snapshotCountKnown,snapshotCount,indexBlobCountKnown,indexBlobCount,
+#               sizeBytesKnown,sizeBytes,
+#               lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,
+#               lastReverifyAgeSeconds}
+#   maintenance.{hasRun,lastSuccessAgeSeconds}
+#
+# Unobserved values are i64::MAX. For a FRESHNESS check (`< N`) that fails closed
+# (unknown reads as infinitely old → blocks). But for a COUNT/SIZE check (`> N`) the
+# same sentinel fails OPEN, so ALWAYS pair it with the `*Known`/`hasRun` companion so
+# the unknown case fails closed:
+#   maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800
+#   repository.snapshotCountKnown && repository.snapshotCount > 0
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  # --8<-- [start:preflight]
+  preflight:
+    # How long to hold a backup in Pending while a check is unsatisfied before it
+    # transitions to Failed (Go-style duration; default 10m; `0` = hold forever).
+    timeout: 10m
+    # ALL checks must pass (AND) before the backup's mover Job launches.
+    checks:
+      # Don't back up unless maintenance has run within the last 7 days. The
+      # `hasRun` guard makes the intent explicit (a never-maintained repo blocks).
+      - name: maintenance-fresh
+        expr: "maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"
+        message: "repository maintenance has not run in the last 7 days"
+      # Don't back up while the backend health probe reports the repository
+      # unreachable/vanished (true when the probe is disabled — no evidence of fault).
+      - name: backend-reachable
+        expr: "repository.backendReachable"
+        message: "repository backend is not reachable"
+      # Count/size checks fail OPEN at the unobserved sentinel, so guard with the
+      # `*Known` companion: only require "repo has snapshots" once the count is
+      # actually observed (before the first catalog scan it is unknown → blocks).
+      - name: repo-populated
+        expr: "repository.snapshotCountKnown && repository.snapshotCount > 0"
+        message: "repository snapshot count not yet observed, or repository is empty"
+  # --8<-- [end:preflight]
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    cron: "H 2 * * *"
+    jitter: 30m
+    runOnCreate: false
+  # Bound how many Failed Snapshots (incl. preflight failures) this schedule keeps;
+  # the oldest beyond this are pruned. Defaults to 10 when omitted.
+  failedJobsHistoryLimit: 10

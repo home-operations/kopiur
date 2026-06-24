@@ -62,6 +62,7 @@ pub struct Metrics {
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
+    health_probe_failures: Counter<u64>,
 
     // Repository business metrics.
     repo_size_bytes: Gauge<i64>,
@@ -182,6 +183,15 @@ impl Metrics {
                  kopiur_controller_reconcile_errors.",
             )
             .build();
+        let health_probe_failures = m
+            .u64_counter("kopiur_repository_health_probe_failures")
+            .with_description(
+                "Total backend health-probe alerts raised (after the consecutive-failure \
+                 debounce), labeled by kind and outcome (vanished = backend reachable but the \
+                 repository is absent; unreachable = backend/mount/auth failure). The repository \
+                 stays Ready — these are alerts, not outages, and kopiur never auto-recreates.",
+            )
+            .build();
 
         let repo_size_bytes = m
             .i64_gauge("kopiur_repo_size_bytes")
@@ -231,6 +241,7 @@ impl Metrics {
             schedule_backups_created,
             secrets_projected,
             backups_refused,
+            health_probe_failures,
             repo_size_bytes,
             repo_snapshot_count,
             repo_discovered_backups,
@@ -382,6 +393,21 @@ impl Metrics {
                 KeyValue::new("namespace", ns.to_string()),
                 KeyValue::new("name", name.to_string()),
                 KeyValue::new("reason", reason),
+            ],
+        );
+    }
+
+    /// Count a backend health-probe alert (raised only after the debounce). `kind`
+    /// is the repository kind (`Repository`/`ClusterRepository`); `outcome` is
+    /// `vanished` or `unreachable`. Mirrors the `BackendReachable` condition reason.
+    pub fn inc_health_probe_failure(&self, ns: &str, name: &str, kind: &str, outcome: &str) {
+        self.health_probe_failures.add(
+            1,
+            &[
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("name", name.to_string()),
+                KeyValue::new("kind", kind.to_string()),
+                KeyValue::new("outcome", outcome.to_string()),
             ],
         );
     }

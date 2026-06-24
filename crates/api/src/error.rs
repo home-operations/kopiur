@@ -350,6 +350,48 @@ pub enum ValidationError {
         got: String,
     },
 
+    /// A `SnapshotPolicy.spec.preflight` check expression failed to compile (CEL
+    /// syntax error, or it exceeds the length budget). Surfaced at admission.
+    #[error(
+        "preflight check expression {expr:?} failed to compile: {reason} (check the CEL syntax)"
+    )]
+    PreflightExprCompile {
+        /// The offending CEL expression.
+        expr: String,
+        /// The parser's reason (or the length-budget message).
+        reason: String,
+    },
+
+    /// A preflight check expression referenced a variable outside its environment
+    /// (e.g. a typo), or otherwise failed to evaluate. The environment is the
+    /// `repository` and `maintenance` maps.
+    #[error(
+        "preflight check expression {expr:?} failed to evaluate: {reason} \
+         (available variables: repository.{{phase,ready,backendReachable,snapshotCountKnown,\
+         snapshotCount,indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,\
+         lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}}, \
+         maintenance.{{hasRun,lastSuccessAgeSeconds}})"
+    )]
+    PreflightExprEval {
+        /// The offending CEL expression.
+        expr: String,
+        /// The evaluation error (e.g. an undeclared-variable reference).
+        reason: String,
+    },
+
+    /// A preflight check expression evaluated to a non-bool value. A preflight
+    /// check is a pass/fail predicate and must return a bool.
+    #[error(
+        "preflight check expression {expr:?} must return a bool, got {got} \
+         (it is a pass/fail predicate)"
+    )]
+    PreflightExprType {
+        /// The offending CEL expression.
+        expr: String,
+        /// The CEL value type it returned instead of a bool.
+        got: String,
+    },
+
     /// A `RepositoryReplication`'s `destination` backend is identical to its
     /// source repository's backend (ADR-0005 §13(d)) — replicating a repository to
     /// itself is a no-op (or worse, a loop). The webhook rejects it.

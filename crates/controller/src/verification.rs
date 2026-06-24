@@ -671,6 +671,7 @@ mod tests {
                 error_handling: None,
                 upload: None,
                 verification: Some(verification),
+                preflight: None,
                 suspend: false,
                 hooks: None,
                 mover: None,

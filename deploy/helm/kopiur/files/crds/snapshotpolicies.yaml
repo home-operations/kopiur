@@ -739,6 +739,48 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              preflight:
+                description: |-
+                  Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒
+                  no preflight). A failing check holds the `Snapshot` in `Pending`
+                  (`PreflightFailed`) and, after `timeout`, fails it.
+                nullable: true
+                properties:
+                  checks:
+                    description: |-
+                      Checks that must **all** pass (AND) before the backup launches. An empty
+                      list is an inert no-op (symmetric with `verification` absent).
+                    items:
+                      description: 'One named precondition: a CEL bool predicate over the preflight environment.'
+                      properties:
+                        expr:
+                          description: CEL bool predicate; the backup proceeds only when this evaluates `true`.
+                          type: string
+                        message:
+                          description: Optional human message surfaced alongside the check name when it blocks.
+                          nullable: true
+                          type: string
+                        name:
+                          description: |-
+                            Stable identifier surfaced in the `Snapshot`'s status when this check blocks
+                            (e.g. `maintenance-fresh`). Unique within the policy.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - expr
+                      - name
+                      type: object
+                    maxItems: 50
+                    type: array
+                  timeout:
+                    description: |-
+                      How long to hold a `Snapshot` in `Pending` while a check is unsatisfied
+                      before failing it (Go-style duration like `10m` or `1h`; default `10m`). A
+                      zero duration (`0`/`0s`) holds indefinitely (never fail on preflight).
+                    nullable: true
+                    type: string
+                type: object
               repository:
                 description: Discriminated reference to a `Repository` or `ClusterRepository`.
                 properties:

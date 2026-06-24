@@ -585,6 +585,32 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  probe:
+                    description: |-
+                      Opt-in periodic backend health probe: re-connect a `Ready` repository on a
+                      timer to confirm the kopia repository still exists at the backend.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Turn the probe on. Off by default — existing repositories keep their
+                          current behavior until a user opts in.
+                        type: boolean
+                      failureThreshold:
+                        description: |-
+                          How many *consecutive* failing probes to require before raising the loud
+                          condition + event (default `3`). Debounces a single transient blip from
+                          alarming or nudging a destructive manual recreate. Any success resets it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      interval:
+                        description: |-
+                          How often to re-probe the backend (Go-style duration like `30m` or `1h`;
+                          minimum `30s`, default `30m`). Inert unless `enabled`.
+                        nullable: true
+                        type: string
+                    type: object
                 type: object
               maintenance:
                 description: Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR.
@@ -2386,6 +2412,32 @@ spec:
                   - type
                   type: object
                 type: array
+              health:
+                description: Backend health-probe state (`spec.health.probe`), when enabled.
+                nullable: true
+                properties:
+                  consecutiveProbeFailures:
+                    description: |-
+                      Consecutive failing probes accrued; reset to zero on any success. The loud
+                      condition is raised only once this reaches the failure threshold.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  firstFailureAt:
+                    description: RFC 3339 timestamp of the first failure in the current failing streak.
+                    nullable: true
+                    type: string
+                  lastHealthyAt:
+                    description: RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present).
+                    nullable: true
+                    type: string
+                  lastProbeAt:
+                    description: |-
+                      RFC 3339 timestamp of the last completed probe (success or failure); drives
+                      the `health_probe_due` timer so the probe re-fires on cadence.
+                    nullable: true
+                    type: string
+                type: object
               lastReverifyAt:
                 description: |-
                   Last reverify-request token honored from a `Snapshot`'s re-probe nudge
@@ -2468,6 +2520,16 @@ spec:
                     description: Human-readable total on-disk size (e.g. `412Gi`).
                     nullable: true
                     type: string
+                  totalSizeBytes:
+                    description: |-
+                      Logical bytes under management (the integer form of `total_size`): the sum,
+                      over each distinct snapshot source, of the most-recent snapshot's logical
+                      size. Exposed to backup preflight as `repository.sizeBytes`. This is
+                      repository *total size*, not backend free space (object stores don't report
+                      remaining capacity).
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               uniqueId:
                 description: Kopia repository unique ID.
@@ -3130,6 +3192,32 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  probe:
+                    description: |-
+                      Opt-in periodic backend health probe: re-connect a `Ready` repository on a
+                      timer to confirm the kopia repository still exists at the backend.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Turn the probe on. Off by default — existing repositories keep their
+                          current behavior until a user opts in.
+                        type: boolean
+                      failureThreshold:
+                        description: |-
+                          How many *consecutive* failing probes to require before raising the loud
+                          condition + event (default `3`). Debounces a single transient blip from
+                          alarming or nudging a destructive manual recreate. Any success resets it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      interval:
+                        description: |-
+                          How often to re-probe the backend (Go-style duration like `30m` or `1h`;
+                          minimum `30s`, default `30m`). Inert unless `enabled`.
+                        nullable: true
+                        type: string
+                    type: object
                 type: object
               identityDefaults:
                 description: Identity defaults (CEL `*Expr`) applied when consumers don't override.
@@ -4955,6 +5043,32 @@ spec:
                   - type
                   type: object
                 type: array
+              health:
+                description: Backend health-probe state (`spec.health.probe`), when enabled.
+                nullable: true
+                properties:
+                  consecutiveProbeFailures:
+                    description: |-
+                      Consecutive failing probes accrued; reset to zero on any success. The loud
+                      condition is raised only once this reaches the failure threshold.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  firstFailureAt:
+                    description: RFC 3339 timestamp of the first failure in the current failing streak.
+                    nullable: true
+                    type: string
+                  lastHealthyAt:
+                    description: RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present).
+                    nullable: true
+                    type: string
+                  lastProbeAt:
+                    description: |-
+                      RFC 3339 timestamp of the last completed probe (success or failure); drives
+                      the `health_probe_due` timer so the probe re-fires on cadence.
+                    nullable: true
+                    type: string
+                type: object
               lastReverifyAt:
                 description: |-
                   Last reverify-request token honored from a `Snapshot`'s re-probe nudge
@@ -5037,6 +5151,16 @@ spec:
                     description: Human-readable total on-disk size (e.g. `412Gi`).
                     nullable: true
                     type: string
+                  totalSizeBytes:
+                    description: |-
+                      Logical bytes under management (the integer form of `total_size`): the sum,
+                      over each distinct snapshot source, of the most-recent snapshot's logical
+                      size. Exposed to backup preflight as `repository.sizeBytes`. This is
+                      repository *total size*, not backend free space (object stores don't report
+                      remaining capacity).
+                    format: int64
+                    nullable: true
+                    type: integer
                 type: object
               uniqueId:
                 description: Kopia repository unique ID.
@@ -5792,6 +5916,48 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              preflight:
+                description: |-
+                  Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒
+                  no preflight). A failing check holds the `Snapshot` in `Pending`
+                  (`PreflightFailed`) and, after `timeout`, fails it.
+                nullable: true
+                properties:
+                  checks:
+                    description: |-
+                      Checks that must **all** pass (AND) before the backup launches. An empty
+                      list is an inert no-op (symmetric with `verification` absent).
+                    items:
+                      description: 'One named precondition: a CEL bool predicate over the preflight environment.'
+                      properties:
+                        expr:
+                          description: CEL bool predicate; the backup proceeds only when this evaluates `true`.
+                          type: string
+                        message:
+                          description: Optional human message surfaced alongside the check name when it blocks.
+                          nullable: true
+                          type: string
+                        name:
+                          description: |-
+                            Stable identifier surfaced in the `Snapshot`'s status when this check blocks
+                            (e.g. `maintenance-fresh`). Unique within the policy.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - expr
+                      - name
+                      type: object
+                    maxItems: 50
+                    type: array
+                  timeout:
+                    description: |-
+                      How long to hold a `Snapshot` in `Pending` while a check is unsatisfied
+                      before failing it (Go-style duration like `10m` or `1h`; default `10m`). A
+                      zero duration (`0`/`0s`) holds indefinitely (never fail on preflight).
+                    nullable: true
+                    type: string
+                type: object
               repository:
                 description: Discriminated reference to a `Repository` or `ClusterRepository`.
                 properties:
@@ -6382,6 +6548,15 @@ spec:
                 description: 'The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile.'
                 nullable: true
                 type: boolean
+              preflightSince:
+                description: |-
+                  RFC 3339 timestamp of the first reconcile where the repository was `Ready`
+                  but a `spec.preflight` check was failing. The one-shot anchor for the
+                  preflight `timeout` deadline (so the budget covers preflight only, not the
+                  earlier repository-not-Ready wait). Cleared once every preflight check passes,
+                  so a later failing episode gets a fresh budget rather than a stale anchor.
+                nullable: true
+                type: string
               resolved:
                 description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true

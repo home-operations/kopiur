@@ -1067,6 +1067,7 @@ fn backup_config_aggregate_collects_multiple_errors() {
         error_handling: None,
         upload: None,
         verification: None,
+        preflight: None,
         suspend: false,
         hooks: None,
         mover: None,
@@ -1111,6 +1112,7 @@ fn backup_config_valid_spec_has_no_errors() {
         error_handling: None,
         upload: None,
         verification: None,
+        preflight: None,
         suspend: false,
         hooks: None,
         mover: None,
@@ -1191,6 +1193,43 @@ fn backup_schedule_aggregate_rejects_bad_timezone() {
             .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
         "a typo'd timezone must be rejected at admission: {errs:?}"
     );
+}
+
+#[test]
+fn backup_schedule_aggregate_rejects_bad_jitter() {
+    use crate::common::PolicyRef;
+    use crate::snapshot_schedule::ScheduleSpec;
+    let mk = |jitter: &str| SnapshotScheduleSpec {
+        policy_ref: Some(PolicyRef {
+            name: "c".into(),
+            namespace: None,
+        }),
+        policy_selector: None,
+        schedule: ScheduleSpec {
+            cron: "0 2 * * *".into(),
+            jitter: Some(jitter.into()),
+            timezone: None,
+            run_on_create: false,
+            suspend: false,
+            concurrency_policy: Default::default(),
+            starting_deadline_seconds: None,
+        },
+        failed_jobs_history_limit: None,
+    };
+    // Unparseable / overflowing jitter is rejected at admission rather than silently
+    // degrading to no-jitter at reconcile.
+    for bad in ["every-hour", "9999999999999999h"] {
+        let errs = validate_backup_schedule(&mk(bad));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. } if field == "spec.schedule.jitter"
+            )),
+            "jitter {bad:?} must be rejected: {errs:?}"
+        );
+    }
+    // A valid jitter is accepted.
+    assert!(validate_backup_schedule(&mk("30m")).is_empty());
 }
 
 // --- §10 policyRef XOR policySelector ---
@@ -2322,6 +2361,7 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     // Negative is nonsensical → rejected with an actionable message.
     let bad = RepositoryHealthSpec {
         index_blob_warn_threshold: Some(-1),
+        ..Default::default()
     };
     let err = validate_repository_health(Some(&bad), "Repository").unwrap_err();
     let msg = err.to_string();
@@ -2335,7 +2375,8 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     assert!(
         validate_repository_health(
             Some(&RepositoryHealthSpec {
-                index_blob_warn_threshold: Some(0)
+                index_blob_warn_threshold: Some(0),
+                ..Default::default()
             }),
             "Repository"
         )
@@ -2344,13 +2385,66 @@ fn repository_health_rejects_negative_threshold_but_allows_zero() {
     assert!(
         validate_repository_health(
             Some(&RepositoryHealthSpec {
-                index_blob_warn_threshold: Some(2000)
+                index_blob_warn_threshold: Some(2000),
+                ..Default::default()
             }),
             "ClusterRepository"
         )
         .is_ok()
     );
     assert!(validate_repository_health(None, "Repository").is_ok());
+}
+
+#[test]
+fn repository_health_probe_interval_and_threshold_are_validated() {
+    use crate::repository::RepositoryHealthProbeSpec;
+
+    // Unparseable interval → rejected, names the field.
+    let bad = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("every-hour".to_string()),
+            failure_threshold: None,
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&bad), "Repository").unwrap_err();
+    assert!(err.to_string().contains("health.probe.interval"), "{err}");
+
+    // Below the 30s floor → rejected.
+    let too_fast = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("5s".to_string()),
+            failure_threshold: None,
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&too_fast), "ClusterRepository").unwrap_err();
+    assert!(err.to_string().contains("30s minimum"), "{err}");
+
+    // failureThreshold < 1 → rejected.
+    let bad_threshold = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: None,
+            failure_threshold: Some(0),
+        }),
+        ..Default::default()
+    };
+    let err = validate_repository_health(Some(&bad_threshold), "Repository").unwrap_err();
+    assert!(err.to_string().contains("failureThreshold"), "{err}");
+
+    // Valid probe (or omitted interval/threshold) is accepted.
+    let ok = RepositoryHealthSpec {
+        probe: Some(RepositoryHealthProbeSpec {
+            enabled: true,
+            interval: Some("30s".to_string()),
+            failure_threshold: Some(3),
+        }),
+        ..Default::default()
+    };
+    assert!(validate_repository_health(Some(&ok), "Repository").is_ok());
 }
 
 // --- retention keeps-nothing data-loss guard ---
@@ -2399,6 +2493,69 @@ fn backup_config_rejects_keeps_nothing_retention_but_not_absent() {
             ValidationError::InvalidFieldValue { field, .. } if field == "spec.retention"
         )),
         "absent retention is the safe no-prune case and must not be flagged: {errs:?}"
+    );
+}
+
+// --- preflight validation ---
+
+#[test]
+fn backup_config_validates_preflight() {
+    // Valid preflight is accepted.
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  timeout: 10m\n  checks:\n\
+         \x20   - { name: a, expr: \"repository.ready\" }\n\
+         \x20   - { name: b, expr: \"maintenance.hasRun\" }\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+
+    // Bad timeout → rejected, names the field.
+    let bad_to: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  timeout: every-hour\n  checks: [ { name: a, expr: \"repository.ready\" } ]\n",
+    );
+    assert!(
+        validate_backup_config(&bad_to).iter().any(|e| matches!(
+            e, ValidationError::InvalidFieldValue { field, .. } if field == "spec.preflight.timeout"
+        )),
+        "{:?}",
+        validate_backup_config(&bad_to)
+    );
+
+    // Duplicate check name → rejected.
+    let dup: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  checks:\n\
+         \x20   - { name: same, expr: \"repository.ready\" }\n\
+         \x20   - { name: same, expr: \"maintenance.hasRun\" }\n",
+    );
+    assert!(
+        validate_backup_config(&dup).iter().any(|e| matches!(
+            e, ValidationError::InvalidFieldValue { field, .. } if field.starts_with("spec.preflight.checks[")
+        )),
+        "{:?}",
+        validate_backup_config(&dup)
+    );
+
+    // Bad expr (out-of-scope variable) → rejected.
+    let bad_expr: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         preflight:\n  checks: [ { name: a, expr: \"bogus > 0\" } ]\n",
+    );
+    assert!(
+        validate_backup_config(&bad_expr)
+            .iter()
+            .any(|e| matches!(e, ValidationError::PreflightExprEval { .. })),
+        "{:?}",
+        validate_backup_config(&bad_expr)
     );
 }
 

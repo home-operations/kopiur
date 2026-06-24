@@ -12,7 +12,8 @@ use crate::common::{
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::repository::{
-    BootstrapSpec, CatalogStatus, RepositoryHealthSpec, RepositoryPhase, StorageStats,
+    BootstrapSpec, CatalogStatus, RepositoryHealthSpec, RepositoryHealthStatus, RepositoryPhase,
+    StorageStats,
 };
 use crate::server::{ClusterServerSpec, ServerStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
@@ -186,6 +187,9 @@ pub struct ClusterRepositoryStatus {
     /// (RFC3339); the loop guard that keeps each request a one-shot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reverify_at: Option<String>,
+    /// Backend health-probe state (`spec.health.probe`), when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RepositoryHealthStatus>,
     /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,

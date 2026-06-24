@@ -1,13 +1,18 @@
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use chrono::{DateTime, Utc};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use kube::Api;
 use kube::api::{Patch, PatchParams};
+use kube::runtime::reflector::Store;
 
 use kopiur_api::backend::Backend;
 use kopiur_api::cluster_repository::IdentityDefaults;
 use kopiur_api::common::{
-    Encryption, MoverDefaults, NamespaceDeletePolicy, RepositoryKind, RepositoryMode, RepositoryRef,
+    Encryption, MoverDefaults, NamespaceDeletePolicy, PhaseLabel, RepositoryKind, RepositoryMode,
+    RepositoryRef,
 };
-use kopiur_api::{ClusterRepository, Repository};
+use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
+use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
+use kopiur_api::{ClusterRepository, Maintenance, Repository};
 
 use crate::error::{Error, Result};
 
@@ -235,6 +240,169 @@ pub async fn repository_ready(
             Ok(repo.status.and_then(|s| s.phase) == ready)
         }
     }
+}
+
+/// Seconds since an RFC3339 timestamp (`(known, age)`): clamped to ≥0, and
+/// `(false, UNKNOWN_AGE)` when absent/unparseable so a freshness guard fails closed.
+fn age_seconds(ts: Option<&str>, now: DateTime<Utc>) -> (bool, i64) {
+    match ts.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) {
+        Some(t) => (true, (now - t.with_timezone(&Utc)).num_seconds().max(0)),
+        None => (false, UNKNOWN_AGE),
+    }
+}
+
+/// **Pure.** Map a repository status's common fields (shared by `Repository` and
+/// `ClusterRepository`) into [`PreflightInputs`]. The `maintenance.*` fields are left
+/// at their fail-closed defaults — the caller fills them via [`maintenance_recency`].
+pub fn repo_status_to_inputs(
+    phase: Option<RepositoryPhase>,
+    conditions: &[Condition],
+    storage: Option<&StorageStats>,
+    health: Option<&RepositoryHealthStatus>,
+    last_reverify_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> PreflightInputs {
+    // `BackendReachable` absent ⇒ the health probe is off ⇒ no evidence the backend
+    // is down, so don't block on it.
+    let backend_reachable = conditions
+        .iter()
+        .find(|c| c.type_ == crate::consts::BACKEND_REACHABLE_CONDITION)
+        .is_none_or(|c| c.status == "True");
+    let (last_healthy_known, last_healthy_age_seconds) =
+        age_seconds(health.and_then(|h| h.last_healthy_at.as_deref()), now);
+    let (last_reverify_known, last_reverify_age_seconds) = age_seconds(last_reverify_at, now);
+    // Counts/sizes fail OPEN for `> N` checks at the UNKNOWN_AGE sentinel, so a
+    // `*Known` companion is exposed for the user to guard with. `split` derives both
+    // from the SAME Option so the known flag can't desync from its value.
+    let split = |o: Option<i64>| (o.is_some(), o.unwrap_or(UNKNOWN_AGE));
+    let (snapshot_count_known, snapshot_count) = split(storage.and_then(|s| s.snapshot_count));
+    let (index_blob_count_known, index_blob_count) =
+        split(storage.and_then(|s| s.index_blob_count));
+    let (size_bytes_known, size_bytes) = split(storage.and_then(|s| s.total_size_bytes));
+    PreflightInputs {
+        repository_phase: phase.map(|p| p.label().to_string()).unwrap_or_default(),
+        repository_ready: phase == Some(RepositoryPhase::Ready),
+        backend_reachable,
+        snapshot_count_known,
+        snapshot_count,
+        index_blob_count_known,
+        index_blob_count,
+        size_bytes_known,
+        size_bytes,
+        last_healthy_known,
+        last_healthy_age_seconds,
+        last_reverify_known,
+        last_reverify_age_seconds,
+        // Maintenance filled by the caller.
+        ..PreflightInputs::default()
+    }
+}
+
+/// **Pure over an iterator.** The "last successful maintenance" age for the repo
+/// `(kind, name, match_namespace)`: the max of `{full,quick}.{lastRunAt,lastHandledAt}`
+/// across every matching `Maintenance`. `lastRunAt` is mover-written on *every*
+/// successful run — scheduled **and** manual run-now — and `lastHandledAt` is the
+/// controller-observed terminal success (covering the reaped-Job case), so the max
+/// reflects a manual run-now without touching the cron-slot dedup field. Returns
+/// `(false, UNKNOWN_AGE)` when no successful run is recorded (fail-closed).
+pub fn maintenance_recency(
+    items: impl IntoIterator<Item = Maintenance>,
+    kind: RepositoryKind,
+    name: &str,
+    match_namespace: Option<&str>,
+    now: DateTime<Utc>,
+) -> (bool, i64) {
+    let mut newest: Option<DateTime<Utc>> = None;
+    for m in items {
+        let owner_ns = m.metadata.namespace.as_deref().unwrap_or_default();
+        if !m
+            .spec
+            .repository
+            .resolves_to(owner_ns, kind, name, match_namespace)
+        {
+            continue;
+        }
+        let Some(st) = m.status.as_ref() else {
+            continue;
+        };
+        for run in [st.full.as_ref(), st.quick.as_ref()].into_iter().flatten() {
+            for ts in [run.last_run_at.as_deref(), run.last_handled_at.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(t) = DateTime::parse_from_rfc3339(ts) {
+                    let t = t.with_timezone(&Utc);
+                    newest = Some(newest.map_or(t, |n| n.max(t)));
+                }
+            }
+        }
+    }
+    match newest {
+        Some(t) => (true, (now - t).num_seconds().max(0)),
+        None => (false, UNKNOWN_AGE),
+    }
+}
+
+/// Gather the live [`PreflightInputs`] for a repository plus its readiness — one
+/// `Repository`/`ClusterRepository` GET for status, and the shared `Maintenance`
+/// informer for recency. Returns `(inputs, ready)` so the caller derives the
+/// readiness gate from the same fetch (no second lookup). `MissingDependency` if
+/// the repository is absent (mirrors [`repository_ready`]).
+pub async fn gather_preflight_inputs(
+    client: &kube::Client,
+    repo_ref: &RepositoryRef,
+    default_ns: &str,
+    maintenance_store: &Store<Maintenance>,
+    now: DateTime<Utc>,
+) -> Result<(PreflightInputs, bool)> {
+    let (mut inputs, kind, name, match_ns) = match repo_lookup(repo_ref, default_ns) {
+        RepoLookup::Namespaced { namespace, name } => {
+            let api: Api<Repository> = Api::namespaced(client.clone(), &namespace);
+            let repo = api.get_opt(&name).await?.ok_or_else(|| {
+                Error::MissingDependency(format!("Repository {namespace}/{name}"))
+            })?;
+            let st = repo.status.as_ref();
+            let inputs = repo_status_to_inputs(
+                st.and_then(|s| s.phase),
+                st.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+                st.and_then(|s| s.storage_stats.as_ref()),
+                st.and_then(|s| s.health.as_ref()),
+                st.and_then(|s| s.last_reverify_at.as_deref()),
+                now,
+            );
+            (inputs, RepositoryKind::Repository, name, Some(namespace))
+        }
+        RepoLookup::Cluster { name } => {
+            let api: Api<ClusterRepository> = Api::all(client.clone());
+            let repo = api
+                .get_opt(&name)
+                .await?
+                .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
+            let st = repo.status.as_ref();
+            let inputs = repo_status_to_inputs(
+                st.and_then(|s| s.phase),
+                st.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+                st.and_then(|s| s.storage_stats.as_ref()),
+                st.and_then(|s| s.health.as_ref()),
+                st.and_then(|s| s.last_reverify_at.as_deref()),
+                now,
+            );
+            (inputs, RepositoryKind::ClusterRepository, name, None)
+        }
+    };
+    let ready = inputs.repository_ready;
+    // Best-effort recency from the shared informer; a cold store ⇒ fail-closed
+    // (has_run=false, UNKNOWN_AGE), bounded by the preflight timeout.
+    let (has_run, age) = maintenance_recency(
+        maintenance_store.state().iter().map(|m| (**m).clone()),
+        kind,
+        &name,
+        match_ns.as_deref(),
+        now,
+    );
+    inputs.maintenance_has_run = has_run;
+    inputs.maintenance_last_success_age_seconds = age;
+    Ok((inputs, ready))
 }
 
 /// Stamp the reverify annotation (`now`, RFC3339) to request an immediate

@@ -23,6 +23,7 @@ pub mod error;
 pub mod identity;
 pub mod invariants;
 pub mod jitter;
+pub mod preflight;
 pub mod retention;
 pub mod schema;
 pub mod secctx_compat;
@@ -76,6 +77,9 @@ pub use duration::parse_go_duration;
 pub use error::{ValidationError, ValidationResult};
 pub use identity::{IdentityInputs, identity_string, resolve_identity, validate_identity_expr};
 pub use jitter::{offset as jitter_offset, substitute_h};
+pub use preflight::{
+    PreflightCheck, PreflightInputs, PreflightSpec, eval_preflight_expr, validate_preflight_expr,
+};
 pub use retention::{KeptSet, SnapshotLike, select_kept};
 pub use success_expr::{
     RestoredStats, SuccessExprInputs, VerifyStats, eval_success_expr, validate_success_expr,

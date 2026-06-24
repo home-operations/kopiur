@@ -214,6 +214,33 @@ impl KopiaErrorClass {
     }
 }
 
+/// Whether a [`KopiaErrorClass::NotFound`] connect failure is the backend
+/// reporting a *genuinely uninitialized* repository (kopia's
+/// `ErrRepositoryNotInitialized`: "repository not initialized in the provided
+/// storage") rather than a *missing path / mount* ("no such file or directory",
+/// "does not exist").
+///
+/// Both phrasings classify as [`KopiaErrorClass::NotFound`] (so first-bootstrap
+/// `create` still fires for either), but they mean very different things for an
+/// already-`Ready` repository under the health probe:
+///
+/// * genuine "not initialized" ⇒ the backend answered and the kopia format blob
+///   is gone — a candidate *vanished repository* (`RepositoryVanished`).
+/// * a missing path / mount ⇒ the PVC isn't bound or the export moved — a
+///   *backend/mount fault* (`BackendReachable=False`), NOT a wipe. Recreating
+///   here would be catastrophic, so the two must never be conflated.
+///
+/// Returns `false` for any non-`NotFound` stderr; callers gate on the class first.
+///
+/// ```
+/// use kopiur_kopia::notfound_is_uninitialized;
+/// assert!(notfound_is_uninitialized("repository not initialized in the provided storage"));
+/// assert!(!notfound_is_uninitialized("open /repo/kopia.repository: no such file or directory"));
+/// ```
+pub fn notfound_is_uninitialized(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("not initialized")
+}
+
 impl fmt::Display for KopiaErrorClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -396,6 +423,28 @@ mod tests {
         );
         // NotFound is non-retryable: the fix is a spec change, not a blind retry.
         assert!(!KopiaErrorClass::NotFound.is_retryable());
+    }
+
+    #[test]
+    fn notfound_distinguishes_uninitialized_from_missing_path() {
+        // A genuinely empty backend (format blob absent) → uninitialized: the health
+        // probe may treat this as a candidate "vanished" repository.
+        assert!(notfound_is_uninitialized(
+            "ERROR error connecting to repository: repository not initialized in the \
+             provided storage"
+        ));
+        // A missing path / unbound mount also classifies NotFound, but is a backend/
+        // mount fault — NOT an empty repository. Must NOT read as uninitialized, so the
+        // probe never misreads a mis-mounted volume as a wipe (and never nudges a recreate).
+        assert!(!notfound_is_uninitialized(
+            "open /repo/kopia.repository: no such file or directory"
+        ));
+        assert!(!notfound_is_uninitialized("stat /mnt/nas: does not exist"));
+        // Both still classify as NotFound (so first-bootstrap `create` fires for either).
+        assert_eq!(
+            KopiaErrorClass::classify("open /repo/kopia.repository: no such file or directory"),
+            KopiaErrorClass::NotFound
+        );
     }
 
     #[test]

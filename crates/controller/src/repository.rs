@@ -218,7 +218,13 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                 .await
             {
-                let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
+                // Part A: never auto-create over a once-`Ready` repository (pinned
+                // `uniqueId`). A wiped/unreachable backend must surface as a failure,
+                // never a silent fresh empty repo — re-create is a deliberate action.
+                let create_enabled = health::auto_create_allowed(
+                    kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+                    repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+                );
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -562,6 +568,45 @@ async fn bootstrap_via_mover(
         repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
     );
 
+    // Backend health probe (`spec.health.probe`, opt-in). A repo that has reached
+    // `Ready` carries a pinned `uniqueId`; a probe re-runs the bootstrap as a pure
+    // connect (Part A forces `auto_create=false`), and the result is interpreted as
+    // a probe — the phase STAYS `Ready` (backups/replication keep running) and the
+    // outcome surfaces as the `BackendReachable` condition (see `finalize_bootstrap`).
+    let bootstrapped_before = repo
+        .status
+        .as_ref()
+        .and_then(|s| s.unique_id.as_deref())
+        .is_some();
+    let probe_enabled =
+        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
+    let probe_due = health::health_probe_due(
+        bootstrapped_before,
+        probe_enabled,
+        repo.status
+            .as_ref()
+            .and_then(|s| s.health.as_ref())
+            .and_then(|h| h.last_probe_at.as_deref()),
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
+            repo.spec.health.as_ref(),
+        ),
+        chrono::Utc::now(),
+    );
+    let spec_changed =
+        repo.metadata.generation != repo.status.as_ref().and_then(|s| s.observed_generation);
+    // A re-run of an already-bootstrapped, probe-enabled repo on the SAME spec is a
+    // probe: interpret it gently (stay `Ready`) and process the job exactly once
+    // (`finalize_bootstrap` deletes it). A spec change is a real re-bootstrap of new
+    // config and keeps the strict `Failed`-on-error semantics.
+    // `!reverify`: a reverify nudge (a failed backup's forced re-probe) must keep its
+    // strict semantics — flip the phase to `Failed` on a connect failure — and must
+    // NOT be downgraded to an alert-only probe. The probe is a separate, timer-driven
+    // concern (`probe_due`).
+    let probe_run = probe_enabled && bootstrapped_before && !spec_changed && !reverify;
+    // When LAUNCHING such a re-run, do not flip the phase to `Initializing` (that
+    // would fail the `repository_ready` gate and pause backups) — keep `Ready`.
+    let keep_ready_on_launch = probe_enabled && bootstrapped_before && !reverify && !spec_changed;
+
     if let Some(job) = job_api.get_opt(&job_name).await? {
         let already_ready =
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
@@ -581,13 +626,16 @@ async fn bootstrap_via_mover(
                 Ok(Action::requeue(Duration::from_secs(15)))
             }
             // Complete or backoff-exhausted: read the structured result — unless
-            // the result is stale (catalog refresh due, or the spec changed since
-            // it was taken): then recycle the Job so the next reconcile re-runs
-            // the bootstrap for a fresh connect + `snapshot list`.
+            // the result is stale (catalog refresh due, the spec changed, or a health
+            // probe is due) since it was taken: then recycle the Job so the next
+            // reconcile re-runs the bootstrap for a FRESH connect. `probe_due` is
+            // essential — without it the first probe would re-read the lingering
+            // first-bootstrap result and report healthy without ever re-connecting.
             Some(success) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
+                    || probe_due
                     || catalog::bootstrap_recycle_due(
                         already_ready,
                         repo.metadata.generation,
@@ -612,6 +660,7 @@ async fn bootstrap_via_mover(
                 }
                 finalize_bootstrap(
                     ctx, repo, namespace, name, repo_uid, api, backend, &job_name, success,
+                    probe_run,
                 )
                 .await
             }
@@ -624,6 +673,7 @@ async fn bootstrap_via_mover(
     // due, or spec changed) — re-creating unconditionally would pin the refresh
     // cadence to the Job TTL instead of `catalog.refreshInterval`.
     if !(reverify
+        || probe_due
         || catalog::bootstrap_create_due(
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
             repo.metadata.generation,
@@ -634,14 +684,18 @@ async fn bootstrap_via_mover(
             chrono::Utc::now(),
         ))
     {
-        return Ok(Action::requeue(catalog::reconcile_interval(
-            repo.spec.catalog.as_ref(),
-        )));
+        return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
 
     // Build + apply the Job (ConfigMap carries the work spec; the result is
     // written back into the same ConfigMap under `result.json`).
-    let create_enabled = kopiur_api::common::create_enabled(repo.spec.create.as_ref());
+    // Part A: the mover work spec only carries `auto_create` for a never-bootstrapped
+    // repo. A once-`Ready` repo (pinned `uniqueId`) re-runs its bootstrap as a pure
+    // connect probe — it can never silently recreate over a vanished backend.
+    let create_enabled = health::auto_create_allowed(
+        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+    );
     let work_spec = bootstrap_work_spec(
         backend,
         name,
@@ -780,8 +834,15 @@ async fn bootstrap_via_mover(
     let job = jobs::build_job(&inputs);
     io::apply_mover_objects(&ctx.client, namespace, &job_name, &cm, &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored.
-    let mut create_status =
-        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() });
+    // A health-probe re-run of an already-`Ready` repo keeps its phase `Ready`
+    // (`keep_ready_on_launch`) so backups/replication are never paused while the
+    // probe connects; only a first bootstrap or a spec-change re-bootstrap shows
+    // `Initializing`.
+    let mut create_status = if keep_ready_on_launch {
+        serde_json::json!({ "backend": backend.kind_str() })
+    } else {
+        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() })
+    };
     if let Some(token) = reverify_token {
         create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
     }
@@ -878,6 +939,11 @@ async fn finalize_bootstrap(
     backend: &Backend,
     job_name: &str,
     job_succeeded: bool,
+    // True when this is a health-probe re-run of an already-`Ready` repo (same
+    // spec): the result is interpreted as a probe (phase stays `Ready`, the
+    // `BackendReachable` condition carries the outcome) and the Job is consumed
+    // exactly once (deleted after processing).
+    probe_run: bool,
 ) -> Result<Action> {
     let result = read_bootstrap_result(ctx, namespace, job_name).await?;
 
@@ -894,6 +960,12 @@ async fn finalize_bootstrap(
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
         io::BootstrapOutcome::Failed(failure) => {
+            // Health-probe failure on an already-`Ready` repo: alert-only. Keep the
+            // phase `Ready` (never halt backups/replication), surface the debounced
+            // `BackendReachable` condition + Warning event, and NEVER auto-recreate.
+            if probe_run {
+                return finalize_probe_failure(ctx, repo, api, name, job_name, &failure).await;
+            }
             let reason = failure.reason();
             let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
             // Guard the write so a re-confirmed failure fires the Event + warn log only
@@ -959,6 +1031,30 @@ async fn finalize_bootstrap(
         index_blob_event = upd.event;
         // Merge-patch: setting storageStats.indexBlobCount preserves snapshotCount.
         status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
+    }
+    // A successful health probe: clear any prior `BackendReachable=False`/failure
+    // debounce and stamp `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally
+    // here because a probe run consumes its Job exactly once (deleted below), so this
+    // never re-runs on the same result — no status churn.
+    if probe_run {
+        let now = chrono::Utc::now().to_rfc3339();
+        let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
+        conditions = upd.conditions;
+        // Explicit-null patch so the merge clears the failure counters (a `None`
+        // would be elided and leave the prior streak, re-firing on the next failure).
+        status_patch["health"] = health::probe_success_health_patch(&now);
+        // Part A invariant: a probe NEVER rebinds identity. Keep the pinned
+        // `uniqueId` so a backend re-initialized at the old location by another party
+        // (same password) can't silently overwrite `status.uniqueId` on connect.
+        if let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
+            if result.unique_id.as_deref() != Some(pinned) {
+                tracing::warn!(
+                    repo = %name, pinned, observed = ?result.unique_id,
+                    "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+                );
+            }
+            status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
+        }
     }
     status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
     // Guarded write: this path re-runs on EVERY reconcile while the finished
@@ -1034,9 +1130,118 @@ async fn finalize_bootstrap(
         .await;
     }
 
-    Ok(Action::requeue(catalog::reconcile_interval(
-        repo.spec.catalog.as_ref(),
-    )))
+    // A probe consumes its Job exactly once: delete it so the steady state has no
+    // lingering finished Job to re-read (no churn) and the next probe is a fresh
+    // connect. Requeue on the probe cadence (or the catalog cadence, whichever is
+    // sooner) so the next probe fires on time even when `periodicRefresh` is off.
+    if probe_run {
+        delete_bootstrap_job(ctx, namespace, job_name).await?;
+    }
+    Ok(Action::requeue(probe_aware_reconcile_interval(repo)))
+}
+
+/// Health-probe failure on an already-`Ready` `Repository`: alert-only. Keeps the
+/// phase `Ready`, folds the debounced `BackendReachable` condition + (on a
+/// transition) a Warning event + metric, deletes the consumed Job, and requeues on
+/// the probe cadence. NEVER changes the phase and NEVER auto-recreates.
+async fn finalize_probe_failure(
+    ctx: &Context,
+    repo: &Repository,
+    api: &Api<Repository>,
+    name: &str,
+    job_name: &str,
+    failure: &io::BootstrapFailure,
+) -> Result<Action> {
+    let namespace = repo
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let kind = if failure.is_repository_absent() {
+        health::ProbeFailureKind::Vanished
+    } else {
+        health::ProbeFailureKind::Unreachable
+    };
+    let existing = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let upd = health::reconcile_probe_failure(
+        &existing,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        kind,
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
+            repo.spec.health.as_ref(),
+        ),
+        &now,
+        repo.metadata.generation,
+    );
+    // Phase stays `Ready` (set explicitly so a stray `Initializing`/`Degraded` from
+    // an earlier path self-heals); the alert lives entirely in the condition.
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({
+            "phase": "Ready",
+            "health": upd.health,
+            "conditions": upd.conditions,
+        }),
+    )
+    .await?;
+    if let Some(w) = upd.event {
+        let kind_label = match kind {
+            health::ProbeFailureKind::Vanished => "vanished",
+            health::ProbeFailureKind::Unreachable => "unreachable",
+        };
+        ctx.metrics
+            .inc_health_probe_failure(&namespace, name, "Repository", kind_label);
+        if wrote {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+            tracing::warn!(repo = %name, reason = w.reason, "repository health probe raised an alert");
+        }
+    }
+    delete_bootstrap_job(ctx, &namespace, job_name).await?;
+    Ok(Action::requeue(probe_aware_reconcile_interval(repo)))
+}
+
+/// Delete a finished bootstrap Job + its result ConfigMap, tolerating a 404 (the
+/// kube TTL controller may have reaped it first). Used to consume a probe Job
+/// exactly once.
+async fn delete_bootstrap_job(ctx: &Context, namespace: &str, job_name: &str) -> Result<()> {
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    match job_api.delete(job_name, &DeleteParams::background()).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+    match cm_api.delete(job_name, &DeleteParams::default()).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    Ok(())
+}
+
+/// The steady-state requeue for a `Repository`, shortened to the health-probe
+/// cadence when the probe is enabled (so a sub-5m probe interval actually fires on
+/// time, independent of `catalog.periodicRefresh`).
+fn probe_aware_reconcile_interval(repo: &Repository) -> Duration {
+    let base = catalog::reconcile_interval(repo.spec.catalog.as_ref());
+    if kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref()) {
+        base.min(
+            kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
+                repo.spec.health.as_ref(),
+            ),
+        )
+    } else {
+        base
+    }
 }
 
 /// Upsert the `Bootstrapped` condition onto the repository's existing conditions.
@@ -1098,13 +1303,12 @@ async fn run_catalog_scan(
     )
     .await?;
 
-    // Logical bytes under management is recorded directly from kopia's data
-    // (the status field is a human string, so the gauge bypasses it).
-    ctx.metrics.set_repo_size_bytes(
-        namespace,
-        repo_name,
-        logical_bytes_under_management(listing),
-    );
+    // Logical bytes under management is recorded directly from kopia's data, both as
+    // the metric gauge and as `storageStats.totalSizeBytes` (the integer form of the
+    // human `total_size`), which backup preflight reads as `repository.sizeBytes`.
+    let size_bytes = logical_bytes_under_management(listing);
+    ctx.metrics
+        .set_repo_size_bytes(namespace, repo_name, size_bytes);
 
     let api: Api<Repository> = Api::namespaced(ctx.client.clone(), namespace);
     io::patch_status(
@@ -1115,7 +1319,7 @@ async fn run_catalog_scan(
                 "discoveredBackupCount": outcome.discovered,
                 "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
             },
-            "storageStats": { "snapshotCount": total_snapshot_count },
+            "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),
     )
     .await?;

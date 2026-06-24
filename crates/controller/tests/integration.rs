@@ -129,6 +129,7 @@ fn sample_backup_config(name: &str) -> SnapshotPolicy {
             error_handling: None,
             upload: None,
             verification: None,
+            preflight: None,
             suspend: false,
             hooks: None,
             mover: None,

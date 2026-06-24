@@ -1,0 +1,70 @@
+# Example 27 — Opt-in backend health probe (detect a wiped/unreachable repository)
+#
+# Once a Repository reaches `Ready`, an object-store / volume-backed backend is
+# NOT re-checked on the steady-state heartbeat — so a repository that is wiped or
+# becomes unreachable between backups goes unnoticed until the next backup fails.
+# `spec.health.probe` opts that Repository into a periodic backend re-connect.
+#
+# It is ALERT-ONLY by design:
+#   * the Repository stays `Ready` (backups & replication keep running) — the
+#     result surfaces as the `BackendReachable` condition + a Warning Event +
+#     the `kopiur_repository_health_probe_failures` metric;
+#   * kopiur NEVER auto-recreates a once-`Ready` repository — a wipe and a
+#     transient outage look alike, and recreating an empty repo over a real one
+#     destroys restorability. Re-creating is always a deliberate human action.
+#
+# Two distinct alerts are raised (after the debounce):
+#   * RepositoryVanished   — backend reachable, but the kopia repository is gone.
+#   * BackendReachable=False (BackendUnreachable) — unreachable / mount / auth fault.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the bucket
+# lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    # `create.enabled` governs the FIRST bootstrap only. Even with it true, kopiur
+    # never recreates a repository that has already been `Ready` — the probe alerts,
+    # it does not act (the data-safety invariant).
+    enabled: true
+  # --8<-- [start:health]
+  health:
+    # Opt-in backend health probe. Off by default; everything below is inert
+    # until `enabled: true`.
+    probe:
+      enabled: true
+      # How often to re-connect the backend (Go-style duration; min 30s, default 30m).
+      interval: 30m
+      # Consecutive failing probes required before the alert fires (default 3).
+      # Debounces a single transient blip (an S3 list-after-delete race, a NAS
+      # reboot) from alarming or nudging a destructive manual recreate.
+      failureThreshold: 3
+  # --8<-- [end:health]

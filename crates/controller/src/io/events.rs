@@ -426,6 +426,24 @@ impl BootstrapFailure {
         }
     }
 
+    /// Whether this failure means "the backend answered but the kopia repository
+    /// is absent" (an empty/uninitialized backend) rather than "the backend is
+    /// unreachable / the connect otherwise failed". Only the
+    /// [`RepositoryNotInitialized`](Self::RepositoryNotInitialized) sentinel — which
+    /// the mover emits *only* for a genuine `repository not initialized`, never a
+    /// missing path/mount — qualifies. The health probe uses this to choose between
+    /// `RepositoryVanished` and `BackendUnreachable`; it must stay exhaustive so a
+    /// new failure variant can't silently default to "repository absent" (which
+    /// could, in a future auto-recreate, be catastrophic).
+    pub fn is_repository_absent(&self) -> bool {
+        match self {
+            BootstrapFailure::RepositoryNotInitialized => true,
+            BootstrapFailure::Backend { .. } | BootstrapFailure::JobFailedWithoutResult { .. } => {
+                false
+            }
+        }
+    }
+
     /// The stable, actionable condition message (what failed / why / how to find
     /// the cause). Volatile-free so the guarded status write stays a no-op across
     /// repeated identical failures (no hot-loop — see [`crate::io::patch_status_if_changed`]).

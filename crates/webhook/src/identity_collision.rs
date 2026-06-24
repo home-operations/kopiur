@@ -262,6 +262,7 @@ mod tests {
             error_handling: None,
             upload: None,
             verification: None,
+            preflight: None,
             suspend: false,
             hooks: None,
             mover: None,

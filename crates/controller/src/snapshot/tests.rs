@@ -96,6 +96,59 @@ fn run_decision_covers_every_phase() {
     );
 }
 
+#[test]
+fn should_run_preflight_only_at_first_launch() {
+    use kopiur_api::snapshot::SnapshotPhase;
+    // First launch: gate runs.
+    assert!(should_run_preflight(None));
+    assert!(should_run_preflight(Some(SnapshotPhase::Pending)));
+    // A Running snapshot whose Job vanished resumes — preflight must NOT re-gate it.
+    assert!(!should_run_preflight(Some(SnapshotPhase::Running)));
+    // Terminal/other phases never reach the gate, but be explicit.
+    assert!(!should_run_preflight(Some(SnapshotPhase::Succeeded)));
+    assert!(!should_run_preflight(Some(SnapshotPhase::Failed)));
+}
+
+#[test]
+fn preflight_expired_anchors_on_since_and_honors_indefinite() {
+    use chrono::{DateTime, Duration as ChronoDuration};
+    use std::time::Duration;
+    let t0 = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let since = t0.to_rfc3339();
+    let timeout = Some(Duration::from_secs(600));
+    // Not yet elapsed.
+    assert!(!preflight_expired(
+        Some(&since),
+        timeout,
+        t0 + ChronoDuration::seconds(300)
+    ));
+    // Exactly/over the deadline → expired.
+    assert!(preflight_expired(
+        Some(&since),
+        timeout,
+        t0 + ChronoDuration::seconds(600)
+    ));
+    assert!(preflight_expired(
+        Some(&since),
+        timeout,
+        t0 + ChronoDuration::seconds(9000)
+    ));
+    // No anchor yet (failure just started) → never expired.
+    assert!(!preflight_expired(
+        None,
+        timeout,
+        t0 + ChronoDuration::seconds(9000)
+    ));
+    // Indefinite (timeout None, e.g. spec `timeout: 0`) → never expired.
+    assert!(!preflight_expired(
+        Some(&since),
+        None,
+        t0 + ChronoDuration::seconds(9_000_000)
+    ));
+}
+
 // --- §2 phase → Ready mapping ---
 
 #[test]
@@ -164,6 +217,7 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
             error_handling: None,
             upload: None,
             verification: None,
+            preflight: None,
             suspend: false,
             hooks: None,
             mover: None,
@@ -232,6 +286,7 @@ fn config_with_source(name: &str, source: kopiur_api::snapshot_policy::Source) -
             error_handling: None,
             upload: None,
             verification: None,
+            preflight: None,
             suspend: false,
             hooks: None,
             mover: None,

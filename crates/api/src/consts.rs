@@ -146,6 +146,41 @@ pub const DEFAULT_CATALOG_REFRESH_INTERVAL: std::time::Duration =
 /// this is Job churn with no operational value.
 pub const MIN_CATALOG_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Default `spec.health.probe.interval` when unset: how often an opt-in backend
+/// health probe re-connects a `Ready` repository to confirm the kopia repository
+/// still exists at the backend. Off by default; only meaningful once
+/// `spec.health.probe.enabled: true`. Conservative — a vanished/unreachable
+/// repository is rare and the probe runs a short mover Job — so it leans long.
+/// Part of the documented API contract, so it lives here, not in the controller.
+pub const DEFAULT_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Floor for `spec.health.probe.interval`, enforced at admission. Each probe runs
+/// a short mover Job (object-store / volume-backed) or an in-process connect;
+/// anything faster than this is Job churn with no operational value. Shares the
+/// 30s floor with the catalog re-scan for the same reason.
+pub const MIN_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default `spec.health.probe.failureThreshold`: how many *consecutive* failing
+/// probes must accumulate before the loud `RepositoryVanished` / `BackendReachable=False`
+/// condition is raised and an event fired. Debounces a single transient blip
+/// (an S3 list-after-delete race, a NAS reboot, a credential-rotation moment)
+/// from alarming on-call or nudging a destructive manual recreate.
+pub const DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD: i64 = 3;
+
+/// Default `SnapshotSchedule.spec.failedJobsHistoryLimit` when unset: how many
+/// `Failed` `Snapshot` CRs from a schedule to retain (the rest are pruned). Bounds
+/// failure history so a schedule firing against a persistently-failing precondition
+/// or backend doesn't accumulate `Failed` CRs forever. GFS retention applies only to
+/// successful snapshots, so this is the *only* bound on failures (ADR-0003). Part of
+/// the documented API contract, so it lives here, not in the controller.
+pub const DEFAULT_FAILED_JOBS_HISTORY_LIMIT: u32 = 10;
+
+/// The effective failed-history limit: `failedJobsHistoryLimit` when set, else
+/// [`DEFAULT_FAILED_JOBS_HISTORY_LIMIT`]. `Some(0)` keeps no failed snapshots.
+pub fn effective_failed_jobs_history_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
