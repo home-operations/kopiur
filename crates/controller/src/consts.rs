@@ -31,6 +31,11 @@ pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
 /// because a `SnapshotPolicy.spec.preflight` check is not satisfied. The backup
 /// never launches until every preflight check passes.
 pub const PREFLIGHT_FAILED_REASON: &str = "PreflightFailed";
+/// `reason` when a preflight-gated backup is held in `Pending` because the
+/// `Maintenance` informer cache has not finished its initial sync yet (so
+/// maintenance recency can't be trusted). Surfaced so a never-syncing informer
+/// (e.g. missing RBAC on `Maintenance`) is diagnosable instead of a silent stall.
+pub const PREFLIGHT_WAITING_REASON: &str = "WaitingForPreflightData";
 /// Default `spec.preflight.timeout` when unset: how long a `Snapshot` is held in
 /// `Pending` while a preflight check is unsatisfied before it transitions to
 /// `Failed`. Bounded so scheduled backups don't pile up `Pending` CRs.

@@ -1195,6 +1195,43 @@ fn backup_schedule_aggregate_rejects_bad_timezone() {
     );
 }
 
+#[test]
+fn backup_schedule_aggregate_rejects_bad_jitter() {
+    use crate::common::PolicyRef;
+    use crate::snapshot_schedule::ScheduleSpec;
+    let mk = |jitter: &str| SnapshotScheduleSpec {
+        policy_ref: Some(PolicyRef {
+            name: "c".into(),
+            namespace: None,
+        }),
+        policy_selector: None,
+        schedule: ScheduleSpec {
+            cron: "0 2 * * *".into(),
+            jitter: Some(jitter.into()),
+            timezone: None,
+            run_on_create: false,
+            suspend: false,
+            concurrency_policy: Default::default(),
+            starting_deadline_seconds: None,
+        },
+        failed_jobs_history_limit: None,
+    };
+    // Unparseable / overflowing jitter is rejected at admission rather than silently
+    // degrading to no-jitter at reconcile.
+    for bad in ["every-hour", "9999999999999999h"] {
+        let errs = validate_backup_schedule(&mk(bad));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. } if field == "spec.schedule.jitter"
+            )),
+            "jitter {bad:?} must be rejected: {errs:?}"
+        );
+    }
+    // A valid jitter is accepted.
+    assert!(validate_backup_schedule(&mk("30m")).is_empty());
+}
+
 // --- §10 policyRef XOR policySelector ---
 
 #[test]

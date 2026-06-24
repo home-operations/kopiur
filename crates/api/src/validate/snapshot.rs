@@ -90,12 +90,21 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             if let Err(e) = validate_timezone(q.timezone.as_deref()) {
                 errs.push(e);
             }
+            if let Err(e) = validate_jitter("spec.verification.quick.jitter", q.jitter.as_deref()) {
+                errs.push(e);
+            }
         }
         if let Some(d) = &v.deep {
             if let Err(e) = validate_cron(&d.schedule.cron) {
                 errs.push(e);
             }
             if let Err(e) = validate_timezone(d.schedule.timezone.as_deref()) {
+                errs.push(e);
+            }
+            if let Err(e) = validate_jitter(
+                "spec.verification.deep.schedule.jitter",
+                d.schedule.jitter.as_deref(),
+            ) {
                 errs.push(e);
             }
         }
@@ -261,6 +270,9 @@ pub fn validate_backup_schedule(spec: &SnapshotScheduleSpec) -> Vec<ValidationEr
         errs.push(e);
     }
     if let Err(e) = validate_timezone(spec.schedule.timezone.as_deref()) {
+        errs.push(e);
+    }
+    if let Err(e) = validate_jitter("spec.schedule.jitter", spec.schedule.jitter.as_deref()) {
         errs.push(e);
     }
     errs

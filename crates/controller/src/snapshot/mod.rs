@@ -496,40 +496,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the pod would only fail on `kopia repository connect`. Hold the Snapshot in
     // `Pending` and requeue until the repository's own reconcile marks it `Ready`.
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
-    //
-    // Readiness — plus the live preflight inputs ONLY when a preflight block exists.
-    // The full gather clones the Maintenance informer store, so the common
-    // no-preflight backup keeps the cheap single-GET `repository_ready` path.
-    let now = chrono::Utc::now();
-    let has_preflight = config
-        .spec
-        .preflight
-        .as_ref()
-        .is_some_and(|p| !p.checks.is_empty());
-    let (pf_inputs, repo_ready) = if has_preflight {
-        // A cold Maintenance informer would make maintenance recency fail closed
-        // (has_run=false) and could spuriously fail a maintenance-gated preflight;
-        // hold briefly until the store has synced rather than evaluate stale state.
-        if !ctx
-            .maintenance_synced
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Ok(Action::requeue(Duration::from_secs(5)));
-        }
-        let (inputs, ready) = io::gather_preflight_inputs(
-            &ctx.client,
-            &config.spec.repository,
-            &namespace,
-            &ctx.maintenance_store,
-            now,
-        )
-        .await?;
-        (Some(inputs), ready)
-    } else {
-        let ready = io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await?;
-        (None, ready)
-    };
-    if !repo_ready {
+    // A cheap single GET — independent of preflight, so it's evaluated FIRST and the
+    // repository-not-ready reason is always surfaced before any preflight machinery.
+    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
@@ -551,22 +520,55 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // (`None`/`Pending`) — a `Running` snapshot whose Job vanished resumes, never
     // re-gated. A failing check holds the Snapshot `Pending` (`PreflightFailed`) and,
     // once `spec.preflight.timeout` elapses from `status.preflightSince`, fails it
-    // (bounded so scheduled backups don't pile up `Pending` CRs).
-    if has_preflight
+    // (bounded so scheduled backups don't pile up `Pending` CRs). `preflight` is the
+    // single source of truth here — bound once, so `pf_inputs` is a plain value.
+    if let Some(pf) = config
+        .spec
+        .preflight
+        .as_ref()
+        .filter(|p| !p.checks.is_empty())
         && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
-        && let Some(pf_inputs) = pf_inputs.as_ref()
     {
-        let pf = config
-            .spec
-            .preflight
-            .as_ref()
-            .expect("has_preflight ⇒ Some");
+        let now = chrono::Utc::now();
+        // Maintenance recency is read from the shared informer; a not-yet-synced
+        // (cold/empty) store would fail closed and could spuriously block a
+        // maintenance-gated check. Surface the wait so a never-syncing informer
+        // (e.g. missing RBAC on `Maintenance`) is diagnosable, not a silent stall.
+        if !ctx
+            .maintenance_synced
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let current = serde_json::to_value(&backup.status).ok();
+            io::patch_status_if_changed(
+                &api,
+                &name,
+                current.as_ref(),
+                snapshot_ready_status(
+                    backup,
+                    SnapshotPhase::Pending,
+                    crate::consts::PREFLIGHT_WAITING_REASON,
+                    "waiting for the Maintenance cache to sync before evaluating preflight checks",
+                ),
+            )
+            .await?;
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+        // The gather (which clones the Maintenance store for recency) runs only here,
+        // so the common no-preflight backup never pays for it.
+        let (pf_inputs, _ready) = io::gather_preflight_inputs(
+            &ctx.client,
+            &config.spec.repository,
+            &namespace,
+            &ctx.maintenance_store,
+            now,
+        )
+        .await?;
         // First failing check (AND semantics). Distinguish a check that returned
         // `false` (precondition unmet) from one that ERRORED (couldn't be evaluated
         // against live state) — the latter is a config/transient fault, surfaced
         // distinctly so it's diagnosable from the CR, not silently merged into "unmet".
         let failed = pf.checks.iter().find_map(|c| {
-            match kopiur_api::eval_preflight_expr(&c.expr, pf_inputs) {
+            match kopiur_api::eval_preflight_expr(&c.expr, &pf_inputs) {
                 Ok(true) => None,
                 Ok(false) => Some((c, None)),
                 Err(e) => Some((c, Some(e))),
@@ -624,6 +626,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             } else {
                 Action::requeue(Duration::from_secs(30))
             });
+        }
+        // All checks passed. Clear the one-shot deadline anchor so a *later* failing
+        // episode (e.g. this Snapshot is held `Pending` again by a downstream gate
+        // like missing credentials, then a check flaps back) starts with a fresh
+        // timeout budget instead of the stale anchor from this episode.
+        if backup
+            .status
+            .as_ref()
+            .and_then(|s| s.preflight_since.as_ref())
+            .is_some()
+        {
+            io::patch_status(&api, &name, serde_json::json!({ "preflightSince": null })).await?;
         }
     }
 

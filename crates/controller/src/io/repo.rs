@@ -271,25 +271,24 @@ pub fn repo_status_to_inputs(
     let (last_healthy_known, last_healthy_age_seconds) =
         age_seconds(health.and_then(|h| h.last_healthy_at.as_deref()), now);
     let (last_reverify_known, last_reverify_age_seconds) = age_seconds(last_reverify_at, now);
+    // Counts/sizes fail OPEN for `> N` checks at the UNKNOWN_AGE sentinel, so a
+    // `*Known` companion is exposed for the user to guard with. `split` derives both
+    // from the SAME Option so the known flag can't desync from its value.
+    let split = |o: Option<i64>| (o.is_some(), o.unwrap_or(UNKNOWN_AGE));
+    let (snapshot_count_known, snapshot_count) = split(storage.and_then(|s| s.snapshot_count));
+    let (index_blob_count_known, index_blob_count) =
+        split(storage.and_then(|s| s.index_blob_count));
+    let (size_bytes_known, size_bytes) = split(storage.and_then(|s| s.total_size_bytes));
     PreflightInputs {
         repository_phase: phase.map(|p| p.label().to_string()).unwrap_or_default(),
         repository_ready: phase == Some(RepositoryPhase::Ready),
         backend_reachable,
-        // Counts/sizes fail OPEN for `> N` checks at the UNKNOWN_AGE sentinel, so a
-        // `*Known` companion is exposed for the user to guard with (a check like
-        // `repository.snapshotCountKnown && repository.snapshotCount > 0`).
-        snapshot_count_known: storage.and_then(|s| s.snapshot_count).is_some(),
-        snapshot_count: storage
-            .and_then(|s| s.snapshot_count)
-            .unwrap_or(UNKNOWN_AGE),
-        index_blob_count_known: storage.and_then(|s| s.index_blob_count).is_some(),
-        index_blob_count: storage
-            .and_then(|s| s.index_blob_count)
-            .unwrap_or(UNKNOWN_AGE),
-        size_bytes_known: storage.and_then(|s| s.total_size_bytes).is_some(),
-        size_bytes: storage
-            .and_then(|s| s.total_size_bytes)
-            .unwrap_or(UNKNOWN_AGE),
+        snapshot_count_known,
+        snapshot_count,
+        index_blob_count_known,
+        index_blob_count,
+        size_bytes_known,
+        size_bytes,
         last_healthy_known,
         last_healthy_age_seconds,
         last_reverify_known,

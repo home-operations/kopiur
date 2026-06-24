@@ -936,8 +936,11 @@ fn repo_status_to_inputs_maps_fields_and_sentinels() {
     assert!(inputs.repository_ready);
     assert!(!inputs.backend_reachable, "BackendReachable=False ⇒ false");
     assert_eq!(inputs.snapshot_count, 7);
+    assert!(inputs.snapshot_count_known);
     assert_eq!(inputs.index_blob_count, 3);
+    assert!(inputs.index_blob_count_known);
     assert_eq!(inputs.size_bytes, 4096);
+    assert!(inputs.size_bytes_known);
     assert!(inputs.last_healthy_known);
     assert_eq!(inputs.last_healthy_age_seconds, 3600);
     assert!(inputs.last_reverify_known);
@@ -951,7 +954,10 @@ fn repo_status_to_inputs_maps_fields_and_sentinels() {
         "no condition ⇒ no evidence of failure"
     );
     assert_eq!(empty.snapshot_count, UNKNOWN_AGE);
+    assert!(!empty.snapshot_count_known, "unobserved count ⇒ not known");
     assert_eq!(empty.size_bytes, UNKNOWN_AGE);
+    assert!(!empty.size_bytes_known);
+    assert!(!empty.index_blob_count_known);
     assert!(!empty.last_healthy_known);
     assert_eq!(empty.last_healthy_age_seconds, UNKNOWN_AGE);
 }

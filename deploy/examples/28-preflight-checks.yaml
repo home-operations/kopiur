@@ -9,13 +9,19 @@
 # It is symmetric with the built-in repository-readiness gate, but user-extensible.
 # Evaluated by the operator at reconcile against LIVE repository + maintenance state:
 #
-#   repository.{phase,ready,backendReachable,snapshotCount,indexBlobCount,sizeBytes,
+#   repository.{phase,ready,backendReachable,
+#               snapshotCountKnown,snapshotCount,indexBlobCountKnown,indexBlobCount,
+#               sizeBytesKnown,sizeBytes,
 #               lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,
 #               lastReverifyAgeSeconds}
 #   maintenance.{hasRun,lastSuccessAgeSeconds}
 #
-# Fail-closed: an unknown age reads as "infinitely old", so a naive freshness check
-# BLOCKS when the value was never observed. Guard with `hasRun` to be explicit.
+# Unobserved values are i64::MAX. For a FRESHNESS check (`< N`) that fails closed
+# (unknown reads as infinitely old → blocks). But for a COUNT/SIZE check (`> N`) the
+# same sentinel fails OPEN, so ALWAYS pair it with the `*Known`/`hasRun` companion so
+# the unknown case fails closed:
+#   maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800
+#   repository.snapshotCountKnown && repository.snapshotCount > 0
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`, NOT `backend: { kind: S3 }`).
@@ -85,6 +91,12 @@ spec:
       - name: backend-reachable
         expr: "repository.backendReachable"
         message: "repository backend is not reachable"
+      # Count/size checks fail OPEN at the unobserved sentinel, so guard with the
+      # `*Known` companion: only require "repo has snapshots" once the count is
+      # actually observed (before the first catalog scan it is unknown → blocks).
+      - name: repo-populated
+        expr: "repository.snapshotCountKnown && repository.snapshotCount > 0"
+        message: "repository snapshot count not yet observed, or repository is empty"
   # --8<-- [end:preflight]
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1

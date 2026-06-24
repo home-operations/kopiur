@@ -228,6 +228,26 @@ pub fn validate_cron(expr: &str) -> ValidationResult {
     }
 }
 
+/// Validate an optional Go-style `jitter` duration (`30m`, `1h`, …) against the SAME
+/// parser the controller uses at scheduling time, so a typo or an out-of-range value
+/// is rejected at apply time rather than silently degrading to *no jitter* at the
+/// next reconcile (`parse_go_duration` returns `None`, which the schedule treats as a
+/// zero offset). `None` (no jitter) is always valid. `field` names the path for the
+/// error message (e.g. `spec.schedule.jitter`).
+pub fn validate_jitter(field: &str, jitter: Option<&str>) -> ValidationResult {
+    if let Some(j) = jitter
+        && crate::duration::parse_go_duration(j).is_none()
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: field.to_string(),
+            reason: format!(
+                "{j:?} is not a valid duration. Use a Go-style duration like 30s, 5m, or 1h"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Validate an optional IANA timezone name against the same `chrono-tz` database the
 /// controller uses at scheduling time, so a typo (e.g. `America/Chicgo`) is rejected at
 /// apply time rather than silently resolving to UTC at the next reconcile. `None` (use
