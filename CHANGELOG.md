@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.13](https://github.com/home-operations/kopiur/compare/0.4.12...0.4.13) (2026-06-24)
+
+
+### Features
+
+* native gdrive backend, rclone/bootstrap timeouts, CRD cleanups ([#152](https://github.com/home-operations/kopiur/issues/152), [#154](https://github.com/home-operations/kopiur/issues/154), [#155](https://github.com/home-operations/kopiur/issues/155)) ([#164](https://github.com/home-operations/kopiur/issues/164)) ([03b336c](https://github.com/home-operations/kopiur/commit/03b336c1b4714da629c222ba9dc403c980b4f102))
+* **probe:** support repo health checks ([#165](https://github.com/home-operations/kopiur/issues/165)) ([d5b9eb2](https://github.com/home-operations/kopiur/commit/d5b9eb2eafa97e6cbed43bf2ac23777651e30acf))
+
+
+### Bug Fixes
+
+* **mise:** hopefully make the mise lock happy now ([d230ac7](https://github.com/home-operations/kopiur/commit/d230ac7e0bd59f6203aa6caa5d88f721f80a9728))
+* **mover:** drop phase from the progress heartbeat (Restore "Running" 422) ([#163](https://github.com/home-operations/kopiur/issues/163)) ([84cdc6c](https://github.com/home-operations/kopiur/commit/84cdc6ce687ae52f731da2dde4de3a5a9500dc94))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.12 manifest ([2117b17](https://github.com/home-operations/kopiur/commit/2117b172613b8bcb2254198467df371a7c6fb1f0))
+
 ## [0.4.12](https://github.com/home-operations/kopiur/compare/0.4.11...0.4.12) (2026-06-22)
 
 
