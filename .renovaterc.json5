@@ -1,17 +1,6 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
-  packageRules: [
-    {
-      matchManagers: ["cargo"],
-      matchDatasources: ["git-refs", "git-tags"],
-      postUpgradeTasks: {
-        commands: ["cargo update --config net.git-fetch-with-cli=true --manifest-path Cargo.toml --package {{{depName}}}"],
-        fileFilters: ["Cargo.lock"],
-        executionMode: "update",
-      },
-    },
-  ],
   postUpgradeTasks: {
     commands: [
       "helm-docs --chart-search-root=deploy/helm --log-level=warn",
