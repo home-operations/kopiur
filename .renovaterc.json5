@@ -1,10 +1,17 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
-  // Regenerate the chart's committed docs after an upgrade so a value bump
-  // doesn't leave README.md / values.schema.json stale and fail helm-docs-check.
-  // Runs the helm-docs + helm-schema binaries shipped in the Renovate container
-  // (mirrors `mise run helm-docs`).
+  packageRules: [
+    {
+      matchManagers: ["cargo"],
+      matchDatasources: ["git-refs", "git-tags"],
+      postUpgradeTasks: {
+        commands: ["cargo update --config net.git-fetch-with-cli=true --manifest-path Cargo.toml --package {{{depName}}}"],
+        fileFilters: ["Cargo.lock"],
+        executionMode: "update",
+      },
+    },
+  ],
   postUpgradeTasks: {
     commands: [
       "helm-docs --chart-search-root=deploy/helm --log-level=warn",
