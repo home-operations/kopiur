@@ -15,7 +15,7 @@ experimental = true
 config_roots = ["crates/e2e"]
 
 [tools]
-rust = { version = "1.95.0", components = "rustfmt,clippy,llvm-tools-preview" }
+rust = { version = "1.96.0", components = "rustfmt,clippy,llvm-tools-preview" }
 lefthook = "2.1.9"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
