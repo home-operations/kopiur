@@ -1,12 +1,4 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
-  postUpgradeTasks: {
-    commands: [
-      "helm-docs --chart-search-root=deploy/helm --log-level=warn",
-      "helm-schema --chart-search-root deploy/helm/kopiur --skip-auto-generation required,additionalProperties --append-newline",
-    ],
-    fileFilters: ["deploy/helm/kopiur/README.md", "deploy/helm/kopiur/values.schema.json"],
-    executionMode: "branch",
-  },
 }
