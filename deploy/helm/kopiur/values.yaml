@@ -190,6 +190,8 @@ controller:
   # -- Extra pod labels / annotations.
   podLabels: {}
   podAnnotations: {}
+  # -- Address the controller server binds to (env KOPIUR_CONTROLLER_ADDR)
+  listenAddr: "0.0.0.0:8081"
   # -- Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).
   probePort: 8081
 

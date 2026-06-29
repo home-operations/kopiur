@@ -25,6 +25,7 @@ pub mod verification;
 pub mod watch;
 pub mod webhook_tls;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -130,6 +131,10 @@ pub async fn run() -> anyhow::Result<()> {
         None => KopiaClientFactory::new(),
     };
 
+    let addr: SocketAddr = std::env::var(config::CONTROLLER_ADDR_ENV)
+        .unwrap_or_else(|_| config::DEFAULT_ADDR.to_string())
+        .parse()?;
+
     // Shared Maintenance informer: a single reflector-backed cache the
     // Repository/ClusterRepository reconcilers read to answer "is a Maintenance
     // configured for me?" without an `Api::list` per reconcile. We drive the
@@ -207,7 +212,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("starting kopiur controllers");
 
-    let http_srv = tokio::spawn(serve_http(metrics.clone()));
+    let http_srv = tokio::spawn(serve_http(addr, metrics.clone()));
     let controllers = spawn_all(client, ctx);
 
     tokio::select! {
@@ -780,7 +785,7 @@ async fn spawn_all(client: Client, ctx: Arc<Context>) {
 /// The controller's HTTP server: `/metrics` (Prometheus exposition) plus real
 /// `/healthz` + `/readyz` endpoints matching the chart's liveness/readiness
 /// probes (the previous raw listener returned the metrics body for any path).
-async fn serve_http(metrics: Metrics) -> anyhow::Result<()> {
+async fn serve_http(addr: SocketAddr, metrics: Metrics) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
@@ -802,11 +807,8 @@ async fn serve_http(metrics: Metrics) -> anyhow::Result<()> {
         .route("/readyz", get(health))
         .with_state(metrics);
 
-    let listener = tokio::net::TcpListener::bind(config::HTTP_ADDR).await?;
-    tracing::info!(
-        addr = config::HTTP_ADDR,
-        "http server listening (/metrics, /healthz, /readyz)"
-    );
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "http server listening (/metrics, /healthz, /readyz)");
     axum::serve(listener, app).await?;
     Ok(())
 }

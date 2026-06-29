@@ -80,6 +80,8 @@ spec:
             # ignoring the cgroup CPU quota) and the opt-in WatchList streaming list.
             - name: KOPIUR_WORKER_THREADS
               value: {{ .Values.controller.workerThreads | quote }}
+            - name: KOPIUR_CONTROLLER_ADDR
+              value: {{ .Values.controller.listenAddr | quote }}
             {{- if .Values.controller.streamingLists }}
             - name: KOPIUR_STREAMING_LISTS
               value: "true"

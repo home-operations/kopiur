@@ -47,9 +47,13 @@ pub const OPERATOR_NAMESPACE_ENV: &str = "KOPIUR_NAMESPACE";
 /// mounts an `emptyDir`; set this only when relocating that mount.
 pub const KOPIA_CACHE_DIR_ENV: &str = "KOPIUR_KOPIA_CACHE_DIR";
 
+/// Address that the controller binds to.
+pub const CONTROLLER_ADDR_ENV: &str = "KOPIUR_CONTROLLER_ADDR";
+
 /// Address the controller's HTTP server (`/metrics`, `/healthz`, `/readyz`)
-/// binds to. Matches the chart's `controller.probePort` (8081).
-pub const HTTP_ADDR: &str = "0.0.0.0:8081";
+/// binds to when [`CONTROLLER_ADDR_ENV`] is unset. Matches the chart's
+/// `controller.probePort` (8081).
+pub const DEFAULT_ADDR: &str = "0.0.0.0:8081";
 
 /// Number of tokio worker threads the controller runtime runs. The controller is
 /// I/O-bound — watch streams, debounced reconciles, short idempotent kopia calls —

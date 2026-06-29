@@ -54,6 +54,12 @@
           "title": "leaderElection",
           "type": "object"
         },
+        "listenAddr": {
+          "default": "0.0.0.0:8081",
+          "description": "Address the controller server binds to (env KOPIUR_CONTROLLER_ADDR)",
+          "title": "listenAddr",
+          "type": "string"
+        },
         "logLevel": {
           "default": "info",
           "description": "DEPRECATED: use the top-level `logging.level` instead. Kept as a fallback\nfor existing values files — `logging.level` wins when both are set. Applies to\nthe controller and webhook (RUST_LOG style: error|warn|info|debug|trace).",

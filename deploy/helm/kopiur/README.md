@@ -66,6 +66,7 @@ Disable the webhook entirely with `webhook.enabled=false` (validation then falls
 | controller.extraVolumeMounts | list | `[]` | Extra volume mounts on the controller container (pairs with extraVolumes). |
 | controller.extraVolumes | list | `[]` | Extra volumes on the controller pod. Use this to make a filesystem-backend repository reachable in-process (hostPath/NFS/PVC) so the controller can run short idempotent kopia ops (ADR §5.4). The e2e harness uses a hostPath here. |
 | controller.leaderElection | object | `{"enabled":true}` | Enable leader election. Required when replicaCount > 1; harmless at 1. |
+| controller.listenAddr | string | `"0.0.0.0:8081"` | Address the controller server binds to (env KOPIUR_CONTROLLER_ADDR) |
 | controller.logLevel | string | `"info"` | DEPRECATED: use the top-level `logging.level` instead. Kept as a fallback for existing values files — `logging.level` wins when both are set. Applies to the controller and webhook (RUST_LOG style: error|warn|info|debug|trace). |
 | controller.nodeSelector | object | `{}` | Scheduling controls. |
 | controller.podAnnotations | object | `{}` |  |
