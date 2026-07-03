@@ -11,7 +11,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use prometheus::{Encoder, Registry, TextEncoder};
 
@@ -73,6 +73,33 @@ fn resource(service_name: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_string())
         .build()
+}
+
+/// The OTel SDK caps every instrument at 2000 distinct attribute sets by
+/// default; past that, additional series silently fold into one
+/// `otel.metric.overflow=true` point instead of erroring
+/// (`opentelemetry_sdk::metrics::internal::aggregate::CARDINALITY_LIMIT_DEFAULT`).
+/// Kopiur's per-resource instruments (one series per CR, times a handful of
+/// label values — e.g. `kopiur_resource_phase`) blow past 2000 on any busy
+/// cluster: 559 Snapshots × 6 phases ≈ 3,354 attribute sets on that instrument
+/// alone silently dropped per-CR series (GitHub issue #175). Every `kopiur_*`
+/// instrument is per-resource by construction, so raising the limit crate-wide
+/// is harmless and cheaper to maintain than an exhaustive name list that a
+/// future metric could forget to add to.
+const HIGH_CARDINALITY_LIMIT: usize = 20_000;
+
+/// Provider view that raises [`HIGH_CARDINALITY_LIMIT`] for every `kopiur_*`
+/// instrument, leaving name/description/unit/aggregation untouched for all
+/// instruments (including non-`kopiur_` ones, which this returns `None` for
+/// and so keep the SDK default view entirely).
+fn cardinality_view(instrument: &Instrument) -> Option<Stream> {
+    if !instrument.name().starts_with("kopiur_") {
+        return None;
+    }
+    Stream::builder()
+        .with_cardinality_limit(HIGH_CARDINALITY_LIMIT)
+        .build()
+        .ok()
 }
 
 /// Console log format for the fmt layer. Selected by `KOPIUR_LOG_FORMAT`.
@@ -167,9 +194,13 @@ impl MetricsProvider {
                 source: Box::new(e),
             })?;
 
+        // The view is provider-level, so it applies to every reader attached
+        // below — the always-on prometheus exporter and the optional OTLP
+        // `PeriodicReader` — without any reader-specific wiring.
         let mut builder = SdkMeterProvider::builder()
             .with_reader(prom_exporter)
-            .with_resource(resource(service_name));
+            .with_resource(resource(service_name))
+            .with_view(cardinality_view);
 
         if let Some(cfg) = otlp.as_ref() {
             match build_metric_exporter(cfg) {
@@ -457,6 +488,45 @@ mod tests {
         assert!(
             text.contains("kopiur_test_total"),
             "exposition missing counter: {text}"
+        );
+    }
+
+    /// Regression test for GitHub issue #175: the OTel SDK's default
+    /// per-instrument cardinality limit (2000 attribute sets) silently
+    /// collapses every series past the limit into a single
+    /// `otel.metric.overflow=true` point. Busy clusters (e.g. 559 Snapshots ×
+    /// 6 phases ≈ 3,354 attribute sets on `kopiur_resource_phase` alone)
+    /// blow past 2000, so per-CR series vanish. This exercises 2500 distinct
+    /// attribute sets (> 2000) on a `kopiur_`-prefixed instrument and asserts
+    /// every series survives with no overflow series present.
+    #[test]
+    fn per_resource_instrument_cardinality_exceeds_default_limit() {
+        let mp = MetricsProvider::build("kopiur-test", None).expect("build offline");
+        // Same instrument kind the controller actually uses for this metric
+        // (crates/controller/src/metrics.rs) — an `i64_gauge`, which the
+        // prometheus exporter exposes under the exact instrument name (unlike
+        // counters, which get a `_total` suffix).
+        let gauge = mp.meter().i64_gauge("kopiur_resource_phase").build();
+        const N: usize = 2500;
+        for i in 0..N {
+            gauge.record(
+                1,
+                &[opentelemetry::KeyValue::new("name", format!("res-{i}"))],
+            );
+        }
+        let text = String::from_utf8(mp.gather()).expect("utf8 exposition");
+
+        let series_count = text
+            .lines()
+            .filter(|l| l.starts_with("kopiur_resource_phase{"))
+            .count();
+        assert_eq!(
+            series_count, N,
+            "expected all {N} distinct attribute sets to be present as series, got {series_count}"
+        );
+        assert!(
+            !text.contains("otel_metric_overflow") && !text.contains("otel.metric.overflow"),
+            "overflow series present; cardinality limit was not raised: {text}"
         );
     }
 
