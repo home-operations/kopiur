@@ -43,7 +43,7 @@ these types; don't re-invent them, and don't add `Eq`.
 
 ### Materialized defaults vs `skip_serializing_if`
 
-Fields like `copyMethod` (`Direct`), `mode` (`ReadWrite`), `onNamespaceDelete`
+Fields like `copyMethod` (`Snapshot`), `mode` (`ReadWrite`), `onNamespaceDelete`
 (`Orphan`), `concurrencyPolicy` (`Forbid`), `runOnCreate` (`false`), and
 `fromPolicy.offset` (`0`) carry a **real OpenAPI `default:`** in the schema rather than
 being `Option` + `skip_serializing_if`. A named `default_*` fn backs **both**
@@ -150,12 +150,17 @@ name/key, so a rename with identical content must pass (locking it broke GitOps)
 
 ### SnapshotPolicy
 
-- **`copyMethod` default `Direct`** — `Direct` (read the live PVC) is the default for
-  backward-compat and portability: it was the behavior in effect before `copyMethod` was
-  wired (the field was inert) and works on any storage with no CSI snapshot stack.
-  ADR-0005 §1 originally proposed `Snapshot` as the default, but defaulting to it would
-  silently break every existing policy / non-CSI source on upgrade. (The
-  backward-compat reasoning is preserved in full in the `default_copy_method` fn doc.)
+- **`copyMethod` default `Snapshot`** — `Snapshot` (point-in-time CSI `VolumeSnapshot`
+  staging) is the default because it is crash-consistent: kopia reads a frozen capture
+  instead of a live, possibly-mid-write PVC, which matters most for databases and other
+  stateful apps (ADR-0005 §1 originally proposed this default). It requires the CSI
+  snapshot stack + a `VolumeSnapshotClass` for the source's driver; `Direct` (read the
+  live PVC, no CSI required) remains available and is the right choice for non-CSI/static
+  sources — set it explicitly. If the CSI stack is missing under the `Snapshot` default,
+  the operator fails loud with a pointer to install the stack or set `copyMethod:
+  Direct` (see `crates/controller/src/io/staging.rs`). (Earlier releases defaulted to
+  `Direct` for backward-compat with the field's pre-wiring behavior; the reasoning for
+  the flip is preserved in full in the `default_copy_method` fn doc.)
 - **`groupBy`** — must be set explicitly; a silent per-PVC fallback would produce
   inconsistent backups (a data-integrity hazard, ADR §4.9). Multi-PVC fan-out +
   VolumeGroupSnapshot is **not yet wired** (single-PVC staging only today).

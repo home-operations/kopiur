@@ -242,6 +242,9 @@ async fn succeeded_snapshot_is_not_rerun_after_its_job_is_ttl_reaped() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-ttl-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             // Tiny TTL: the finished mover Job is reaped in-test.
             "mover": { "ttlSecondsAfterFinished": JOB_TTL_SECONDS }
@@ -351,6 +354,9 @@ async fn failed_snapshot_is_not_retried_after_its_job_is_ttl_reaped() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-ttl-fail-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "extraArgs": ["--kopiur-e2e-bogus-flag"],
             "mover": { "ttlSecondsAfterFinished": JOB_TTL_SECONDS }
         }

@@ -4,31 +4,36 @@
 
 | Method | What the mover reads | Point-in-time? | Decoupled from the app's node? | Requires |
 | --- | --- | --- | --- | --- |
-| **`Direct`** _(default)_ | Your **live** source PVC, read-only | ❌ no (crash-consistent live read) | ❌ no (co-located with the app) | Nothing — works on any storage |
-| **`Snapshot`** | A temporary PVC restored from a CSI **VolumeSnapshot** of your source | ✅ yes | ✅ yes | CSI snapshot stack + a `VolumeSnapshotClass` |
+| **`Snapshot`** _(default)_ | A temporary PVC restored from a CSI **VolumeSnapshot** of your source | ✅ yes | ✅ yes | CSI snapshot stack + a `VolumeSnapshotClass` |
 | **`Clone`** | A temporary **CSI clone** of your source PVC | ✅ yes (at clone time) | ✅ yes | CSI driver with volume-clone support |
+| **`Direct`** | Your **live** source PVC, read-only | ❌ no (crash-consistent live read) | ❌ no (co-located with the app) | Nothing — works on any storage |
 
 ## Which should I use?
 
 ```text
-Do you need a point-in-time, app-decoupled backup (e.g. a database)?
+Do you have (or can you install) the CSI snapshot stack for this source?
 │
-├─ No  ────────────────────────────────────────────►  Direct
-│         (config, media, file shares; simplest; works everywhere)
+├─ Yes  ─────────────────────────────────────────────►  Snapshot   (default, preferred)
+│         (crash-consistent, point-in-time, decoupled from the app's node)
 │
-└─ Yes
-    │
-    ├─ Does your CSI driver support VolumeSnapshots?  ──►  Snapshot   (preferred)
-    │
-    └─ Only volume cloning, not snapshots?  ───────────►  Clone
+│         Only volume cloning, not snapshots?  ────►  Clone
+│
+└─ No — no CSI snapshot support, or a static/hostPath/non-CSI source  ─►  Direct
+          (config, media, file shares; simplest; works everywhere; set explicitly)
 ```
 
-- **Start with `Direct`** if you don't have (or don't want to maintain) the CSI snapshot stack — it just works.
-- **Use `Snapshot`** for databases and anything where you want a consistent, point-in-time capture that doesn't tie the backup to the node your app runs on.
+- **Start with `Snapshot`** (the default) — crash-consistent, point-in-time, and decoupled from the node your app runs on. Best for databases and anything you don't want tied to app placement.
+- **Set `copyMethod: Direct` explicitly** if you don't have (or don't want to maintain) the CSI snapshot stack, or the source is a static/non-CSI volume (hostPath, some NFS setups) — it works on any storage, no CSI required.
 - **Use `Clone`** only if your driver does cloning but not snapshots (uncommon).
 
-!!! note "`Direct` is the default"
-    `copyMethod` defaults to `Direct` so backups work on **any** storage with no extra setup. Opt into `Snapshot` (or `Clone`) per-policy when you want a point-in-time, app-decoupled capture **and** your cluster has the CSI snapshot stack. (When you do opt in but the stack/class is missing, the backup fails with a clear condition — it never silently falls back.)
+!!! note "`Snapshot` is the default"
+    `copyMethod` defaults to `Snapshot` because it is **crash-consistent**: kopia reads a frozen point-in-time capture instead of a live, possibly-mid-write PVC — the difference matters most for databases and other stateful apps. It requires the CSI snapshot stack (external-snapshotter + a `VolumeSnapshotClass` for your source's driver). If your cluster doesn't have it, or the source is a static/non-CSI volume, set `copyMethod: Direct` explicitly. When the stack/class is missing and `copyMethod` was left at its default, the backup fails with a clear condition telling you exactly what to install or which field to set — it never silently falls back to a live read.
+
+!!! warning "Upgrading? Two hazards when `copyMethod` is left implicit"
+    `copyMethod` began defaulting to `Snapshot` as of this release (previously `Direct`). Check any `SnapshotPolicy` that never sets `copyMethod` explicitly:
+
+    1. **No CSI snapshot stack for that source?** It now fails instead of silently reading the live PVC — pin `copyMethod: Direct` on that policy.
+    2. **Server-side re-defaulting**: a server-defaulted field has no field owner under server-side apply. Re-applying an *existing* manifest that omits `copyMethod` can silently flip a stored `Direct` value to `Snapshot` once the CRD is upgraded — pin `copyMethod` explicitly on every `SnapshotPolicy` you manage, especially ones reconciled by GitOps. This also applies to manifests previously produced by `kopiur-migrate`: translations run before this release omit `copyMethod` when the source VolSync object had none set, so they're exposed to this hazard too — re-run the migration (now emits an explicit value) or add `copyMethod: Direct` by hand before re-applying.
 
 ---
 
@@ -88,7 +93,7 @@ The live `app-data` PVC was never mounted by the mover — only the staged copy 
 
 ---
 
-## `Snapshot` — point-in-time CSI snapshot (opt-in)
+## `Snapshot` — point-in-time CSI snapshot (default)
 
 When a backup runs, Kopiur:
 
@@ -143,9 +148,9 @@ Use it when your CSI driver supports cloning (`CLONE_VOLUME`) but not snapshots.
 
 ---
 
-## `Direct` — read the live volume (default)
+## `Direct` — read the live volume (opt-in)
 
-`Direct` mounts your **live** source PVC into the mover, read-only, and kopia reads it in place. No snapshot, no clone, no extra storage — it works on **any** storage, including `local-path`/hostPath that has no snapshot support.
+`Direct` mounts your **live** source PVC into the mover, read-only, and kopia reads it in place. No snapshot, no clone, no extra storage — it works on **any** storage, including `local-path`/hostPath that has no snapshot support. Set `copyMethod: Direct` explicitly on the `SnapshotPolicy` to opt in — it is no longer the default.
 
 Because the live volume is mounted, Kopiur **co-locates** the mover on the node already holding the PVC (for `ReadWriteOnce` volumes), avoiding the Kubernetes *Multi-Attach error*. See [Repositories → `sourceColocation`](repositories.md#sourcecolocation-avoid-the-rwo-multi-attach-error). A `ReadWriteOncePod` source is stricter: it can't be co-mounted by the mover **at all** while your app holds it, so use `Snapshot` (or `Clone`) for those — see [PVC access modes & RWOP](access-modes.md).
 
@@ -171,6 +176,8 @@ Kopiur reaps the staged PVC and VolumeSnapshot when the backup reaches a termina
 `status.staged` on the `Snapshot` records what was created (the VolumeSnapshot + staged PVC names) for visibility.
 
 ## Troubleshooting
+
+If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapshot stack, the backup fails **immediately** on the (default) `Snapshot` attempt — most often with `SnapshotStackMissing` below. The fix in every row is the same shape: install what's missing, **or** pin `copyMethod: Direct` on the policy to opt out of CSI staging.
 
 | Condition / symptom | Cause | Fix |
 | --- | --- | --- |

@@ -134,6 +134,12 @@ pub fn merge_spec(mut base: serde_json::Value, extra: serde_json::Value) -> serd
 }
 
 /// A `SnapshotPolicy` over the shared `e2e-src` source PVC, referencing `repo`.
+///
+/// Pins `copyMethod: Direct` explicitly — `e2e-src` is a statically-provisioned
+/// (hostPath-backed, non-CSI) PVC, and `copyMethod` now defaults to `Snapshot`, which
+/// would fail preflight (`SourceNotCSIProvisioned`) against it. Callers that need CSI
+/// staging (e.g. `copy_methods.rs`) override `copyMethod` via `extra_spec`, which
+/// [`merge_spec`] applies on top of this base.
 pub fn snapshot_policy_json(
     ns: &str,
     name: &str,
@@ -149,6 +155,7 @@ pub fn snapshot_policy_json(
             "spec": {
                 "repository": { "kind": repo_kind, "name": repo },
                 "sources": [ { "pvc": { "name": "e2e-src" } } ],
+                "copyMethod": "Direct",
                 "retention": { "keepLatest": 5 }
             }
         }),

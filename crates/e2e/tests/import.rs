@@ -607,6 +607,9 @@ async fn catalog_refresh_discovers_out_of_band_snapshots_and_never_duplicates_pr
                 "spec": {
                     "repository": { "kind": "Repository", "name": "e2e-import-refresh" },
                     "sources": [ { "pvc": { "name": consts::PVC_SRC } } ],
+                    // PVC_SRC is a statically-provisioned (non-CSI) hostPath PVC;
+                    // copyMethod now defaults to Snapshot, which would fail preflight.
+                    "copyMethod": "Direct",
                     "retention": { "keepLatest": 5 }
                 }
             })),

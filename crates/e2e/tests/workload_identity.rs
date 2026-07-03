@@ -206,6 +206,9 @@ async fn workload_identity_s3_full_pipeline_without_static_keys() {
                 "spec": {
                     "repository": { "kind": "Repository", "name": "e2e-wi" },
                     "sources": [ { "pvc": { "name": "e2e-src" } } ],
+                    // e2e-src is a statically-provisioned (non-CSI) hostPath PVC;
+                    // copyMethod now defaults to Snapshot, which would fail preflight.
+                    "copyMethod": "Direct",
                     "retention": { "keepLatest": 5 }
                 }
             })),

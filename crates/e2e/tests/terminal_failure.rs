@@ -261,6 +261,9 @@ async fn failed_mover_writes_log_tail_and_failure_block() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-movertail-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "extraArgs": ["--kopiur-e2e-bogus-flag"]
         }
     });

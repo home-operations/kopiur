@@ -66,6 +66,10 @@ fn backup_config_json(name: &str, repo: &str, src_pvc: &str) -> serde_json::Valu
         "spec": {
             "repository": { "kind": "Repository", "name": repo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })
@@ -103,6 +107,10 @@ fn cluster_backup_config_json(name: &str, crepo: &str, src_pvc: &str) -> serde_j
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": crepo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })
@@ -471,6 +479,9 @@ async fn cross_namespace_backup_mints_mover_rbac_and_surfaces_missing_creds() {
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": "e2e-xns-crepo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     });
@@ -610,6 +621,9 @@ async fn privileged_mover_requires_namespace_optin() {
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": "e2e-priv-crepo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "securityContext": { "runAsUser": 0, "runAsGroup": 0 } }
         }
@@ -773,6 +787,9 @@ async fn mover_inherits_security_context_from_workload_pod() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-inherit-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
@@ -952,6 +969,9 @@ async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-root-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
@@ -1106,6 +1126,10 @@ async fn wedged_mover_pod_fails_fast_instead_of_hanging() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-wedge-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight (before the mover
+            // Job is even created) rather than exercising the Unschedulable wedge.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "resources": { "requests": { "cpu": "10000" } } }
         }
@@ -1220,6 +1244,9 @@ async fn backup_mover_applies_explicit_security_and_pod_context() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-scctx-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "securityContext": { "runAsUser": 3000, "runAsGroup": 3000, "runAsNonRoot": true },

@@ -175,6 +175,9 @@ async fn pvc_consumer_auto_derives_security_context() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-scc-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "inheritSecurityContextFrom": { "pvcConsumer": {} } }
         }
@@ -296,6 +299,9 @@ async fn mismatched_mover_is_not_flagged_false_up_front() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-scc-mm-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "securityContext": { "runAsUser": 7777, "runAsGroup": 7777, "runAsNonRoot": true } }
         }

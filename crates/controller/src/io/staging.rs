@@ -114,6 +114,70 @@ pub const REASON_VS_FAILED: &str = "VolumeSnapshotFailed";
 /// can't be snapshotted/cloned.
 pub const REASON_SOURCE_NOT_CSI: &str = "SourceNotCSIProvisioned";
 
+/// Appended to every `StagingOutcome::Failed` message whose fix is "set copyMethod:
+/// Direct" — since `copyMethod` now *defaults* to `Snapshot` (as of this release), a user
+/// who never touched the field can land here with no idea a default even applies. Spells
+/// out both the fact and the fix so the message is actionable without reading the CRD.
+const COPY_METHOD_DEFAULTED_NOTE: &str = "copyMethod defaulted to Snapshot as of this \
+    release; set spec.copyMethod: Direct on the SnapshotPolicy to read the live PVC \
+    without CSI snapshots";
+
+/// Message for [`REASON_STACK_MISSING`]: no `VolumeSnapshotClass` API at all — the CSI
+/// external-snapshotter stack (snapshot-controller + CRDs) isn't installed. This is the
+/// failure most likely to hit a user who never set `copyMethod` and has no CSI snapshot
+/// support in their cluster, so it carries the full default-changed explanation.
+fn stack_missing_message(provisioner: &str) -> String {
+    format!(
+        "the CSI snapshot stack is not installed (no VolumeSnapshotClass API), so \
+         copyMethod: Snapshot cannot run; install the external-snapshotter \
+         (snapshot-controller + CRDs) and a VolumeSnapshotClass for driver \
+         `{provisioner}`, or set copyMethod: Direct. {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
+/// Message for [`REASON_SOURCE_NOT_CSI`] when the source PVC has no `storageClassName` /
+/// CSI provisioner at all (a statically-provisioned or hostPath-backed volume) — the
+/// other common "no CSI available" failure a default-`Snapshot` user can hit blindly.
+fn source_not_csi_message(ns: &str, source_name: &str) -> String {
+    format!(
+        "source PVC `{ns}/{source_name}` has no StorageClass / CSI provisioner, so it \
+         cannot be CSI-snapshotted; use a CSI StorageClass, or set copyMethod: Direct. \
+         {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
+/// Message for [`REASON_SOURCE_NOT_CSI`] when the source PVC itself doesn't exist yet.
+/// Not strictly a "no CSI stack" failure, but `copyMethod: Direct` is still a valid
+/// workaround while the PVC is created, so it carries the same pointer.
+fn source_pvc_not_found_message(ns: &str, source_name: &str, copy_method: CopyMethod) -> String {
+    format!(
+        "source PVC `{ns}/{source_name}` was not found; copyMethod {copy_method:?} needs an \
+         existing CSI-provisioned PVC to snapshot — create the PVC, or set copyMethod: \
+         Direct. {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
+/// Message for [`REASON_NO_CLASS`] / [`ClassDecision::ExplicitNotFound`]: an explicit
+/// `volumeSnapshotClassName` names a class that doesn't exist.
+fn explicit_class_not_found_message(name: &str, provisioner: &str) -> String {
+    format!(
+        "volumeSnapshotClassName `{name}` does not exist; create it (driver \
+         `{provisioner}`), pick an existing class, or set copyMethod: Direct. \
+         {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
+/// Message for [`REASON_NO_CLASS`] / [`ClassDecision::NoneForDriver`]: the CSI stack is
+/// installed but no `VolumeSnapshotClass` matches the source's driver.
+fn no_class_for_driver_message(driver: &str) -> String {
+    format!(
+        "no VolumeSnapshotClass has driver `{driver}` (the source PVC's provisioner); \
+         create a VolumeSnapshotClass for it (optionally annotate it \
+         {DEFAULT_CLASS_ANNOTATION}=true), set volumeSnapshotClassName explicitly, or set \
+         copyMethod: Direct. {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
 /// A `VolumeSnapshotClass` as far as class selection cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassInfo {
@@ -494,10 +558,7 @@ pub async fn resolve_staging(
     let Some(source_pvc) = pvc_api.get_opt(source_name).await? else {
         return Ok(StagingOutcome::Failed {
             reason: REASON_SOURCE_NOT_CSI,
-            message: format!(
-                "source PVC `{ns}/{source_name}` was not found; copyMethod {copy_method:?} needs an \
-                 existing CSI-provisioned PVC to snapshot — create the PVC, or set copyMethod: Direct"
-            ),
+            message: source_pvc_not_found_message(ns, source_name, copy_method),
         });
     };
 
@@ -511,22 +572,14 @@ pub async fn resolve_staging(
         let Some(provisioner) = source_provisioner(client, &source_pvc).await? else {
             return Ok(StagingOutcome::Failed {
                 reason: REASON_SOURCE_NOT_CSI,
-                message: format!(
-                    "source PVC `{ns}/{source_name}` has no StorageClass / CSI provisioner, so it \
-                     cannot be CSI-snapshotted; use a CSI StorageClass, or set copyMethod: Direct"
-                ),
+                message: source_not_csi_message(ns, source_name),
             });
         };
         // Preflight the snapshot stack + pick the class.
         let Some(classes) = list_snapshot_classes(client).await? else {
             return Ok(StagingOutcome::Failed {
                 reason: REASON_STACK_MISSING,
-                message: format!(
-                    "the CSI snapshot stack is not installed (no VolumeSnapshotClass API), so \
-                     copyMethod: Snapshot cannot run; install the external-snapshotter \
-                     (snapshot-controller + CRDs) and a VolumeSnapshotClass for driver \
-                     `{provisioner}`, or set copyMethod: Direct"
-                ),
+                message: stack_missing_message(&provisioner),
             });
         };
         let class = match decide_class(
@@ -538,21 +591,13 @@ pub async fn resolve_staging(
             ClassDecision::ExplicitNotFound(name) => {
                 return Ok(StagingOutcome::Failed {
                     reason: REASON_NO_CLASS,
-                    message: format!(
-                        "volumeSnapshotClassName `{name}` does not exist; create it (driver \
-                         `{provisioner}`), pick an existing class, or set copyMethod: Direct"
-                    ),
+                    message: explicit_class_not_found_message(&name, &provisioner),
                 });
             }
             ClassDecision::NoneForDriver(driver) => {
                 return Ok(StagingOutcome::Failed {
                     reason: REASON_NO_CLASS,
-                    message: format!(
-                        "no VolumeSnapshotClass has driver `{driver}` (the source PVC's \
-                         provisioner); create a VolumeSnapshotClass for it (optionally annotate it \
-                         {DEFAULT_CLASS_ANNOTATION}=true), set volumeSnapshotClassName explicitly, \
-                         or set copyMethod: Direct"
-                    ),
+                    message: no_class_for_driver_message(&driver),
                 });
             }
             ClassDecision::Ambiguous { driver, candidates } => {
@@ -893,6 +938,65 @@ mod tests {
         // Unbound (no volumeName) → nothing to reclaim.
         pvc.spec.as_mut().unwrap().volume_name = None;
         assert_eq!(cleanup_plan(&pvc).reclaim_pv, None);
+    }
+
+    // --- Failed message text: what/why/fix + the copyMethod-defaulted pointer ---
+
+    #[test]
+    fn stack_missing_message_names_driver_and_default_pointer() {
+        let msg = stack_missing_message("ebs.csi.aws.com");
+        assert!(
+            msg.contains("VolumeSnapshotClass API"),
+            "should say what's missing: {msg}"
+        );
+        assert!(
+            msg.contains("external-snapshotter"),
+            "should say the fix (install the stack): {msg}"
+        );
+        assert!(
+            msg.contains("driver `ebs.csi.aws.com`"),
+            "should name the source's driver: {msg}"
+        );
+        assert!(
+            msg.contains("copyMethod defaulted to Snapshot as of this release"),
+            "should explain the new default: {msg}"
+        );
+        assert!(
+            msg.contains("set spec.copyMethod: Direct on the SnapshotPolicy"),
+            "should give the exact fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_not_csi_message_has_default_pointer() {
+        let msg = source_not_csi_message("backups", "app-data");
+        assert!(msg.contains("backups/app-data"));
+        assert!(msg.contains("no StorageClass / CSI provisioner"));
+        assert!(msg.contains("copyMethod defaulted to Snapshot as of this release"));
+    }
+
+    #[test]
+    fn source_pvc_not_found_message_has_default_pointer() {
+        let msg = source_pvc_not_found_message("backups", "app-data", CopyMethod::Snapshot);
+        assert!(msg.contains("backups/app-data"));
+        assert!(msg.contains("was not found"));
+        assert!(msg.contains("copyMethod defaulted to Snapshot as of this release"));
+    }
+
+    #[test]
+    fn explicit_class_not_found_message_has_default_pointer() {
+        let msg = explicit_class_not_found_message("csi-missing", "ebs.csi.aws.com");
+        assert!(msg.contains("volumeSnapshotClassName `csi-missing` does not exist"));
+        assert!(msg.contains("driver `ebs.csi.aws.com`"));
+        assert!(msg.contains("copyMethod defaulted to Snapshot as of this release"));
+    }
+
+    #[test]
+    fn no_class_for_driver_message_has_default_pointer() {
+        let msg = no_class_for_driver_message("zfs.csi.openebs.io");
+        assert!(msg.contains("no VolumeSnapshotClass has driver `zfs.csi.openebs.io`"));
+        assert!(msg.contains(DEFAULT_CLASS_ANNOTATION));
+        assert!(msg.contains("copyMethod defaulted to Snapshot as of this release"));
     }
 
     // --- build_volume_snapshot wire shape ---
