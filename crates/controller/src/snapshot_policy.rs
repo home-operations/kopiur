@@ -233,6 +233,9 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // LAST-SNAPSHOT column + the staleness alert). Deterministic (the max endTime
     // over this policy's Succeeded Snapshots), so an unchanged value is a no-op patch.
     let last_successful = latest_successful_snapshot(&ctx.client, &namespace, &name).await?;
+    // Does this policy have a verifiable backup yet? Backs the #168 verification gate
+    // below (captured before `last_successful` is consumed by the status patch).
+    let has_successful_snapshot = last_successful.is_some();
 
     // 2. Enforce GFS retention: list this config's Snapshots, decide which to
     //    delete, and delete each (the Snapshot finalizer governs the snapshot).
@@ -375,7 +378,9 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // requeue on the shorter of the steady cadence and the verify cadence so a due
     // verification fires on time.
     let steady = std::time::Duration::from_secs(300);
-    match crate::verification::verify_step(config, ctx, &repo, &namespace).await? {
+    match crate::verification::verify_step(config, ctx, &repo, &namespace, has_successful_snapshot)
+        .await?
+    {
         Some(verify_requeue) => Ok(Action::requeue(steady.min(verify_requeue))),
         None => Ok(Action::requeue(steady)),
     }
