@@ -149,12 +149,17 @@ Assert the **user-visible success condition**, not an intermediate detail:
 When the assertion is "a metric is emitted," drive the real lifecycle, then
 **scrape `/metrics` and parse the exposition** rather than trusting a code path:
 
-- curl the controller `:8080/metrics` (and webhook `/metrics`); assert the
+- curl the controller `:8081/metrics` (and webhook `/metrics`); assert the
   expected families/labels are present with sane values
   (`kopiur_controller_reconciliations_total{kind=…} > 0`,
   `kopiur_resource_phase{kind=Snapshot,phase=Succeeded} == 1`, backup
   size/files/duration `> 0`, error/consecutive-failure counters reflect an
-  induced failure).
+  induced failure). `kopiur_resource_phase` and the per-CR/per-policy Snapshot
+  gauges are store-backed observable gauges: only the CR's **active** phase is
+  ever emitted (never a `phase=…}=0` line for the inactive phases), and a
+  series disappears from the next scrape once its CR is deleted — so a
+  regression test for a lifecycle fix should also assert **absence** after
+  deletion, not just presence while the CR is live.
 - Assert the body still **parses as valid Prometheus text** — a regression guard
   for the OTel→Prometheus name rewrite (`_total` suffixes, `otel_scope_*`,
   `target_info`).

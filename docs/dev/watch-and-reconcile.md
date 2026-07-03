@@ -91,12 +91,19 @@ For the mover-driven kinds (`Snapshot`, `Restore`, `RepositoryReplication`), the
 **mover** stamps the terminal `status.phase` (`Succeeded`/`Completed`) — and only
 that, plus its own outputs (`kopiaSnapshotID`, `lastReplicated`, `logTail`). The
 **controller** then heals the *derived* status in a FOLLOW-UP reconcile: the
-kstatus trio (`Ready`/`Reconciling`/`Stalled`), `status.hooks.*`, and the
-`kopiur_resource_phase` gauge. The terminal gate's self-check keys on the
-distinctive healed condition, not the phase, precisely because the phase lands
-first (`restore.rs::kstatus_settled_for`). The same split applies to controller-
-driven kinds whose Ready heal is a separate write from their primary bookkeeping
-(`Maintenance::set_ready_if_changed`).
+kstatus trio (`Ready`/`Reconciling`/`Stalled`) and `status.hooks.*`. The terminal
+gate's self-check keys on the distinctive healed condition, not the phase,
+precisely because the phase lands first (`restore.rs::kstatus_settled_for`). The
+same split applies to controller-driven kinds whose Ready heal is a separate
+write from their primary bookkeeping (`Maintenance::set_ready_if_changed`).
+
+`kopiur_resource_phase` is not part of this heal: it is a store-backed
+*observable* gauge (`Metrics::register_resource_observers`) whose callback reads
+`status.phase` straight from each controller's reflector `Store` at collection
+time, so it reflects whatever `status.phase` the mover already stamped as soon as
+the reflector's watch delivers that update — it does not wait for the
+follow-up-reconcile heal, and it needs no explicit write/reset on transition or
+deletion (the series simply stops being observed once the CR is gone).
 
 Consequence — the heal lags the phase by up to one **debounce window**
 (`spawn_all`'s `ctrl_cfg`, currently 250 ms). That window is a deliberate
@@ -108,8 +115,10 @@ to break e2e assertions — see the commit history and `crates/controller/src/li
 **Rule for tests and external consumers:** never gate on `status.phase` and then
 read a *healed* field in the same breath — that races the heal. Gate on the healed
 field itself. In e2e use `common::wait_ready` (or `wait_condition(.., "Ready",
-"True")`) before asserting any kstatus condition / `hooks.*` / phase-gauge metric.
-The guards live in `restore.rs::restore_completed_reports_kstatus_ready`,
+"True")`) before asserting any kstatus condition or `hooks.*` (the
+`kopiur_resource_phase` gauge is the exception — it observes `status.phase`
+directly, not a healed field, so it needs no such wait). The guards live in
+`restore.rs::restore_completed_reports_kstatus_ready`,
 `hooks.rs::http_request_post_hook_hits_in_cluster_receiver`,
 `lifecycle.rs::metrics_reflect_backup_lifecycle` /
 `maintenance_claims_lease`, and
