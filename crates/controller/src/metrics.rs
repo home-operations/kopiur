@@ -58,9 +58,10 @@ pub struct Metrics {
     // store-backed i64 *observable* gauges registered in
     // [`Metrics::register_resource_observers`], whose callbacks enumerate the
     // controllers' reflector stores at collection time. A series exists iff its CR
-    // does — the SDK's Delta temporality drops any series not observed in a cycle,
-    // so a deleted CR's series genuinely disappears from `/metrics` (the #172/#175
-    // fix; a sync gauge could only zero a series, never remove it).
+    // does — the callback is the sole source of truth per collection cycle, so an
+    // attribute set it doesn't observe is simply absent from that cycle's point
+    // set, and a deleted CR's series genuinely disappears from `/metrics` (the
+    // #172/#175 fix; a sync gauge could only zero a series, never remove it).
     backup_verified_timestamp: Gauge<i64>,
     backup_consecutive_failures: Gauge<i64>,
     snapshots_completed: Counter<u64>,
@@ -273,9 +274,10 @@ impl Metrics {
     /// dropped, so a deleted or GC'd CR's `kopiur_resource_phase{...}==1` /
     /// `kopiur_snapshot_*` series would linger forever and keep firing staleness
     /// alerts (#172/#175). An observable gauge is re-derived from live store state
-    /// each cycle, and the SDK's Delta temporality makes a series absent from a cycle
-    /// disappear from the next Prometheus exposition — so a series exists **iff** its
-    /// CR exists.
+    /// each cycle, and the callback is the sole source of truth for that cycle: an
+    /// attribute set it doesn't emit is simply absent from the collected point set,
+    /// so a series disappears from the next Prometheus exposition — a series exists
+    /// **iff** its CR exists.
     ///
     /// `kopiur_resource_phase` emits `1` for the **active** phase only — never a
     /// 0-valued series for the inactive phases (the old enumerate-and-reset flooded

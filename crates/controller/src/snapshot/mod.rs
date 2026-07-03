@@ -183,9 +183,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .await?;
                 // The MOVER stamped `phase: Succeeded` (the common in-cluster path,
                 // so `finalize_succeeded` never ran) and we are healing the kstatus
-                // exactly once (`!ready`). Count the terminal transition here — the
-                // symmetric partner to the `finalize_succeeded` count; the two paths
-                // are mutually exclusive for a given Snapshot, so it fires once.
+                // (`!ready`). Count the terminal transition here — the symmetric
+                // partner to the `finalize_succeeded` count; the two paths are
+                // mutually exclusive for a given Snapshot, so this fires once per
+                // terminal transition in the common path. A reflector-cache-lagged
+                // concurrent reconcile can re-observe `!ready` before the healed
+                // status lands, adding a bounded duplicate count — never an
+                // under-count.
                 ctx.metrics
                     .inc_snapshot_completed("succeeded", &namespace, backup_policy(backup));
             }
@@ -241,16 +245,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 )
                 .await?;
             }
-            // Heal the kstatus exactly once for a terminal failure the controller
-            // hasn't finalized yet: the mover stamps only `phase: Failed` (+ the
-            // failure block) — never the kstatus conditions — so without this a
+            // Heal the kstatus for a terminal failure the controller hasn't
+            // finalized yet: the mover stamps only `phase: Failed` (+ the failure
+            // block) — never the kstatus conditions — so without this a
             // mover-stamped Failed would lack `Stalled=True` and
             // `kubectl wait --for=condition=Stalled` would never fire. A
             // controller-stamped Failed (MoverJobFailed/MoverPodWedged/preflight)
             // already carries `Stalled=True` (see `snapshot_ready_status`), so this
-            // is a no-op there. The `wrote` guard is therefore the exactly-once seam
-            // for counting a mover-stamped (or hook-/refusal-stamped) completion; the
-            // controller-stamped paths count at their own write site instead.
+            // is a no-op there. The `wrote` guard is the seam for counting a
+            // mover-stamped (or hook-/refusal-stamped) completion — once per
+            // terminal transition in the common path; a reflector-cache-lagged
+            // concurrent reconcile can re-observe an unhealed status and add a
+            // bounded duplicate count, never an under-count. The controller-stamped
+            // paths count at their own write site instead.
             if !snapshot_stalled(backup) {
                 let current = serde_json::to_value(&backup.status).ok();
                 let wrote = io::patch_status_if_changed(
