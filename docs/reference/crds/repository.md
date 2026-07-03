@@ -37,6 +37,15 @@ cache, `nodeSelector`/`tolerations`/`affinity`, Job TTL — inherited by **every
 mover this repository spawns (bootstrap, backup, restore, maintenance). Each recipe
 can override fields per-mover; the merge is field-wise. See [Movers](../../movers.md).
 
+### `scheduleDefaults`
+
+Repo-level scheduling defaults inherited at reconcile time by consumers that don't
+set their own equivalent field: `SnapshotPolicy.spec.verification`,
+`RepositoryReplication.spec.schedule`, and `Maintenance.spec.schedule` all fall
+back to `scheduleDefaults.timezone` when their own `timezone` is absent (the
+consuming cron's own value always wins). `SnapshotSchedule` does not inherit it
+yet. See [Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-once).
+
 ### `catalog`
 
 Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia

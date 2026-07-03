@@ -69,7 +69,7 @@ fn handled_slot_does_not_refire_after_its_job_is_ttl_reaped() {
     };
     let m = maint_with("*/5 * * * *", "0 3 * * *", Some(status));
     assert!(
-        due_mode(&m, now).is_none(),
+        due_mode(&m, now, None).is_none(),
         "a handled (yielded) slot must not re-fire after its Job is TTL-reaped"
     );
 }
@@ -90,7 +90,7 @@ fn handling_a_year_old_slot_does_not_start_a_backlog_march() {
     };
     let m = maint_with("0 3 * * *", "30 4 * * 0", Some(status));
     assert!(
-        due_mode(&m, now).is_none(),
+        due_mode(&m, now, None).is_none(),
         "after handling the first-ever slot, the next due slot must be in \
          the FUTURE — not the next entry of a year-long backlog"
     );
@@ -127,14 +127,14 @@ fn mode_after_takes_the_later_of_run_and_handled() {
     // Neither recorded → first-ever fires immediately (a slot exists in the
     // year-long lookback window).
     let m = maint_with("*/5 * * * *", "0 3 * * *", None);
-    assert!(due_mode(&m, now).is_some());
+    assert!(due_mode(&m, now, None).is_some());
 }
 
 #[test]
 fn first_ever_reconcile_is_due_and_prefers_full() {
     // No status → both due; full wins (it subsumes quick).
     let m = maint_with("*/5 * * * *", "0 3 * * *", None);
-    let (mode, _slot) = due_mode(&m, Utc::now()).expect("first run is due");
+    let (mode, _slot) = due_mode(&m, Utc::now(), None).expect("first run is due");
     assert_eq!(mode, MaintenanceMode::Full);
 }
 
@@ -150,7 +150,7 @@ fn not_due_right_after_a_run() {
     };
     let m = maint_with("*/5 * * * *", "0 3 * * *", Some(status));
     assert!(
-        due_mode(&m, now).is_none(),
+        due_mode(&m, now, None).is_none(),
         "a mode that just ran must not be immediately due again"
     );
 }
@@ -165,7 +165,7 @@ fn quick_due_when_full_recent() {
         ..Default::default()
     };
     let m = maint_with("*/5 * * * *", "0 3 * * *", Some(status));
-    let (mode, _) = due_mode(&m, now).expect("quick should be due");
+    let (mode, _) = due_mode(&m, now, None).expect("quick should be due");
     assert_eq!(mode, MaintenanceMode::Quick);
 }
 
@@ -218,7 +218,73 @@ fn requeue_is_capped() {
         ..Default::default()
     };
     let m = maint_with("0 */6 * * *", "0 3 * * *", Some(status));
-    assert!(cap(next_wakeup(&m, now, None)) <= REQUEUE_CAP);
+    assert!(cap(next_wakeup(&m, now, None, None)) <= REQUEUE_CAP);
+}
+
+// --- scheduleDefaults.timezone three-level cascade (GitHub #174 item 3) ----
+// per-cron `timezone` -> schedule-level `timezone` -> repo `scheduleDefaults.
+// timezone` -> UTC.
+
+#[test]
+fn due_mode_falls_all_the_way_through_to_the_repo_default_timezone() {
+    // No per-cron or schedule-level timezone at all — the repo default is the
+    // ONLY source of a non-UTC zone, so it must be what shifts the slot.
+    let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let status = MaintenanceStatus {
+        quick: Some(run_at(&(now - chrono::Duration::hours(2)).to_rfc3339())),
+        full: Some(run_at(&(now - chrono::Duration::hours(2)).to_rfc3339())),
+        ..Default::default()
+    };
+    let m = maint_with("0 5 * * *", "0 5 * * *", Some(status));
+    assert!(
+        due_mode(&m, now, None).is_some(),
+        "UTC (no repo default) → 05:00 UTC has already passed"
+    );
+    assert!(
+        due_mode(&m, now, Some("America/Los_Angeles")).is_none(),
+        "repo scheduleDefaults.timezone must shift the evaluated slot when no \
+         per-cron or schedule-level timezone is set"
+    );
+}
+
+#[test]
+fn schedule_level_timezone_wins_over_repo_default() {
+    let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let status = MaintenanceStatus {
+        quick: Some(run_at(&(now - chrono::Duration::hours(2)).to_rfc3339())),
+        full: Some(run_at(&(now - chrono::Duration::hours(2)).to_rfc3339())),
+        ..Default::default()
+    };
+    let mut m = maint_with("0 5 * * *", "0 5 * * *", Some(status));
+    m.spec.schedule.timezone = Some("UTC".into());
+    // Schedule-level UTC says the slot is due; the repo default
+    // (America/Los_Angeles, which would push the slot hours into the future)
+    // must be ignored.
+    assert!(
+        due_mode(&m, now, Some("America/Los_Angeles")).is_some(),
+        "schedule-level timezone must win over the repo default"
+    );
+}
+
+#[test]
+fn per_cron_timezone_wins_over_repo_default() {
+    let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let status = MaintenanceStatus {
+        full: Some(run_at(&(now - chrono::Duration::hours(2)).to_rfc3339())),
+        ..Default::default()
+    };
+    let mut m = maint_with("*/5 * * * *", "0 5 * * *", Some(status));
+    m.spec.schedule.full.timezone = Some("UTC".into());
+    // Per-cron UTC on full wins over BOTH the (absent) schedule-level timezone
+    // and the repo default.
+    let (mode, _) = due_mode(&m, now, Some("America/Los_Angeles")).expect("full is due");
+    assert_eq!(mode, MaintenanceMode::Full);
 }
 
 // --- manual (annotation-requested) runs -----------------------------------

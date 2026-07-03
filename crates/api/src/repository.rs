@@ -3,7 +3,7 @@
 use crate::backend::Backend;
 use crate::common::{
     CatalogBounds, CreateBehavior, Encryption, FailurePolicy, MoverDefaults, NamespaceDeletePolicy,
-    RepositoryMode, default_namespace_delete_policy, default_repository_mode,
+    RepositoryMode, ScheduleDefaults, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::server::{ServerSpec, ServerStatus};
@@ -62,6 +62,11 @@ pub struct RepositorySpec {
     /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
+    /// Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
+    /// their own equivalent field — verification, replication, and maintenance
+    /// schedules today; set once here instead of repeating it on every cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_defaults: Option<ScheduleDefaults>,
     /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogBounds>,
@@ -607,6 +612,39 @@ health:
         assert!(
             json["health"]["probe"].get("enabled").is_none(),
             "enabled: false must be elided"
+        );
+    }
+
+    #[test]
+    fn schedule_defaults_timezone_round_trips() {
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             scheduleDefaults:\n  timezone: America/New_York\n",
+        );
+        assert_eq!(
+            spec.schedule_defaults
+                .as_ref()
+                .and_then(|d| d.timezone.as_deref()),
+            Some("America/New_York")
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["scheduleDefaults"]["timezone"], "America/New_York");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent scheduleDefaults stays None and is elided (no stored-object churn).
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n",
+        );
+        assert!(bare.schedule_defaults.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("scheduleDefaults")
+                .is_none(),
+            "absent scheduleDefaults must be elided"
         );
     }
 }

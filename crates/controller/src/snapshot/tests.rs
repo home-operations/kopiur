@@ -255,6 +255,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         repo_namespace: Some("media-ns".into()),
         mover_defaults: None,
         identity_defaults: None,
+        schedule_defaults: None,
         on_namespace_delete: Default::default(),
         mode: Default::default(),
         credential_projection_allowed: false,

@@ -293,6 +293,42 @@ Co-location lets the mover read a **live** volume — that snapshot is crash-con
 
 ///
 
+## `scheduleDefaults` — set the cron timezone once
+
+Every cron-driven consumer of a repository (`SnapshotPolicy.spec.verification`,
+`RepositoryReplication.spec.schedule`, `Maintenance.spec.schedule`) takes its own
+optional `timezone`. Repeating the same IANA zone on every one of them is
+tedious and easy to drift. Set it **once** on the repository instead:
+
+```yaml
+spec:
+    scheduleDefaults:
+        timezone: America/New_York # IANA name, validated at admission
+```
+
+Precedence (resolved at reconcile time, not admission-pinned): the consuming
+cron's own `timezone` wins when set, else `scheduleDefaults.timezone` here,
+else UTC. `Maintenance` already cascades per-cron → schedule-level before
+falling to the repo default, so this becomes the **third and final** level for
+it.
+
+/// note | Inherited today, not everywhere yet
+
+`SnapshotPolicy` verification, `RepositoryReplication`, and `Maintenance` all
+inherit `scheduleDefaults.timezone`. `SnapshotSchedule.spec.schedule.timezone`
+(the recurring-backup cron) does **not** inherit it yet — that cascade needs a
+referent watch on the repository and is a separate follow-up. Until then, set
+`timezone` explicitly on a `SnapshotSchedule` if it needs a non-UTC zone.
+
+///
+
+A complete, apply-ready example — a `Repository` with `scheduleDefaults.timezone`
+and a `SnapshotPolicy.spec.verification.quick` cron that inherits it:
+
+```yaml
+--8<-- "deploy/examples/29-repo-schedule-timezone.yaml"
+```
+
 ## `onNamespaceDelete` — what `kubectl delete ns` does to snapshots
 
 `Orphan` (default) or `Delete`. A backup tool must not make deleting a namespace a silent data-loss event, so the default is fail-safe:
@@ -422,6 +458,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
 | `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`).       |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
+| `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance schedules. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |
 | `suspend`                                              | Pause connect/bootstrap + maintenance.            |

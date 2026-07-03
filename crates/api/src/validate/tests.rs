@@ -1037,6 +1037,7 @@ fn repository_inline_retention_hook_passes_today() {
         create: None,
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         maintenance: None,
@@ -1323,6 +1324,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         create: None,
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         maintenance: m,
@@ -1416,6 +1418,7 @@ fn cluster_repository_rejects_all_false() {
         create: None,
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         allowed_namespaces: AllowedNamespaces::All(false),
@@ -1450,6 +1453,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         create: None,
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         allowed_namespaces: AllowedNamespaces::All(true),
@@ -1504,6 +1508,7 @@ fn repo_spec_create(
         }),
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         maintenance: None,
@@ -1560,6 +1565,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
         }),
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         allowed_namespaces: AllowedNamespaces::All(true),
@@ -1656,6 +1662,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
         }),
         bootstrap: None,
         mover_defaults: None,
+        schedule_defaults: None,
         catalog: None,
         server: None,
         allowed_namespaces: AllowedNamespaces::All(true),
@@ -2014,6 +2021,92 @@ catalog:
             .any(|e| e.to_string().contains("catalog.refreshInterval")),
         "{errs:?}"
     );
+}
+
+// --- scheduleDefaults.timezone (GitHub #174 item 3) ---
+
+#[test]
+fn repository_rejects_bad_schedule_defaults_timezone() {
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+scheduleDefaults:
+  timezone: America/Chicgo
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
+        "a typo'd scheduleDefaults.timezone must be rejected at admission: {errs:?}"
+    );
+}
+
+#[test]
+fn repository_accepts_valid_schedule_defaults_timezone() {
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+scheduleDefaults:
+  timezone: America/New_York
+"#,
+    );
+    assert!(validate_repository(&repo).is_empty());
+}
+
+#[test]
+fn cluster_repository_rejects_bad_schedule_defaults_timezone() {
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+scheduleDefaults:
+  timezone: America/Chicgo
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
+        "a typo'd scheduleDefaults.timezone must be rejected at admission: {errs:?}"
+    );
+}
+
+#[test]
+fn cluster_repository_accepts_valid_schedule_defaults_timezone() {
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+scheduleDefaults:
+  timezone: America/New_York
+"#,
+    );
+    assert!(validate_cluster_repository(&crepo).is_empty());
 }
 
 // --- repository_warnings (inline-NFS fsGroup footgun) ---

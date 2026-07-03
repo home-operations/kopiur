@@ -114,6 +114,12 @@ Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the s
 | `takeoverPolicy` | Ownership-lease policy (see [Ownership](#ownership-and-shared-repositories)).                                             |
 | `namespace`      | **`ClusterRepository` only** — which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
 
+/// tip | Timezone cascades three levels
+
+`quick.timezone`/`full.timezone` (per-cron) wins; else the shared `schedule.timezone`; else the target repository's `scheduleDefaults.timezone` ([Repositories → `scheduleDefaults`](repositories.md#scheduledefaults--set-the-cron-timezone-once)); else UTC. Set it once on the repository instead of repeating it on every `Maintenance`.
+
+///
+
 ### 2. Author a standalone `Maintenance`
 
 For fine-grained control — a custom ownership identity or takeover policy — author a `Maintenance` directly ([example 08](examples.md#example-08--maintenance)). When one references a repository, the operator **defers to it and never creates a duplicate**, even if `spec.maintenance` is otherwise default-on.

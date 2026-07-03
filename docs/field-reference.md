@@ -35,6 +35,7 @@ Short name `kopiarepo`. Print columns: `PHASE`, `BACKEND`, `AGE`.
 | `encryption.passwordSecretRef` | [SecretKeyRef](#secretkeyref) | **required** | The kopia repository password Secret. The *reference* may be changed/renamed; the password *value* it resolves to must stay the same (kopia bakes only the value into the repo format). |
 | `create` | [CreateBehavior](#createbehavior) | — | Initialize the repo if absent (off by default). |
 | `moverDefaults` | [MoverDefaults](#moverdefaults) | — | Base config every mover inherits (bootstrap/backup/restore/maintenance). |
+| `scheduleDefaults` | [ScheduleDefaults](#scheduledefaults) | — | Repo-level scheduling defaults (today: `timezone`) inherited by consumers that don't set their own. |
 | `catalog` | [CatalogBounds](#catalogbounds) | — | Bounds materialization of `discovered` `Snapshot` CRs. |
 | `maintenance` | [RepositoryMaintenanceSpec](#repositorymaintenancespec) | default-on | Default-managed `Maintenance` projection. |
 | `onNamespaceDelete` | enum(**`Orphan`**\|`Delete`) | `Orphan` | What a consuming-namespace deletion does to snapshots. §5 |
@@ -77,6 +78,7 @@ Because it is cluster-scoped, **every** Secret reference in it (`backend.*.auth`
 | `encryption.passwordSecretRef` | [SecretKeyRef](#secretkeyref) (with `namespace`) | **required** | Repo password. The *reference* may be changed/renamed; the resolved password *value* must stay the same. |
 | `create` | [CreateBehavior](#createbehavior) | — | Same as `Repository`. |
 | `moverDefaults` | [MoverDefaults](#moverdefaults) | — | Inherited by every mover (including consumer backup/restore). |
+| `scheduleDefaults` | [ScheduleDefaults](#scheduledefaults) | — | Repo-level scheduling defaults (today: `timezone`) inherited by consumers that don't set their own. |
 | `catalog` | [CatalogBounds](#catalogbounds) | — | Adds `fallbackNamespace` for discovered snapshots. |
 | `allowedNamespaces` | externally-tagged [AllowedNamespaces](#allowednamespaces) | **required** | Tenancy gate. |
 | `identityDefaults` | [IdentityDefaults](#identitydefaults) | — | Per-tenant identity CEL `*Expr`. |
@@ -369,6 +371,21 @@ referrer's namespace (required on cluster-scoped CRs).
 `securityContext`/`podSecurityContext`/`resources`/`cache` merge field-wise:
 `hardened ⊂ moverDefaults ⊂ recipe.mover`. See
 [`moverDefaults` on the Repositories page](repositories.md).
+
+### ScheduleDefaults
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `timezone` | string | — | IANA tz applied to every consuming cron that doesn't set its own `timezone`. Validated at admission. |
+
+Precedence (resolved at reconcile time, not admission-pinned): the consuming
+cron's own `timezone` wins, else `spec.scheduleDefaults.timezone` on the
+`Repository`/`ClusterRepository` it targets, else UTC. Today the consumers are
+`SnapshotPolicy.spec.verification` (quick/deep), `RepositoryReplication.spec
+.schedule`, and `Maintenance.spec.schedule` (quick/full, itself already cascading
+per-cron → schedule-level before falling to the repo default).
+`SnapshotSchedule.spec.schedule.timezone` does **not** inherit from
+`scheduleDefaults` yet — that cascade is a separate follow-up.
 
 ### MoverSpec
 

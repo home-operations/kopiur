@@ -2,11 +2,11 @@
 
 A cluster-scoped, shared kopia repository operated by a platform team and
 referenceable from allow-listed namespaces. It has the same storage surface as a
-[Repository](repository.md) (backend, encryption, create, moverDefaults, catalog),
-plus a tenancy gate (`allowedNamespaces`) and per-namespace identity expressions
-(`identityDefaults`). For the terse type/default table see the
-[field reference](../../field-reference.md); for how-to guidance see
-[Repositories](../../repositories.md).
+[Repository](repository.md) (backend, encryption, create, moverDefaults,
+scheduleDefaults, catalog), plus a tenancy gate (`allowedNamespaces`) and
+per-namespace identity expressions (`identityDefaults`). For the terse
+type/default table see the [field reference](../../field-reference.md); for
+how-to guidance see [Repositories](../../repositories.md).
 
 !!! important "Every Secret reference needs an explicit namespace"
     A `ClusterRepository` is cluster-scoped, so it has no namespace of its own to
@@ -17,9 +17,10 @@ plus a tenancy gate (`allowedNamespaces`) and per-namespace identity expressions
 
 ## `spec`
 
-Fields shared with `Repository` — `backend`, `create`, `moverDefaults`, `catalog`,
-`maintenance`, `onNamespaceDelete`, `mode`, `suspend`, `health` — behave exactly as
-on the [Repository](repository.md) page. The differences and additions:
+Fields shared with `Repository` — `backend`, `create`, `moverDefaults`,
+`scheduleDefaults`, `catalog`, `maintenance`, `onNamespaceDelete`, `mode`,
+`suspend`, `health` — behave exactly as on the [Repository](repository.md) page.
+The differences and additions:
 
 ### `encryption`
 

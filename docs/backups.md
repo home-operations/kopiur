@@ -293,7 +293,7 @@ You can set the scratch size/class **once** at the repository level via [`moverD
 It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 
 !!! tip "A timezone for the verify crons"
-    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent ⇒ UTC.
+    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
 
 ### suspend — pause a recipe
 

@@ -8,7 +8,7 @@ use kopiur_api::backend::Backend;
 use kopiur_api::cluster_repository::IdentityDefaults;
 use kopiur_api::common::{
     Encryption, MoverDefaults, NamespaceDeletePolicy, PhaseLabel, RepositoryKind, RepositoryMode,
-    RepositoryRef,
+    RepositoryRef, ScheduleDefaults,
 };
 use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
 use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
@@ -66,6 +66,12 @@ pub struct ResolvedRepository {
     /// consumer doesn't override its identity (ADR-0004 §5). `None` for a namespaced
     /// `Repository` (which has no identity defaults).
     pub identity_defaults: Option<IdentityDefaults>,
+    /// The repository's `scheduleDefaults` (e.g. `timezone`), inherited at
+    /// reconcile time by consumers that don't set their own equivalent field —
+    /// verification, replication, and maintenance schedules today (GitHub #174
+    /// item 3). Resolved via [`kopiur_api::common::resolve_tz_with_default`], NOT
+    /// admission-pinned.
+    pub schedule_defaults: Option<ScheduleDefaults>,
     /// The repository's namespace-deletion cascade policy (ADR-0005 §5): `Orphan`
     /// (keep history) or `Delete` (cascade). Consulted by the `Snapshot` finalizer
     /// when the owning namespace is terminating.
@@ -177,6 +183,7 @@ pub async fn resolve_repository_ref(
                 mover_defaults: repo.spec.mover_defaults,
                 // A namespaced Repository has no identity defaults.
                 identity_defaults: None,
+                schedule_defaults: repo.spec.schedule_defaults,
                 on_namespace_delete: repo.spec.on_namespace_delete,
                 // A namespaced Repository has no owner-side projection gate: its
                 // credential Secret co-resides with the consumer, so projection is a
@@ -199,6 +206,7 @@ pub async fn resolve_repository_ref(
                 encryption: repo.spec.encryption,
                 mover_defaults: repo.spec.mover_defaults,
                 identity_defaults: repo.spec.identity_defaults,
+                schedule_defaults: repo.spec.schedule_defaults,
                 on_namespace_delete: repo.spec.on_namespace_delete,
                 credential_projection_allowed: repo
                     .spec

@@ -156,6 +156,7 @@ mod tests {
             },
             repo_namespace: Some("ns".into()),
             identity_defaults: None,
+            schedule_defaults: None,
             on_namespace_delete: Default::default(),
             mode: Default::default(),
             credential_projection_allowed: false,

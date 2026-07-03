@@ -8,7 +8,7 @@
 use crate::backend::Backend;
 use crate::common::{
     CatalogBounds, CreateBehavior, Encryption, MoverDefaults, NamespaceDeletePolicy,
-    RepositoryMode, default_namespace_delete_policy, default_repository_mode,
+    RepositoryMode, ScheduleDefaults, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::repository::{
@@ -67,6 +67,11 @@ pub struct ClusterRepositorySpec {
     /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
+    /// Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
+    /// their own equivalent field — verification, replication, and maintenance
+    /// schedules today; set once here instead of repeating it on every cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_defaults: Option<ScheduleDefaults>,
     /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogBounds>,
@@ -297,5 +302,42 @@ catalog:
     fn allowed_namespaces_unknown_variant_is_rejected() {
         let value: serde_json::Value = serde_yaml::from_str("everyone: true\n").unwrap();
         assert!(serde_json::from_value::<AllowedNamespaces>(value).is_err());
+    }
+
+    #[test]
+    fn schedule_defaults_timezone_round_trips() {
+        let yaml = r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }
+allowedNamespaces: { all: true }
+scheduleDefaults:
+  timezone: America/New_York
+"#;
+        let spec: ClusterRepositorySpec = from_yaml(yaml);
+        assert_eq!(
+            spec.schedule_defaults
+                .as_ref()
+                .and_then(|d| d.timezone.as_deref()),
+            Some("America/New_York")
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["scheduleDefaults"]["timezone"], "America/New_York");
+        let reparsed: ClusterRepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent scheduleDefaults stays None and is elided (no stored-object churn).
+        let bare: ClusterRepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+             allowedNamespaces: { all: true }\n",
+        );
+        assert!(bare.schedule_defaults.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("scheduleDefaults")
+                .is_none(),
+            "absent scheduleDefaults must be elided"
+        );
     }
 }

@@ -779,3 +779,47 @@ fn resolve_mover_carries_throttle_from_defaults() {
             .is_none()
     );
 }
+
+// --- repo-level scheduleDefaults.timezone precedence (GitHub #174 item 3) ---
+
+#[test]
+fn resolve_tz_with_default_own_wins_over_repo_default() {
+    assert_eq!(
+        resolve_tz_with_default(Some("America/Chicago"), Some("Europe/Berlin")),
+        "America/Chicago".parse::<chrono_tz::Tz>().unwrap()
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_repo_default_fills_when_own_absent() {
+    assert_eq!(
+        resolve_tz_with_default(None, Some("America/New_York")),
+        "America/New_York".parse::<chrono_tz::Tz>().unwrap()
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_both_absent_is_utc() {
+    assert_eq!(resolve_tz_with_default(None, None), chrono_tz::Tz::UTC);
+}
+
+#[test]
+fn resolve_tz_with_default_invalid_own_falls_back_to_utc_per_resolve_tz_semantics() {
+    // An unparseable own timezone falls straight back to UTC — same defensive
+    // fallback as `resolve_tz` — even when a VALID repo default is present. The
+    // admission webhook rejects bad names up front for both levels, so this
+    // should never be observed in practice; the point is the fallback matches
+    // `resolve_tz`'s existing (own-only) semantics, not a secondary retry.
+    assert_eq!(
+        resolve_tz_with_default(Some("America/Chicgo"), Some("Europe/Berlin")),
+        chrono_tz::Tz::UTC
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_invalid_repo_default_with_no_own_is_utc() {
+    assert_eq!(
+        resolve_tz_with_default(None, Some("Not/AZone")),
+        chrono_tz::Tz::UTC
+    );
+}

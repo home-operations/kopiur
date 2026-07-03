@@ -443,6 +443,54 @@ pub fn resolve_tz(name: Option<&str>) -> chrono_tz::Tz {
         .unwrap_or(chrono_tz::Tz::UTC)
 }
 
+/// Repo-level scheduling defaults, inherited at reconcile time by consumers that
+/// don't set their own equivalent field (ADR §2.2 principle 10: sub-object, not a
+/// leaf field, so future defaults — e.g. jitter — slot in without API breakage).
+///
+/// Consumed today by `SnapshotPolicy` verification, `RepositoryReplication`, and
+/// `Maintenance` scheduling (all of which already resolve their repository
+/// in-reconciler via [`crate::common::RepositoryRef`]); `SnapshotSchedule`
+/// inheritance is a separate follow-up (it needs a referent watch on the
+/// repository, which this task does not add).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleDefaults {
+    /// IANA timezone name applied to every consuming cron that doesn't set its own
+    /// `timezone` (e.g. `America/New_York`). Set once here instead of repeating it
+    /// on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and
+    /// `Maintenance.schedule` cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// Resolve a consuming cron's own optional IANA timezone against a repository-level
+/// default, falling back to UTC (mirrors [`resolve_tz`]): `own` wins when set, else
+/// `repo_default` (typically `Repository`/`ClusterRepository`
+/// `spec.scheduleDefaults.timezone`), else UTC. An unparseable name at whichever
+/// level is selected falls back to UTC defensively, same as `resolve_tz` — the
+/// admission webhook rejects bad names up front for both levels via
+/// `validate::validate_timezone`, so reconcile-time resolution should never see one.
+///
+/// ```
+/// use kopiur_api::common::resolve_tz_with_default;
+///
+/// // The schedule's own timezone wins, even over a repo default.
+/// assert_eq!(
+///     resolve_tz_with_default(Some("America/Chicago"), Some("UTC")),
+///     "America/Chicago".parse::<chrono_tz::Tz>().unwrap(),
+/// );
+/// // Absent own timezone falls through to the repo default.
+/// assert_eq!(
+///     resolve_tz_with_default(None, Some("America/New_York")),
+///     "America/New_York".parse::<chrono_tz::Tz>().unwrap(),
+/// );
+/// // Both absent → UTC.
+/// assert_eq!(resolve_tz_with_default(None, None), chrono_tz::Tz::UTC);
+/// ```
+pub fn resolve_tz_with_default(own: Option<&str>, repo_default: Option<&str>) -> chrono_tz::Tz {
+    resolve_tz(own.or(repo_default))
+}
+
 impl RepositoryRef {
     /// True if this reference points at the given repository.
     ///
