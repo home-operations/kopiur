@@ -58,6 +58,9 @@ kubectl krew install kopiur/kopiur
 kubectl kopiur status
 ```
 
+Or via Homebrew: `brew install home-operations/tap/kopiur` (installs the
+standalone `kopiur` command, so it coexists with a krew install).
+
 Full reference: **[docs/cli/index.md](docs/cli/index.md)**.
 
 ## Layout

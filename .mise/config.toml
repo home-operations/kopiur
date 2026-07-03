@@ -15,7 +15,10 @@ experimental = true
 config_roots = ["crates/e2e"]
 
 [tools]
-rust = { version = "1.95.0", components = "rustfmt,clippy,llvm-tools-preview" }
+# `targets` carries the cross-compile stdlibs the goreleaser rust builder needs:
+# cargo-zigbuild links every release triple from one macOS runner (musl keeps
+# the Linux binaries fully static).
+rust = { version = "1.95.0", components = "rustfmt,clippy,llvm-tools-preview", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin" }
 lefthook = "2.1.9"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
@@ -34,6 +37,11 @@ shellcheck = "0.11.0"
 kind = "0.32.0"
 kopia = "v0.23.1"
 "aqua:EmbarkStudios/cargo-deny" = "0.19.9"
+# goreleaser's rust builder cross-links every release target (incl. the C bits
+# in `ring`) with zig's clang via cargo-zigbuild — one runner builds all the
+# release triples. See .goreleaser.yaml.
+zig = "0.15.2"
+"aqua:rust-cross/cargo-zigbuild" = "0.23.0"
 "aqua:taiki-e/cargo-llvm-cov" = "0.8.7"
 # Docs site toolchain. The docs are an MkDocs Material site (see `mise run docs`);
 # the MkDocs + Material + pymdown-extensions versions are pinned in pyproject.toml

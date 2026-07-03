@@ -8,9 +8,11 @@ tasks.
 
 To see these commands in the context of a full install-to-restore journey, follow the [Complete walkthrough](../walkthrough.md).
 
-The plugin is a single static binary named `kubectl-kopiur`. kubectl discovers
+The plugin is a single static binary, shipped as `kopiur`. kubectl discovers
 plugins by binary name: any executable called `kubectl-kopiur` on your `PATH`
-makes `kubectl kopiur …` work. It talks to the cluster with the **same
+makes `kubectl kopiur …` work — krew creates that link for you, Homebrew
+installs the standalone `kopiur` command instead (both at once never collide).
+It talks to the cluster with the **same
 configuration kubectl uses** — `$KUBECONFIG`, `~/.kube/config`, or in-cluster
 credentials — and never needs anything besides API-server access.
 
@@ -54,18 +56,33 @@ $ kubectl kopiur --version
 `kubectl krew upgrade` picks up new releases after a `kubectl krew update`
 (which pulls the index).
 
-Without krew: every GitHub release attaches per-platform archives
-(`kopiur-cli_<os>_<arch>.tar.gz` for linux/darwin amd64+arm64,
-`…windows_amd64.zip` best-effort) with `.sha256` files, plus the rendered
-krew manifest `kopiur.yaml` — `kubectl krew install --manifest-url
-<that asset's URL>` also works. Or drop the `kubectl-kopiur` binary anywhere
-on your `PATH`.
+Via [Homebrew](https://brew.sh/) — the release workflow publishes a cask to
+[home-operations/homebrew-tap](https://github.com/home-operations/homebrew-tap)
+from the same release assets (macOS and Linux, amd64 + arm64). Brew installs
+the standalone `kopiur` command — not the `kubectl-kopiur` shim — so it
+coexists with a krew install of the same plugin:
+
+```console
+$ brew install home-operations/tap/kopiur
+$ kopiur --version
+```
+
+`brew upgrade` picks up new releases.
+
+Without krew or Homebrew: every GitHub release attaches per-platform archives
+(`kubectl-kopiur_<version>_<os>_<arch>.tar.gz` for linux/darwin amd64+arm64;
+the Linux binaries are fully static musl builds) with `.sha256` checksums,
+SBOMs, and keyless Cosign signatures. `kubectl krew install --manifest-url
+https://raw.githubusercontent.com/home-operations/kopiur/main/plugins/kopiur.yaml`
+also works (the in-repo index copy, always the latest release). Or place the
+archive's `kopiur` binary on your `PATH` — named `kubectl-kopiur` if you want
+kubectl discovery, or as-is for the standalone command.
 
 From source (requires the repo and [mise](https://mise.jdx.dev/)):
 
 ```console
 $ mise run build
-$ install -m 0755 target/debug/kubectl-kopiur ~/.local/bin/kubectl-kopiur
+$ install -m 0755 target/debug/kopiur ~/.local/bin/kubectl-kopiur
 ```
 
 ## Try it end-to-end

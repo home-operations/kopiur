@@ -1,0 +1,140 @@
+---
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: kubectl-kopiur
+
+# Each target's rust-std must be installed before building (goreleaser does not
+# add rustup targets itself). The mise rust tool declares them (`targets =` in
+# .mise/config.toml) so the toolchain that provides cargo also carries the
+# stdlibs — a `rustup target add` hook here can install into a different
+# RUSTUP_HOME than the active cargo resolves against.
+before:
+  hooks:
+    - cargo fetch --locked
+
+builds:
+  - id: kubectl-kopiur
+    builder: rust
+    # Must match the crates/cli [[bin]] name — the rust builder collects
+    # target/<triple>/release/<binary> verbatim (no rename). The file ships as
+    # plain `kopiur` so brew and krew never collide: brew links it as the
+    # standalone `kopiur` command, while krew symlinks `kubectl-kopiur` (the
+    # name kubectl discovers) to this file itself.
+    binary: kopiur
+    # cargo-zigbuild (the rust builder's default command) links every target —
+    # including the C bits in `ring` — with zig's clang, so all the triples
+    # build from ONE runner. That runner must be macOS: `security-framework-sys`
+    # (in kube's graph via hyper-rustls, even though the CLI's webpki-roots
+    # feature compiles its code out) emits `-framework Security` link flags that
+    # only resolve against a real macOS SDK, which Linux runners don't have.
+    # musl keeps the Linux binaries fully static (as the old native matrix did).
+    # No Windows target: kopiur-mover (whose pure Job builders the CLI reuses)
+    # is unix-only, and the old matrix's best-effort Windows leg was already
+    # failing — no release ships a Windows asset. The CLI is rustls-only.
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - --package=kopiur-cli
+      - --locked
+    env:
+      # consts::VERSION prefers this compile-time stamp over the crate version,
+      # mirroring how the operator images stamp VERSION. release-please has
+      # already bumped Cargo.toml at the tag, so this is belt-and-braces.
+      - KOPIUR_VERSION={{ .Version }}
+
+archives:
+  - id: kubectl-kopiur
+    ids:
+      - kubectl-kopiur
+
+# No upx stanza (unlike the Go tools' configs): upx ships no macOS-host builds,
+# and this release job must run on macOS (see the builds comment). The tar.gz
+# archives already compress the download; unpacked binaries also skip upx's
+# AV-false-positive and startup-decompression costs.
+
+checksum:
+  algorithm: sha256
+  split: true
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.sbom.json"
+
+signs:
+  - cmd: cosign
+    signature: ${artifact}.sigstore.json
+    args:
+      - sign-blob
+      - --bundle=${signature}
+      - --yes
+      - ${artifact}
+    artifacts: all
+    output: true
+
+homebrew_casks:
+  - name: kopiur
+    ids:
+      - kubectl-kopiur
+    # brew installs the standalone `kopiur` command (the file's shipped name —
+    # see the builds comment) while krew owns the `kubectl-kopiur` shim, so
+    # installing via both never collides on PATH.
+    # `brew install home-operations/tap/kopiur` mirrors
+    # `kubectl krew install kopiur/kopiur`.
+    binaries:
+      - kopiur
+    repository:
+      owner: home-operations
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://kopiur.home-operations.com/cli/
+    description: Kubectl plugin operating the kopiur Kopia-native backup operator
+    # Binaries aren't notarized — strip the quarantine bit so macOS doesn't
+    # block the first run with "developer cannot be verified".
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kopiur"] if OS.mac?
+
+# The krew manifest, committed to THIS repo's plugins/ directory — the kopiur
+# repository doubles as its own krew custom index (`kubectl krew index add
+# kopiur <this repo's git URL>`). Pushed with the bot app token; bot-token
+# pushes retrigger workflows, so every on-push workflow ignores plugins/**.
+# No commit_author override: goreleaser can't derive an identity from the
+# token and always sends its default (goreleaserbot), matching the tap's
+# flate/yayamlls commits. The plugin name stays `kopiur` so existing
+# `kubectl krew upgrade` installs keep working; its bin follows the shipped
+# file name (`kopiur`) — krew's own `kubectl-kopiur` symlink to that bin is
+# what kubectl discovers, so the rename is invisible to plugin users.
+krews:
+  - name: kopiur
+    ids:
+      - kubectl-kopiur
+    repository:
+      owner: home-operations
+      name: kopiur
+      branch: main
+      token: "{{ .Env.KREW_INDEX_TOKEN }}"
+    commit_msg_template: "chore(krew): kopiur {{ .Version }} manifest"
+    homepage: https://kopiur.home-operations.com/cli/
+    short_description: Operate the kopiur backup operator
+    description: |
+      kubectl kopiur wraps day-to-day operations of the kopiur Kopia-native
+      backup operator: trigger snapshots and restores, suspend/resume resources,
+      inspect snapshots, run maintenance, browse files INSIDE snapshots through
+      a read-only in-cluster session, diagnose installs with `doctor`, and
+      translate VolSync restic configs with `migrate volsync`.
+    caveats: |
+      The plugin tracks the kopiur v1alpha1 CRDs — keep it on the same release
+      as the operator. Browsing needs the chart's opt-in browse ClusterRole
+      (rbac.browseRole) or equivalent RBAC.
+
+# release-please creates the GitHub Release with the changelog; goreleaser
+# attaches binaries/sboms/sigs to it.
+release:
+  mode: keep-existing
