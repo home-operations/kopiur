@@ -134,22 +134,23 @@ pub enum DiscoveredProbeScope {
     ClusterWide,
 }
 
-/// **Pure.** Decide where [`repo_has_discovered_snapshots`] should LIST, from whether
-/// the resolved repository is cluster-scoped and the probing policy's namespace.
+/// **Pure.** Decide where [`repo_has_discovered_snapshots`] should LIST, from the
+/// resolved repository's own namespace ([`ResolvedRepository::repo_namespace`]).
 ///
-/// Namespaced repos keep the existing policy-namespace probe (the catalog materializes
-/// their discovered rows in that one namespace). A `ClusterRepository`'s rows land in
-/// arbitrary, per-identity namespaces the reconciler can't enumerate a priori, so the
-/// only correct probe is cluster-wide — otherwise an *adopted* `ClusterRepository`
+/// Namespaced repos probe **their own** namespace, not the probing policy's: the
+/// catalog materializes discovered rows in the repository's namespace
+/// ([`crate::catalog::Placement::Namespace`]), and `RepositoryRef` allows a policy to
+/// reference a `Repository` in a different namespace from its own
+/// (`kopiur_api::validate::repository`) — so a same-namespace assumption silently
+/// never unlocks verification for a cross-namespace-referenced adopted repository. A
+/// `ClusterRepository` (`repo_namespace: None`) scatters its rows across arbitrary,
+/// per-identity namespaces the reconciler can't enumerate a priori, so the only
+/// correct probe there is cluster-wide — otherwise an *adopted* `ClusterRepository`
 /// would never unlock verification before its first child backup (#168 regression).
-pub fn discovered_probe_scope(
-    cluster_scoped: bool,
-    policy_namespace: &str,
-) -> DiscoveredProbeScope {
-    if cluster_scoped {
-        DiscoveredProbeScope::ClusterWide
-    } else {
-        DiscoveredProbeScope::Namespace(policy_namespace.to_string())
+pub fn discovered_probe_scope(repo_namespace: Option<&str>) -> DiscoveredProbeScope {
+    match repo_namespace {
+        Some(ns) => DiscoveredProbeScope::Namespace(ns.to_string()),
+        None => DiscoveredProbeScope::ClusterWide,
     }
 }
 
@@ -316,13 +317,15 @@ pub async fn verify_step(
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
     // snapshot OR its repo already carries discovered (adopted) snapshots. The
     // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
-    // entirely once a successful backup already unlocks the gate. A cluster-scoped
-    // repository (`repo_namespace == None`) scatters its discovered rows across
-    // per-identity namespaces, so the probe scope is cluster-wide there.
+    // entirely once a successful backup already unlocks the gate. Probed in the
+    // repository's OWN namespace (not the policy's — `RepositoryRef` allows a
+    // cross-namespace reference), or cluster-wide for a cluster-scoped repository
+    // (`repo_namespace == None`), which scatters its discovered rows across
+    // per-identity namespaces.
     let has_discovered = if has_successful {
         false
     } else {
-        let scope = discovered_probe_scope(repo.repo_namespace.is_none(), namespace);
+        let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
         repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await?
     };
     let unlocked = verification_unlocked(has_successful, has_discovered);
@@ -842,23 +845,39 @@ mod tests {
     }
 
     #[test]
-    fn namespaced_repo_probes_the_policy_namespace() {
-        // A namespaced Repository materializes its discovered rows in one namespace
-        // (Placement::Namespace) — keep the existing policy-namespace probe.
+    fn namespaced_repo_same_namespace_as_policy_probes_that_namespace() {
+        // Same-namespace ref (the common case): the repo's own namespace happens to
+        // equal the referencing policy's — unchanged behavior from before this fix.
         assert_eq!(
-            discovered_probe_scope(false, "billing"),
+            discovered_probe_scope(Some("billing")),
             DiscoveredProbeScope::Namespace("billing".into())
+        );
+    }
+
+    #[test]
+    fn namespaced_repo_cross_namespace_ref_probes_the_repos_own_namespace() {
+        // Cross-namespace RepositoryRef (crates/api/src/validate/repository.rs:11-13):
+        // a SnapshotPolicy can live in one namespace while referencing an adopted
+        // Repository that lives in another. Discovered Snapshot CRs materialize in
+        // the REPOSITORY's own namespace (Placement::Namespace, repository.rs:1299),
+        // so the probe must follow the repo, not the policy. A pre-fix
+        // `discovered_probe_scope(false, policy_namespace)` would probe "billing"
+        // here and never see the discovered rows in "storage" — this assertion fails
+        // on that code.
+        assert_eq!(
+            discovered_probe_scope(Some("storage")),
+            DiscoveredProbeScope::Namespace("storage".into())
         );
     }
 
     #[test]
     fn cluster_repo_probes_cluster_wide_so_adopted_repos_unlock() {
         // Regression for the escape hatch no-op: a ClusterRepository's discovered rows
-        // land in per-identity namespaces (Placement::Cluster) — generally NOT the
-        // policy's namespace — so the probe MUST be cluster-wide, or an adopted
+        // land in per-identity namespaces (Placement::Cluster) — generally NOT any
+        // single namespace — so the probe MUST be cluster-wide, or an adopted
         // ClusterRepository never unlocks verification before its first child backup.
         assert_eq!(
-            discovered_probe_scope(true, "billing"),
+            discovered_probe_scope(None),
             DiscoveredProbeScope::ClusterWide
         );
     }
