@@ -1461,6 +1461,143 @@ async fn schedule_inherits_repository_timezone_default() {
     );
 }
 
+/// A `policySelector` schedule with NO `spec.schedule.timezone` fans out to
+/// policies whose repositories DISAGREE on `scheduleDefaults.timezone` — pure
+/// logic in `kopiur_api::common::effective_timezone` (GitHub #174 item 3):
+/// resolution degrades to UTC and the schedule reports
+/// `TimezoneDefaultAmbiguous=True`. Then patching one repository so both agree —
+/// WITHOUT touching the SnapshotSchedule object — proves the Repository→schedules
+/// referent watch (`crates/controller/src/lib.rs`, `watch::repository_to_schedules`)
+/// fires promptly: the pinned `status.nextSchedule` recomputes into the
+/// now-agreed zone and the ambiguity condition clears.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn schedule_policy_selector_timezone_ambiguity_and_referent_watch() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Two repositories whose scheduleDefaults disagree.
+    let mut repo_a = repository_json("e2e-tzamb-repo-a");
+    repo_a["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "Pacific/Kiritimati" });
+    repos
+        .create(&PostParams::default(), &cr(repo_a))
+        .await
+        .expect("create repo a");
+    let mut repo_b = repository_json("e2e-tzamb-repo-b");
+    repo_b["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "America/New_York" });
+    repos
+        .create(&PostParams::default(), &cr(repo_b))
+        .await
+        .expect("create repo b");
+
+    // Two policies, one per repo, sharing a label the schedule's policySelector targets.
+    let mut cfg_a = backup_config_json("e2e-tzamb-cfg-a", "e2e-tzamb-repo-a", "e2e-src");
+    cfg_a["metadata"]["labels"] = serde_json::json!({ "tzband": "amb" });
+    configs
+        .create(&PostParams::default(), &cr(cfg_a))
+        .await
+        .expect("create cfg a");
+    let mut cfg_b = backup_config_json("e2e-tzamb-cfg-b", "e2e-tzamb-repo-b", "e2e-src");
+    cfg_b["metadata"]["labels"] = serde_json::json!({ "tzband": "amb" });
+    configs
+        .create(&PostParams::default(), &cr(cfg_b))
+        .await
+        .expect("create cfg b");
+
+    // No spec.schedule.timezone → must inherit from the matched policies' repos.
+    let sched = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotSchedule",
+        "metadata": { "name": "e2e-tzamb-sched", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "policySelector": { "matchLabels": { "tzband": "amb" } },
+            "schedule": { "cron": "0 3 * * *" }
+        }
+    });
+    schedules
+        .create(&PostParams::default(), &cr::<SnapshotSchedule>(sched))
+        .await
+        .expect("create SnapshotSchedule");
+
+    // 1. Disagreement degrades resolution to UTC, pinned and recorded as such.
+    wait_until(
+        "nextSchedule pins UTC while the matched repos disagree",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tzamb-sched").await?;
+            let tz = s
+                .status
+                .and_then(|st| st.next_schedule)
+                .and_then(|n| n.timezone);
+            Ok((tz.as_deref() == Some("UTC")).then_some(()))
+        },
+    )
+    .await
+    .expect("schedule must pin UTC when matched repos' timezone defaults disagree");
+
+    // ...and the ambiguity condition is raised.
+    wait_condition(
+        &schedules,
+        "e2e-tzamb-sched",
+        "TimezoneDefaultAmbiguous",
+        "True",
+    )
+    .await
+    .expect("disagreeing repo defaults must raise TimezoneDefaultAmbiguous=True");
+
+    // 2. Patch repo_b to agree with repo_a — WITHOUT touching the schedule object.
+    let patch =
+        serde_json::json!({ "spec": { "scheduleDefaults": { "timezone": "Pacific/Kiritimati" } } });
+    repos
+        .patch(
+            "e2e-tzamb-repo-b",
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .expect("patch repo b to agree with repo a");
+
+    // The Repository→schedules referent watch must promptly re-reconcile the
+    // schedule and recompute its stale pinned slot into the now-agreed zone. No
+    // sleeps: `wait_until`'s poll budget already covers a slow kind node, and a
+    // working referent watch resolves this in seconds, not a full requeue cycle.
+    wait_until(
+        "nextSchedule recomputes into the now-agreed timezone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tzamb-sched").await?;
+            let tz = s
+                .status
+                .and_then(|st| st.next_schedule)
+                .and_then(|n| n.timezone);
+            Ok((tz.as_deref() == Some("Pacific/Kiritimati")).then_some(()))
+        },
+    )
+    .await
+    .expect("referent watch must recompute the pinned slot once the repos agree");
+
+    // ...and the ambiguity condition clears.
+    wait_condition(
+        &schedules,
+        "e2e-tzamb-sched",
+        "TimezoneDefaultAmbiguous",
+        "False",
+    )
+    .await
+    .expect("agreement must clear TimezoneDefaultAmbiguous");
+}
+
 /// `policySelector` fan-out (ADR-0005 §10): one schedule firing creates exactly
 /// one Snapshot per MATCHING, non-suspended SnapshotPolicy — and nothing for the
 /// non-matching or suspended ones. A broken selector fails silently in
