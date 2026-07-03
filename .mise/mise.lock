@@ -406,7 +406,7 @@ checksum = "sha256:f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda252
 url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-x64.zip"
 
 [[tools.oxfmt]]
-version = "0.56.0"
+version = "0.57.0"
 backend = "npm:oxfmt"
 
 [[tools.rust]]
