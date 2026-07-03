@@ -48,7 +48,7 @@ use kopiur_api::{
 };
 
 use crate::context::{Context, KopiaClientFactory};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ResourceStores};
 
 /// Build the controller manager and run every controller concurrently, plus the
 /// `/metrics` server, until shutdown.
@@ -764,6 +764,18 @@ async fn spawn_all(client: Client, ctx: Arc<Context>) {
                 tracing::debug!(error = %e, "repository_replication reconcile error");
             }
         });
+
+    // Register the store-backed observable gauges (kopiur_resource_phase, the
+    // per-Snapshot stat series, and the per-policy "latest" family). Their callbacks
+    // read these reflector caches at scrape time, so each series exists only while
+    // its CR does. The reader handles are `Clone`d out of the controllers' own
+    // stores; the watch closures above already hold their own clones.
+    ctx.metrics.register_resource_observers(ResourceStores {
+        snapshots: snapshot_store.clone(),
+        repositories: repo_store.clone(),
+        cluster_repositories: crepo_store.clone(),
+        restores: restore_store.clone(),
+    });
 
     tokio::join!(
         snapshot_ctrl,

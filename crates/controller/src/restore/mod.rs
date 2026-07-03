@@ -98,32 +98,11 @@ pub async fn reconcile(restore: Arc<Restore>, ctx: Arc<Context>) -> Result<Actio
     let result = reconcile_inner(&restore, &ctx).await;
     ctx.metrics
         .record_reconcile("Restore", start.elapsed().as_secs_f64());
-    record_restore_status_metrics(&restore, &ctx, result.is_ok()).await;
+    // The Restore lifecycle phase is a store-backed observable gauge
+    // (`kopiur_resource_phase`, see
+    // [`crate::metrics::Metrics::register_resource_observers`]); nothing to mirror
+    // here. Restore *duration* is still recorded at the Job-completion site.
     result
-}
-
-/// Mirror a Restore's phase gauge. Zeroes it on deletion (so a Failed restore's
-/// alert clears once the CR is gone) and re-reads the freshest status on success
-/// — see the Snapshot equivalent for the rationale. (Restore *duration* is
-/// recorded at the Job-completion site, not from status.)
-async fn record_restore_status_metrics(restore: &Restore, ctx: &Context, ok: bool) {
-    let (Some(ns), name) = (restore.namespace(), restore.name_any()) else {
-        return;
-    };
-    if restore.metadata.deletion_timestamp.is_some() {
-        ctx.metrics
-            .clear_phase::<RestorePhase>("Restore", &ns, &name);
-        return;
-    }
-    if !ok {
-        return;
-    }
-    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), &ns);
-    if let Ok(Some(latest)) = api.get_opt(&name).await
-        && let Some(phase) = latest.status.as_ref().and_then(|s| s.phase)
-    {
-        ctx.metrics.set_restore_phase(&ns, &name, phase);
-    }
 }
 
 async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {

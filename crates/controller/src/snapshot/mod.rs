@@ -65,59 +65,25 @@ pub async fn reconcile(backup: Arc<Snapshot>, ctx: Arc<Context>) -> Result<Actio
     let result = reconcile_inner(&backup, &ctx).await;
     ctx.metrics
         .record_reconcile("Snapshot", start.elapsed().as_secs_f64());
-    record_backup_status_metrics(&backup, &ctx, result.is_ok()).await;
     result
 }
 
-/// Drive the Snapshot's phase + stats gauges. On deletion the phase series is
-/// zeroed so `kopiur_resource_phase{...} == 1` alerts clear before the CR is GC'd
-/// (OTel sync gauges can't drop a series). Otherwise, on a successful reconcile,
-/// the freshest status is re-read — the object handed to `reconcile` is the
-/// pre-reconcile watch-cache copy, so reading its status would lag one cycle.
-async fn record_backup_status_metrics(backup: &Snapshot, ctx: &Context, ok: bool) {
-    let (Some(ns), name) = (backup.namespace(), backup.name_any()) else {
-        return;
-    };
-    if backup.metadata.deletion_timestamp.is_some() {
-        ctx.metrics
-            .clear_phase::<SnapshotPhase>("Snapshot", &ns, &name);
-        return;
-    }
-    if !ok {
-        return;
-    }
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &ns);
-    if let Ok(Some(latest)) = api.get_opt(&name).await {
-        record_backup_metrics(&latest, ctx);
-    }
+/// The `policy` label for a Snapshot's completion counter: `spec.policyRef.name`,
+/// or `None` for a discovered snapshot (no policyRef) so the label is omitted.
+fn backup_policy(backup: &Snapshot) -> Option<&str> {
+    backup.spec.policy_ref.as_ref().map(|p| p.name.as_str())
 }
 
-/// Mirror the Snapshot's observed status onto the phase + stats gauges. Idempotent
-/// (it `set`s current values), so it is safe to call every reconcile.
-fn record_backup_metrics(backup: &Snapshot, ctx: &Context) {
-    let (Some(ns), name) = (backup.namespace(), backup.name_any()) else {
-        return;
-    };
-    let Some(status) = backup.status.as_ref() else {
-        return;
-    };
-    if let Some(phase) = status.phase {
-        ctx.metrics.set_backup_phase(&ns, &name, phase);
-    }
-    let size = status.stats.as_ref().and_then(|s| s.size_bytes);
-    // Only emit a file count when at least one category is present — otherwise
-    // "unknown" would masquerade as a measured zero.
-    let files = status.stats.as_ref().and_then(|s| {
-        match (s.files_new, s.files_modified, s.files_unchanged) {
-            (None, None, None) => None,
-            (a, b, c) => Some(a.unwrap_or(0) + b.unwrap_or(0) + c.unwrap_or(0)),
-        }
-    });
-    let duration = status.timing.as_ref().and_then(|t| t.duration_seconds);
-    if size.is_some() || files.is_some() || duration.is_some() {
-        ctx.metrics
-            .set_backup_stats(&ns, &name, size, files, duration);
-    }
+/// Whether the Snapshot's kstatus `Stalled` condition is already `True` — i.e. the
+/// controller has finalized this terminal failure's conditions. A mover-stamped
+/// `Failed` has no such condition (the mover writes only `phase`), which is the seam
+/// the TerminalFailed heal + completion count keys on.
+fn snapshot_stalled(backup: &Snapshot) -> bool {
+    backup.status.as_ref().is_some_and(|s| {
+        s.conditions
+            .iter()
+            .any(|c| c.type_ == crate::consts::STALLED_CONDITION && c.status == "True")
+    })
 }
 
 async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
@@ -215,6 +181,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     ),
                 )
                 .await?;
+                // The MOVER stamped `phase: Succeeded` (the common in-cluster path,
+                // so `finalize_succeeded` never ran) and we are healing the kstatus
+                // exactly once (`!ready`). Count the terminal transition here — the
+                // symmetric partner to the `finalize_succeeded` count; the two paths
+                // are mutually exclusive for a given Snapshot, so it fires once.
+                ctx.metrics
+                    .inc_snapshot_completed("succeeded", &namespace, backup_policy(backup));
             }
             // Certain incompleteness signal: the mover recorded source entries kopia
             // EXCLUDED (the ignore-file-errors path — an otherwise-silent partial backup).
@@ -267,6 +240,35 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     false,
                 )
                 .await?;
+            }
+            // Heal the kstatus exactly once for a terminal failure the controller
+            // hasn't finalized yet: the mover stamps only `phase: Failed` (+ the
+            // failure block) — never the kstatus conditions — so without this a
+            // mover-stamped Failed would lack `Stalled=True` and
+            // `kubectl wait --for=condition=Stalled` would never fire. A
+            // controller-stamped Failed (MoverJobFailed/MoverPodWedged/preflight)
+            // already carries `Stalled=True` (see `snapshot_ready_status`), so this
+            // is a no-op there. The `wrote` guard is therefore the exactly-once seam
+            // for counting a mover-stamped (or hook-/refusal-stamped) completion; the
+            // controller-stamped paths count at their own write site instead.
+            if !snapshot_stalled(backup) {
+                let current = serde_json::to_value(&backup.status).ok();
+                let wrote = io::patch_status_if_changed(
+                    &api,
+                    &name,
+                    current.as_ref(),
+                    snapshot_ready_status(
+                        backup,
+                        SnapshotPhase::Failed,
+                        "SnapshotFailed",
+                        "the backup failed; see status.failure and the mover Job/pod logs",
+                    ),
+                )
+                .await?;
+                if wrote {
+                    ctx.metrics
+                        .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
+                }
             }
             return Ok(Action::await_change());
         }
@@ -349,6 +351,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         ),
                     )
                     .await?;
+                    // Controller-stamped terminal failure (the mover didn't PATCH
+                    // Failed): count it once here. This write set `Stalled=True`, so
+                    // the follow-up TerminalFailed reconcile won't re-count it.
+                    ctx.metrics
+                        .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                     // A failed backup may mean the backend went away: nudge the repository
                     // to re-probe now so the gate engages without waiting for the catalog
                     // refresh. Best-effort — a nudge error must not mask the failure above.
@@ -403,6 +410,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         ),
                     )
                     .await?;
+                    // Controller-stamped terminal failure (set `Stalled=True`): count
+                    // once; the follow-up TerminalFailed reconcile won't re-count it.
+                    ctx.metrics
+                        .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                     // Delete the wedged Job *and its pod* (Background cascade) so the
                     // kubelet stops retrying immediately — don't wait for TTL/ownerRef GC.
                     let _ = job_api.delete(&name, &DeleteParams::background()).await;
@@ -620,7 +631,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 status["preflightSince"] = serde_json::Value::String(since);
             }
             let current = serde_json::to_value(&backup.status).ok();
-            io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
+            let wrote = io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
+            // Preflight timed out ⇒ terminal Failed. This write set `Stalled=True`, so
+            // count once here (guarded by the real transition); TerminalFailed won't
+            // re-count it.
+            if expired && wrote {
+                ctx.metrics
+                    .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
+            }
             return Ok(if expired {
                 Action::await_change()
             } else {
@@ -1954,8 +1972,12 @@ async fn finalize_succeeded(
         }
     }
     io::patch_status(api, name, status).await?;
+    // Terminal transition (guarded by the `phase != Succeeded` check at the call
+    // site): count it exactly once. The last-success TIMESTAMP is no longer stamped
+    // here — it is the mover-recorded `status.timing.endTime`, surfaced by the
+    // store-backed `kopiur_snapshot_last_success_timestamp_seconds` observable gauge.
     ctx.metrics
-        .set_backup_last_success(namespace, name, chrono::Utc::now().timestamp());
+        .inc_snapshot_completed("succeeded", namespace, backup_policy(backup));
     tracing::info!(backup = %name, "backup Job succeeded; phase=Succeeded");
     Ok(())
 }
