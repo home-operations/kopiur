@@ -248,7 +248,8 @@ Opt-in. When absent, nothing runs. When set, the operator runs a frequent blob-l
 
 ```yaml
 verification:
-    quick: { cron: "0 4 * * *", jitter: 30m } # blob-level verify, often
+    quick: # blob-level `kopia snapshot verify`, often
+        schedule: { cron: "0 4 * * *", jitter: 30m }
     deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
         schedule: { cron: "0 5 * * 0", jitter: 1h }
         capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
@@ -265,23 +266,55 @@ get my data back?"_ — it restores the latest snapshot into a throwaway volume,
 checks the result, and discards it. That is the closest thing to a real recovery,
 so you run it rarely. Schedule the two independently.
 
-/// note | Why `deep` is an object but `quick` is just a cron
+/// note | Both tiers nest their cron under `schedule:`
 
-This asymmetry trips people up, so it's deliberate: `quick` is a bare cron
-(`{ cron, jitter }`) because an integrity check needs **nothing but a schedule**.
-`deep` is a nested object because a restore drill needs somewhere to restore _to_
-— so alongside its `schedule` it carries the scratch-volume knobs (`capacity`,
-`storageClassName`) that `quick` has no use for. Grouping the schedule and its
-storage under one `deep:` key keeps "deep verify is off" and "deep verify is on,
-configured like this" a single on/off unit, and gives future deep-only options a
-home without reshaping the API. The two tiers share `successExpr` and
-`status.lastVerified`; only `deep` has a scratch volume.
+`quick` and `deep` share the same shape: `{ schedule: CronSpec, ... }`. Each
+tier's cron/jitter/timezone lives under its own `schedule:` key — `quick.schedule`,
+`deep.schedule` — instead of a bare `{ cron, jitter }` on the tier itself. `deep`
+additionally carries the scratch-volume knobs (`capacity`, `storageClassName`)
+that `quick` has no use for, since a restore drill needs somewhere to restore
+_to_. Grouping each tier's schedule (and, for `deep`, its storage) under its own
+key keeps "this tier is off" / "this tier is on, configured like this" a single
+unit, and gives future per-tier options a home without reshaping the API. The two
+tiers share `successExpr` and `status.lastVerified`; only `deep` has a scratch
+volume.
 
 ///
+
+!!! warning "Upgrading from the old flat `quick: { cron, jitter }` shape"
+    `verification.quick` used to be a bare `{ cron, jitter, timezone }` (GitHub #174). An
+    already-persisted `SnapshotPolicy` in that old shape keeps decoding fine, but with
+    its quick tier treated as **disabled** (no schedule to run) until you migrate it.
+    Re-applying that old shape as a **new** write is rejected at admission with a
+    message pointing at the move: nest the same fields under `quick.schedule`, e.g.
+    `quick: { cron: "0 4 * * *", jitter: 30m }` becomes
+    `quick: { schedule: { cron: "0 4 * * *", jitter: 30m } }`.
 
 Deep verify restores into a throwaway scratch volume, then discards it. `capacity` and `storageClassName` size and place that volume: **set `capacity`** and the operator provisions a fresh generic-ephemeral PVC (auto-deleted with the Job) of that size — size it to comfortably hold the restored snapshot; **omit `capacity`** and scratch falls back to a node-ephemeral `emptyDir` (zero-config, but bounded by node disk — fine for small snapshots). `storageClassName` only applies when `capacity` is set — a class with no capacity is a no-op (an `emptyDir` has no StorageClass), which the operator surfaces as a `ScratchStorageClassIgnored` condition + Warning Event on the `SnapshotPolicy`.
 
 You can set the scratch size/class **once** at the repository level via [`moverDefaults.scratch`](repositories.md#moverdefaults--one-place-to-configure-every-mover) instead of repeating it on every policy; the `verification.deep` fields here override that repo default field-wise.
+
+### verification scheduling — gated until there is something to verify
+
+Verification only ever runs against a snapshot that actually exists. On a
+brand-new `SnapshotPolicy` the operator does **not** schedule a verify Job the
+moment `verification` is added — it waits until either:
+
+- this policy has produced its **first successful backup** (a `Snapshot` that
+  reached `Succeeded`), or
+- the resolved repository already carries **discovered** (adopted) snapshots —
+  the escape hatch for an [adopted repository](scenarios/adopt-existing-repo.md),
+  where a deep verify legitimately restores the latest repo snapshot for the
+  identity even though this policy has never run a backup itself.
+
+While gated, `status.lastVerified` stays unset and no verify Job is created; the
+`SnapshotPolicy` keeps reconciling on a steady background cadence rather than the
+tight polling it uses once a verify Job is actually in flight — there is nothing
+wrong to report, just nothing to verify yet. As soon as the gate opens (typically:
+the first backup succeeds), the operator catches up and runs the first due
+verification promptly, without waiting for the next cron slot. Before this gate
+existed, a fresh policy with `verification` configured but no backup yet could
+spawn a verify Job that failed hard against an empty repository (GitHub #168).
 
 `successExpr` is a CEL predicate (returns `bool`) over the verify result. The environment is:
 
@@ -293,7 +326,7 @@ You can set the scratch size/class **once** at the repository level via [`moverD
 It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 
 !!! tip "A timezone for the verify crons"
-    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
+    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
 
 ### suspend — pause a recipe
 

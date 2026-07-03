@@ -25,7 +25,8 @@ extra RBAC:
 ```yaml
 spec:
     verification:
-        quick: { cron: "0 4 * * *", jitter: 30m } # blob-level `kopia snapshot verify`, often
+        quick: # blob-level `kopia snapshot verify`, often
+            schedule: { cron: "0 4 * * *", jitter: 30m }
         deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
             schedule: { cron: "0 5 * * 0", jitter: 1h }
             capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
@@ -35,8 +36,13 @@ spec:
 ```
 
 - **`quick`** is a cheap, frequent blob-level integrity check; **`deep`** is a rare
-  full scratch-restore into a throwaway volume (then discarded). Schedule each
-  independently.
+  full scratch-restore into a throwaway volume (then discarded). Both tiers nest
+  their cron under `schedule:` (`quick.schedule`, `deep.schedule`); `deep` additionally
+  carries the scratch-volume knobs below. Schedule each independently.
+- **Gated until there's something to verify** — a brand-new policy does not spawn a
+  verify Job before it has a first successful backup (or, for an adopted repository,
+  discovered snapshots already in it). See
+  [Backups → verification scheduling](../backups.md#verification-scheduling--gated-until-there-is-something-to-verify).
 - **`deep` scratch sizing** — set **`capacity`** to provision a fresh generic-ephemeral
   PVC (auto-deleted with the Job), sized to hold the restored snapshot;
   **`storageClassName`** places it (omit = cluster default). Omit `capacity` and

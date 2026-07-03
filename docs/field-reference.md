@@ -490,12 +490,18 @@ Externally tagged — `workloadExec` / `runJob` / `httpRequest`. Each carries
 
 ### Verification
 
-`{ quick?: CronSpec, deep?: { schedule, storageClassName?, capacity? }, successExpr?,
-verifyFilesPercent? }` — `successExpr` is a CEL bool predicate over
+`{ quick?: { schedule?: CronSpec }, deep?: { schedule: CronSpec, storageClassName?,
+capacity? }, successExpr?, verifyFilesPercent? }` — both tiers nest their cron under
+`schedule:` (`quick.schedule`, `deep.schedule`); `quick.schedule` is itself `Option`
+so an old-shape persisted object (`quick: { cron, jitter }`, pre-#174) still decodes,
+with the quick tier disabled until migrated — a **new** write of that old shape is
+rejected at admission. `successExpr` is a CEL bool predicate over
 `stats{files,bytes,errors}`/`snapshot`/`restored{files,checksumMatches}`/`tier`
 (`"quick"`|`"deep"`), validated at admission. For `quick`, `stats.files`/`stats.bytes`
 are filled from the verified snapshot's manifest (so `stats.files > 0` is meaningful);
-`restored` is deep-only. §4
+`restored` is deep-only. Scheduling is gated on a first successful backup (or
+discovered snapshots on an adopted repo) existing — see
+[Backups → verification scheduling](backups.md#verification-scheduling--gated-until-there-is-something-to-verify). §4
 
 ### Preflight
 

@@ -116,22 +116,37 @@ within a snapshot. Absent knobs leave kopia's default.
 ### `verification`
 
 First-class backup verification that proves snapshots are **restorable**, not just
-that maintenance ran. Opt-in: when absent, no verification runs. Two tiers:
+that maintenance ran. Opt-in: when absent, no verification runs. Two tiers, both
+shaped `{ schedule: CronSpec, ... }`:
 
-- `quick` — a schedule for the frequent blob-level `kopia snapshot verify`; absent
-  means no quick verification. `verifyFilesPercent` (`--verify-files-percent`) tunes
-  how many files it verifies fully (absent leaves kopia's default).
-- `deep` — a schedule plus knobs for the rarer scratch-restore restorability test,
-  which restores the latest snapshot into an ephemeral volume, sanity-checks it,
-  then discards it. `deep.schedule` is its cron+jitter (e.g. weekly);
-  `deep.capacity` sizes the ephemeral scratch PVC (e.g. `10Gi`) — absent falls
-  back to a node-ephemeral `emptyDir`; `deep.storageClassName` picks the scratch
-  PVC's StorageClass (absent uses the cluster default, and only applies when
-  `capacity` is set).
+- `quick` — a `QuickVerification { schedule?: CronSpec }`: the frequent blob-level
+  `kopia snapshot verify`. `quick.schedule` absent means no quick verification.
+  `verifyFilesPercent` (`--verify-files-percent`, a sibling of `quick`/`deep` on
+  `verification` itself) tunes how many files it verifies fully (absent leaves
+  kopia's default).
+- `deep` — a `DeepVerification { schedule: CronSpec, storageClassName?, capacity? }`:
+  the rarer scratch-restore restorability test, which restores the latest snapshot
+  into an ephemeral volume, sanity-checks it, then discards it. `deep.schedule` is
+  its cron+jitter (e.g. weekly); `deep.capacity` sizes the ephemeral scratch PVC
+  (e.g. `10Gi`) — absent falls back to a node-ephemeral `emptyDir`;
+  `deep.storageClassName` picks the scratch PVC's StorageClass (absent uses the
+  cluster default, and only applies when `capacity` is set).
 - `successExpr` — a CEL pass/fail predicate over the verify result, applied to both
   tiers. The environment exposes `stats{files,bytes,errors}`, `snapshot`, and (deep
   only) `restored{files,checksumMatches}`; returning `false` fails the run, killing
   the silent "0 files" success. Example: `"stats.files > 0 && stats.errors == 0"`.
+
+Scheduling is gated: a policy with `verification` set does not spawn a verify Job
+until it has either a first successful backup or (an adopted repository) discovered
+snapshots already present — see
+[Backups → verification scheduling](../../backups.md#verification-scheduling--gated-until-there-is-something-to-verify).
+
+/// note | Old flat `quick: { cron, jitter }` shape
+`quick`'s `schedule` field is `Option` specifically so an already-persisted old-shape
+object (`quick: { cron, jitter }`, pre-#174) keeps decoding — with the quick tier
+treated as disabled until migrated. A **new** write in that old shape is rejected at
+admission with a message pointing at the `quick.schedule` move.
+///
 
 ### `preflight`
 
