@@ -1,60 +1,50 @@
 ---
-# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
 version: 2
 project_name: kubectl-kopiur
 
-# Each target's rust-std must be installed before building (goreleaser does not
-# add rustup targets itself). The mise rust tool declares them (`targets =` in
-# .mise/config.toml) so the toolchain that provides cargo also carries the
-# stdlibs — a `rustup target add` hook here can install into a different
-# RUSTUP_HOME than the active cargo resolves against.
-before:
-  hooks:
-    - cargo fetch --locked
-
 builds:
+  # The binaries are NOT built here: the plugin-binaries.yaml matrix compiles
+  # `kopiur` natively per target (parallel legs, ~5 min wall clock vs ~18 min
+  # measured for one runner cross-linking everything with zig) and the
+  # prebuilt builder (goreleaser Pro) imports them into the artifact catalog,
+  # so archives/checksums/SBOMs/signing/cask/krew all work unchanged. This
+  # also frees the packaging job from macOS — with no linking there is no
+  # Security.framework, so it runs on ubuntu.
+  #
+  # The workflow downloads each `kopiur-<os>_<arch>` artifact into prebuilt/
+  # and restores the executable bit (workflow artifacts drop file modes).
+  #
+  # `binary` must stay `kopiur` (the crates/cli [[bin]] name): brew links the
+  # file as-is as the standalone `kopiur` command, while krew symlinks
+  # `kubectl-kopiur` (the name kubectl discovers) to this file itself — so
+  # installing via both never collides on PATH.
+  #
+  # No Windows target: kopiur-mover (whose pure Job builders the CLI reuses)
+  # is unix-only — no release has ever shipped a Windows asset.
   - id: kubectl-kopiur
-    builder: rust
-    # Must match the crates/cli [[bin]] name — the rust builder collects
-    # target/<triple>/release/<binary> verbatim (no rename). The file ships as
-    # plain `kopiur` so brew and krew never collide: brew links it as the
-    # standalone `kopiur` command, while krew symlinks `kubectl-kopiur` (the
-    # name kubectl discovers) to this file itself.
+    builder: prebuilt
     binary: kopiur
-    # cargo-zigbuild (the rust builder's default command) links every target —
-    # including the C bits in `ring` — with zig's clang, so all the triples
-    # build from ONE runner. That runner must be macOS: `security-framework-sys`
-    # (in kube's graph via hyper-rustls, even though the CLI's webpki-roots
-    # feature compiles its code out) emits `-framework Security` link flags that
-    # only resolve against a real macOS SDK, which Linux runners don't have.
-    # musl keeps the Linux binaries fully static (as the old native matrix did).
-    # No Windows target: kopiur-mover (whose pure Job builders the CLI reuses)
-    # is unix-only, and the old matrix's best-effort Windows leg was already
-    # failing — no release ships a Windows asset. The CLI is rustls-only.
-    targets:
-      - x86_64-unknown-linux-musl
-      - aarch64-unknown-linux-musl
-      - x86_64-apple-darwin
-      - aarch64-apple-darwin
-    flags:
-      - --release
-      - --package=kopiur-cli
-      - --locked
-    env:
-      # consts::VERSION prefers this compile-time stamp over the crate version,
-      # mirroring how the operator images stamp VERSION. release-please has
-      # already bumped Cargo.toml at the tag, so this is belt-and-braces.
-      - KOPIUR_VERSION={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    prebuilt:
+      path: prebuilt/kopiur-{{ .Os }}_{{ .Arch }}/kopiur
 
 archives:
   - id: kubectl-kopiur
     ids:
       - kubectl-kopiur
 
-# No upx stanza (unlike the Go tools' configs): upx ships no macOS-host builds,
-# and this release job must run on macOS (see the builds comment). The tar.gz
-# archives already compress the download; unpacked binaries also skip upx's
-# AV-false-positive and startup-decompression costs.
+# No upx stanza (unlike the Go tools' configs): modern macOS kills upx-packed
+# binaries outright (Gatekeeper rejects the packed Mach-O), and shrinking only
+# the Linux pair isn't worth the AV-false-positive and startup-decompression
+# costs. The tar.gz archives already compress the download.
 
 checksum:
   algorithm: sha256

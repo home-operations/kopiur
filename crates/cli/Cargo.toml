@@ -32,9 +32,8 @@ kopiur-mover = { workspace = true }
 # `webpki-roots` compiles in Mozilla's root store as the TLS fallback for the
 # rare kubeconfig without certificate-authority data (e.g. a cluster fronted by
 # public-CA TLS); the normal path — the cluster CA embedded in kubeconfig — is
-# unaffected. It also compiles out kube's native-roots path, whose macOS
-# Security.framework *symbols* zig's linker cannot resolve — required by the
-# goreleaser release build, which links every target with zig (.goreleaser.yaml).
+# unaffected. It also gives that fallback identical behavior on every platform
+# (kube's native-roots path would consult each OS's own trust store).
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "webpki-roots", "ws"] }
 futures = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_33"] }

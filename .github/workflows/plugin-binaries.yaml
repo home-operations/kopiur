@@ -1,0 +1,105 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Plugin Binaries
+
+# Reusable matrix that builds the plugin binary (`kopiur`) natively for every
+# release target and uploads each as a workflow artifact named
+# `kopiur-<os>_<arch>` — the layout goreleaser's prebuilt builder consumes
+# (.goreleaser.yaml `prebuilt.path`). Called by release.yaml (with the release
+# tag as `version`) and goreleaser-check.yaml (unstamped snapshot). Native legs
+# run in parallel (~5 min wall clock) vs ~18 min measured for one runner
+# cross-linking everything with zig; native linking also drops the zig
+# toolchain and the macOS-runner requirement from the packaging job.
+#
+# NOTE: workflow artifacts do not preserve file modes — consumers must
+# `chmod +x` the downloaded binaries before goreleaser packages them.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release tag to stamp into `kopiur --version` (empty = crate version)
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # No Windows: kopiur-mover (whose pure Job builders the CLI reuses) is
+        # unix-only. Both apple targets build on the arm64 macOS runner — the
+        # SDK links either architecture. musl keeps Linux fully static.
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            slug: linux_amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            slug: linux_arm64
+          - target: x86_64-apple-darwin
+            os: macos-15
+            slug: darwin_amd64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            slug: darwin_arm64
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Read the pinned toolchain version out of mise's config without
+      # installing any mise tools — rustup provisions the leg's toolchain so
+      # each runner only downloads its own target's stdlib.
+      - name: Setup Mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          cache: false
+          experimental: true
+          install: false
+
+      - name: Resolve Rust version
+        id: rust
+        run: echo "version=$(mise config get tools.rust.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Install musl toolchain
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.rust.outputs.version }}
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add "${TARGET}"
+
+      # KOPIUR_VERSION stamps `kopiur --version` with the release tag
+      # (crates/cli/src/consts.rs option_env!). Only exported when a version
+      # was passed — an empty env var would stamp an empty string instead of
+      # falling back to the crate version.
+      - name: Build kopiur
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "${VERSION}" ]; then
+            export KOPIUR_VERSION="${VERSION}"
+          fi
+          cargo build --release --locked --target "${TARGET}" -p kopiur-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kopiur-${{ matrix.slug }}
+          path: target/${{ matrix.target }}/release/kopiur
+          if-no-files-found: error
+          retention-days: 1
