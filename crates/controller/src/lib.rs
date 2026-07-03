@@ -205,9 +205,16 @@ pub async fn run() -> anyhow::Result<()> {
         spawn_webhook_tls_reconcile(client.clone(), webhook_tls, boot_ok);
     }
 
+    // Resolved eagerly (not inside `serve_http`) so a typo'd `KOPIUR_HTTP_ADDR`
+    // fails the process immediately with a non-zero exit and an actionable
+    // message, instead of only surfacing as a `tracing::warn!` once the spawned
+    // HTTP task loses the `tokio::select!` race below — silently leaving probes
+    // unreachable while the controller otherwise looks like it started fine.
+    let http_addr = config::http_addr()?;
+
     tracing::info!("starting kopiur controllers");
 
-    let http_srv = tokio::spawn(serve_http(metrics.clone()));
+    let http_srv = tokio::spawn(serve_http(metrics.clone(), http_addr));
     let controllers = spawn_all(client, ctx);
 
     tokio::select! {
@@ -780,7 +787,12 @@ async fn spawn_all(client: Client, ctx: Arc<Context>) {
 /// The controller's HTTP server: `/metrics` (Prometheus exposition) plus real
 /// `/healthz` + `/readyz` endpoints matching the chart's liveness/readiness
 /// probes (the previous raw listener returned the metrics body for any path).
-async fn serve_http(metrics: Metrics) -> anyhow::Result<()> {
+///
+/// `addr` is resolved by the caller (see [`config::http_addr`]) — by the time
+/// this runs, `KOPIUR_HTTP_ADDR` has already been validated, so a bind failure
+/// here is a genuine runtime issue (port in use, no permission), not a bad
+/// address.
+async fn serve_http(metrics: Metrics, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
@@ -802,9 +814,9 @@ async fn serve_http(metrics: Metrics) -> anyhow::Result<()> {
         .route("/readyz", get(health))
         .with_state(metrics);
 
-    let listener = tokio::net::TcpListener::bind(config::HTTP_ADDR).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
-        addr = config::HTTP_ADDR,
+        %addr,
         "http server listening (/metrics, /healthz, /readyz)"
     );
     axum::serve(listener, app).await?;

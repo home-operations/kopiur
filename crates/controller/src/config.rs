@@ -47,9 +47,34 @@ pub const OPERATOR_NAMESPACE_ENV: &str = "KOPIUR_NAMESPACE";
 /// mounts an `emptyDir`; set this only when relocating that mount.
 pub const KOPIA_CACHE_DIR_ENV: &str = "KOPIUR_KOPIA_CACHE_DIR";
 
-/// Address the controller's HTTP server (`/metrics`, `/healthz`, `/readyz`)
-/// binds to. Matches the chart's `controller.probePort` (8081).
+/// Override for the address the controller's HTTP server (`/metrics`,
+/// `/healthz`, `/readyz`) binds to. Unset uses [`HTTP_ADDR`]. Needed on
+/// IPv6-only/dual-stack clusters, where the kubelet cannot reach an IPv4-only
+/// bind (`0.0.0.0`) and probes never succeed — set `[::]:8081` there. The port
+/// must agree with the chart's `controller.probePort` (the Service/probes
+/// target that port, not whatever `KOPIUR_HTTP_ADDR` happens to contain).
+/// Mirrors the webhook's `KOPIUR_WEBHOOK_ADDR` (`kopiur_webhook::config::WEBHOOK_ADDR_ENV`).
+pub const HTTP_ADDR_ENV: &str = "KOPIUR_HTTP_ADDR";
+
+/// Default address the controller's HTTP server (`/metrics`, `/healthz`,
+/// `/readyz`) binds to when [`HTTP_ADDR_ENV`] is unset. Matches the chart's
+/// `controller.probePort` (8081).
 pub const HTTP_ADDR: &str = "0.0.0.0:8081";
+
+/// Resolve the controller HTTP server's bind address from [`HTTP_ADDR_ENV`],
+/// falling back to [`HTTP_ADDR`] when unset.
+///
+/// Unlike [`worker_threads`] (which clamps an out-of-range value rather than
+/// fail), an unparseable address is surfaced as an error instead of silently
+/// falling back to the default: a typo'd probe address must fail loudly at
+/// startup, not silently bind the default and mask the operator's intent
+/// (most often an IPv6-only cluster that needed `[::]:8081`).
+pub fn http_addr() -> crate::error::Result<std::net::SocketAddr> {
+    let value = std::env::var(HTTP_ADDR_ENV).unwrap_or_else(|_| HTTP_ADDR.to_string());
+    value
+        .parse::<std::net::SocketAddr>()
+        .map_err(|source| crate::error::Error::InvalidHttpAddr { value, source })
+}
 
 /// Number of tokio worker threads the controller runtime runs. The controller is
 /// I/O-bound — watch streams, debounced reconciles, short idempotent kopia calls —
@@ -132,3 +157,52 @@ pub const WEBHOOK_TLS_RETRY_INTERVAL: std::time::Duration = std::time::Duration:
 /// vars (`RUST_LOG`, `KOPIUR_LOG_FORMAT`) are forwarded whenever present so a
 /// mover inherits the controller's log level and format regardless of OTLP.
 pub use kopiur_telemetry::env::{LOG_PASSTHROUGH, OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_PASSTHROUGH};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    // `std::env::set_var`/`remove_var` are process-global; `#[serial]` (already
+    // a kopiur-controller dev-dependency) serializes every test in this module
+    // that touches HTTP_ADDR_ENV so they can't race each other (Rust runs
+    // `#[test]`s concurrently by default). Each test clears the var itself
+    // rather than relying on a shared teardown, so a failing assertion can't
+    // poison the env for a later test.
+
+    #[test]
+    #[serial]
+    fn http_addr_unset_uses_default() {
+        // SAFETY: serialized by #[serial] against every other test in this module.
+        unsafe { std::env::remove_var(HTTP_ADDR_ENV) };
+        assert_eq!(http_addr().unwrap(), HTTP_ADDR.parse().unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn http_addr_custom_value_is_used() {
+        // SAFETY: serialized by #[serial] against every other test in this module.
+        unsafe { std::env::set_var(HTTP_ADDR_ENV, "[::]:8081") };
+        let result = http_addr();
+        unsafe { std::env::remove_var(HTTP_ADDR_ENV) };
+        assert_eq!(result.unwrap(), "[::]:8081".parse().unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn http_addr_invalid_value_fails_loudly_with_an_actionable_message() {
+        // SAFETY: serialized by #[serial] against every other test in this module.
+        unsafe { std::env::set_var(HTTP_ADDR_ENV, "not-an-addr") };
+        let result = http_addr();
+        unsafe { std::env::remove_var(HTTP_ADDR_ENV) };
+        let err = result.expect_err("garbage KOPIUR_HTTP_ADDR must not silently fall back");
+        let msg = err.to_string();
+        // What: which var, what value. Why: not a valid socket address. Fix:
+        // both accepted forms plus how to get back to the default.
+        assert!(msg.contains("KOPIUR_HTTP_ADDR='not-an-addr'"), "{msg}");
+        assert!(msg.contains("is not a valid socket address"), "{msg}");
+        assert!(msg.contains("0.0.0.0:8081"), "{msg}");
+        assert!(msg.contains("[::]:8081"), "{msg}");
+        assert!(msg.contains("unset it to use the default"), "{msg}");
+    }
+}

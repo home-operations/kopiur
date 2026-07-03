@@ -190,6 +190,13 @@ controller:
   # -- Extra pod labels / annotations.
   podLabels: {}
   podAnnotations: {}
+  # -- Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;
+  # serves /metrics, /healthz, /readyz). Override on an IPv6-only/dual-stack
+  # cluster, where the kubelet cannot reach an IPv4-only bind (0.0.0.0) and
+  # probes never succeed — set "[::]:8081" there. Must agree on port with
+  # probePort below (the Service and probes target that port, not whatever
+  # this address happens to contain).
+  listenAddr: "0.0.0.0:8081"
   # -- Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).
   probePort: 8081
 
