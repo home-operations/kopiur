@@ -1732,12 +1732,18 @@ async fn metrics_reflect_backup_lifecycle() {
         "kopiur_resource_phase must never emit a 0-valued series:\n{text}"
     );
 
-    // Per-policy "latest successful backup" family: populated with a positive
-    // value for the policy this scenario drove.
-    for metric in [
-        "kopiur_policy_last_backup_duration_seconds",
-        "kopiur_policy_last_backup_size_bytes",
-        "kopiur_policy_last_backup_success_timestamp_seconds",
+    // Per-policy "latest successful backup" family: populated for the policy
+    // this scenario drove. `status.timing.durationSeconds` is integer seconds
+    // and the e2e backup can complete in under a second, so 0 is a legitimate
+    // duration — that series only asserts presence + a parseable, non-negative
+    // value. Size and the success timestamp are always strictly positive.
+    for (metric, min_inclusive) in [
+        ("kopiur_policy_last_backup_duration_seconds", 0.0),
+        ("kopiur_policy_last_backup_size_bytes", f64::MIN_POSITIVE),
+        (
+            "kopiur_policy_last_backup_success_timestamp_seconds",
+            f64::MIN_POSITIVE,
+        ),
     ] {
         let line = text
             .lines()
@@ -1752,8 +1758,8 @@ async fn metrics_reflect_backup_lifecycle() {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or_else(|| panic!("unparseable value for {metric}:\n{line}"));
         assert!(
-            value > 0.0,
-            "expected positive {metric}, got {value}:\n{line}"
+            value >= min_inclusive,
+            "expected {metric} >= {min_inclusive}, got {value}:\n{line}"
         );
     }
 

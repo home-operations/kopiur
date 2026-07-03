@@ -197,6 +197,46 @@ helm upgrade --install kopiur deploy/helm/kopiur \\
   --namespace kopiur-e2e --create-namespace \\
   --wait --timeout 5m \\
   -f deploy/e2e/values.yaml
+
+# `--wait` above only covers Deployment readiness (pods Ready), not the
+# admission-webhook path: the API server can still get `connection refused`
+# calling the webhook Service for the first ~minute (endpoint/iptables
+# propagation lag), and the chart's webhook.failurePolicy is Fail, so every
+# CREATE/UPDATE of a kopiur kind is rejected until that settles. Gate suite
+# start on a REAL admission round-trip: server-side dry-run create of a
+# spec-valid Repository (same shape kubectl-kopiur's `doctor` probe and
+# tests/webhook.rs use) — dry-run passes through both webhooks but persists
+# nothing, so it is safe to retry and never leaves cluster state behind.
+echo "==> waiting for webhook admission readiness (dry-run probe)"
+deadline=$(($(date +%s) + 120))
+probe='apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: kopiur-webhook-readiness-probe
+  namespace: kopiur-e2e
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: kopiur-webhook-readiness-probe
+  encryption:
+    passwordSecretRef:
+      name: kopiur-webhook-readiness-probe
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+'
+until printf '%s\\n' "$probe" | kubectl apply --dry-run=server -f - >/dev/null 2>&1; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "==> ERROR: webhook admission still unreachable after 120s" >&2
+    printf '%s\\n' "$probe" | kubectl apply --dry-run=server -f - >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+echo "==> webhook admission ready"
 """
 
 [tasks.down]
