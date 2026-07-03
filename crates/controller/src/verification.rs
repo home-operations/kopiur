@@ -98,7 +98,7 @@ fn slot_for(
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
 /// the policy's `verification`, the seed, the last-verified time, `now`, and the
-/// repository's `scheduleDefaults.timezone` (`repo_tz`, ADR §174 item 3).
+/// repository's `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
 pub fn due_tier(
     verification: &Verification,
     seed: &str,
