@@ -1692,6 +1692,139 @@ async fn metrics_reflect_backup_lifecycle() {
         text.contains("# TYPE kopiur_controller_reconciliations_total counter"),
         "exposition should carry # TYPE metadata"
     );
+
+    // ---- store-backed metrics semantics (issues #172/#175) ----------------
+
+    let policy_name = "e2e-mx-cfg";
+
+    // The Succeeded Snapshot's phase line AND its size-bytes line carry the
+    // `policy` label sourced from spec.policyRef.
+    let phase_line = text
+        .lines()
+        .find(|l| {
+            l.starts_with("kopiur_resource_phase{")
+                && l.contains("name=\"e2e-mx-backup\"")
+                && l.contains("phase=\"Succeeded\"")
+        })
+        .unwrap_or_else(|| panic!("missing Succeeded phase line for e2e-mx-backup:\n{text}"));
+    assert!(
+        phase_line.contains(&format!("policy=\"{policy_name}\"")),
+        "expected policy label on the phase line:\n{phase_line}"
+    );
+    let size_line = text
+        .lines()
+        .find(|l| {
+            l.starts_with("kopiur_snapshot_size_bytes{") && l.contains("name=\"e2e-mx-backup\"")
+        })
+        .unwrap_or_else(|| panic!("missing kopiur_snapshot_size_bytes for e2e-mx-backup:\n{text}"));
+    assert!(
+        size_line.contains(&format!("policy=\"{policy_name}\"")),
+        "expected policy label on the size_bytes line:\n{size_line}"
+    );
+
+    // Active-only emission: never a 0-valued kopiur_resource_phase series (the
+    // old enumerate-and-reset behavior flooded /metrics with phase="…"}=0 lines
+    // for every inactive phase).
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.starts_with("kopiur_resource_phase") && l.trim_end().ends_with(" 0")),
+        "kopiur_resource_phase must never emit a 0-valued series:\n{text}"
+    );
+
+    // Per-policy "latest successful backup" family: populated with a positive
+    // value for the policy this scenario drove.
+    for metric in [
+        "kopiur_policy_last_backup_duration_seconds",
+        "kopiur_policy_last_backup_size_bytes",
+        "kopiur_policy_last_backup_success_timestamp_seconds",
+    ] {
+        let line = text
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("{metric}{{"))
+                    && l.contains(&format!("policy=\"{policy_name}\""))
+            })
+            .unwrap_or_else(|| panic!("missing {metric} for policy {policy_name}:\n{text}"));
+        let value: f64 = line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("unparseable value for {metric}:\n{line}"));
+        assert!(
+            value > 0.0,
+            "expected positive {metric}, got {value}:\n{line}"
+        );
+    }
+
+    // Completion counter: a terminal (Succeeded) transition recorded once, with
+    // the result and policy labels, and — unlike the observable phase gauge —
+    // durable across the CR's eventual deletion (issue #175).
+    let completed_line = text
+        .lines()
+        .find(|l| {
+            l.starts_with("kopiur_snapshots_completed_total{")
+                && l.contains("result=\"succeeded\"")
+                && l.contains(&format!("policy=\"{policy_name}\""))
+        })
+        .unwrap_or_else(|| {
+            panic!("missing kopiur_snapshots_completed_total{{result=\"succeeded\"}} for policy {policy_name}:\n{text}")
+        });
+    let completed_value: f64 = completed_line
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("unparseable completed value:\n{completed_line}"));
+    assert!(
+        completed_value >= 1.0,
+        "expected kopiur_snapshots_completed_total >= 1:\n{completed_line}"
+    );
+
+    // THE regression pin (issues #172/#175): once the Snapshot CR is deleted (and
+    // its finalizer has run), every one of its per-resource series must be absent
+    // from the NEXT scrape. Before the store-backed conversion these were sync
+    // gauges that could only be overwritten, never dropped, so a deleted CR's
+    // series lingered forever — this assertion would time out on that code.
+    backups
+        .delete("e2e-mx-backup", &DeleteParams::default())
+        .await
+        .expect("delete Snapshot");
+    wait_until(
+        "e2e-mx-backup removed after finalizer",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            match backups.get_opt("e2e-mx-backup").await? {
+                Some(_) => Ok(None),
+                None => Ok(Some(())),
+            }
+        },
+    )
+    .await
+    .expect("Snapshot CR should be removed once the finalizer runs");
+
+    wait_until(
+        "kopiur metrics no longer carry any series for the deleted Snapshot",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            async move {
+                match scrape_controller_metrics(&client).await {
+                    Ok(t) if !t.lines().any(|l| l.contains("name=\"e2e-mx-backup\"")) => {
+                        Ok(Some(()))
+                    }
+                    // Series still present, or the proxy isn't up — keep polling.
+                    _ => Ok(None),
+                }
+            }
+        },
+    )
+    .await
+    .expect(
+        "all kopiur_resource_phase/kopiur_snapshot_*/kopiur_snapshot_last_success_timestamp_seconds \
+         series for the deleted Snapshot must disappear from /metrics (#172/#175)",
+    );
 }
 
 /// Default-managed maintenance (ADR §3.7): a `Repository` with no
