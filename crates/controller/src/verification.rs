@@ -116,6 +116,43 @@ pub fn verification_unlocked(has_successful: bool, has_discovered: bool) -> bool
     has_successful || has_discovered
 }
 
+/// Where to look for a repository's **discovered** (adopted) `Snapshot` CRs when
+/// probing the #168 escape hatch. Derived purely from whether the policy's resolved
+/// repository is namespaced or cluster-scoped — the two placements the catalog uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveredProbeScope {
+    /// Namespaced [`Repository`](kopiur_api::Repository): the catalog materializes
+    /// discovered rows in a single namespace ([`crate::catalog::Placement::Namespace`]),
+    /// so a namespaced LIST there suffices.
+    Namespace(String),
+    /// Cluster-scoped [`ClusterRepository`](kopiur_api::ClusterRepository): the catalog
+    /// scatters discovered rows across identity-hostname namespaces / the
+    /// `fallbackNamespace` ([`crate::catalog::Placement::Cluster`]) — generally NOT the
+    /// policy's namespace — so probe cluster-wide. The `repository-uid` label already
+    /// scopes the LIST to this repository's rows, so the wide scan can't false-positive
+    /// on another repo's discovered snapshots.
+    ClusterWide,
+}
+
+/// **Pure.** Decide where [`repo_has_discovered_snapshots`] should LIST, from whether
+/// the resolved repository is cluster-scoped and the probing policy's namespace.
+///
+/// Namespaced repos keep the existing policy-namespace probe (the catalog materializes
+/// their discovered rows in that one namespace). A `ClusterRepository`'s rows land in
+/// arbitrary, per-identity namespaces the reconciler can't enumerate a priori, so the
+/// only correct probe is cluster-wide — otherwise an *adopted* `ClusterRepository`
+/// would never unlock verification before its first child backup (#168 regression).
+pub fn discovered_probe_scope(
+    cluster_scoped: bool,
+    policy_namespace: &str,
+) -> DiscoveredProbeScope {
+    if cluster_scoped {
+        DiscoveredProbeScope::ClusterWide
+    } else {
+        DiscoveredProbeScope::Namespace(policy_namespace.to_string())
+    }
+}
+
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
 /// the policy's `verification`, the seed, the last-verified time, `now`, the
@@ -181,12 +218,19 @@ pub fn next_verify_wakeup(
         }
     }
     match earliest {
+        // A future slot: sleep until it (floored/capped).
         Some(slot) if slot > now => (slot - now)
             .to_std()
             .unwrap_or(REQUEUE_CAP)
             .min(REQUEUE_CAP)
             .max(REQUEUE_RUNNING),
-        _ => REQUEUE_RUNNING,
+        // A past-due slot: the prompt 30s cadence, since the caller then spawns and
+        // tracks the Job.
+        Some(_) => REQUEUE_RUNNING,
+        // No live schedule at all (e.g. an old-shape quick-only policy whose
+        // `quick.schedule` decoded to `None`, with no deep): nothing will ever come
+        // due, so floor at the steady cadence rather than the 30s hot loop.
+        None => REQUEUE_GATED,
     }
 }
 
@@ -272,11 +316,14 @@ pub async fn verify_step(
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
     // snapshot OR its repo already carries discovered (adopted) snapshots. The
     // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
-    // entirely once a successful backup already unlocks the gate.
+    // entirely once a successful backup already unlocks the gate. A cluster-scoped
+    // repository (`repo_namespace == None`) scatters its discovered rows across
+    // per-identity namespaces, so the probe scope is cluster-wide there.
     let has_discovered = if has_successful {
         false
     } else {
-        repo_has_discovered_snapshots(&ctx.client, namespace, &repo.owner_ref.uid).await?
+        let scope = discovered_probe_scope(repo.repo_namespace.is_none(), namespace);
+        repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await?
     };
     let unlocked = verification_unlocked(has_successful, has_discovered);
 
@@ -636,16 +683,21 @@ fn verify_identity(
 }
 
 /// Whether the policy's resolved repository already carries **discovered** (adopted)
-/// snapshots — the #168 verification escape hatch. A cheap labeled LIST in the
-/// policy's namespace scoped by the repo-uid + `origin=discovered` labels the catalog
-/// scanner stamps on every materialized foreign snapshot (`crate::catalog`); `true`
-/// as soon as one exists. Thin IO over the pure [`verification_unlocked`] gate.
+/// snapshots — the #168 verification escape hatch. A cheap labeled LIST scoped by the
+/// repo-uid + `origin=discovered` labels the catalog scanner stamps on every
+/// materialized foreign snapshot (`crate::catalog`); `true` as soon as one exists.
+/// The [`DiscoveredProbeScope`] (from [`discovered_probe_scope`]) selects namespaced
+/// vs cluster-wide so an adopted `ClusterRepository`'s scattered rows are seen. Thin
+/// IO over the pure [`verification_unlocked`] gate.
 async fn repo_has_discovered_snapshots(
     client: &kube::Client,
-    namespace: &str,
+    scope: &DiscoveredProbeScope,
     repo_uid: &str,
 ) -> Result<bool> {
-    let api: Api<Snapshot> = Api::namespaced(client.clone(), namespace);
+    let api: Api<Snapshot> = match scope {
+        DiscoveredProbeScope::Namespace(ns) => Api::namespaced(client.clone(), ns),
+        DiscoveredProbeScope::ClusterWide => Api::all(client.clone()),
+    };
     let selector = format!(
         "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL}={}",
         Origin::Discovered.label_value()
@@ -743,10 +795,15 @@ mod tests {
             due_tier(&v, "seed", None, Utc::now(), None, true).is_none(),
             "quick with no schedule must be disabled, not due"
         );
-        // And it doesn't inflate the wakeup either: with no live schedule at all, the
-        // wakeup floors at the running cadence rather than a past-due hot loop.
+        // And it doesn't spin either: with no live schedule at all, the wakeup floors
+        // at the steady cadence rather than the 30s past-due hot loop, so an unmigrated
+        // quick-only policy doesn't re-reconcile every 30s forever.
         let wake = next_verify_wakeup(&v, "seed", None, Utc::now(), None);
-        assert_eq!(wake, REQUEUE_RUNNING);
+        assert_eq!(wake, REQUEUE_GATED);
+        // idle_requeue agrees when the policy is unlocked (a successful backup exists):
+        // no live schedule => steady cadence, not the hot loop.
+        let idle = idle_requeue(&v, "seed", None, Utc::now(), None, true);
+        assert_eq!(idle, REQUEUE_GATED);
     }
 
     // --- #168 gate: no verify before a verifiable snapshot exists ---
@@ -782,6 +839,28 @@ mod tests {
         let unlocked = verification_unlocked(false, true);
         assert!(unlocked);
         assert!(due_tier(&v, "seed", None, Utc::now(), None, unlocked).is_some());
+    }
+
+    #[test]
+    fn namespaced_repo_probes_the_policy_namespace() {
+        // A namespaced Repository materializes its discovered rows in one namespace
+        // (Placement::Namespace) — keep the existing policy-namespace probe.
+        assert_eq!(
+            discovered_probe_scope(false, "billing"),
+            DiscoveredProbeScope::Namespace("billing".into())
+        );
+    }
+
+    #[test]
+    fn cluster_repo_probes_cluster_wide_so_adopted_repos_unlock() {
+        // Regression for the escape hatch no-op: a ClusterRepository's discovered rows
+        // land in per-identity namespaces (Placement::Cluster) — generally NOT the
+        // policy's namespace — so the probe MUST be cluster-wide, or an adopted
+        // ClusterRepository never unlocks verification before its first child backup.
+        assert_eq!(
+            discovered_probe_scope(true, "billing"),
+            DiscoveredProbeScope::ClusterWide
+        );
     }
 
     #[test]
