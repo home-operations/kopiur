@@ -1,60 +1,33 @@
 ---
-# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
 version: 2
 project_name: kubectl-kopiur
 
-# Each target's rust-std must be installed before building (goreleaser does not
-# add rustup targets itself). The mise rust tool declares them (`targets =` in
-# .mise/config.toml) so the toolchain that provides cargo also carries the
-# stdlibs — a `rustup target add` hook here can install into a different
-# RUSTUP_HOME than the active cargo resolves against.
-before:
-  hooks:
-    - cargo fetch --locked
-
 builds:
+  # Binaries come from the plugin-binaries.yaml native matrix; prebuilt (Pro)
+  # imports them so archives/checksums/SBOMs/signing/cask/krew work unchanged.
+  # `binary` must equal the crates/cli [[bin]] name: brew links the file as
+  # the standalone `kopiur`, krew symlinks `kubectl-kopiur` to it — both
+  # installable without PATH collision. No Windows: kopiur-mover is unix-only.
   - id: kubectl-kopiur
-    builder: rust
-    # Must match the crates/cli [[bin]] name — the rust builder collects
-    # target/<triple>/release/<binary> verbatim (no rename). The file ships as
-    # plain `kopiur` so brew and krew never collide: brew links it as the
-    # standalone `kopiur` command, while krew symlinks `kubectl-kopiur` (the
-    # name kubectl discovers) to this file itself.
+    builder: prebuilt
     binary: kopiur
-    # cargo-zigbuild (the rust builder's default command) links every target —
-    # including the C bits in `ring` — with zig's clang, so all the triples
-    # build from ONE runner. That runner must be macOS: `security-framework-sys`
-    # (in kube's graph via hyper-rustls, even though the CLI's webpki-roots
-    # feature compiles its code out) emits `-framework Security` link flags that
-    # only resolve against a real macOS SDK, which Linux runners don't have.
-    # musl keeps the Linux binaries fully static (as the old native matrix did).
-    # No Windows target: kopiur-mover (whose pure Job builders the CLI reuses)
-    # is unix-only, and the old matrix's best-effort Windows leg was already
-    # failing — no release ships a Windows asset. The CLI is rustls-only.
-    targets:
-      - x86_64-unknown-linux-musl
-      - aarch64-unknown-linux-musl
-      - x86_64-apple-darwin
-      - aarch64-apple-darwin
-    flags:
-      - --release
-      - --package=kopiur-cli
-      - --locked
-    env:
-      # consts::VERSION prefers this compile-time stamp over the crate version,
-      # mirroring how the operator images stamp VERSION. release-please has
-      # already bumped Cargo.toml at the tag, so this is belt-and-braces.
-      - KOPIUR_VERSION={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    prebuilt:
+      path: prebuilt/kopiur-{{ .Os }}_{{ .Arch }}/kopiur
 
 archives:
   - id: kubectl-kopiur
     ids:
       - kubectl-kopiur
 
-# No upx stanza (unlike the Go tools' configs): upx ships no macOS-host builds,
-# and this release job must run on macOS (see the builds comment). The tar.gz
-# archives already compress the download; unpacked binaries also skip upx's
-# AV-false-positive and startup-decompression costs.
+# No upx: macOS kills upx-packed binaries, and shrinking only the Linux pair
+# isn't worth the AV-false-positive cost.
 
 checksum:
   algorithm: sha256
@@ -101,16 +74,10 @@ homebrew_casks:
         install: |
           system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kopiur"] if OS.mac?
 
-# The krew manifest, committed to THIS repo's plugins/ directory — the kopiur
-# repository doubles as its own krew custom index (`kubectl krew index add
-# kopiur <this repo's git URL>`). Pushed with the bot app token; bot-token
-# pushes retrigger workflows, so every on-push workflow ignores plugins/**.
-# No commit_author override: goreleaser can't derive an identity from the
-# token and always sends its default (goreleaserbot), matching the tap's
-# flate/yayamlls commits. The plugin name stays `kopiur` so existing
-# `kubectl krew upgrade` installs keep working; its bin follows the shipped
-# file name (`kopiur`) — krew's own `kubectl-kopiur` symlink to that bin is
-# what kubectl discovers, so the rename is invisible to plugin users.
+# Krew manifest committed to this repo's plugins/ (its own custom index) with
+# the bot token — bot pushes retrigger workflows, so on-push workflows ignore
+# plugins/**. kubectl discovery comes from krew's own `kubectl-kopiur` symlink
+# to the manifest's bin, so the `kopiur` file name is invisible to plugin users.
 krews:
   - name: kopiur
     ids:

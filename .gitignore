@@ -6,6 +6,8 @@ target/
 
 # MkDocs docs site output (`mise run docs`); rustdoc output is under target/.
 /site/
+# Staged binaries for goreleaser's prebuilt builder (local snapshot testing).
+/prebuilt/
 # uv-managed virtualenv for the docs toolchain.
 /.venv/
 
