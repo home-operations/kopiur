@@ -8,6 +8,10 @@
 //!   `mkdir /scratch: permission denied`. With `capacity`/`storageClassName`
 //!   unset the scratch volume is an `emptyDir`; the run must succeed and stamp
 //!   `status.lastVerified`.
+//! - gate (GitHub #168): a brand-new policy with `verification` configured but
+//!   NO backup yet must not spawn a verify Job (the mover would fail hard
+//!   against an empty repository); the first verify catches up promptly once
+//!   the first backup succeeds.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -17,11 +21,13 @@
 mod common;
 use common::*;
 
+use std::time::Duration;
+
 use kube::Api;
-use kube::api::{ListParams, Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
-use kopiur_api::{Repository, SnapshotPolicy};
+use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
 /// Verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.quick` with an
@@ -266,5 +272,138 @@ async fn deep_verify_scratch_inherits_repo_mover_defaults() {
         cache_cap.as_deref(),
         Some("2Gi"),
         "verify cache PVC must inherit moverDefaults.cache.capacity"
+    );
+}
+
+/// GitHub #168 regression: a brand-new `SnapshotPolicy` with BOTH verification
+/// tiers configured — but no backup yet — must NOT spawn a verify Job. Before the
+/// fix, `due_tier`'s catch-up logic anchored a never-verified policy a year in the
+/// past, so the very first reconcile treated every configured tier as already
+/// past-due and spawned a verify Job against a repository with zero snapshots;
+/// the mover failed hard (`deep verify found no snapshot to restore …`).
+/// Verification unlocks on this policy's first successful backup (or, for an
+/// adopted repository, discovered snapshots already present — not exercised
+/// here), at which point the catch-up fires promptly (asserted below).
+///
+/// Deliberately does NOT call `ensure_seed` (every other test in this file does)
+/// — that is exactly the scenario #168 needs: `verification` configured before
+/// any snapshot exists.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn verification_gated_until_first_successful_snapshot_168() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    // A Ready Repository + SnapshotPolicy with NO Snapshot at all (mirrors
+    // ensure_seed's fixtures minus the seed leg) — the #168 precondition.
+    ensure_empty_policy(
+        &client,
+        "e2e-vfy-gate-repo",
+        "e2e-vfy-gate-policy",
+        "vfygate",
+    )
+    .await;
+
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    // Both tiers, every minute, new nested shape: gives pre-fix code the best
+    // chance to fire a verify Job well within the assertion window below.
+    let patch = serde_json::json!({
+        "spec": { "verification": {
+            "quick": { "schedule": { "cron": "* * * * *" } },
+            "deep": { "schedule": { "cron": "* * * * *" } },
+            "successExpr": "stats.errors == 0"
+        } }
+    });
+    policies
+        .patch(
+            "e2e-vfy-gate-policy",
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .expect("patch verification onto the SnapshotPolicy");
+
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let selector = "app.kubernetes.io/component=verify,\
+                    kopiur.home-operations.com/verify=e2e-vfy-gate-policy";
+
+    // --- Gated: no verify Job for a fixed window, and no lastVerified/Failed
+    // verify reported. 45s comfortably exceeds both the every-minute cron cadence
+    // and the controller's reconcile-on-create — on pre-fix code the past-due
+    // catch-up slot is consumed on the very first reconcile (seconds, not
+    // minutes), so a real regression is unambiguous well inside this window
+    // (same margin as the `QUIET_WINDOW` precedent in steady_state.rs).
+    tokio::time::sleep(Duration::from_secs(45)).await;
+    let found = jobs
+        .list(&ListParams::default().labels(selector))
+        .await
+        .expect("list verify Jobs")
+        .items;
+    assert!(
+        found.is_empty(),
+        "no verify Job may exist before any snapshot succeeds (#168), found: {:?}",
+        found
+            .iter()
+            .map(|j| j.metadata.name.clone())
+            .collect::<Vec<_>>()
+    );
+    let gated_status = status_json(&policies, "e2e-vfy-gate-policy").await;
+    assert!(
+        gated_status
+            .get("lastVerified")
+            .and_then(|v| v.as_str())
+            .is_none(),
+        "status.lastVerified must stay unset while gated, got: {gated_status:?}"
+    );
+
+    // --- Unlock the gate: create/seed the first backup, the same mechanism
+    // `ensure_seed`'s snapshot leg uses, and wait for it to Succeed.
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-vfy-gate-seed",
+                "e2e-vfy-gate-policy",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create the first Snapshot");
+    wait_phase(&backups, "e2e-vfy-gate-seed", "Succeeded")
+        .await
+        .expect("the first backup should succeed");
+
+    // --- Catch-up: now unlocked, the first due verify fires promptly and stamps
+    // lastVerified (reuses the assertion pattern of the quick-verify test above).
+    wait_until(
+        "SnapshotPolicy.status.lastVerified is stamped after the first successful backup (#168 catch-up)",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&policies, "e2e-vfy-gate-policy").await;
+            Ok(s.get("lastVerified")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect(
+        "verification must catch up promptly once the first successful backup unlocks the gate",
+    );
+
+    let after_unlock = jobs
+        .list(&ListParams::default().labels(selector))
+        .await
+        .expect("list verify Jobs")
+        .items;
+    assert!(
+        !after_unlock.is_empty(),
+        "a verify Job must have fired after the first successful backup unlocked verification"
     );
 }
