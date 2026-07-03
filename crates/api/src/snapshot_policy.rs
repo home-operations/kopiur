@@ -298,9 +298,10 @@ pub struct Upload {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Verification {
-    /// Schedule for the frequent blob-level `kopia snapshot verify`; absent ⇒ no quick verification.
+    /// Quick (blob-level) verification tier; absent ⇒ no quick verification. Its cron
+    /// lives under `quick.schedule` (matching `deep.schedule`), see [`QuickVerification`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quick: Option<CronSpec>,
+    pub quick: Option<QuickVerification>,
     /// Schedule + knobs for the rarer scratch-restore test; absent ⇒ no deep verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deep: Option<DeepVerification>,
@@ -310,6 +311,24 @@ pub struct Verification {
     /// How many files `quick` verifies fully (`--verify-files-percent`); absent leaves kopia's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_files_percent: Option<u8>,
+}
+
+/// Quick (blob-level) verification tier: schedule for the frequent `kopia snapshot verify`.
+///
+/// A wrapper so this tier's shape matches `deep` — the cron lives at
+/// `quick.schedule.cron` (GitHub #174). `schedule` is deliberately `Option` for
+/// decode-tolerance: an already-persisted old-shape `quick: { cron: ... }` object
+/// still decodes (serde ignores the unknown `cron` key) as `schedule: None` rather
+/// than failing typed serde — a hard decode failure would wedge the SnapshotPolicy
+/// reflector and poison SnapshotPolicy admission cluster-wide. New writes with the
+/// old shape are rejected at admission by the shared validator, which points at the
+/// move. A persisted `schedule: None` means the quick tier is disabled until updated.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickVerification {
+    /// Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<CronSpec>,
 }
 
 /// Deep (scratch-restore) verification: restore the latest snapshot into an ephemeral volume, then discard.
@@ -852,7 +871,8 @@ suspend: true
 repository: { kind: Repository, name: r }
 sources: [ { pvc: { name: d } } ]
 verification:
-  quick: { cron: "0 4 * * *", jitter: 30m }
+  quick:
+    schedule: { cron: "0 4 * * *", jitter: 30m }
   deep:
     schedule: { cron: "0 5 * * 0", jitter: 1h }
     capacity: 10Gi
@@ -862,7 +882,8 @@ verification:
 "#;
         let spec: SnapshotPolicySpec = from_yaml(yaml);
         let v = spec.verification.as_ref().expect("verification");
-        assert_eq!(v.quick.as_ref().unwrap().cron, "0 4 * * *");
+        let quick = v.quick.as_ref().expect("quick");
+        assert_eq!(quick.schedule.as_ref().unwrap().cron, "0 4 * * *");
         let deep = v.deep.as_ref().expect("deep");
         assert_eq!(deep.schedule.cron, "0 5 * * 0");
         assert_eq!(deep.capacity.as_deref(), Some("10Gi"));
@@ -873,7 +894,10 @@ verification:
         assert_eq!(v.verify_files_percent, Some(10));
 
         let json = serde_json::to_value(&spec).expect("serialize");
-        assert_eq!(json["verification"]["quick"]["cron"], "0 4 * * *");
+        assert_eq!(
+            json["verification"]["quick"]["schedule"]["cron"],
+            "0 4 * * *"
+        );
         let reparsed: SnapshotPolicySpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
 
@@ -887,6 +911,28 @@ verification:
                 .unwrap()
                 .get("verification")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn verification_quick_old_shape_still_decodes() {
+        // GitHub #174: `verification.quick` gained a nested `schedule`. An object
+        // persisted in etcd BEFORE this change carries the flat shape
+        // (`quick: { cron: ... }`). It MUST still decode (serde ignores the unknown
+        // `cron`/`jitter` keys) as `schedule: None` — a hard decode failure would
+        // wedge the SnapshotPolicy reflector and poison admission cluster-wide. The
+        // quick tier is then treated as disabled; the webhook rejects NEW old-shape
+        // writes with a pointer to the move.
+        let old = from_yaml::<SnapshotPolicySpec>(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             verification:\n  quick: { cron: \"0 4 * * *\", jitter: 30m }\n",
+        );
+        let v = old.verification.as_ref().expect("verification");
+        let quick = v.quick.as_ref().expect("quick present");
+        assert!(
+            quick.schedule.is_none(),
+            "old flat `quick: {{cron: ...}}` must decode with schedule: None (quick disabled)"
         );
     }
 

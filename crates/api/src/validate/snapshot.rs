@@ -84,14 +84,32 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     // out-of-scope variable — rejected at admission rather than at first verify run.
     if let Some(v) = &spec.verification {
         if let Some(q) = &v.quick {
-            if let Err(e) = validate_cron(&q.cron) {
-                errs.push(e);
-            }
-            if let Err(e) = validate_timezone(q.timezone.as_deref()) {
-                errs.push(e);
-            }
-            if let Err(e) = validate_jitter("spec.verification.quick.jitter", q.jitter.as_deref()) {
-                errs.push(e);
+            // The flat `verification.quick.cron` shape moved under `quick.schedule`
+            // (GitHub #174) — a required schedule would break decode of old persisted
+            // objects, so `schedule` is Option and this validator is the gate that
+            // rejects a re-apply of the old shape with an actionable pointer.
+            match &q.schedule {
+                None => errs.push(ValidationError::InvalidFieldValue {
+                    field: "spec.verification.quick.schedule".to_string(),
+                    reason: "the flat `verification.quick.cron` shape moved to \
+                             `verification.quick.schedule.cron` (matching `deep.schedule`). \
+                             Move your cron/jitter/timezone fields under `schedule:`."
+                        .to_string(),
+                }),
+                Some(s) => {
+                    if let Err(e) = validate_cron(&s.cron) {
+                        errs.push(e);
+                    }
+                    if let Err(e) = validate_timezone(s.timezone.as_deref()) {
+                        errs.push(e);
+                    }
+                    if let Err(e) = validate_jitter(
+                        "spec.verification.quick.schedule.jitter",
+                        s.jitter.as_deref(),
+                    ) {
+                        errs.push(e);
+                    }
+                }
             }
         }
         if let Some(d) = &v.deep {

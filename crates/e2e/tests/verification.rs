@@ -50,7 +50,7 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
     // a successExpr asserting the verify reported zero errors.
     let patch = serde_json::json!({
         "spec": { "verification": {
-            "quick": { "cron": "* * * * *" },
+            "quick": { "schedule": { "cron": "* * * * *" } },
             "successExpr": "stats.errors == 0"
         } }
     });

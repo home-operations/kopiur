@@ -44,10 +44,12 @@ spec:
     keepDaily: 14
   # The operator verifies restorability on this cadence — no CronJob needed.
   verification:
-    # Quick: blob-level `kopia snapshot verify`, often.
+    # Quick: blob-level `kopia snapshot verify`, often. Its cron lives under
+    # `quick.schedule` (matching `deep.schedule`).
     quick:
-      cron: "0 4 * * *"
-      jitter: 30m
+      schedule:
+        cron: "0 4 * * *"
+        jitter: 30m
     # Deep: scratch-restore the latest snapshot into a throwaway volume, weekly.
     deep:
       schedule:

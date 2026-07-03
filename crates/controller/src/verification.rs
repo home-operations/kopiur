@@ -141,8 +141,13 @@ pub fn due_tier(
     {
         return Some((VerifyTierKind::Deep, slot));
     }
+    // `quick.schedule == None` ⇒ quick tier disabled. This is the old-shape
+    // decode-tolerance path: a stale persisted `quick: {cron: ...}` decodes as
+    // `schedule: None`, so the quick tier is simply not due (never panics/wedges);
+    // new writes with the old shape are rejected at admission.
     if let Some(q) = &verification.quick
-        && let Ok(slot) = slot_for(seed, q, after, repo_tz)
+        && let Some(schedule) = &q.schedule
+        && let Ok(slot) = slot_for(seed, schedule, after, repo_tz)
         && now >= slot
     {
         return Some((VerifyTierKind::Quick, slot));
@@ -162,7 +167,10 @@ pub fn next_verify_wakeup(
     let after = tier_after(last_verified);
     let mut earliest: Option<DateTime<Utc>> = None;
     for spec in [
-        verification.quick.as_ref(),
+        verification
+            .quick
+            .as_ref()
+            .and_then(|q| q.schedule.as_ref()),
         verification.deep.as_ref().map(|d| &d.schedule),
     ]
     .into_iter()
@@ -660,14 +668,16 @@ async fn has_active_verify_job(job_api: &Api<Job>, policy_name: &str) -> Result<
 mod tests {
     use super::*;
     use kopiur_api::common::CronSpec;
-    use kopiur_api::snapshot_policy::DeepVerification;
+    use kopiur_api::snapshot_policy::{DeepVerification, QuickVerification};
 
     fn verification(quick: Option<&str>, deep: Option<&str>) -> Verification {
         Verification {
-            quick: quick.map(|c| CronSpec {
-                cron: c.into(),
-                jitter: None,
-                timezone: None,
+            quick: quick.map(|c| QuickVerification {
+                schedule: Some(CronSpec {
+                    cron: c.into(),
+                    jitter: None,
+                    timezone: None,
+                }),
             }),
             deep: deep.map(|c| DeepVerification {
                 schedule: CronSpec {
@@ -715,6 +725,28 @@ mod tests {
         let v = verification(None, None);
         assert!(due_tier(&v, "seed", None, Utc::now(), None, true).is_none());
         assert!(due_tier(&v, "seed", None, Utc::now(), None, true).is_none());
+    }
+
+    #[test]
+    fn old_shape_quick_without_schedule_is_disabled_not_paniced() {
+        // GitHub #174 decode-tolerance: a stale persisted `quick: {cron: ...}` object
+        // decodes as `quick: Some(QuickVerification { schedule: None })`. The reconciler
+        // must treat it as "quick tier disabled" — never due, no panic/wedge. (New
+        // writes of this shape are blocked at admission.)
+        let v = Verification {
+            quick: Some(QuickVerification { schedule: None }),
+            deep: None,
+            success_expr: None,
+            verify_files_percent: None,
+        };
+        assert!(
+            due_tier(&v, "seed", None, Utc::now(), None, true).is_none(),
+            "quick with no schedule must be disabled, not due"
+        );
+        // And it doesn't inflate the wakeup either: with no live schedule at all, the
+        // wakeup floors at the running cadence rather than a past-due hot loop.
+        let wake = next_verify_wakeup(&v, "seed", None, Utc::now(), None);
+        assert_eq!(wake, REQUEUE_RUNNING);
     }
 
     // --- #168 gate: no verify before a verifiable snapshot exists ---
@@ -820,7 +852,13 @@ mod tests {
             .with_timezone(&Utc);
         let last_verified = Some(now - chrono::Duration::hours(2));
         let mut v = verification(Some("0 5 * * *"), None);
-        v.quick.as_mut().unwrap().timezone = Some("UTC".into());
+        v.quick
+            .as_mut()
+            .unwrap()
+            .schedule
+            .as_mut()
+            .unwrap()
+            .timezone = Some("UTC".into());
         // Own timezone (UTC) says the slot is due; the repo default
         // (America/Los_Angeles, which would push the slot hours into the future)
         // must be ignored.
