@@ -1373,6 +1373,94 @@ async fn schedule_creates_backup() {
     .expect("schedule should create a Snapshot CR");
 }
 
+/// A `SnapshotSchedule` with no `spec.schedule.timezone` inherits its cron
+/// timezone from its target policy's repository `scheduleDefaults.timezone`
+/// (GitHub #174 item 3). The pinned `status.nextSchedule` is computed in the
+/// inherited zone and records it, so a large-offset, DST-free repo default
+/// (`Pacific/Kiritimati`, fixed UTC+14) demonstrably shifts the wall-clock slot
+/// away from a UTC interpretation.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn schedule_inherits_repository_timezone_default() {
+    use chrono::Timelike;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Repository whose scheduleDefaults set a large-offset, DST-free zone.
+    let mut repo = repository_json("e2e-tz-repo");
+    repo["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "Pacific/Kiritimati" });
+    let _ = repos.create(&PostParams::default(), &cr(repo)).await;
+    let _ = configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json("e2e-tz-cfg", "e2e-tz-repo", "e2e-src")),
+        )
+        .await;
+
+    // No spec.schedule.timezone → inherit the repo default. Daily 03:00, no
+    // runOnCreate and no jitter → the pin is a clean wall-clock slot.
+    let sched = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotSchedule",
+        "metadata": { "name": "e2e-tz-sched", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "policyRef": { "name": "e2e-tz-cfg" },
+            "schedule": { "cron": "0 3 * * *" }
+        }
+    });
+    schedules
+        .create(&PostParams::default(), &cr::<SnapshotSchedule>(sched))
+        .await
+        .expect("create SnapshotSchedule");
+
+    // The controller pins nextSchedule with the inherited zone recorded.
+    let pinned = wait_until(
+        "nextSchedule is pinned with a timezone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tz-sched").await?;
+            Ok(s.status
+                .and_then(|st| st.next_schedule)
+                .filter(|n| n.at.is_some()))
+        },
+    )
+    .await
+    .expect("schedule should pin nextSchedule");
+
+    // Primary assertion: the pin records the inherited repository timezone default.
+    assert_eq!(
+        pinned.timezone.as_deref(),
+        Some("Pacific/Kiritimati"),
+        "nextSchedule must record the inherited repository timezone default"
+    );
+
+    // Zone-consistency: 03:00 in a fixed UTC+14 zone is 13:00 the previous day UTC.
+    // Convert the pinned UTC instant back by the fixed +14 offset (Kiritimati has no
+    // DST) and assert the local wall clock is 03:00 — i.e. the slot was computed in
+    // Kiritimati, NOT UTC (a UTC interpretation would leave the instant at 03:00Z).
+    let at = pinned.at.as_deref().expect("pin carries an instant");
+    let utc = chrono::DateTime::parse_from_rfc3339(at)
+        .expect("pin is RFC3339")
+        .with_timezone(&chrono::Utc);
+    let local = utc + chrono::Duration::hours(14);
+    assert_eq!(
+        (local.hour(), local.minute()),
+        (3, 0),
+        "pinned slot must be 03:00 in Pacific/Kiritimati (got {utc} UTC → {local} local)"
+    );
+}
+
 /// `policySelector` fan-out (ADR-0005 §10): one schedule firing creates exactly
 /// one Snapshot per MATCHING, non-suspended SnapshotPolicy — and nothing for the
 /// non-matching or suspended ones. A broken selector fails silently in

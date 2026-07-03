@@ -296,7 +296,8 @@ Co-location lets the mover read a **live** volume — that snapshot is crash-con
 ## `scheduleDefaults` — set the cron timezone once
 
 Every cron-driven consumer of a repository (`SnapshotPolicy.spec.verification`,
-`RepositoryReplication.spec.schedule`, `Maintenance.spec.schedule`) takes its own
+`RepositoryReplication.spec.schedule`, `Maintenance.spec.schedule`, and
+`SnapshotSchedule.spec.schedule` — the recurring-backup cron) takes its own
 optional `timezone`. Repeating the same IANA zone on every one of them is
 tedious and easy to drift. Set it **once** on the repository instead:
 
@@ -312,18 +313,25 @@ else UTC. `Maintenance` already cascades per-cron → schedule-level before
 falling to the repo default, so this becomes the **third and final** level for
 it.
 
-/// note | Inherited today, not everywhere yet
+/// note | How `SnapshotSchedule` inherits
 
-`SnapshotPolicy` verification, `RepositoryReplication`, and `Maintenance` all
-inherit `scheduleDefaults.timezone`. `SnapshotSchedule.spec.schedule.timezone`
-(the recurring-backup cron) does **not** inherit it yet — that cascade needs a
-referent watch on the repository and is a separate follow-up. Until then, set
-`timezone` explicitly on a `SnapshotSchedule` if it needs a non-UTC zone.
+A `SnapshotSchedule` with no `spec.schedule.timezone` resolves its **target
+policy's** repository `scheduleDefaults.timezone` (following `policyRef`, or each
+`policySelector` match) at slot-computation time. The resolved zone is recorded in
+`status.nextSchedule.timezone`, and editing `scheduleDefaults.timezone` re-triggers
+the affected schedules (a repository referent watch) and recomputes the pinned
+slot in the new zone — you don't have to touch each schedule.
+
+For a `policySelector` schedule whose matched policies' repositories **disagree**
+on the zone, there is no single right answer: the schedule falls back to UTC and
+raises a `TimezoneDefaultAmbiguous` condition recommending you set
+`spec.schedule.timezone` explicitly.
 
 ///
 
-A complete, apply-ready example — a `Repository` with `scheduleDefaults.timezone`
-and a `SnapshotPolicy.spec.verification.quick` cron that inherits it:
+A complete, apply-ready example — a `Repository` with `scheduleDefaults.timezone`,
+a `SnapshotPolicy.spec.verification.quick` cron, and a `SnapshotSchedule` that all
+inherit it:
 
 ```yaml
 --8<-- "deploy/examples/29-repo-schedule-timezone.yaml"
@@ -458,7 +466,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
 | `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`).       |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
-| `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance schedules. |
+| `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |
 | `suspend`                                              | Pause connect/bootstrap + maintenance.            |

@@ -362,6 +362,49 @@ pub fn cluster_repository_to_replications(
     })
 }
 
+/// SnapshotSchedules potentially affected by a change to the namespaced
+/// `Repository` — for the `scheduleDefaults.timezone` a schedule inherits when it
+/// sets no `spec.schedule.timezone` (GitHub #174 item 3).
+///
+/// **Namespace-broadcast (deliberate simplification).** A schedule inherits from
+/// its *target policy's* repository, not from a repository it references directly,
+/// so the precise set is `repo → policies referencing it → schedules targeting
+/// those policies`. That two-hop join needs a `SnapshotPolicy` reflector cache in
+/// the schedule controller, which it does not have (and the brief says not to add a
+/// full cache without need). Since a schedule's selector policies and its
+/// same-namespace `policyRef` policies (and thus their repositories) live in the
+/// schedule's own namespace, we enqueue every schedule in the changed repository's
+/// namespace. Schedules are few and slot computation is idempotent, so a spurious
+/// reconcile is cheap; the only miss is a schedule whose `policyRef` crosses into
+/// another namespace to a policy backed by this repo — that rare case is still
+/// covered by the schedule's own periodic requeue and by pin invalidation on the
+/// next natural pin.
+pub fn repository_to_schedules(
+    store: &Store<SnapshotSchedule>,
+    repo: &Repository,
+) -> Vec<ObjectRef<SnapshotSchedule>> {
+    let Some(ns) = repo.namespace() else {
+        return Vec::new();
+    };
+    select(store, |s: &SnapshotSchedule| {
+        s.namespace().as_deref() == Some(ns.as_str())
+    })
+}
+
+/// SnapshotSchedules potentially affected by a change to the cluster-scoped
+/// `ClusterRepository`'s `scheduleDefaults.timezone`. A `ClusterRepository` can be
+/// referenced from any namespace, so — unlike the namespaced case above — the
+/// affected namespaces are unbounded; enqueue every schedule cluster-wide. Same
+/// cost/idempotence rationale: schedules are few, slot logic is idempotent, and
+/// the effective-timezone resolution short-circuits for any schedule that sets its
+/// own `spec.schedule.timezone`.
+pub fn cluster_repository_to_schedules(
+    store: &Store<SnapshotSchedule>,
+    _repo: &ClusterRepository,
+) -> Vec<ObjectRef<SnapshotSchedule>> {
+    select(store, |_s: &SnapshotSchedule| true)
+}
+
 // --- M3: SnapshotPolicy -> Snapshot / SnapshotSchedule ----------------------
 
 /// Snapshots whose `spec.policyRef` targets the changed `SnapshotPolicy`.

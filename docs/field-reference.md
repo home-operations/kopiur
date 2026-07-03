@@ -380,12 +380,16 @@ referrer's namespace (required on cluster-scoped CRs).
 
 Precedence (resolved at reconcile time, not admission-pinned): the consuming
 cron's own `timezone` wins, else `spec.scheduleDefaults.timezone` on the
-`Repository`/`ClusterRepository` it targets, else UTC. Today the consumers are
+`Repository`/`ClusterRepository` it targets, else UTC. The consumers are
 `SnapshotPolicy.spec.verification` (quick/deep), `RepositoryReplication.spec
-.schedule`, and `Maintenance.spec.schedule` (quick/full, itself already cascading
-per-cron → schedule-level before falling to the repo default).
-`SnapshotSchedule.spec.schedule.timezone` does **not** inherit from
-`scheduleDefaults` yet — that cascade is a separate follow-up.
+.schedule`, `Maintenance.spec.schedule` (quick/full, itself already cascading
+per-cron → schedule-level before falling to the repo default), and
+`SnapshotSchedule.spec.schedule` (the recurring-backup cron). A `SnapshotSchedule`
+inherits its target policy's repository default, pins the resolved zone to
+`status.nextSchedule.timezone`, and is re-triggered by a repository referent watch
+when the default changes (recomputing the pinned slot). If a `policySelector`
+schedule's matched policies' repositories disagree on the zone, it falls back to
+UTC and raises a `TimezoneDefaultAmbiguous` condition.
 
 ### MoverSpec
 

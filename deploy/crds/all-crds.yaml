@@ -6933,6 +6933,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               lastSuccessfulSchedule:
                 description: The most recent firing whose `Snapshot` succeeded.
@@ -6952,6 +6962,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               nextSchedule:
                 description: The next firing slot the controller has computed (cron + jitter, pinned).
@@ -6971,6 +6991,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               observedGeneration:
                 description: The `metadata.generation` this status reflects, for staleness detection.

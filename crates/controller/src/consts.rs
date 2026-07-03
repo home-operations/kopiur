@@ -238,6 +238,18 @@ pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";
 /// `action` for any other backend failure: check the backend configuration.
 pub const CHECK_BACKEND_ACTION: &str = "CheckBackend";
 
+/// `SnapshotSchedule` warn-only condition: the schedule inherits its cron timezone
+/// from its target policies' repository `scheduleDefaults.timezone`, but the matched
+/// policies' repositories **disagree** on the zone, so the controller fell back to
+/// UTC. `True` = ambiguous (UTC in effect), `False` = resolved unambiguously (the
+/// default consistent state). Never blocks scheduling — it recommends setting an
+/// explicit `spec.schedule.timezone`.
+pub const SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION: &str = "TimezoneDefaultAmbiguous";
+/// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `True`.
+pub const SCHEDULE_TIMEZONE_AMBIGUOUS_REASON: &str = "RepositoryDefaultsDisagree";
+/// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `False`.
+pub const SCHEDULE_TIMEZONE_RESOLVED_REASON: &str = "TimezoneResolved";
+
 /// Machine-readable `reason` (condition + Warning Event) when a bootstrap connect
 /// found **no** repository at the backend and `spec.create.enabled` is `false`, so
 /// kopiur declined to initialize one. Distinct from a kopia error class so the

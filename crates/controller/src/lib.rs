@@ -469,6 +469,24 @@ async fn spawn_all(client: Client, ctx: Arc<Context>) {
             let store = sched_store.clone();
             move |p: SnapshotPolicy| watch::policy_to_schedules(&store, &p)
         })
+        // A schedule with no `spec.schedule.timezone` inherits its cron timezone
+        // from its target policies' repository `scheduleDefaults.timezone`. Watch
+        // Repository/ClusterRepository so an edit to that default re-triggers the
+        // affected schedules promptly (recomputing any stale pinned slot) instead of
+        // waiting out the requeue — the schedule reconciler never reads its
+        // generation, so nothing else would notice the change.
+        .watches(Api::<Repository>::all(client.clone()), cfg.clone(), {
+            let store = sched_store.clone();
+            move |r: Repository| watch::repository_to_schedules(&store, &r)
+        })
+        .watches(
+            Api::<ClusterRepository>::all(client.clone()),
+            cfg.clone(),
+            {
+                let store = sched_store.clone();
+                move |r: ClusterRepository| watch::cluster_repository_to_schedules(&store, &r)
+            },
+        )
         .run(
             snapshot_schedule::reconcile,
             snapshot_schedule::error_policy,

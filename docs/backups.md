@@ -476,12 +476,24 @@ is described in the table below.
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schedule.cron`                    | When to fire. Supports Jenkins-style **`H`** (see below).                                                                                    |
 | `schedule.jitter`                  | Spread firings over a window (e.g. `30m`), so many schedules don't all hit at once.                                                          |
-| `schedule.timezone`                | IANA timezone the cron is evaluated in.                                                                                                      |
+| `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once), else UTC (see the tip below).                                                          |
 | `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately — GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
 | `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one).                      |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
+
+!!! tip "The cron timezone can be inherited from the repository"
+    Leave `schedule.timezone` unset and the schedule evaluates its cron in the
+    target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once)
+    (else UTC) — set the zone once on the repository instead of on every schedule.
+    The resolved zone is recorded in `status.nextSchedule.timezone`; if you later
+    change the repository default, the schedule re-reconciles (a referent watch)
+    and **recomputes its pinned slot** in the new zone rather than waiting for the
+    stale slot to fire. A `policySelector` schedule whose matched policies'
+    repositories disagree on the zone can't be resolved unambiguously — it falls
+    back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
+    set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
 
 ### `policyRef` or `policySelector` — one recipe or many
 
