@@ -1,0 +1,64 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: GoReleaser Check
+
+# Snapshot-build the full release pipeline (all four targets, archives,
+# checksums, SBOMs) on the release job's actual runner whenever a PR touches
+# something that could break it: the goreleaser config, the dependency graph
+# (a bumped dep can introduce C bits zig can't link), the pinned toolchain, or
+# this workflow. Without this, `release.yaml`'s goreleaser job only ever runs
+# on published releases — a regression would surface as a broken release, and
+# build timings would be guesswork. Publishing and cosign signing are skipped
+# (signing needs OIDC, which fork PRs don't get, and adds only seconds).
+on:
+  pull_request:
+    paths:
+      - .goreleaser.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - .mise/config.toml
+      - .mise/mise.lock
+      - .github/workflows/goreleaser-check.yaml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    name: Snapshot Build
+    runs-on: macos-15 # must match release.yaml's goreleaser job (see its comment)
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # mirror the release job so timings are comparable
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          cache: false
+          experimental: true
+          install_args: --locked
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Run GoReleaser (snapshot)
+        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --snapshot --skip=publish,sign
+
+      - name: Inspect rendered artifacts
+        run: |
+          echo "== cask =="
+          cat dist/homebrew/Casks/kopiur.rb
+          echo "== krew manifest =="
+          cat dist/krew/kopiur.yaml
+          echo "== archives =="
+          ls -lh dist/*.tar.gz
