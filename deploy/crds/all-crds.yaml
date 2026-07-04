@@ -6205,24 +6205,31 @@ spec:
                     - schedule
                     type: object
                   quick:
-                    description: Schedule for the frequent blob-level `kopia snapshot verify`; absent ⇒ no quick verification.
+                    description: |-
+                      Quick (blob-level) verification tier; absent ⇒ no quick verification. Its cron
+                      lives under `quick.schedule` (matching `deep.schedule`), see [`QuickVerification`].
                     nullable: true
                     properties:
-                      cron:
-                        description: The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
-                        type: string
-                      jitter:
-                        description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
+                      schedule:
+                        description: Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
                         nullable: true
-                        type: string
-                      timezone:
-                        description: |-
-                          IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses
-                          the enclosing schedule's timezone, else the controller default (UTC).
-                        nullable: true
-                        type: string
-                    required:
-                    - cron
+                        properties:
+                          cron:
+                            description: The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter.
+                            type: string
+                          jitter:
+                            description: Optional deterministic jitter window as a Go-style duration string (e.g. `30m`).
+                            nullable: true
+                            type: string
+                          timezone:
+                            description: |-
+                              IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses
+                              the enclosing schedule's timezone, else the controller default (UTC).
+                            nullable: true
+                            type: string
+                        required:
+                        - cron
+                        type: object
                     type: object
                   successExpr:
                     description: CEL pass/fail predicate over the verify result; applies to both tiers.

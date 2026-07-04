@@ -234,8 +234,9 @@ pub enum MoverError {
 
     /// Deep verification found no snapshot to scratch-restore.
     #[error(
-        "deep verify found no snapshot to restore for source path {source_path:?}; run a backup \
-         first or set verify.deep.snapshotID explicitly"
+        "deep verify found no snapshot to restore for source path {source_path:?}: the \
+         repository has no snapshot for this identity yet. Run a backup first (the operator \
+         normally schedules verification only after the first successful backup)"
     )]
     VerifyNoSnapshot {
         /// The identity source path the lookup keyed on.
@@ -580,6 +581,26 @@ mod tests {
         // an environmental/config problem: a blind re-run won't help
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
         assert!(!err.retry_recommended());
+    }
+
+    #[test]
+    fn verify_no_snapshot_message_is_what_why_fix_without_the_nonexistent_field() {
+        let err = MoverError::VerifyNoSnapshot {
+            source_path: "/pvc/agregarr".into(),
+        };
+        let msg = err.to_string();
+        // what: no snapshot found for the source path
+        assert!(msg.contains("/pvc/agregarr"), "{msg}");
+        assert!(msg.contains("no snapshot to restore"), "{msg}");
+        // why: the repository has no snapshot for this identity yet
+        assert!(msg.contains("no snapshot for this identity yet"), "{msg}");
+        // fix: run a backup first
+        assert!(msg.contains("Run a backup first"), "{msg}");
+        // must NOT recommend the nonexistent CRD field
+        assert!(
+            !msg.contains("snapshotID") && !msg.contains("snapshotId"),
+            "message must not reference the nonexistent verify.deep.snapshotID field: {msg}"
+        );
     }
 
     #[test]

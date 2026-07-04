@@ -2652,6 +2652,73 @@ fn backup_config_validates_preflight() {
     );
 }
 
+#[test]
+fn backup_config_validates_verification() {
+    // New nested-quick shape is accepted.
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\", jitter: 30m }\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+
+    // GitHub #174: a re-applied OLD flat shape (`quick: { cron: ... }`) decodes with
+    // schedule: None, and must be rejected with an actionable pointer to the move —
+    // NOT a cryptic structural error. Assert the field AND the message text.
+    let old_shape: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  quick: { cron: \"0 4 * * *\", jitter: 30m }\n",
+    );
+    let errs = validate_backup_config(&old_shape);
+    let quick_err = errs
+        .iter()
+        .find_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, reason }
+                if field == "spec.verification.quick.schedule" =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a quick.schedule rejection, got: {errs:?}"));
+    assert!(
+        quick_err.contains("verification.quick.schedule.cron")
+            && quick_err.contains("Move your cron/jitter/timezone fields under `schedule:`"),
+        "message must name the move actionably, got: {quick_err:?}"
+    );
+
+    // A bad cron under the new schedule is still rejected (the schedule is validated).
+    let bad_cron: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  quick:\n    schedule: { cron: \"not a cron\" }\n",
+    );
+    assert!(
+        validate_backup_config(&bad_cron)
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidCron { .. })),
+        "{:?}",
+        validate_backup_config(&bad_cron)
+    );
+
+    // Quick entirely absent ⇒ no verification error (quick is opt-in).
+    let no_quick: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  deep:\n    schedule: { cron: \"0 5 * * 0\" }\n",
+    );
+    assert!(
+        validate_backup_config(&no_quick).is_empty(),
+        "{:?}",
+        validate_backup_config(&no_quick)
+    );
+}
+
 // --- identity shape validation ---
 
 #[test]

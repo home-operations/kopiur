@@ -25,14 +25,15 @@ use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::{CronSpec, ScratchDefaults};
-use kopiur_api::{SnapshotPolicy, Verification};
+use kopiur_api::{Origin, Snapshot, SnapshotPolicy, Verification};
 use kopiur_mover::workspec::{
     DeepVerify, MoverOptions, MoverWorkSpec, Operation, QuickVerify, ResolvedIdentity, TargetRef,
     VerifyOp, VerifyTier,
 };
 
 use crate::consts::{
-    API_VERSION, COMPONENT_LABEL, VERIFY_COMPONENT, VERIFY_INSTANCE_LABEL, VERIFY_SLOT_ANNOTATION,
+    API_VERSION, COMPONENT_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL, VERIFY_COMPONENT,
+    VERIFY_INSTANCE_LABEL, VERIFY_SLOT_ANNOTATION,
 };
 use crate::context::Context;
 use crate::error::Result;
@@ -49,6 +50,12 @@ const VERIFY_JOB_TTL_SECS: i64 = 3600;
 const REQUEUE_RUNNING: Duration = Duration::from_secs(30);
 /// Requeue after a failed verify Job (re-check / bounded retry once TTL-reaped).
 const REQUEUE_FAILED: Duration = Duration::from_secs(300);
+/// Requeue while verification is gated (no verifiable snapshot yet, #168). The
+/// steady policy cadence — deliberately NOT [`REQUEUE_RUNNING`]'s 30s hot loop,
+/// which [`next_verify_wakeup`] would otherwise produce for the past-due catch-up
+/// slot. The first successful backup re-reconciles the policy promptly via its
+/// child-Snapshot watch, so this never delays the first real verify.
+const REQUEUE_GATED: Duration = Duration::from_secs(300);
 /// Upper bound on any requeue so the schedule is re-evaluated within the heartbeat.
 const REQUEUE_CAP: Duration = Duration::from_secs(1800);
 
@@ -95,17 +102,76 @@ fn slot_for(
     next_fire(&spec.cron, jitter, seed, after, tz)
 }
 
+/// Whether verification is *unlocked*: a snapshot actually exists to verify. Pure.
+///
+/// The `tier_after` catch-up (a "never verified" policy anchors a year ago so the
+/// first slot is immediately past-due) is deliberate for missed slots — but on a
+/// brand-new policy it would fire a verify Job *before any backup exists*, and the
+/// mover fails hard (`deep verify found no snapshot to restore …`, #168). Gate it:
+/// schedule no verify until either this policy has produced a successful backup
+/// (`has_successful`) OR its resolved repository already contains **discovered**
+/// (adopted) snapshots (`has_discovered`) — the adopted-repo escape hatch, where
+/// deep verify legitimately resolves the latest repo snapshot for the identity.
+pub fn verification_unlocked(has_successful: bool, has_discovered: bool) -> bool {
+    has_successful || has_discovered
+}
+
+/// Where to look for a repository's **discovered** (adopted) `Snapshot` CRs when
+/// probing the #168 escape hatch. Derived purely from whether the policy's resolved
+/// repository is namespaced or cluster-scoped — the two placements the catalog uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveredProbeScope {
+    /// Namespaced [`Repository`](kopiur_api::Repository): the catalog materializes
+    /// discovered rows in a single namespace ([`crate::catalog::Placement::Namespace`]),
+    /// so a namespaced LIST there suffices.
+    Namespace(String),
+    /// Cluster-scoped [`ClusterRepository`](kopiur_api::ClusterRepository): the catalog
+    /// scatters discovered rows across identity-hostname namespaces / the
+    /// `fallbackNamespace` ([`crate::catalog::Placement::Cluster`]) — generally NOT the
+    /// policy's namespace — so probe cluster-wide. The `repository-uid` label already
+    /// scopes the LIST to this repository's rows, so the wide scan can't false-positive
+    /// on another repo's discovered snapshots.
+    ClusterWide,
+}
+
+/// **Pure.** Decide where [`repo_has_discovered_snapshots`] should LIST, from the
+/// resolved repository's own namespace ([`ResolvedRepository::repo_namespace`]).
+///
+/// Namespaced repos probe **their own** namespace, not the probing policy's: the
+/// catalog materializes discovered rows in the repository's namespace
+/// ([`crate::catalog::Placement::Namespace`]), and `RepositoryRef` allows a policy to
+/// reference a `Repository` in a different namespace from its own
+/// (`kopiur_api::validate::repository`) — so a same-namespace assumption silently
+/// never unlocks verification for a cross-namespace-referenced adopted repository. A
+/// `ClusterRepository` (`repo_namespace: None`) scatters its rows across arbitrary,
+/// per-identity namespaces the reconciler can't enumerate a priori, so the only
+/// correct probe there is cluster-wide — otherwise an *adopted* `ClusterRepository`
+/// would never unlock verification before its first child backup (#168 regression).
+pub fn discovered_probe_scope(repo_namespace: Option<&str>) -> DiscoveredProbeScope {
+    match repo_namespace {
+        Some(ns) => DiscoveredProbeScope::Namespace(ns.to_string()),
+        None => DiscoveredProbeScope::ClusterWide,
+    }
+}
+
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
-/// the policy's `verification`, the seed, the last-verified time, `now`, and the
-/// repository's `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
+/// the policy's `verification`, the seed, the last-verified time, `now`, the
+/// repository's `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3), and
+/// whether verification is `unlocked` ([`verification_unlocked`]) — a locked policy
+/// is never due (the #168 gate), so the catch-up slot is not consumed until a
+/// snapshot exists.
 pub fn due_tier(
     verification: &Verification,
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     repo_tz: Option<&str>,
+    unlocked: bool,
 ) -> Option<(VerifyTierKind, DateTime<Utc>)> {
+    if !unlocked {
+        return None;
+    }
     let after = tier_after(last_verified);
     if let Some(d) = &verification.deep
         && let Ok(slot) = slot_for(seed, &d.schedule, after, repo_tz)
@@ -113,8 +179,13 @@ pub fn due_tier(
     {
         return Some((VerifyTierKind::Deep, slot));
     }
+    // `quick.schedule == None` ⇒ quick tier disabled. This is the old-shape
+    // decode-tolerance path: a stale persisted `quick: {cron: ...}` decodes as
+    // `schedule: None`, so the quick tier is simply not due (never panics/wedges);
+    // new writes with the old shape are rejected at admission.
     if let Some(q) = &verification.quick
-        && let Ok(slot) = slot_for(seed, q, after, repo_tz)
+        && let Some(schedule) = &q.schedule
+        && let Ok(slot) = slot_for(seed, schedule, after, repo_tz)
         && now >= slot
     {
         return Some((VerifyTierKind::Quick, slot));
@@ -134,7 +205,10 @@ pub fn next_verify_wakeup(
     let after = tier_after(last_verified);
     let mut earliest: Option<DateTime<Utc>> = None;
     for spec in [
-        verification.quick.as_ref(),
+        verification
+            .quick
+            .as_ref()
+            .and_then(|q| q.schedule.as_ref()),
         verification.deep.as_ref().map(|d| &d.schedule),
     ]
     .into_iter()
@@ -145,12 +219,39 @@ pub fn next_verify_wakeup(
         }
     }
     match earliest {
+        // A future slot: sleep until it (floored/capped).
         Some(slot) if slot > now => (slot - now)
             .to_std()
             .unwrap_or(REQUEUE_CAP)
             .min(REQUEUE_CAP)
             .max(REQUEUE_RUNNING),
-        _ => REQUEUE_RUNNING,
+        // A past-due slot: the prompt 30s cadence, since the caller then spawns and
+        // tracks the Job.
+        Some(_) => REQUEUE_RUNNING,
+        // No live schedule at all (e.g. an old-shape quick-only policy whose
+        // `quick.schedule` decoded to `None`, with no deep): nothing will ever come
+        // due, so floor at the steady cadence rather than the 30s hot loop.
+        None => REQUEUE_GATED,
+    }
+}
+
+/// The requeue delay when no verify tier is due, honoring the #168 gate. A gated
+/// policy (`!unlocked`) requeues at the steady cadence ([`REQUEUE_GATED`]) — never
+/// [`next_verify_wakeup`]'s past-due 30s hot loop — since it is re-triggered by its
+/// first successful child Snapshot. An unlocked policy sleeps until its next slot
+/// (capped by [`REQUEUE_CAP`]). Pure so the gated-vs-scheduled requeue is testable.
+fn idle_requeue(
+    verification: &Verification,
+    seed: &str,
+    last_verified: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    repo_tz: Option<&str>,
+    unlocked: bool,
+) -> Duration {
+    if unlocked {
+        next_verify_wakeup(verification, seed, last_verified, now, repo_tz).min(REQUEUE_CAP)
+    } else {
+        REQUEUE_GATED
     }
 }
 
@@ -190,6 +291,7 @@ pub async fn verify_step(
     ctx: &Context,
     repo: &ResolvedRepository,
     namespace: &str,
+    has_successful: bool,
 ) -> Result<Option<Duration>> {
     let Some(verification) = config.spec.verification.as_ref() else {
         return Ok(None);
@@ -210,10 +312,41 @@ pub async fn verify_step(
         .as_ref()
         .and_then(|d| d.timezone.as_deref());
 
-    let Some((tier, slot)) = due_tier(verification, &seed, last_verified, now, repo_tz) else {
-        return Ok(Some(
-            next_verify_wakeup(verification, &seed, last_verified, now, repo_tz).min(REQUEUE_CAP),
-        ));
+    // #168 gate: never schedule a verify before a verifiable snapshot exists — the
+    // tier_after catch-up would otherwise fire a Job on the first reconcile, before
+    // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
+    // snapshot OR its repo already carries discovered (adopted) snapshots. The
+    // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
+    // entirely once a successful backup already unlocks the gate. Probed in the
+    // repository's OWN namespace (not the policy's — `RepositoryRef` allows a
+    // cross-namespace reference), or cluster-wide for a cluster-scoped repository
+    // (`repo_namespace == None`), which scatters its discovered rows across
+    // per-identity namespaces.
+    let has_discovered = if has_successful {
+        false
+    } else {
+        let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
+        repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await?
+    };
+    let unlocked = verification_unlocked(has_successful, has_discovered);
+
+    let Some((tier, slot)) = due_tier(verification, &seed, last_verified, now, repo_tz, unlocked)
+    else {
+        if !unlocked {
+            tracing::debug!(
+                policy = %name,
+                "verification gated: no verifiable snapshot yet (no successful backup and no \
+                 discovered snapshots); deferring until the first successful backup"
+            );
+        }
+        return Ok(Some(idle_requeue(
+            verification,
+            &seed,
+            last_verified,
+            now,
+            repo_tz,
+            unlocked,
+        )));
     };
 
     let job_name = verify_job_name(&name, tier, slot);
@@ -552,6 +685,30 @@ fn verify_identity(
     }
 }
 
+/// Whether the policy's resolved repository already carries **discovered** (adopted)
+/// snapshots — the #168 verification escape hatch. A cheap labeled LIST scoped by the
+/// repo-uid + `origin=discovered` labels the catalog scanner stamps on every
+/// materialized foreign snapshot (`crate::catalog`); `true` as soon as one exists.
+/// The [`DiscoveredProbeScope`] (from [`discovered_probe_scope`]) selects namespaced
+/// vs cluster-wide so an adopted `ClusterRepository`'s scattered rows are seen. Thin
+/// IO over the pure [`verification_unlocked`] gate.
+async fn repo_has_discovered_snapshots(
+    client: &kube::Client,
+    scope: &DiscoveredProbeScope,
+    repo_uid: &str,
+) -> Result<bool> {
+    let api: Api<Snapshot> = match scope {
+        DiscoveredProbeScope::Namespace(ns) => Api::namespaced(client.clone(), ns),
+        DiscoveredProbeScope::ClusterWide => Api::all(client.clone()),
+    };
+    let selector = format!(
+        "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL}={}",
+        Origin::Discovered.label_value()
+    );
+    let lp = ListParams::default().labels(&selector).limit(1);
+    Ok(!api.list(&lp).await?.items.is_empty())
+}
+
 /// Whether any non-terminal verify Job is owned by this policy (single-flight gate).
 async fn has_active_verify_job(job_api: &Api<Job>, policy_name: &str) -> Result<bool> {
     let selector =
@@ -566,14 +723,16 @@ async fn has_active_verify_job(job_api: &Api<Job>, policy_name: &str) -> Result<
 mod tests {
     use super::*;
     use kopiur_api::common::CronSpec;
-    use kopiur_api::snapshot_policy::DeepVerification;
+    use kopiur_api::snapshot_policy::{DeepVerification, QuickVerification};
 
     fn verification(quick: Option<&str>, deep: Option<&str>) -> Verification {
         Verification {
-            quick: quick.map(|c| CronSpec {
-                cron: c.into(),
-                jitter: None,
-                timezone: None,
+            quick: quick.map(|c| QuickVerification {
+                schedule: Some(CronSpec {
+                    cron: c.into(),
+                    jitter: None,
+                    timezone: None,
+                }),
             }),
             deep: deep.map(|c| DeepVerification {
                 schedule: CronSpec {
@@ -591,16 +750,17 @@ mod tests {
 
     #[test]
     fn first_ever_reconcile_is_due_and_prefers_deep() {
-        // No lastVerified → both due; deep wins (it subsumes quick).
+        // No lastVerified, but UNLOCKED (a successful backup exists) → both due; deep
+        // wins (it subsumes quick). The catch-up semantics are preserved once unlocked.
         let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
-        let (tier, _slot) = due_tier(&v, "seed", None, Utc::now(), None).expect("due");
+        let (tier, _slot) = due_tier(&v, "seed", None, Utc::now(), None, true).expect("due");
         assert_eq!(tier, VerifyTierKind::Deep);
     }
 
     #[test]
     fn quick_only_is_due_when_no_deep() {
         let v = verification(Some("*/5 * * * *"), None);
-        let (tier, _) = due_tier(&v, "seed", None, Utc::now(), None).expect("due");
+        let (tier, _) = due_tier(&v, "seed", None, Utc::now(), None, true).expect("due");
         assert_eq!(tier, VerifyTierKind::Quick);
     }
 
@@ -610,7 +770,7 @@ mod tests {
         let just = now - chrono::Duration::seconds(1);
         let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
         assert!(
-            due_tier(&v, "seed", Some(just), now, None).is_none(),
+            due_tier(&v, "seed", Some(just), now, None, true).is_none(),
             "a tier that just ran must not be immediately due again"
         );
     }
@@ -618,7 +778,129 @@ mod tests {
     #[test]
     fn no_schedules_is_never_due() {
         let v = verification(None, None);
-        assert!(due_tier(&v, "seed", None, Utc::now(), None).is_none());
+        assert!(due_tier(&v, "seed", None, Utc::now(), None, true).is_none());
+        assert!(due_tier(&v, "seed", None, Utc::now(), None, true).is_none());
+    }
+
+    #[test]
+    fn old_shape_quick_without_schedule_is_disabled_not_paniced() {
+        // GitHub #174 decode-tolerance: a stale persisted `quick: {cron: ...}` object
+        // decodes as `quick: Some(QuickVerification { schedule: None })`. The reconciler
+        // must treat it as "quick tier disabled" — never due, no panic/wedge. (New
+        // writes of this shape are blocked at admission.)
+        let v = Verification {
+            quick: Some(QuickVerification { schedule: None }),
+            deep: None,
+            success_expr: None,
+            verify_files_percent: None,
+        };
+        assert!(
+            due_tier(&v, "seed", None, Utc::now(), None, true).is_none(),
+            "quick with no schedule must be disabled, not due"
+        );
+        // And it doesn't spin either: with no live schedule at all, the wakeup floors
+        // at the steady cadence rather than the 30s past-due hot loop, so an unmigrated
+        // quick-only policy doesn't re-reconcile every 30s forever.
+        let wake = next_verify_wakeup(&v, "seed", None, Utc::now(), None);
+        assert_eq!(wake, REQUEUE_GATED);
+        // idle_requeue agrees when the policy is unlocked (a successful backup exists):
+        // no live schedule => steady cadence, not the hot loop.
+        let idle = idle_requeue(&v, "seed", None, Utc::now(), None, true);
+        assert_eq!(idle, REQUEUE_GATED);
+    }
+
+    // --- #168 gate: no verify before a verifiable snapshot exists ---
+
+    #[test]
+    fn gated_when_no_successful_and_no_discovered_is_not_due() {
+        // The #168 regression: a brand-new policy (no successful backup, adopted-repo
+        // escape hatch closed) must NOT be due, even though tier_after makes the
+        // first slot past-due. Fails on pre-gate code (which returned Some(Deep)).
+        let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
+        let unlocked = verification_unlocked(false, false);
+        assert!(!unlocked);
+        assert!(
+            due_tier(&v, "seed", None, Utc::now(), None, unlocked).is_none(),
+            "no snapshot to verify → nothing due"
+        );
+    }
+
+    #[test]
+    fn unlocked_by_successful_snapshot_is_due() {
+        let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
+        let unlocked = verification_unlocked(true, false);
+        assert!(unlocked);
+        assert!(due_tier(&v, "seed", None, Utc::now(), None, unlocked).is_some());
+    }
+
+    #[test]
+    fn unlocked_by_discovered_snapshot_is_due_adopted_repo_escape_hatch() {
+        // Adopted repo (05-adopt-existing-repo): no Succeeded snapshot for this policy,
+        // but the repo carries discovered CRs. Deep verify works there, so the gate
+        // must open on the discovered signal alone.
+        let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
+        let unlocked = verification_unlocked(false, true);
+        assert!(unlocked);
+        assert!(due_tier(&v, "seed", None, Utc::now(), None, unlocked).is_some());
+    }
+
+    #[test]
+    fn namespaced_repo_same_namespace_as_policy_probes_that_namespace() {
+        // Same-namespace ref (the common case): the repo's own namespace happens to
+        // equal the referencing policy's — unchanged behavior from before this fix.
+        assert_eq!(
+            discovered_probe_scope(Some("billing")),
+            DiscoveredProbeScope::Namespace("billing".into())
+        );
+    }
+
+    #[test]
+    fn namespaced_repo_cross_namespace_ref_probes_the_repos_own_namespace() {
+        // Cross-namespace RepositoryRef (crates/api/src/validate/repository.rs:11-13):
+        // a SnapshotPolicy can live in one namespace while referencing an adopted
+        // Repository that lives in another. Discovered Snapshot CRs materialize in
+        // the REPOSITORY's own namespace (Placement::Namespace, repository.rs:1299),
+        // so the probe must follow the repo, not the policy. A pre-fix
+        // `discovered_probe_scope(false, policy_namespace)` would probe "billing"
+        // here and never see the discovered rows in "storage" — this assertion fails
+        // on that code.
+        assert_eq!(
+            discovered_probe_scope(Some("storage")),
+            DiscoveredProbeScope::Namespace("storage".into())
+        );
+    }
+
+    #[test]
+    fn cluster_repo_probes_cluster_wide_so_adopted_repos_unlock() {
+        // Regression for the escape hatch no-op: a ClusterRepository's discovered rows
+        // land in per-identity namespaces (Placement::Cluster) — generally NOT any
+        // single namespace — so the probe MUST be cluster-wide, or an adopted
+        // ClusterRepository never unlocks verification before its first child backup.
+        assert_eq!(
+            discovered_probe_scope(None),
+            DiscoveredProbeScope::ClusterWide
+        );
+    }
+
+    #[test]
+    fn gated_requeue_is_steady_not_the_30s_hot_loop() {
+        // While gated, the past-due catch-up slot must NOT drive next_verify_wakeup's
+        // 30s REQUEUE_RUNNING; idle_requeue returns the steady cadence instead.
+        let now = Utc::now();
+        let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
+        let gated = idle_requeue(&v, "seed", None, now, None, false);
+        assert_eq!(gated, REQUEUE_GATED);
+        assert!(
+            gated > REQUEUE_RUNNING,
+            "gated requeue must not be the 30s hot loop"
+        );
+        // Unlocked with a past-due slot DOES want the prompt 30s cadence (the caller
+        // then spawns/tracks the Job) — guards that the gate only affects the locked path.
+        assert_eq!(
+            idle_requeue(&v, "seed", None, now, None, true),
+            REQUEUE_RUNNING,
+            "an unlocked past-due policy keeps the prompt cadence"
+        );
     }
 
     #[test]
@@ -644,11 +926,19 @@ mod tests {
         // the repo default.
         let v = verification(Some("0 5 * * *"), None);
         assert!(
-            due_tier(&v, "seed", last_verified, now, None).is_some(),
+            due_tier(&v, "seed", last_verified, now, None, true).is_some(),
             "UTC (no repo default) → 05:00 UTC has already passed"
         );
         assert!(
-            due_tier(&v, "seed", last_verified, now, Some("America/Los_Angeles")).is_none(),
+            due_tier(
+                &v,
+                "seed",
+                last_verified,
+                now,
+                Some("America/Los_Angeles"),
+                true
+            )
+            .is_none(),
             "repo scheduleDefaults.timezone must shift the evaluated slot"
         );
     }
@@ -660,12 +950,26 @@ mod tests {
             .with_timezone(&Utc);
         let last_verified = Some(now - chrono::Duration::hours(2));
         let mut v = verification(Some("0 5 * * *"), None);
-        v.quick.as_mut().unwrap().timezone = Some("UTC".into());
+        v.quick
+            .as_mut()
+            .unwrap()
+            .schedule
+            .as_mut()
+            .unwrap()
+            .timezone = Some("UTC".into());
         // Own timezone (UTC) says the slot is due; the repo default
         // (America/Los_Angeles, which would push the slot hours into the future)
         // must be ignored.
         assert!(
-            due_tier(&v, "seed", last_verified, now, Some("America/Los_Angeles")).is_some(),
+            due_tier(
+                &v,
+                "seed",
+                last_verified,
+                now,
+                Some("America/Los_Angeles"),
+                true
+            )
+            .is_some(),
             "the CronSpec's own timezone must win over the repo default"
         );
     }
