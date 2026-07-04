@@ -92,11 +92,12 @@ pub enum StagingOutcome {
     /// The VolumeSnapshot is not `readyToUse` yet — requeue (transient). The message is
     /// for a `SourceStaged=False` / `Pending` condition.
     Waiting(String),
-    /// The stage cannot be produced yet (no snapshot stack / no class / VolumeSnapshot errored
-    /// past its grace / source not CSI-provisioned). Staging is a pre-Job gate, so the
-    /// reconciler holds the Snapshot `Pending` (with this `reason` + `message` on
-    /// `SourceStaged=False`) and re-drives on the structural cadence — recovering once the
-    /// cluster is fixed (a class is installed, or the VolumeSnapshot becomes `readyToUse`).
+    /// The stage cannot be produced (no snapshot stack / no class / VolumeSnapshot errored
+    /// past its grace / source not CSI-provisioned). The reconciler fails the Snapshot
+    /// (terminal `phase: Failed`) with this `reason` + actionable `message` on
+    /// `SourceStaged=False`; the fix goes on the cluster/spec and a new Snapshot then
+    /// succeeds (this CR does not re-run). Transient VolumeSnapshot errors are absorbed
+    /// upstream by the grace window, so this only fires on a genuine problem.
     Failed {
         /// kstatus condition reason (a stable PascalCase token).
         reason: &'static str,

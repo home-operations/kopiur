@@ -1083,13 +1083,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Err(Error::MissingDependency(msg));
             }
             io::StagingOutcome::Failed { reason, message } => {
-                // Staging is a pre-Job gate (no mover Job exists yet), so — like the
-                // repository-not-ready and missing-credentials gates above — hold the Snapshot
-                // `Pending`, not `Failed`. `Failed` would trip the one-shot `TerminalFailed`
-                // gate (`await_change`, never re-entering staging) and permanently lose a run
-                // the cluster usually self-heals moments later. `Pending` lets the requeue
-                // re-check staging and recover. Error::StagingFailed drives the requeue and its
-                // Warning Event, without the misleading "fix the spec" InvalidSpec.
+                // Stack/class missing, source not CSI, or the VolumeSnapshot errored past its
+                // grace (transient errors are absorbed upstream by the grace window, so this
+                // only fires on a genuine, non-self-healing problem). Staging runs before any
+                // mover Job, so none was created. Terminal (`phase: Failed` → one-shot
+                // `TerminalFailed`): the fix goes on the cluster/spec per `message` and a new
+                // Snapshot retries — this CR does not re-run. Error::StagingFailed (not
+                // Validation) carries the specific `reason` and avoids the misleading
+                // "fix the field(s) named above and re-apply" InvalidSpec Event.
                 let existing = backup
                     .status
                     .as_ref()
@@ -1108,7 +1109,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &api,
                     &name,
                     current.as_ref(),
-                    serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+                    serde_json::json!({ "phase": "Failed", "conditions": conditions }),
                 )
                 .await?;
                 return Err(Error::StagingFailed { reason, message });

@@ -247,13 +247,15 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  field(s) named above and re-apply."
             ),
         ),
-        // Staging failures carry their own kstatus reason and recover on their own once the
-        // cluster is fixed — so, unlike a spec error, the note must not tell the user to edit
-        // a spec that isn't broken (the message already gives the actual fix).
+        // Staging failures carry their own kstatus reason and are terminal — the fix goes on
+        // the cluster/spec (the message spells it out), then a new Snapshot retries. Unlike a
+        // spec error, don't tell the user to edit a field on THIS object and re-apply.
         Error::StagingFailed { reason, message } => (
             reason,
             FIX_SNAPSHOT_STACK_ACTION,
-            format!("{message} The reconcile retries automatically; no spec change is needed."),
+            format!(
+                "{message} This Snapshot won't retry on its own — apply that fix and a new Snapshot succeeds."
+            ),
         ),
         Error::MissingDependency(_) => (
             MISSING_DEPENDENCY_REASON,
