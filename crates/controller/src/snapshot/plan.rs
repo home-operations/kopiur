@@ -323,15 +323,52 @@ pub(super) fn snapshot_ready_status(
     reason: &str,
     message: &str,
 ) -> serde_json::Value {
-    use kopiur_api::common::PhaseLabel;
-    let existing = backup
+    snapshot_ready_status_over(backup, phase, reason, message, &existing_conditions(backup))
+}
+
+/// Like [`snapshot_ready_status`], but additionally upserts a domain condition
+/// (e.g. `SourceStaged=False`) into the same write, so a terminal transition
+/// carries both the specific condition and the derived kstatus set atomically.
+pub(super) fn snapshot_ready_status_with_condition(
+    backup: &Snapshot,
+    phase: SnapshotPhase,
+    reason: &str,
+    message: &str,
+    condition_type: &str,
+    condition_status: bool,
+) -> serde_json::Value {
+    let seeded = io::upsert_condition(
+        &existing_conditions(backup),
+        condition_type,
+        condition_status,
+        reason,
+        message,
+        backup.meta().generation,
+    );
+    snapshot_ready_status_over(backup, phase, reason, message, &seeded)
+}
+
+fn existing_conditions(
+    backup: &Snapshot,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    backup
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn snapshot_ready_status_over(
+    backup: &Snapshot,
+    phase: SnapshotPhase,
+    reason: &str,
+    message: &str,
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> serde_json::Value {
+    use kopiur_api::common::PhaseLabel;
     let generation = backup.meta().generation;
     let conditions = io::set_ready(
-        &existing,
+        existing,
         generation,
         snapshot_ready_outcome(phase),
         reason,

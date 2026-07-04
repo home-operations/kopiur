@@ -132,6 +132,20 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
+    // Staging: the timeout must parse — rejected at admission rather than silently
+    // falling back to the default at the first backup run.
+    if let Some(st) = &spec.staging
+        && let Some(t) = &st.timeout
+        && crate::duration::parse_go_duration(t).is_none()
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.staging.timeout".to_string(),
+            reason: format!(
+                "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
+                 for the default (10m), or 0 to wait for the VolumeSnapshot indefinitely"
+            ),
+        });
+    }
     // Preflight: the timeout must parse, check names must be unique + non-blank, and
     // each check expression must compile + trial-evaluate to a bool with no
     // out-of-scope variable — rejected at admission rather than at the first run.

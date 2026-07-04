@@ -47,6 +47,10 @@ pub struct SnapshotPolicySpec {
     /// `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_snapshot_class_name: Option<String>,
+    /// Staging knobs for `copyMethod: Snapshot`/`Clone` (e.g. how long to wait for
+    /// the CSI capture to become ready before failing the backup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging: Option<StagingSpec>,
     /// Multi-PVC consistency grouping; `None` opts into independent per-PVC snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_group_by")]
@@ -229,6 +233,23 @@ pub enum CopyMethod {
     Clone,
     /// Read the live PVC directly with no intermediate snapshot/clone (opt-in; works on any storage, no CSI required).
     Direct,
+}
+
+/// `SnapshotPolicy.spec.staging` — knobs for the CSI capture (`copyMethod:
+/// Snapshot`/`Clone`) that runs before the mover. A sub-object so future staging
+/// fields slot in without API breakage.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingSpec {
+    /// How long the staged `VolumeSnapshot` may take to become `readyToUse`
+    /// (measured from its creation) before the backup is failed (Go-style
+    /// duration like `10m` or `1h`; default `10m`). A transient CSI/
+    /// snapshot-controller error during the wait is retried, never fatal on its
+    /// own — only this deadline fails staging. A zero duration (`0`/`0s`) waits
+    /// indefinitely. Raise this for backends whose snapshots take long to become
+    /// ready (e.g. cloud snapshots of large volumes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
 }
 
 /// Multi-PVC grouping strategy. Defaults to a consistent group snapshot across
@@ -590,6 +611,36 @@ mod tests {
             default, "Snapshot",
             "copyMethod must emit `default: Snapshot` in the CRD schema; got {default:?}"
         );
+    }
+
+    #[test]
+    fn staging_timeout_round_trips_and_defaults_to_absent() {
+        // Absent staging parses to None (runtime default 10m applies in the
+        // controller) and is skip-elided on the wire.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert_eq!(spec.staging, None);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(
+            json.get("staging").is_none(),
+            "absent staging must be elided"
+        );
+
+        // A set timeout round-trips through the cluster's parse path.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             staging: { timeout: 30m }\n",
+        );
+        assert_eq!(
+            spec.staging,
+            Some(StagingSpec {
+                timeout: Some("30m".to_string())
+            })
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["staging"]["timeout"], "30m");
     }
 
     #[test]

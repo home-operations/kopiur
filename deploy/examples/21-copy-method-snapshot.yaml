@@ -26,6 +26,13 @@ spec:
     name: primary
   copyMethod: Snapshot
   volumeSnapshotClassName: csi-rbd-snapclass # optional; omit to use the driver default
+  # Optional: how long the VolumeSnapshot may take to become readyToUse before the
+  # backup fails (default 10m; "0" waits indefinitely). Transient CSI/snapshot-
+  # controller errors during the wait are retried — only this deadline fails staging.
+  # Raise it for backends whose snapshots are slow to become ready (e.g. cloud
+  # snapshots of large volumes).
+  staging:
+    timeout: 10m
   sources:
     - pvc:
         name: postgres-data

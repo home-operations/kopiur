@@ -40,6 +40,12 @@ pub const PREFLIGHT_WAITING_REASON: &str = "WaitingForPreflightData";
 /// `Pending` while a preflight check is unsatisfied before it transitions to
 /// `Failed`. Bounded so scheduled backups don't pile up `Pending` CRs.
 pub const DEFAULT_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Default `spec.staging.timeout` when unset: how long a staged `VolumeSnapshot`
+/// may take to become `readyToUse` (from its creation) before the backup is
+/// failed. Bounded so a broken CSI driver can't hold a `Snapshot` `Pending`
+/// forever and silently starve a `concurrencyPolicy: Forbid` schedule; a
+/// transient `status.error` during the wait never fails staging on its own.
+pub const DEFAULT_STAGING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// In-container mount path for an inline-NFS backup *source* whose server-side
 /// export is the NFSv4 pseudo-root (`/`). The export's server path and the

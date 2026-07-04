@@ -253,6 +253,7 @@ mod tests {
             }],
             copy_method: Default::default(),
             volume_snapshot_class_name: None,
+            staging: None,
             group_by: None,
             retention: None,
             default_deletion_policy: None,

@@ -953,6 +953,24 @@ spec:
                     rule: '(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) == 1'
                 maxItems: 100
                 type: array
+              staging:
+                description: |-
+                  Staging knobs for `copyMethod: Snapshot`/`Clone` (e.g. how long to wait for
+                  the CSI capture to become ready before failing the backup).
+                nullable: true
+                properties:
+                  timeout:
+                    description: |-
+                      How long the staged `VolumeSnapshot` may take to become `readyToUse`
+                      (measured from its creation) before the backup is failed (Go-style
+                      duration like `10m` or `1h`; default `10m`). A transient CSI/
+                      snapshot-controller error during the wait is retried, never fatal on its
+                      own — only this deadline fails staging. A zero duration (`0`/`0s`) waits
+                      indefinitely. Raise this for backends whose snapshots take long to become
+                      ready (e.g. cloud snapshots of large volumes).
+                    nullable: true
+                    type: string
+                type: object
               suspend:
                 description: Pause this recipe declaratively (schedules and reconcile skip a suspended policy).
                 type: boolean

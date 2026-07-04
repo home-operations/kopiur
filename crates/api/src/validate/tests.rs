@@ -1059,6 +1059,7 @@ fn backup_config_aggregate_collects_multiple_errors() {
         sources: vec![], // missing required
         copy_method: Default::default(),
         volume_snapshot_class_name: None,
+        staging: None,
         group_by: None,
         retention: None,
         default_deletion_policy: None,
@@ -1104,6 +1105,7 @@ fn backup_config_valid_spec_has_no_errors() {
         }],
         copy_method: Default::default(),
         volume_snapshot_class_name: None,
+        staging: None,
         group_by: None,
         retention: None,
         default_deletion_policy: None,
@@ -2587,6 +2589,50 @@ fn backup_config_rejects_keeps_nothing_retention_but_not_absent() {
         )),
         "absent retention is the safe no-prune case and must not be flagged: {errs:?}"
     );
+}
+
+// --- staging validation ---
+
+#[test]
+fn backup_config_validates_staging_timeout() {
+    // Valid Go-duration timeouts are accepted — including "0" (wait indefinitely).
+    for t in ["10m", "1h", "0", "0s"] {
+        let ok: SnapshotPolicySpec = crate::testutil::from_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             sources: [ {{ pvc: {{ name: data }} }} ]\n\
+             staging: {{ timeout: {t:?} }}\n"
+        ));
+        assert!(
+            validate_backup_config(&ok).is_empty(),
+            "timeout {t:?} must be accepted: {:?}",
+            validate_backup_config(&ok)
+        );
+    }
+
+    // Absent staging / absent timeout are both fine (runtime default applies).
+    let absent: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         staging: {}\n",
+    );
+    assert!(validate_backup_config(&absent).is_empty());
+
+    // Unparseable timeout → rejected, names the field, message says what/why/fix.
+    let bad: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         staging: { timeout: every-hour }\n",
+    );
+    let errs = validate_backup_config(&bad);
+    let err = errs
+        .iter()
+        .find(|e| matches!(
+            e, ValidationError::InvalidFieldValue { field, .. } if field == "spec.staging.timeout"
+        ))
+        .unwrap_or_else(|| panic!("expected spec.staging.timeout rejection, got {errs:?}"));
+    let msg = err.to_string();
+    assert!(msg.contains("Go-style duration"), "{msg}");
+    assert!(msg.contains("default (10m)"), "{msg}");
 }
 
 // --- preflight validation ---

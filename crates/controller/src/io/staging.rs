@@ -90,12 +90,17 @@ pub enum StagingOutcome {
     /// The stage is provisioned and ready; mount [`StagedSource::pvc_name`].
     Ready(StagedSource),
     /// The VolumeSnapshot is not `readyToUse` yet — requeue (transient). The message is
-    /// for a `SourceStaged=False` / `Pending` condition.
+    /// for a `SourceStaged=False` / `Pending` condition. A `status.error` on the
+    /// VolumeSnapshot lands HERE (not `Failed`) while the staging deadline has not
+    /// passed: external-snapshotter sets it transiently (e.g. a benign 409-conflict
+    /// retry) and clears it on the next successful sync, so first sight is never fatal.
     Waiting(String),
-    /// The stage cannot be produced (no snapshot stack / no class / VolumeSnapshot
-    /// errored / source not CSI-provisioned). The reconciler fails the Snapshot with this
-    /// `reason` + actionable `message` and re-drives on the structural cadence (so it
-    /// recovers once the cluster is fixed — e.g. a class is installed).
+    /// The stage cannot be produced (no snapshot stack / no class / source not
+    /// CSI-provisioned / the VolumeSnapshot missed the staging deadline). The reconciler
+    /// fails the Snapshot with this `reason` + actionable `message`. **Terminal** for
+    /// the Snapshot CR: `Failed` phase → `RunDecision::TerminalFailed` →
+    /// `Action::await_change()` — a NEW Snapshot (e.g. the next scheduled run) is how a
+    /// retry happens, so the bar for producing this variant is deliberately high.
     Failed {
         /// kstatus condition reason (a stable PascalCase token).
         reason: &'static str,
@@ -108,8 +113,15 @@ pub enum StagingOutcome {
 pub const REASON_STACK_MISSING: &str = "SnapshotStackMissing";
 /// Condition reason: no usable `VolumeSnapshotClass` for the source's driver.
 pub const REASON_NO_CLASS: &str = "NoVolumeSnapshotClass";
-/// Condition reason: the created `VolumeSnapshot` reported an error.
+/// Condition reason: the created `VolumeSnapshot` was still reporting an error when
+/// the staging deadline (`spec.staging.timeout`) passed. Never produced on first
+/// sight of an error — external-snapshotter errors are transient until proven
+/// persistent.
 pub const REASON_VS_FAILED: &str = "VolumeSnapshotFailed";
+/// Condition reason: the created `VolumeSnapshot` did not become `readyToUse` within
+/// the staging deadline (`spec.staging.timeout`) and reported no error — the CSI
+/// driver / snapshot-controller is stuck or very slow.
+pub const REASON_STAGING_TIMEOUT: &str = "StagingTimedOut";
 /// Condition reason: the source PVC isn't CSI-provisioned (no StorageClass), so it
 /// can't be snapshotted/cloned.
 pub const REASON_SOURCE_NOT_CSI: &str = "SourceNotCSIProvisioned";
@@ -498,12 +510,29 @@ pub async fn source_provisioner(
     Ok(api.get_opt(&class).await?.map(|sc| sc.provisioner))
 }
 
-/// Read a VolumeSnapshot's readiness: `(ready_to_use, restore_size, error_message)`.
+/// One observation of a staged VolumeSnapshot's state, as read from the cluster.
+/// Plain data so [`vs_wait_outcome`] — the decision over it — stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VsObservation {
+    /// `status.readyToUse` (`false` when absent/unset).
+    pub ready: bool,
+    /// `status.restoreSize`, normalized to a string quantity.
+    pub restore_size: Option<String>,
+    /// `status.error.message`, if the last snapshot-controller sync failed. Inherently
+    /// transient: set on any failed attempt (including a benign 409-conflict retry)
+    /// and cleared on the next successful one, independently of `readyToUse`.
+    pub error: Option<String>,
+    /// `metadata.creationTimestamp` — the staging deadline anchor. Stable across the
+    /// idempotent SSA re-applies each reconcile performs.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read a VolumeSnapshot's state; `None` when it doesn't exist.
 async fn read_volume_snapshot(
     client: &kube::Client,
     ns: &str,
     name: &str,
-) -> Result<Option<(bool, Option<String>, Option<String>)>> {
+) -> Result<Option<VsObservation>> {
     let api = volume_snapshot_api(client, ns);
     let Some(vs) = api.get_opt(name).await? else {
         return Ok(None);
@@ -523,7 +552,119 @@ async fn read_volume_snapshot(
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
-    Ok(Some((ready, restore_size, error)))
+    // metadata.creationTimestamp is a k8s-openapi `Time` wrapping a jiff
+    // `Timestamp`; convert via unix seconds to chrono (matches snapshot_policy).
+    let created_at = vs
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t.0.as_second(), 0));
+    Ok(Some(VsObservation {
+        ready,
+        restore_size,
+        error,
+        created_at,
+    }))
+}
+
+/// What [`vs_wait_outcome`] decided about an observed VolumeSnapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VsWait {
+    /// `readyToUse` — provision the staged PVC. Overrides any error/deadline: a ready
+    /// snapshot is a usable snapshot.
+    Ready { restore_size: Option<String> },
+    /// Not ready, deadline not passed — hold `Pending` and requeue.
+    Waiting(String),
+    /// Not ready when the deadline passed — terminal for this Snapshot CR.
+    Failed {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// Render a duration the way the CRD field is written (`1h`/`10m`/`90s`), so the
+/// terminal message echoes a value the user can paste into `spec.staging.timeout`.
+fn fmt_go_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs > 0 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs > 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Decide the wait outcome for one VolumeSnapshot observation. Pure / clock-injected
+/// (issue #198): a `status.error` NEVER fails staging on sight — external-snapshotter
+/// sets it transiently during benign retry loops (e.g. a 409 finalizer-add conflict)
+/// and clears it once a retry succeeds, so the only failure signal is the deadline
+/// (`created_at + timeout`, `timeout == None` ⇒ indefinite). Because a `Failed`
+/// Snapshot is terminal (one-shot discipline), the bar here is deliberately high.
+pub(crate) fn vs_wait_outcome(
+    obs: &VsObservation,
+    ns: &str,
+    vs_name: &str,
+    class: &str,
+    timeout: Option<std::time::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> VsWait {
+    if obs.ready {
+        return VsWait::Ready {
+            restore_size: obs.restore_size.clone(),
+        };
+    }
+    // `created_at` missing is a just-created / not-yet-persisted read: not expired.
+    // A timeout too large for chrono (absurd but admissible) degrades to indefinite.
+    let deadline = match (timeout, obs.created_at) {
+        (Some(t), Some(created)) => chrono::Duration::from_std(t).ok().map(|d| created + d),
+        _ => None,
+    };
+    let expired = deadline.is_some_and(|d| now >= d);
+    if !expired {
+        let mut msg = format!("waiting for VolumeSnapshot `{ns}/{vs_name}` to become readyToUse");
+        if let Some(err) = &obs.error {
+            // Surface the error as diagnostic context, framed as what it is: a
+            // possibly-transient condition the snapshot-controller retries itself.
+            msg.push_str(&format!(
+                "; it reported a possibly-transient error (the snapshot-controller \
+                 retries automatically): {err}"
+            ));
+        }
+        match deadline {
+            // Deterministic per-VS (creationTimestamp + timeout are fixed), so the
+            // condition message doesn't churn status on every reconcile.
+            Some(d) => msg.push_str(&format!(
+                "; staging fails at {} if still not ready",
+                d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )),
+            None => msg.push_str("; waiting indefinitely (spec.staging.timeout: 0)"),
+        }
+        return VsWait::Waiting(msg);
+    }
+    let waited = fmt_go_duration(timeout.expect("expired implies a timeout"));
+    match &obs.error {
+        Some(err) => VsWait::Failed {
+            reason: REASON_VS_FAILED,
+            message: format!(
+                "VolumeSnapshot `{ns}/{vs_name}` did not become readyToUse within {waited} \
+                 (spec.staging.timeout; default 10m) and last reported: {err}; check the \
+                 VolumeSnapshotClass `{class}` / CSI driver, or raise spec.staging.timeout \
+                 if the backend is just slow. This Snapshot is terminal — the next \
+                 scheduled run (or a new Snapshot) retries"
+            ),
+        },
+        None => VsWait::Failed {
+            reason: REASON_STAGING_TIMEOUT,
+            message: format!(
+                "VolumeSnapshot `{ns}/{vs_name}` did not become readyToUse within {waited} \
+                 (spec.staging.timeout; default 10m) and reported no error — the CSI driver \
+                 or snapshot-controller is stuck or very slow; check both, or raise \
+                 spec.staging.timeout if the backend is just slow. This Snapshot is \
+                 terminal — the next scheduled run (or a new Snapshot) retries"
+            ),
+        },
+    }
 }
 
 /// Resolve staging for a backup. Performs the cluster IO (preflight, create
@@ -616,22 +757,32 @@ pub async fn resolve_staging(
         let vs = build_volume_snapshot(&vs_name, ns, source_name, Some(&class), owner.clone());
         apply(&volume_snapshot_api(client, ns), &vs_name, &vs).await?;
 
+        // Wait for readyToUse, bounded by the staging deadline (issue #198): a
+        // `status.error` alone is never fatal — external-snapshotter sets it during
+        // benign retry loops — only the deadline fails staging.
+        let timeout = kopiur_api::resolve_timeout(
+            policy
+                .spec
+                .staging
+                .as_ref()
+                .and_then(|s| s.timeout.as_deref()),
+            crate::consts::DEFAULT_STAGING_TIMEOUT,
+        );
         let restore_size = match read_volume_snapshot(client, ns, &vs_name).await? {
-            Some((true, restore_size, _)) => restore_size,
-            Some((false, _, Some(err))) => {
-                return Ok(StagingOutcome::Failed {
-                    reason: REASON_VS_FAILED,
-                    message: format!(
-                        "VolumeSnapshot `{ns}/{vs_name}` failed: {err}; check the \
-                         VolumeSnapshotClass `{class}` / CSI driver, then re-create the Snapshot"
-                    ),
-                });
-            }
-            // Not ready yet (or status not populated) → requeue.
-            _ => {
+            // Not visible yet (SSA create still propagating) → requeue.
+            None => {
                 return Ok(StagingOutcome::Waiting(format!(
                     "waiting for VolumeSnapshot `{ns}/{vs_name}` to become readyToUse"
                 )));
+            }
+            Some(obs) => {
+                match vs_wait_outcome(&obs, ns, &vs_name, &class, timeout, chrono::Utc::now()) {
+                    VsWait::Ready { restore_size } => restore_size,
+                    VsWait::Waiting(msg) => return Ok(StagingOutcome::Waiting(msg)),
+                    VsWait::Failed { reason, message } => {
+                        return Ok(StagingOutcome::Failed { reason, message });
+                    }
+                }
             }
         };
 
@@ -997,6 +1148,163 @@ mod tests {
         assert!(msg.contains("no VolumeSnapshotClass has driver `zfs.csi.openebs.io`"));
         assert!(msg.contains(DEFAULT_CLASS_ANNOTATION));
         assert!(msg.contains("copyMethod defaulted to Snapshot as of this release"));
+    }
+
+    // --- vs_wait_outcome: the issue-#198 decision (error ≠ failure; deadline is) ---
+
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-04T18:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn obs(ready: bool, error: Option<&str>, age: Option<std::time::Duration>) -> VsObservation {
+        VsObservation {
+            ready,
+            restore_size: Some("5Gi".into()),
+            error: error.map(str::to_string),
+            created_at: age.map(|a| t0() - chrono::Duration::from_std(a).unwrap()),
+        }
+    }
+
+    const TEN_MIN: Option<std::time::Duration> = Some(std::time::Duration::from_secs(600));
+    const CONFLICT_409: &str = "the object has been modified; please apply your changes \
+        to the latest version and try again";
+
+    fn decide(o: &VsObservation, timeout: Option<std::time::Duration>) -> VsWait {
+        vs_wait_outcome(
+            o,
+            "selfhosted",
+            "karakeep-snap",
+            "openebs-snapshots",
+            timeout,
+            t0(),
+        )
+    }
+
+    #[test]
+    fn vs_error_on_first_sight_is_waiting_not_failed() {
+        // THE #198 regression: a transient snapshot-controller 409 observed while the
+        // VolumeSnapshot is seconds old must wait, never terminally fail the backup.
+        let o = obs(
+            false,
+            Some(CONFLICT_409),
+            Some(std::time::Duration::from_secs(1)),
+        );
+        match decide(&o, TEN_MIN) {
+            VsWait::Waiting(msg) => {
+                assert!(
+                    msg.contains(CONFLICT_409),
+                    "error surfaced for diagnosis: {msg}"
+                );
+                assert!(
+                    msg.contains("possibly-transient") && msg.contains("retries automatically"),
+                    "framed as transient, not fatal: {msg}"
+                );
+                assert!(
+                    msg.contains("staging fails at 2026-07-04T18:39:59Z"),
+                    "names the (deterministic) deadline: {msg}"
+                );
+            }
+            other => panic!("a fresh VS error must be Waiting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ready_wins_over_error_and_deadline() {
+        // readyToUse: true is a usable snapshot even if a stale error rides along or
+        // the deadline has passed (e.g. the operator was down while it recovered).
+        let o = obs(
+            true,
+            Some(CONFLICT_409),
+            Some(std::time::Duration::from_secs(3600)),
+        );
+        assert_eq!(
+            decide(&o, TEN_MIN),
+            VsWait::Ready {
+                restore_size: Some("5Gi".into())
+            }
+        );
+    }
+
+    #[test]
+    fn persistent_error_fails_only_at_the_deadline() {
+        let age = |s| Some(std::time::Duration::from_secs(s));
+        // One second before the deadline: still waiting.
+        assert!(matches!(
+            decide(&obs(false, Some(CONFLICT_409), age(599)), TEN_MIN),
+            VsWait::Waiting(_)
+        ));
+        // At/after the deadline: terminal, with the error + the knob in the message.
+        match decide(&obs(false, Some(CONFLICT_409), age(600)), TEN_MIN) {
+            VsWait::Failed { reason, message } => {
+                assert_eq!(reason, REASON_VS_FAILED);
+                assert!(message.contains(CONFLICT_409), "{message}");
+                assert!(message.contains("within 10m"), "{message}");
+                assert!(message.contains("spec.staging.timeout"), "{message}");
+                assert!(
+                    message.contains("VolumeSnapshotClass `openebs-snapshots`"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("next scheduled run (or a new Snapshot) retries"),
+                    "terminal semantics must be honest: {message}"
+                );
+            }
+            other => panic!("expected Failed at the deadline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn silent_not_ready_times_out_with_distinct_reason() {
+        // No error, never ready → StagingTimedOut (stuck driver), not VolumeSnapshotFailed.
+        match decide(
+            &obs(false, None, Some(std::time::Duration::from_secs(601))),
+            TEN_MIN,
+        ) {
+            VsWait::Failed { reason, message } => {
+                assert_eq!(reason, REASON_STAGING_TIMEOUT);
+                assert!(message.contains("reported no error"), "{message}");
+                assert!(message.contains("spec.staging.timeout"), "{message}");
+            }
+            other => panic!("expected StagingTimedOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_timeout_waits_indefinitely() {
+        // spec.staging.timeout: "0" resolves to None → never expires, even with a
+        // persistent error and an ancient VS.
+        let o = obs(
+            false,
+            Some(CONFLICT_409),
+            Some(std::time::Duration::from_secs(864000)),
+        );
+        match decide(&o, None) {
+            VsWait::Waiting(msg) => {
+                assert!(msg.contains("waiting indefinitely"), "{msg}")
+            }
+            other => panic!("indefinite timeout must never fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_creation_timestamp_is_not_expired() {
+        // Defensive: a read racing the SSA create (no persisted creationTimestamp yet)
+        // must count as "just started", not instantly expired.
+        assert!(matches!(
+            decide(&obs(false, Some(CONFLICT_409), None), TEN_MIN),
+            VsWait::Waiting(_)
+        ));
+    }
+
+    #[test]
+    fn fmt_go_duration_echoes_crd_grammar() {
+        let d = std::time::Duration::from_secs;
+        assert_eq!(fmt_go_duration(d(600)), "10m");
+        assert_eq!(fmt_go_duration(d(3600)), "1h");
+        assert_eq!(fmt_go_duration(d(90)), "90s");
+        assert_eq!(fmt_go_duration(d(0)), "0s");
     }
 
     // --- build_volume_snapshot wire shape ---

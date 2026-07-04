@@ -114,6 +114,7 @@ Short name `kopiasp`, plural `snapshotpolicies`. Print columns: `REPOSITORY`,
 | `sources` | [][Source](#source) | — | What to back up (≥1, webhook-enforced). |
 | `copyMethod` | enum(**`Snapshot`**\|`Clone`\|`Direct`) | `Snapshot` | How the source is captured: `Snapshot` (CSI VolumeSnapshot → staged PVC — default, crash-consistent), `Clone` (CSI clone → staged PVC, opt-in), `Direct` (live PVC, co-located, opt-in — set explicitly for non-CSI sources). See [Copy methods](copy-methods.md). |
 | `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` for `Snapshot`/`Clone`; unset auto-selects the source driver's default class. NFS sources reject it (nothing to snapshot). |
+| `staging.timeout` | duration | `10m` | How long the staged `VolumeSnapshot` may take to become `readyToUse` (from its creation) before the backup fails (`VolumeSnapshotFailed`/`StagingTimedOut`). Transient CSI/snapshot-controller errors during the wait are retried, never fatal on their own. `0` waits indefinitely. See [Copy methods → staging deadline](copy-methods.md#how-long-staging-may-wait-specstagingtimeout). |
 | `groupBy` | enum(**`VolumeGroupSnapshot`**\|`None`) | `VolumeGroupSnapshot` | Multi-PVC consistency. **Not yet wired** — single-PVC staging only today (multi-PVC `pvcSelector` fan-out + VolumeGroupSnapshot is future work). |
 | `retention` | [Retention](#retention) | — | GFS — the only successful-retention driver. |
 | `defaultDeletionPolicy` | enum(`Delete`\|`Retain`\|`Orphan`) | `Delete` (effective) | Default `deletionPolicy` for child `Snapshot`s. |

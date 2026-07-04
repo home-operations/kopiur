@@ -98,7 +98,7 @@ The live `app-data` PVC was never mounted by the mover — only the staged copy 
 When a backup runs, Kopiur:
 
 1. Creates a CSI **`VolumeSnapshot`** of your source PVC (after any `beforeSnapshot` hooks, so a quiesced app yields a consistent capture).
-2. Waits for the snapshot to become `readyToUse`.
+2. Waits for the snapshot to become `readyToUse` — bounded by the [staging deadline](#how-long-staging-may-wait-specstagingtimeout) (`spec.staging.timeout`, default `10m`).
 3. Provisions a temporary **staged PVC** from the snapshot.
 4. Runs the kopia mover against the **staged PVC** — never the live volume.
 5. **Cleans everything up** (staged PVC + VolumeSnapshot) when the backup finishes.
@@ -126,6 +126,27 @@ spec:
 - **Set it explicitly** to pin a specific class.
 - **Leave it unset** and Kopiur picks the **default `VolumeSnapshotClass` for your source's driver** (the one annotated `snapshot.storage.kubernetes.io/is-default-class: "true"`). If exactly one class exists for the driver it's used even without the annotation.
 - If **no** class matches your driver, or **several** match with no single default, the backup fails asking you to create/annotate a class or name one explicitly.
+
+### How long staging may wait (`spec.staging.timeout`)
+
+The wait for `readyToUse` is bounded by a **staging deadline**, measured from the `VolumeSnapshot`'s creation:
+
+```yaml
+spec:
+    copyMethod: Snapshot
+    staging:
+        # Go-style duration; default 10m. "0" waits indefinitely.
+        timeout: 30m
+```
+
+- **Default `10m`** — plenty for drivers that cut snapshots in seconds (most local/on-cluster CSI), and bounded so a broken driver can't hold a `Snapshot` `Pending` forever and silently starve a `concurrencyPolicy: Forbid` schedule.
+- **Raise it** for backends whose snapshots take long to become ready — e.g. cloud snapshots of large volumes (the first EBS snapshot of a big volume can take well over 10 minutes).
+- **`timeout: "0"`** waits indefinitely (never fails on the deadline).
+
+Only this deadline fails staging. If it expires the backup goes `Failed` with reason `VolumeSnapshotFailed` (the snapshot was still reporting an error) or `StagingTimedOut` (no error — the driver/snapshot-controller is stuck), and the message names this field. A `Failed` backup is terminal; the next scheduled run (or a new `Snapshot`) retries.
+
+!!! note "A `VolumeSnapshot` error during the wait is NOT a failure"
+    The snapshot-controller routinely reports **transient** errors on a perfectly healthy `VolumeSnapshot` — most commonly a benign `409 Conflict` (`"the object has been modified; please apply your changes to the latest version and try again"`) while it adds finalizers, which its own retry clears a moment later. Kopiur surfaces such errors on the `SourceStaged` condition for visibility but keeps waiting; it declares `VolumeSnapshotFailed` only if the snapshot is still not `readyToUse` when the staging deadline passes.
 
 ```yaml
 --8<-- "deploy/examples/21-copy-method-snapshot.yaml"
@@ -183,7 +204,8 @@ If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapsho
 | --- | --- | --- |
 | `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API — the external-snapshotter isn't installed. | Install the [snapshot-controller + CRDs](https://kubernetes-csi.github.io/docs/snapshot-controller.html) and a `VolumeSnapshotClass`, or set `copyMethod: Direct`. |
 | `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver (or several do with no single default). | Create/annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
-| `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The CSI driver reported an error creating the snapshot. | Read the message (it includes the driver's error); check the class/driver, then re-create the `Snapshot`. |
+| `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The VolumeSnapshot was **still reporting an error when the staging deadline passed** (`spec.staging.timeout`, default `10m`) — transient errors during the wait are retried, never fatal on their own. | Read the message (it includes the driver's last error); fix the class/driver, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run (or a new `Snapshot`) retries. |
+| `SourceStaged=False`, reason **`StagingTimedOut`** | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported **no error** — the CSI driver / snapshot-controller is stuck or very slow. | Check the driver and the snapshot-controller; raise `spec.staging.timeout` (or set it to `"0"` to wait indefinitely) if the backend is just slow. |
 | `SourceStaged=False`, reason **`SourceNotCSIProvisioned`** | The source PVC has no `StorageClass` (a static/hostPath volume) — nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |
 | Backup stuck `Pending`, staged PVC `Pending` | `WaitForFirstConsumer` (normal — binds when the mover starts) **or** the driver can't clone (for `Clone`). | If it never binds, `kubectl describe pvc <name>-src` for the driver event; switch method if cloning is unsupported. |
 
