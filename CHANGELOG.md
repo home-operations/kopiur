@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.5.2](https://github.com/home-operations/kopiur/compare/0.5.1...0.5.2) (2026-07-04)
+
+
+### Features
+
+* **docs:** update docs for some restores and tests ([a3e3850](https://github.com/home-operations/kopiur/commit/a3e38506d7c1b658b990e0206c2b38137ee8ca5e))
+
+
+### Bug Fixes
+
+* **controller:** transient VolumeSnapshot errors no longer terminally fail backups ([#201](https://github.com/home-operations/kopiur/issues/201)) ([757793f](https://github.com/home-operations/kopiur/commit/757793f9aefca6e669da1a44a6553af67e36af3d))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.5.1 manifest ([afb3ab2](https://github.com/home-operations/kopiur/commit/afb3ab2f8f9e118d140e75437e6b0f1c18a43b30))
+
 ## [0.5.1](https://github.com/home-operations/kopiur/compare/0.5.0...0.5.1) (2026-07-04)
 
 
