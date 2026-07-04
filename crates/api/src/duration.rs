@@ -33,9 +33,40 @@ pub fn parse_go_duration(s: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Resolve an optional policy timeout string to an effective deadline duration,
+/// with the semantics every `*.timeout` field shares (`spec.preflight.timeout`,
+/// `spec.staging.timeout`): absent ⇒ `default`; parsed-zero (`0`/`0s`) ⇒ `None`
+/// (indefinite — never expires); unparseable ⇒ `default` (defensive only — the
+/// webhook rejects unparseable values at admission).
+pub fn resolve_timeout(spec: Option<&str>, default: Duration) -> Option<Duration> {
+    match spec {
+        None => Some(default),
+        Some(s) => match parse_go_duration(s) {
+            Some(d) if d.is_zero() => None,
+            Some(d) => Some(d),
+            None => Some(default),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_timeout_shared_semantics() {
+        let default = Duration::from_secs(600);
+        assert_eq!(resolve_timeout(None, default), Some(default));
+        assert_eq!(
+            resolve_timeout(Some("30m"), default),
+            Some(Duration::from_secs(1800))
+        );
+        // Zero means indefinite (never expires), not "expire immediately".
+        assert_eq!(resolve_timeout(Some("0"), default), None);
+        assert_eq!(resolve_timeout(Some("0s"), default), None);
+        // Unparseable falls back to the default (webhook rejects it anyway).
+        assert_eq!(resolve_timeout(Some("every-hour"), default), Some(default));
+    }
 
     #[test]
     fn parse_go_duration_handles_units() {

@@ -324,7 +324,7 @@ async fn mismatched_mover_is_not_flagged_false_up_front() {
         "mover Job created",
         default_timeout(),
         poll_interval(),
-        || async { Ok(jobs.get_opt("e2e-scc-mm-backup").await?) },
+        || async { jobs.get_opt("e2e-scc-mm-backup").await },
     )
     .await
     .expect("the mover Job should be created (the reconcile, incl. the compat check, has run)");

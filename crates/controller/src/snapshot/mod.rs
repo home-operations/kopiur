@@ -594,14 +594,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         });
         if let Some((check, eval_err)) = failed {
             // Resolve the timeout: absent ⇒ default; parsed-zero ⇒ indefinite.
-            let timeout = match pf.timeout.as_deref() {
-                None => Some(crate::consts::DEFAULT_PREFLIGHT_TIMEOUT),
-                Some(s) => match kopiur_api::parse_go_duration(s) {
-                    Some(d) if d.is_zero() => None,
-                    Some(d) => Some(d),
-                    None => Some(crate::consts::DEFAULT_PREFLIGHT_TIMEOUT),
-                },
-            };
+            let timeout = kopiur_api::resolve_timeout(
+                pf.timeout.as_deref(),
+                crate::consts::DEFAULT_PREFLIGHT_TIMEOUT,
+            );
             // Anchor the deadline on the FIRST failing reconcile (carried forward),
             // so the timeout budget covers preflight only, not the earlier
             // repository-not-Ready wait. Stamp it ONCE (only when newly failing) so a
@@ -1061,6 +1057,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             }
             io::StagingOutcome::Waiting(msg) => {
                 // The VolumeSnapshot isn't readyToUse yet — a normal, transient wait.
+                // The message may carry the VolumeSnapshot's (possibly transient)
+                // `status.error` as diagnostic context; that is NOT a failure — see
+                // `StagingOutcome::Failed` for the deadline that is (issue #198).
                 let existing = backup
                     .status
                     .as_ref()
@@ -1074,40 +1073,40 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &msg,
                     backup.meta().generation,
                 );
-                io::patch_status(
+                // if_changed: the wait message is deterministic per VolumeSnapshot
+                // (fixed deadline), so steady-state reconciles don't churn status.
+                let current = serde_json::to_value(&backup.status).ok();
+                io::patch_status_if_changed(
                     &api,
                     &name,
+                    current.as_ref(),
                     serde_json::json!({ "phase": "Pending", "conditions": conditions }),
                 )
                 .await?;
                 return Err(Error::MissingDependency(msg));
             }
             io::StagingOutcome::Failed { reason, message } => {
-                // Stack/class missing or the VolumeSnapshot errored: a clear, actionable
-                // Failed condition + Warning Event. Returned as a Validation error so the
-                // structural-cadence requeue re-checks and RECOVERS once the cluster is
-                // fixed (e.g. a VolumeSnapshotClass is installed) — no spec change needed.
-                let existing = backup
-                    .status
-                    .as_ref()
-                    .map(|s| s.conditions.clone())
-                    .unwrap_or_default();
-                let conditions = io::upsert_condition(
-                    &existing,
-                    SOURCE_STAGED_CONDITION,
-                    false,
+                // Staging cannot produce the stage (stack/class missing, source not
+                // CSI, or the VolumeSnapshot missed the staging deadline). TERMINAL:
+                // this write stamps `Failed` + `Stalled=True`, and the one-shot
+                // discipline (`run_decision` → `TerminalFailed` → `await_change`)
+                // never re-enters staging — a NEW Snapshot (e.g. the next scheduled
+                // run) is how a retry happens. Mirrors the preflight-expired path:
+                // patch + specific Warning Event + completed(failed) metric +
+                // `Ok(await_change)` — deliberately NOT an `Error::Validation`, whose
+                // generic `InvalidSpec` event would tell the user to fix a spec that
+                // isn't broken.
+                let status = snapshot_ready_status_with_condition(
+                    backup,
+                    SnapshotPhase::Failed,
                     reason,
                     &message,
-                    backup.meta().generation,
+                    SOURCE_STAGED_CONDITION,
+                    false,
                 );
                 let current = serde_json::to_value(&backup.status).ok();
-                let wrote = io::patch_status_if_changed(
-                    &api,
-                    &name,
-                    current.as_ref(),
-                    serde_json::json!({ "phase": "Failed", "conditions": conditions }),
-                )
-                .await?;
+                let wrote =
+                    io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
                 if wrote {
                     let _ = ctx
                         .recorder
@@ -1123,8 +1122,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         )
                         .await;
                     tracing::warn!(backup = %name, reason, "source staging failed: {message}");
+                    // This write is the real Failed transition (guarded by `wrote`);
+                    // TerminalFailed won't re-count it.
+                    ctx.metrics
+                        .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                 }
-                return Err(Error::Validation(message));
+                return Ok(Action::await_change());
             }
         };
 

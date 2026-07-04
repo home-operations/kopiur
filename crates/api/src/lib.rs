@@ -66,14 +66,14 @@ pub use snapshot::{
 };
 pub use snapshot_policy::{
     CopyMethod, DeepVerification, GroupBy, Hook, SnapshotPolicy, SnapshotPolicySpec,
-    SnapshotPolicyStatus, SourcePathStrategy, Verification,
+    SnapshotPolicyStatus, SourcePathStrategy, StagingSpec, Verification,
 };
 pub use snapshot_schedule::{
     ConcurrencyPolicy, ScheduleSpec, SnapshotSchedule, SnapshotScheduleSpec, SnapshotScheduleStatus,
 };
 
 // Shared logic re-exports.
-pub use duration::parse_go_duration;
+pub use duration::{parse_go_duration, resolve_timeout};
 pub use error::{ValidationError, ValidationResult};
 pub use identity::{IdentityInputs, identity_string, resolve_identity, validate_identity_expr};
 pub use jitter::{offset as jitter_offset, substitute_h};
