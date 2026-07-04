@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.1](https://github.com/home-operations/kopiur/compare/0.5.0...0.5.1) (2026-07-04)
+
+
+### Features
+
+* **cli:** release the kubectl plugin via goreleaser (Homebrew cask + krew) ([#187](https://github.com/home-operations/kopiur/issues/187)) ([6aa0080](https://github.com/home-operations/kopiur/commit/6aa008057677c32316efe19684789b0df43868f8))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.5.0 manifest ([1fab014](https://github.com/home-operations/kopiur/commit/1fab0143d1ff40d40c9411bdcca2cd2e03918ddf))
+
 ## [0.5.0](https://github.com/home-operations/kopiur/compare/0.4.13...0.5.0) (2026-07-04)
 
 
