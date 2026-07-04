@@ -59,16 +59,26 @@ description = "Install Rust components required by project tasks"
 run = "rustup component add rustfmt clippy llvm-tools-preview"
 
 [tasks.test]
-description = "Hermetic test suite: unit + serde + validation (no cluster, no network)"
-run = "cargo test --workspace --locked"
+# The second command compile-checks ALL feature-gated targets (integration/e2e)
+# without running anything: gated tests are also #[ignore]d, but a default-features
+# `cargo test` never even COMPILES them, so a stale struct literal in one slips
+# past every local gate and breaks only in CI (bit us on PR #201).
+description = "Hermetic test suite: unit + serde + validation (no cluster, no network); also compile-checks feature-gated targets"
+run = [
+  "cargo test --workspace --locked",
+  "cargo test --no-run --workspace --all-features --locked",
+]
 
 [tasks.test-int]
 description = "Cluster + kopia integration tests on an ephemeral kind cluster"
 run = "scripts/with-kind.sh cargo test --workspace --features integration --locked -- --include-ignored"
 
 [tasks.clippy]
-description = "Clippy across the workspace, warnings are errors"
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+# --all-features so the integration/e2e-gated test targets are linted too — the
+# CI lint job runs this task, so gated code now fails the FAST lint job instead
+# of the slow integration job (or a merged main).
+description = "Clippy across the workspace incl. feature-gated targets, warnings are errors"
+run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
 
 [tasks.fmt]
 description = "Format the workspace in place"
