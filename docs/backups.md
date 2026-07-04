@@ -130,17 +130,17 @@ When a selector matches several PVCs, `groupBy` defaults to `VolumeGroupSnapshot
 
 ### How the source is captured — `copyMethod`
 
-| `copyMethod`         | What happens                                                  | Requires                                                              |
-| -------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `Direct` _(default)_ | Read the **live** PVC directly (co-located on its node).     | Nothing — works on any storage.                                      |
-| `Snapshot`           | Point-in-time CSI `VolumeSnapshot` → temporary staged PVC → kopia reads the stage. | The CSI **snapshot stack** + a `VolumeSnapshotClass` for your driver. |
-| `Clone`              | CSI clone of the source PVC → kopia reads the clone.          | A CSI driver that supports volume **cloning**.                       |
+| `copyMethod`           | What happens                                                  | Requires                                                              |
+| ---------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `Snapshot` _(default)_ | Point-in-time CSI `VolumeSnapshot` → temporary staged PVC → kopia reads the stage. | The CSI **snapshot stack** + a `VolumeSnapshotClass` for your driver. |
+| `Clone`                | CSI clone of the source PVC → kopia reads the clone.          | A CSI driver that supports volume **cloning**.                       |
+| `Direct`               | Read the **live** PVC directly (co-located on its node).     | Nothing — works on any storage.                                      |
 
 `volumeSnapshotClassName` selects the snapshot class when `Snapshot`/`Clone` is used; leave it unset to auto-pick your driver's **default** class.
 
-/// note | `Snapshot`/`Clone` are opt-in and need the CSI snapshot stack
+/// note | `Direct` is opt-in; non-CSI sources must set it explicitly
 
-`copyMethod` defaults to `Direct` (live read — works anywhere). When you opt into `Snapshot`/`Clone` on a cluster **without** the external-snapshotter and a matching `VolumeSnapshotClass`, the backup **fails with a clear, actionable condition** (it never silently falls back). Install the stack, or stay on `Direct`. See **[Copy methods](copy-methods.md)** for the full decision guide, requirements, consistency, and cleanup behavior.
+`copyMethod` defaults to `Snapshot` (crash-consistent CSI staging). On a cluster **without** the external-snapshotter and a matching `VolumeSnapshotClass` — or for a static/non-CSI source — the backup **fails with a clear, actionable condition** unless you set `copyMethod: Direct` explicitly (it never silently falls back to a live read). See **[Copy methods](copy-methods.md)** for the full decision guide, requirements, consistency, cleanup behavior, and the upgrade hazards around this default.
 ///
 
 ### Retention — how long backups are kept (GFS)
@@ -293,7 +293,7 @@ You can set the scratch size/class **once** at the repository level via [`moverD
 It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 
 !!! tip "A timezone for the verify crons"
-    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent ⇒ UTC.
+    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
 
 ### suspend — pause a recipe
 
@@ -476,12 +476,24 @@ is described in the table below.
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schedule.cron`                    | When to fire. Supports Jenkins-style **`H`** (see below).                                                                                    |
 | `schedule.jitter`                  | Spread firings over a window (e.g. `30m`), so many schedules don't all hit at once.                                                          |
-| `schedule.timezone`                | IANA timezone the cron is evaluated in.                                                                                                      |
+| `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once), else UTC (see the tip below).                                                          |
 | `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately — GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
 | `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one).                      |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
+
+!!! tip "The cron timezone can be inherited from the repository"
+    Leave `schedule.timezone` unset and the schedule evaluates its cron in the
+    target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once)
+    (else UTC) — set the zone once on the repository instead of on every schedule.
+    The resolved zone is recorded in `status.nextSchedule.timezone`; if you later
+    change the repository default, the schedule re-reconciles (a referent watch)
+    and **recomputes its pinned slot** in the new zone rather than waiting for the
+    stale slot to fire. A `policySelector` schedule whose matched policies'
+    repositories disagree on the zone can't be resolved unambiguously — it falls
+    back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
+    set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
 
 ### `policyRef` or `policySelector` — one recipe or many
 

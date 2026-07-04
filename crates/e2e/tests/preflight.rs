@@ -56,6 +56,11 @@ fn policy_with_preflight(
         "spec": {
             "repository": { "kind": "Repository", "name": repo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight staging against it (a different, earlier preflight than
+            // spec.preflight below).
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "preflight": {
                 "timeout": timeout,

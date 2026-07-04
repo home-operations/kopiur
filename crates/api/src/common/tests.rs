@@ -779,3 +779,131 @@ fn resolve_mover_carries_throttle_from_defaults() {
             .is_none()
     );
 }
+
+// --- repo-level scheduleDefaults.timezone precedence (GitHub #174 item 3) ---
+
+#[test]
+fn resolve_tz_with_default_own_wins_over_repo_default() {
+    assert_eq!(
+        resolve_tz_with_default(Some("America/Chicago"), Some("Europe/Berlin")),
+        "America/Chicago".parse::<chrono_tz::Tz>().unwrap()
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_repo_default_fills_when_own_absent() {
+    assert_eq!(
+        resolve_tz_with_default(None, Some("America/New_York")),
+        "America/New_York".parse::<chrono_tz::Tz>().unwrap()
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_both_absent_is_utc() {
+    assert_eq!(resolve_tz_with_default(None, None), chrono_tz::Tz::UTC);
+}
+
+#[test]
+fn resolve_tz_with_default_invalid_own_falls_back_to_utc_per_resolve_tz_semantics() {
+    // An unparseable own timezone falls straight back to UTC — same defensive
+    // fallback as `resolve_tz` — even when a VALID repo default is present. The
+    // admission webhook rejects bad names up front for both levels, so this
+    // should never be observed in practice; the point is the fallback matches
+    // `resolve_tz`'s existing (own-only) semantics, not a secondary retry.
+    assert_eq!(
+        resolve_tz_with_default(Some("America/Chicgo"), Some("Europe/Berlin")),
+        chrono_tz::Tz::UTC
+    );
+}
+
+#[test]
+fn resolve_tz_with_default_invalid_repo_default_with_no_own_is_utc() {
+    assert_eq!(
+        resolve_tz_with_default(None, Some("Not/AZone")),
+        chrono_tz::Tz::UTC
+    );
+}
+
+#[test]
+fn effective_timezone_own_wins_without_lookups() {
+    // Own timezone is authoritative; matched-policy defaults are never consulted.
+    let (tz, amb) = effective_timezone(
+        Some("America/Los_Angeles"),
+        &[Some("Europe/Berlin".to_string())],
+    );
+    assert_eq!(tz.name(), "America/Los_Angeles");
+    assert!(amb.is_none());
+}
+
+#[test]
+fn effective_timezone_unset_single_agreeing_default() {
+    let defs = [Some("America/New_York".to_string())];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz.name(), "America/New_York");
+    assert!(amb.is_none());
+}
+
+#[test]
+fn effective_timezone_unset_multiple_agreeing_defaults() {
+    let defs = [
+        Some("Europe/Berlin".to_string()),
+        Some("Europe/Berlin".to_string()),
+        Some("Europe/Berlin".to_string()),
+    ];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz.name(), "Europe/Berlin");
+    assert!(amb.is_none());
+}
+
+#[test]
+fn effective_timezone_unset_disagreeing_defaults_is_utc_with_ambiguity() {
+    let defs = [
+        Some("Europe/Berlin".to_string()),
+        Some("America/Chicago".to_string()),
+    ];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz, chrono_tz::Tz::UTC);
+    let amb = amb.expect("disagreeing defaults must surface an ambiguity signal");
+    // Candidates are the distinct zones, sorted by IANA name.
+    assert_eq!(amb.candidates, ["America/Chicago", "Europe/Berlin"]);
+}
+
+#[test]
+fn effective_timezone_unset_mix_of_default_and_none_is_ambiguous() {
+    // A repo with no default resolves to UTC, so "a zone" vs "no default" is a
+    // genuine disagreement — reported, not silently one-sided.
+    let defs = [Some("Europe/Berlin".to_string()), None];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz, chrono_tz::Tz::UTC);
+    let amb = amb.expect("a zone mixed with no-default must be ambiguous");
+    assert_eq!(amb.candidates, ["Europe/Berlin", "UTC"]);
+}
+
+#[test]
+fn effective_timezone_unset_no_policies_is_utc() {
+    let (tz, amb) = effective_timezone(None, &[]);
+    assert_eq!(tz, chrono_tz::Tz::UTC);
+    assert!(amb.is_none());
+}
+
+#[test]
+fn effective_timezone_unset_all_repos_without_default_agree_on_utc() {
+    // Several matched policies, none of whose repos set a default → all UTC → agree.
+    let defs = [None, None];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz, chrono_tz::Tz::UTC);
+    assert!(amb.is_none());
+}
+
+#[test]
+fn effective_timezone_unset_invalid_default_falls_back_to_utc() {
+    // An unparseable repo default resolves to UTC (resolve_tz semantics). Two invalid
+    // strings both collapse to UTC and therefore agree.
+    let defs = [
+        Some("Not/AZone".to_string()),
+        Some("Also/Bogus".to_string()),
+    ];
+    let (tz, amb) = effective_timezone(None, &defs);
+    assert_eq!(tz, chrono_tz::Tz::UTC);
+    assert!(amb.is_none());
+}

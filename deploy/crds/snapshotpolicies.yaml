@@ -54,8 +54,8 @@ spec:
                     type: array
                 type: object
               copyMethod:
-                default: Direct
-                description: 'How the source volume is captured before kopia reads it: `Direct` (default), `Snapshot`, or `Clone`.'
+                default: Snapshot
+                description: 'How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`.'
                 enum:
                 - Snapshot
                 - Clone

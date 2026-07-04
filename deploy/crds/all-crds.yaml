@@ -1988,6 +1988,22 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              scheduleDefaults:
+                description: |-
+                  Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
+                  their own equivalent field — verification, replication, and maintenance
+                  schedules today; set once here instead of repeating it on every cron.
+                nullable: true
+                properties:
+                  timezone:
+                    description: |-
+                      IANA timezone name applied to every consuming cron that doesn't set its own
+                      `timezone` (e.g. `America/New_York`). Set once here instead of repeating it
+                      on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and
+                      `Maintenance.schedule` cron.
+                    nullable: true
+                    type: string
+                type: object
               server:
                 description: Optional kopia web-UI server, exposed via a `Service` in this namespace.
                 nullable: true
@@ -4608,6 +4624,22 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              scheduleDefaults:
+                description: |-
+                  Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
+                  their own equivalent field — verification, replication, and maintenance
+                  schedules today; set once here instead of repeating it on every cron.
+                nullable: true
+                properties:
+                  timezone:
+                    description: |-
+                      IANA timezone name applied to every consuming cron that doesn't set its own
+                      `timezone` (e.g. `America/New_York`). Set once here instead of repeating it
+                      on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and
+                      `Maintenance.schedule` cron.
+                    nullable: true
+                    type: string
+                type: object
               server:
                 description: Optional kopia web-UI server (the target `namespace` is required).
                 nullable: true
@@ -5231,8 +5263,8 @@ spec:
                     type: array
                 type: object
               copyMethod:
-                default: Direct
-                description: 'How the source volume is captured before kopia reads it: `Direct` (default), `Snapshot`, or `Clone`.'
+                default: Snapshot
+                description: 'How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`.'
                 enum:
                 - Snapshot
                 - Clone
@@ -6901,6 +6933,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               lastSuccessfulSchedule:
                 description: The most recent firing whose `Snapshot` succeeded.
@@ -6920,6 +6962,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               nextSchedule:
                 description: The next firing slot the controller has computed (cron + jitter, pinned).
@@ -6939,6 +6991,16 @@ spec:
                     required:
                     - name
                     type: object
+                  timezone:
+                    description: |-
+                      The IANA timezone the cron was evaluated in when this slot was pinned
+                      (`nextSchedule` only). Recorded so the controller can detect an
+                      effective-timezone change — a `spec.schedule.timezone` edit or a change to
+                      the target repository's `scheduleDefaults.timezone` — and invalidate the
+                      pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+                      pins written before this field existed (treated as "unchanged").
+                    nullable: true
+                    type: string
                 type: object
               observedGeneration:
                 description: The `metadata.generation` this status reflects, for staleness detection.

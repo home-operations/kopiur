@@ -1,0 +1,104 @@
+# Example 29 — Set the cron timezone once on the repository (GitHub #174 item 3)
+#
+# `spec.scheduleDefaults.timezone` (RepositorySpec / ClusterRepositorySpec) is
+# inherited at reconcile time by every consumer that doesn't set its own
+# `timezone`: SnapshotPolicy verification, RepositoryReplication, Maintenance,
+# AND SnapshotSchedule (the recurring-backup cron). Set the IANA zone ONCE here
+# instead of repeating it on every cron. Precedence: the consumer's own
+# `timezone` always wins; absent, it falls back to this field; absent that, UTC.
+#
+# A SnapshotSchedule resolves its target policy's repository default at
+# slot-computation time and records the zone in `status.nextSchedule.timezone`; a
+# later change to `scheduleDefaults.timezone` re-triggers the schedule (referent
+# watch) and recomputes the pinned slot. For a `policySelector` schedule whose
+# matched policies' repositories disagree on the zone, the schedule falls back to
+# UTC and raises a `TimezoneDefaultAmbiguous` condition recommending an explicit
+# `spec.schedule.timezone`.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the
+# bucket lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  # Set once here: every verification/replication/maintenance cron below (and
+  # any future one) that omits its own `timezone` evaluates in America/New_York.
+  scheduleDefaults:
+    timezone: America/New_York
+  # Maintenance is default-managed and has no timezone of its own here, so its
+  # quick/full crons fall all the way through to scheduleDefaults.timezone above.
+  maintenance:
+    enabled: true
+    schedule:
+      quick: { cron: "0 */6 * * *", jitter: 30m }
+      full: { cron: "0 3 * * *", jitter: 1h }
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  verification:
+    # No `timezone` here: "0 4 * * *" evaluates as 4 a.m. America/New_York
+    # (DST-correct), inherited from the repository's scheduleDefaults above —
+    # not 4 a.m. UTC.
+    quick:
+      cron: "0 4 * * *"
+      jitter: 30m
+    successExpr: "stats.files > 0 && stats.errors == 0"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    # No `timezone` here either: "H 2 * * *" fires ~2 a.m. America/New_York
+    # (DST-correct), inherited from the target policy's repository scheduleDefaults
+    # above — not 2 a.m. UTC. The resolved zone is pinned to
+    # status.nextSchedule.timezone; editing scheduleDefaults.timezone re-triggers
+    # this schedule and recomputes the pinned slot in the new zone.
+    cron: "H 2 * * *"
+    jitter: 30m

@@ -151,7 +151,7 @@ static credential Secret.
 ## Controller Deployment
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:132:194"
+--8<-- "deploy/helm/kopiur/values.yaml:132:201"
 ```
 
 The operator itself. The settings worth knowing:
@@ -167,6 +167,16 @@ The operator itself. The settings worth knowing:
 - **`resources`** — only **requests** are set by default; there are intentionally
   **no limits** (the `limits` block ships commented out). Uncomment and tune it to
   your own measured ceiling if you want them.
+- **`listenAddr`** (env `KOPIUR_HTTP_ADDR`, default `0.0.0.0:8081`) — the
+  address the controller's HTTP server (`/metrics`, `/healthz`, `/readyz`)
+  binds to. You need this only on an **IPv6-only or dual-stack cluster**: the
+  kubelet can't reach an IPv4-only `0.0.0.0` bind there, so the liveness/
+  readiness probes never succeed and the pod never goes Ready — set
+  `controller.listenAddr: "[::]:8081"` to fix it. The port must stay in sync
+  with `probePort` below (the Service and the probes target that port, not
+  whatever `listenAddr` happens to contain); an unparseable `listenAddr`
+  fails the controller at startup with an actionable error instead of
+  silently falling back to the default.
 
 /// note | Why the controller ships with no memory limit
 
@@ -196,7 +206,7 @@ The webhook is a **separate** Deployment + Service; the Service maps
 `443 → 8443`.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:201:239"
+--8<-- "deploy/helm/kopiur/values.yaml:208:246"
 ```
 
 - **`enabled`** — when `false`, validation falls back to the controller's
@@ -211,7 +221,7 @@ The webhook is a **separate** Deployment + Service; the Service maps
 ### Webhook TLS
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:240:270"
+--8<-- "deploy/helm/kopiur/values.yaml:247:277"
 ```
 
 The webhook **always** serves TLS (Kubernetes requires HTTPS for admission);
@@ -230,7 +240,7 @@ TLS](install.md#webhook-tls).
 ## Metrics & observability
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:275:331"
+--8<-- "deploy/helm/kopiur/values.yaml:282:338"
 ```
 
 All metrics are under the `kopiur_` namespace and served via a Prometheus **pull**
@@ -251,7 +261,7 @@ Prometheus Operator and Grafana:
 ## OpenTelemetry (OTLP)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:341:354"
+--8<-- "deploy/helm/kopiur/values.yaml:348:361"
 ```
 
 Off by default. Metrics are **always** available via the `/metrics` pull endpoint;
@@ -268,7 +278,7 @@ and a sample collector config.
 ## Logging
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:362:369"
+--8<-- "deploy/helm/kopiur/values.yaml:369:376"
 ```
 
 Controls the stdout (`kubectl logs`) logging every component writes. The
@@ -284,7 +294,7 @@ mover honors the same level and format.
 ## Pod security
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:375:388"
+--8<-- "deploy/helm/kopiur/values.yaml:382:395"
 ```
 
 Shared defaults for the controller and webhook pods: non-root **uid/gid 65534

@@ -238,6 +238,18 @@ pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";
 /// `action` for any other backend failure: check the backend configuration.
 pub const CHECK_BACKEND_ACTION: &str = "CheckBackend";
 
+/// `SnapshotSchedule` warn-only condition: the schedule inherits its cron timezone
+/// from its target policies' repository `scheduleDefaults.timezone`, but the matched
+/// policies' repositories **disagree** on the zone, so the controller fell back to
+/// UTC. `True` = ambiguous (UTC in effect), `False` = resolved unambiguously (the
+/// default consistent state). Never blocks scheduling — it recommends setting an
+/// explicit `spec.schedule.timezone`.
+pub const SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION: &str = "TimezoneDefaultAmbiguous";
+/// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `True`.
+pub const SCHEDULE_TIMEZONE_AMBIGUOUS_REASON: &str = "RepositoryDefaultsDisagree";
+/// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `False`.
+pub const SCHEDULE_TIMEZONE_RESOLVED_REASON: &str = "TimezoneResolved";
+
 /// Machine-readable `reason` (condition + Warning Event) when a bootstrap connect
 /// found **no** repository at the backend and `spec.create.enabled` is `false`, so
 /// kopiur declined to initialize one. Distinct from a kopia error class so the
@@ -316,6 +328,13 @@ pub const APPLY_GRANT_ACTION: &str = "ApplyGrant";
 pub const WEBHOOK_SETUP_FAILED_REASON: &str = "WebhookSetupFailed";
 /// `action` for a webhook TLS setup failure: check the webhook configuration.
 pub const CHECK_WEBHOOK_CONFIGURATION_ACTION: &str = "CheckWebhookConfiguration";
+/// Event `reason` when `KOPIUR_HTTP_ADDR` failed to parse as a socket address.
+/// Only reachable in principle — the controller fails at process startup
+/// before any reconciler (and thus any Event publish) runs — but the
+/// exhaustive `Error` match requires an arm regardless.
+pub const INVALID_HTTP_ADDR_REASON: &str = "InvalidHttpAddr";
+/// `action` for an unparseable `KOPIUR_HTTP_ADDR`: fix the env var / Helm value.
+pub const FIX_HTTP_ADDR_ACTION: &str = "FixHttpAddrEnv";
 
 /// Annotation the controller stamps on the self-managed webhook TLS Secret
 /// recording the serving leaf's `notAfter` as a Unix timestamp (seconds). Read

@@ -25,7 +25,7 @@ use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::PolicyRef;
+use kopiur_api::common::{PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz};
 use kopiur_api::snapshot::SnapshotSpec;
 use kopiur_api::{
     ConcurrencyPolicy, ScheduleSpec, Snapshot, SnapshotPolicy, SnapshotSchedule, jitter, validate,
@@ -81,6 +81,95 @@ pub fn next_fire(
 /// Whether a slot is due to fire at `now` (i.e. the scheduled time has arrived).
 pub fn should_fire_now(slot: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now >= slot
+}
+
+/// **Pure.** Whether a pinned `nextSchedule` slot must be recomputed because the
+/// effective cron timezone changed since it was pinned. `pinned_tz` is the zone
+/// recorded on the pin (`None` on legacy pins written before the field existed);
+/// `effective` is the zone resolved this reconcile.
+///
+/// Determinism guard: returns `false` for equal zones AND for an absent `pinned_tz`,
+/// so the steady state never recomputes — no jitter churn on every reconcile, and
+/// no one-time churn for schedules upgraded across the addition of the field. A
+/// recompute is triggered only by an observed, recorded zone that actually differs.
+pub fn pin_needs_recompute(pinned_tz: Option<&str>, effective: Tz) -> bool {
+    pinned_tz.is_some_and(|p| p != effective.name())
+}
+
+/// Outcome of resolving a `SnapshotSchedule`'s effective cron timezone for one
+/// reconcile. Distinguishes a genuine resolution (referents read successfully) from a
+/// **degraded** pass (a referent GET/list failed, or a matched policy/repo was
+/// missing) so the caller can honor the invariant that *a transient referent failure
+/// must never invalidate an established pin*: without this distinction the old
+/// `(Tz::UTC, None)`-on-failure return was indistinguishable from a genuinely-resolved
+/// UTC, so an apiserver blip would flap a `Europe/Berlin` pin to UTC timing and back.
+/// Internal to the reconciler — not serialized, so the status schema is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimezoneResolution {
+    /// Referents were read; `tz` is the effective zone and `ambiguity` is `Some` when
+    /// matched policies' repositories disagreed on their default (UTC in effect + a
+    /// warn-only status condition).
+    Resolved {
+        tz: Tz,
+        ambiguity: Option<TimezoneAmbiguity>,
+    },
+    /// Resolution could not complete this reconcile (referent GET/list failure or a
+    /// missing policy/repo). The controller keeps an established pin untouched and
+    /// only self-heals a *first* pin to UTC.
+    Degraded,
+}
+
+/// **Pure.** Decide the effective zone, ambiguity signal, and whether the pinned
+/// `nextSchedule` slot must be recomputed, given the pin's recorded zone
+/// (`pinned_tz`) and this reconcile's [`TimezoneResolution`]. Exhaustive over the
+/// resolution — no `_ =>`:
+///
+/// - `Resolved { tz, ambiguity }`: the pin is invalidated iff its recorded zone
+///   differs from `tz` (via [`pin_needs_recompute`]); `tz`/`ambiguity` flow on to the
+///   re-pin and status.
+/// - `Degraded`: a transient referent failure must **never** invalidate an
+///   established pin, so recompute is always `false` and the pin's own recorded zone
+///   stays in effect for this reconcile (a legacy pin with no recorded zone resolves
+///   to UTC via [`resolve_tz`]). No ambiguity is asserted while degraded.
+fn resolve_pinned_slot_tz(
+    pinned_tz: Option<&str>,
+    resolution: &TimezoneResolution,
+) -> (Tz, Option<TimezoneAmbiguity>, bool) {
+    match resolution {
+        TimezoneResolution::Resolved { tz, ambiguity } => {
+            (*tz, ambiguity.clone(), pin_needs_recompute(pinned_tz, *tz))
+        }
+        TimezoneResolution::Degraded => (resolve_tz(pinned_tz), None, false),
+    }
+}
+
+/// **Pure.** The zone + ambiguity to pin on the FIRST reconcile (no pin recorded
+/// yet). Exhaustive over [`TimezoneResolution`] — no `_ =>`:
+/// - `Resolved { tz, ambiguity }`: pin that zone (and surface any ambiguity).
+/// - `Degraded`: self-heal by pinning UTC now; once referents recover, the
+///   pinned-slot branch recomputes into the inherited zone exactly once (then
+///   stabilizes — see [`resolve_pinned_slot_tz`]).
+fn first_pin_tz(resolution: &TimezoneResolution) -> (Tz, Option<TimezoneAmbiguity>) {
+    match resolution {
+        TimezoneResolution::Resolved { tz, ambiguity } => (*tz, ambiguity.clone()),
+        TimezoneResolution::Degraded => (Tz::UTC, None),
+    }
+}
+
+/// The `TimezoneDefaultAmbiguous` condition's current truthiness on `schedule.status`
+/// (absent condition = not ambiguous). Lets the not-due path skip a status patch when
+/// the freshly-computed ambiguity state already matches what's recorded — steady state
+/// stays patch-free (no watch churn), while a resolved or newly-arisen ambiguity is
+/// corrected promptly instead of lingering until the next fire.
+fn recorded_tz_ambiguous(schedule: &SnapshotSchedule) -> bool {
+    schedule
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == crate::consts::SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION)
+        .is_some_and(|c| c.status == "True")
 }
 
 /// Whether the `starting_deadline_seconds` has been missed for a slot (the slot
@@ -181,9 +270,20 @@ pub fn should_run_on_create(schedule: &ScheduleSpec, already_ran: bool) -> bool 
 /// The kstatus Ready conditions for a `SnapshotSchedule` (ADR-0005 §2). A schedule
 /// has no phase; it's `Ready` whenever it has reconciled — whether actively
 /// scheduling or correctly `suspend`ed (a paused schedule is healthy, not stalled).
+/// `ambiguity` is `Some` when the schedule inherits its timezone but its target
+/// policies' repositories disagree on the zone (UTC in effect) — surfaced as a
+/// warn-only [`consts::SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] recommending an
+/// explicit `spec.schedule.timezone`; `None` clears it back to the resolved state.
 /// Returns the `conditions` + `observedGeneration` to merge into a status patch.
 /// Existing conditions are preserved by [`io::set_ready`]'s upsert.
-fn schedule_ready_status(schedule: &SnapshotSchedule) -> (serde_json::Value, i64) {
+fn schedule_ready_status(
+    schedule: &SnapshotSchedule,
+    ambiguity: Option<&TimezoneAmbiguity>,
+) -> (serde_json::Value, i64) {
+    use crate::consts::{
+        SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION, SCHEDULE_TIMEZONE_AMBIGUOUS_REASON,
+        SCHEDULE_TIMEZONE_RESOLVED_REASON,
+    };
     let existing = schedule
         .status
         .as_ref()
@@ -201,6 +301,28 @@ fn schedule_ready_status(schedule: &SnapshotSchedule) -> (serde_json::Value, i64
         io::ReadyOutcome::Ready,
         reason,
         message,
+    );
+    // Upsert the timezone-ambiguity condition either way so it clears once the
+    // disagreement is resolved (order-stable, transition-time-preserving).
+    let tz_message = match ambiguity {
+        Some(a) => format!(
+            "matched policies' repository scheduleDefaults.timezone disagree ({}); \
+             defaulting to UTC — set spec.schedule.timezone explicitly to pick a zone",
+            a.candidates.join(", ")
+        ),
+        None => "schedule timezone resolved without ambiguity".to_string(),
+    };
+    let conditions = io::upsert_condition(
+        &conditions,
+        SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION,
+        ambiguity.is_some(),
+        if ambiguity.is_some() {
+            SCHEDULE_TIMEZONE_AMBIGUOUS_REASON
+        } else {
+            SCHEDULE_TIMEZONE_RESOLVED_REASON
+        },
+        &tz_message,
+        Some(generation),
     );
     (serde_json::json!(conditions), generation)
 }
@@ -253,20 +375,63 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         .jitter
         .as_deref()
         .and_then(parse_go_duration);
-    let tz = kopiur_api::common::resolve_tz(schedule.spec.schedule.timezone.as_deref());
+    // Effective cron timezone resolution for this reconcile. When the schedule sets
+    // its own `spec.schedule.timezone`, that wins with no lookups. Otherwise inherit
+    // from the target policies' repository `scheduleDefaults.timezone` (agree-or-UTC;
+    // a disagreement among selector matches degrades to UTC + a status condition). A
+    // referent GET/list failure (or a missing policy/repo) yields `Degraded` — which
+    // must NOT invalidate an established pin (a transient apiserver blip would
+    // otherwise flap the pinned slot to UTC and back); it only self-heals a first pin
+    // to UTC. See `resolve_pinned_slot_tz` / `first_pin_tz`.
+    let resolution = resolve_effective_timezone(ctx, schedule, &namespace).await;
 
     // The previously-pinned slot (status.nextSchedule) is the one that may now be
     // due. If absent (first reconcile), compute the upcoming slot from now and
     // pin it without firing (GitOps-friendly: runOnCreate defaults false).
-    let pinned_slot = schedule
+    let pinned = schedule
         .status
         .as_ref()
-        .and_then(|s| s.next_schedule.as_ref())
+        .and_then(|s| s.next_schedule.as_ref());
+    let pinned_slot = pinned
         .and_then(|r| r.at.as_deref())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
+    // The timezone this slot was pinned in. Absent on legacy pins (written before the
+    // field existed) → treated as "unchanged" so an upgrade never churns the pin.
+    let pinned_tz = pinned.and_then(|r| r.timezone.clone());
 
     if let Some(slot) = pinned_slot {
+        // Effective zone + whether the pin is stale, honoring Degraded semantics:
+        // `Resolved` invalidates iff the recorded zone actually changed; `Degraded`
+        // keeps the pin's own zone and never invalidates (no flap on a referent blip).
+        let (tz, tz_ambiguity, needs_recompute) =
+            resolve_pinned_slot_tz(pinned_tz.as_deref(), &resolution);
+        // If the effective timezone changed since this slot was pinned (a
+        // `spec.schedule.timezone` edit or a repo `scheduleDefaults` change), the
+        // pinned wall-clock instant is stale. Recompute deterministically via the
+        // existing `next_fire` (croner + deterministic jitter — NO new randomness)
+        // and re-pin in the new zone without firing; the requeue re-enters and the
+        // freshly-pinned slot fires when due. The equal case falls through untouched.
+        if needs_recompute {
+            let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
+            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            io::patch_status(
+                &api,
+                &sched_name,
+                serde_json::json!({
+                    "nextSchedule": { "at": next.to_rfc3339(), "timezone": tz.name() },
+                    "observedGeneration": generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+            tracing::info!(
+                schedule = %sched_name, from = ?pinned_tz, to = %tz.name(),
+                "effective timezone changed; recomputed the pinned slot"
+            );
+            let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
+            return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
+        }
         // Is a run currently active (an unfinished Snapshot owned by this schedule)?
         let run_active = active_run_exists(ctx, &namespace, &sched_name).await?;
         if should_create_backup(&schedule.spec.schedule, slot, now, run_active) {
@@ -280,13 +445,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 .as_ref()
                 .map(|_| scheduled_backup_name(&sched_name, slot));
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
-            let (conditions, generation) = schedule_ready_status(schedule);
+            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
             io::patch_status(
                 &api,
                 &sched_name,
                 serde_json::json!({
                     "lastSchedule": { "at": slot.to_rfc3339(), "snapshotRef": snapshot_ref.map(|n| serde_json::json!({ "name": n })) },
-                    "nextSchedule": { "at": next.to_rfc3339() },
+                    "nextSchedule": { "at": next.to_rfc3339(), "timezone": tz.name() },
                     "consecutiveFailures": 0,
                     "observedGeneration": generation,
                     "conditions": conditions,
@@ -296,12 +461,34 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
-        // Slot not yet due: wait until it is.
+        // Slot not yet due: wait until it is. The ambiguity condition is otherwise
+        // only rewritten on a status-patching path, so a resolved (or newly-arisen)
+        // ambiguity could linger until the next fire. When resolution succeeded and
+        // the freshly-computed state differs from what's recorded, patch just the
+        // conditions; the equality guard keeps steady state patch-free, and a Degraded
+        // pass is skipped entirely (it asserts nothing about ambiguity).
+        if matches!(resolution, TimezoneResolution::Resolved { .. })
+            && tz_ambiguity.is_some() != recorded_tz_ambiguous(schedule)
+        {
+            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            io::patch_status(
+                &api,
+                &sched_name,
+                serde_json::json!({
+                    "observedGeneration": generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+        }
         let until = (slot - now).to_std().unwrap_or(StdDuration::from_secs(1));
         return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
     }
 
-    // First reconcile (nextSchedule not yet pinned). Compute the upcoming slot.
+    // First reconcile (nextSchedule not yet pinned). Choose the zone to pin: the
+    // resolved zone, or UTC when Degraded (self-heals — once referents recover, the
+    // pinned-slot branch recomputes into the inherited zone exactly once).
+    let (tz, tz_ambiguity) = first_pin_tz(&resolution);
     let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
 
     // Honor `runOnCreate`: fire one backup immediately instead of waiting for the
@@ -327,13 +514,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             .policy_ref
             .as_ref()
             .map(|_| scheduled_backup_name(&sched_name, anchor));
-        let (conditions, generation) = schedule_ready_status(schedule);
+        let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
         io::patch_status(
             &api,
             &sched_name,
             serde_json::json!({
                 "lastSchedule": { "at": anchor.to_rfc3339(), "snapshotRef": snapshot_ref.map(|n| serde_json::json!({ "name": n })) },
-                "nextSchedule": { "at": next.to_rfc3339() },
+                "nextSchedule": { "at": next.to_rfc3339(), "timezone": tz.name() },
                 "consecutiveFailures": 0,
                 "observedGeneration": generation,
                 "conditions": conditions,
@@ -345,12 +532,12 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     }
 
     // No runOnCreate: pin the next slot without firing (GitOps-friendly default).
-    let (conditions, generation) = schedule_ready_status(schedule);
+    let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
     io::patch_status(
         &api,
         &sched_name,
         serde_json::json!({
-            "nextSchedule": { "at": next.to_rfc3339() },
+            "nextSchedule": { "at": next.to_rfc3339(), "timezone": tz.name() },
             "observedGeneration": generation,
             "conditions": conditions,
         }),
@@ -492,6 +679,74 @@ async fn target_policy_refs(
     Ok(refs)
 }
 
+/// Resolve the effective cron timezone for this reconcile (see
+/// [`effective_timezone`] for the rule). When `spec.schedule.timezone` is set, that
+/// wins with no lookups (`Resolved`, never degraded, never ambiguous). Otherwise it
+/// GETs each target policy and resolves that policy's repository
+/// `scheduleDefaults.timezone`, then applies the agree-or-UTC rule.
+///
+/// Returns [`TimezoneResolution::Degraded`] on any referent GET/list failure (or a
+/// missing policy/repo) rather than a genuinely-resolved UTC: a missing or unreadable
+/// referent must not wedge scheduling, and — critically — must not be mistaken for a
+/// real UTC and used to invalidate an established non-UTC pin (see
+/// [`resolve_pinned_slot_tz`]). The pin's own requeue plus the referent watch recover
+/// once the referent returns.
+///
+/// Note an *empty* matched-policy set (a selector that matches nothing) is a genuine
+/// `Resolved { tz: UTC }`, not `Degraded` — there was nothing to inherit, and pinning
+/// UTC there is correct.
+async fn resolve_effective_timezone(
+    ctx: &Context,
+    schedule: &SnapshotSchedule,
+    namespace: &str,
+) -> TimezoneResolution {
+    if let Some(own) = schedule.spec.schedule.timezone.as_deref() {
+        return TimezoneResolution::Resolved {
+            tz: resolve_tz(Some(own)),
+            ambiguity: None,
+        };
+    }
+    // Same target set the fire path uses (single policyRef, or each selector match).
+    let policy_refs = match target_policy_refs(ctx, schedule, namespace).await {
+        Ok(refs) => refs,
+        Err(e) => {
+            tracing::debug!(error = %e, "listing target policies for timezone default failed; degrading (established pin preserved)");
+            return TimezoneResolution::Degraded;
+        }
+    };
+    let mut defaults: Vec<Option<String>> = Vec::with_capacity(policy_refs.len());
+    for pref in &policy_refs {
+        match policy_repo_timezone_default(ctx, pref, namespace).await {
+            Ok(tz) => defaults.push(tz),
+            Err(e) => {
+                tracing::debug!(policy = %pref.name, error = %e, "resolving policy repository timezone default failed; degrading (established pin preserved)");
+                return TimezoneResolution::Degraded;
+            }
+        }
+    }
+    // `own` is provably `None` here (the explicit-timezone case returned above).
+    let (tz, ambiguity) = effective_timezone(None, &defaults);
+    TimezoneResolution::Resolved { tz, ambiguity }
+}
+
+/// GET one target policy and resolve its repository's `scheduleDefaults.timezone`.
+/// Honors `policyRef.namespace` for a cross-namespace ref; the policy's repository
+/// is resolved in the policy's own namespace (matching how the policy itself
+/// resolves it). `Ok(None)` = the policy's repository sets no default.
+async fn policy_repo_timezone_default(
+    ctx: &Context,
+    policy_ref: &PolicyRef,
+    schedule_ns: &str,
+) -> Result<Option<String>> {
+    let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
+    let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), policy_ns);
+    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
+        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+    })?;
+    let repo = io::resolve_repository_ref(&ctx.client, &policy.spec.repository, policy_ns).await?;
+    Ok(repo.schedule_defaults.and_then(|d| d.timezone))
+}
+
 /// Create a scheduled Snapshot CR for `policy_ref` (owner-ref to the schedule,
 /// origin=scheduled). Server-side applied so re-firing the same slot converges
 /// instead of erroring. `backup_name` is the per-policy slot-stamped name.
@@ -600,6 +855,105 @@ mod tests {
         assert_eq!(parse_go_duration("120"), Some(StdDuration::from_secs(120)));
         assert_eq!(parse_go_duration(""), None);
         assert_eq!(parse_go_duration("bogus"), None);
+    }
+
+    #[test]
+    fn pin_recompute_only_when_recorded_zone_differs() {
+        // Differing recorded zone → recompute (the pin is stale).
+        assert!(pin_needs_recompute(Some("America/Chicago"), Tz::UTC));
+        assert!(pin_needs_recompute(
+            Some("UTC"),
+            "Europe/Berlin".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn pin_recompute_equal_zone_keeps_pin_no_churn() {
+        // Determinism guard: identical zones never recompute (no jitter churn).
+        assert!(!pin_needs_recompute(Some("UTC"), Tz::UTC));
+        assert!(!pin_needs_recompute(
+            Some("America/Chicago"),
+            "America/Chicago".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn pin_recompute_legacy_absent_zone_keeps_pin() {
+        // A legacy pin (no recorded zone) is treated as unchanged — no upgrade churn.
+        assert!(!pin_needs_recompute(None, Tz::UTC));
+        assert!(!pin_needs_recompute(
+            None,
+            "Pacific/Kiritimati".parse().unwrap()
+        ));
+    }
+
+    fn resolved(name: &str) -> TimezoneResolution {
+        TimezoneResolution::Resolved {
+            tz: name.parse().unwrap(),
+            ambiguity: None,
+        }
+    }
+
+    #[test]
+    fn degraded_keeps_established_non_utc_pin() {
+        // REGRESSION (reviewer's flap concern): an established Europe/Berlin pin must
+        // NOT be invalidated when timezone resolution degrades (a transient referent
+        // failure). On the old `(Tz::UTC, None)`-on-failure code the caller could not
+        // tell this from a resolved UTC, so `pin_needs_recompute(Some("Europe/Berlin"),
+        // UTC)` fired and rewrote the pin to UTC timing — then flapped back on recovery.
+        let (tz, ambiguity, needs_recompute) =
+            resolve_pinned_slot_tz(Some("Europe/Berlin"), &TimezoneResolution::Degraded);
+        assert!(!needs_recompute, "degrade must never invalidate a live pin");
+        // The pin's own recorded zone stays in effect for this reconcile (no flap).
+        assert_eq!(tz.name(), "Europe/Berlin");
+        assert!(ambiguity.is_none());
+    }
+
+    #[test]
+    fn resolved_differing_zone_invalidates_established_pin() {
+        // A genuine resolution to a different zone still recomputes (the pin is stale).
+        let (tz, _amb, needs_recompute) =
+            resolve_pinned_slot_tz(Some("UTC"), &resolved("Europe/Berlin"));
+        assert!(needs_recompute);
+        assert_eq!(tz.name(), "Europe/Berlin");
+        // Same zone resolved → no churn.
+        let (_tz, _amb, again) =
+            resolve_pinned_slot_tz(Some("Europe/Berlin"), &resolved("Europe/Berlin"));
+        assert!(!again);
+    }
+
+    #[test]
+    fn first_pin_degrade_then_recover_recomputes_exactly_once() {
+        // (1) First reconcile while degraded: self-heal by pinning UTC now.
+        let (tz0, amb0) = first_pin_tz(&TimezoneResolution::Degraded);
+        assert_eq!(tz0.name(), "UTC");
+        assert!(amb0.is_none());
+        let pinned_tz = tz0.name().to_string(); // recorded on the pin = "UTC"
+
+        // (2) Referents recover and resolve to the inherited Europe/Berlin: the
+        // pinned-slot branch recomputes exactly once (UTC != Europe/Berlin).
+        let (tz1, _amb1, recompute1) =
+            resolve_pinned_slot_tz(Some(&pinned_tz), &resolved("Europe/Berlin"));
+        assert!(
+            recompute1,
+            "recovery must recompute the UTC self-heal pin once"
+        );
+        assert_eq!(tz1.name(), "Europe/Berlin");
+        let pinned_tz = tz1.name().to_string(); // re-pinned as Europe/Berlin
+
+        // (3) Steady state: the same resolution no longer recomputes (stabilizes).
+        let (_tz2, _amb2, recompute2) =
+            resolve_pinned_slot_tz(Some(&pinned_tz), &resolved("Europe/Berlin"));
+        assert!(
+            !recompute2,
+            "must stabilize — no repeated churn after recovery"
+        );
+    }
+
+    #[test]
+    fn first_pin_resolved_pins_that_zone() {
+        let (tz, _amb) = first_pin_tz(&resolved("America/Chicago"));
+        assert_eq!(tz.name(), "America/Chicago");
     }
 
     #[test]

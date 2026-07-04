@@ -104,24 +104,46 @@ pub fn translate_source(
         "sources": [ { "pvc": { "name": source_pvc } } ],
     });
 
-    // copyMethod: VolSync None/Direct → Direct; Snapshot/Clone 1:1.
-    if let Some(method) = &restic.copy_method {
-        let kopiur_method = match method.as_str() {
-            "Snapshot" => Some("Snapshot"),
-            "Clone" => Some("Clone"),
-            "Direct" | "None" => Some("Direct"),
-            other => {
-                t.unmappable(
-                    "spec.restic.copyMethod",
-                    &format!("unknown VolSync copyMethod {other:?}; defaulting to kopiur's Direct"),
-                );
-                None
-            }
-        };
-        if let Some(m) = kopiur_method {
-            policy_spec["copyMethod"] = serde_json::json!(m);
+    // copyMethod: ALWAYS emit an explicit value in the translated output — never leave
+    // it absent, which would instead pick up kopiur's OWN copyMethod default (which can
+    // change independently of what this VolSync source actually needs; it defaults to
+    // `Snapshot` as of this release). VolSync `Snapshot`/`Clone` map 1:1; VolSync
+    // `Direct`, `None`, and an absent field all mean "read the live PVC" in VolSync, so
+    // they all translate to an explicit kopiur `Direct` — preserving the exact
+    // VolSync-era behavior regardless of kopiur's current default.
+    let raw_copy_method = restic.copy_method.as_deref();
+    let kopiur_method = match raw_copy_method {
+        Some("Snapshot") => "Snapshot",
+        Some("Clone") => "Clone",
+        Some("Direct") | Some("None") | None => "Direct",
+        Some(other) => {
+            t.unmappable(
+                "spec.restic.copyMethod",
+                &format!(
+                    "unknown VolSync copyMethod {other:?}; translated to an explicit \
+                     SnapshotPolicy.spec.copyMethod: Direct — review whether this source \
+                     actually wants CSI staging (Snapshot/Clone) instead"
+                ),
+            );
+            "Direct"
+        }
+    };
+    policy_spec["copyMethod"] = serde_json::json!(kopiur_method);
+    match raw_copy_method {
+        // Recognized explicit value — a plain field mapping.
+        Some("Snapshot") | Some("Clone") | Some("Direct") | Some("None") => {
             t.mapped("spec.restic.copyMethod", "SnapshotPolicy.spec.copyMethod");
         }
+        // Absent — VolSync's implicit live-read default, pinned explicitly so the
+        // translated manifest is immune to kopiur's own copyMethod default changing.
+        None => {
+            t.mapped(
+                "spec.restic.copyMethod (absent; VolSync default is a live read)",
+                "SnapshotPolicy.spec.copyMethod: Direct (pinned explicitly)",
+            );
+        }
+        // Unknown value — already recorded as Unmappable above.
+        Some(_) => {}
     }
     if let Some(class) = &restic.volume_snapshot_class_name {
         policy_spec["volumeSnapshotClassName"] = serde_json::json!(class);
@@ -686,6 +708,58 @@ mod tests {
         let spec_typed: kopiur_api::SnapshotPolicySpec =
             serde_json::from_value(policy["spec"].clone()).expect("valid SnapshotPolicySpec");
         assert_eq!(spec_typed.sources.len(), 1);
+    }
+
+    #[test]
+    fn absent_copy_method_translates_to_explicit_direct() {
+        // A VolSync ReplicationSource with no spec.restic.copyMethod at all defaults to a
+        // live read in VolSync — the translated SnapshotPolicy must pin that as an
+        // EXPLICIT `copyMethod: Direct`, never leave the field absent (which would
+        // instead pick up kopiur's own copyMethod default, currently Snapshot).
+        let spec = source_spec(serde_json::json!({
+            "sourcePVC": "data",
+            "restic": { "repository": "restic-secret" }
+        }));
+        let t = translate_source("app", "media", &spec, &repo_ref()).unwrap();
+        let policy = &t.objects[0];
+        assert_eq!(policy["spec"]["copyMethod"], "Direct");
+        assert!(!t.has_unmappable);
+        let note = t
+            .notes
+            .iter()
+            .find(|n| n.field.starts_with("spec.restic.copyMethod"))
+            .unwrap_or_else(|| panic!("no copyMethod note: {:?}", t.notes));
+        assert!(matches!(note.disposition, Disposition::Mapped { .. }));
+    }
+
+    #[test]
+    fn unknown_copy_method_translates_to_explicit_direct_and_is_unmappable() {
+        // An unrecognized copyMethod string still must not leave the field absent —
+        // it falls back to an explicit Direct, and the accounting message must not lie
+        // about "defaulting to kopiur's Direct" (kopiur's default is Snapshot now).
+        let spec = source_spec(serde_json::json!({
+            "sourcePVC": "data",
+            "restic": { "repository": "restic-secret", "copyMethod": "Wat" }
+        }));
+        let t = translate_source("app", "media", &spec, &repo_ref()).unwrap();
+        let policy = &t.objects[0];
+        assert_eq!(policy["spec"]["copyMethod"], "Direct");
+        assert!(t.has_unmappable);
+        let note = t
+            .notes
+            .iter()
+            .find(|n| n.field == "spec.restic.copyMethod")
+            .expect("copyMethod note");
+        match &note.disposition {
+            Disposition::Unmappable { reason } => {
+                assert!(reason.contains("explicit"), "{reason}");
+                assert!(
+                    !reason.contains("defaulting to kopiur's Direct"),
+                    "message must not claim kopiur defaults to Direct: {reason}"
+                );
+            }
+            other => panic!("expected Unmappable, got {other:?}"),
+        }
     }
 
     #[test]

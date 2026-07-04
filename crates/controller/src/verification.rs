@@ -83,31 +83,38 @@ fn tier_after(last_verified: Option<DateTime<Utc>>) -> DateTime<Utc> {
 
 /// The next cron slot for a verification `CronSpec` strictly after `after`, seeded by
 /// the policy UID for a stable per-replica spread and evaluated in the cron's own
-/// `timezone` (absent ⇒ UTC).
-fn slot_for(seed: &str, spec: &CronSpec, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
+/// `timezone` (absent ⇒ the repository's `scheduleDefaults.timezone`, else UTC).
+fn slot_for(
+    seed: &str,
+    spec: &CronSpec,
+    after: DateTime<Utc>,
+    repo_tz: Option<&str>,
+) -> Result<DateTime<Utc>> {
     let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
-    let tz = kopiur_api::common::resolve_tz(spec.timezone.as_deref());
+    let tz = kopiur_api::common::resolve_tz_with_default(spec.timezone.as_deref(), repo_tz);
     next_fire(&spec.cron, jitter, seed, after, tz)
 }
 
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
-/// the policy's `verification`, the seed, the last-verified time, and `now`.
+/// the policy's `verification`, the seed, the last-verified time, `now`, and the
+/// repository's `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
 pub fn due_tier(
     verification: &Verification,
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
+    repo_tz: Option<&str>,
 ) -> Option<(VerifyTierKind, DateTime<Utc>)> {
     let after = tier_after(last_verified);
     if let Some(d) = &verification.deep
-        && let Ok(slot) = slot_for(seed, &d.schedule, after)
+        && let Ok(slot) = slot_for(seed, &d.schedule, after, repo_tz)
         && now >= slot
     {
         return Some((VerifyTierKind::Deep, slot));
     }
     if let Some(q) = &verification.quick
-        && let Ok(slot) = slot_for(seed, q, after)
+        && let Ok(slot) = slot_for(seed, q, after, repo_tz)
         && now >= slot
     {
         return Some((VerifyTierKind::Quick, slot));
@@ -122,6 +129,7 @@ pub fn next_verify_wakeup(
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
+    repo_tz: Option<&str>,
 ) -> Duration {
     let after = tier_after(last_verified);
     let mut earliest: Option<DateTime<Utc>> = None;
@@ -132,7 +140,7 @@ pub fn next_verify_wakeup(
     .into_iter()
     .flatten()
     {
-        if let Ok(slot) = slot_for(seed, spec, after) {
+        if let Ok(slot) = slot_for(seed, spec, after, repo_tz) {
             earliest = Some(earliest.map_or(slot, |e| e.min(slot)));
         }
     }
@@ -195,10 +203,16 @@ pub async fn verify_step(
         .and_then(|s| s.last_verified.as_deref())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
+    // GitHub #174 item 3: a per-cron `timezone` wins; else the repository's
+    // `scheduleDefaults.timezone`; else UTC.
+    let repo_tz = repo
+        .schedule_defaults
+        .as_ref()
+        .and_then(|d| d.timezone.as_deref());
 
-    let Some((tier, slot)) = due_tier(verification, &seed, last_verified, now) else {
+    let Some((tier, slot)) = due_tier(verification, &seed, last_verified, now, repo_tz) else {
         return Ok(Some(
-            next_verify_wakeup(verification, &seed, last_verified, now).min(REQUEUE_CAP),
+            next_verify_wakeup(verification, &seed, last_verified, now, repo_tz).min(REQUEUE_CAP),
         ));
     };
 
@@ -208,7 +222,7 @@ pub async fn verify_step(
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped lastVerified; sleep until the next slot.
             Some(true) => Ok(Some(
-                next_verify_wakeup(verification, &seed, Some(now), now).min(REQUEUE_CAP),
+                next_verify_wakeup(verification, &seed, Some(now), now, repo_tz).min(REQUEUE_CAP),
             )),
             Some(false) => Ok(Some(REQUEUE_FAILED)),
             None => Ok(Some(REQUEUE_RUNNING)),
@@ -579,14 +593,14 @@ mod tests {
     fn first_ever_reconcile_is_due_and_prefers_deep() {
         // No lastVerified → both due; deep wins (it subsumes quick).
         let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
-        let (tier, _slot) = due_tier(&v, "seed", None, Utc::now()).expect("due");
+        let (tier, _slot) = due_tier(&v, "seed", None, Utc::now(), None).expect("due");
         assert_eq!(tier, VerifyTierKind::Deep);
     }
 
     #[test]
     fn quick_only_is_due_when_no_deep() {
         let v = verification(Some("*/5 * * * *"), None);
-        let (tier, _) = due_tier(&v, "seed", None, Utc::now()).expect("due");
+        let (tier, _) = due_tier(&v, "seed", None, Utc::now(), None).expect("due");
         assert_eq!(tier, VerifyTierKind::Quick);
     }
 
@@ -596,7 +610,7 @@ mod tests {
         let just = now - chrono::Duration::seconds(1);
         let v = verification(Some("*/5 * * * *"), Some("0 3 * * 0"));
         assert!(
-            due_tier(&v, "seed", Some(just), now).is_none(),
+            due_tier(&v, "seed", Some(just), now, None).is_none(),
             "a tier that just ran must not be immediately due again"
         );
     }
@@ -604,7 +618,7 @@ mod tests {
     #[test]
     fn no_schedules_is_never_due() {
         let v = verification(None, None);
-        assert!(due_tier(&v, "seed", None, Utc::now()).is_none());
+        assert!(due_tier(&v, "seed", None, Utc::now(), None).is_none());
     }
 
     #[test]
@@ -613,7 +627,47 @@ mod tests {
         let just = now - chrono::Duration::seconds(1);
         // Daily deep, ran moments ago → next ~24h out, but capped to the heartbeat.
         let v = verification(None, Some("0 3 * * *"));
-        assert!(next_verify_wakeup(&v, "seed", Some(just), now) <= REQUEUE_CAP);
+        assert!(next_verify_wakeup(&v, "seed", Some(just), now, None) <= REQUEUE_CAP);
+    }
+
+    #[test]
+    fn due_tier_honors_repo_schedule_default_timezone() {
+        // A cron pinned to a specific wall-clock hour is due/not-due depending on
+        // which timezone it's evaluated in — proof the repo default actually
+        // reaches the scheduling decision, not just the CronSpec's own field.
+        let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let last_verified = Some(now - chrono::Duration::hours(2));
+        // 05:00 UTC has already passed; 05:00 America/Los_Angeles (UTC-7 in June)
+        // is still ~6.5h out. No own timezone on the CronSpec — must come from
+        // the repo default.
+        let v = verification(Some("0 5 * * *"), None);
+        assert!(
+            due_tier(&v, "seed", last_verified, now, None).is_some(),
+            "UTC (no repo default) → 05:00 UTC has already passed"
+        );
+        assert!(
+            due_tier(&v, "seed", last_verified, now, Some("America/Los_Angeles")).is_none(),
+            "repo scheduleDefaults.timezone must shift the evaluated slot"
+        );
+    }
+
+    #[test]
+    fn due_tier_own_timezone_wins_over_repo_default() {
+        let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let last_verified = Some(now - chrono::Duration::hours(2));
+        let mut v = verification(Some("0 5 * * *"), None);
+        v.quick.as_mut().unwrap().timezone = Some("UTC".into());
+        // Own timezone (UTC) says the slot is due; the repo default
+        // (America/Los_Angeles, which would push the slot hours into the future)
+        // must be ignored.
+        assert!(
+            due_tier(&v, "seed", last_verified, now, Some("America/Los_Angeles")).is_some(),
+            "the CronSpec's own timezone must win over the repo default"
+        );
     }
 
     #[test]
@@ -698,6 +752,7 @@ mod tests {
             repo_namespace: Some("ns".into()),
             mover_defaults: None,
             identity_defaults: None,
+            schedule_defaults: None,
             on_namespace_delete: Default::default(),
             credential_projection_allowed: false,
             owner_ref: Default::default(),

@@ -66,6 +66,10 @@ fn backup_config_json(name: &str, repo: &str, src_pvc: &str) -> serde_json::Valu
         "spec": {
             "repository": { "kind": "Repository", "name": repo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })
@@ -103,6 +107,10 @@ fn cluster_backup_config_json(name: &str, crepo: &str, src_pvc: &str) -> serde_j
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": crepo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })
@@ -471,6 +479,9 @@ async fn cross_namespace_backup_mints_mover_rbac_and_surfaces_missing_creds() {
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": "e2e-xns-crepo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     });
@@ -610,6 +621,9 @@ async fn privileged_mover_requires_namespace_optin() {
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": "e2e-priv-crepo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "securityContext": { "runAsUser": 0, "runAsGroup": 0 } }
         }
@@ -773,6 +787,9 @@ async fn mover_inherits_security_context_from_workload_pod() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-inherit-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
@@ -952,6 +969,9 @@ async fn root_workload_inherit_yields_valid_root_mover_not_a_wedge() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-root-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "inheritSecurityContextFrom": {
@@ -1106,6 +1126,10 @@ async fn wedged_mover_pod_fails_fast_instead_of_hanging() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-wedge-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight (before the mover
+            // Job is even created) rather than exercising the Unschedulable wedge.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": { "resources": { "requests": { "cpu": "10000" } } }
         }
@@ -1220,6 +1244,9 @@ async fn backup_mover_applies_explicit_security_and_pod_context() {
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-scctx-repo" },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 },
             "mover": {
                 "securityContext": { "runAsUser": 3000, "runAsGroup": 3000, "runAsNonRoot": true },
@@ -1344,6 +1371,231 @@ async fn schedule_creates_backup() {
     )
     .await
     .expect("schedule should create a Snapshot CR");
+}
+
+/// A `SnapshotSchedule` with no `spec.schedule.timezone` inherits its cron
+/// timezone from its target policy's repository `scheduleDefaults.timezone`
+/// (GitHub #174 item 3). The pinned `status.nextSchedule` is computed in the
+/// inherited zone and records it, so a large-offset, DST-free repo default
+/// (`Pacific/Kiritimati`, fixed UTC+14) demonstrably shifts the wall-clock slot
+/// away from a UTC interpretation.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn schedule_inherits_repository_timezone_default() {
+    use chrono::Timelike;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Repository whose scheduleDefaults set a large-offset, DST-free zone.
+    let mut repo = repository_json("e2e-tz-repo");
+    repo["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "Pacific/Kiritimati" });
+    let _ = repos.create(&PostParams::default(), &cr(repo)).await;
+    let _ = configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json("e2e-tz-cfg", "e2e-tz-repo", "e2e-src")),
+        )
+        .await;
+
+    // No spec.schedule.timezone → inherit the repo default. Daily 03:00, no
+    // runOnCreate and no jitter → the pin is a clean wall-clock slot.
+    let sched = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotSchedule",
+        "metadata": { "name": "e2e-tz-sched", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "policyRef": { "name": "e2e-tz-cfg" },
+            "schedule": { "cron": "0 3 * * *" }
+        }
+    });
+    schedules
+        .create(&PostParams::default(), &cr::<SnapshotSchedule>(sched))
+        .await
+        .expect("create SnapshotSchedule");
+
+    // The controller pins nextSchedule with the inherited zone recorded.
+    let pinned = wait_until(
+        "nextSchedule is pinned with a timezone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tz-sched").await?;
+            Ok(s.status
+                .and_then(|st| st.next_schedule)
+                .filter(|n| n.at.is_some()))
+        },
+    )
+    .await
+    .expect("schedule should pin nextSchedule");
+
+    // Primary assertion: the pin records the inherited repository timezone default.
+    assert_eq!(
+        pinned.timezone.as_deref(),
+        Some("Pacific/Kiritimati"),
+        "nextSchedule must record the inherited repository timezone default"
+    );
+
+    // Zone-consistency: 03:00 in a fixed UTC+14 zone is 13:00 the previous day UTC.
+    // Convert the pinned UTC instant back by the fixed +14 offset (Kiritimati has no
+    // DST) and assert the local wall clock is 03:00 — i.e. the slot was computed in
+    // Kiritimati, NOT UTC (a UTC interpretation would leave the instant at 03:00Z).
+    let at = pinned.at.as_deref().expect("pin carries an instant");
+    let utc = chrono::DateTime::parse_from_rfc3339(at)
+        .expect("pin is RFC3339")
+        .with_timezone(&chrono::Utc);
+    let local = utc + chrono::Duration::hours(14);
+    assert_eq!(
+        (local.hour(), local.minute()),
+        (3, 0),
+        "pinned slot must be 03:00 in Pacific/Kiritimati (got {utc} UTC → {local} local)"
+    );
+}
+
+/// A `policySelector` schedule with NO `spec.schedule.timezone` fans out to
+/// policies whose repositories DISAGREE on `scheduleDefaults.timezone` — pure
+/// logic in `kopiur_api::common::effective_timezone` (GitHub #174 item 3):
+/// resolution degrades to UTC and the schedule reports
+/// `TimezoneDefaultAmbiguous=True`. Then patching one repository so both agree —
+/// WITHOUT touching the SnapshotSchedule object — proves the Repository→schedules
+/// referent watch (`crates/controller/src/lib.rs`, `watch::repository_to_schedules`)
+/// fires promptly: the pinned `status.nextSchedule` recomputes into the
+/// now-agreed zone and the ambiguity condition clears.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn schedule_policy_selector_timezone_ambiguity_and_referent_watch() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Two repositories whose scheduleDefaults disagree.
+    let mut repo_a = repository_json("e2e-tzamb-repo-a");
+    repo_a["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "Pacific/Kiritimati" });
+    repos
+        .create(&PostParams::default(), &cr(repo_a))
+        .await
+        .expect("create repo a");
+    let mut repo_b = repository_json("e2e-tzamb-repo-b");
+    repo_b["spec"]["scheduleDefaults"] = serde_json::json!({ "timezone": "America/New_York" });
+    repos
+        .create(&PostParams::default(), &cr(repo_b))
+        .await
+        .expect("create repo b");
+
+    // Two policies, one per repo, sharing a label the schedule's policySelector targets.
+    let mut cfg_a = backup_config_json("e2e-tzamb-cfg-a", "e2e-tzamb-repo-a", "e2e-src");
+    cfg_a["metadata"]["labels"] = serde_json::json!({ "tzband": "amb" });
+    configs
+        .create(&PostParams::default(), &cr(cfg_a))
+        .await
+        .expect("create cfg a");
+    let mut cfg_b = backup_config_json("e2e-tzamb-cfg-b", "e2e-tzamb-repo-b", "e2e-src");
+    cfg_b["metadata"]["labels"] = serde_json::json!({ "tzband": "amb" });
+    configs
+        .create(&PostParams::default(), &cr(cfg_b))
+        .await
+        .expect("create cfg b");
+
+    // No spec.schedule.timezone → must inherit from the matched policies' repos.
+    let sched = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotSchedule",
+        "metadata": { "name": "e2e-tzamb-sched", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "policySelector": { "matchLabels": { "tzband": "amb" } },
+            "schedule": { "cron": "0 3 * * *" }
+        }
+    });
+    schedules
+        .create(&PostParams::default(), &cr::<SnapshotSchedule>(sched))
+        .await
+        .expect("create SnapshotSchedule");
+
+    // 1. Disagreement degrades resolution to UTC, pinned and recorded as such.
+    wait_until(
+        "nextSchedule pins UTC while the matched repos disagree",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tzamb-sched").await?;
+            let tz = s
+                .status
+                .and_then(|st| st.next_schedule)
+                .and_then(|n| n.timezone);
+            Ok((tz.as_deref() == Some("UTC")).then_some(()))
+        },
+    )
+    .await
+    .expect("schedule must pin UTC when matched repos' timezone defaults disagree");
+
+    // ...and the ambiguity condition is raised.
+    wait_condition(
+        &schedules,
+        "e2e-tzamb-sched",
+        "TimezoneDefaultAmbiguous",
+        "True",
+    )
+    .await
+    .expect("disagreeing repo defaults must raise TimezoneDefaultAmbiguous=True");
+
+    // 2. Patch repo_b to agree with repo_a — WITHOUT touching the schedule object.
+    let patch =
+        serde_json::json!({ "spec": { "scheduleDefaults": { "timezone": "Pacific/Kiritimati" } } });
+    repos
+        .patch(
+            "e2e-tzamb-repo-b",
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .expect("patch repo b to agree with repo a");
+
+    // The Repository→schedules referent watch must promptly re-reconcile the
+    // schedule and recompute its stale pinned slot into the now-agreed zone. No
+    // sleeps: `wait_until`'s poll budget already covers a slow kind node, and a
+    // working referent watch resolves this in seconds, not a full requeue cycle.
+    wait_until(
+        "nextSchedule recomputes into the now-agreed timezone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = schedules.get("e2e-tzamb-sched").await?;
+            let tz = s
+                .status
+                .and_then(|st| st.next_schedule)
+                .and_then(|n| n.timezone);
+            Ok((tz.as_deref() == Some("Pacific/Kiritimati")).then_some(()))
+        },
+    )
+    .await
+    .expect("referent watch must recompute the pinned slot once the repos agree");
+
+    // ...and the ambiguity condition clears.
+    wait_condition(
+        &schedules,
+        "e2e-tzamb-sched",
+        "TimezoneDefaultAmbiguous",
+        "False",
+    )
+    .await
+    .expect("agreement must clear TimezoneDefaultAmbiguous");
 }
 
 /// `policySelector` fan-out (ADR-0005 §10): one schedule firing creates exactly

@@ -84,10 +84,13 @@ spec:
   sources:
     - pvc:
         name: app-data # the PVC to back up
-  # Direct (the default, explicit here) reads the live volume — zero CSI
-  # requirements, fine for files that don't rewrite in place. Use `Snapshot`
-  # (CSI VolumeSnapshot) for databases and RWOP volumes, `Clone` where your
-  # driver clones faster than it snapshots. See the copy-methods guide.
+  # Direct (opt-in; pinned explicitly here since this walkthrough targets
+  # arbitrary storage with no assumed CSI snapshot support) reads the live
+  # volume — zero CSI requirements, fine for files that don't rewrite in
+  # place. `Snapshot` (CSI VolumeSnapshot) is the CRD default and is the
+  # right choice for databases and RWOP volumes once your CSI driver supports
+  # it; `Clone` where your driver clones faster than it snapshots. See the
+  # copy-methods guide.
   copyMethod: Direct
   # GFS retention is the ONLY thing that prunes successful backups. Each tier
   # answers a different recovery question:

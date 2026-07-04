@@ -90,6 +90,24 @@ pub enum Error {
     /// never crashes), but typed so the `rcgen` source chain stays inspectable.
     #[error("webhook TLS setup failed: could not mint or resolve the CA/serving certificate: {0}")]
     WebhookCert(#[from] crate::webhook_tls::CertError),
+
+    /// `KOPIUR_HTTP_ADDR` (see [`crate::config::http_addr`]) is set to a value
+    /// that does not parse as a socket address. Structural: this is an operator
+    /// misconfiguration, not a backend blip, and the controller must fail loudly
+    /// at startup rather than silently bind the default and mask the operator's
+    /// intent (most often an IPv6-only cluster that needed `[::]:8081`). The
+    /// underlying `AddrParseError` stays inspectable via `source()`.
+    #[error(
+        "KOPIUR_HTTP_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
+         0.0.0.0:8081 (IPv4), [::]:8081 (IPv6/dual-stack); unset it to use the default 0.0.0.0:8081"
+    )]
+    InvalidHttpAddr {
+        /// The raw (unparseable) value of `KOPIUR_HTTP_ADDR`.
+        value: String,
+        /// The underlying parse failure.
+        #[source]
+        source: std::net::AddrParseError,
+    },
 }
 
 /// How a reconcile error should be re-driven — the classification that picks the
@@ -155,7 +173,8 @@ impl Error {
             | Error::BlockedOnGrant(_)
             | Error::Serialization(_)
             | Error::InvalidSchedule(_)
-            | Error::Invariant(_) => ErrorClass::Structural,
+            | Error::Invariant(_)
+            | Error::InvalidHttpAddr { .. } => ErrorClass::Structural,
         }
     }
 }
@@ -291,6 +310,30 @@ mod tests {
         assert_eq!(
             Error::Invariant("no name".into()).class(),
             ErrorClass::Structural
+        );
+    }
+
+    #[test]
+    fn invalid_http_addr_is_structural_and_keeps_the_source_chain() {
+        // A typo'd KOPIUR_HTTP_ADDR is an operator misconfiguration, not a
+        // backend blip: Structural (long retry), not Transient — and it must
+        // never be silently swapped for the default (that would mask the
+        // operator's intent, e.g. an IPv6-only cluster needing `[::]:8081`).
+        let source = "not-an-addr".parse::<std::net::SocketAddr>().unwrap_err();
+        let err = Error::InvalidHttpAddr {
+            value: "not-an-addr".into(),
+            source,
+        };
+        assert_eq!(err.class(), ErrorClass::Structural);
+        let msg = err.to_string();
+        assert!(msg.contains("KOPIUR_HTTP_ADDR='not-an-addr'"));
+        assert!(msg.contains("not a valid socket address"));
+        assert!(msg.contains("0.0.0.0:8081"));
+        assert!(msg.contains("[::]:8081"));
+        assert!(msg.contains("unset it to use the default"));
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the AddrParseError source chain must stay inspectable"
         );
     }
 

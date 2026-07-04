@@ -108,8 +108,14 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
 
     let now = Utc::now();
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+    // GitHub #174 item 3: `spec.schedule.timezone` wins; else the source
+    // repository's `scheduleDefaults.timezone`; else UTC.
+    let repo_tz = repo
+        .schedule_defaults
+        .as_ref()
+        .and_then(|d| d.timezone.as_deref());
 
-    let Some(slot) = due_slot(repl, now) else {
+    let Some(slot) = due_slot(repl, now, repo_tz) else {
         // Mark Ready (idle, waiting for the next slot) and sleep.
         patch_ready_if_changed(
             &api,
@@ -121,14 +127,19 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             None,
         )
         .await?;
-        return Ok(Action::requeue(cap(next_wakeup(repl, now, None))));
+        return Ok(Action::requeue(cap(next_wakeup(repl, now, None, repo_tz))));
     };
 
     let job_name = replication_job_name(&name, slot);
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped status; sleep until the next slot.
-            Some(true) => Ok(Action::requeue(cap(next_wakeup(repl, now, Some(slot))))),
+            Some(true) => Ok(Action::requeue(cap(next_wakeup(
+                repl,
+                now,
+                Some(slot),
+                repo_tz,
+            )))),
             Some(false) => {
                 patch_ready_if_changed(
                     &api,
@@ -332,18 +343,28 @@ pub fn build_replication_work_spec(
 }
 
 /// The replication slot due now (cron + jitter strictly after the last run), or
-/// `None` if not yet due. Pure given the CR and `now`.
-pub fn due_slot(repl: &RepositoryReplication, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// `None` if not yet due. Pure given the CR, `now`, and the source repository's
+/// `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
+pub fn due_slot(
+    repl: &RepositoryReplication,
+    now: DateTime<Utc>,
+    repo_tz: Option<&str>,
+) -> Option<DateTime<Utc>> {
     let after = last_run_at(repl).unwrap_or_else(|| now - chrono::Duration::days(365));
-    match slot_for(repl, after) {
+    match slot_for(repl, after, repo_tz) {
         Ok(slot) if now >= slot => Some(slot),
         _ => None,
     }
 }
 
 /// The next cron slot for this replication strictly after `after` (croner + jitter,
-/// seeded by the CR UID).
-fn slot_for(repl: &RepositoryReplication, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
+/// seeded by the CR UID). `spec.schedule.timezone` wins; else the source
+/// repository's `scheduleDefaults.timezone`; else UTC.
+fn slot_for(
+    repl: &RepositoryReplication,
+    after: DateTime<Utc>,
+    repo_tz: Option<&str>,
+) -> Result<DateTime<Utc>> {
     let seed = repl.uid().unwrap_or_else(|| repl.name_any());
     let jitter = repl
         .spec
@@ -351,7 +372,10 @@ fn slot_for(repl: &RepositoryReplication, after: DateTime<Utc>) -> Result<DateTi
         .jitter
         .as_deref()
         .and_then(parse_go_duration);
-    let tz = kopiur_api::common::resolve_tz(repl.spec.schedule.timezone.as_deref());
+    let tz = kopiur_api::common::resolve_tz_with_default(
+        repl.spec.schedule.timezone.as_deref(),
+        repo_tz,
+    );
     next_fire(&repl.spec.schedule.cron, jitter, &seed, after, tz)
 }
 
@@ -371,9 +395,10 @@ fn next_wakeup(
     repl: &RepositoryReplication,
     now: DateTime<Utc>,
     handled: Option<DateTime<Utc>>,
+    repo_tz: Option<&str>,
 ) -> Duration {
     let after = handled.unwrap_or_else(|| last_run_at(repl).unwrap_or(now));
-    match slot_for(repl, after) {
+    match slot_for(repl, after, repo_tz) {
         Ok(slot) if slot > now => (slot - now)
             .to_std()
             .unwrap_or(REQUEUE_CAP)
@@ -532,6 +557,7 @@ mod tests {
             repo_namespace: Some("ns".into()),
             mover_defaults: None,
             identity_defaults: None,
+            schedule_defaults: None,
             on_namespace_delete: Default::default(),
             credential_projection_allowed: false,
             owner_ref: Default::default(),
@@ -542,7 +568,7 @@ mod tests {
     #[test]
     fn first_ever_reconcile_is_due() {
         let r = repl_with("0 5 * * *", None);
-        assert!(due_slot(&r, Utc::now()).is_some());
+        assert!(due_slot(&r, Utc::now(), None).is_some());
     }
 
     #[test]
@@ -555,7 +581,7 @@ mod tests {
         };
         let r = repl_with("0 5 * * *", Some(status));
         assert!(
-            due_slot(&r, now).is_none(),
+            due_slot(&r, now, None).is_none(),
             "a replication that just ran must not be immediately due again"
         );
     }
@@ -569,7 +595,30 @@ mod tests {
             ..Default::default()
         };
         let r = repl_with("0 5 * * *", Some(status));
-        assert!(cap(next_wakeup(&r, now, None)) <= REQUEUE_CAP);
+        assert!(cap(next_wakeup(&r, now, None, None)) <= REQUEUE_CAP);
+    }
+
+    #[test]
+    fn due_slot_honors_repo_schedule_default_timezone() {
+        // Mirrors the verification precedence test: no own timezone on the
+        // schedule, so the repo default must be what shifts the evaluated slot.
+        let now = DateTime::parse_from_rfc3339("2026-06-09T05:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let just = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let status = RepositoryReplicationStatus {
+            last_replicated: Some(just),
+            ..Default::default()
+        };
+        let r = repl_with("0 5 * * *", Some(status));
+        assert!(
+            due_slot(&r, now, None).is_some(),
+            "UTC (no repo default) → 05:00 UTC has already passed"
+        );
+        assert!(
+            due_slot(&r, now, Some("America/Los_Angeles")).is_none(),
+            "repo scheduleDefaults.timezone must shift the evaluated slot"
+        );
     }
 
     #[test]

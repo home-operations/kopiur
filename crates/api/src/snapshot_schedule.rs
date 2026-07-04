@@ -163,6 +163,14 @@ pub struct ScheduleRef {
     /// The `Snapshot` CR this slot produced, when one was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_ref: Option<SnapshotReference>,
+    /// The IANA timezone the cron was evaluated in when this slot was pinned
+    /// (`nextSchedule` only). Recorded so the controller can detect an
+    /// effective-timezone change — a `spec.schedule.timezone` edit or a change to
+    /// the target repository's `scheduleDefaults.timezone` — and invalidate the
+    /// pinned wall-clock slot, recomputing it in the new zone. Absent on legacy
+    /// pins written before this field existed (treated as "unchanged").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// A by-name reference to a `Snapshot` CR created by a schedule slot.
@@ -323,5 +331,33 @@ consecutiveFailures: 0
         let json = serde_json::to_value(&status).unwrap();
         let reparsed: SnapshotScheduleStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status, reparsed);
+    }
+
+    #[test]
+    fn next_schedule_timezone_round_trips() {
+        // The pinned-slot timezone (recorded so an effective-timezone change can
+        // invalidate the pin) parses from YAML and serializes back unchanged.
+        let status: SnapshotScheduleStatus = from_yaml(
+            r#"
+nextSchedule:
+  at: 2026-05-25T09:00:00Z
+  timezone: America/Chicago
+"#,
+        );
+        assert_eq!(
+            status.next_schedule.as_ref().unwrap().timezone.as_deref(),
+            Some("America/Chicago")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["nextSchedule"]["timezone"], "America/Chicago");
+        let reparsed: SnapshotScheduleStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Absent timezone (legacy pins) stays absent, not `null`.
+        let bare: SnapshotScheduleStatus =
+            from_yaml("nextSchedule: { at: 2026-05-25T09:00:00Z }\n");
+        assert!(bare.next_schedule.as_ref().unwrap().timezone.is_none());
+        let bare_json = serde_json::to_value(&bare).unwrap();
+        assert!(bare_json["nextSchedule"].get("timezone").is_none());
     }
 }

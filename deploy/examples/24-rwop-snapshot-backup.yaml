@@ -1,13 +1,14 @@
 # Example 24 — Back up a ReadWriteOncePod (RWOP) PVC with no downtime
 #
-# A ReadWriteOncePod PVC can be mounted by exactly ONE pod cluster-wide, so the
-# default copyMethod (Direct) cannot mount it while your app holds it — a held RWOP
-# volume fails fast with guidance instead of leaving a mover stuck Pending. The fix
-# is copyMethod: Snapshot: Kopiur snapshots the volume at the STORAGE layer (which
-# RWOP's mount exclusivity does not restrict), stages a temporary PVC from the
-# snapshot, and the mover reads that stage — never the live volume. The staged PVC
-# inherits RWOP, but the mover is its only pod, so the exclusivity is satisfied.
-# Your app keeps running, untouched. See docs/access-modes.md.
+# A ReadWriteOncePod PVC can be mounted by exactly ONE pod cluster-wide, so
+# copyMethod: Direct cannot mount it while your app holds it — a held RWOP volume
+# fails fast with guidance instead of leaving a mover stuck Pending. copyMethod:
+# Snapshot (the default; shown explicitly here for clarity) sidesteps the whole
+# problem: Kopiur snapshots the volume at the STORAGE layer (which RWOP's mount
+# exclusivity does not restrict), stages a temporary PVC from the snapshot, and the
+# mover reads that stage — never the live volume. The staged PVC inherits RWOP, but
+# the mover is its only pod, so the exclusivity is satisfied. Your app keeps
+# running, untouched. See docs/access-modes.md.
 #
 # REQUIRES the CSI snapshot stack (external-snapshotter + CRDs) and a
 # VolumeSnapshotClass for your driver — and since RWOP itself is CSI-only, a driver

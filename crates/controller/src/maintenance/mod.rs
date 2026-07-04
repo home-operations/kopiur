@@ -111,6 +111,13 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
 
     let repo_ref = &maint.spec.repository;
     let repo = io::resolve_repository_ref(&ctx.client, repo_ref, &namespace).await?;
+    // GitHub #174 item 3: the last of the three cascade levels (per-cron →
+    // schedule-level → repo scheduleDefaults.timezone → UTC), resolved in
+    // `slot_for`.
+    let repo_tz = repo
+        .schedule_defaults
+        .as_ref()
+        .and_then(|d| d.timezone.as_deref());
 
     // G7: an object-store repository must be bootstrapped (connected/created)
     // before `kopia maintenance` can reach it. Spawning earlier just produces a
@@ -169,8 +176,8 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     }
 
     // Nothing due → sleep until the earliest next slot (capped).
-    let Some((mode, slot)) = due_mode(maint, now) else {
-        return Ok(Action::requeue(cap(next_wakeup(maint, now, None))));
+    let Some((mode, slot)) = due_mode(maint, now, repo_tz) else {
+        return Ok(Action::requeue(cap(next_wakeup(maint, now, None, repo_tz))));
     };
 
     let job_name = maintenance_job_name(&name, mode, slot);
@@ -191,6 +198,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                     maint,
                     now,
                     Some((mode, slot)),
+                    repo_tz,
                 ))))
             }
             // Failed: surface the condition once (transition-guarded) and re-check.
@@ -681,10 +689,16 @@ fn maintenance_job_limits(maint: &Maintenance) -> JobLimits {
 }
 
 /// Choose the maintenance pass due now, preferring full (it subsumes quick).
-/// Returns the mode and its scheduled slot, or `None` if nothing is due.
-fn due_mode(maint: &Maintenance, now: DateTime<Utc>) -> Option<(MaintenanceMode, DateTime<Utc>)> {
+/// Returns the mode and its scheduled slot, or `None` if nothing is due. `repo_tz`
+/// is the target repository's `scheduleDefaults.timezone` (GitHub #174 item 3),
+/// the last of three cascade levels (see [`slot_for`]).
+fn due_mode(
+    maint: &Maintenance,
+    now: DateTime<Utc>,
+    repo_tz: Option<&str>,
+) -> Option<(MaintenanceMode, DateTime<Utc>)> {
     for mode in [MaintenanceMode::Full, MaintenanceMode::Quick] {
-        if let Ok(slot) = slot_for(maint, mode, mode_after(maint, mode))
+        if let Ok(slot) = slot_for(maint, mode, mode_after(maint, mode), repo_tz)
             && now >= slot
         {
             return Some((mode, slot));
@@ -708,11 +722,13 @@ fn mode_after(maint: &Maintenance, mode: MaintenanceMode) -> DateTime<Utc> {
 }
 
 /// The next cron slot for `mode` strictly after `after` (croner + jitter, seeded
-/// by the CR UID for a stable per-replica spread).
+/// by the CR UID for a stable per-replica spread). `repo_tz` is the target
+/// repository's `scheduleDefaults.timezone` (GitHub #174 item 3).
 fn slot_for(
     maint: &Maintenance,
     mode: MaintenanceMode,
     after: DateTime<Utc>,
+    repo_tz: Option<&str>,
 ) -> Result<DateTime<Utc>> {
     let seed = maint.uid().unwrap_or_else(|| maint.name_any());
     let spec = match mode {
@@ -720,12 +736,14 @@ fn slot_for(
         MaintenanceMode::Full => &maint.spec.schedule.full,
     };
     let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
-    // Per-cron `timezone` wins; else the schedule-level shared timezone; else UTC.
-    let tz = kopiur_api::common::resolve_tz(
-        spec.timezone
-            .as_deref()
-            .or(maint.spec.schedule.timezone.as_deref()),
-    );
+    // Three-level cascade: per-cron `timezone` wins; else the schedule-level
+    // shared timezone; else the target repository's `scheduleDefaults.timezone`;
+    // else UTC.
+    let own = spec
+        .timezone
+        .as_deref()
+        .or(maint.spec.schedule.timezone.as_deref());
+    let tz = kopiur_api::common::resolve_tz_with_default(own, repo_tz);
     next_fire(&spec.cron, jitter, &seed, after, tz)
 }
 
@@ -801,6 +819,7 @@ fn next_wakeup(
     maint: &Maintenance,
     now: DateTime<Utc>,
     handled: Option<(MaintenanceMode, DateTime<Utc>)>,
+    repo_tz: Option<&str>,
 ) -> Duration {
     let mut earliest: Option<DateTime<Utc>> = None;
     for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
@@ -808,7 +827,7 @@ fn next_wakeup(
             Some((hm, hs)) if hm == mode => hs,
             _ => mode_after(maint, mode),
         };
-        if let Ok(slot) = slot_for(maint, mode, after) {
+        if let Ok(slot) = slot_for(maint, mode, after, repo_tz) {
             earliest = Some(earliest.map_or(slot, |e| e.min(slot)));
         }
     }

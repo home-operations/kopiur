@@ -331,7 +331,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         bootstrap: None, mover_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
+/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -386,6 +386,13 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
         && let Some(fp) = &b.failure_policy
         && let Err(e) = validate_failure_policy(fp, "Repository spec.bootstrap")
     {
+        errs.push(e);
+    }
+    if let Err(e) = validate_timezone(
+        spec.schedule_defaults
+            .as_ref()
+            .and_then(|d| d.timezone.as_deref()),
+    ) {
         errs.push(e);
     }
     errs
@@ -681,6 +688,13 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         && let Some(fp) = &b.failure_policy
         && let Err(e) = validate_failure_policy(fp, "ClusterRepository spec.bootstrap")
     {
+        errs.push(e);
+    }
+    if let Err(e) = validate_timezone(
+        spec.schedule_defaults
+            .as_ref()
+            .and_then(|d| d.timezone.as_deref()),
+    ) {
         errs.push(e);
     }
     errs

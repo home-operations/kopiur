@@ -84,6 +84,11 @@ spec:
             - name: KOPIUR_STREAMING_LISTS
               value: "true"
             {{- end }}
+            # Address the HTTP server (/metrics, /healthz, /readyz) binds to.
+            # Override on an IPv6-only/dual-stack cluster (e.g. "[::]:8081");
+            # must agree on port with controller.probePort below.
+            - name: KOPIUR_HTTP_ADDR
+              value: {{ .Values.controller.listenAddr | quote }}
             {{- if eq (include "kopiur.webhook.selfManaged" .) "true" }}
             # Self-managed webhook TLS (webhook.tls.mode: self): the controller
             # mints the serving cert into this Secret and injects caBundle into

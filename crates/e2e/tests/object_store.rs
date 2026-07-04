@@ -65,6 +65,10 @@ fn backup_config_json(name: &str, repo: &str, src_pvc: &str) -> serde_json::Valu
         "spec": {
             "repository": { "kind": "Repository", "name": repo },
             "sources": [ { "pvc": { "name": src_pvc } } ],
+            // src_pvc is always a statically-provisioned (non-CSI) hostPath PVC in
+            // this suite; copyMethod now defaults to Snapshot, which would fail
+            // preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })

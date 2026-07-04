@@ -1,7 +1,8 @@
 # Example 21 — copyMethod: Snapshot (point-in-time CSI VolumeSnapshot)
 #
-# An OPT-IN method (the default is Direct) recommended for stateful apps when you have
-# the CSI snapshot stack. Kopiur takes a CSI VolumeSnapshot of the source PVC, restores
+# THE DEFAULT copyMethod (shown explicitly here for clarity) — recommended for
+# stateful apps whenever you have the CSI snapshot stack. Kopiur takes a CSI
+# VolumeSnapshot of the source PVC, restores
 # it into a temporary staged PVC, and runs the mover against that stage — never the live
 # volume. The backup is
 # point-in-time and fully decoupled from the node your app runs on; the staged

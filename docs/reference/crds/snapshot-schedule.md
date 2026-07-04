@@ -30,7 +30,15 @@ A deterministic offset (Go-style duration, e.g. `30m`) added to each firing, der
 
 #### `schedule.timezone`
 
-The IANA timezone the cron is evaluated in (e.g. `America/Los_Angeles`). Absent uses the controller's configured default.
+The IANA timezone the cron is evaluated in (e.g. `America/Los_Angeles`). When set,
+it wins outright. When **absent**, the schedule inherits its target policy's
+repository [`scheduleDefaults.timezone`](repository.md#scheduledefaults) (resolved
+at slot-computation time, following `policyRef` or each `policySelector` match),
+else UTC. The resolved zone is recorded in [`status.nextSchedule.timezone`](#status);
+a change to the repository default re-triggers the schedule (referent watch) and
+recomputes the pinned slot. A `policySelector` schedule whose matched policies'
+repositories disagree on the zone falls back to UTC and raises a
+`TimezoneDefaultAmbiguous` condition recommending an explicit `schedule.timezone`.
 
 #### `schedule.runOnCreate`
 
@@ -64,9 +72,9 @@ The maximum number of *failed* `Snapshot` CRs from this schedule to retain (defa
 | --- | --- |
 | `observedGeneration` | The `metadata.generation` this status reflects, for staleness detection. |
 | `lastSchedule` | The most recent firing (cron + jitter, pinned), and the `Snapshot` it produced. |
-| `nextSchedule` | The next firing slot the controller has computed. |
+| `nextSchedule` | The next firing slot the controller has computed, plus the `timezone` it was computed in (so an effective-timezone change can invalidate and recompute the pinned slot). |
 | `lastSuccessfulSchedule` | The most recent firing whose `Snapshot` succeeded. |
 | `consecutiveFailures` | Count of back-to-back failed runs; resets on success. Drives alerting. |
 | `conditions` | Standard Kubernetes conditions surfacing schedule health. |
 
-Each schedule slot is recorded as an `at` (the RFC3339 instant it fired or is scheduled to) plus an optional `snapshotRef` naming the `Snapshot` CR that slot produced.
+Each schedule slot is recorded as an `at` (the RFC3339 instant it fired or is scheduled to) plus an optional `snapshotRef` naming the `Snapshot` CR that slot produced. `nextSchedule` additionally records the `timezone` the slot was computed in; if the schedule's effective timezone later changes (a `schedule.timezone` edit or an inherited repository `scheduleDefaults.timezone` change), the controller detects the mismatch and recomputes the pinned slot in the new zone.

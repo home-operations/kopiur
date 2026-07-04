@@ -8,10 +8,11 @@ use crate::consts::{
     APPLY_GRANT_ACTION, BLOCKED_ON_GRANT_REASON, BOOTSTRAP_JOB_FAILED_REASON,
     CHECK_API_SERVER_ACTION, CHECK_BACKEND_ACTION, CHECK_CREDENTIALS_ACTION,
     CHECK_PERMISSIONS_ACTION, CHECK_REFERENCES_ACTION, CHECK_WEBHOOK_CONFIGURATION_ACTION,
-    ENABLE_CREATE_ACTION, FIX_SCHEDULE_ACTION, FIX_SPEC_ACTION, INVALID_SCHEDULE_REASON,
-    INVALID_SPEC_REASON, INVARIANT_VIOLATED_REASON, KUBE_API_ERROR_REASON,
-    MISSING_CREDENTIALS_REASON, MISSING_DEPENDENCY_REASON, REPORT_ISSUE_ACTION,
-    REPOSITORY_NOT_INITIALIZED_REASON, SERIALIZATION_FAILED_REASON, WEBHOOK_SETUP_FAILED_REASON,
+    ENABLE_CREATE_ACTION, FIX_HTTP_ADDR_ACTION, FIX_SCHEDULE_ACTION, FIX_SPEC_ACTION,
+    INVALID_HTTP_ADDR_REASON, INVALID_SCHEDULE_REASON, INVALID_SPEC_REASON,
+    INVARIANT_VIOLATED_REASON, KUBE_API_ERROR_REASON, MISSING_CREDENTIALS_REASON,
+    MISSING_DEPENDENCY_REASON, REPORT_ISSUE_ACTION, REPOSITORY_NOT_INITIALIZED_REASON,
+    SERIALIZATION_FAILED_REASON, WEBHOOK_SETUP_FAILED_REASON,
 };
 use crate::context::Context;
 use crate::error::Error;
@@ -294,6 +295,17 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                 "{err}. Admission stays untrusted until TLS setup succeeds (it is retried); check \
                  the webhook configuration/namespace and the operator's RBAC on Secrets and \
                  webhook configurations."
+            ),
+        ),
+        // Unreachable in practice: `KOPIUR_HTTP_ADDR` is validated at process
+        // startup (before any reconciler runs), so this never reaches a
+        // reconcile's error_policy — but the exhaustive match still needs an
+        // arm to keep the type-safety property intact.
+        Error::InvalidHttpAddr { .. } => (
+            INVALID_HTTP_ADDR_REASON,
+            FIX_HTTP_ADDR_ACTION,
+            format!(
+                "{err}. Fix the KOPIUR_HTTP_ADDR env var (or the chart's controller.listenAddr value) and restart the controller."
             ),
         ),
     };

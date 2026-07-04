@@ -54,6 +54,12 @@
           "title": "leaderElection",
           "type": "object"
         },
+        "listenAddr": {
+          "default": "0.0.0.0:8081",
+          "description": "Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;\nserves /metrics, /healthz, /readyz). Override on an IPv6-only/dual-stack\ncluster, where the kubelet cannot reach an IPv4-only bind (0.0.0.0) and\nprobes never succeed — set \"[::]:8081\" there. Must agree on port with\nprobePort below (the Service and probes target that port, not whatever\nthis address happens to contain).",
+          "title": "listenAddr",
+          "type": "string"
+        },
         "logLevel": {
           "default": "info",
           "description": "DEPRECATED: use the top-level `logging.level` instead. Kept as a fallback\nfor existing values files — `logging.level` wins when both are set. Applies to\nthe controller and webhook (RUST_LOG style: error|warn|info|debug|trace).",

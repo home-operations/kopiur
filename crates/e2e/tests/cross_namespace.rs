@@ -121,6 +121,9 @@ fn backup_config_json(ns: &str, name: &str, repo_kind: &str, repo_name: &str) ->
         "spec": {
             "repository": { "kind": repo_kind, "name": repo_name },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })

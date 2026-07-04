@@ -171,6 +171,9 @@ async fn ensure_seed_backup(client: &Client) {
             "spec": {
                 "repository": { "kind": "Repository", "name": SEED_REPO },
                 "sources": [ { "pvc": { "name": "e2e-src" } } ],
+                // e2e-src is a statically-provisioned (non-CSI) hostPath PVC;
+                // copyMethod now defaults to Snapshot, which would fail preflight.
+                "copyMethod": "Direct",
                 "retention": { "keepLatest": 5 }
             }
         });
@@ -1051,7 +1054,10 @@ async fn restore_missing_snapshot_fail_vs_continue() {
             "metadata": { "name": empty_cfg, "namespace": E2E_NAMESPACE },
             "spec": {
                 "repository": { "kind": "Repository", "name": SEED_REPO },
-                "sources": [ { "pvc": { "name": "e2e-src" } } ]
+                "sources": [ { "pvc": { "name": "e2e-src" } } ],
+                // e2e-src is a statically-provisioned (non-CSI) hostPath PVC;
+                // copyMethod now defaults to Snapshot, which would fail preflight.
+                "copyMethod": "Direct"
             }
         });
         let _ = configs.create(&PostParams::default(), &cr(cfg)).await;

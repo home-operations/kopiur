@@ -86,6 +86,9 @@ fn policy_json() -> serde_json::Value {
         "spec": {
             "repository": { "kind": "Repository", "name": REPO },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "retention": { "keepLatest": 5 }
         }
     })
@@ -430,6 +433,9 @@ fn poisoned_policy_json() -> serde_json::Value {
         "spec": {
             "repository": { "kind": "Repository", "name": REPO },
             "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
             "extraArgs": ["--kopiur-e2e-bogus-flag"]
         }
     })
@@ -706,7 +712,10 @@ async fn cli_restore_from_policy_into_created_pvc() {
         "metadata": { "name": "e2e-cli-fs-pol", "namespace": E2E_NAMESPACE },
         "spec": {
             "repository": { "kind": "Repository", "name": "e2e-cli-fs" },
-            "sources": [ { "pvc": { "name": "e2e-src" } } ]
+            "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // now defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct"
         }
     });
     let repos: Api<kopiur_api::Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);

@@ -443,6 +443,135 @@ pub fn resolve_tz(name: Option<&str>) -> chrono_tz::Tz {
         .unwrap_or(chrono_tz::Tz::UTC)
 }
 
+/// Repo-level scheduling defaults, inherited at reconcile time by consumers that
+/// don't set their own equivalent field (ADR §2.2 principle 10: sub-object, not a
+/// leaf field, so future defaults — e.g. jitter — slot in without API breakage).
+///
+/// Consumed by `SnapshotPolicy` verification, `RepositoryReplication`,
+/// `Maintenance` scheduling, and `SnapshotSchedule` (the recurring-backup cron) —
+/// all of which resolve their repository in-reconciler via
+/// [`crate::common::RepositoryRef`]. The `SnapshotSchedule` consumer resolves its
+/// target policy's repository default at slot-computation time (see
+/// [`effective_timezone`]) and is re-triggered by a repository referent watch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleDefaults {
+    /// IANA timezone name applied to every consuming cron that doesn't set its own
+    /// `timezone` (e.g. `America/New_York`). Set once here instead of repeating it
+    /// on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and
+    /// `Maintenance.schedule` cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// Resolve a consuming cron's own optional IANA timezone against a repository-level
+/// default, falling back to UTC (mirrors [`resolve_tz`]): `own` wins when set, else
+/// `repo_default` (typically `Repository`/`ClusterRepository`
+/// `spec.scheduleDefaults.timezone`), else UTC. An unparseable name at whichever
+/// level is selected falls back to UTC defensively, same as `resolve_tz` — the
+/// admission webhook rejects bad names up front for both levels via
+/// `validate::validate_timezone`, so reconcile-time resolution should never see one.
+///
+/// ```
+/// use kopiur_api::common::resolve_tz_with_default;
+///
+/// // The schedule's own timezone wins, even over a repo default.
+/// assert_eq!(
+///     resolve_tz_with_default(Some("America/Chicago"), Some("UTC")),
+///     "America/Chicago".parse::<chrono_tz::Tz>().unwrap(),
+/// );
+/// // Absent own timezone falls through to the repo default.
+/// assert_eq!(
+///     resolve_tz_with_default(None, Some("America/New_York")),
+///     "America/New_York".parse::<chrono_tz::Tz>().unwrap(),
+/// );
+/// // Both absent → UTC.
+/// assert_eq!(resolve_tz_with_default(None, None), chrono_tz::Tz::UTC);
+/// ```
+pub fn resolve_tz_with_default(own: Option<&str>, repo_default: Option<&str>) -> chrono_tz::Tz {
+    resolve_tz(own.or(repo_default))
+}
+
+/// Matched `SnapshotSchedule` target policies disagreed on their repositories'
+/// `scheduleDefaults.timezone`, so [`effective_timezone`] could not pick one
+/// unambiguously and fell back to UTC. The controller surfaces this as a status
+/// condition recommending an explicit `spec.schedule.timezone`.
+///
+/// This case only arises for the `policySelector` fan-out form (a single
+/// `policyRef` has exactly one repository, so it can never disagree with itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimezoneAmbiguity {
+    /// The distinct candidate zones (IANA names, sorted) that disagreed, for the
+    /// human-readable condition message.
+    pub candidates: Vec<String>,
+}
+
+/// **Pure.** Decide the effective timezone a `SnapshotSchedule`'s cron is
+/// evaluated in, given the schedule's own `spec.schedule.timezone` (`own`) and the
+/// `scheduleDefaults.timezone` of each *matched* target policy's repository
+/// (`policy_repo_defaults`, one entry per matched policy; `None` = that repo sets
+/// no default). Mirrors [`resolve_tz`] fallback semantics (an unparseable name
+/// degrades to UTC — the webhook rejects bad names up front).
+///
+/// Rules (the reconciler does the GETs and passes the data in):
+/// - `own` set → that zone wins, no lookups, never ambiguous.
+/// - `own` unset, **no** matched policies → UTC, not ambiguous.
+/// - `own` unset, all matched policies resolve to **one** zone → that zone.
+/// - `own` unset, matched policies resolve to **differing** zones → UTC plus a
+///   [`TimezoneAmbiguity`] (recommend an explicit `spec.schedule.timezone`).
+///
+/// A single `policyRef` therefore never yields ambiguity (one repository). Repos
+/// with no default resolve to UTC, so mixing "a zone" with "no default" is a
+/// genuine disagreement and is reported.
+///
+/// ```
+/// use kopiur_api::common::effective_timezone;
+///
+/// // Own timezone wins outright.
+/// let (tz, amb) = effective_timezone(Some("America/Chicago"), &[]);
+/// assert_eq!(tz.name(), "America/Chicago");
+/// assert!(amb.is_none());
+///
+/// // Unset own, one agreeing default across matched policies.
+/// let defs = [Some("Europe/Berlin".to_string()), Some("Europe/Berlin".to_string())];
+/// let (tz, amb) = effective_timezone(None, &defs);
+/// assert_eq!(tz.name(), "Europe/Berlin");
+/// assert!(amb.is_none());
+///
+/// // Unset own, disagreeing defaults → UTC + ambiguity signal.
+/// let defs = [Some("Europe/Berlin".to_string()), None];
+/// let (tz, amb) = effective_timezone(None, &defs);
+/// assert_eq!(tz, chrono_tz::Tz::UTC);
+/// assert!(amb.is_some());
+/// ```
+pub fn effective_timezone(
+    own: Option<&str>,
+    policy_repo_defaults: &[Option<String>],
+) -> (chrono_tz::Tz, Option<TimezoneAmbiguity>) {
+    if own.is_some() {
+        return (resolve_tz(own), None);
+    }
+    // No matched policies → nothing to inherit from.
+    if policy_repo_defaults.is_empty() {
+        return (chrono_tz::Tz::UTC, None);
+    }
+    // Resolve each matched policy's repo default to a concrete zone, then reduce to
+    // the distinct set. A repo with no default resolves to UTC (via `resolve_tz`),
+    // so it can legitimately disagree with a repo that sets one.
+    let mut zones: Vec<chrono_tz::Tz> = policy_repo_defaults
+        .iter()
+        .map(|d| resolve_tz(d.as_deref()))
+        .collect();
+    zones.sort_by(|a, b| a.name().cmp(b.name()));
+    zones.dedup();
+    if zones.len() == 1 {
+        (zones[0], None)
+    } else {
+        let candidates = zones.iter().map(|z| z.name().to_string()).collect();
+        (chrono_tz::Tz::UTC, Some(TimezoneAmbiguity { candidates }))
+    }
+}
+
 impl RepositoryRef {
     /// True if this reference points at the given repository.
     ///
