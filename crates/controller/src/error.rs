@@ -48,6 +48,21 @@ pub enum Error {
     #[error("missing dependency: {0}")]
     MissingDependency(String),
 
+    /// Source staging (CSI VolumeSnapshot / clone) could not be produced yet — no snapshot
+    /// stack/class, source not CSI-provisioned, or a VolumeSnapshot errored past its grace
+    /// ([`crate::io::StagingOutcome::Failed`]). Staging is a pre-Job gate, so the reconciler
+    /// holds the Snapshot `Pending`, not terminal `Failed`; the Structural requeue re-enters
+    /// staging and recovers once the cluster is fixed. Distinct from [`Error::Validation`] so
+    /// its Event doesn't tell the user to fix a spec that isn't broken; carries the specific
+    /// kstatus `reason` so the published Event keeps the precise cause.
+    #[error("source staging failed: {message}")]
+    StagingFailed {
+        /// The stable kstatus condition reason (also the Event reason).
+        reason: &'static str,
+        /// The actionable what/why/fix message.
+        message: String,
+    },
+
     /// Blocked on a grant an admin applies out-of-band on ANOTHER object (e.g.
     /// the namespace `privileged-movers` opt-in annotation). The granting object
     /// is watched, so the grant re-enqueues the blocked CR the moment it lands —
@@ -170,6 +185,7 @@ impl Error {
                 }
             }
             Error::Validation(_)
+            | Error::StagingFailed { .. }
             | Error::BlockedOnGrant(_)
             | Error::Serialization(_)
             | Error::InvalidSchedule(_)

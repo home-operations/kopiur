@@ -92,10 +92,11 @@ pub enum StagingOutcome {
     /// The VolumeSnapshot is not `readyToUse` yet — requeue (transient). The message is
     /// for a `SourceStaged=False` / `Pending` condition.
     Waiting(String),
-    /// The stage cannot be produced (no snapshot stack / no class / VolumeSnapshot
-    /// errored / source not CSI-provisioned). The reconciler fails the Snapshot with this
-    /// `reason` + actionable `message` and re-drives on the structural cadence (so it
-    /// recovers once the cluster is fixed — e.g. a class is installed).
+    /// The stage cannot be produced yet (no snapshot stack / no class / VolumeSnapshot errored
+    /// past its grace / source not CSI-provisioned). Staging is a pre-Job gate, so the
+    /// reconciler holds the Snapshot `Pending` (with this `reason` + `message` on
+    /// `SourceStaged=False`) and re-drives on the structural cadence — recovering once the
+    /// cluster is fixed (a class is installed, or the VolumeSnapshot becomes `readyToUse`).
     Failed {
         /// kstatus condition reason (a stable PascalCase token).
         reason: &'static str,
@@ -113,6 +114,46 @@ pub const REASON_VS_FAILED: &str = "VolumeSnapshotFailed";
 /// Condition reason: the source PVC isn't CSI-provisioned (no StorageClass), so it
 /// can't be snapshotted/cloned.
 pub const REASON_SOURCE_NOT_CSI: &str = "SourceNotCSIProvisioned";
+
+/// How long a VolumeSnapshot's `status.error` must persist before it counts as a terminal
+/// staging failure. external-snapshotter's `status.error` is racy: it is set on any failed
+/// CSI attempt (e.g. a benign `409 Conflict` from the protection-finalizer add) and cleared
+/// once a later attempt succeeds, so one reconcile can see `readyToUse: false` + an `error` on
+/// a snapshot that goes `readyToUse: true` moments later. Permanent misconfigurations (missing
+/// stack/class, non-CSI source) are caught by preflight before the VolumeSnapshot is created,
+/// so this only guards the post-creation error path.
+const VOLUME_SNAPSHOT_ERROR_GRACE_SECS: i64 = 120;
+
+/// The staging verdict for an observed VolumeSnapshot, from whether it is `readyToUse`, whether
+/// `status.error` is populated, and its `age_secs` (`None` when the creationTimestamp is
+/// absent). Pure + time-injected (unix seconds, matching [`super::mover::classify_wedged_pods`])
+/// so the grace unit-tests without a clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerdict {
+    /// `readyToUse: true` — stage from it.
+    Ready,
+    /// Not ready yet (no error, or an error still inside the grace) — requeue.
+    Waiting,
+    /// An error that has persisted past the grace — fail with actionable guidance.
+    Failed,
+}
+
+/// Classify an observed VolumeSnapshot (see [`SnapshotVerdict`]). A populated `status.error`
+/// is only terminal once the snapshot is at least [`VOLUME_SNAPSHOT_ERROR_GRACE_SECS`] old —
+/// a younger error is a transient external-snapshotter retry and stays a `Waiting`.
+pub fn classify_volume_snapshot(
+    ready: bool,
+    has_error: bool,
+    age_secs: Option<i64>,
+) -> SnapshotVerdict {
+    if ready {
+        SnapshotVerdict::Ready
+    } else if has_error && age_secs.is_some_and(|a| a >= VOLUME_SNAPSHOT_ERROR_GRACE_SECS) {
+        SnapshotVerdict::Failed
+    } else {
+        SnapshotVerdict::Waiting
+    }
+}
 
 /// Appended to every `StagingOutcome::Failed` message whose fix is "set copyMethod:
 /// Direct" — since `copyMethod` now *defaults* to `Snapshot` (as of this release), a user
@@ -498,12 +539,25 @@ pub async fn source_provisioner(
     Ok(api.get_opt(&class).await?.map(|sc| sc.provisioner))
 }
 
-/// Read a VolumeSnapshot's readiness: `(ready_to_use, restore_size, error_message)`.
+/// A VolumeSnapshot's readiness as far as staging cares.
+struct VsStatus {
+    /// `status.readyToUse`.
+    ready: bool,
+    /// `status.restoreSize` (string or integer bytes), if reported.
+    restore_size: Option<String>,
+    /// `status.error.message`, if the last CSI attempt errored (racy — see
+    /// [`VOLUME_SNAPSHOT_ERROR_GRACE_SECS`]).
+    error: Option<String>,
+    /// `metadata.creationTimestamp` in unix seconds; age is derived at the call site.
+    created_unix: Option<i64>,
+}
+
+/// Read a VolumeSnapshot's readiness. `None` when the object isn't observed yet.
 async fn read_volume_snapshot(
     client: &kube::Client,
     ns: &str,
     name: &str,
-) -> Result<Option<(bool, Option<String>, Option<String>)>> {
+) -> Result<Option<VsStatus>> {
     let api = volume_snapshot_api(client, ns);
     let Some(vs) = api.get_opt(name).await? else {
         return Ok(None);
@@ -523,7 +577,17 @@ async fn read_volume_snapshot(
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
-    Ok(Some((ready, restore_size, error)))
+    let created_unix = vs
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| t.0.as_second());
+    Ok(Some(VsStatus {
+        ready,
+        restore_size,
+        error,
+        created_unix,
+    }))
 }
 
 /// Resolve staging for a backup. Performs the cluster IO (preflight, create
@@ -617,18 +681,37 @@ pub async fn resolve_staging(
         apply(&volume_snapshot_api(client, ns), &vs_name, &vs).await?;
 
         let restore_size = match read_volume_snapshot(client, ns, &vs_name).await? {
-            Some((true, restore_size, _)) => restore_size,
-            Some((false, _, Some(err))) => {
-                return Ok(StagingOutcome::Failed {
-                    reason: REASON_VS_FAILED,
-                    message: format!(
-                        "VolumeSnapshot `{ns}/{vs_name}` failed: {err}; check the \
-                         VolumeSnapshotClass `{class}` / CSI driver, then re-create the Snapshot"
-                    ),
-                });
+            // Observed → classify (a fresh `status.error` is transient; see the grace const).
+            Some(vs) => {
+                let age_secs = vs.created_unix.map(|c| chrono::Utc::now().timestamp() - c);
+                match classify_volume_snapshot(vs.ready, vs.error.is_some(), age_secs) {
+                    SnapshotVerdict::Ready => vs.restore_size,
+                    SnapshotVerdict::Failed => {
+                        let err = vs.error.unwrap_or_default();
+                        return Ok(StagingOutcome::Failed {
+                            reason: REASON_VS_FAILED,
+                            message: format!(
+                                "VolumeSnapshot `{ns}/{vs_name}` failed: {err}; check the \
+                                 VolumeSnapshotClass `{class}` / CSI driver, then re-create the \
+                                 Snapshot"
+                            ),
+                        });
+                    }
+                    // Not ready yet. Surface any lingering error in the wait message, don't fail.
+                    SnapshotVerdict::Waiting => {
+                        let detail = match vs.error {
+                            Some(err) => format!(" (last transient error: {err})"),
+                            None => String::new(),
+                        };
+                        return Ok(StagingOutcome::Waiting(format!(
+                            "waiting for VolumeSnapshot `{ns}/{vs_name}` to become \
+                             readyToUse{detail}"
+                        )));
+                    }
+                }
             }
-            // Not ready yet (or status not populated) → requeue.
-            _ => {
+            // Not observed yet (freshly applied) → requeue.
+            None => {
                 return Ok(StagingOutcome::Waiting(format!(
                     "waiting for VolumeSnapshot `{ns}/{vs_name}` to become readyToUse"
                 )));
@@ -825,6 +908,60 @@ mod tests {
             decide_class(&two_defaults, driver, None),
             ClassDecision::Ambiguous { .. }
         ));
+    }
+
+    // --- classify_volume_snapshot: transient-error grace ---
+
+    #[test]
+    fn classify_ready_is_ready_regardless_of_error_or_age() {
+        assert_eq!(
+            classify_volume_snapshot(true, false, None),
+            SnapshotVerdict::Ready
+        );
+        // readyToUse wins even over a (now-stale) error.
+        assert_eq!(
+            classify_volume_snapshot(true, true, Some(3600)),
+            SnapshotVerdict::Ready
+        );
+    }
+
+    #[test]
+    fn classify_not_ready_without_error_waits() {
+        assert_eq!(
+            classify_volume_snapshot(false, false, Some(3600)),
+            SnapshotVerdict::Waiting
+        );
+    }
+
+    #[test]
+    fn classify_transient_error_inside_grace_waits() {
+        // A fresh error (the benign 409-conflict-and-retry case) is not yet terminal.
+        assert_eq!(
+            classify_volume_snapshot(false, true, Some(1)),
+            SnapshotVerdict::Waiting
+        );
+        // Clock skew (negative age) → still inside grace → wait.
+        assert_eq!(
+            classify_volume_snapshot(false, true, Some(-5)),
+            SnapshotVerdict::Waiting
+        );
+        // Missing creationTimestamp → cannot age it out → wait (never spuriously fail).
+        assert_eq!(
+            classify_volume_snapshot(false, true, None),
+            SnapshotVerdict::Waiting
+        );
+    }
+
+    #[test]
+    fn classify_persistent_error_past_grace_fails() {
+        assert_eq!(
+            classify_volume_snapshot(false, true, Some(VOLUME_SNAPSHOT_ERROR_GRACE_SECS)),
+            SnapshotVerdict::Failed
+        );
+        assert_eq!(
+            classify_volume_snapshot(false, true, Some(3600)),
+            SnapshotVerdict::Failed
+        );
     }
 
     // --- staged_child_name ---

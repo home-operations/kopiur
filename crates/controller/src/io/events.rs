@@ -8,8 +8,8 @@ use crate::consts::{
     APPLY_GRANT_ACTION, BLOCKED_ON_GRANT_REASON, BOOTSTRAP_JOB_FAILED_REASON,
     CHECK_API_SERVER_ACTION, CHECK_BACKEND_ACTION, CHECK_CREDENTIALS_ACTION,
     CHECK_PERMISSIONS_ACTION, CHECK_REFERENCES_ACTION, CHECK_WEBHOOK_CONFIGURATION_ACTION,
-    ENABLE_CREATE_ACTION, FIX_HTTP_ADDR_ACTION, FIX_SCHEDULE_ACTION, FIX_SPEC_ACTION,
-    INVALID_HTTP_ADDR_REASON, INVALID_SCHEDULE_REASON, INVALID_SPEC_REASON,
+    ENABLE_CREATE_ACTION, FIX_HTTP_ADDR_ACTION, FIX_SCHEDULE_ACTION, FIX_SNAPSHOT_STACK_ACTION,
+    FIX_SPEC_ACTION, INVALID_HTTP_ADDR_REASON, INVALID_SCHEDULE_REASON, INVALID_SPEC_REASON,
     INVARIANT_VIOLATED_REASON, KUBE_API_ERROR_REASON, MISSING_CREDENTIALS_REASON,
     MISSING_DEPENDENCY_REASON, REPORT_ISSUE_ACTION, REPOSITORY_NOT_INITIALIZED_REASON,
     SERIALIZATION_FAILED_REASON, WEBHOOK_SETUP_FAILED_REASON,
@@ -246,6 +246,14 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                 "{err}. The object will not reconcile until the spec is corrected — fix the \
                  field(s) named above and re-apply."
             ),
+        ),
+        // Staging failures carry their own kstatus reason and recover on their own once the
+        // cluster is fixed — so, unlike a spec error, the note must not tell the user to edit
+        // a spec that isn't broken (the message already gives the actual fix).
+        Error::StagingFailed { reason, message } => (
+            reason,
+            FIX_SNAPSHOT_STACK_ACTION,
+            format!("{message} The reconcile retries automatically; no spec change is needed."),
         ),
         Error::MissingDependency(_) => (
             MISSING_DEPENDENCY_REASON,

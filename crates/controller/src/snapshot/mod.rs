@@ -35,8 +35,8 @@ use kopiur_mover::workspec::{
 use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
-    CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
-    HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
+    CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, HOOKS_SUCCEEDED_CONDITION,
+    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
     PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
     SECURITY_CONTEXT_COMPATIBLE_REASON, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
     SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
@@ -1083,10 +1083,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Err(Error::MissingDependency(msg));
             }
             io::StagingOutcome::Failed { reason, message } => {
-                // Stack/class missing or the VolumeSnapshot errored: a clear, actionable
-                // Failed condition + Warning Event. Returned as a Validation error so the
-                // structural-cadence requeue re-checks and RECOVERS once the cluster is
-                // fixed (e.g. a VolumeSnapshotClass is installed) — no spec change needed.
+                // Staging is a pre-Job gate (no mover Job exists yet), so — like the
+                // repository-not-ready and missing-credentials gates above — hold the Snapshot
+                // `Pending`, not `Failed`. `Failed` would trip the one-shot `TerminalFailed`
+                // gate (`await_change`, never re-entering staging) and permanently lose a run
+                // the cluster usually self-heals moments later. `Pending` lets the requeue
+                // re-check staging and recover. Error::StagingFailed drives the requeue and its
+                // Warning Event, without the misleading "fix the spec" InvalidSpec.
                 let existing = backup
                     .status
                     .as_ref()
@@ -1101,30 +1104,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     backup.meta().generation,
                 );
                 let current = serde_json::to_value(&backup.status).ok();
-                let wrote = io::patch_status_if_changed(
+                io::patch_status_if_changed(
                     &api,
                     &name,
                     current.as_ref(),
-                    serde_json::json!({ "phase": "Failed", "conditions": conditions }),
+                    serde_json::json!({ "phase": "Pending", "conditions": conditions }),
                 )
                 .await?;
-                if wrote {
-                    let _ = ctx
-                        .recorder
-                        .publish(
-                            &Event {
-                                type_: EventType::Warning,
-                                reason: reason.to_string(),
-                                note: Some(message.clone()),
-                                action: FIX_SNAPSHOT_STACK_ACTION.into(),
-                                secondary: None,
-                            },
-                            &io::event_ref(backup),
-                        )
-                        .await;
-                    tracing::warn!(backup = %name, reason, "source staging failed: {message}");
-                }
-                return Err(Error::Validation(message));
+                return Err(Error::StagingFailed { reason, message });
             }
         };
 
