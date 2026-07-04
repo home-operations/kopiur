@@ -124,6 +124,16 @@ A `Restore` with **no** `target` is rejected by the webhook. Populator intent mu
 
 ///
 
+/// note | A populator `Restore` is reusable — recreate the PVC and it restores again
+
+A populator `Restore` is a **living source, not a one-shot**. `Completed` reports the *last* populate; it does **not** latch the `Restore` "consumed". Every PVC that claims it via `dataSourceRef` is populated as that PVC is provisioned — so if you delete the claiming PVC and apply a new one with the same `dataSourceRef`, Kopiur restores into the new PVC again. You don't touch the `Restore` at all: the PVC event re-enqueues it, and a populator's `Completed` phase is deliberately **not** terminal until a *bound* consumer exists, so a fresh, unbound claim drives a new populate.
+
+The catch is _which_ snapshot: it re-restores the one **pinned in `status.resolved` at the first resolution**, not whatever is newest — the same pin-once rule that governs every source on this page. To pick up a newer snapshot, delete and re-create the `Restore` so it re-resolves.
+
+Contrast a **direct** target (`pvc` / `pvcRef`): that restore _is_ one-shot. Once `Completed` it's terminal, and deleting then re-creating the target PVC does **not** re-restore — create a new `Restore` to restore again.
+
+///
+
 ## How to write — `options` and `policy`
 
 ```yaml
@@ -206,7 +216,7 @@ See [Permissions](permissions.md) for how to choose the UID/GID and when a privi
 
 The headline pattern: commit one bundle and apply it to **any** cluster. On a fresh cluster pointed at an existing repository, the PVC restores the latest snapshot before the app starts; on a brand-new repository, the PVC comes up empty and is backed up going forward. No "is this a new install or a recovery?" branching.
 
-The mechanism is a **passive `Restore`** (`source.fromPolicy`, `target.populator: {}`, `onMissingSnapshot: Continue`) consumed by a PVC's `dataSourceRef` as a volume populator. The full manifest is [example 05](examples.md#example-05--deploy-or-restore-gitops).
+The mechanism is a **passive `Restore`** (`source.fromPolicy`, `target.populator: {}`, `onMissingSnapshot: Continue`) consumed by a PVC's `dataSourceRef` as a volume populator. The full manifest is [example 05](examples.md#example-05--deploy-or-restore-gitops). The same `Restore` keeps serving claims for its whole life — tear the app's PVC down and stand it back up (a `kubectl delete` + re-apply, a namespace rebuild, a migration) and the new PVC is populated again from the pinned snapshot, no change to the `Restore` needed (see [the reusability note above](#populator--passive-populator-mode)).
 
 /// note | Kubernetes ≥ 1.24
 

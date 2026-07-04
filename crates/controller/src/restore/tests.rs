@@ -141,7 +141,10 @@ fn populator_completed_is_not_terminal_at_guard() {
     use RestorePhase::{Completed, Failed, Pending, Resolving, Restoring};
 
     // A populator `Completed` (mover done with the prime PVC, rebind still pending)
-    // must NOT be terminal at the guard, or the rebind never runs.
+    // must NOT be terminal at the guard, or the rebind never runs. This non-terminal
+    // `Completed` is also what makes a populator `Restore` REUSABLE: delete the claiming
+    // PVC and apply a fresh one with the same `dataSourceRef` and reconcile falls through
+    // here to populate the new (unbound) claim, rather than short-circuiting as "consumed".
     assert!(!phase_is_terminal_at_guard(Completed, AwaitingClaim));
     // A direct restore writes the target itself, so `Completed` IS terminal.
     assert!(phase_is_terminal_at_guard(Completed, DirectTarget));
