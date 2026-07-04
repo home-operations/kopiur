@@ -118,7 +118,7 @@ Short name `kopiasp`, plural `snapshotpolicies`. Print columns: `REPOSITORY`,
 | `retention` | [Retention](#retention) | — | GFS — the only successful-retention driver. |
 | `defaultDeletionPolicy` | enum(`Delete`\|`Retain`\|`Orphan`) | `Delete` (effective) | Default `deletionPolicy` for child `Snapshot`s. |
 | `compression` | {`compressor`?,`neverCompress`[]} | — | kopia compressor + per-glob opt-out. |
-| `files` | {`ignoreRules`[],`ignoreCacheDirs`,`ignoreIdenticalSnapshots`} | — | kopia files policy: ignore globs, honor `CACHEDIR.TAG`, skip identical re-snapshots. |
+| `files` | {`ignoreRules`[],`ignoreCacheDirs`,`ignoreIdenticalSnapshots`} | — | kopia files policy: ignore globs, honor `CACHEDIR.TAG`, skip identical re-snapshots. `ignoreRules` defaults to a 5-entry OS-artifact exclude set (`/lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot`) applied even when `files` is omitted entirely; an explicit list REPLACES the default (not merged), and `ignoreRules: []` opts fully out. See [Backups → ignoreRules default](backups.md#filesignorerules-default-os-artifact-excludes). |
 | `extraArgs` | []string | — | Escape hatch for kopia flags. |
 | `errorHandling` | {`ignoreFileErrors`,`ignoreDirErrors`,`ignoreUnknownTypes`} | all `false` | Let a snapshot complete-with-errors. §13(b) |
 | `upload` | {`maxParallelSnapshots`?,`maxParallelFileReads`?} | — | Upload parallelism. §13(f) |

@@ -1,8 +1,9 @@
 //! e2e: SnapshotPolicy "knob" surfaces that previously had no end-to-end guard —
-//! `errorHandling.ignoreFileErrors` (against a REAL unreadable file) and the
+//! `errorHandling.ignoreFileErrors` (against a REAL unreadable file), the
 //! `compression` / `upload` tuning (asserted at the controller→mover work-spec
 //! contract, the seam where a regression would silently drop them while the
-//! snapshot still succeeded).
+//! snapshot still succeeded), and the default `files.ignoreRules` OS-artifact
+//! exclude set (task PR4 — proven against a REAL `lost+found` dir end to end).
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
@@ -14,14 +15,14 @@ use common::{
     cr, ensure_repo, observed_snapshot_count, repository_json, snapshot_json, snapshot_policy_json,
     wait_for_job, wait_phase,
 };
-use kube::Api;
-use kube::api::PostParams;
+use kube::api::{DeleteParams, PostParams};
+use kube::{Api, Client};
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 
-use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
-use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts};
+use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
+use kopiur_e2e::{E2E_NAMESPACE, Need, World, builders, consts, wait};
 
 const SUBPATH: &str = "errh";
 const REPO: &str = "e2e-knobs-repo";
@@ -209,4 +210,205 @@ async fn compression_and_upload_knobs_reach_the_mover_contract() {
     wait_phase(&backups, "e2e-knobs", "Succeeded")
         .await
         .expect("the tuned backup should succeed (kopia accepted the policy flags)");
+}
+
+// --- task PR4: default `files.ignoreRules` OS-artifact excludes ---
+
+/// Seed the test's OWN dynamic source PVC (never the shared `e2e-src` — content
+/// written there would contaminate other shards' assertions, mirrors
+/// `hooks.rs`'s `ensure_hooks_world`) with a `lost+found/` dir (the default
+/// exclude the test proves) plus a `keep.txt` control file (proves the backup
+/// isn't just empty/failed).
+async fn ensure_ignore_rules_source(client: &Client, src_pvc: &str) {
+    use kopiur_e2e::apply::{Fixture, apply_all};
+    let fixtures: Vec<Fixture> = vec![builders::dynamic_pvc(E2E_NAMESPACE, src_pvc, "1Gi").into()];
+    apply_all(client, &fixtures).await.expect("source PVC");
+
+    let seeder = format!("{src_pvc}-seed");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if pods.get_opt(&seeder).await.ok().flatten().is_none() {
+        let pod = builders::one_shot_pod(
+            E2E_NAMESPACE,
+            &seeder,
+            &[
+                "sh",
+                "-c",
+                "mkdir -p /data/lost+found && echo leftover > /data/lost+found/leftover.txt \
+                 && echo keep > /data/keep.txt",
+            ],
+            &[(src_pvc, "/data")],
+        );
+        let _ = pods.create(&PostParams::default(), &pod).await;
+    }
+    wait::pod_succeeded(client, E2E_NAMESPACE, &seeder)
+        .await
+        .expect("ignore-rules source seeder pod should succeed");
+}
+
+/// Restore `snapshot` into a fresh PVC and assert, via a reader pod, that
+/// `keep.txt` (the control file) IS present and `lost+found` (the default
+/// exclude) is ABSENT — proving the default `files.ignoreRules` set actually
+/// excludes at the kopia layer, end to end.
+async fn assert_lost_and_found_excluded(client: &Client, snapshot: &str) {
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = format!("{snapshot}-verify");
+    let dst = format!("{snapshot}-dst");
+    let restore = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": REPO },
+            "source": { "snapshotRef": { "name": snapshot } },
+            "target": { "pvc": { "name": dst, "capacity": "1Gi" } }
+        }
+    });
+    let _ = restores.create(&PostParams::default(), &cr(restore)).await;
+    wait_phase(&restores, &name, "Completed")
+        .await
+        .expect("verification restore should complete");
+
+    let reader = format!("{snapshot}-reader");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if pods.get_opt(&reader).await.ok().flatten().is_none() {
+        let script = "test -f /restore/keep.txt && test ! -e /restore/lost+found";
+        let pod = builders::one_shot_pod(
+            E2E_NAMESPACE,
+            &reader,
+            &["sh", "-c", script],
+            &[(dst.as_str(), "/restore")],
+        );
+        let _ = pods.create(&PostParams::default(), &pod).await;
+    }
+    wait::pod_succeeded(client, E2E_NAMESPACE, &reader)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "keep.txt must survive the default backup AND lost+found must be excluded by \
+                 the default ignoreRules set: {e}"
+            )
+        });
+    let _ = restores.delete(&name, &DeleteParams::default()).await;
+    let _ = pods.delete(&reader, &DeleteParams::default()).await;
+}
+
+/// The load-bearing end-to-end proof for task PR4: a `SnapshotPolicy` with NO
+/// `files` block at all (the common case — most policies never set it) must
+/// still exclude the default OS-artifact set at the kopia layer. A negative
+/// control proves the fixture is real: WITHOUT the default (explicit
+/// `ignoreRules: []`, full opt-out) the same `lost+found` dir survives the
+/// round trip, so the positive case passing means the default actually did the
+/// excluding, not that the fixture never had anything to exclude.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn default_ignore_rules_exclude_lost_and_found_end_to_end() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_knobs_repo(&client).await;
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Positive case: absent `files:` — the default set must exclude lost+found.
+    let src_default = "e2e-ignorerules-src-default";
+    ensure_ignore_rules_source(&client, src_default).await;
+    let cfg_default = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-ignorerules-default-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({ "sources": [ { "pvc": { "name": src_default } } ] }),
+    );
+    let _ = configs
+        .create(&PostParams::default(), &cr(cfg_default))
+        .await;
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-ignorerules-default",
+                "e2e-ignorerules-default-cfg",
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+    wait_phase(&backups, "e2e-ignorerules-default", "Succeeded")
+        .await
+        .expect("default backup (no files: block) should succeed");
+    assert_lost_and_found_excluded(&client, "e2e-ignorerules-default").await;
+
+    // Negative control: explicit `ignoreRules: []` (full opt-out) — the same
+    // source's lost+found dir must NOT be excluded, proving the positive case
+    // above genuinely exercised the default rather than an inert fixture.
+    let src_optout = "e2e-ignorerules-src-optout";
+    ensure_ignore_rules_source(&client, src_optout).await;
+    let cfg_optout = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-ignorerules-optout-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({
+            "sources": [ { "pvc": { "name": src_optout } } ],
+            "files": { "ignoreRules": [] }
+        }),
+    );
+    let _ = configs
+        .create(&PostParams::default(), &cr(cfg_optout))
+        .await;
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-ignorerules-optout",
+                "e2e-ignorerules-optout-cfg",
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+    wait_phase(&backups, "e2e-ignorerules-optout", "Succeeded")
+        .await
+        .expect("opt-out backup (ignoreRules: []) should succeed");
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = "e2e-ignorerules-optout-verify";
+    let dst = "e2e-ignorerules-optout-dst";
+    let restore = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": REPO },
+            "source": { "snapshotRef": { "name": "e2e-ignorerules-optout" } },
+            "target": { "pvc": { "name": dst, "capacity": "1Gi" } }
+        }
+    });
+    let _ = restores.create(&PostParams::default(), &cr(restore)).await;
+    wait_phase(&restores, name, "Completed")
+        .await
+        .expect("opt-out verification restore should complete");
+    let reader = "e2e-ignorerules-optout-reader";
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if pods.get_opt(reader).await.ok().flatten().is_none() {
+        let pod = builders::one_shot_pod(
+            E2E_NAMESPACE,
+            reader,
+            &["sh", "-c", "test -e /restore/lost+found"],
+            &[(dst, "/restore")],
+        );
+        let _ = pods.create(&PostParams::default(), &pod).await;
+    }
+    wait::pod_succeeded(&client, E2E_NAMESPACE, reader)
+        .await
+        .expect(
+            "with ignoreRules: [] (opt-out), lost+found must SURVIVE the round trip — if this \
+             failed, the fixture no longer proves the positive case above meant anything",
+        );
 }

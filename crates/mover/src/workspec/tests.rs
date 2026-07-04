@@ -599,9 +599,11 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     assert_eq!(args.splitter, None);
 }
 
-#[test]
-fn policy_args_from_empty_policy_is_empty() {
-    let spec = kopiur_api::SnapshotPolicySpec {
+/// A `SnapshotPolicySpec` with every optional policy surface left `None`/empty
+/// except the one field the test overrides — shared by the two ignoreRules
+/// glue tests below (and easy to spot the ONE field each varies).
+fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
+    kopiur_api::SnapshotPolicySpec {
         repository: kopiur_api::common::RepositoryRef {
             kind: Default::default(),
             name: "r".into(),
@@ -625,8 +627,53 @@ fn policy_args_from_empty_policy_is_empty() {
         hooks: None,
         mover: None,
         credential_projection: None,
-    };
-    assert!(PolicyArgsSpec::from_policy(&spec).is_empty());
+    }
+}
+
+/// The load-bearing glue test (task PR4): the apiserver only server-side-defaults
+/// NESTED fields when the parent object is present, so a `SnapshotPolicy` that
+/// omits `files:` entirely NEVER gets `Files.ignoreRules`'s schema default
+/// applied — the controller glue (`PolicyArgsSpec::from_policy`'s `None` arm)
+/// must apply `kopiur_api::snapshot_policy::default_ignore_rules()` itself. This
+/// is the seam a regression would silently skip: `files: None` must still reach
+/// the mover with the 5-entry OS-artifact exclude set.
+#[test]
+fn policy_args_from_absent_files_block_gets_default_ignore_rules() {
+    let spec = empty_policy_spec();
+    assert!(spec.files.is_none());
+    let p = PolicyArgsSpec::from_policy(&spec);
+    assert_eq!(
+        p.ignore,
+        kopiur_api::snapshot_policy::default_ignore_rules()
+    );
+    // ignore_cache_dirs is untouched by the ignoreRules default — still None
+    // (absent `files:` leaves kopia's own default for that knob).
+    assert_eq!(p.ignore_cache_dirs, None);
+    assert!(
+        !p.is_empty(),
+        "a non-empty `ignore` means the mover DOES run `kopia policy set`"
+    );
+}
+
+/// The explicit opt-out (`files: { ignoreRules: [] }`) must NOT be overridden by
+/// the glue's default — only the wholly-absent `files: None` case falls back to
+/// `default_ignore_rules()`. A present-but-empty `Files` is honored verbatim.
+#[test]
+fn policy_args_from_explicit_opt_out_files_is_empty() {
+    use kopiur_api::snapshot_policy::Files;
+    let mut spec = empty_policy_spec();
+    spec.files = Some(Files {
+        ignore_rules: vec![],
+        ignore_cache_dirs: false,
+        ignore_identical_snapshots: false,
+    });
+    let p = PolicyArgsSpec::from_policy(&spec);
+    assert!(
+        p.ignore.is_empty(),
+        "explicit ignoreRules: [] must opt fully out, got {:?}",
+        p.ignore
+    );
+    assert!(p.is_empty());
 }
 
 // --- §13(e) throttle mapping ---

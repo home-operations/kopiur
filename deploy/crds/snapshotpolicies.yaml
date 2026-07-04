@@ -111,7 +111,21 @@ spec:
                     description: Skip taking a new snapshot when the source is identical to the previous one.
                     type: boolean
                   ignoreRules:
-                    description: Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`, `lost+found`).
+                    default:
+                    - /lost+found
+                    - System Volume Information
+                    - $RECYCLE.BIN
+                    - '@eaDir'
+                    - .snapshot
+                    description: |-
+                      Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`).
+                      Absent ⇒ [`default_ignore_rules`] (OS-artifact junk: `/lost+found`,
+                      `System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot`). An
+                      explicit list REPLACES the default wholesale (re-add any entries you
+                      still want); explicit `ignoreRules: []` opts fully out. NOT
+                      `skip_serializing_if` — an explicit empty list must round-trip as `[]`,
+                      not vanish back to "absent" (which would silently resurrect the
+                      default on the next parse).
                     items:
                       type: string
                     type: array
