@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.5.0](https://github.com/home-operations/kopiur/compare/0.4.13...0.5.0) (2026-07-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** gate verification on a verifiable snapshot; nest quick under schedule ([#191](https://github.com/home-operations/kopiur/issues/191))
+* **api:** copyMethod defaults to Snapshot; repo-level timezone defaults; KOPIUR_HTTP_ADDR ([#192](https://github.com/home-operations/kopiur/issues/192))
+* **observability:** store-backed metrics — series live and die with their CRs ([#190](https://github.com/home-operations/kopiur/issues/190))
+
+### Features
+
+* **api:** copyMethod defaults to Snapshot; repo-level timezone defaults; KOPIUR_HTTP_ADDR ([#192](https://github.com/home-operations/kopiur/issues/192)) ([e1291d0](https://github.com/home-operations/kopiur/commit/e1291d057ca8872763d8f4c811f956dd613d4754))
+* **api:** default files.ignoreRules to OS-artifact excludes (lost+found and friends) ([#193](https://github.com/home-operations/kopiur/issues/193)) ([0674b3b](https://github.com/home-operations/kopiur/commit/0674b3be797b5b7f45b1c09d6660f9ce6d809718))
+* **api:** gate verification on a verifiable snapshot; nest quick under schedule ([#191](https://github.com/home-operations/kopiur/issues/191)) ([9bdc9a7](https://github.com/home-operations/kopiur/commit/9bdc9a70722bf70a5c4335fb11731128a19bc941))
+* **deps:** update rust crate cel (0.13.0 → 0.14.0) ([#178](https://github.com/home-operations/kopiur/issues/178)) ([d98718c](https://github.com/home-operations/kopiur/commit/d98718c12d1c01827a99e367ca921f59a95daed5))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate anyhow (1.0.102 → 1.0.103) ([#170](https://github.com/home-operations/kopiur/issues/170)) ([41257b8](https://github.com/home-operations/kopiur/commit/41257b89ce1857421918076493932a7bd3aeb587))
+* **deps:** update rust crate rustls (0.23.40 → 0.23.41) ([#160](https://github.com/home-operations/kopiur/issues/160)) ([ebe8263](https://github.com/home-operations/kopiur/commit/ebe8263685cc30b6c020ed4110ec49bf90a6b36c))
+* **deps:** update rust crate time (0.3.49 → 0.3.51) ([#157](https://github.com/home-operations/kopiur/issues/157)) ([393b58d](https://github.com/home-operations/kopiur/commit/393b58d50afb1a7489c004f0fc257bea61a59831))
+* **observability:** store-backed metrics — series live and die with their CRs ([#190](https://github.com/home-operations/kopiur/issues/190)) ([576e457](https://github.com/home-operations/kopiur/commit/576e45773ed7e49673c0b26e49bff6029736ed78))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.4.13 manifest ([9c090a9](https://github.com/home-operations/kopiur/commit/9c090a996c227bee8dd108b7f99b57c6c3f9a933))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.21 → 0.11.24) ([#133](https://github.com/home-operations/kopiur/issues/133)) ([bacc9f8](https://github.com/home-operations/kopiur/commit/bacc9f856a60078f4caec62947e3068320a0c024))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.24 → 0.11.25) ([#173](https://github.com/home-operations/kopiur/issues/173)) ([183247e](https://github.com/home-operations/kopiur/commit/183247eb701d2a1c1cd6440548b309fc2e4a1125))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.25 → 0.11.26) ([#185](https://github.com/home-operations/kopiur/issues/185)) ([87c3bcb](https://github.com/home-operations/kopiur/commit/87c3bcb6cfd74de5e4300f83ff66e4905fdcada7))
+* **mise:** Update tool node (22.22.3 → v24.18.0) ([#158](https://github.com/home-operations/kopiur/issues/158)) ([d0e0398](https://github.com/home-operations/kopiur/commit/d0e0398be49f1ec6f46ddc70fc56fad2c13aa9f9))
+* **mise:** Update tool oxfmt (0.55.0 → 0.56.0) ([#161](https://github.com/home-operations/kopiur/issues/161)) ([e0c93c3](https://github.com/home-operations/kopiur/commit/e0c93c3f81ab50f43eb4a0b69a1a6698b103eb50))
+* **mise:** Update tool oxfmt (0.56.0 → 0.57.0) ([#183](https://github.com/home-operations/kopiur/issues/183)) ([a1f0629](https://github.com/home-operations/kopiur/commit/a1f0629490d7b7d3f078ed5c78a85c69efaf4859))
+* **renovate:** drop the dead cargo postUpgradeTask ([#177](https://github.com/home-operations/kopiur/issues/177)) ([83eba29](https://github.com/home-operations/kopiur/commit/83eba2949019ace1ecda459e64591f7b4baaac8b))
+* **renovate:** inherit shared chart-docs postUpgradeTasks preset ([#179](https://github.com/home-operations/kopiur/issues/179)) ([2c614f9](https://github.com/home-operations/kopiur/commit/2c614f991d4ff3fc8bee6b1645eb6c64859ec8df))
+* test out regenerating cargo lock on update ([55daa93](https://github.com/home-operations/kopiur/commit/55daa9385316cb86fb987d351626a0e03b20f323))
+
 ## [0.4.13](https://github.com/home-operations/kopiur/compare/0.4.12...0.4.13) (2026-06-24)
 
 
