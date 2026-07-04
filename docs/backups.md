@@ -204,7 +204,7 @@ compression:
     compressor: zstd
     neverCompress: ["*.zip", "*.gz", "*.mp4"] # skip already-compressed files
 files:
-    ignoreRules: ["*.tmp", "*/cache/*", "lost+found"] # paths kopia skips
+    ignoreRules: ["*.tmp", "*/cache/*"] # paths kopia skips, REPLACING the default set (see below)
     ignoreCacheDirs: true # honor CACHEDIR.TAG
     ignoreIdenticalSnapshots: false # take a new snapshot even if nothing changed
 extraArgs: [] # escape hatch for kopia flags not modeled above
@@ -220,6 +220,75 @@ extraArgs: [] # escape hatch for kopia flags not modeled above
 | `extraArgs` | Pass-through kopia flags for anything not modeled above. |
 
 The object **splitter** is not here — it is a repository property fixed at creation and lives on [`Repository.create.splitter`](repositories.md#encryption-and-repository-creation), where it applies repository-wide.
+
+#### `files.ignoreRules` default: OS-artifact excludes
+
+`ignoreRules` defaults to a 5-entry OS-artifact exclude set, so a `SnapshotPolicy`
+that omits `files` entirely — or sets `files: {}` — never snapshots filesystem
+junk that is never intentional user data:
+
+```yaml
+ignoreRules:
+    - /lost+found # ext4/fsck recovery dir — anchored to the source ROOT only
+    - System Volume Information # Windows/SMB-client artifact on samba-share PVCs
+    - $RECYCLE.BIN # Windows/SMB-client artifact on samba-share PVCs
+    - "@eaDir" # Synology NAS extended-attribute/thumbnail metadata junk
+    - .snapshot # NAS-exposed snapshot pseudo-dirs (NetApp-style); UNANCHORED
+```
+
+Per-entry rationale:
+
+- **`/lost+found`** — root-anchored (leading `/`), so only the source root's
+  own ext4 fsck-recovery directory is excluded; a *nested* directory a user
+  happens to name `lost+found` deeper in the tree is left alone.
+- **`System Volume Information`**, **`$RECYCLE.BIN`** — Windows/SMB-client
+  artifacts that appear on samba-share-backed PVCs.
+- **`@eaDir`** — Synology NAS extended-attribute/thumbnail metadata junk.
+- **`.snapshot`** — NAS-exposed snapshot pseudo-directories (NetApp-style).
+  Deliberately **unanchored** (no leading `/`): these appear at *every* level
+  of a NetApp-backed export, not just the root, and backing one up recursively
+  would multiply the backup size by re-capturing older snapshot generations as
+  regular file data. The flip side of being unanchored: a *legitimate* directory
+  you happen to name `.snapshot`, at any depth, is also excluded — if you have
+  one, set `ignoreRules` explicitly (your list replaces the default wholesale).
+
+!!! warning "An explicit `ignoreRules` REPLACES the default — it does not merge"
+    Setting `files.ignoreRules` to any list, including a single-entry list,
+    **replaces** the default 5-entry set wholesale; it is not appended to it. If
+    you set `ignoreRules: ["*.tmp"]` you get `*.tmp` excluded and NOTHING else —
+    `/lost+found` and the rest of the default set are no longer excluded. Re-add
+    any default entries you still want alongside your own globs. Setting
+    `ignoreRules: []` explicitly opts out of ignoring anything at all (a full
+    snapshot of everything, including the OS junk above).
+
+!!! tip "Carrying `ignoreRules: [\"/lost+found\"]` in every SnapshotPolicy today?"
+    If your manifests (or a kustomize component applied to every app) paste in
+    `ignoreRules: ["/lost+found"]` by hand, you can delete that block — the
+    default now covers it, plus four more entries. Keeping it explicit pins you
+    to exactly that one-entry list (see the replace-semantics warning above), so
+    only keep it if you deliberately want `/lost+found` excluded and nothing
+    else from the default set.
+
+**Recommended extras** — desktop/editor junk that is deliberately **not**
+defaulted (copy this list into your own `ignoreRules` alongside anything else
+you need; remember it replaces, so include the default entries you want too):
+
+```yaml
+files:
+    ignoreRules:
+        # Kopiur's defaults:
+        - /lost+found
+        - System Volume Information
+        - $RECYCLE.BIN
+        - "@eaDir"
+        - .snapshot
+        # Desktop/editor junk — opt in per-workload, not defaulted:
+        - .DS_Store # macOS Finder metadata — harmless to drop, but not universal (server workloads never see it)
+        - "._*" # macOS AppleDouble sidecar files — CAN carry real xattrs/resource forks; dropping by default risks silent data loss for some workloads
+        - Thumbs.db # Windows Explorer thumbnail cache
+        - desktop.ini # Windows Explorer per-folder display settings
+        - .Trash-* # Linux desktop trash dirs — contents are recoverable deletions, but deliberately not auto-discarded by default
+```
 
 ### errorHandling — let a snapshot complete with errors
 

@@ -90,9 +90,19 @@ uncompressed (e.g. already-compressed media).
 ### `files`
 
 File-ignore policy. `ignoreRules` are filename/path globs to exclude from the
-snapshot (e.g. `*.tmp`, `*/cache/*`, `lost+found`); `ignoreCacheDirs` honors
-`CACHEDIR.TAG`; `ignoreIdenticalSnapshots` skips taking a new snapshot when the
-source is identical to the previous one.
+snapshot (e.g. `*.tmp`, `*/cache/*`); `ignoreCacheDirs` honors `CACHEDIR.TAG`;
+`ignoreIdenticalSnapshots` skips taking a new snapshot when the source is
+identical to the previous one.
+
+`ignoreRules` defaults to a 5-entry OS-artifact exclude set — `/lost+found`,
+`System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot` — applied even
+when `files` is omitted from the spec entirely (the apiserver only
+server-side-defaults *nested* fields when the parent object is present, so this
+default is additionally applied by the controller when resolving the mover work
+spec). An explicit `ignoreRules` list **replaces** the default wholesale rather
+than merging with it; `ignoreRules: []` opts fully out of ignoring anything. See
+[Backups → `files.ignoreRules` default](../../backups.md#filesignorerules-default-os-artifact-excludes)
+for the per-entry rationale and a copy-paste "recommended extras" block.
 
 ### `extraArgs`
 

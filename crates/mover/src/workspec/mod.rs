@@ -191,7 +191,14 @@ impl PolicyArgsSpec {
             // (Some(true)) — an unset/false leaves kopia's default rather than forcing
             // `--no-ignore-cache-dirs`, matching the "absent = kopia default" contract.
             Some(f) => (f.ignore_rules.clone(), f.ignore_cache_dirs.then_some(true)),
-            None => (Vec::new(), None),
+            // The apiserver only server-side-defaults NESTED fields when the parent
+            // object is present, so a `SnapshotPolicy` that omits `files:` entirely
+            // (the common case) never gets `Files.ignore_rules`'s schema default
+            // applied. Fall back to the SAME `default_ignore_rules()` fn the API
+            // layer wires as the serde/schemars default, so there is one source of
+            // truth for the OS-artifact exclude set regardless of which of the two
+            // "absent" shapes (`files:` missing vs. `files: {}`) the spec took.
+            None => (kopiur_api::snapshot_policy::default_ignore_rules(), None),
         };
         let eh = spec.error_handling.as_ref();
         let up = spec.upload.as_ref();

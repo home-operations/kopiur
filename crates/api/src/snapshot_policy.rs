@@ -174,6 +174,41 @@ fn default_copy_method() -> CopyMethod {
     CopyMethod::Snapshot
 }
 
+/// The default OS-artifact exclude set for `Files.ignore_rules` — filesystem/NAS
+/// junk that is never intentional user data, so excluding it by default is
+/// additive-safe. Per-entry rationale:
+///
+/// - `/lost+found` — root-anchored ext4/fsck recovery dir. Anchored (leading
+///   `/`) so a *nested* user directory named `lost+found` is left alone; only
+///   the source root's own fsck dir is excluded.
+/// - `System Volume Information`, `$RECYCLE.BIN` — Windows/SMB-client
+///   artifacts that show up on samba-share-backed PVCs.
+/// - `@eaDir` — Synology NAS extended-attribute/thumbnail metadata junk.
+/// - `.snapshot` — NAS-exposed snapshot pseudo-directories (NetApp-style).
+///   Deliberately **unanchored** (no leading `/`): these appear at *every*
+///   level of a NetApp-backed export, not just the root, and backing one up
+///   recursively would multiply the backup size by re-capturing older
+///   snapshot generations as regular file data. Flip side: a legitimate
+///   directory named `.snapshot` at any depth is also excluded — set
+///   `ignoreRules` explicitly if you have one (your list replaces the default).
+///
+/// A named fn so it backs BOTH `#[serde(default = ...)]` (the common case: an
+/// absent `files:` block, handled by the controller glue in
+/// `kopiur_mover::workspec` since the apiserver only server-side-defaults
+/// NESTED fields when the parent object is present) AND
+/// `#[schemars(default = ...)]` (so the default is visible in the generated
+/// CRD schema / `kubectl explain`, and applies when `files: {}` is present
+/// without `ignoreRules`). ONE source of truth for both layers.
+pub fn default_ignore_rules() -> Vec<String> {
+    vec![
+        "/lost+found".to_string(),
+        "System Volume Information".to_string(),
+        "$RECYCLE.BIN".to_string(),
+        "@eaDir".to_string(),
+        ".snapshot".to_string(),
+    ]
+}
+
 /// Volume snapshot copy method. Closed enum. ADR §3.3.
 ///
 /// ```
@@ -256,8 +291,16 @@ pub struct Compression {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Files {
-    /// Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`, `lost+found`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`).
+    /// Absent ⇒ [`default_ignore_rules`] (OS-artifact junk: `/lost+found`,
+    /// `System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot`). An
+    /// explicit list REPLACES the default wholesale (re-add any entries you
+    /// still want); explicit `ignoreRules: []` opts fully out. NOT
+    /// `skip_serializing_if` — an explicit empty list must round-trip as `[]`,
+    /// not vanish back to "absent" (which would silently resurrect the
+    /// default on the next parse).
+    #[serde(default = "default_ignore_rules")]
+    #[schemars(default = "default_ignore_rules")]
     pub ignore_rules: Vec<String>,
     /// Honor `CACHEDIR.TAG`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -560,6 +603,124 @@ mod tests {
         // And it serializes (not skip-elided), so the materialized value round-trips.
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["copyMethod"], "Snapshot");
+    }
+
+    /// The 5-entry OS-artifact default set, in the fixed order `default_ignore_rules`
+    /// returns it — shared by every assertion below so the list itself has one
+    /// source of truth in the test file too.
+    fn expected_default_ignore_rules() -> Vec<String> {
+        vec![
+            "/lost+found".to_string(),
+            "System Volume Information".to_string(),
+            "$RECYCLE.BIN".to_string(),
+            "@eaDir".to_string(),
+            ".snapshot".to_string(),
+        ]
+    }
+
+    #[test]
+    fn files_ignore_rules_carries_static_openapi_default_in_crd() {
+        // `files.ignoreRules` must carry a real schema `default:` (the 5-entry
+        // OS-artifact set) so it appears in `kubectl explain`. Mirrors
+        // `copy_method_carries_static_openapi_default_in_crd`.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let default = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["files"]["properties"]["ignoreRules"]["default"];
+        let want: Vec<serde_json::Value> = expected_default_ignore_rules()
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        assert_eq!(
+            default,
+            &serde_json::Value::Array(want),
+            "files.ignoreRules must emit the 5-entry OS-artifact `default:` in the CRD schema; got {default:?}"
+        );
+    }
+
+    #[test]
+    fn ignore_rules_defaults_when_files_block_absent_entirely() {
+        // The load-bearing case: apiserver server-side-defaulting only fires for
+        // NESTED fields when the parent object is present, so a spec that omits
+        // `files:` altogether never gets `Files.ignoreRules`'s schema default
+        // applied by the apiserver. The *serde* default on `Files::ignore_rules`
+        // only helps once `files: {}` exists — it can't fire on a wholly-`None`
+        // `spec.files`. This asserts the glue tier's contract: the mover work-spec
+        // seam (`kopiur_mover::workspec::PolicyArgsSpec::from_policy`) is the layer
+        // that must apply `default_ignore_rules()` for THIS shape; see the mover
+        // crate's `workspec` tests for that half.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(
+            spec.files.is_none(),
+            "a spec omitting `files:` entirely must parse to `None`, not a defaulted `Files`"
+        );
+    }
+
+    #[test]
+    fn ignore_rules_defaults_when_files_block_present_but_empty() {
+        // `files: {}` (parent present, `ignoreRules` absent): the serde default
+        // DOES fire here, and this is also what the schemars `default:` covers for
+        // apiserver server-side-defaulting.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\nfiles: {}\n",
+        );
+        let files = spec.files.expect("files: {} must parse to Some(Files)");
+        assert_eq!(files.ignore_rules, expected_default_ignore_rules());
+    }
+
+    #[test]
+    fn ignore_rules_explicit_empty_list_opts_out_and_round_trips() {
+        // Regression test for the opt-out subtlety: an explicit `ignoreRules: []`
+        // must deserialize as present-empty (serde defaults only fire when the KEY
+        // is ABSENT, not when it's present-and-empty) and — critically — must
+        // round-trip back through serialize/deserialize as `[]`, not vanish to
+        // "absent" and silently resurrect the default. This is why `ignore_rules`
+        // does NOT carry `skip_serializing_if`.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\nfiles: { ignoreRules: [] }\n",
+        );
+        let files = spec
+            .files
+            .as_ref()
+            .expect("files: {...} must parse to Some(Files)");
+        assert!(
+            files.ignore_rules.is_empty(),
+            "explicit `ignoreRules: []` must opt fully out, got {:?}",
+            files.ignore_rules
+        );
+
+        // The round-trip: serialize back to JSON, the `ignoreRules` key must still
+        // be PRESENT (as `[]`), not omitted.
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(
+            json["files"]["ignoreRules"],
+            serde_json::json!([]),
+            "an explicit empty ignoreRules must serialize as `[]`, not be omitted \
+             (omission would deserialize back to the 5-entry default)"
+        );
+
+        // And re-parsing that JSON must still yield the empty, opted-out list —
+        // not the default reappearing.
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+        assert!(reparsed.files.expect("files").ignore_rules.is_empty());
+    }
+
+    #[test]
+    fn ignore_rules_explicit_custom_list_replaces_default_wholesale() {
+        // An explicit non-empty list REPLACES the default outright — it is not
+        // merged/appended. Re-adding a default entry you still want is on the
+        // user (documented in docs/backups.md).
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\nfiles: { ignoreRules: [\"*.tmp\", \"lost+found\"] }\n",
+        );
+        let files = spec.files.expect("files");
+        assert_eq!(
+            files.ignore_rules,
+            vec!["*.tmp".to_string(), "lost+found".to_string()]
+        );
     }
 
     #[test]
