@@ -40,7 +40,7 @@
       "id": 2,
       "type": "stat",
       "title": "Backups OK",
-      "description": "Snapshot CRs currently in the Succeeded phase.",
+      "description": "Backups (Snapshot runs) that completed successfully within the selected dashboard time range.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "fieldConfig": {
@@ -56,7 +56,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Snapshot\", phase=\"Succeeded\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "sum(increase(kopiur_snapshots_completed_total{result=\"succeeded\", namespace=~\"$namespace\"}[$__range])) or vector(0)",
           "refId": "A"
         }
       ]
@@ -65,7 +65,7 @@
       "id": 3,
       "type": "stat",
       "title": "Backups Failed",
-      "description": "Snapshot CRs currently in the Failed phase. Non-zero = backups are not completing.",
+      "description": "Backups (Snapshot runs) that failed within the selected dashboard time range.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "fieldConfig": {
@@ -87,7 +87,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Snapshot\", phase=\"Failed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "sum(increase(kopiur_snapshots_completed_total{result=\"failed\", namespace=~\"$namespace\"}[$__range])) or vector(0)",
           "refId": "A"
         }
       ]
@@ -120,7 +120,7 @@
       },
       "targets": [
         {
-          "expr": "max(time() - kopiur_snapshot_last_success_timestamp_seconds{namespace=~\"$namespace\"})",
+          "expr": "max(time() - kopiur_policy_last_backup_success_timestamp_seconds{namespace=~\"$namespace\"})",
           "refId": "A"
         }
       ]
@@ -145,7 +145,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=~\"Repository|ClusterRepository\", phase=\"Ready\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=~\"Repository|ClusterRepository\", phase=\"Ready\"}) or vector(0)",
           "refId": "A"
         }
       ]
@@ -176,7 +176,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=~\"Repository|ClusterRepository\", phase=~\"Degraded|Failed\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=~\"Repository|ClusterRepository\", phase=~\"Degraded|Failed\"}) or vector(0)",
           "refId": "A"
         }
       ]
@@ -232,7 +232,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Completed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Completed\", namespace=~\"$namespace\"}) or vector(0)",
           "refId": "A"
         }
       ]
@@ -263,7 +263,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Failed\", namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "count(kopiur_resource_phase{kind=\"Restore\", phase=\"Failed\", namespace=~\"$namespace\"}) or vector(0)",
           "refId": "A"
         }
       ]
@@ -402,7 +402,7 @@
       "options": { "showHeader": true },
       "targets": [
         {
-          "expr": "kopiur_resource_phase{kind=\"Snapshot\", namespace=~\"$namespace\"} == 1",
+          "expr": "kopiur_resource_phase{kind=\"Snapshot\", namespace=~\"$namespace\"}",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -433,7 +433,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
       "targets": [
         {
-          "expr": "sum by (kind, phase) (kopiur_resource_phase{namespace=~\"$namespace\"} == 1)",
+          "expr": "sum by (kind, phase) (kopiur_resource_phase{namespace=~\"$namespace\"})",
           "legendFormat": "{{kind}}/{{phase}}",
           "refId": "A"
         }
@@ -448,8 +448,8 @@
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 18 },
       "targets": [
         {
-          "expr": "time() - kopiur_snapshot_last_success_timestamp_seconds{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{name}}",
+          "expr": "time() - kopiur_policy_last_backup_success_timestamp_seconds{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{policy}}",
           "refId": "A"
         }
       ]
@@ -463,8 +463,8 @@
       "gridPos": { "h": 7, "w": 8, "x": 8, "y": 18 },
       "targets": [
         {
-          "expr": "kopiur_snapshot_size_bytes{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{name}}",
+          "expr": "kopiur_policy_last_backup_size_bytes{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{policy}}",
           "refId": "A"
         }
       ]
@@ -478,8 +478,8 @@
       "gridPos": { "h": 7, "w": 8, "x": 16, "y": 18 },
       "targets": [
         {
-          "expr": "kopiur_snapshot_duration_seconds{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{name}}",
+          "expr": "kopiur_policy_last_backup_duration_seconds{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{policy}}",
           "refId": "A"
         }
       ]
@@ -493,8 +493,8 @@
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
       "targets": [
         {
-          "expr": "kopiur_snapshot_files{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{name}}",
+          "expr": "kopiur_policy_last_backup_files{namespace=~\"$namespace\"}",
+          "legendFormat": "{{namespace}}/{{policy}}",
           "refId": "A"
         }
       ]
@@ -595,7 +595,7 @@
       "options": { "showHeader": true },
       "targets": [
         {
-          "expr": "kopiur_resource_phase{kind=\"Restore\", namespace=~\"$namespace\"} == 1",
+          "expr": "kopiur_resource_phase{kind=\"Restore\", namespace=~\"$namespace\"}",
           "format": "table",
           "instant": true,
           "refId": "A"

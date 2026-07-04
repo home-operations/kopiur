@@ -73,30 +73,22 @@ pub async fn reconcile(repo: Arc<Repository>, ctx: Arc<Context>) -> Result<Actio
     result
 }
 
-/// Mirror a Repository's phase + catalog gauges. Zeroes the phase on deletion
-/// (so Degraded/Failed alerts clear) and re-reads the freshest status on success
-/// (the passed object is the pre-reconcile cache copy). See the Snapshot
-/// equivalent for the rationale.
+/// Mirror a Repository's catalog gauges. The lifecycle *phase* is no longer written
+/// here: `kopiur_resource_phase` is a store-backed observable gauge (see
+/// [`crate::metrics::Metrics::register_resource_observers`]), so a deleted
+/// Repository's series drops on its own. The freshest status is re-read on success
+/// (the passed object is the pre-reconcile cache copy).
 async fn record_repository_status_metrics(repo: &Repository, ctx: &Context, ok: bool) {
     let (Some(ns), name) = (repo.namespace(), repo.name_any()) else {
         return;
     };
-    if repo.metadata.deletion_timestamp.is_some() {
-        ctx.metrics
-            .clear_phase::<RepositoryPhase>("Repository", &ns, &name);
-        return;
-    }
-    if !ok {
+    if repo.metadata.deletion_timestamp.is_some() || !ok {
         return;
     }
     let api: Api<Repository> = Api::namespaced(ctx.client.clone(), &ns);
     if let Ok(Some(latest)) = api.get_opt(&name).await
         && let Some(status) = latest.status.as_ref()
     {
-        if let Some(phase) = status.phase {
-            ctx.metrics
-                .set_repository_phase("Repository", &ns, &name, phase);
-        }
         let snapshots = status.storage_stats.as_ref().and_then(|s| s.snapshot_count);
         let discovered = status
             .catalog

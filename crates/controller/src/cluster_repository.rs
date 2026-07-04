@@ -86,31 +86,24 @@ pub async fn reconcile(repo: Arc<ClusterRepository>, ctx: Arc<Context>) -> Resul
     result
 }
 
-/// Mirror a ClusterRepository's phase + catalog gauges (cluster-scoped, so the
-/// `namespace` label is empty). Zeroes the phase on deletion and re-reads the
-/// freshest status on success — see the Snapshot equivalent for the rationale.
+/// Mirror a ClusterRepository's catalog gauges (cluster-scoped, so the `namespace`
+/// label is empty). The lifecycle *phase* is no longer written here: it is a
+/// store-backed observable gauge (see
+/// [`crate::metrics::Metrics::register_resource_observers`]), so a deleted
+/// ClusterRepository's series drops on its own. Freshest status is re-read on success.
 async fn record_cluster_repository_status_metrics(
     repo: &ClusterRepository,
     ctx: &Context,
     ok: bool,
 ) {
     let name = repo.name_any();
-    if repo.metadata.deletion_timestamp.is_some() {
-        ctx.metrics
-            .clear_phase::<RepositoryPhase>("ClusterRepository", "", &name);
-        return;
-    }
-    if !ok {
+    if repo.metadata.deletion_timestamp.is_some() || !ok {
         return;
     }
     let api: Api<ClusterRepository> = Api::all(ctx.client.clone());
     if let Ok(Some(latest)) = api.get_opt(&name).await
         && let Some(status) = latest.status.as_ref()
     {
-        if let Some(phase) = status.phase {
-            ctx.metrics
-                .set_repository_phase("ClusterRepository", "", &name, phase);
-        }
         let snapshots = status.storage_stats.as_ref().and_then(|s| s.snapshot_count);
         let discovered = status
             .catalog
