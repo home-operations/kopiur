@@ -8,6 +8,10 @@ on:
       - main
     paths-ignore:
       - "**.md"
+      # The release workflow's krew step pushes plugins/kopiur.yaml to main with
+      # the bot app token, which (unlike GITHUB_TOKEN) retriggers workflows —
+      # ignore it so a release doesn't re-run this workflow for a manifest bump.
+      - "plugins/**"
   pull_request:
     branches:
       - main

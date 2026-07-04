@@ -1,4 +1,4 @@
-//! kubectl-kopiur binary: a thin entrypoint that delegates to
+//! The `kopiur` plugin binary: a thin entrypoint that delegates to
 //! [`kopiur_cli::run`]. All logic lives in the library so it is testable.
 
 use clap::Parser;

@@ -1,0 +1,73 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: GoReleaser Check
+
+# release.yaml's plugin/goreleaser jobs only run on published releases; this
+# exercises the same matrix + a Pro snapshot render on the PRs that can break
+# them (dep graph, config, toolchain pins). Snapshots run keyless, so fork
+# PRs get full coverage.
+on:
+  pull_request:
+    paths:
+      - .goreleaser.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - .mise/config.toml
+      - .mise/mise.lock
+      - .github/workflows/goreleaser-check.yaml
+      - .github/workflows/plugin-binaries.yaml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binaries:
+    name: Binaries
+    permissions:
+      contents: read
+    uses: ./.github/workflows/plugin-binaries.yaml
+
+  snapshot:
+    name: Snapshot
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # goreleaser derives the snapshot version from tags
+          persist-credentials: false
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Download plugin binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: kopiur-*
+          path: prebuilt
+
+      # Workflow artifacts drop file modes.
+      - name: Restore executable bits
+        run: chmod +x prebuilt/kopiur-*/kopiur
+
+      - name: Run GoReleaser (snapshot)
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser-pro # the prebuilt builder is a Pro feature
+          version: "~> v2"
+          args: release --clean --snapshot --skip=publish,sign
+        env:
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+
+      - name: Inspect rendered artifacts
+        run: |
+          echo "== cask =="
+          cat dist/homebrew/Casks/kopiur.rb
+          echo "== krew manifest =="
+          cat dist/krew/kopiur.yaml
+          echo "== archives =="
+          ls -lh dist/*.tar.gz

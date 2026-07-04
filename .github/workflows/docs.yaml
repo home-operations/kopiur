@@ -6,6 +6,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      # The release workflow's krew step pushes plugins/kopiur.yaml to main with
+      # the bot app token, which (unlike GITHUB_TOKEN) retriggers workflows —
+      # the docs site doesn't render plugins/, so skip the rebuild.
+      - "plugins/**"
   pull_request:
     branches:
       - main

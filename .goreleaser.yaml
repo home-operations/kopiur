@@ -1,0 +1,107 @@
+---
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+version: 2
+project_name: kubectl-kopiur
+
+builds:
+  # Binaries come from the plugin-binaries.yaml native matrix; prebuilt (Pro)
+  # imports them so archives/checksums/SBOMs/signing/cask/krew work unchanged.
+  # `binary` must equal the crates/cli [[bin]] name: brew links the file as
+  # the standalone `kopiur`, krew symlinks `kubectl-kopiur` to it — both
+  # installable without PATH collision. No Windows: kopiur-mover is unix-only.
+  - id: kubectl-kopiur
+    builder: prebuilt
+    binary: kopiur
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    prebuilt:
+      path: prebuilt/kopiur-{{ .Os }}_{{ .Arch }}/kopiur
+
+archives:
+  - id: kubectl-kopiur
+    ids:
+      - kubectl-kopiur
+
+# No upx: macOS kills upx-packed binaries, and shrinking only the Linux pair
+# isn't worth the AV-false-positive cost.
+
+checksum:
+  algorithm: sha256
+  split: true
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.sbom.json"
+
+signs:
+  - cmd: cosign
+    signature: ${artifact}.sigstore.json
+    args:
+      - sign-blob
+      - --bundle=${signature}
+      - --yes
+      - ${artifact}
+    artifacts: all
+    output: true
+
+homebrew_casks:
+  - name: kopiur
+    ids:
+      - kubectl-kopiur
+    # brew installs the standalone `kopiur` command (the file's shipped name —
+    # see the builds comment) while krew owns the `kubectl-kopiur` shim, so
+    # installing via both never collides on PATH.
+    # `brew install home-operations/tap/kopiur` mirrors
+    # `kubectl krew install kopiur/kopiur`.
+    binaries:
+      - kopiur
+    repository:
+      owner: home-operations
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://kopiur.home-operations.com/cli/
+    description: Kubectl plugin operating the kopiur Kopia-native backup operator
+    # Binaries aren't notarized — strip the quarantine bit so macOS doesn't
+    # block the first run with "developer cannot be verified".
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kopiur"] if OS.mac?
+
+# Krew manifest committed to this repo's plugins/ (its own custom index) with
+# the bot token — bot pushes retrigger workflows, so on-push workflows ignore
+# plugins/**. kubectl discovery comes from krew's own `kubectl-kopiur` symlink
+# to the manifest's bin, so the `kopiur` file name is invisible to plugin users.
+krews:
+  - name: kopiur
+    ids:
+      - kubectl-kopiur
+    repository:
+      owner: home-operations
+      name: kopiur
+      branch: main
+      token: "{{ .Env.KREW_INDEX_TOKEN }}"
+    commit_msg_template: "chore(krew): kopiur {{ .Version }} manifest"
+    homepage: https://kopiur.home-operations.com/cli/
+    short_description: Operate the kopiur backup operator
+    description: |
+      kubectl kopiur wraps day-to-day operations of the kopiur Kopia-native
+      backup operator: trigger snapshots and restores, suspend/resume resources,
+      inspect snapshots, run maintenance, browse files INSIDE snapshots through
+      a read-only in-cluster session, diagnose installs with `doctor`, and
+      translate VolSync restic configs with `migrate volsync`.
+    caveats: |
+      The plugin tracks the kopiur v1alpha1 CRDs — keep it on the same release
+      as the operator. Browsing needs the chart's opt-in browse ClusterRole
+      (rbac.browseRole) or equivalent RBAC.
+
+# release-please creates the GitHub Release with the changelog; goreleaser
+# attaches binaries/sboms/sigs to it.
+release:
+  mode: keep-existing

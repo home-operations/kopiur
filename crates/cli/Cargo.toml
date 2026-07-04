@@ -8,10 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# kubectl discovers plugins by binary name: `kubectl kopiur` resolves to a
-# `kubectl-kopiur` executable on PATH. The package keeps the kopiur-* naming.
+# The binary ships as plain `kopiur` so Homebrew's PATH link and krew's
+# install never collide: krew symlinks `kubectl-kopiur` (the name kubectl
+# discovers) to this file itself, and brew links it as the standalone `kopiur`
+# command. Manual installs get `kubectl kopiur` by naming their PATH
+# copy/symlink `kubectl-kopiur`.
 [[bin]]
-name = "kubectl-kopiur"
+name = "kopiur"
 path = "src/main.rs"
 
 [dependencies]
@@ -26,7 +29,12 @@ kopiur-kopia = { workspace = true }
 kopiur-mover = { workspace = true }
 # `runtime` powers the --wait watcher (kube::runtime::watcher); `ws` powers the
 # browse session's pod-exec transport (WebSocket attach).
-kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ws"] }
+# `webpki-roots` compiles in Mozilla's root store as the TLS fallback for the
+# rare kubeconfig without certificate-authority data (e.g. a cluster fronted by
+# public-CA TLS); the normal path — the cluster CA embedded in kubeconfig — is
+# unaffected. It also gives that fallback identical behavior on every platform
+# (kube's native-roots path would consult each OS's own trust store).
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "webpki-roots", "ws"] }
 futures = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_33"] }
 rustls = { workspace = true }

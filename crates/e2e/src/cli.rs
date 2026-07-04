@@ -1,4 +1,4 @@
-//! Run the compiled `kubectl-kopiur` plugin binary the way a user does: a real
+//! Run the compiled `kopiur` plugin binary the way a user does: a real
 //! subprocess against the e2e cluster's kubeconfig (inherited from the
 //! environment — the mise `run` task pins `KUBECONFIG=target/e2e/kubeconfig`).
 //!
@@ -21,9 +21,9 @@ pub struct CliOutput {
     pub stderr: String,
 }
 
-/// Locate the `kubectl-kopiur` binary: `KOPIUR_E2E_CLI_BIN` if set, else
-/// `$CARGO_TARGET_DIR/debug/kubectl-kopiur`, else the workspace
-/// `target/debug/kubectl-kopiur` built by the mise pipeline.
+/// Locate the plugin binary (built as `kopiur`): `KOPIUR_E2E_CLI_BIN` if set,
+/// else `$CARGO_TARGET_DIR/debug/kopiur`, else the workspace
+/// `target/debug/kopiur` built by the mise pipeline.
 pub fn cli_bin() -> PathBuf {
     if let Ok(p) = std::env::var("KOPIUR_E2E_CLI_BIN") {
         return PathBuf::from(p);
@@ -37,7 +37,7 @@ pub fn cli_bin() -> PathBuf {
         },
         PathBuf::from,
     );
-    target_dir.join("debug/kubectl-kopiur")
+    target_dir.join("debug/kopiur")
 }
 
 /// Run `kubectl-kopiur <args>` and capture the result. Panics (with a build

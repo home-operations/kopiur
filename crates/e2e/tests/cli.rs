@@ -1,5 +1,5 @@
 //! End-to-end scenarios for the `kubectl kopiur` plugin (crates/cli), exercised
-//! exactly as a user runs it: the compiled `kubectl-kopiur` binary as a
+//! exactly as a user runs it: the compiled `kopiur` binary as a
 //! subprocess against the e2e cluster's kubeconfig.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`, skipping gracefully without
