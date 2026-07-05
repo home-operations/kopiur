@@ -1210,7 +1210,7 @@ async fn run_restore_mover(
         namespace,
         &[&repo.backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await
@@ -1529,7 +1529,7 @@ async fn run_restore_mover(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: crate::snapshot::mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits: {
             let mut l = restore_job_limits(restore);
             if l.ttl_seconds_after_finished.is_none() {

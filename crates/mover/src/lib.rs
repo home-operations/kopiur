@@ -2,6 +2,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod bootstrap;
+pub mod cli;
 pub mod credentials;
 pub mod env;
 pub mod error;

@@ -43,7 +43,7 @@ use crate::server::{
     ServerReconcileCtx, generated_secret_name, mirrored_creds_secret_name, reconcile_server,
     server_object_name, server_status_json,
 };
-use crate::snapshot::{backend_to_repository_connect, mover_pull_policy_pub};
+use crate::snapshot::backend_to_repository_connect;
 
 /// Where to materialize a discovered `Snapshot` under a `ClusterRepository`
 /// (ADR §2.3). `identity_namespace` is the namespace named by the snapshot's
@@ -532,7 +532,7 @@ async fn reconcile_cluster_server(
         creds_src_namespace,
         is_cluster: true,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         service_account: ctx.mover_service_account.as_deref(),
     };
 
@@ -764,7 +764,7 @@ async fn bootstrap_cluster_via_mover(
         &job_ns,
         &[backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await?;
@@ -808,7 +808,7 @@ async fn bootstrap_cluster_via_mover(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         // Bound the bootstrap Job so a pod that never schedules (missing mover SA,
         // image-pull failure) becomes terminal-`Failed` instead of hanging — then
         // `finalize_cluster_bootstrap` runs and surfaces a Warning Event.

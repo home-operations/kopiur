@@ -59,7 +59,7 @@ use crate::metrics::{Metrics, ResourceStores};
 /// - `Repository`/`ClusterRepository` watch discovered `Snapshot`.
 /// - `Snapshot` owns `Job` + `ConfigMap` (mover run).
 /// - `Restore` watches the target `PVC` (populator handshake).
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // Install the tracing subscriber (fmt + OTLP traces/logs when configured).
     // Held for the process lifetime so buffered OTLP spans/logs flush on exit.
     // Errors only surface under KOPIUR_OTEL_STRICT; otherwise OTLP degrades to
@@ -76,53 +76,29 @@ pub async fn run() -> anyhow::Result<()> {
     let metrics = Metrics::new();
     let reporter = Reporter::from("kopiur-controller");
     let recorder = Recorder::new(client.clone(), reporter);
-    // The mover image is configurable via KOPIUR_MOVER_IMAGE so a deployment (or
-    // the e2e harness) can pin a locally-loaded image instead of the published
-    // default (jobs::DEFAULT_MOVER_IMAGE).
-    let mover_image = std::env::var(config::MOVER_IMAGE_ENV)
-        .unwrap_or_else(|_| jobs::DEFAULT_MOVER_IMAGE.to_string());
-    tracing::info!(mover_image = %mover_image, "mover image configured");
-    // The mover PATCHes the owning CR's status, so its Job pods must run as an SA
-    // bound to the mover status-patch RBAC. This is a dedicated least-privilege SA
-    // (not the operator SA): the controller mints it + a RoleBinding to the mover
-    // role in each Job's (workload) namespace. The chart sets this name; `None`
-    // (off-chart) keeps the legacy behaviour of the `default` SA with no minting.
-    let mover_service_account = std::env::var(config::MOVER_SERVICE_ACCOUNT_ENV)
-        .ok()
-        .filter(|s| !s.is_empty());
-    tracing::info!(mover_service_account = ?mover_service_account, "mover SA configured");
-    // Name of the mover ClusterRole/Role the minted RoleBinding references. Falls
-    // back to the chart's default name when unset so minting still resolves.
-    let mover_clusterrole = std::env::var(config::MOVER_CLUSTERROLE_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| config::DEFAULT_MOVER_NAME.to_string());
-    // `roleRef.kind` for the minted mover RoleBinding (ClusterRole vs Role), set by
-    // the chart from installScope.
-    let mover_role_kind = std::env::var(config::MOVER_ROLE_KIND_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| config::DEFAULT_MOVER_ROLE_KIND.to_string());
-    tracing::info!(mover_clusterrole = %mover_clusterrole, mover_role_kind = %mover_role_kind, "mover role configured");
-    // The operator's own namespace (downward API: KOPIUR_NAMESPACE). Default
-    // placement for a ClusterRepository's managed (namespaced) Maintenance CR.
-    let operator_namespace = std::env::var(config::OPERATOR_NAMESPACE_ENV)
-        .ok()
-        .filter(|s| !s.is_empty());
-    tracing::info!(operator_namespace = ?operator_namespace, "operator namespace configured");
+    // Everything below reads the pre-resolved config (flags with KOPIUR_* env
+    // fallback, parsed in main): defaults applied, empty strings filtered,
+    // closed value sets already typed. The startup log lines keep the same
+    // shape so operators grepping for them see no change.
+    tracing::info!(mover_image = %config.mover_image, "mover image configured");
+    tracing::info!(mover_service_account = ?config.mover_service_account, "mover SA configured");
+    tracing::info!(
+        mover_clusterrole = %config.mover_clusterrole,
+        mover_role_kind = %config.mover_role_kind.as_str(),
+        "mover role configured"
+    );
+    tracing::info!(operator_namespace = ?config.operator_namespace, "operator namespace configured");
     // Telemetry + logging env the controller passes through to mover Jobs: OTLP
     // (when a collector is configured) plus RUST_LOG / KOPIUR_LOG_FORMAT so movers
-    // inherit the controller's log level and format.
+    // inherit the controller's log level and format. (Still read from the process
+    // env: these names are owned by the telemetry crate and forwarded verbatim.)
     let mover_env_passthrough = collect_mover_env_passthrough();
 
     // The writable base for the controller's in-process kopia cache/logs/config
     // (an emptyDir the chart mounts at the default). Overridable only if that
     // mount is relocated; without it kopia would try $HOME (/nonexistent) on the
     // read-only rootfs and fail to create its cache.
-    let kopia_factory = match std::env::var(config::KOPIA_CACHE_DIR_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    let kopia_factory = match &config.kopia_cache_dir {
         Some(dir) => {
             tracing::info!(kopia_cache_dir = %dir, "kopia cache dir overridden");
             KopiaClientFactory::new().with_cache_dir(dir)
@@ -175,22 +151,24 @@ pub async fn run() -> anyhow::Result<()> {
         kopia_factory,
         metrics.clone(),
         recorder,
-        mover_image,
-        mover_service_account,
-        mover_clusterrole,
-        mover_role_kind,
+        config.mover_image.clone(),
+        config.mover_image_overridden,
+        config.mover_pull_policy,
+        config.mover_service_account.clone(),
+        config.mover_clusterrole.clone(),
+        config.mover_role_kind,
         mover_env_passthrough,
         maintenance_store,
         maintenance_synced,
-        operator_namespace,
+        config.operator_namespace.clone(),
     ));
 
     // Self-managed webhook TLS (`webhook.tls.mode: self`): mint the serving cert
     // and inject the caBundle so the API server trusts the webhook — no
     // cert-manager. Best-effort at boot (the webhook configs may not exist yet on
     // a first apply); a slow background task then handles drift + leaf rotation.
-    // Absent the managed-mode env, this is a no-op (cert-manager / manual mode).
-    if let Some(webhook_tls) = webhook_tls_config() {
+    // Absent the managed-mode config, this is a no-op (cert-manager / manual mode).
+    if let Some(webhook_tls) = webhook_tls_config(&config) {
         let ns = webhook_tls.namespace.clone();
         let boot_ok = match webhook_tls::ensure(&client, &webhook_tls).await {
             Ok(()) => {
@@ -205,17 +183,16 @@ pub async fn run() -> anyhow::Result<()> {
         spawn_webhook_tls_reconcile(client.clone(), webhook_tls, boot_ok);
     }
 
-    // Resolved eagerly (not inside `serve_http`) so a typo'd `KOPIUR_HTTP_ADDR`
-    // fails the process immediately with a non-zero exit and an actionable
-    // message, instead of only surfacing as a `tracing::warn!` once the spawned
-    // HTTP task loses the `tokio::select!` race below — silently leaving probes
-    // unreachable while the controller otherwise looks like it started fine.
-    let http_addr = config::http_addr()?;
+    // The bind address was validated at parse time (a typo'd `KOPIUR_HTTP_ADDR`
+    // already failed the process in main with an actionable message), so this
+    // can't silently leave probes unreachable behind a `tracing::warn!` once
+    // the spawned HTTP task loses the `tokio::select!` race below.
+    let http_addr = config.http_addr;
 
     tracing::info!("starting kopiur controllers");
 
     let http_srv = tokio::spawn(serve_http(metrics.clone(), http_addr));
-    let controllers = spawn_all(client, ctx);
+    let controllers = spawn_all(client, ctx, config.streaming_lists);
 
     tokio::select! {
         _ = controllers => tracing::warn!("all controllers exited"),
@@ -256,22 +233,19 @@ fn collect_mover_env_passthrough() -> Vec<(String, String)> {
     env
 }
 
-/// Assemble the [`webhook_tls::WebhookTlsConfig`] from env, or `None` when the
-/// chart did not enable self-managed webhook TLS (cert-manager / manual mode, or
-/// off-chart). Requires the managed gate plus a known operator namespace and both
-/// webhook-configuration names; a partial config is treated as not-managed and
-/// logged, rather than guessed.
-fn webhook_tls_config() -> Option<webhook_tls::WebhookTlsConfig> {
-    let managed = std::env::var(config::WEBHOOK_TLS_MANAGED_ENV)
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    if !managed {
+/// Assemble the [`webhook_tls::WebhookTlsConfig`] from the resolved controller
+/// config, or `None` when the chart did not enable self-managed webhook TLS
+/// (cert-manager / manual mode, or off-chart). Requires the managed gate plus a
+/// known operator namespace and both webhook-configuration names; a partial
+/// config is treated as not-managed and logged, rather than guessed. Pure over
+/// its input, so the skip decisions are unit-testable.
+fn webhook_tls_config(config: &config::ControllerConfig) -> Option<webhook_tls::WebhookTlsConfig> {
+    if !config.webhook_tls_managed {
         return None;
     }
-    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
 
-    let namespace = match env(config::OPERATOR_NAMESPACE_ENV) {
-        Some(ns) => ns,
+    let namespace = match &config.operator_namespace {
+        Some(ns) => ns.clone(),
         None => {
             tracing::warn!(
                 "{} is set but {} is unset; cannot place the webhook TLS Secret — skipping \
@@ -283,8 +257,8 @@ fn webhook_tls_config() -> Option<webhook_tls::WebhookTlsConfig> {
         }
     };
     let (Some(validating_config), Some(mutating_config)) = (
-        env(config::WEBHOOK_VALIDATING_CONFIG_ENV),
-        env(config::WEBHOOK_MUTATING_CONFIG_ENV),
+        config.webhook_validating_config.clone(),
+        config.webhook_mutating_config.clone(),
     ) else {
         tracing::warn!(
             "self-managed webhook TLS requested but {}/{} are unset — skipping",
@@ -293,14 +267,11 @@ fn webhook_tls_config() -> Option<webhook_tls::WebhookTlsConfig> {
         );
         return None;
     };
-    let secret_name = env(config::WEBHOOK_SECRET_NAME_ENV)
-        .unwrap_or_else(|| config::DEFAULT_WEBHOOK_SECRET_NAME.to_string());
-    let service_name = env(config::WEBHOOK_SERVICE_NAME_ENV).unwrap_or_else(|| secret_name.clone());
 
     Some(webhook_tls::WebhookTlsConfig {
         namespace,
-        secret_name,
-        service_name,
+        secret_name: config.webhook_secret_name.clone(),
+        service_name: config.webhook_service_name.clone(),
         validating_config,
         mutating_config,
     })
@@ -379,11 +350,11 @@ fn map_to_cluster_repository<K: kube::Resource>(obj: K) -> Option<ObjectRef<Clus
 /// Spawn all eight controllers and join them. Split out so it can be driven
 /// independently of the metrics server. The shared Maintenance informer that the
 /// repo reconcilers read is set up separately in [`run`].
-async fn spawn_all(client: Client, ctx: Arc<Context>) {
+async fn spawn_all(client: Client, ctx: Arc<Context>, streaming_lists: bool) {
     let mut cfg = WatcherConfig::default();
     // Opt-in (off by default for older-apiserver safety): stream the initial list
     // via the WatchList API to cut peak memory on the cluster-wide resync.
-    if crate::config::streaming_lists_enabled() {
+    if streaming_lists {
         cfg = cfg.streaming_lists();
     }
     // Owned children (mover Jobs, work-spec ConfigMaps) ALWAYS carry the managed-by

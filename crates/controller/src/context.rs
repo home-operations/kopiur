@@ -131,6 +131,13 @@ pub struct Context {
     /// Container image used for mover `Job`s (configurable per deployment via
     /// `KOPIUR_MOVER_IMAGE`; defaults to [`crate::jobs::DEFAULT_MOVER_IMAGE`]).
     pub mover_image: String,
+    /// Whether [`mover_image`](Self::mover_image) was explicitly configured —
+    /// presence drives the `imagePullPolicy` inference in
+    /// [`mover_pull_policy`](Self::mover_pull_policy).
+    pub mover_image_overridden: bool,
+    /// Explicit `imagePullPolicy` for mover Jobs (`KOPIUR_MOVER_PULL_POLICY`);
+    /// `None` → inferred (see [`crate::config::effective_mover_pull_policy`]).
+    pub mover_pull_policy: Option<crate::config::PullPolicy>,
     /// ServiceAccount the mover `Job` pods run as (configurable via
     /// `KOPIUR_MOVER_SERVICE_ACCOUNT`). The mover PATCHes the owning CR's
     /// `.status`, so this SA must be bound to the operator's status-patch rules.
@@ -144,8 +151,10 @@ pub struct Context {
     pub mover_clusterrole: String,
     /// `roleRef.kind` for the minted mover `RoleBinding` (`ClusterRole` for a
     /// cluster install, `Role` for a namespaced one — `KOPIUR_MOVER_ROLE_KIND`,
-    /// default [`crate::config::DEFAULT_MOVER_ROLE_KIND`]).
-    pub mover_role_kind: String,
+    /// default [`crate::config::DEFAULT_MOVER_ROLE_KIND`]). Typed: an invalid
+    /// chart value already failed at startup, so reconcilers can't stamp a
+    /// roleRef.kind the API server would reject.
+    pub mover_role_kind: crate::config::RoleKind,
     /// Env the controller passes through to every mover `Job`: OTLP
     /// (`OTEL_EXPORTER_OTLP_*`, only when a collector is configured) plus logging
     /// (`RUST_LOG`, `KOPIUR_LOG_FORMAT`, whenever set) so movers inherit the
@@ -178,9 +187,11 @@ impl Context {
         metrics: Metrics,
         recorder: Recorder,
         mover_image: String,
+        mover_image_overridden: bool,
+        mover_pull_policy: Option<crate::config::PullPolicy>,
         mover_service_account: Option<String>,
         mover_clusterrole: String,
-        mover_role_kind: String,
+        mover_role_kind: crate::config::RoleKind,
         mover_env_passthrough: Vec<(String, String)>,
         maintenance_store: Store<Maintenance>,
         maintenance_synced: Arc<AtomicBool>,
@@ -192,6 +203,8 @@ impl Context {
             metrics,
             recorder,
             mover_image,
+            mover_image_overridden,
+            mover_pull_policy,
             mover_service_account,
             mover_clusterrole,
             mover_role_kind,
@@ -200,6 +213,17 @@ impl Context {
             maintenance_synced,
             operator_namespace,
         }
+    }
+
+    /// The `imagePullPolicy` to stamp on mover `Job` pods: the explicit
+    /// configuration when set, else inferred from whether the mover image was
+    /// pinned. Delegates to the pure, unit-tested
+    /// [`crate::config::effective_mover_pull_policy`].
+    pub fn mover_pull_policy(&self) -> Option<&'static str> {
+        crate::config::effective_mover_pull_policy(
+            self.mover_pull_policy,
+            self.mover_image_overridden,
+        )
     }
 }
 

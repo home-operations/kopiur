@@ -44,7 +44,9 @@ feature-gated integration tests.
   into transient (short requeue) vs structural (long requeue) outcomes.
 - [`metrics::Metrics`] — OTel instruments (Prometheus pull + optional OTLP push,
   via `kopiur-telemetry`).
-- [`config`] — every controller env var name + fixed config value in one place.
+- [`config`] — the clap flag/env surface ([`config::ControllerArgs`]), the
+  resolved [`config::ControllerConfig`], and every controller env var name in
+  one place.
 - [`jobs`] — the pure mover `Job`/`ConfigMap` builder.
 - Pure decision helpers, unit-tested cluster-free:
   [`snapshot::plan_deletion`], [`snapshot_schedule::next_fire`],
@@ -56,9 +58,13 @@ Reconcilers need a live [`kube::Client`], so the entrypoint is shown `no_run`:
 
 ```rust,no_run
 # async fn doc() -> anyhow::Result<()> {
-// Builds every controller plus the /metrics + /healthz + /readyz server and
-// runs them until shutdown.
-kopiur_controller::run().await?;
+use clap::Parser as _;
+
+// Parse the configuration (flags with KOPIUR_* env fallback), then build every
+// controller plus the /metrics + /healthz + /readyz server and run them until
+// shutdown.
+let config = kopiur_controller::config::ControllerArgs::parse().resolve()?;
+kopiur_controller::run(config).await?;
 # Ok(())
 # }
 ```

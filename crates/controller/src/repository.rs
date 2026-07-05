@@ -39,7 +39,7 @@ use crate::error::{Error, Result, TERMINAL_HEARTBEAT, error_policy_for};
 use crate::health;
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs};
-use crate::snapshot::{backend_to_repository_connect, mover_pull_policy_pub};
+use crate::snapshot::backend_to_repository_connect;
 
 /// Logical bytes under management: the sum, over each distinct snapshot source,
 /// of the most-recent snapshot's logical `total_size`. Older snapshots of the
@@ -505,7 +505,7 @@ async fn reconcile_repository_server(
         creds_src_namespace: namespace.to_string(),
         is_cluster: false,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         service_account: ctx.mover_service_account.as_deref(),
     };
 
@@ -705,7 +705,7 @@ async fn bootstrap_via_mover(
         namespace,
         &[backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await?;
@@ -787,7 +787,7 @@ async fn bootstrap_via_mover(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         // Bound the bootstrap Job: a pod that never schedules (missing mover SA,
         // image-pull failure) otherwise never reaches a `Failed` condition, so the
         // controller never finalizes and the repository hangs `Initializing` with

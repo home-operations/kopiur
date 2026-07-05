@@ -61,7 +61,12 @@ scheme.
 
 All three images share a `registry` and (for controller/webhook) a `pullPolicy`,
 each overridable per-image. Each image takes a `tag` (defaults to the chart's
-`appVersion` when empty) or a `digest`.
+`appVersion` when empty) or a `digest`. `image.mover.pullPolicy` sets the
+`imagePullPolicy` on every mover **Job** pod the controller creates (`Always` /
+`IfNotPresent` / `Never`); when unset, the controller infers `IfNotPresent`
+whenever an explicit mover image is configured (so a pinned, e.g.
+locally-loaded, image is never re-pulled) and otherwise leaves the cluster
+default in charge.
 
 /// warning | Digest-pin the mover in production
 
@@ -290,6 +295,43 @@ mover honors the same level and format.
   deprecated `controller.logLevel`.
 - **`format`** — `text` (human-readable, default) or `json` (one structured
   object per line for Loki / ELK / Datadog).
+
+## Flags & environment variables
+
+You normally configure Kopiur through the Helm values above — the chart turns
+them into environment variables on the controller and webhook Deployments.
+Under the hood, every one of those knobs is also a **command-line flag** on the
+binary, with the env var as its fallback (**flag > env var > built-in
+default**). Run any binary with `--help` for the full, self-documenting list:
+
+```console
+$ kopiur-controller --help   # every knob, its KOPIUR_* env var, and its default
+$ kopiur-webhook --help
+$ kopiur-mover --help        # ready / serve subcommands + run-once mode
+```
+
+The flags matter in two situations:
+
+- **Running a binary outside the chart** (local development, a custom
+  deployment): `kopiur-controller --mover-image ghcr.io/… --http-addr '[::]:8081'`
+  beats exporting env vars by hand.
+- **`controller.extraArgs`** — extra flags are now actually parsed. That cuts
+  both ways: a valid flag works, and an unknown or malformed one fails the
+  container at startup with an actionable usage error (previously extra args
+  were silently ignored).
+
+/// warning | Malformed values now fail loudly at startup
+
+A typo'd configuration value used to be silently swallowed: a garbage
+`KOPIUR_WORKER_THREADS` fell back to the default, and a misspelled boolean
+(e.g. `KOPIUR_STREAMING_LISTS=ture`) silently meant "off". Every value is now
+validated at startup — an unparseable number, boolean, socket address,
+role kind, or pull policy stops the process with a message naming the variable,
+the accepted values, and the fix. Chart-rendered values are unaffected (the
+chart only emits valid ones); hand-set `extraEnv` / `extraArgs` values get the
+loud failure instead of a silent mis-configuration.
+
+///
 
 ## Pod security
 

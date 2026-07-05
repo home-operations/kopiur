@@ -676,7 +676,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         &[&repo.backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await
@@ -1197,7 +1197,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits,
         resources: resolved_mover.resources.clone(),
         // The fully-merged contexts (hardened ⊂ moverDefaults ⊂ recipe) — the same
@@ -1733,7 +1733,7 @@ async fn delete_snapshot_via_job(
         job_ns,
         &[&repo.backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await?;
@@ -1744,7 +1744,7 @@ async fn delete_snapshot_via_job(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -1896,7 +1896,7 @@ async fn reconcile_pin(
         namespace,
         &[&repo.backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await?;
@@ -1907,7 +1907,7 @@ async fn reconcile_pin(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

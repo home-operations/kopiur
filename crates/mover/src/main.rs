@@ -1,7 +1,8 @@
 //! kopiur-mover: the per-`Snapshot`/`Restore` Job binary (ADR §4.10).
 //!
 //! Flow:
-//! 1. Read the work-spec path from arg/env, parse [`MoverWorkSpec`].
+//! 1. Parse the CLI ([`MoverCli`]: `ready` / `serve [path]` / run-once with an
+//!    optional work-spec path, env fallback), parse [`MoverWorkSpec`].
 //! 2. Build a [`KopiaClient`], connect to the repository.
 //! 3. Run the operation (backup / restore / snapshot-delete), emitting periodic
 //!    progress PATCHes (interval configurable via the work spec).
@@ -17,6 +18,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::Parser as _;
 use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
@@ -29,8 +31,9 @@ use tracing::{error, info, warn};
 use kopiur_mover::bootstrap::{
     BootstrapResult, MAX_RETURNED_SNAPSHOTS, RESULT_CONFIGMAP_KEY, should_attempt_create,
 };
+use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
-use kopiur_mover::env::{KOPIA_BINARY, RESULT_CONFIGMAP, WORK_SPEC_PATH};
+use kopiur_mover::env::{RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
 use kopiur_mover::resolve::match_current_manifest;
 use kopiur_mover::serve::ServerWorkSpec;
@@ -46,32 +49,34 @@ use kopiur_mover::workspec::{
 };
 
 fn main() -> std::process::ExitCode {
-    // Readiness-probe mode, BEFORE the work-spec loading path: a browse-session
-    // pod's readinessProbe execs `kopiur-mover ready` (the distroless image has
-    // no shell to `test -f` with), which must exit 0 iff the session marker
-    // exists. Checked first so the probe never tries to parse "ready" as a
-    // work-spec path; the decision itself is the pure `session_ready`.
-    if std::env::args().nth(1).as_deref() == Some("ready") {
-        return if session_ready(std::path::Path::new(kopiur_mover::env::READY_MARKER)) {
-            std::process::ExitCode::SUCCESS
-        } else {
-            std::process::ExitCode::FAILURE
-        };
-    }
-
-    // `mover serve [path]` runs the long-lived kopia web UI; everything else is a
-    // run-once backup/restore/delete. The serve path connects then `exec`s kopia,
-    // replacing this process, so it never returns on success.
-    if std::env::args().nth(1).as_deref() == Some("serve") {
-        return run_serve();
-    }
-
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    match runtime.block_on(run()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            error!(error = %e, "mover run failed");
-            std::process::ExitCode::FAILURE
+    let cli = MoverCli::parse();
+    match &cli.command {
+        // Readiness-probe mode, BEFORE the work-spec loading path: a
+        // browse-session pod's readinessProbe execs `kopiur-mover ready` (the
+        // distroless image has no shell to `test -f` with), which must exit 0
+        // iff the session marker exists. The decision itself is the pure
+        // `session_ready`.
+        Some(MoverCommand::Ready) => {
+            if session_ready(std::path::Path::new(kopiur_mover::env::READY_MARKER)) {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+        // `mover serve [path]` runs the long-lived kopia web UI. The serve path
+        // connects then `exec`s kopia, replacing this process, so it never
+        // returns on success.
+        Some(MoverCommand::Serve { spec }) => run_serve(spec.clone(), cli.kopia_binary()),
+        // No subcommand: a run-once operation, selected by the work-spec JSON.
+        None => {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            match runtime.block_on(run(&cli)) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    error!(error = %e, "mover run failed");
+                    std::process::ExitCode::FAILURE
+                }
+            }
         }
     }
 }
@@ -80,7 +85,7 @@ fn main() -> std::process::ExitCode {
 ///
 /// On success `exec` replaces this process with kopia, so this never returns; it
 /// returns a non-zero `ExitCode` only if loading/connecting/exec fails.
-fn run_serve() -> std::process::ExitCode {
+fn run_serve(spec_arg: Option<PathBuf>, kopia_binary: Option<&str>) -> std::process::ExitCode {
     let _telemetry = match kopiur_telemetry::init_tracing("kopiur-mover") {
         Ok(t) => t,
         Err(e) => {
@@ -91,7 +96,7 @@ fn run_serve() -> std::process::ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    let spec = match server_spec_path().and_then(|p| load_server_spec(&p)) {
+    let spec = match server_spec_path(spec_arg).and_then(|p| load_server_spec(&p)) {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "loading server work spec");
@@ -106,7 +111,7 @@ fn run_serve() -> std::process::ExitCode {
         "loaded server work spec"
     );
 
-    let client = build_serve_client();
+    let client = build_serve_client(kopia_binary);
 
     // Connect to the repository first (short, idempotent) so the server can read
     // the connected repo from the kopia config file. Cache tuning is inherited from
@@ -138,10 +143,12 @@ fn run_serve() -> std::process::ExitCode {
     std::process::ExitCode::FAILURE
 }
 
-/// Locate the server work spec: `mover serve <path>` arg, else [`env::SERVER_SPEC_PATH`].
-fn server_spec_path() -> Result<PathBuf> {
-    if let Some(arg) = std::env::args().nth(2) {
-        return Ok(PathBuf::from(arg));
+/// Locate the server work spec: `mover serve <path>` arg, else
+/// [`env::SERVER_SPEC_PATH`]. The env fallback is deliberately manual (not
+/// clap `#[arg(env)]`) — see [`kopiur_mover::cli`].
+fn server_spec_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(arg) = arg {
+        return Ok(arg);
     }
     if let Ok(env) = std::env::var(kopiur_mover::env::SERVER_SPEC_PATH) {
         return Ok(PathBuf::from(env));
@@ -165,9 +172,9 @@ fn load_server_spec(path: &PathBuf) -> Result<ServerWorkSpec> {
 /// Build a kopia client for the serve path. Repository/UI credentials, config and
 /// cache dirs are inherited from the pod environment (mounted Secret + emptyDir
 /// env), so only the binary override and the update-check suppression are set here.
-fn build_serve_client() -> KopiaClient {
+fn build_serve_client(kopia_binary: Option<&str>) -> KopiaClient {
     let mut builder = KopiaClient::builder();
-    if let Ok(bin) = std::env::var(KOPIA_BINARY) {
+    if let Some(bin) = kopia_binary {
         builder = builder.binary(bin);
     }
     builder = builder.env("KOPIA_CHECK_FOR_UPDATES", "false");
@@ -181,7 +188,7 @@ fn session_ready(marker: &std::path::Path) -> bool {
     marker.exists()
 }
 
-async fn run() -> Result<()> {
+async fn run(cli: &MoverCli) -> Result<()> {
     // Tracing subscriber (fmt + OTLP traces/logs when configured). The mover is a
     // short-lived Job, so OTLP push is the right model for its metrics — we flush
     // both before returning.
@@ -192,7 +199,7 @@ async fn run() -> Result<()> {
     // client (the rustls-tls backend panics without it). Idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let spec_path = work_spec_path()?;
+    let spec_path = work_spec_path(cli.work_spec.clone())?;
     let spec = load_work_spec(&spec_path)?;
     let operation = spec.operation.kind_str().to_string();
     info!(
@@ -202,7 +209,7 @@ async fn run() -> Result<()> {
         "loaded work spec"
     );
 
-    let client = build_client(&spec);
+    let client = build_client(&spec, cli.kopia_binary());
 
     let started = std::time::Instant::now();
     // Build the connect spec once, materializing any file-based backend
@@ -219,7 +226,7 @@ async fn run() -> Result<()> {
         // first, then runs with periodic progress PATCHes.
         Ok(connect) => match &spec.operation {
             Operation::BootstrapRepository(op) => {
-                run_bootstrap_flow(&client, &spec, op, &connect).await
+                run_bootstrap_flow(&client, &spec, op, &connect, cli.result_configmap()).await
             }
             // Maintenance, like bootstrap, owns its own connect lifecycle: the
             // lease decision needs `kopia maintenance info`, which requires repo
@@ -810,6 +817,7 @@ async fn run_bootstrap_flow(
     spec: &MoverWorkSpec,
     op: &BootstrapRepositoryOp,
     connect: &ConnectSpec,
+    result_configmap: Option<&str>,
 ) -> Result<()> {
     info!(
         backend = spec.repository.kind_str(),
@@ -821,7 +829,7 @@ async fn run_bootstrap_flow(
     // Persist BEFORE returning: a failed bootstrap still exits non-zero (so the
     // Job is marked Failed and backoff is bounded), but the controller must be
     // able to read the structured failure to set an actionable Repository status.
-    write_bootstrap_result(spec, &result).await;
+    write_bootstrap_result(spec, &result, result_configmap).await;
     if result.success {
         info!(
             backend = spec.repository.kind_str(),
@@ -1048,16 +1056,20 @@ async fn run_bootstrap(
 
 /// Persist a [`BootstrapResult`] into the work-spec ConfigMap (best-effort). The
 /// controller reads it from key [`RESULT_CONFIGMAP_KEY`].
-async fn write_bootstrap_result(spec: &MoverWorkSpec, result: &BootstrapResult) {
-    let cm_name = match std::env::var(RESULT_CONFIGMAP) {
-        Ok(n) if !n.is_empty() => n,
-        _ => {
+async fn write_bootstrap_result(
+    spec: &MoverWorkSpec,
+    result: &BootstrapResult,
+    result_configmap: Option<&str>,
+) {
+    let cm_name = match result_configmap {
+        Some(n) => n,
+        None => {
             warn!("{RESULT_CONFIGMAP} unset; bootstrap result not persisted");
             return;
         }
     };
     let ns = &spec.target_ref.namespace;
-    match write_result_configmap(&cm_name, ns, result).await {
+    match write_result_configmap(cm_name, ns, result).await {
         Ok(()) => info!(configmap = %cm_name, "wrote bootstrap result"),
         Err(e) => warn!(error = %e, configmap = %cm_name, "failed to write bootstrap result"),
     }
@@ -1669,9 +1681,12 @@ impl MoverMetrics {
     }
 }
 
-fn work_spec_path() -> Result<PathBuf> {
-    if let Some(arg) = std::env::args().nth(1) {
-        return Ok(PathBuf::from(arg));
+/// Locate the run-once work spec: positional arg, else [`env::WORK_SPEC_PATH`].
+/// The env fallback is deliberately manual (not clap `#[arg(env)]`) — see
+/// [`kopiur_mover::cli`].
+fn work_spec_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(arg) = arg {
+        return Ok(arg);
     }
     if let Ok(env) = std::env::var(WORK_SPEC_PATH) {
         return Ok(PathBuf::from(env));
@@ -1692,9 +1707,9 @@ fn load_work_spec(path: &PathBuf) -> Result<MoverWorkSpec> {
     Ok(spec)
 }
 
-fn build_client(spec: &MoverWorkSpec) -> KopiaClient {
+fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient {
     let mut builder = KopiaClient::builder();
-    if let Ok(bin) = std::env::var(KOPIA_BINARY) {
+    if let Some(bin) = kopia_binary {
         builder = builder.binary(bin);
     }
     // Suppress the GitHub update check globally.
