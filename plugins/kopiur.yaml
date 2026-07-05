@@ -4,32 +4,32 @@ kind: Plugin
 metadata:
   name: kopiur
 spec:
-  version: v0.5.1
+  version: v0.5.2
   platforms:
     - bin: kopiur
-      uri: https://github.com/home-operations/kopiur/releases/download/0.5.1/kubectl-kopiur_0.5.1_linux_arm64.tar.gz
-      sha256: 7ba77ab2bba5b3566ce4c59bbec61a719df97460320cce07b0b7387f6645e24a
+      uri: https://github.com/home-operations/kopiur/releases/download/0.5.2/kubectl-kopiur_0.5.2_linux_arm64.tar.gz
+      sha256: 8092968ca7e55c5cb8325f8cbfeb6bb23af41212cabea0d8eb49da584ef1e210
       selector:
         matchLabels:
           os: linux
           arch: arm64
     - bin: kopiur
-      uri: https://github.com/home-operations/kopiur/releases/download/0.5.1/kubectl-kopiur_0.5.1_linux_amd64.tar.gz
-      sha256: c35d876614ee5cf0e2931ef38a91cd1d8f145d3af87a10b934166acd5a8874f1
+      uri: https://github.com/home-operations/kopiur/releases/download/0.5.2/kubectl-kopiur_0.5.2_linux_amd64.tar.gz
+      sha256: 4281bdcdac1bac8c07ed5187fe5a063ae8ba22ad8567ec6f00a749ea22f46bfd
       selector:
         matchLabels:
           os: linux
           arch: amd64
     - bin: kopiur
-      uri: https://github.com/home-operations/kopiur/releases/download/0.5.1/kubectl-kopiur_0.5.1_darwin_arm64.tar.gz
-      sha256: 7ac81c77e2fd40aba9ed61c96a365a144c24fc8370f46d185d70d3a609d94f0f
+      uri: https://github.com/home-operations/kopiur/releases/download/0.5.2/kubectl-kopiur_0.5.2_darwin_arm64.tar.gz
+      sha256: 079b2361c2982e15e90fcaf8bcef54657948f6436a63307dc8afcb6d2a3054eb
       selector:
         matchLabels:
           os: darwin
           arch: arm64
     - bin: kopiur
-      uri: https://github.com/home-operations/kopiur/releases/download/0.5.1/kubectl-kopiur_0.5.1_darwin_amd64.tar.gz
-      sha256: 020fde11e50842399cfc8c0a6ac4c3e18a4a3ae40a1bdc5c290e8fa3ea6e4bd7
+      uri: https://github.com/home-operations/kopiur/releases/download/0.5.2/kubectl-kopiur_0.5.2_darwin_amd64.tar.gz
+      sha256: fabe6407b86f9f2a342c95801cf79ae333093fbf198559005d688a6b367e9713
       selector:
         matchLabels:
           os: darwin
