@@ -1549,6 +1549,7 @@ dependencies = [
  "croner",
  "futures",
  "http",
+ "http-body-util",
  "k8s-openapi",
  "kopiur-api",
  "kopiur-kopia",

@@ -1,0 +1,371 @@
+//! Process startup: [`run`] — telemetry, the kube client, the HTTP server,
+//! the leader-election gate, the shared Maintenance informer, self-managed
+//! webhook TLS, and finally the controller fan-out
+//! ([`crate::controllers::spawn_all`]).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::StreamExt;
+use kube::runtime::events::{Recorder, Reporter};
+use kube::runtime::watcher::Config as WatcherConfig;
+use kube::runtime::{WatchStreamExt, reflector, watcher};
+use kube::{Api, Client};
+
+use kopiur_api::Maintenance;
+
+use crate::config;
+use crate::context::{Context, KopiaClientFactory};
+use crate::controllers::{scoped_api, spawn_all};
+use crate::http::serve_http;
+use crate::leader;
+use crate::metrics::Metrics;
+use crate::webhook_tls;
+
+/// Build the controller manager and run every controller concurrently, plus the
+/// `/metrics` server, until shutdown.
+///
+/// Each `Controller` wires its owned-resource watches per ADR §5.2:
+/// - `SnapshotSchedule` owns `Snapshot`.
+/// - `SnapshotPolicy` watches `Snapshot` (GFS retention).
+/// - `Repository`/`ClusterRepository` watch discovered `Snapshot`.
+/// - `Snapshot` owns `Job` + `ConfigMap` (mover run).
+/// - `Restore` watches the target `PVC` (populator handshake).
+pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
+    // Install the tracing subscriber (fmt + OTLP traces/logs when configured).
+    // Held for the process lifetime so buffered OTLP spans/logs flush on exit.
+    // Errors only surface under KOPIUR_OTEL_STRICT; otherwise OTLP degrades to
+    // fmt-only and the call succeeds.
+    let _telemetry = kopiur_telemetry::init_tracing("kopiur-controller")?;
+
+    // Install the process-level rustls CryptoProvider before the kube client
+    // builds any TLS config; without this, kube's rustls-tls backend panics with
+    // "no process-level CryptoProvider available". Idempotent: ignore the error
+    // if a provider is already installed (e.g. the webhook installed it).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let client = Client::try_default().await?;
+    let metrics = Metrics::new();
+
+    // The HTTP server (probes + /metrics) starts BEFORE the leader-election
+    // gate: a standby replica must pass its liveness/readiness probes while it
+    // waits for the Lease, or the kubelet would kill the very replica that is
+    // supposed to take over on failover.
+    let http_srv = tokio::spawn(serve_http(metrics.clone(), config.http_addr));
+
+    // Leader election (--leader-elect): block until this replica holds the
+    // Lease, then keep renewing it. Everything below this point — reconcilers,
+    // the shared informer, self-managed webhook TLS — is leader-only work.
+    // `leadership_lost` completes only if the Lease is lost; that is fatal
+    // (exit, restart, re-elect) — see [`leader`] for why. A missing-RBAC 403
+    // degrades to no-election (`Acquired::Degraded`, loudly) so a new image
+    // under an old chart — which stamps --leader-elect=true but grants no
+    // leases RBAC — keeps running instead of crash-looping.
+    let leadership = match &config.leader_election {
+        Some(le) => {
+            let identity = leader_identity();
+            match leader::acquire(&client, le, &identity).await {
+                leader::Acquired::Leading => Some((le.clone(), identity)),
+                leader::Acquired::Degraded => None,
+            }
+        }
+        None => None,
+    };
+    let leadership_lost = leadership
+        .as_ref()
+        .map(|(le, id)| leader::spawn_renewal(client.clone(), le.clone(), id.clone()));
+
+    let reporter = Reporter::from("kopiur-controller");
+    let recorder = Recorder::new(client.clone(), reporter);
+    // Everything below reads the pre-resolved config (flags with KOPIUR_* env
+    // fallback, parsed in main): defaults applied, empty strings filtered,
+    // closed value sets already typed. The startup log lines keep the same
+    // shape so operators grepping for them see no change.
+    tracing::info!(watch_scope = ?config.watch_scope, "install scope configured");
+    tracing::info!(mover_image = %config.mover_image, "mover image configured");
+    tracing::info!(mover_service_account = ?config.mover_service_account, "mover SA configured");
+    tracing::info!(
+        mover_clusterrole = %config.mover_clusterrole,
+        mover_role_kind = %config.mover_role_kind.as_str(),
+        "mover role configured"
+    );
+    tracing::info!(operator_namespace = ?config.operator_namespace, "operator namespace configured");
+    // Telemetry + logging env the controller passes through to mover Jobs: OTLP
+    // (when a collector is configured) plus RUST_LOG / KOPIUR_LOG_FORMAT so movers
+    // inherit the controller's log level and format. (Still read from the process
+    // env: these names are owned by the telemetry crate and forwarded verbatim.)
+    let mover_env_passthrough = collect_mover_env_passthrough();
+
+    // The writable base for the controller's in-process kopia cache/logs/config
+    // (an emptyDir the chart mounts at the default). Overridable only if that
+    // mount is relocated; without it kopia would try $HOME (/nonexistent) on the
+    // read-only rootfs and fail to create its cache.
+    let kopia_factory = match &config.kopia_cache_dir {
+        Some(dir) => {
+            tracing::info!(kopia_cache_dir = %dir, "kopia cache dir overridden");
+            KopiaClientFactory::new().with_cache_dir(dir)
+        }
+        None => KopiaClientFactory::new(),
+    };
+
+    // Shared Maintenance informer: a single reflector-backed cache the
+    // Repository/ClusterRepository reconcilers read to answer "is a Maintenance
+    // configured for me?" without an `Api::list` per reconcile. We drive the
+    // reflector stream ourselves in a spawned task (a standalone `Store`'s
+    // `wait_until_ready()` does NOT drive the underlying watch — kube requires the
+    // reflector stream to be polled separately), and flip `maintenance_synced`
+    // once the initial list completes so a cold cache never yields a false
+    // "not configured" warning on startup.
+    let (maintenance_store, maintenance_writer) = reflector::store::<Maintenance>();
+    let maintenance_synced = Arc::new(AtomicBool::new(false));
+    {
+        let reader = maintenance_store.clone();
+        let synced = maintenance_synced.clone();
+        let api: Api<Maintenance> = scoped_api(&client, &config.watch_scope);
+        tokio::spawn(async move {
+            // Flip the flag as soon as the reflector reports its first sync.
+            let mark_ready = async move {
+                if reader.wait_until_ready().await.is_ok() {
+                    synced.store(true, Ordering::Relaxed);
+                    tracing::info!("maintenance informer cache synced");
+                } else {
+                    tracing::warn!("maintenance informer writer dropped before sync");
+                }
+            };
+            // Drive the watch → reflector store forever (with backoff on errors).
+            let drive = async move {
+                let stream = reflector(maintenance_writer, watcher(api, WatcherConfig::default()))
+                    .default_backoff()
+                    .touched_objects();
+                futures::pin_mut!(stream);
+                while let Some(ev) = stream.next().await {
+                    if let Err(e) = ev {
+                        tracing::debug!(error = %e, "maintenance informer watch error");
+                    }
+                }
+            };
+            tokio::join!(mark_ready, drive);
+        });
+    }
+
+    let ctx = Arc::new(Context::new(
+        client.clone(),
+        kopia_factory,
+        metrics.clone(),
+        recorder,
+        config.mover_image.clone(),
+        config.mover_image_overridden,
+        config.mover_pull_policy,
+        config.mover_service_account.clone(),
+        config.mover_clusterrole.clone(),
+        config.mover_role_kind,
+        mover_env_passthrough,
+        maintenance_store,
+        maintenance_synced,
+        config.operator_namespace.clone(),
+        config.watch_scope.clone(),
+    ));
+
+    // Self-managed webhook TLS (`webhook.tls.mode: self`): mint the serving cert
+    // and inject the caBundle so the API server trusts the webhook — no
+    // cert-manager. Best-effort at boot (the webhook configs may not exist yet on
+    // a first apply); a slow background task then handles drift + leaf rotation.
+    // Absent the managed-mode config, this is a no-op (cert-manager / manual mode).
+    if let Some(webhook_tls) = webhook_tls_config(&config) {
+        let ns = webhook_tls.namespace.clone();
+        let boot_ok = match webhook_tls::ensure(&client, &webhook_tls).await {
+            Ok(()) => {
+                tracing::info!(namespace = %ns, "self-managed webhook TLS ready");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "initial webhook TLS setup failed; retrying shortly");
+                false
+            }
+        };
+        spawn_webhook_tls_reconcile(client.clone(), webhook_tls, boot_ok);
+    }
+
+    tracing::info!("starting kopiur controllers");
+
+    let controllers = spawn_all(
+        client.clone(),
+        ctx,
+        config.streaming_lists,
+        config.watch_scope.clone(),
+    );
+
+    match leadership_lost {
+        Some(lost) => {
+            tokio::select! {
+                _ = controllers => tracing::warn!("all controllers exited"),
+                r = http_srv => tracing::warn!(?r, "http server exited"),
+                _ = lost => {
+                    // Continuing to reconcile without the Lease would be a
+                    // split-brain double-reconcile; exit non-zero so the pod
+                    // restarts and re-enters the election.
+                    anyhow::bail!("leader lease lost; exiting to re-elect");
+                }
+                _ = shutdown_signal() => {
+                    // Graceful shutdown while leading: release the Lease so
+                    // the successor claims it immediately, instead of every
+                    // rolling upgrade stalling reconciliation for the full
+                    // lease duration while the dead holder's Lease ages out.
+                    tracing::info!("shutdown signal received; releasing leader lease");
+                    if let Some((le, id)) = &leadership {
+                        leader::release(&client, le, id).await;
+                    }
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                _ = controllers => tracing::warn!("all controllers exited"),
+                r = http_srv => tracing::warn!(?r, "http server exited"),
+                _ = shutdown_signal() => tracing::info!("shutdown signal received"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve on SIGTERM (Kubernetes pod termination) or Ctrl-C, so `run` gets a
+/// graceful-shutdown branch (used to release the leader Lease on the way out).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// This replica's leader-election identity: the pod name (`HOSTNAME`, set by
+/// the kubelet), falling back to a pid-suffixed name for off-cluster runs so
+/// two local processes never share an identity.
+fn leader_identity() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| format!("kopiur-controller-{}", std::process::id()))
+}
+
+/// Collect the env vars the controller stamps onto every mover `Job` so a mover
+/// inherits the controller's telemetry + logging configuration. Two groups:
+///
+/// - **OTLP** (`OTEL_EXPORTER_OTLP_*`): forwarded only when a collector endpoint
+///   is set, so movers stay fully offline (fmt-only) otherwise.
+/// - **Logging** (`RUST_LOG`, `KOPIUR_LOG_FORMAT`): forwarded whenever present,
+///   regardless of OTLP, so `kubectl logs` on a mover Job honors the same level
+///   and format the controller runs with.
+///
+/// `(name, value)` pairs, de-duplicated by name (the two groups don't overlap).
+fn collect_mover_env_passthrough() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+
+    // OTLP only when a collector is configured.
+    if std::env::var(config::OTEL_EXPORTER_OTLP_ENDPOINT).is_ok() {
+        env.extend(
+            config::OTLP_PASSTHROUGH
+                .iter()
+                .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v))),
+        );
+    }
+
+    // Logging always (when set in the controller's env).
+    env.extend(
+        config::LOG_PASSTHROUGH
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v))),
+    );
+
+    env
+}
+
+/// Assemble the [`webhook_tls::WebhookTlsConfig`] from the resolved controller
+/// config, or `None` when the chart did not enable self-managed webhook TLS
+/// (cert-manager / manual mode, or off-chart). Requires the managed gate plus a
+/// known operator namespace and both webhook-configuration names; a partial
+/// config is treated as not-managed and logged, rather than guessed. Pure over
+/// its input, so the skip decisions are unit-testable.
+fn webhook_tls_config(config: &config::ControllerConfig) -> Option<webhook_tls::WebhookTlsConfig> {
+    if !config.webhook_tls_managed {
+        return None;
+    }
+
+    let namespace = match &config.operator_namespace {
+        Some(ns) => ns.clone(),
+        None => {
+            tracing::warn!(
+                "{} is set but {} is unset; cannot place the webhook TLS Secret — skipping \
+                 self-managed webhook TLS",
+                config::WEBHOOK_TLS_MANAGED_ENV,
+                config::OPERATOR_NAMESPACE_ENV
+            );
+            return None;
+        }
+    };
+    let (Some(validating_config), Some(mutating_config)) = (
+        config.webhook_validating_config.clone(),
+        config.webhook_mutating_config.clone(),
+    ) else {
+        tracing::warn!(
+            "self-managed webhook TLS requested but {}/{} are unset — skipping",
+            config::WEBHOOK_VALIDATING_CONFIG_ENV,
+            config::WEBHOOK_MUTATING_CONFIG_ENV
+        );
+        return None;
+    };
+
+    Some(webhook_tls::WebhookTlsConfig {
+        namespace,
+        secret_name: config.webhook_secret_name.clone(),
+        service_name: config.webhook_service_name.clone(),
+        validating_config,
+        mutating_config,
+    })
+}
+
+/// Drive [`webhook_tls::ensure`] in the background so the serving leaf rotates
+/// before expiry and the `caBundle` self-heals if anything overwrites it.
+///
+/// The cadence is adaptive: after a success it waits the slow steady-state
+/// interval ([`config::WEBHOOK_TLS_RECONCILE_INTERVAL`]); after a failure it
+/// retries soon ([`config::WEBHOOK_TLS_RETRY_INTERVAL`]). This matters at boot —
+/// if the webhook configurations aren't registered yet when the controller
+/// starts, the first inject fails, and a fixed slow tick would leave admission
+/// untrusted for hours. `boot_ok` seeds the first wait from the boot attempt's
+/// result. Errors are logged, never fatal (degrade-not-crash).
+fn spawn_webhook_tls_reconcile(client: Client, cfg: webhook_tls::WebhookTlsConfig, boot_ok: bool) {
+    tokio::spawn(async move {
+        let mut ok = boot_ok;
+        loop {
+            let delay = if ok {
+                config::WEBHOOK_TLS_RECONCILE_INTERVAL
+            } else {
+                config::WEBHOOK_TLS_RETRY_INTERVAL
+            };
+            tokio::time::sleep(delay).await;
+            ok = match webhook_tls::ensure(&client, &cfg).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "webhook TLS reconcile failed; will retry soon");
+                    false
+                }
+            };
+        }
+    });
+}

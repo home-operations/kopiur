@@ -1010,126 +1010,133 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the source PVC and run the mover against the STAGE, not the live volume (ADR §3.3).
     // Done AFTER beforeSnapshot hooks so a quiesced app yields a consistent capture.
     // `Direct` (and any NFS source) returns NotApplicable and mounts the live source.
-    let staged_claim: Option<String> =
-        match io::resolve_staging(&ctx.client, &config, &namespace, &name, &owner).await? {
-            io::StagingOutcome::NotApplicable => None,
-            io::StagingOutcome::Ready(staged) => {
-                // Mount the staged PVC in place of the live source — same mount path and
-                // kopia source path, so the snapshot's recorded identity is unchanged.
-                if let Some(mount) = source_volume.as_mut() {
-                    *mount = VolumeMountSpec::pvc(
-                        staged.pvc_name.clone(),
-                        mount.mount_path.clone(),
-                        mount.read_only,
-                    );
-                }
-                let existing = backup
-                    .status
-                    .as_ref()
-                    .map(|s| s.conditions.clone())
-                    .unwrap_or_default();
-                let conditions = io::upsert_condition(
-                    &existing,
-                    SOURCE_STAGED_CONDITION,
-                    true,
-                    SOURCE_STAGED_REASON,
-                    &format!(
-                        "staged source ready ({}): pvc `{}`",
-                        staged.copy_method, staged.pvc_name
-                    ),
-                    backup.meta().generation,
+    let staged_claim: Option<String> = match io::resolve_staging(
+        &ctx.client,
+        &ctx.watch_scope,
+        &config,
+        &namespace,
+        &name,
+        &owner,
+    )
+    .await?
+    {
+        io::StagingOutcome::NotApplicable => None,
+        io::StagingOutcome::Ready(staged) => {
+            // Mount the staged PVC in place of the live source — same mount path and
+            // kopia source path, so the snapshot's recorded identity is unchanged.
+            if let Some(mount) = source_volume.as_mut() {
+                *mount = VolumeMountSpec::pvc(
+                    staged.pvc_name.clone(),
+                    mount.mount_path.clone(),
+                    mount.read_only,
                 );
-                io::patch_status(
-                    &api,
-                    &name,
-                    serde_json::json!({
-                        "conditions": conditions,
-                        "staged": {
-                            "copyMethod": staged.copy_method,
-                            "volumeSnapshotName": staged.volume_snapshot_name,
-                            "pvcName": staged.pvc_name,
-                            "ready": true,
+            }
+            let existing = backup
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let conditions = io::upsert_condition(
+                &existing,
+                SOURCE_STAGED_CONDITION,
+                true,
+                SOURCE_STAGED_REASON,
+                &format!(
+                    "staged source ready ({}): pvc `{}`",
+                    staged.copy_method, staged.pvc_name
+                ),
+                backup.meta().generation,
+            );
+            io::patch_status(
+                &api,
+                &name,
+                serde_json::json!({
+                    "conditions": conditions,
+                    "staged": {
+                        "copyMethod": staged.copy_method,
+                        "volumeSnapshotName": staged.volume_snapshot_name,
+                        "pvcName": staged.pvc_name,
+                        "ready": true,
+                    },
+                }),
+            )
+            .await?;
+            Some(staged.pvc_name)
+        }
+        io::StagingOutcome::Waiting(msg) => {
+            // The VolumeSnapshot isn't readyToUse yet — a normal, transient wait.
+            // The message may carry the VolumeSnapshot's (possibly transient)
+            // `status.error` as diagnostic context; that is NOT a failure — see
+            // `StagingOutcome::Failed` for the deadline that is (issue #198).
+            let existing = backup
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let conditions = io::upsert_condition(
+                &existing,
+                SOURCE_STAGED_CONDITION,
+                false,
+                STAGING_WAITING_REASON,
+                &msg,
+                backup.meta().generation,
+            );
+            // if_changed: the wait message is deterministic per VolumeSnapshot
+            // (fixed deadline), so steady-state reconciles don't churn status.
+            let current = serde_json::to_value(&backup.status).ok();
+            io::patch_status_if_changed(
+                &api,
+                &name,
+                current.as_ref(),
+                serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+            )
+            .await?;
+            return Err(Error::MissingDependency(msg));
+        }
+        io::StagingOutcome::Failed { reason, message } => {
+            // Staging cannot produce the stage (stack/class missing, source not
+            // CSI, or the VolumeSnapshot missed the staging deadline). TERMINAL:
+            // this write stamps `Failed` + `Stalled=True`, and the one-shot
+            // discipline (`run_decision` → `TerminalFailed` → `await_change`)
+            // never re-enters staging — a NEW Snapshot (e.g. the next scheduled
+            // run) is how a retry happens. Mirrors the preflight-expired path:
+            // patch + specific Warning Event + completed(failed) metric +
+            // `Ok(await_change)` — deliberately NOT an `Error::Validation`, whose
+            // generic `InvalidSpec` event would tell the user to fix a spec that
+            // isn't broken.
+            let status = snapshot_ready_status_with_condition(
+                backup,
+                SnapshotPhase::Failed,
+                reason,
+                &message,
+                SOURCE_STAGED_CONDITION,
+                false,
+            );
+            let current = serde_json::to_value(&backup.status).ok();
+            let wrote = io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
+            if wrote {
+                let _ = ctx
+                    .recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Warning,
+                            reason: reason.to_string(),
+                            note: Some(message.clone()),
+                            action: FIX_SNAPSHOT_STACK_ACTION.into(),
+                            secondary: None,
                         },
-                    }),
-                )
-                .await?;
-                Some(staged.pvc_name)
+                        &io::event_ref(backup),
+                    )
+                    .await;
+                tracing::warn!(backup = %name, reason, "source staging failed: {message}");
+                // This write is the real Failed transition (guarded by `wrote`);
+                // TerminalFailed won't re-count it.
+                ctx.metrics
+                    .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
             }
-            io::StagingOutcome::Waiting(msg) => {
-                // The VolumeSnapshot isn't readyToUse yet — a normal, transient wait.
-                // The message may carry the VolumeSnapshot's (possibly transient)
-                // `status.error` as diagnostic context; that is NOT a failure — see
-                // `StagingOutcome::Failed` for the deadline that is (issue #198).
-                let existing = backup
-                    .status
-                    .as_ref()
-                    .map(|s| s.conditions.clone())
-                    .unwrap_or_default();
-                let conditions = io::upsert_condition(
-                    &existing,
-                    SOURCE_STAGED_CONDITION,
-                    false,
-                    STAGING_WAITING_REASON,
-                    &msg,
-                    backup.meta().generation,
-                );
-                // if_changed: the wait message is deterministic per VolumeSnapshot
-                // (fixed deadline), so steady-state reconciles don't churn status.
-                let current = serde_json::to_value(&backup.status).ok();
-                io::patch_status_if_changed(
-                    &api,
-                    &name,
-                    current.as_ref(),
-                    serde_json::json!({ "phase": "Pending", "conditions": conditions }),
-                )
-                .await?;
-                return Err(Error::MissingDependency(msg));
-            }
-            io::StagingOutcome::Failed { reason, message } => {
-                // Staging cannot produce the stage (stack/class missing, source not
-                // CSI, or the VolumeSnapshot missed the staging deadline). TERMINAL:
-                // this write stamps `Failed` + `Stalled=True`, and the one-shot
-                // discipline (`run_decision` → `TerminalFailed` → `await_change`)
-                // never re-enters staging — a NEW Snapshot (e.g. the next scheduled
-                // run) is how a retry happens. Mirrors the preflight-expired path:
-                // patch + specific Warning Event + completed(failed) metric +
-                // `Ok(await_change)` — deliberately NOT an `Error::Validation`, whose
-                // generic `InvalidSpec` event would tell the user to fix a spec that
-                // isn't broken.
-                let status = snapshot_ready_status_with_condition(
-                    backup,
-                    SnapshotPhase::Failed,
-                    reason,
-                    &message,
-                    SOURCE_STAGED_CONDITION,
-                    false,
-                );
-                let current = serde_json::to_value(&backup.status).ok();
-                let wrote =
-                    io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
-                if wrote {
-                    let _ = ctx
-                        .recorder
-                        .publish(
-                            &Event {
-                                type_: EventType::Warning,
-                                reason: reason.to_string(),
-                                note: Some(message.clone()),
-                                action: FIX_SNAPSHOT_STACK_ACTION.into(),
-                                secondary: None,
-                            },
-                            &io::event_ref(backup),
-                        )
-                        .await;
-                    tracing::warn!(backup = %name, reason, "source staging failed: {message}");
-                    // This write is the real Failed transition (guarded by `wrote`);
-                    // TerminalFailed won't re-count it.
-                    ctx.metrics
-                        .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
-                }
-                return Ok(Action::await_change());
-            }
-        };
+            return Ok(Action::await_change());
+        }
+    };
 
     let mut labels = run_labels(&config, origin);
     mover_identity.decorate_labels(&mut labels);

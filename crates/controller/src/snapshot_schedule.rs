@@ -6,10 +6,11 @@
 //! `Action::requeue(time_until_slot)`. When that requeue fires, we check whether
 //! the slot is due and, if so, create a `Snapshot` CR; then we recompute and
 //! requeue again. This is **HA-safe and restart-safe**: there is no per-schedule
-//! background task to leak, leader-election is handled by the controller runtime
-//! (only the active replica reconciles), and a restart simply recomputes the
-//! same wall-clock slot. A `tokio::interval` task per schedule would duplicate
-//! across replicas and strand on restart. (ADR §4.1 anchors on `cron(now)`.)
+//! background task to leak, leader election ([`crate::leader`], `--leader-elect`,
+//! on by default in the chart) ensures only the Lease-holding replica runs any
+//! reconciler at all, and a restart simply recomputes the same wall-clock slot.
+//! A `tokio::interval` task per schedule would duplicate across replicas and
+//! strand on restart. (ADR §4.1 anchors on `cron(now)`.)
 //!
 //! The scheduling kernel here is **pure**: [`next_fire`] computes the jittered
 //! next slot deterministically (reusing `api::jitter`), and [`should_fire_now`]

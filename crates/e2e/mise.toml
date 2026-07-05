@@ -193,10 +193,14 @@ env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -eu
 echo "==> helm install"
+# KOPIUR_E2E_HELM_SET — optional extra `--set` overrides for a shard that needs a
+# non-default install shape (e.g. the install-scope shard sets
+# `installScope=namespaced` to prove a Role-only install actually reconciles).
 helm upgrade --install kopiur deploy/helm/kopiur \\
   --namespace kopiur-e2e --create-namespace \\
   --wait --timeout 5m \\
-  -f deploy/e2e/values.yaml
+  -f deploy/e2e/values.yaml \\
+  ${KOPIUR_E2E_HELM_SET:+--set "$KOPIUR_E2E_HELM_SET"}
 
 # `--wait` above only covers Deployment readiness (pods Ready), not the
 # admission-webhook path: the API server can still get `connection refused`

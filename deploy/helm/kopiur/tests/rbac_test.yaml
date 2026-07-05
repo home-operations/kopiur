@@ -5,6 +5,7 @@ release:
 templates:
   - role.tpl
   - clusterrole.tpl
+  - leader-role.tpl
 tests:
   - it: namespaced scope renders a Role and no ClusterRole
     set:
@@ -99,6 +100,105 @@ tests:
       - hasDocuments:
           count: 0
         template: role.tpl
+
+  # --- leader-election Lease RBAC (controller.leaderElection.enabled) --------
+  #
+  # The controller claims/renews ONE coordination.k8s.io Lease in the release
+  # namespace when leader election is on (the default). Both install flavours
+  # must carry the grant (a missing rule degrades the election at startup), and
+  # it must be namespace-local + name-scoped — never a cluster-wide leases
+  # grant, which would reach node-heartbeat and other controllers' Leases.
+
+  - it: "leader election (cluster) renders a name-scoped Role + RoleBinding, not a ClusterRole grant"
+    set:
+      installScope: cluster
+    asserts:
+      - hasDocuments:
+          count: 2
+        template: leader-role.tpl
+      - isKind:
+          of: Role
+        template: leader-role.tpl
+        documentIndex: 0
+      - contains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [create]
+        template: leader-role.tpl
+        documentIndex: 0
+      - contains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            resourceNames: [kopiur]
+            verbs: [get, update]
+        template: leader-role.tpl
+        documentIndex: 0
+      - isKind:
+          of: RoleBinding
+        template: leader-role.tpl
+        documentIndex: 1
+      # The operator ClusterRole itself must carry NO leases grant.
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [get, create, update]
+        template: clusterrole.tpl
+
+  - it: "leader election (namespaced) grants the name-scoped leases rules in the operator Role"
+    set:
+      installScope: namespaced
+      webhook.enabled: false
+    template: role.tpl
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [create]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            resourceNames: [kopiur]
+            verbs: [get, update]
+
+  - it: "leader election disabled drops the leases RBAC entirely (cluster)"
+    set:
+      installScope: cluster
+      controller.leaderElection.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: leader-role.tpl
+
+  - it: "leader election disabled drops the leases rules from the namespaced Role too"
+    set:
+      installScope: namespaced
+      webhook.enabled: false
+      controller.leaderElection.enabled: false
+    template: role.tpl
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [create]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            resourceNames: [kopiur]
+            verbs: [get, update]
 
   # --- per-feature secrets-write gating (least privilege) --------------------
   #

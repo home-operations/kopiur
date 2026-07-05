@@ -10,7 +10,6 @@
 
 use std::net::SocketAddr;
 
-use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Parser};
 
 /// Container image the controller stamps into every mover `Job`. Overrides
@@ -97,6 +96,19 @@ pub const DEFAULT_WORKER_THREADS: usize = 2;
 /// (the `WatchList` feature: beta in 1.32, GA in 1.34), so it is OFF by default —
 /// older clusters are unaffected. The chart exposes it as `controller.streamingLists`.
 pub const STREAMING_LISTS_ENV: &str = "KOPIUR_STREAMING_LISTS";
+
+/// Gate for Lease-based leader election (`--leader-elect`). The chart stamps
+/// the flag (from `controller.leaderElection.enabled`); the env var exists for
+/// off-chart runs.
+pub const LEADER_ELECT_ENV: &str = "KOPIUR_LEADER_ELECT";
+
+/// Name of the leader-election `Lease` in the operator's namespace
+/// (`--lease-name`). The chart sets it to the release fullname; defaults to
+/// [`DEFAULT_LEASE_NAME`].
+pub const LEASE_NAME_ENV: &str = "KOPIUR_LEASE_NAME";
+
+/// Fallback leader-election `Lease` name when [`LEASE_NAME_ENV`] is unset.
+pub const DEFAULT_LEASE_NAME: &str = "kopiur-leader";
 
 // --- Self-managed webhook TLS (`webhook.tls.mode: self`) --------------------
 //
@@ -193,7 +205,8 @@ pub struct ControllerArgs {
     pub http_addr: SocketAddr,
 
     /// Tokio worker threads (clamped to at least 1 — tokio panics on 0).
-    #[arg(long, env = WORKER_THREADS_ENV, default_value_t = DEFAULT_WORKER_THREADS)]
+    #[arg(long, env = WORKER_THREADS_ENV, default_value_t = DEFAULT_WORKER_THREADS,
+          value_parser = parse_worker_threads)]
     pub worker_threads: usize,
 
     /// Opt-in: stream cluster-wide list/resync via the WatchList API.
@@ -203,13 +216,13 @@ pub struct ControllerArgs {
     /// keeps the bare `--streaming-lists` form working.
     #[arg(long, env = STREAMING_LISTS_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
-          value_parser = BoolishValueParser::new())]
+          value_parser = parse_flag_bool)]
     pub streaming_lists: bool,
 
     /// Gate for self-managed webhook TLS (chart `webhook.tls.mode: self`).
     #[arg(long, env = WEBHOOK_TLS_MANAGED_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
-          value_parser = BoolishValueParser::new())]
+          value_parser = parse_flag_bool)]
     pub webhook_tls_managed: bool,
 
     /// Name of the webhook serving-cert Secret (self-managed TLS).
@@ -229,37 +242,58 @@ pub struct ControllerArgs {
     #[arg(long, env = WEBHOOK_MUTATING_CONFIG_ENV)]
     pub webhook_mutating_config: Option<String>,
 
-    /// Chart-stamped args the binary historically ignored; parsed for
-    /// backward compatibility, currently inert.
-    #[command(flatten)]
-    pub chart_compat: ChartCompatArgs,
-}
-
-/// Args the Helm chart has stamped on the controller container since v0.1
-/// (`deployment.tpl`) that the binary historically never parsed. Accepted so an
-/// existing chart-rendered pod spec keeps starting — a strict parser that
-/// rejected them would crash-loop every deployed controller — but currently
-/// inert: leader election and install-scope watch narrowing are not implemented
-/// yet. Hidden from `--help` until they do something.
-#[derive(Debug, Clone, clap::Args)]
-pub struct ChartCompatArgs {
-    /// Chart-stamped (`--leader-elect=true|false`); leader election is not
-    /// implemented yet, so this is parsed and ignored.
-    #[arg(long, hide = true, action = ArgAction::Set, num_args = 0..=1,
-          default_value_t = true, default_missing_value = "true",
-          value_parser = BoolishValueParser::new())]
+    /// Lease-based leader election: only the lease holder reconciles.
+    /// Required for replicaCount > 1; the chart stamps it from
+    /// `controller.leaderElection.enabled`. Needs --operator-namespace (the
+    /// Lease lives there) and RBAC on coordination.k8s.io leases.
+    #[arg(long, env = LEADER_ELECT_ENV, action = ArgAction::Set,
+          num_args = 0..=1, default_value_t = false, default_missing_value = "true",
+          value_parser = parse_flag_bool)]
     pub leader_elect: bool,
 
-    /// Chart-stamped for `installScope: cluster`; watch narrowing is not
-    /// implemented yet, so this is parsed and ignored.
-    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    /// Name of the leader-election Lease (in the operator's namespace). The
+    /// chart sets it to the release fullname so two releases in one namespace
+    /// never contend on the same Lease.
+    #[arg(long, env = LEASE_NAME_ENV)]
+    pub lease_name: Option<String>,
+
+    /// Cluster-scoped install: watch every namespace and reconcile
+    /// ClusterRepository. The chart stamps it for `installScope: cluster`.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "namespace")]
     pub cluster_scope: bool,
 
-    /// Chart-stamped for a namespaced install. NOT wired to `KOPIUR_NAMESPACE`
-    /// (that would silently flip precedence over the downward-API env var);
-    /// `--operator-namespace` is the real flag.
-    #[arg(long, hide = true)]
+    /// Namespaced install: watch ONLY this namespace (matches the chart's
+    /// Role-only RBAC) and skip cluster-scoped kinds (ClusterRepository,
+    /// Namespace referents). The chart stamps `--namespace={{ .Release.Namespace }}`
+    /// for `installScope: namespaced`. Deliberately separate from
+    /// --operator-namespace / KOPIUR_NAMESPACE (which only places managed
+    /// objects and the Lease).
+    #[arg(long)]
     pub namespace: Option<String>,
+}
+
+/// Which namespaces the controller watches — the install scope, as an enum
+/// end-to-end (the type-safety thesis): every watch-building site `match`es
+/// this, so a namespaced install structurally cannot register the cluster-wide
+/// (Role-RBAC-forbidden) watches that used to leave it silently inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchScope {
+    /// Watch every namespace and reconcile `ClusterRepository`
+    /// (`installScope: cluster`, ClusterRole RBAC). Also the default for
+    /// off-chart runs, matching the pre-flag behavior.
+    Cluster,
+    /// Watch exactly this namespace; skip cluster-scoped kinds
+    /// (`installScope: namespaced`, Role RBAC).
+    Namespaced(String),
+}
+
+/// Resolved leader-election settings (present only when `--leader-elect`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderElection {
+    /// Name of the `coordination.k8s.io/v1` Lease.
+    pub lease_name: String,
+    /// Namespace the Lease lives in (the operator's own namespace).
+    pub namespace: String,
 }
 
 /// `roleRef.kind` for the minted mover `RoleBinding`. A closed two-value set,
@@ -378,6 +412,16 @@ pub enum ConfigError {
         /// The raw (unrecognized) value.
         value: String,
     },
+
+    /// `--leader-elect` without a known operator namespace: the election Lease
+    /// must live somewhere, and guessing a namespace could split-brain two
+    /// replicas onto different Leases.
+    #[error(
+        "--leader-elect/KOPIUR_LEADER_ELECT is enabled but the operator namespace is unknown; \
+         set KOPIUR_NAMESPACE/--operator-namespace (the chart injects it via the downward API) \
+         so the election Lease has a home, or disable leader election"
+    )]
+    LeaderElectionNeedsNamespace,
 }
 
 /// The resolved controller configuration: defaults applied, empty strings
@@ -419,6 +463,10 @@ pub struct ControllerConfig {
     pub webhook_validating_config: Option<String>,
     /// MutatingWebhookConfiguration name, if configured.
     pub webhook_mutating_config: Option<String>,
+    /// Which namespaces to watch (install scope).
+    pub watch_scope: WatchScope,
+    /// Leader election, when enabled (`--leader-elect`).
+    pub leader_election: Option<LeaderElection>,
 }
 
 impl ControllerArgs {
@@ -449,6 +497,30 @@ impl ControllerArgs {
         let webhook_service_name =
             nonempty(self.webhook_service_name).unwrap_or_else(|| webhook_secret_name.clone());
 
+        let operator_namespace = nonempty(self.operator_namespace);
+
+        // Install scope: --cluster-scope and --namespace are mutually exclusive
+        // at parse time (clap `conflicts_with`); with neither (an off-chart
+        // run), default to cluster-wide — the pre-flag behavior.
+        let watch_scope = match nonempty(self.namespace) {
+            Some(ns) => WatchScope::Namespaced(ns),
+            None => WatchScope::Cluster,
+        };
+
+        // Leader election needs a namespace for its Lease; guessing one could
+        // split-brain two replicas onto different Leases, so fail loudly.
+        let leader_election = if self.leader_elect {
+            Some(LeaderElection {
+                lease_name: nonempty(self.lease_name)
+                    .unwrap_or_else(|| DEFAULT_LEASE_NAME.to_string()),
+                namespace: operator_namespace
+                    .clone()
+                    .ok_or(ConfigError::LeaderElectionNeedsNamespace)?,
+            })
+        } else {
+            None
+        };
+
         Ok(ControllerConfig {
             mover_image: mover_image
                 .unwrap_or_else(|| crate::jobs::DEFAULT_MOVER_IMAGE.to_string()),
@@ -457,7 +529,7 @@ impl ControllerArgs {
             mover_service_account: nonempty(self.mover_service_account),
             mover_clusterrole,
             mover_role_kind,
-            operator_namespace: nonempty(self.operator_namespace),
+            operator_namespace,
             kopia_cache_dir: nonempty(self.kopia_cache_dir),
             http_addr: self.http_addr,
             worker_threads: self.worker_threads.max(1),
@@ -467,6 +539,8 @@ impl ControllerArgs {
             webhook_service_name,
             webhook_validating_config: nonempty(self.webhook_validating_config),
             webhook_mutating_config: nonempty(self.webhook_mutating_config),
+            watch_scope,
+            leader_election,
         })
     }
 }
@@ -474,8 +548,12 @@ impl ControllerArgs {
 /// Value parser for [`HTTP_ADDR_ENV`]/`--http-addr`. A typo'd probe address
 /// must fail loudly at startup, not silently bind the default and mask the
 /// operator's intent (most often an IPv6-only cluster that needed `[::]:8081`),
-/// so the message carries the what/why/fix in full.
+/// so the message carries the what/why/fix in full. An EMPTY value means
+/// "unset" (the default) — the chart can render an env var as `""` (e.g. a
+/// nulled Helm value through `| quote`), and clap consults the env before
+/// `resolve()`'s empty-string filter can run.
 fn parse_http_addr(value: &str) -> Result<SocketAddr, String> {
+    let value = if value.is_empty() { HTTP_ADDR } else { value };
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
             "KOPIUR_HTTP_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
@@ -483,6 +561,37 @@ fn parse_http_addr(value: &str) -> Result<SocketAddr, String> {
              0.0.0.0:8081"
         )
     })
+}
+
+/// Value parser for [`WORKER_THREADS_ENV`]/`--worker-threads`: empty ≡ unset
+/// (→ the default, matching the pre-clap tolerance for a blanked env var);
+/// garbage still fails loudly with the what/why/fix.
+fn parse_worker_threads(value: &str) -> Result<usize, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_WORKER_THREADS);
+    }
+    value.parse::<usize>().map_err(|_| {
+        format!(
+            "KOPIUR_WORKER_THREADS='{value}' is not a valid thread count; use a positive \
+             integer, e.g. 2; unset it to use the default {DEFAULT_WORKER_THREADS}"
+        )
+    })
+}
+
+/// Boolean parser for flag-or-env fields: the boolish value set
+/// (true/1/yes/on & false/0/no/off, case-insensitive), plus empty ≡ unset
+/// (→ false, every bool here defaults off) so a chart-rendered `""` keeps
+/// meaning "not enabled" instead of aborting the process at parse time.
+fn parse_flag_bool(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "" => Ok(false),
+        "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+        _ => Err(format!(
+            "'{value}' is not a valid boolean; use true/false (also accepted: 1/0, yes/no, \
+             on/off); unset it or leave it empty for the default"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +634,9 @@ mod tests {
         assert!(!cfg.webhook_tls_managed);
         assert_eq!(cfg.webhook_secret_name, DEFAULT_WEBHOOK_SECRET_NAME);
         assert_eq!(cfg.webhook_service_name, DEFAULT_WEBHOOK_SECRET_NAME);
+        // Off-chart runs keep the pre-flag behavior: cluster-wide, no election.
+        assert_eq!(cfg.watch_scope, WatchScope::Cluster);
+        assert_eq!(cfg.leader_election, None);
     }
 
     #[test]
@@ -577,26 +689,83 @@ mod tests {
         assert_eq!(cfg.webhook_mutating_config.as_deref(), Some("mwc"));
     }
 
-    // --- regression guard: the chart has stamped these args on the controller
-    // container since v0.1 (deployment.tpl). A strict parser that rejected them
-    // would crash-loop every chart-deployed controller on upgrade. ---
+    // --- the chart argv contract: deployment.tpl has stamped these args since
+    // v0.1 (a strict parser that rejected them would crash-loop every deployed
+    // controller on upgrade) — and they now DO something, so the resolved
+    // semantics are pinned here too. ---
 
     #[test]
     #[serial]
-    fn chart_stamped_args_parse_cluster_install() {
-        let args = parse(&["--leader-elect=true", "--cluster-scope"]);
-        assert!(args.chart_compat.leader_elect);
-        assert!(args.chart_compat.cluster_scope);
+    fn chart_stamped_args_resolve_cluster_install() {
+        let cfg = parse(&[
+            "--leader-elect=true",
+            "--cluster-scope",
+            "--operator-namespace",
+            "kopiur-system",
+        ])
+        .resolve()
+        .expect("cluster-install argv must resolve");
+        assert_eq!(cfg.watch_scope, WatchScope::Cluster);
+        assert_eq!(
+            cfg.leader_election,
+            Some(LeaderElection {
+                lease_name: DEFAULT_LEASE_NAME.to_string(),
+                namespace: "kopiur-system".to_string(),
+            })
+        );
     }
 
     #[test]
     #[serial]
-    fn chart_stamped_args_parse_namespaced_install() {
-        let args = parse(&["--leader-elect=false", "--namespace=kopiur-system"]);
-        assert!(!args.chart_compat.leader_elect);
+    fn chart_stamped_args_resolve_namespaced_install() {
+        let cfg = parse(&["--leader-elect=false", "--namespace=kopiur-system"])
+            .resolve()
+            .expect("namespaced-install argv must resolve");
         assert_eq!(
-            args.chart_compat.namespace.as_deref(),
-            Some("kopiur-system")
+            cfg.watch_scope,
+            WatchScope::Namespaced("kopiur-system".to_string())
+        );
+        assert_eq!(cfg.leader_election, None);
+    }
+
+    #[test]
+    #[serial]
+    fn cluster_scope_and_namespace_conflict_at_parse_time() {
+        // The chart renders exactly one of the two; passing both by hand is a
+        // contradiction the parser must reject, not resolve by precedence.
+        ControllerArgs::try_parse_from([
+            "kopiur-controller",
+            "--cluster-scope",
+            "--namespace=kopiur-system",
+        ])
+        .expect_err("--cluster-scope with --namespace must be rejected");
+    }
+
+    #[test]
+    #[serial]
+    fn leader_election_without_a_namespace_fails_actionably() {
+        let err = parse(&["--leader-elect=true"])
+            .resolve()
+            .expect_err("leader election must not guess a Lease namespace");
+        let msg = err.to_string();
+        assert!(msg.contains("KOPIUR_NAMESPACE"), "{msg}");
+        assert!(msg.contains("Lease"), "{msg}");
+        assert!(msg.contains("disable leader election"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn lease_name_flag_overrides_the_default() {
+        let cfg = parse(&[
+            "--leader-elect",
+            "--operator-namespace=ns1",
+            "--lease-name=myrelease-kopiur",
+        ])
+        .resolve()
+        .expect("must resolve");
+        assert_eq!(
+            cfg.leader_election.expect("elected").lease_name,
+            "myrelease-kopiur"
         );
     }
 
@@ -618,6 +787,8 @@ mod tests {
             "--webhook-service-name=",
             "--webhook-validating-config=",
             "--webhook-mutating-config=",
+            "--namespace=",
+            "--lease-name=",
         ]);
         assert_eq!(cfg.mover_image, crate::jobs::DEFAULT_MOVER_IMAGE);
         assert!(!cfg.mover_image_overridden);
@@ -630,6 +801,8 @@ mod tests {
         assert_eq!(cfg.webhook_service_name, DEFAULT_WEBHOOK_SECRET_NAME);
         assert_eq!(cfg.webhook_validating_config, None);
         assert_eq!(cfg.webhook_mutating_config, None);
+        // An empty --namespace means "no narrowing", not Namespaced("").
+        assert_eq!(cfg.watch_scope, WatchScope::Cluster);
     }
 
     #[test]
@@ -711,6 +884,28 @@ mod tests {
         );
         assert!(msg.contains("Always, IfNotPresent or Never"), "{msg}");
         assert!(msg.contains("unset it to infer the policy"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn empty_typed_values_mean_unset_too() {
+        // The chart can render ANY env var as "" (a nulled Helm value through
+        // `| quote`); typed fields must treat that as unset — clap consults the
+        // env before resolve()'s empty-string filter can run, so the tolerance
+        // lives in the value parsers. Regression guard for the upgrade-breaking
+        // "cannot parse integer from empty string" abort.
+        let cfg = resolve(&[
+            "--worker-threads=",
+            "--http-addr=",
+            "--streaming-lists=",
+            "--webhook-tls-managed=",
+            "--leader-elect=",
+        ]);
+        assert_eq!(cfg.worker_threads, DEFAULT_WORKER_THREADS);
+        assert_eq!(cfg.http_addr, HTTP_ADDR.parse().unwrap());
+        assert!(!cfg.streaming_lists);
+        assert!(!cfg.webhook_tls_managed);
+        assert_eq!(cfg.leader_election, None);
     }
 
     #[test]

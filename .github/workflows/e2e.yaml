@@ -156,6 +156,24 @@ jobs:
           - shard: security-context-compat
             bins: "security_context_compat"
             backends: false
+          # Leader election (--leader-elect, chart default): Lease held by the
+          # controller pod, single holder at 2 replicas, failover on holder
+          # deletion, and the NEW leader reconciling a backup. Own shard: it
+          # scales the operator Deployment, which no other test may race.
+          - shard: leader-election
+            bins: "leader_election"
+            backends: false
+          # Namespaced install (installScope=namespaced, Role-only RBAC): the
+          # operator must reconcile its release namespace (the pre-scoping
+          # controller sat Ready-but-inert on 403'd cluster-wide watches) and
+          # must ignore foreign namespaces + ClusterRepository. helm_set
+          # reshapes the install, so this shard owns its cluster. The test
+          # detects the deployed scope from the controller Deployment's args
+          # itself, so no further env wiring can silently skip it.
+          - shard: install-scope
+            bins: "install_scope"
+            backends: false
+            helm_set: "installScope=namespaced"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -213,6 +231,9 @@ jobs:
         run: mise run //crates/e2e:snapshot-stack
 
       - name: Install chart
+        env:
+          # Optional per-shard chart reshape (e.g. installScope=namespaced).
+          KOPIUR_E2E_HELM_SET: ${{ matrix.helm_set || '' }}
         run: mise run //crates/e2e:helm
 
       - name: Run e2e tests

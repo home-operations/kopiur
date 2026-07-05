@@ -81,6 +81,29 @@ helm install kopiur deploy/helm/kopiur -n kopiur-system --set webhook.enabled=fa
 
 Use **cluster** scope for a shared platform repository (`ClusterRepository`) referenced by many tenant namespaces. See `deploy/examples/02-cluster-repository.yaml`.
 
+In namespaced scope the controller's watches are narrowed to the release
+namespace to match the Role-only RBAC (the chart passes
+`--namespace={{ .Release.Namespace }}`), and cluster-scoped kinds are skipped
+entirely: `ClusterRepository` is not reconciled, and the
+[privileged-movers namespace opt-in](permissions.md) check fails **open**
+(the operator is already confined to admin-chosen namespaces there).
+
+/// warning | Features that need cluster RBAC are refused in namespaced scope
+
+Two features read or write cluster-scoped objects (PersistentVolumes,
+StorageClasses, VolumeSnapshotClasses) that a Role can never grant, so a
+namespaced install refuses them **up front with an actionable message**
+instead of retrying forever:
+
+- **`target.populator` restores** — use `target.pvc`/`target.pvcRef`, or
+  install with `installScope: cluster`.
+- **`copyMethod: Snapshot`/`Clone` backups** (CSI staging) — set
+  `copyMethod: Direct` on the `SnapshotPolicy`. Note `copyMethod`
+  **defaults to `Snapshot`**, so an untouched policy hits this refusal; the
+  message spells out the fix.
+
+///
+
 /// note | RBAC for the optional web UI
 
 If you use the [web UI](server.md) (`spec.server` on a `Repository`/`ClusterRepository`), the controller manages `Deployments`, `Services`, `ConfigMaps`, and `Secrets` for the kopia server pod. That RBAC ships with the chart in both scopes — nothing extra to grant. The feature is off until you add a `spec.server` block.

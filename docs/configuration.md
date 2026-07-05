@@ -161,10 +161,28 @@ static credential Secret.
 
 The operator itself. The settings worth knowing:
 
-- **`replicaCount` + `leaderElection`** — run more than one replica for HA. Only
-  the elected leader reconciles; Kopiur's deterministic jitter (derived from
-  `(scheduleUID, slot)`) keeps schedules identical across replicas and
-  across failover, so HA never doubles or skews a scheduled backup.
+- **`replicaCount` + `leaderElection`** — run more than one replica for HA.
+  With `leaderElection.enabled` (the default) the replicas elect a leader via a
+  `coordination.k8s.io/v1` Lease in the release namespace (named after the
+  release): only the Lease holder runs reconcilers, while standby replicas stay
+  Ready (probes and `/metrics` are served by every replica) and take over
+  within ~15s (the lease duration) if the leader dies — or **immediately** on a
+  graceful shutdown, where the outgoing leader releases the Lease so rolling
+  upgrades don't stall reconciliation. A leader that loses its Lease exits and
+  re-enters the election on restart — fail-fast beats a split-brain
+  double-reconcile. If the leases RBAC is missing (e.g. a new image under an
+  old chart), the controller logs a loud error and runs **without** election
+  rather than crash-looping. Kopiur's deterministic jitter (derived from
+  `(scheduleUID, slot)`) keeps schedules identical across replicas and across
+  failover, so HA never doubles or skews a scheduled backup.
+
+/// warning | Don't run replicas > 1 with leaderElection disabled
+
+`leaderElection.enabled: false` removes the Lease RBAC and the election
+entirely — every replica then reconciles concurrently, duplicating mover Jobs
+and racing status writes. Only disable it at `replicaCount: 1`.
+
+///
 - **`extraVolumes` / `extraVolumeMounts`** — the way to make a **filesystem
   backend** reachable in-process (hostPath / NFS / PVC), so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath

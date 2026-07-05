@@ -279,12 +279,27 @@ pub async fn resolve_source_colocation(
             node = pv_hostname_from_affinity(&pv);
         }
         // VolumeAttachment (volume still attached though the pod is gone).
+        // Cluster-scoped: a namespaced install's Role RBAC can never grant it,
+        // so a 403 degrades to "no node discovered" (the RBAC's documented
+        // contract — co-location there relies on the consuming-pod lookup
+        // above) instead of wedging the whole reconcile.
         if node.is_none() {
-            let attachments = Api::<VolumeAttachment>::all(client.clone())
+            match Api::<VolumeAttachment>::all(client.clone())
                 .list(&ListParams::default())
-                .await?
-                .items;
-            node = attached_node_from_list(&attachments, &pv_name);
+                .await
+            {
+                Ok(attachments) => {
+                    node = attached_node_from_list(&attachments.items, &pv_name);
+                }
+                Err(kube::Error::Api(e)) if e.code == 403 => {
+                    tracing::debug!(
+                        pv = %pv_name,
+                        "cannot list VolumeAttachments (namespaced-scope install); relying on \
+                         the consuming-pod lookup for co-location"
+                    );
+                }
+                Err(e) => return Err(Error::Kube(e)),
+            }
         }
     }
 

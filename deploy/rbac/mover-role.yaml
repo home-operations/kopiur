@@ -13,7 +13,6 @@ rules:
   - snapshots/status
   - restores/status
   - repositories/status
-  - clusterrepositories/status
   - maintenances/status
   - snapshotpolicies/status
   - repositoryreplications/status

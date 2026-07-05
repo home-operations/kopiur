@@ -175,6 +175,11 @@ pub struct Context {
     /// unset (e.g. running out-of-cluster), in which case the cluster-repo
     /// placement is surfaced as unresolved rather than guessed.
     pub operator_namespace: Option<String>,
+    /// The install scope (`--cluster-scope` / `--namespace`). Reconcile-time
+    /// LISTs of kopiur CRs (e.g. the catalog scan) must match it: a
+    /// cluster-wide LIST under a namespaced install's Role RBAC is a permanent
+    /// 403 that wedges the reconcile.
+    pub watch_scope: crate::config::WatchScope,
 }
 
 impl Context {
@@ -196,6 +201,7 @@ impl Context {
         maintenance_store: Store<Maintenance>,
         maintenance_synced: Arc<AtomicBool>,
         operator_namespace: Option<String>,
+        watch_scope: crate::config::WatchScope,
     ) -> Self {
         Context {
             client,
@@ -212,6 +218,7 @@ impl Context {
             maintenance_store,
             maintenance_synced,
             operator_namespace,
+            watch_scope,
         }
     }
 

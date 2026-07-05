@@ -48,6 +48,11 @@ rand = "0.9"
 serial_test = { workspace = true }
 tower = { workspace = true }
 http = "1"
+# Collect mock request bodies in the leader-election protocol tests.
+http-body-util = "0.1"
+# `test-util` enables paused tokio time (`start_paused`) so the renewal-loss
+# test drives RENEW_PERIOD sleeps instantly.
+tokio = { workspace = true, features = ["test-util"] }
 # Parse minted certs in webhook_tls tests to assert SANs + CA chaining. Matches
 # the version rcgen pulls via its `x509-parser` feature.
 x509-parser = "0.18"

@@ -71,3 +71,29 @@ tests:
           content:
             name: KOPIUR_MOVER_ROLE_KIND
             value: ClusterRole
+
+  # --- leader election (controller.leaderElection.enabled, default on) -------
+
+  - it: "leader election (default) passes --leader-elect=true and the release-scoped Lease name"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --leader-elect=true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_LEASE_NAME
+            value: RELEASE-NAME-kopiur
+
+  - it: "leader election disabled passes --leader-elect=false and no Lease name"
+    set:
+      controller.leaderElection.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --leader-elect=false
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_LEASE_NAME
+            value: RELEASE-NAME-kopiur

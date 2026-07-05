@@ -116,6 +116,17 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     let name = restore.name_any();
     let api: Api<Restore> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    // A populator restore rebinds cluster-scoped PersistentVolumes and reads
+    // StorageClasses — permanent 403s under a namespaced install's Role RBAC.
+    // Refuse up front with the fix (Structural: surfaced as an event + long
+    // requeue) instead of letting the handshake wedge on retried 403s while
+    // the consumer PVC sits Pending with no explanation.
+    if matches!(restore.spec.target, RestoreTarget::Populator(_))
+        && matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_))
+    {
+        return Err(Error::Validation(populator_needs_cluster_scope_message()));
+    }
+
     let state = populator_state(&restore.spec.target);
 
     // Already terminal: a Restore is one-shot. Once Completed/Failed there is

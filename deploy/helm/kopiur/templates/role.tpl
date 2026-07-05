@@ -127,6 +127,22 @@ rules:
     resources:
       - rolebindings
     verbs: [get, create, update, patch]
+  {{- if .Values.controller.leaderElection.enabled }}
+  # Leader election (--leader-elect): the controller claims/renews ONE Lease in
+  # the release namespace. get/update are resourceName-scoped to it; create
+  # cannot be name-scoped (no resourceName at create time) but stays
+  # namespace-local. SYNCED from xtask (leader_election_rules).
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs: [create]
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    resourceNames:
+      - {{ include "kopiur.fullname" . }}
+    verbs: [get, update]
+  {{- end }}
   {{- if eq (include "kopiur.webhook.selfManaged" .) "true" }}
   # Self-managed webhook TLS (webhook.tls.mode: self): writing the serving Secret
   # (namespace-local). create is unscoped (no resourceName at create time); the

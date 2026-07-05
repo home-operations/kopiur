@@ -469,15 +469,19 @@ pub async fn scan(
         ScanOwner::Repository { name, .. } | ScanOwner::ClusterRepository { name } => name,
     };
 
-    // One cluster-wide LIST serves both sides of the plan: this repository's
+    // One install-scope-wide LIST serves both sides of the plan: this repository's
     // discovered rows (by the dedup labels — always controller-stamped) AND the
-    // produced snapshots whose ids must never be re-discovered. Cluster-wide on
-    // purpose: a ClusterRepository's rows live in many namespaces, and a
-    // SnapshotPolicy may reference a Repository across namespaces. No label
-    // selector: a bare `kubectl create` manual Snapshot may carry no origin
-    // label, and missing it here would duplicate it as a discovered row. The
-    // LIST is refresh-gated (default 1h), not per-reconcile.
-    let all_api: Api<Snapshot> = Api::all(ctx.client.clone());
+    // produced snapshots whose ids must never be re-discovered. Cluster-wide in
+    // cluster scope on purpose: a ClusterRepository's rows live in many
+    // namespaces, and a SnapshotPolicy may reference a Repository across
+    // namespaces. In namespaced scope the LIST is narrowed to the release
+    // namespace — Role RBAC makes a cluster-wide LIST a permanent 403 (which
+    // wedged every namespaced Repository at Initializing), and both cross-
+    // namespace cases above are structurally out of a namespaced install's
+    // world. No label selector: a bare `kubectl create` manual Snapshot may
+    // carry no origin label, and missing it here would duplicate it as a
+    // discovered row. The LIST is refresh-gated (default 1h), not per-reconcile.
+    let all_api: Api<Snapshot> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
     let all_snapshots = all_api.list(&ListParams::default()).await?.items;
     let rows = rows_for(repo_uid, &all_snapshots);
     let produced_ids = produced_ids_for(owner, &all_snapshots);

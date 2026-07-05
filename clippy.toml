@@ -1,0 +1,5 @@
+# Threshold for clippy::cognitive_complexity (the `mise run complexity` /
+# `complexity-check` tasks). 25 is clippy's default — pinned here so the
+# complexity ratchet is stable across toolchain bumps. The lint is
+# allow-by-default, so the ordinary `mise run clippy` gate is unaffected.
+cognitive-complexity-threshold = 25

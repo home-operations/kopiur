@@ -51,8 +51,15 @@ pub struct WebhookArgs {
 
 /// Value parser for [`WEBHOOK_ADDR_ENV`]/`--addr`. A typo'd bind address must
 /// fail loudly at startup with the what/why/fix, mirroring the controller's
-/// `KOPIUR_HTTP_ADDR` contract — never silently bind the default.
+/// `KOPIUR_HTTP_ADDR` contract — never silently bind the default. An EMPTY
+/// value means "unset" (the default): the chart can render an env var as `""`,
+/// and clap consults the env before any downstream filter could run.
 fn parse_webhook_addr(value: &str) -> Result<SocketAddr, String> {
+    let value = if value.is_empty() {
+        DEFAULT_ADDR
+    } else {
+        value
+    };
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
             "KOPIUR_WEBHOOK_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
