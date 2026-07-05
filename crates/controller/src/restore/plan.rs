@@ -73,6 +73,21 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => PopulatorState::DirectTarget,
     }
 }
+
+/// Actionable refusal for a populator `Restore` under a namespaced install
+/// (what / why / fix — pure so the text is unit-asserted). The populator
+/// handshake reads StorageClasses and rebinds PersistentVolumes, both
+/// cluster-scoped: a namespaced install's Role RBAC can never grant them, so
+/// without this guard the reconcile just wedges on retried 403s while the
+/// consumer PVC sits Pending unexplained.
+pub fn populator_needs_cluster_scope_message() -> String {
+    "target.populator is not available in a namespaced install (installScope: namespaced): \
+     the volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, \
+     which are cluster-scoped and cannot be granted by the install's Role RBAC. Use \
+     target.pvc or target.pvcRef for a direct restore, or reinstall with \
+     installScope=cluster to use the populator."
+        .to_string()
+}
 /// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
 /// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
 /// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC

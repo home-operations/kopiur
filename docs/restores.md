@@ -216,7 +216,7 @@ See [Permissions](permissions.md) for how to choose the UID/GID and when a privi
 
 The headline pattern: commit one bundle and apply it to **any** cluster. On a fresh cluster pointed at an existing repository, the PVC restores the latest snapshot before the app starts; on a brand-new repository, the PVC comes up empty and is backed up going forward. No "is this a new install or a recovery?" branching.
 
-The mechanism is a **passive `Restore`** (`source.fromPolicy`, `target.populator: {}`, `onMissingSnapshot: Continue`) consumed by a PVC's `dataSourceRef` as a volume populator. The full manifest is [example 05](examples.md#example-05--deploy-or-restore-gitops). The same `Restore` keeps serving claims for its whole life — tear the app's PVC down and stand it back up (a `kubectl delete` + re-apply, a namespace rebuild, a migration) and the new PVC is populated again from the pinned snapshot, no change to the `Restore` needed (see [the reusability note above](#populator--passive-populator-mode)).
+The mechanism is a **passive `Restore`** (`source.fromPolicy`, `target.populator: {}`, `onMissingSnapshot: Continue`) consumed by a PVC's `dataSourceRef` as a volume populator. The full manifest is [example 05](examples.md#example-05--deploy-or-restore-gitops). The same `Restore` keeps serving claims for its whole life — tear the app's PVC down and stand it back up (a `kubectl delete` + re-apply, a namespace rebuild, a migration) and the new PVC is populated again from the pinned snapshot, no change to the `Restore` needed (see [the reusability note above](#populator---passive-populator-mode)).
 
 /// note | Kubernetes ≥ 1.24
 

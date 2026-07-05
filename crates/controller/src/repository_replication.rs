@@ -32,7 +32,7 @@ use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
-use crate::snapshot::{backend_to_repository_connect, job_terminal_state, mover_pull_policy_pub};
+use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
 
 /// How long a finished replication Job lingers before TTL-reaping.
@@ -225,7 +225,7 @@ async fn spawn_replication_job(
         namespace,
         &[&repo.backend, &repl.spec.destination],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await?;
@@ -280,7 +280,7 @@ async fn spawn_replication_job(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

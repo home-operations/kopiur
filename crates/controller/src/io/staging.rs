@@ -147,6 +147,19 @@ fn stack_missing_message(provisioner: &str) -> String {
     )
 }
 
+/// Message for a namespaced install (Role-only RBAC), where the cluster-scoped
+/// reads/deletes CSI staging needs (StorageClasses, VolumeSnapshotClasses,
+/// VolumeSnapshotContents) can never be granted — and `copyMethod` defaults to
+/// `Snapshot`, so an untouched policy lands here blindly.
+fn namespaced_install_cannot_stage_message() -> String {
+    format!(
+        "this is a namespaced install (installScope: namespaced), whose Role RBAC cannot \
+         read the cluster-scoped StorageClass/VolumeSnapshotClass objects CSI staging \
+         requires; set copyMethod: Direct, or reinstall with installScope=cluster. \
+         {COPY_METHOD_DEFAULTED_NOTE}."
+    )
+}
+
 /// Message for [`REASON_SOURCE_NOT_CSI`] when the source PVC has no `storageClassName` /
 /// CSI provisioner at all (a statically-provisioned or hostPath-backed volume) — the
 /// other common "no CSI available" failure a default-`Snapshot` user can hit blindly.
@@ -673,6 +686,7 @@ pub(crate) fn vs_wait_outcome(
 /// create is SSA over a deterministic name.
 pub async fn resolve_staging(
     client: &kube::Client,
+    scope: &crate::config::WatchScope,
     policy: &SnapshotPolicy,
     ns: &str,
     snapshot_cr: &str,
@@ -684,6 +698,18 @@ pub async fn resolve_staging(
     // downstream).
     if copy_method == CopyMethod::Direct {
         return Ok(StagingOutcome::NotApplicable);
+    }
+    // Staging reads StorageClasses/VolumeSnapshotClasses and deletes
+    // VolumeSnapshotContents — all cluster-scoped, all permanent 403s under a
+    // namespaced install's Role RBAC. Refuse up front with the fix instead of
+    // wedging the reconcile on retried 403s (and since copyMethod DEFAULTS to
+    // Snapshot, an untouched policy lands here — the message carries the
+    // default-changed note like every other staging refusal).
+    if matches!(scope, crate::config::WatchScope::Namespaced(_)) {
+        return Ok(StagingOutcome::Failed {
+            reason: REASON_SOURCE_NOT_CSI,
+            message: namespaced_install_cannot_stage_message(),
+        });
     }
     let Some(source) = policy.spec.sources.first() else {
         return Ok(StagingOutcome::NotApplicable);

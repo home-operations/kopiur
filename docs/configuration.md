@@ -61,7 +61,12 @@ scheme.
 
 All three images share a `registry` and (for controller/webhook) a `pullPolicy`,
 each overridable per-image. Each image takes a `tag` (defaults to the chart's
-`appVersion` when empty) or a `digest`.
+`appVersion` when empty) or a `digest`. `image.mover.pullPolicy` sets the
+`imagePullPolicy` on every mover **Job** pod the controller creates (`Always` /
+`IfNotPresent` / `Never`); when unset, the controller infers `IfNotPresent`
+whenever an explicit mover image is configured (so a pinned, e.g.
+locally-loaded, image is never re-pulled) and otherwise leaves the cluster
+default in charge.
 
 /// warning | Digest-pin the mover in production
 
@@ -156,10 +161,28 @@ static credential Secret.
 
 The operator itself. The settings worth knowing:
 
-- **`replicaCount` + `leaderElection`** — run more than one replica for HA. Only
-  the elected leader reconciles; Kopiur's deterministic jitter (derived from
-  `(scheduleUID, slot)`) keeps schedules identical across replicas and
-  across failover, so HA never doubles or skews a scheduled backup.
+- **`replicaCount` + `leaderElection`** — run more than one replica for HA.
+  With `leaderElection.enabled` (the default) the replicas elect a leader via a
+  `coordination.k8s.io/v1` Lease in the release namespace (named after the
+  release): only the Lease holder runs reconcilers, while standby replicas stay
+  Ready (probes and `/metrics` are served by every replica) and take over
+  within ~15s (the lease duration) if the leader dies — or **immediately** on a
+  graceful shutdown, where the outgoing leader releases the Lease so rolling
+  upgrades don't stall reconciliation. A leader that loses its Lease exits and
+  re-enters the election on restart — fail-fast beats a split-brain
+  double-reconcile. If the leases RBAC is missing (e.g. a new image under an
+  old chart), the controller logs a loud error and runs **without** election
+  rather than crash-looping. Kopiur's deterministic jitter (derived from
+  `(scheduleUID, slot)`) keeps schedules identical across replicas and across
+  failover, so HA never doubles or skews a scheduled backup.
+
+/// warning | Don't run replicas > 1 with leaderElection disabled
+
+`leaderElection.enabled: false` removes the Lease RBAC and the election
+entirely — every replica then reconciles concurrently, duplicating mover Jobs
+and racing status writes. Only disable it at `replicaCount: 1`.
+
+///
 - **`extraVolumes` / `extraVolumeMounts`** — the way to make a **filesystem
   backend** reachable in-process (hostPath / NFS / PVC), so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath
@@ -290,6 +313,43 @@ mover honors the same level and format.
   deprecated `controller.logLevel`.
 - **`format`** — `text` (human-readable, default) or `json` (one structured
   object per line for Loki / ELK / Datadog).
+
+## Flags & environment variables
+
+You normally configure Kopiur through the Helm values above — the chart turns
+them into environment variables on the controller and webhook Deployments.
+Under the hood, every one of those knobs is also a **command-line flag** on the
+binary, with the env var as its fallback (**flag > env var > built-in
+default**). Run any binary with `--help` for the full, self-documenting list:
+
+```console
+$ kopiur-controller --help   # every knob, its KOPIUR_* env var, and its default
+$ kopiur-webhook --help
+$ kopiur-mover --help        # ready / serve subcommands + run-once mode
+```
+
+The flags matter in two situations:
+
+- **Running a binary outside the chart** (local development, a custom
+  deployment): `kopiur-controller --mover-image ghcr.io/… --http-addr '[::]:8081'`
+  beats exporting env vars by hand.
+- **`controller.extraArgs`** — extra flags are now actually parsed. That cuts
+  both ways: a valid flag works, and an unknown or malformed one fails the
+  container at startup with an actionable usage error (previously extra args
+  were silently ignored).
+
+/// warning | Malformed values now fail loudly at startup
+
+A typo'd configuration value used to be silently swallowed: a garbage
+`KOPIUR_WORKER_THREADS` fell back to the default, and a misspelled boolean
+(e.g. `KOPIUR_STREAMING_LISTS=ture`) silently meant "off". Every value is now
+validated at startup — an unparseable number, boolean, socket address,
+role kind, or pull policy stops the process with a message naming the variable,
+the accepted values, and the fix. Chart-rendered values are unaffected (the
+chart only emits valid ones); hand-set `extraEnv` / `extraArgs` values get the
+loud failure instead of a silent mis-configuration.
+
+///
 
 ## Pod security
 

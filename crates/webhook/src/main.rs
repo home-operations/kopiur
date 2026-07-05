@@ -1,22 +1,29 @@
 //! kopiur admission webhook server (ADR-0003 §5.3).
 //!
-//! Serves the admission router over HTTPS when TLS cert/key paths are provided via
-//! env, otherwise over plain HTTP (for in-cluster use behind a service mesh, or for
-//! local testing) with a loud warning. TLS is entirely runtime/env-gated, so the
+//! Serves the admission router over HTTPS when TLS cert/key paths are provided
+//! (flags with env fallback, see [`kopiur_webhook::config::WebhookArgs`]),
+//! otherwise over plain HTTP (for in-cluster use behind a service mesh, or for
+//! local testing) with a loud warning. TLS is entirely runtime-gated, so the
 //! binary builds and starts without any cert files present.
 //!
-//! Environment:
-//! - `KOPIUR_WEBHOOK_ADDR`     bind address (default `0.0.0.0:8443`).
-//! - `KOPIUR_WEBHOOK_TLS_CERT` PEM cert chain path (enables TLS when set with key).
-//! - `KOPIUR_WEBHOOK_TLS_KEY`  PEM private key path.
-//! - `RUST_LOG`                tracing filter (default `info`).
+//! Configuration (flag > env > default):
+//! - `--addr`     / `KOPIUR_WEBHOOK_ADDR`     bind address (default `0.0.0.0:8443`).
+//! - `--tls-cert` / `KOPIUR_WEBHOOK_TLS_CERT` PEM cert chain path (enables TLS with the key).
+//! - `--tls-key`  / `KOPIUR_WEBHOOK_TLS_KEY`  PEM private key path.
+//! - `RUST_LOG`                               tracing filter (default `info`).
 
+use clap::Parser as _;
 use kopiur_webhook::app;
+use kopiur_webhook::config::WebhookArgs;
 use std::net::SocketAddr;
 use tokio::signal;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse first: a bad flag/env value must fail the process with clap's
+    // actionable message before any subsystem starts.
+    let args = WebhookArgs::parse();
+
     // Tracing subscriber (fmt + OTLP traces/logs when configured). Held for the
     // process lifetime so buffered OTLP data flushes on shutdown.
     let _telemetry = kopiur_telemetry::init_tracing("kopiur-webhook")?;
@@ -25,9 +32,7 @@ async fn main() -> anyhow::Result<()> {
     // rustls ServerConfig). Ignore the error if a provider is already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let addr: SocketAddr = std::env::var(kopiur_webhook::config::WEBHOOK_ADDR_ENV)
-        .unwrap_or_else(|_| kopiur_webhook::config::DEFAULT_ADDR.to_string())
-        .parse()?;
+    let addr = args.addr;
 
     // Best-effort kube client. If unavailable (no kubeconfig / not in-cluster), the
     // webhook still serves; ClusterRepository tenancy checks then fail closed.
@@ -47,10 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
     let router = app(client);
 
-    let cert = std::env::var(kopiur_webhook::config::WEBHOOK_TLS_CERT_ENV).ok();
-    let key = std::env::var(kopiur_webhook::config::WEBHOOK_TLS_KEY_ENV).ok();
-
-    match (cert, key) {
+    match (args.tls_cert, args.tls_key) {
         (Some(cert), Some(key)) => {
             tracing::info!(%addr, cert, key, "serving admission webhook over HTTPS");
             serve_tls(addr, router, &cert, &key).await

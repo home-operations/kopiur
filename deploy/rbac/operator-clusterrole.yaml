@@ -275,3 +275,43 @@ subjects:
 - kind: ServiceAccount
   name: kopiur-controller
   namespace: kopiur-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/name: kopiur
+  name: kopiur-leader-election
+  namespace: kopiur-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+- apiGroups:
+  - coordination.k8s.io
+  resourceNames:
+  - kopiur-leader
+  resources:
+  - leases
+  verbs:
+  - get
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: kopiur
+  name: kopiur-leader-election
+  namespace: kopiur-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kopiur-leader-election
+subjects:
+- kind: ServiceAccount
+  name: kopiur-controller
+  namespace: kopiur-system

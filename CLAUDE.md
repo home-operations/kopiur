@@ -102,6 +102,8 @@ one. Mise is mandatory and pins the Rust toolchain plus required components.
 mise run build
 mise run test                  # hermetic: unit/serde/validation. No cluster, no network.
 mise run clippy
+mise run complexity-check      # cognitive-complexity ratchet: offender count must not grow
+mise run complexity            # advisory: list every function above the threshold
 mise run fmt-check
 mise run gen                   # regenerate deploy/crds + RBAC (M3+)
 mise run gen-check             # CI drift guard: fails if checked-in artifacts are stale

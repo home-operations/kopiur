@@ -116,6 +116,17 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     let name = restore.name_any();
     let api: Api<Restore> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    // A populator restore rebinds cluster-scoped PersistentVolumes and reads
+    // StorageClasses — permanent 403s under a namespaced install's Role RBAC.
+    // Refuse up front with the fix (Structural: surfaced as an event + long
+    // requeue) instead of letting the handshake wedge on retried 403s while
+    // the consumer PVC sits Pending with no explanation.
+    if matches!(restore.spec.target, RestoreTarget::Populator(_))
+        && matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_))
+    {
+        return Err(Error::Validation(populator_needs_cluster_scope_message()));
+    }
+
     let state = populator_state(&restore.spec.target);
 
     // Already terminal: a Restore is one-shot. Once Completed/Failed there is
@@ -1210,7 +1221,7 @@ async fn run_restore_mover(
         namespace,
         &[&repo.backend],
         ctx.mover_service_account.as_deref(),
-        &ctx.mover_role_kind,
+        ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
     )
     .await
@@ -1529,7 +1540,7 @@ async fn run_restore_mover(
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
-        image_pull_policy: crate::snapshot::mover_pull_policy_pub(),
+        image_pull_policy: ctx.mover_pull_policy(),
         limits: {
             let mut l = restore_job_limits(restore);
             if l.ttl_seconds_after_finished.is_none() {

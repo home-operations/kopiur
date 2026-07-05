@@ -214,11 +214,6 @@ pub(crate) fn repository_connect_pub(repo: &ResolvedRepository) -> Result<Reposi
     repository_connect(repo)
 }
 
-/// Public wrapper for the mover image pull policy (reused by restore).
-pub(crate) fn mover_pull_policy_pub() -> Option<&'static str> {
-    mover_pull_policy()
-}
-
 /// Map a `Repository`'s backend to the mover's `RepositoryConnect`.
 ///
 /// Exhaustive over every CRD `Backend` variant — a new backend cannot compile
@@ -310,13 +305,6 @@ pub(crate) fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64)
     )
 }
 
-/// `IfNotPresent` when running against a locally-loaded mover image (kind e2e),
-/// else `None` (cluster default). Controlled by the same env that picks the
-/// image so the two stay consistent.
-pub(super) fn mover_pull_policy() -> Option<&'static str> {
-    if std::env::var(crate::config::MOVER_IMAGE_ENV).is_ok() {
-        Some("IfNotPresent")
-    } else {
-        None
-    }
-}
+// The mover imagePullPolicy decision moved to
+// `crate::config::effective_mover_pull_policy` (pure, unit-tested there);
+// reconcilers reach it via `ctx.mover_pull_policy()`.

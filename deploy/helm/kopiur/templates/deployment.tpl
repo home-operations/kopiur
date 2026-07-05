@@ -55,6 +55,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.controller.leaderElection.enabled }}
+            # Leader-election Lease name: the release fullname, so two releases
+            # sharing a namespace never contend on the same Lease.
+            - name: KOPIUR_LEASE_NAME
+              value: {{ include "kopiur.fullname" . | quote }}
+            {{- end }}
             # The mover image the controller stamps into every Backup/Restore Job.
             - name: KOPIUR_MOVER_IMAGE
               value: {{ include "kopiur.image" (dict "root" $ "img" .Values.image.mover) | quote }}

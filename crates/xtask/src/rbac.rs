@@ -40,6 +40,12 @@ const DEFAULT_NAMESPACE: &str = "kopiur-system";
 /// `kopiur-mover` ServiceAccount by a controller-minted RoleBinding; the SA and
 /// binding are created at runtime, so only the role itself is shipped here.
 const MOVER_CLUSTERROLE_NAME: &str = "kopiur-mover";
+/// Name of the leader-election Role + RoleBinding the cluster artifact pairs
+/// with its ClusterRole (the Lease is namespace-local; see [`leader_election_rules`]).
+const LEADER_ROLE_NAME: &str = "kopiur-leader-election";
+/// Default election Lease name (`KOPIUR_LEASE_NAME` unset — off-chart runs).
+/// Matches `kopiur_controller::config::DEFAULT_LEASE_NAME`.
+const DEFAULT_LEASE_NAME: &str = "kopiur-leader";
 const MOVER_ROLE_NAME: &str = "kopiur-mover";
 
 /// CRD plurals whose `.status` the mover PATCHes (the dynamic `targetRef` kinds).
@@ -242,6 +248,28 @@ fn workload_rules() -> Vec<PolicyRule> {
     ]
 }
 
+/// Leader election (`--leader-elect` / `controller.leaderElection.enabled`):
+/// the controller claims and renews a `coordination.k8s.io/v1` Lease in its own
+/// namespace (`crates/controller/src/leader.rs`). `get`/`update` (the CAS
+/// renew/claim is a `replace`) are `resourceName`-scoped to the one Lease the
+/// protocol ever touches; `create` cannot be name-scoped (the authorizer can't
+/// match a name at create time) but stays namespace-local. No `list`/`watch` —
+/// the protocol polls its one Lease by name. Deliberately a namespaced Role in
+/// BOTH install flavours (the cluster artifact pairs its ClusterRole with a
+/// small Role+RoleBinding): a cluster-wide leases grant would let the operator
+/// re-stamp node-heartbeat Leases or steal other controllers' elections.
+fn leader_election_rules(lease_name: &str) -> Vec<PolicyRule> {
+    vec![
+        rule(&["coordination.k8s.io"], &["leases".into()], &["create"]),
+        rule_named(
+            &["coordination.k8s.io"],
+            &["leases".into()],
+            &["get", "update"],
+            &[lease_name.into()],
+        ),
+    ]
+}
+
 /// RBAC for self-managed webhook TLS (`webhook.tls.mode: self`): the controller
 /// mints its own serving certificate and injects the `caBundle` into its webhook
 /// configurations, removing the cert-manager dependency. Carried by both install
@@ -293,9 +321,17 @@ fn webhook_cert_secret_rules() -> Vec<PolicyRule> {
 /// Nothing else — credentials are env-mounted (no `secrets` access) and the work
 /// spec is a mounted volume (no `configmaps` get for it). This is deliberately a
 /// tiny subset of [`workload_rules`]; the mover runs as its own least-privilege SA.
-fn mover_rules() -> Vec<PolicyRule> {
+///
+/// `cluster` decides whether `clusterrepositories/status` is included. The
+/// namespaced mover Role must EXCLUDE it: RBAC escalation prevention rejects a
+/// RoleBinding whose referenced role grants permissions the binder does not
+/// hold, and the operator's namespaced Role can never hold a cluster-scoped
+/// kind — so an "inert parity" entry here made the controller's runtime
+/// RoleBinding mint 403 and blocked EVERY mover in a namespaced install.
+fn mover_rules(cluster: bool) -> Vec<PolicyRule> {
     let statuses: Vec<String> = MOVER_STATUS_CRDS
         .iter()
+        .filter(|c| cluster || **c != "clusterrepositories")
         .map(|c| format!("{c}/status"))
         .collect();
     vec![
@@ -390,6 +426,9 @@ fn cluster_artifact() -> Result<Artifact> {
     // ClusterRole.
     rules.extend(webhook_cert_cluster_rules());
     rules.extend(webhook_cert_secret_rules());
+    // Leader election deliberately NOT here: the Lease is namespace-local, so
+    // the cluster artifact pairs this ClusterRole with a small Role+RoleBinding
+    // below instead of granting leases cluster-wide.
 
     let clusterrole = ClusterRole {
         metadata: metadata(CLUSTERROLE_NAME, None),
@@ -417,7 +456,35 @@ fn cluster_artifact() -> Result<Artifact> {
         }]),
     };
 
-    let content = document(&[render(&sa)?, render(&clusterrole)?, render(&binding)?]);
+    // Leader election: the Lease is namespace-local, so pair the ClusterRole
+    // with a small Role+RoleBinding instead of a cluster-wide leases grant
+    // (which would reach node-heartbeat and other controllers' Leases).
+    let leader_role = Role {
+        metadata: metadata(LEADER_ROLE_NAME, Some(DEFAULT_NAMESPACE)),
+        rules: Some(leader_election_rules(DEFAULT_LEASE_NAME)),
+    };
+    let leader_binding = RoleBinding {
+        metadata: metadata(LEADER_ROLE_NAME, Some(DEFAULT_NAMESPACE)),
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "Role".to_string(),
+            name: LEADER_ROLE_NAME.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: SA_NAME.to_string(),
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            api_group: None,
+        }]),
+    };
+
+    let content = document(&[
+        render(&sa)?,
+        render(&clusterrole)?,
+        render(&binding)?,
+        render(&leader_role)?,
+        render(&leader_binding)?,
+    ]);
     Ok(Artifact::new(
         "rbac/operator-clusterrole.yaml".to_string(),
         content,
@@ -436,6 +503,8 @@ fn namespaced_artifact() -> Result<Artifact> {
     // cannot live in a Role — a self-mode namespaced install pairs this Role with
     // the small ClusterRole the chart renders.
     rules.extend(webhook_cert_secret_rules());
+    // Leader election Lease (lives in the release namespace, so a Role covers it).
+    rules.extend(leader_election_rules(DEFAULT_LEASE_NAME));
 
     let role = Role {
         metadata: metadata(ROLE_NAME, Some(DEFAULT_NAMESPACE)),
@@ -475,7 +544,7 @@ fn namespaced_artifact() -> Result<Artifact> {
 fn mover_cluster_artifact() -> Result<Artifact> {
     let clusterrole = ClusterRole {
         metadata: metadata(MOVER_CLUSTERROLE_NAME, None),
-        rules: Some(mover_rules()),
+        rules: Some(mover_rules(true)),
         ..Default::default()
     };
     let content = document(&[render(&clusterrole)?]);
@@ -486,12 +555,14 @@ fn mover_cluster_artifact() -> Result<Artifact> {
 }
 
 /// Generate the namespaced mover `Role` (namespaced-install mode). Same minimal
-/// rules as the ClusterRole; the controller mints the SA + RoleBinding in the
-/// workload namespace at runtime.
+/// rules as the ClusterRole MINUS `clusterrepositories/status` (see
+/// [`mover_rules`] — an entry the binder can't hold trips RBAC escalation
+/// prevention on the controller's runtime RoleBinding mint); the controller
+/// mints the SA + RoleBinding in the workload namespace at runtime.
 fn mover_namespaced_artifact() -> Result<Artifact> {
     let role = Role {
         metadata: metadata(MOVER_ROLE_NAME, Some(DEFAULT_NAMESPACE)),
-        rules: Some(mover_rules()),
+        rules: Some(mover_rules(false)),
     };
     let content = document(&[render(&role)?]);
     Ok(Artifact::new("rbac/mover-role.yaml".to_string(), content))

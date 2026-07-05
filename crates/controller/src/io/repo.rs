@@ -477,11 +477,27 @@ pub async fn request_repository_reverify(
 /// set, or its `status.phase` is `Terminating`. Used by the `Snapshot` finalizer to
 /// decide the namespace-deletion cascade (ADR-0005 §5). A missing Namespace (already
 /// gone) counts as terminating — the namespace is clearly being removed. A transient
-/// read error propagates so the caller can back off rather than guess.
+/// read error propagates so the caller can back off rather than guess — EXCEPT a
+/// `403`: a namespaced-scope install has Role-only RBAC and can never read the
+/// (cluster-scoped) Namespace, and blocking every Snapshot deletion on that would
+/// wedge finalizers forever. There the answer is "not terminating" (normal deletion
+/// semantics apply) — and if the namespace really is going away, the operator in it
+/// is going away too.
 pub async fn namespace_is_terminating(client: &kube::Client, namespace: &str) -> Result<bool> {
     use k8s_openapi::api::core::v1::Namespace;
     let api: Api<Namespace> = Api::all(client.clone());
-    match api.get_opt(namespace).await? {
+    let got = match api.get_opt(namespace).await {
+        Ok(got) => got,
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            tracing::debug!(
+                namespace,
+                "cannot read Namespace (namespaced-scope install); assuming not terminating"
+            );
+            return Ok(false);
+        }
+        Err(e) => return Err(Error::Kube(e)),
+    };
+    match got {
         None => Ok(true),
         Some(ns) => {
             let has_ts = ns.metadata.deletion_timestamp.is_some();
