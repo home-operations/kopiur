@@ -15,3 +15,59 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+
+  # --- bind address + probes + extraEnv -------------------------------------
+
+  - it: defaults the webhook bind address to the dual-stack wildcard
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_WEBHOOK_ADDR
+            value: "[::]:8443"
+
+  - it: stamps a custom webhook listenAddr into the env
+    set:
+      webhook.listenAddr: "0.0.0.0:8443"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_WEBHOOK_ADDR
+            value: "0.0.0.0:8443"
+
+  - it: renders the default webhook probes over HTTPS
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.scheme
+          value: HTTPS
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+
+  - it: lets a user retune a webhook probe timing
+    set:
+      webhook.livenessProbe.periodSeconds: 30
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.periodSeconds
+          value: 30
+
+  - it: drops a webhook probe when nulled out
+    set:
+      webhook.readinessProbe: null
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].readinessProbe
+
+  - it: appends webhook.extraEnv after the managed env
+    set:
+      webhook.extraEnv:
+        - name: MY_WEBHOOK_EXTRA
+          value: hi
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MY_WEBHOOK_EXTRA
+            value: hi

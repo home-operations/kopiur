@@ -118,18 +118,14 @@ spec:
             - name: metrics
               containerPort: {{ .Values.controller.probePort }}
               protocol: TCP
+          {{- with .Values.controller.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: metrics
-            initialDelaySeconds: 10
-            periodSeconds: 15
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.controller.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: metrics
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
           securityContext:

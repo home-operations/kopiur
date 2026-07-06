@@ -53,7 +53,7 @@ put authentication in front of it, and restrict who can reach the `Service` with
 | `namespace` | string | — | **`ClusterRepository` only, required** — which namespace the server objects land in (a cluster-scoped owner has no implicit namespace). |
 
 There is no `enabled` field: **presence of `spec.server` is "on"**, absence is
-"off". See the [full field reference](field-reference.md#serverspec).
+"off". See the [full field reference](field-reference.md#repository-spec-server).
 
 ## How to deploy it
 

@@ -114,11 +114,22 @@ pub struct BootstrapSpec {
 pub struct RepositoryHealthSpec {
     /// Index-blob count above which the reconciler raises the `IndexBlobHealth` warning (`0` disables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_index_blob_warn_threshold")]
     pub index_blob_warn_threshold: Option<i64>,
     /// Opt-in periodic backend health probe: re-connect a `Ready` repository on a
     /// timer to confirm the kopia repository still exists at the backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<RepositoryHealthProbeSpec>,
+}
+
+/// schemars default for [`RepositoryHealthSpec::index_blob_warn_threshold`] —
+/// [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`](crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD).
+/// Returns the field's `Option` type so schemars 1 emits the schema `default:`
+/// (which the apiserver materializes on admission). Safe because
+/// `resolve_index_blob_warn_threshold` resolves an absent field to exactly this
+/// constant — server-side defaulting changes the stored shape, not behavior.
+fn default_index_blob_warn_threshold() -> Option<i64> {
+    Some(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
 }
 
 /// Opt-in backend health probe, shared by `Repository` and `ClusterRepository`.
@@ -145,12 +156,30 @@ pub struct RepositoryHealthProbeSpec {
     /// How often to re-probe the backend (Go-style duration like `30m` or `1h`;
     /// minimum `30s`, default `30m`). Inert unless `enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_health_probe_interval")]
     pub interval: Option<String>,
     /// How many *consecutive* failing probes to require before raising the loud
     /// condition + event (default `3`). Debounces a single transient blip from
     /// alarming or nudging a destructive manual recreate. Any success resets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_health_probe_failure_threshold")]
     pub failure_threshold: Option<i64>,
+}
+
+/// schemars default for [`RepositoryHealthProbeSpec::interval`] — the string
+/// form of [`DEFAULT_HEALTH_PROBE_INTERVAL`](crate::consts::DEFAULT_HEALTH_PROBE_INTERVAL)
+/// (`30m`). `effective_interval` resolves an absent/unparseable value to that
+/// same duration, so materializing `30m` is behavior-preserving; the field is
+/// inert unless `probe.enabled`. A unit test pins `"30m"` to the constant.
+fn default_health_probe_interval() -> Option<String> {
+    Some("30m".to_string())
+}
+
+/// schemars default for [`RepositoryHealthProbeSpec::failure_threshold`] —
+/// [`DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD`](crate::consts::DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD)
+/// (`3`), matching `effective_failure_threshold`'s absent→CONST resolution.
+fn default_health_probe_failure_threshold() -> Option<i64> {
+    Some(crate::consts::DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD)
 }
 
 impl RepositoryHealthProbeSpec {
@@ -194,7 +223,8 @@ impl RepositoryHealthProbeSpec {
 /// `spec.health`. Pure, so it's shared by the admission webhook, the controller,
 /// and tests without forking the default/disable semantics:
 ///
-/// * absent spec or unset field ⇒ [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`],
+/// * absent spec or unset field ⇒
+///   [`DEFAULT_INDEX_BLOB_WARN_THRESHOLD`](crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD),
 /// * `Some(0)` ⇒ `0` (the sentinel that disables the warning),
 /// * `Some(n)` ⇒ `n`.
 ///
@@ -356,6 +386,61 @@ mod tests {
     use crate::common::RepositoryMode;
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn repository_schema_emits_context_free_defaults() {
+        // brume's complaint: "everything is usually null for the defaults" in the
+        // CRD/JSON schema. These context-free constants must surface as a schema
+        // `default:` (visible in kubectl explain / the YAML language server, and
+        // consumed by the generated field reference). The apiserver materializes
+        // them server-side, which is safe ONLY because each field's resolver maps
+        // absent → exactly this value (see the paired default fns).
+        let crd = Repository::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["properties"]["health"]["properties"]["indexBlobWarnThreshold"]["default"],
+            serde_json::json!(1000)
+        );
+        assert_eq!(
+            spec["properties"]["health"]["properties"]["probe"]["properties"]["interval"]["default"],
+            serde_json::json!("30m")
+        );
+        assert_eq!(
+            spec["properties"]["health"]["properties"]["probe"]["properties"]["failureThreshold"]["default"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            spec["properties"]["catalog"]["properties"]["refreshInterval"]["default"],
+            serde_json::json!("1h")
+        );
+        assert_eq!(
+            spec["properties"]["server"]["properties"]["service"]["properties"]["port"]["default"],
+            serde_json::json!(51515)
+        );
+    }
+
+    #[test]
+    fn health_probe_interval_schema_default_matches_the_duration_constant() {
+        // The schema default is a STRING ("30m") but the controller resolves an
+        // absent value to the Duration constant. If someone changes the constant
+        // without the string (or vice-versa), server-side defaulting would
+        // materialize a value that no longer equals the resolver's fallback.
+        let s = default_health_probe_interval().expect("some");
+        assert_eq!(
+            crate::duration::parse_go_duration(&s),
+            Some(crate::consts::DEFAULT_HEALTH_PROBE_INTERVAL),
+            "default_health_probe_interval() string must parse to DEFAULT_HEALTH_PROBE_INTERVAL"
+        );
+        assert_eq!(
+            default_health_probe_failure_threshold(),
+            Some(crate::consts::DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD)
+        );
+        assert_eq!(
+            default_index_blob_warn_threshold(),
+            Some(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
+        );
+    }
 
     #[test]
     fn mode_suspend_and_ecc_roundtrip() {

@@ -190,16 +190,18 @@ and racing status writes. Only disable it at `replicaCount: 1`.
 - **`resources`** — only **requests** are set by default; there are intentionally
   **no limits** (the `limits` block ships commented out). Uncomment and tune it to
   your own measured ceiling if you want them.
-- **`listenAddr`** (env `KOPIUR_HTTP_ADDR`, default `0.0.0.0:8081`) — the
+- **`listenAddr`** (env `KOPIUR_HTTP_ADDR`, default `[::]:8081`) — the
   address the controller's HTTP server (`/metrics`, `/healthz`, `/readyz`)
-  binds to. You need this only on an **IPv6-only or dual-stack cluster**: the
-  kubelet can't reach an IPv4-only `0.0.0.0` bind there, so the liveness/
-  readiness probes never succeed and the pod never goes Ready — set
-  `controller.listenAddr: "[::]:8081"` to fix it. The port must stay in sync
-  with `probePort` below (the Service and the probes target that port, not
-  whatever `listenAddr` happens to contain); an unparseable `listenAddr`
-  fails the controller at startup with an actionable error instead of
-  silently falling back to the default.
+  binds to. The default is the **dual-stack wildcard `[::]`**, which serves
+  both IPv4 and IPv6 kubelets (a wildcard IPv6 bind also accepts IPv4 on Linux
+  when `net.ipv6.bindv6only=0`, the default), so probes work on either. You
+  only need to change it on a host where **IPv6 is disabled in the pod network
+  namespace**: there a `[::]` bind fails outright, so set
+  `controller.listenAddr: "0.0.0.0:8081"`. The port must stay in sync with
+  `probePort` below (the Service and the probes target that port, not whatever
+  `listenAddr` happens to contain); an unparseable `listenAddr` fails the
+  controller at startup with an actionable error instead of silently falling
+  back to the default.
 
 /// note | Why the controller ships with no memory limit
 

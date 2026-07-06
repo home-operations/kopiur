@@ -97,3 +97,62 @@ tests:
           content:
             name: KOPIUR_LEASE_NAME
             value: RELEASE-NAME-kopiur
+
+  # --- bind address + probes ------------------------------------------------
+
+  - it: defaults the controller bind address to the dual-stack wildcard
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_HTTP_ADDR
+            value: "[::]:8081"
+
+  - it: stamps a custom controller listenAddr into the env
+    set:
+      controller.listenAddr: "0.0.0.0:8081"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_HTTP_ADDR
+            value: "0.0.0.0:8081"
+
+  - it: renders the default controller probes
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.periodSeconds
+          value: 15
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+
+  - it: lets a user retune a controller probe timing
+    set:
+      controller.readinessProbe.periodSeconds: 30
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.periodSeconds
+          value: 30
+
+  - it: drops a controller probe when nulled out
+    set:
+      controller.livenessProbe: null
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].livenessProbe
+
+  - it: appends controller.extraEnv after the managed env
+    set:
+      controller.extraEnv:
+        - name: MY_EXTRA
+          value: hello
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MY_EXTRA
+            value: hello

@@ -55,10 +55,45 @@
           "type": "object"
         },
         "listenAddr": {
-          "default": "0.0.0.0:8081",
-          "description": "Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;\nserves /metrics, /healthz, /readyz). Override on an IPv6-only/dual-stack\ncluster, where the kubelet cannot reach an IPv4-only bind (0.0.0.0) and\nprobes never succeed — set \"[::]:8081\" there. Must agree on port with\nprobePort below (the Service and probes target that port, not whatever\nthis address happens to contain).",
+          "default": "[::]:8081",
+          "description": "Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;\nserves /metrics, /healthz, /readyz). Defaults to the dual-stack wildcard\n\"[::]:8081\", which serves both IPv4 and IPv6 kubelets (a wildcard IPv6 bind\nalso accepts IPv4 on Linux when net.ipv6.bindv6only=0, the default).\nOverride to \"0.0.0.0:8081\" only where IPv6 is disabled in the pod network\nnamespace, where a \"[::]\" bind fails outright. Must agree on port with\nprobePort below (the Service and probes target that port, not whatever\nthis address happens to contain).",
           "title": "listenAddr",
           "type": "string"
+        },
+        "livenessProbe": {
+          "description": "Liveness probe for the controller container. The whole probe is passed\nthrough with `toYaml`, so you can retune timings/thresholds or swap the\nscheme entirely; set to `{}` to drop the probe. `port: metrics` is the named\ncontainer port (probePort above).",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "metrics",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 10,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 15,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "livenessProbe",
+          "type": "object"
         },
         "logLevel": {
           "default": "info",
@@ -94,6 +129,41 @@
           "description": "Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).",
           "title": "probePort",
           "type": "integer"
+        },
+        "readinessProbe": {
+          "description": "Readiness probe for the controller container (same passthrough as\nlivenessProbe; set to `{}` to drop it).",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "metrics",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 10,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "readinessProbe",
+          "type": "object"
         },
         "replicaCount": {
           "default": 1,
@@ -742,6 +812,14 @@
           "title": "enabled",
           "type": "boolean"
         },
+        "extraEnv": {
+          "description": "Extra environment variables for the webhook container (list of\n`{name, value}` / `{name, valueFrom}` entries), appended after the\noperator-managed env. Mirrors `controller.extraEnv`.",
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
         "failurePolicy": {
           "default": "Fail",
           "description": "failurePolicy for both webhook configurations: Fail (fail-closed,\nrecommended for a backup operator — ADR §7.2) or Ignore.",
@@ -749,10 +827,50 @@
           "type": "string"
         },
         "listenAddr": {
-          "default": "0.0.0.0:8443",
-          "description": "Address the webhook server binds to (env KOPIUR_WEBHOOK_ADDR).",
+          "default": "[::]:8443",
+          "description": "Address the webhook server binds to (env KOPIUR_WEBHOOK_ADDR). Defaults\nto the dual-stack wildcard \"[::]:8443\" (serves both IPv4 and IPv6 API\nservers); override to \"0.0.0.0:8443\" only where IPv6 is disabled in the pod\nnetwork namespace.",
           "title": "listenAddr",
           "type": "string"
+        },
+        "livenessProbe": {
+          "description": "Liveness probe for the webhook container. Passed through with `toYaml`\n(retune timings/thresholds or swap the probe; `{}` drops it). The webhook\nonly serves HTTPS, so `scheme: HTTPS` on the named `https` port.",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "https",
+                  "title": "port",
+                  "type": "string"
+                },
+                "scheme": {
+                  "default": "HTTPS",
+                  "title": "scheme",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 15,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "livenessProbe",
+          "type": "object"
         },
         "nodeSelector": {
           "required": [],
@@ -773,6 +891,46 @@
           "default": "",
           "title": "priorityClassName",
           "type": "string"
+        },
+        "readinessProbe": {
+          "description": "Readiness probe for the webhook container (same passthrough as\nlivenessProbe; set to `{}` to drop it).",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "https",
+                  "title": "port",
+                  "type": "string"
+                },
+                "scheme": {
+                  "default": "HTTPS",
+                  "title": "scheme",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 10,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "readinessProbe",
+          "type": "object"
         },
         "replicaCount": {
           "default": 1,
