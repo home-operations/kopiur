@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/home-operations/kopiur/compare/0.5.2...0.6.0) (2026-07-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **chart:** regroup values to the org operator-chart shape ([#203](https://github.com/home-operations/kopiur/issues/203)) (#206)
+
+### Features
+
+* **chart:** regroup values to the org operator-chart shape ([#203](https://github.com/home-operations/kopiur/issues/203)) ([#206](https://github.com/home-operations/kopiur/issues/206)) ([abe07d6](https://github.com/home-operations/kopiur/commit/abe07d65df62de99835e3b0ef8b1bef114cb2532))
+* **config:** clap flags with env fallback for controller, webhook and mover ([#204](https://github.com/home-operations/kopiur/issues/204)) ([7524f75](https://github.com/home-operations/kopiur/commit/7524f753f55131b218f5822397776ecf1c0aca9f))
+* **docs:** generate the CRD field reference; emit hidden schema defaults; dual-stack binds; Helm env/probes ([#205](https://github.com/home-operations/kopiur/issues/205)) ([2de7030](https://github.com/home-operations/kopiur/commit/2de703084fcd41f87afc3ef05e5640bd7ca016a7))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.5.2 manifest ([6d2a155](https://github.com/home-operations/kopiur/commit/6d2a155ca6d068ecffcf843fadf8c10c3a760028))
+
 ## [0.5.2](https://github.com/home-operations/kopiur/compare/0.5.1...0.5.2) (2026-07-04)
 
 
