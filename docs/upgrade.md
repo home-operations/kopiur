@@ -60,17 +60,18 @@ flux get helmrelease kopiur -n kopiur-system
 **2. Pin the CRDs so the upgrade cannot delete them.** Annotating the live CRDs with
 `helm.sh/resource-policy: keep` makes Helm **skip the prune**, so the CRDs — and every
 CR they hold — survive; the new `crds/`-directory install then finds them already
-present and does nothing.
+present and does nothing. The CRDs carry no distinguishing label, so select them by
+their API group:
 
 ```bash
 # Run BEFORE upgrading / reconciling to 0.6.0
-for crd in $(kubectl get crd -l app.kubernetes.io/part-of=kopiur -o name); do
+for crd in $(kubectl get crd -o name | grep kopiur.home-operations.com); do
   kubectl annotate "$crd" helm.sh/resource-policy=keep --overwrite
 done
 ```
 
-If the label selector returns nothing on your install, annotate the eight CRDs by name
-instead:
+Prefer an explicit list? Annotate the eight CRDs by name — equivalent, and it errors
+loudly if one is missing rather than silently matching nothing:
 
 ```bash
 for name in repositories clusterrepositories snapshotpolicies snapshots \
@@ -80,12 +81,28 @@ for name in repositories clusterrepositories snapshotpolicies snapshots \
 done
 ```
 
-Confirm the annotation landed before going further — every row should end in `keep`:
+Confirm the annotation landed before going further — every kopiur CRD must show `keep`:
 
 ```bash
-kubectl get crd -l app.kubernetes.io/part-of=kopiur \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.helm\.sh/resource-policy}{"\n"}{end}'
+kubectl get crd -o custom-columns='NAME:.metadata.name,KEEP:.metadata.annotations.helm\.sh/resource-policy' \
+  | grep -E 'NAME|kopiur.home-operations.com'
 ```
+
+/// note | Flux / Argo: the pin survives reconciles
+The `keep` annotation is read from the **live** CRD at the instant Helm would prune it,
+and Flux's helm-controller (like Argo) runs the same Helm engine — so the pin is honored
+under GitOps exactly as on the CLI. Helm's three-way merge only strips fields it
+previously set, so a reconcile will not remove an annotation you added out of band.
+
+- If you run helm-controller **drift detection** (`spec.driftDetection.mode: enabled`),
+  it can revert that out-of-band annotation while you are still on 0.5.x. Leave drift
+  detection off for the cutover, or add the annotation immediately before you trigger the
+  reconcile.
+- You do **not** need to change `spec.upgrade.crds` for safety — the pinned CRDs persist
+  whatever its value. Set it to `CreateReplace` if you also want the **0.6.0 CRD schema**
+  applied on upgrade (safe — replacing a CRD keeps its CRs); otherwise apply
+  `deploy/crds/` yourself (see [CRD lifecycle](install.md#crd-lifecycle)).
+///
 
 **3. Migrate your Helm values to the 0.6.0 layout.** 0.6.0 **restructured the chart
 values** (the other half of the breaking change). Notably: the old `controller.*` block
@@ -117,7 +134,7 @@ flux reconcile helmrelease kopiur -n kopiur-system --with-source
 should still be there:
 
 ```bash
-kubectl get crd -l app.kubernetes.io/part-of=kopiur   # still 8
+kubectl get crd | grep kopiur.home-operations.com   # expect 8 lines
 kubectl get repositories,clusterrepositories,snapshots,restores,snapshotpolicies,snapshotschedules,maintenances -A
 ```
 
@@ -126,7 +143,7 @@ only stops Helm from ever deleting the CRDs, which is exactly what the 0.6.0 `cr
 directory already guarantees. To drop it:
 
 ```bash
-for crd in $(kubectl get crd -l app.kubernetes.io/part-of=kopiur -o name); do
+for crd in $(kubectl get crd -o name | grep kopiur.home-operations.com); do
   kubectl annotate "$crd" helm.sh/resource-policy-
 done
 ```

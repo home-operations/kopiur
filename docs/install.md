@@ -28,7 +28,7 @@ kubectl -n kopiur-system rollout status deploy/kopiur-controller
 kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 
 # 3. Confirm the 8 CRDs are registered.
-kubectl get crd -l app.kubernetes.io/part-of=kopiur
+kubectl get crd | grep kopiur.home-operations.com
 ```
 
 ## Webhook TLS

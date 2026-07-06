@@ -65,8 +65,7 @@ $ helm install kopiur deploy/helm/kopiur \
 ```console
 $ kubectl -n kopiur-system rollout status deploy/kopiur-controller
 $ kubectl -n kopiur-system rollout status deploy/kopiur-webhook
-$ kubectl get crd -l app.kubernetes.io/part-of=kopiur
-NAME                                                  CREATED AT
+$ kubectl get crd | grep kopiur.home-operations.com
 snapshotpolicies.kopiur.home-operations.com           ...
 snapshots.kopiur.home-operations.com                  ...
 snapshotschedules.kopiur.home-operations.com          ...

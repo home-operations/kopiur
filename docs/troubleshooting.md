@@ -294,7 +294,7 @@ that one crossing Helm prunes the old release-owned CRDs and cascade-deletes eve
 `kopiur.home-operations.com` object — this is expected, not a bug in the operator.
 
 ```console
-$ kubectl get crd -l app.kubernetes.io/part-of=kopiur   # gone or fewer than 8?
+$ kubectl get crd | grep kopiur.home-operations.com   # gone or fewer than 8?
 ```
 
 Pin the CRDs **before** upgrading to avoid it, or recover from Git afterwards — both
