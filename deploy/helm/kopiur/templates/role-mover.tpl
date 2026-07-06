@@ -1,5 +1,5 @@
 {{- if eq .Values.installScope "namespaced" -}}
-# Least-privilege mover Role (ADR §4.12, namespaced-install mode). RBAC rules SYNCED
+# Least-privilege mover Role (namespaced-install mode). RBAC rules SYNCED
 # from `cargo xtask gen-rbac` (deploy/rbac/mover-role.yaml) — that xtask is the
 # SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
 #

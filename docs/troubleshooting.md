@@ -287,6 +287,20 @@ $ kubectl get snapshotschedule <name> -n <ns> \
 - If the operator was down across a slot and `startingDeadlineSeconds` elapsed, that slot is skipped on purpose (no late stampede).
 - Repeated failures show up as `status.consecutiveFailures`; the failing `Snapshot` CRs (bounded by `failedJobsHistoryLimit`) carry the reason.
 
+## CRDs or CRs disappeared after upgrading to 0.6.0
+
+Upgrading **from 0.5.x to 0.6.0** moves the CRDs into Helm's `crds/` directory. On
+that one crossing Helm prunes the old release-owned CRDs and cascade-deletes every
+`kopiur.home-operations.com` object — this is expected, not a bug in the operator.
+
+```console
+$ kubectl get crd | grep kopiur.home-operations.com   # gone or fewer than 8?
+```
+
+Pin the CRDs **before** upgrading to avoid it, or recover from Git afterwards — both
+are in [Upgrading → 0.5.x → 0.6.0](upgrade.md#upgrading-05x--060-one-time-crd-migration).
+Your kopia snapshots are untouched; only the Kubernetes CR objects are affected.
+
 ## Maintenance isn't running
 
 Maintenance waits for the repository and coordinates a single owner. Check the `Maintenance` resource:

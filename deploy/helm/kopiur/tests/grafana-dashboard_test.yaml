@@ -18,7 +18,7 @@ tests:
   - it: ships the sidecar ConfigMap when enabled
     template: grafana-dashboard.tpl
     set:
-      grafanaDashboard.enabled: true
+      monitoring.dashboards.enabled: true
     asserts:
       - hasDocuments:
           count: 1
@@ -36,7 +36,7 @@ tests:
   - it: does not ship the operator CR in sidecar mode
     template: grafana-dashboard-operator.tpl
     set:
-      grafanaDashboard.enabled: true
+      monitoring.dashboards.enabled: true
     asserts:
       - hasDocuments:
           count: 0
@@ -44,9 +44,9 @@ tests:
   - it: renders the GrafanaDashboard CR in operator mode
     template: grafana-dashboard-operator.tpl
     set:
-      grafanaDashboard.enabled: true
-      grafanaDashboard.grafanaOperator.enabled: true
-      grafanaDashboard.grafanaOperator.matchLabels:
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
+      monitoring.dashboards.grafanaOperator.matchLabels:
         dashboards: grafana
     asserts:
       - hasDocuments:
@@ -74,8 +74,8 @@ tests:
   - it: does not ship the sidecar ConfigMap in operator mode
     template: grafana-dashboard.tpl
     set:
-      grafanaDashboard.enabled: true
-      grafanaDashboard.grafanaOperator.enabled: true
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
     asserts:
       - hasDocuments:
           count: 0
@@ -83,9 +83,9 @@ tests:
   - it: sets the operator folder when provided
     template: grafana-dashboard-operator.tpl
     set:
-      grafanaDashboard.enabled: true
-      grafanaDashboard.grafanaOperator.enabled: true
-      grafanaDashboard.grafanaOperator.folder: Backups
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
+      monitoring.dashboards.grafanaOperator.folder: Backups
     asserts:
       - equal:
           path: spec.folder
@@ -94,9 +94,9 @@ tests:
   - it: places the CR in the override namespace
     template: grafana-dashboard-operator.tpl
     set:
-      grafanaDashboard.enabled: true
-      grafanaDashboard.grafanaOperator.enabled: true
-      grafanaDashboard.namespace: grafana
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
+      monitoring.dashboards.namespace: grafana
     asserts:
       - equal:
           path: metadata.namespace

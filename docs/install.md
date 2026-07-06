@@ -28,7 +28,7 @@ kubectl -n kopiur-system rollout status deploy/kopiur-controller
 kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 
 # 3. Confirm the 8 CRDs are registered.
-kubectl get crd -l app.kubernetes.io/part-of=kopiur
+kubectl get crd | grep kopiur.home-operations.com
 ```
 
 ## Webhook TLS
@@ -74,12 +74,12 @@ helm install kopiur deploy/helm/kopiur -n kopiur-system --set webhook.enabled=fa
 
 ## Install scope
 
-| Mode                 | `--set installScope=` | RBAC        | Manages                | `ClusterRepository` |
-| -------------------- | --------------------- | ----------- | ---------------------- | ------------------- |
-| Namespaced (default) | `namespaced`          | Role        | release namespace only | not reconciled      |
-| Cluster              | `cluster`             | ClusterRole | cluster-wide           | reconciled          |
+| Mode               | `--set installScope=` | RBAC        | Manages                | `ClusterRepository` |
+| ------------------ | --------------------- | ----------- | ---------------------- | ------------------- |
+| Cluster (default)  | `cluster`             | ClusterRole | cluster-wide           | reconciled          |
+| Namespaced         | `namespaced`          | Role        | release namespace only | not reconciled      |
 
-Use **cluster** scope for a shared platform repository (`ClusterRepository`) referenced by many tenant namespaces. See `deploy/examples/02-cluster-repository.yaml`.
+**Cluster** is the default so a shared platform repository (`ClusterRepository`) referenced by many tenant namespaces works out of the box — a namespace-scoped `Role` silently disables the cluster-scoped `ClusterRepository` kind. See `deploy/examples/02-cluster-repository.yaml`. Choose **namespaced** as the explicit least-privilege opt-down for a single-team install.
 
 In namespaced scope the controller's watches are narrowed to the release
 namespace to match the Role-only RBAC (the chart passes
@@ -112,21 +112,21 @@ If you use the [web UI](server.md) (`spec.server` on a `Repository`/`ClusterRepo
 
 ## CRD lifecycle
 
-`installCRDs: true` (default) installs the 8 CRDs as Helm **templates**, so the flag is honored and `helm upgrade` re-applies schema changes.
+The 8 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
 
-> Caution: with templated CRDs, `helm uninstall kopiur` deletes the CRDs **and
-> every `kopiur.home-operations.com` object in the cluster** (Repositories, Snapshots, ...). For an
-> alpha API this is the intended, predictable behavior. To decouple CRD lifecycle
-> from the release (e.g. GitOps), install with `--set installCRDs=false` and apply
-> the generated CRDs out of band:
+> Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it** — you must apply the new CRDs yourself:
 >
 > ```bash
 > # Server-side apply is required: the SnapshotPolicy CRD embeds a full JobSpec
 > # (runJob hook) and is too large for the client-side last-applied annotation.
-> kubectl apply --server-side -f deploy/crds/all-crds.yaml
+> kubectl apply --server-side -f deploy/crds/
 > ```
+>
+> A GitOps flow (Flux/Argo with a `CreateReplace` sync policy) applies CRD changes automatically. Anyone managing CRDs entirely out of band just applies `deploy/crds/` themselves — `helm install` skips the ones that already exist.
 
 The CRDs and RBAC shipped by the chart are **generated** by `cargo xtask gen-crds` / `cargo xtask gen-rbac` and checked in under `deploy/crds/` and `deploy/rbac/`. Those xtasks are the source of truth.
+
+Upgrading **from 0.5.x to 0.6.0** is a special case: the CRDs used to be release-owned templates and moved into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first. See [Upgrading → 0.5.x → 0.6.0](upgrade.md#upgrading-05x--060-one-time-crd-migration) before you upgrade.
 
 ## First backup
 
@@ -152,11 +152,11 @@ Eight runnable walkthroughs live in `deploy/examples/`:
 
 ## Observability
 
-- The controller serves `/metrics`, `/healthz`, and `/readyz` on its probe port (`:8081`); the webhook serves `/metrics` on its TLS port. All metrics are under the `kopiur_` namespace.
-- On an **IPv6-only or dual-stack cluster**, the kubelet can't reach the controller's default IPv4-only bind (`0.0.0.0:8081`), so its probes never succeed and the pod never goes Ready. Set `controller.listenAddr: "[::]:8081"` to fix it — see [Helm chart values → Controller Deployment](configuration.md#controller-deployment) for the full detail (env `KOPIUR_HTTP_ADDR`; the port must stay in sync with `controller.probePort`).
-- `metrics.enabled=true` (default) creates a metrics `Service`.
-- `metrics.serviceMonitor.enabled=true` creates a Prometheus-Operator `ServiceMonitor` (requires the Prometheus-Operator CRDs); `metrics.prometheusRule.enabled=true` ships the kopiur alert rules.
-- `grafanaDashboard.enabled=true` ships the Grafana dashboard as a sidecar-discoverable `ConfigMap` (source: `deploy/dashboards/kopiur.json`). Set `grafanaDashboard.grafanaOperator.enabled=true` to instead render a [grafana-operator](https://grafana.github.io/grafana-operator/) `GrafanaDashboard` CR from the same JSON (use `grafanaDashboard.grafanaOperator.matchLabels` to select the Grafana instance).
+- The controller serves `/metrics`, `/healthz`, and `/readyz` on its single port (`metrics.port`, default `:8081`); the webhook serves `/metrics` on its TLS port (`webhook.port`, default `:8443`). All metrics are under the `kopiur_` namespace.
+- The controller and webhook default to the **dual-stack wildcard bind** (`[::]:8081` / `[::]:8443`), which serves both IPv4 and IPv6 kubelets/API servers, so probes work out of the box on either. The chart renders `[::]:<port>` into `KOPIUR_HTTP_ADDR` (controller) and `KOPIUR_WEBHOOK_ADDR` (webhook). On a host where **IPv6 is disabled in the pod network namespace** a `[::]` bind fails outright — force an IPv4-only bind by adding `KOPIUR_HTTP_ADDR=0.0.0.0:8081` through the controller's `extraEnv`. See [Helm chart values → Controller Deployment](configuration.md#controller-deployment) for the full detail.
+- The controller's metrics `Service` is **always** created (the `:8081` listener co-hosts `/metrics` with the probes, so there's nothing to disable).
+- `monitoring.serviceMonitor.enabled=true` creates a Prometheus-Operator `ServiceMonitor` (requires the Prometheus-Operator CRDs); `monitoring.prometheusRule.enabled=true` ships the kopiur alert rules.
+- `monitoring.dashboards.enabled=true` ships the Grafana dashboard as a sidecar-discoverable `ConfigMap` (source: `deploy/dashboards/kopiur.json`). Set `monitoring.dashboards.grafanaOperator.enabled=true` to instead render a [grafana-operator](https://grafana.github.io/grafana-operator/) `GrafanaDashboard` CR from the same JSON (use `monitoring.dashboards.grafanaOperator.matchLabels` to select the Grafana instance).
 - `observability.otlp.enabled=true` (with `observability.otlp.endpoint`) additionally exports OTLP **traces, logs, and a metrics push** from the controller, webhook, and mover Jobs. Off by default.
 
 Turn it all on with the ready-made overlay:
@@ -171,9 +171,11 @@ See [`docs/dev/observability.md`](dev/observability.md) for the full metric list
 ## Upgrade / uninstall
 
 ```bash
-helm upgrade kopiur deploy/helm/kopiur -n kopiur-system   # re-applies CRD schema
-helm uninstall kopiur -n kopiur-system                     # see CRD caution above
+helm upgrade kopiur deploy/helm/kopiur -n kopiur-system   # does NOT touch crds/ — apply schema changes yourself (see CRD lifecycle)
+helm uninstall kopiur -n kopiur-system                     # leaves the crds/ CRDs (and your CRs) in place
 ```
+
+Upgrading **from 0.5.x** needs a one-time pre-step so the CRD move doesn't delete your resources — see [Upgrading](upgrade.md).
 
 ## See also
 

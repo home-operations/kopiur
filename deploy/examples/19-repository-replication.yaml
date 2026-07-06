@@ -1,4 +1,4 @@
-# Example 19 — Repository replication (the "2" in 3-2-1) (ADR-0005 §13(d))
+# Example 19 — Repository replication (the "2" in 3-2-1)
 #
 # A RepositoryReplication mirrors a source repository's blobs to a SECOND backend
 # on a schedule (`kopia repository sync-to`). It is the off-site copy that turns a
@@ -59,6 +59,6 @@ spec:
   schedule:
     cron: "0 5 * * *" # nightly, after the 02:xx backups have landed
     jitter: 1h
-  # Pause replication without deleting the CR (ADR-0005 §14(e)).
+  # Pause replication without deleting the CR.
   suspend: false
 # --8<-- [end:replication]

@@ -1,4 +1,4 @@
-# Example 20 — Quiesce with hooks (ADR §4.8)
+# Example 20 — Quiesce with hooks
 #
 # App-consistent backups: hooks run IN THE WORKLOAD (the controller execs into
 # your pod; the mover never runs hooks) around the snapshot. The classic pairing

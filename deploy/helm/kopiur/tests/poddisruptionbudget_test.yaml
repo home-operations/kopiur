@@ -1,0 +1,57 @@
+suite: poddisruptionbudget
+templates:
+  - poddisruptionbudget.tpl
+  - webhook-poddisruptionbudget.tpl
+tests:
+  - it: renders no controller PDB by default
+    template: poddisruptionbudget.tpl
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no webhook PDB by default
+    template: webhook-poddisruptionbudget.tpl
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the controller PDB when enabled
+    template: poddisruptionbudget.tpl
+    set:
+      podDisruptionBudget.enabled: true
+      podDisruptionBudget.minAvailable: 1
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-kopiur-controller
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: controller
+
+  - it: renders the webhook PDB when enabled
+    template: webhook-poddisruptionbudget.tpl
+    set:
+      webhook.podDisruptionBudget.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-kopiur-webhook
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: webhook
+
+  - it: omits the webhook PDB when the webhook is disabled
+    template: webhook-poddisruptionbudget.tpl
+    set:
+      webhook.enabled: false
+      webhook.podDisruptionBudget.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

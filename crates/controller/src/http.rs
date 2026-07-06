@@ -8,8 +8,10 @@ use crate::metrics::Metrics;
 ///
 /// `addr` is validated at parse time (`--http-addr`/`KOPIUR_HTTP_ADDR`, see
 /// [`crate::config::ControllerArgs`]), so a bind failure here is a genuine
-/// runtime issue (port in use, no permission), not a bad address.
+/// runtime issue (port in use, no permission, or IPv6 disabled on the host),
+/// not a bad address.
 pub(crate) async fn serve_http(metrics: Metrics, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
@@ -31,7 +33,13 @@ pub(crate) async fn serve_http(metrics: Metrics, addr: std::net::SocketAddr) -> 
         .route("/readyz", get(health))
         .with_state(metrics);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "binding the HTTP server to {addr}; if this host has IPv6 disabled a `[::]` bind \
+             fails — set KOPIUR_HTTP_ADDR=0.0.0.0:{} (via the chart's extraEnv)",
+            addr.port()
+        )
+    })?;
     tracing::info!(
         %addr,
         "http server listening (/metrics, /healthz, /readyz)"

@@ -157,10 +157,12 @@ and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
   the OS; mimalloc stays tight and decays dirty pages. (Chosen over jemalloc because it
   builds with only a C compiler — no make/autotools — so it compiles in the slim
   distroless builder image. Supersedes `MALLOC_ARENA_MAX`.)
-- **Streaming lists (opt-in).** `KOPIUR_STREAMING_LISTS` / `controller.streamingLists`
+- **Streaming lists (on by default).** `KOPIUR_STREAMING_LISTS` / `streamingLists`
   enables `Config::streaming_lists()` on the cluster-wide watches to cut peak memory on
-  the initial resync. Off by default — it needs apiserver WatchList support (beta 1.32,
-  GA 1.34).
+  the initial resync. **On by default** (the chart's `kubeVersion` floor is 1.32): it
+  needs apiserver WatchList support (beta 1.32/1.33, GA 1.34), so the controller gates
+  it on the server version at startup and falls back to paged lists below 1.32. Set
+  `streamingLists: false` only if your apiserver has the WatchList feature gate disabled.
 
 Observe it: `kopiur_process_resident_memory_bytes` (an observable gauge sampled from
 `/proc/self/statm` at scrape time) exposes the controller's RSS on `/metrics` and

@@ -1,4 +1,4 @@
-# Backend: Azure Blob Storage (ADR-0003 §3.1)
+# Backend: Azure Blob Storage
 #
 # Identifiers (container/prefix/storageAccount) live in the Repository spec;
 # credentials live in a Secret read by well-known keys.

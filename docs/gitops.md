@@ -166,8 +166,18 @@ is therefore a snapshot-gated **delete-and-repopulate**, not a silent `git push`
 back up, delete the old PVC, then let the populator-backed PVC provision. Plan the
 cutover deliberately.
 
+## Upgrading across the 0.6.0 CRD move
+
+Upgrading **from 0.5.x to 0.6.0** relocated the CRDs into Helm's `crds/` directory.
+Under GitOps that crossing removes and re-installs the CRDs (cascade-deleting your
+CRs) unless you pin them first, and recovering afterwards is a reconcile-from-Git —
+reinstall the release to recreate the CRDs, then reconcile the apps that own the CRs.
+The full pre-upgrade step and the Flux/Argo recovery sequence live on the
+[Upgrading](upgrade.md#upgrading-05x--060-one-time-crd-migration) page.
+
 ## See also
 
+- [Upgrading](upgrade.md) — the one-time 0.5.x → 0.6.0 CRD migration and recovery.
 - [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops) — the one-bundle GitOps pattern.
 - [Field reference](field-reference.md) — the conditions and status fields per kind.
 - [Observability](dev/observability.md) — metrics + the `resource_phase` gauge.

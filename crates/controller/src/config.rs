@@ -63,18 +63,21 @@ pub const OPERATOR_NAMESPACE_ENV: &str = "KOPIUR_NAMESPACE";
 pub const KOPIA_CACHE_DIR_ENV: &str = "KOPIUR_KOPIA_CACHE_DIR";
 
 /// Override for the address the controller's HTTP server (`/metrics`,
-/// `/healthz`, `/readyz`) binds to. Unset uses [`HTTP_ADDR`]. Needed on
-/// IPv6-only/dual-stack clusters, where the kubelet cannot reach an IPv4-only
-/// bind (`0.0.0.0`) and probes never succeed — set `[::]:8081` there. The port
-/// must agree with the chart's `controller.probePort` (the Service/probes
-/// target that port, not whatever `KOPIUR_HTTP_ADDR` happens to contain).
-/// Mirrors the webhook's `KOPIUR_WEBHOOK_ADDR` (`kopiur_webhook::config::WEBHOOK_ADDR_ENV`).
+/// `/healthz`, `/readyz`) binds to. Unset uses [`HTTP_ADDR`], which is `[::]`
+/// (dual-stack: a wildcard IPv6 bind also accepts IPv4 on Linux when
+/// `net.ipv6.bindv6only=0`, the default). Set `0.0.0.0:8081` only on a host
+/// where IPv6 is disabled in the pod network namespace, where a `[::]` bind
+/// fails outright. The port must agree with the chart's `metrics.port`
+/// (the Service/probes target that port, not whatever `KOPIUR_HTTP_ADDR`
+/// happens to contain). Mirrors the webhook's `KOPIUR_WEBHOOK_ADDR`
+/// (`kopiur_webhook::config::WEBHOOK_ADDR_ENV`).
 pub const HTTP_ADDR_ENV: &str = "KOPIUR_HTTP_ADDR";
 
 /// Default address the controller's HTTP server (`/metrics`, `/healthz`,
-/// `/readyz`) binds to when [`HTTP_ADDR_ENV`] is unset. Matches the chart's
-/// `controller.probePort` (8081).
-pub const HTTP_ADDR: &str = "0.0.0.0:8081";
+/// `/readyz`) binds to when [`HTTP_ADDR_ENV`] is unset. Dual-stack `[::]` so a
+/// single bind serves both IPv4 and IPv6 kubelets; matches the chart's
+/// `metrics.port` (8081).
+pub const HTTP_ADDR: &str = "[::]:8081";
 
 /// Number of tokio worker threads the controller runtime runs. The controller is
 /// I/O-bound — watch streams, debounced reconciles, short idempotent kopia calls —
@@ -90,11 +93,12 @@ pub const WORKER_THREADS_ENV: &str = "KOPIUR_WORKER_THREADS";
 /// a reconcile-heavy deployment.
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 
-/// Opt-in: use the Kubernetes WatchList streaming-list API for the controller's
+/// Use the Kubernetes WatchList streaming-list API for the controller's
 /// cluster-wide watches, cutting peak memory during the initial list/resync by
 /// streaming pages instead of buffering a full page set. Requires apiserver support
-/// (the `WatchList` feature: beta in 1.32, GA in 1.34), so it is OFF by default —
-/// older clusters are unaffected. The chart exposes it as `controller.streamingLists`.
+/// (the `WatchList` feature: beta in 1.32, GA in 1.34). The env/flag default is
+/// off; the chart exposes it as `streamingLists` (default on, gated at startup on
+/// the apiserver version — see `startup::effective_streaming_lists`).
 pub const STREAMING_LISTS_ENV: &str = "KOPIUR_STREAMING_LISTS";
 
 /// Gate for Lease-based leader election (`--leader-elect`). The chart stamps
@@ -547,18 +551,18 @@ impl ControllerArgs {
 
 /// Value parser for [`HTTP_ADDR_ENV`]/`--http-addr`. A typo'd probe address
 /// must fail loudly at startup, not silently bind the default and mask the
-/// operator's intent (most often an IPv6-only cluster that needed `[::]:8081`),
-/// so the message carries the what/why/fix in full. An EMPTY value means
-/// "unset" (the default) — the chart can render an env var as `""` (e.g. a
-/// nulled Helm value through `| quote`), and clap consults the env before
-/// `resolve()`'s empty-string filter can run.
+/// operator's intent (most often a host with IPv6 disabled that needed
+/// `0.0.0.0:8081`), so the message carries the what/why/fix in full. An EMPTY
+/// value means "unset" (the default) — the chart can render an env var as `""`
+/// (e.g. a nulled Helm value through `| quote`), and clap consults the env
+/// before `resolve()`'s empty-string filter can run.
 fn parse_http_addr(value: &str) -> Result<SocketAddr, String> {
     let value = if value.is_empty() { HTTP_ADDR } else { value };
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
             "KOPIUR_HTTP_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
-             0.0.0.0:8081 (IPv4), [::]:8081 (IPv6/dual-stack); unset it to use the default \
-             0.0.0.0:8081"
+             [::]:8081 (IPv6/dual-stack, the default), 0.0.0.0:8081 (IPv4-only, for hosts with \
+             IPv6 disabled); unset it to use the default [::]:8081"
         )
     })
 }

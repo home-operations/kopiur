@@ -1,4 +1,4 @@
-# Example 12 — Restore mover controls: UID/GID, cache & failure policy (ADR-0003 §3.1/§4.6/§4.11)
+# Example 12 — Restore mover controls: UID/GID, cache & failure policy
 #
 # A Restore writes data INTO a target PVC, so — exactly like a backup — the mover
 # must run as a UID/GID that can write there, may want a sized/warm kopia cache for

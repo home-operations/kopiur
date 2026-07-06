@@ -1,4 +1,4 @@
-# Backend: S3 with workload identity — IRSA / EKS Pod Identity (ADR-0003 §3.1, §4.11)
+# Backend: S3 with workload identity — IRSA / EKS Pod Identity
 #
 # No static AWS keys anywhere: the mover Jobs run as a ServiceAccount federated
 # to an IAM role, and kopia resolves credentials through the ambient AWS chain

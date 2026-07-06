@@ -1,4 +1,4 @@
-{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled -}}
+{{- if .Values.monitoring.serviceMonitor.enabled -}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -6,7 +6,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kopiur.labels" . | nindent 4 }}
-    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- with .Values.monitoring.serviceMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
@@ -19,13 +19,13 @@ spec:
   endpoints:
     - port: metrics
       path: /metrics
-      interval: {{ .Values.metrics.serviceMonitor.interval }}
-      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
-      {{- with .Values.metrics.serviceMonitor.relabelings }}
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+      {{- with .Values.monitoring.serviceMonitor.relabelings }}
       relabelings:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+      {{- with .Values.monitoring.serviceMonitor.metricRelabelings }}
       metricRelabelings:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -37,7 +37,10 @@ spec:
             description: Cron schedule that fires `Snapshot` CRs from a `SnapshotPolicy`.
             properties:
               failedJobsHistoryLimit:
-                description: Maximum number of failed `Snapshot` CRs from this schedule to retain.
+                default: 10
+                description: |-
+                  Maximum number of failed `Snapshot` CRs from this schedule to retain
+                  (default `10`; `0` keeps none).
                 format: uint32
                 minimum: 0.0
                 nullable: true

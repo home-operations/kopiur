@@ -29,50 +29,47 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "kopiur.serviceAccountName" . }}
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- include "kopiur.imagePullSecrets" . | nindent 6 }}
       {{- with .Values.webhook.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.webhook.podSecurityContext | nindent 8 }}
       containers:
         - name: webhook
-          image: {{ include "kopiur.image" (dict "root" $ "img" .Values.image.webhook) }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "kopiur.image" (dict "root" $ "img" .Values.webhook.image) }}
+          imagePullPolicy: {{ .Values.webhook.image.pullPolicy }}
           env:
             {{- include "kopiur.loggingEnv" . | nindent 12 }}
+            # Bind address rendered "[::]:<port>" from webhook.port (dual-stack
+            # wildcard); the Service maps 443 -> this port.
             - name: KOPIUR_WEBHOOK_ADDR
-              value: {{ .Values.webhook.listenAddr | quote }}
+              value: {{ printf "[::]:%v" .Values.webhook.port | quote }}
             - name: KOPIUR_WEBHOOK_TLS_CERT
               value: /tls/tls.crt
             - name: KOPIUR_WEBHOOK_TLS_KEY
               value: /tls/tls.key
             {{- include "kopiur.otlpEnv" . | nindent 12 }}
+            {{- with .Values.webhook.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: https
-              containerPort: {{ .Values.webhook.containerPort }}
+              containerPort: {{ .Values.webhook.port }}
               protocol: TCP
+          {{- with .Values.webhook.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: https
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            periodSeconds: 15
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.webhook.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: https
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.webhook.resources | nindent 12 }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- toYaml .Values.webhook.securityContext | nindent 12 }}
           volumeMounts:
             - name: tls
               mountPath: /tls
@@ -81,16 +78,20 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.webhook.tls.secretName }}
-      {{- with .Values.webhook.nodeSelector }}
+      {{- with (include "kopiur.nodeSelector" (dict "root" $ "component" .Values.webhook.nodeSelector)) }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
-      {{- with .Values.webhook.affinity }}
+      {{- with (include "kopiur.affinity" (dict "root" $ "component" .Values.webhook.affinity)) }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
-      {{- with .Values.webhook.tolerations }}
+      {{- with (include "kopiur.tolerations" (dict "root" $ "component" .Values.webhook.tolerations)) }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with (include "kopiur.topologySpreadConstraints" (dict "root" $ "component" .Values.webhook.topologySpreadConstraints)) }}
+      topologySpreadConstraints:
+        {{- . | nindent 8 }}
       {{- end }}
 {{- end }}

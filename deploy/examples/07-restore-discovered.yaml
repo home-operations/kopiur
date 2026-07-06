@@ -1,10 +1,10 @@
-# Example 07 — Restore from a discovered (foreign / pre-install) backup (ADR-0001 §5.7)
+# Example 07 — Restore from a discovered (foreign / pre-install) backup
 #
 # Snapshots the operator did NOT produce (a foreign kopia writer, or snapshots
 # that predate the install) are materialized as Snapshot CRs with
 # origin=discovered, living in the Repository's namespace. Discovered Backups are
 # forced to deletionPolicy: Retain — the operator never deletes data it did not
-# create (ADR §4.5).
+# create.
 #
 #   # list discovered snapshots in the repo namespace:
 #   kubectl get snapshots -n backups -l kopiur.home-operations.com/origin=discovered

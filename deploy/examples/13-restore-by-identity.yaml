@@ -1,4 +1,4 @@
-# Example 13 — Restore by raw kopia identity (ADR-0003 §4.6)
+# Example 13 — Restore by raw kopia identity
 #
 # When there is no `Snapshot` CR to point at — a snapshot written by a foreign kopia
 # client, or one that aged out of the catalog — restore by the raw kopia identity

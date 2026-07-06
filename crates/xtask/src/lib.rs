@@ -4,6 +4,7 @@
 pub mod artifact;
 pub mod crds;
 pub mod dashboards;
+pub mod docs;
 pub mod paths;
 pub mod rbac;
 
@@ -16,10 +17,12 @@ pub fn collect(cmd: &str) -> Result<Vec<Artifact>> {
     Ok(match cmd {
         "gen-crds" => crds::artifacts()?,
         "gen-rbac" => rbac::artifacts()?,
+        "gen-docs" => docs::artifacts()?,
         "gen-all" => {
             let mut v = crds::artifacts()?;
             v.extend(rbac::artifacts()?);
             v.extend(dashboards::artifacts()?);
+            v.extend(docs::artifacts()?);
             v
         }
         other => anyhow::bail!("unknown command {other}"),

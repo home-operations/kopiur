@@ -141,11 +141,19 @@ pub struct ServerService {
     pub r#type: ServiceType,
     /// Listen/Service port. Defaults to [`DEFAULT_SERVER_PORT`] when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_server_port")]
     pub port: Option<u16>,
     /// Annotations applied to the `Service` — the seam users wire their own
     /// Ingress/LoadBalancer controller onto.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
+}
+
+/// schemars default for [`ServerService::port`] — [`DEFAULT_SERVER_PORT`]
+/// (`51515`), matching `resolved_port`'s absent→CONST resolution. Returns the
+/// field's `Option` type so schemars 1 emits the schema `default:`.
+fn default_server_port() -> Option<u16> {
+    Some(DEFAULT_SERVER_PORT)
 }
 
 impl ServerService {

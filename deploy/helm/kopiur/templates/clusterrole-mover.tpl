@@ -1,5 +1,5 @@
 {{- if eq .Values.installScope "cluster" -}}
-# Least-privilege mover ClusterRole (ADR §4.12). RBAC rules SYNCED from
+# Least-privilege mover ClusterRole. RBAC rules SYNCED from
 # `cargo xtask gen-rbac` (deploy/rbac/mover-clusterrole.yaml) — that xtask is the
 # SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
 #

@@ -16,7 +16,7 @@ webhooks:
     failurePolicy: {{ .Values.webhook.failurePolicy }}
     timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
     # reinvocationPolicy IfNeeded: identity templating + deletionPolicy defaulting
-    # (ADR §4.2/§4.5) are pinned once; safe to re-run if another webhook mutates.
+    # are pinned once; safe to re-run if another webhook mutates the object.
     reinvocationPolicy: IfNeeded
     clientConfig:
       {{- if eq .Values.webhook.tls.mode "manual" }}

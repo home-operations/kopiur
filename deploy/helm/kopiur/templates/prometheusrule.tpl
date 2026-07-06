@@ -1,4 +1,4 @@
-{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled -}}
+{{- if .Values.monitoring.prometheusRule.enabled -}}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -7,7 +7,7 @@ metadata:
   labels:
     {{- include "kopiur.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
-    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
@@ -38,7 +38,7 @@ spec:
           # on (namespace, policy) via `unless`.
           expr: >-
             (
-              time() - kopiur_policy_last_backup_success_timestamp_seconds > {{ .Values.metrics.prometheusRule.backupStaleAfterSeconds }}
+              time() - kopiur_policy_last_backup_success_timestamp_seconds > {{ .Values.monitoring.prometheusRule.backupStaleAfterSeconds }}
             )
             or
             (
@@ -50,7 +50,7 @@ spec:
             severity: warning
           annotations:
             summary: "No recent successful backup for {{`{{ $labels.namespace }}/{{ $labels.policy }}`}}"
-            description: "Either the last successful backup was over {{ div .Values.metrics.prometheusRule.backupStaleAfterSeconds 3600 }}h ago, or SnapshotPolicy {{`{{ $labels.namespace }}/{{ $labels.policy }}`}} has never succeeded (or its Succeeded Snapshot CRs were all deleted) and is currently failing."
+            description: "Either the last successful backup was over {{ div .Values.monitoring.prometheusRule.backupStaleAfterSeconds 3600 }}h ago, or SnapshotPolicy {{`{{ $labels.namespace }}/{{ $labels.policy }}`}} has never succeeded (or its Succeeded Snapshot CRs were all deleted) and is currently failing."
         - alert: KopiurRepositoryNotReady
           # Active-only emission means kopiur_resource_phase never carries a 0-valued
           # series, so `== 1` is redundant here; left in place because max-by over a

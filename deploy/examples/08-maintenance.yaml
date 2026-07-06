@@ -1,4 +1,4 @@
-# Example 08 — Maintenance (ADR-0001 §3.7, ADR-0003 §4.5)
+# Example 08 — Maintenance
 #
 # `kopia maintenance` is a first-class concern with its own CRD and an explicit
 # ownership lease (G11). At most one Maintenance owns a repository.
@@ -14,7 +14,7 @@
 # `ownership.takeoverPolicy` is a closed enum: Never (default, safest) |
 # PromptCondition | Force.
 # Storage actually reclaimed is surfaced ONLY here, in status.{quick,full}
-# .lastContentReclaimedBytes (ADR §3.7/§4.5).
+# .lastContentReclaimedBytes.
 #
 # On-demand run (declarative): the metadata.annotations below request an
 # out-of-band maintenance run the next time GitOps reconciles this manifest.

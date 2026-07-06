@@ -1,15 +1,15 @@
-# Example 02 — Shared platform repository (ADR-0001 §5.2)
+# Example 02 — Shared platform repository
 #
 # A platform team owns a cluster-scoped ClusterRepository; tenant namespaces
 # reference it without knowing the secret name or backend details. Identity
 # defaults are CEL expressions evaluated per consumer namespace (at admission,
-# pinned to status — ADR §4.2 / ADR-0004 §5).
+# pinned to status).
 #
 # REQUIRES the operator installed with installScope=cluster (ClusterRepository is
 # a cluster-scoped kind and is only reconciled in cluster scope).
 #
 # Note: because ClusterRepository is cluster-scoped, its Secret references MUST
-# carry an explicit `namespace` (webhook-enforced — ADR §3.2).
+# carry an explicit `namespace` (webhook-enforced).
 ---
 apiVersion: v1
 kind: Secret
@@ -49,7 +49,7 @@ spec:
       - payments
       - identity
       - media
-  # CEL expressions evaluated at admission, pinned to status (ADR-0004 §5). The
+  # CEL expressions evaluated at admission, pinned to status. The
   # CEL environment is `namespace`, `policyName`, `labels`, `annotations` (the
   # consuming SnapshotPolicy's metadata). Each *Expr returns a string.
   identityDefaults:
@@ -61,7 +61,7 @@ spec:
   # (KOPIUR_NAMESPACE) when omitted.
   maintenance:
     namespace: kopiur-system
-  # Index-blob health (ADR-0005 §13). kopia's content index grows with each
+  # Index-blob health. kopia's content index grows with each
   # backup and is compacted by maintenance; if maintenance stops keeping up the
   # count climbs unbounded and backups eventually degrade. The operator records
   # the count on `status.storageStats.indexBlobCount` (and an `IndexBlobs` print
@@ -110,7 +110,7 @@ spec:
 ---
 # A SECOND tenant, in a different namespace, points at the SAME ClusterRepository.
 # Both apps share one deduplicated content pool, but their snapshots never collide
-# because each writes under its own templated identity (ADR-0001 §4.3). This is the
+# because each writes under its own templated identity. This is the
 # recommended layout — one shared repository, many apps — covered in the
 # "How Kopia works" concepts page.
 apiVersion: kopiur.home-operations.com/v1alpha1

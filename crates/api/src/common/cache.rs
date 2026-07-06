@@ -119,6 +119,7 @@ pub struct CatalogBounds {
     /// How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum
     /// `30s`, default `1h`). Inert unless `periodicRefresh` is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_catalog_refresh_interval")]
     pub refresh_interval: Option<String>,
     /// Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +146,15 @@ impl CatalogBounds {
     }
 }
 
+/// schemars default for [`CatalogBounds::refresh_interval`] — the string form of
+/// [`DEFAULT_CATALOG_REFRESH_INTERVAL`](crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL)
+/// (`1h`). `effective_refresh_interval` resolves an absent value to that same
+/// duration and the field is inert unless `periodicRefresh`, so materializing
+/// `1h` is behavior-preserving. A unit test pins `"1h"` to the constant.
+fn default_catalog_refresh_interval() -> Option<String> {
+    Some("1h".to_string())
+}
+
 /// Bounds on the *number* of discovered `Snapshot` CRs kept materialized.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -155,4 +165,27 @@ pub struct CatalogRetain {
     /// Expire discovered `Snapshot` CRs older than this many days (minimum 1); kopia snapshots untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_days: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_refresh_interval_schema_default_matches_the_duration_constant() {
+        // The schema default is the STRING "1h"; the controller resolves an
+        // absent value to the Duration constant. Keep them in lockstep so
+        // server-side defaulting materializes exactly the resolver's fallback.
+        let s = default_catalog_refresh_interval().expect("some");
+        assert_eq!(
+            crate::duration::parse_go_duration(&s),
+            Some(crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL),
+            "default_catalog_refresh_interval() string must parse to DEFAULT_CATALOG_REFRESH_INTERVAL"
+        );
+        // And the resolver agrees when the field is absent.
+        assert_eq!(
+            CatalogBounds::effective_refresh_interval(None),
+            crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL
+        );
+    }
 }

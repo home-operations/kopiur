@@ -1,7 +1,7 @@
-# Example 03 — Restore by picking a Snapshot (ADR-0001 §5.3)
+# Example 03 — Restore by picking a Snapshot
 #
 # Browse the catalog, then reference a specific Snapshot CR. No timestamp math —
-# restore is "pick a row" (ADR §3.8 / G8).
+# restore is "pick a row".
 #
 #   # list candidate snapshots for a config, newest last:
 #   kubectl get snapshots -n billing \

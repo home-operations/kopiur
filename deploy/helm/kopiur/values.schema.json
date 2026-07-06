@@ -1,154 +1,42 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "properties": {
-    "controller": {
-      "description": "=============================================================================\nController deployment\n=============================================================================",
-      "properties": {
-        "affinity": {
-          "required": [],
-          "title": "affinity",
-          "type": "object"
-        },
-        "extraArgs": {
-          "description": "Extra CLI args appended to the controller container.",
-          "items": {
-            "required": []
-          },
-          "title": "extraArgs",
-          "type": "array"
-        },
-        "extraEnv": {
-          "description": "Extra environment variables for the controller container.",
-          "items": {
-            "required": []
-          },
-          "title": "extraEnv",
-          "type": "array"
-        },
-        "extraVolumeMounts": {
-          "description": "Extra volume mounts on the controller container (pairs with extraVolumes).",
-          "items": {
-            "required": []
-          },
-          "title": "extraVolumeMounts",
-          "type": "array"
-        },
-        "extraVolumes": {
-          "description": "Extra volumes on the controller pod. Use this to make a filesystem-backend\nrepository reachable in-process (hostPath/NFS/PVC) so the controller can run\nshort idempotent kopia ops (ADR §5.4). The e2e harness uses a hostPath here.",
-          "items": {
-            "required": []
-          },
-          "title": "extraVolumes",
-          "type": "array"
-        },
-        "leaderElection": {
-          "description": "Enable leader election. Required when replicaCount \u003e 1; harmless at 1.",
-          "properties": {
-            "enabled": {
-              "default": true,
-              "title": "enabled",
-              "type": "boolean"
-            }
-          },
-          "required": [],
-          "title": "leaderElection",
-          "type": "object"
-        },
-        "listenAddr": {
-          "default": "0.0.0.0:8081",
-          "description": "Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;\nserves /metrics, /healthz, /readyz). Override on an IPv6-only/dual-stack\ncluster, where the kubelet cannot reach an IPv4-only bind (0.0.0.0) and\nprobes never succeed — set \"[::]:8081\" there. Must agree on port with\nprobePort below (the Service and probes target that port, not whatever\nthis address happens to contain).",
-          "title": "listenAddr",
-          "type": "string"
-        },
-        "logLevel": {
-          "default": "info",
-          "description": "DEPRECATED: use the top-level `logging.level` instead. Kept as a fallback\nfor existing values files — `logging.level` wins when both are set. Applies to\nthe controller and webhook (RUST_LOG style: error|warn|info|debug|trace).",
-          "title": "logLevel",
-          "type": "string"
-        },
-        "nodeSelector": {
-          "description": "Scheduling controls.",
-          "required": [],
-          "title": "nodeSelector",
-          "type": "object"
-        },
-        "podAnnotations": {
-          "required": [],
-          "title": "podAnnotations",
-          "type": "object"
-        },
-        "podLabels": {
-          "description": "Extra pod labels / annotations.",
-          "required": [],
-          "title": "podLabels",
-          "type": "object"
-        },
-        "priorityClassName": {
-          "default": "",
-          "description": "Pod-level priority class.",
-          "title": "priorityClassName",
-          "type": "string"
-        },
-        "probePort": {
-          "default": 8081,
-          "description": "Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).",
-          "title": "probePort",
-          "type": "integer"
-        },
-        "replicaCount": {
-          "default": 1,
-          "description": "Number of controller replicas. \u003e1 enables HA via leader election;\nonly the elected leader reconciles, so deterministic jitter (ADR §4.1)\nkeeps schedules identical across replicas and across failover.",
-          "title": "replicaCount",
-          "type": "integer"
-        },
-        "resources": {
-          "description": "Resource requests for the controller pod.\nNo limits by default. No CPU limit (CPU throttling on an operator only adds\nreconcile latency; the request reserves a fair share). No memory limit either:\nthe controller's RSS can *burst* on startup/restart, not just steady state\n(~120Mi) — on (re)start it reconciles every existing resource at once, spawning\nconcurrent in-process `kopia` subprocesses (whose RSS counts against this\ncontainer's cgroup) to list/connect a repository that may hold many snapshots.\nA memory limit that doesn't cover that burst OOMKills the controller, which\nthen crash-loops (OOM -\u003e restart -\u003e re-reconcile burst -\u003e OOM). Set a limit\nonly if you've measured your own ceiling. See crates/e2e/tests/lifecycle.rs.",
-          "properties": {
-            "requests": {
-              "properties": {
-                "cpu": {
-                  "default": "50m",
-                  "title": "cpu",
-                  "type": "string"
-                },
-                "memory": {
-                  "default": "128Mi",
-                  "title": "memory",
-                  "type": "string"
-                }
-              },
-              "required": [],
-              "title": "requests",
-              "type": "object"
-            }
-          },
-          "required": [],
-          "title": "resources",
-          "type": "object"
-        },
-        "streamingLists": {
-          "default": false,
-          "description": "Opt-in: use the Kubernetes WatchList streaming-list API for the controller's\ncluster-wide watches, lowering peak memory during the initial resync by streaming\npages instead of buffering them. Requires apiserver support (WatchList: beta in\n1.32, GA in 1.34); leave off on older clusters.",
-          "title": "streamingLists",
-          "type": "boolean"
-        },
-        "tolerations": {
-          "items": {
-            "required": []
-          },
-          "title": "tolerations",
-          "type": "array"
-        },
-        "workerThreads": {
-          "default": 2,
-          "description": "Tokio worker threads for the controller runtime. The controller is I/O-bound,\nso a small pool is ample; the runtime default sizes to the host core count\n(ignoring the cgroup CPU quota), over-allocating worker threads — each a stack\nplus a malloc arena — on large nodes, inflating RSS for no throughput gain.\nRaise only for a reconcile-heavy deployment.",
-          "title": "workerThreads",
-          "type": "integer"
-        }
-      },
+    "affinity": {
       "required": [],
-      "title": "controller",
+      "title": "affinity",
       "type": "object"
+    },
+    "extraArgs": {
+      "description": "Extra CLI args appended to the controller container.",
+      "items": {
+        "required": []
+      },
+      "title": "extraArgs",
+      "type": "array"
+    },
+    "extraEnv": {
+      "description": "Extra environment variables for the controller container.",
+      "items": {
+        "required": []
+      },
+      "title": "extraEnv",
+      "type": "array"
+    },
+    "extraVolumeMounts": {
+      "description": "Extra volume mounts on the controller container (pairs with extraVolumes).",
+      "items": {
+        "required": []
+      },
+      "title": "extraVolumeMounts",
+      "type": "array"
+    },
+    "extraVolumes": {
+      "description": "Extra volumes on the controller pod. Use this to make a filesystem-backend\nrepository reachable in-process (hostPath/NFS/PVC) so the controller can run\nshort idempotent kopia ops directly. The e2e harness uses a hostPath here.",
+      "items": {
+        "required": []
+      },
+      "title": "extraVolumes",
+      "type": "array"
     },
     "features": {
       "description": "=============================================================================\nFeature permissions\n=============================================================================\nA few opt-in features need the operator to WRITE Secrets in the namespaces it\nmanages, so each grants extra RBAC. All are OFF by default (least privilege):\nthe chart does not hand out cluster-wide `secrets` write until you turn on the\nfeature you use. The flag names match the CRD fields that trigger them.\n\nSymptom → fix: if you enable the feature in a CR but forget the flag here, the\nresource's `.status` shows an actionable condition like\n  \"... (HTTP 403). ... Fix: set features.\u003cname\u003e.enabled: true ...\"\nSet the matching flag below and the operator heals on the next reconcile.\nSee docs/feature-permissions.md for the full mapping and security trade-offs.",
@@ -191,194 +79,78 @@
       "type": "string"
     },
     "global": {
-      "description": "Global values are values that can be accessed from any chart or subchart by exactly the same name.",
+      "description": "=============================================================================\nGlobal (chart-wide fallbacks + umbrella-injectable subset)\n=============================================================================\nkopiur has no subcharts, so `global` does not auto-propagate anywhere on its\nown. Its two jobs: (a) kopiur's own templates read `global.*` as a shared\nfallback for the controller (root) and the webhook, so you set a fleet-wide\ndefault once instead of repeating it per component; (b) if kopiur is ever\nwrapped in an umbrella chart, Helm merges the umbrella's `global` down and\nkopiur inherits these for free. Merge rule: list-valued globals\n(imagePullSecrets, tolerations, topologySpreadConstraints) are CONCATENATED\nwith the component value; map-valued globals (nodeSelector, affinity) are used\nonly when the component leaves its own value empty; commonLabels are added to\nevery rendered object.",
+      "properties": {
+        "affinity": {
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "commonLabels": {
+          "description": "Labels stamped on every rendered object (fleet-wide labelling).",
+          "required": [],
+          "title": "commonLabels",
+          "type": "object"
+        },
+        "imagePullSecrets": {
+          "description": "Concatenated with the top-level imagePullSecrets; reaches controller,\nwebhook, and mover Jobs.",
+          "items": {
+            "required": []
+          },
+          "title": "imagePullSecrets",
+          "type": "array"
+        },
+        "nodeSelector": {
+          "description": "Scheduling defaults every kopiur pod inherits unless the component\n(root = controller, webhook.*) sets its own.",
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "tolerations": {
+          "items": {
+            "required": []
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "items": {
+            "required": []
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
+        }
+      },
       "required": [],
       "title": "global",
       "type": "object"
     },
-    "grafanaDashboard": {
-      "description": "Grafana dashboard for the kopiur fleet. The same JSON lives in\ndeploy/dashboards/kopiur.json (the single source of truth, copied into the\nchart by `cargo xtask gen-all`) for manual import. By default it ships as a\nConfigMap labeled for the Grafana sidecar to auto-discover; flip\ngrafanaOperator.enabled to render a grafana-operator GrafanaDashboard CR from\nthe very same JSON instead.",
-      "properties": {
-        "annotations": {
-          "description": "Extra annotations added to the dashboard object (ConfigMap or CR).",
-          "required": [],
-          "title": "annotations",
-          "type": "object"
-        },
-        "enabled": {
-          "default": false,
-          "description": "Create the dashboard (a sidecar ConfigMap by default).",
-          "title": "enabled",
-          "type": "boolean"
-        },
-        "folder": {
-          "default": "",
-          "title": "folder",
-          "type": "string"
-        },
-        "folderAnnotation": {
-          "default": "",
-          "description": "Annotation setting the Grafana folder for the sidecar ConfigMap (optional).",
-          "title": "folderAnnotation",
-          "type": "string"
-        },
-        "grafanaOperator": {
-          "properties": {
-            "allowCrossNamespaceImport": {
-              "default": true,
-              "description": "Allow a Grafana in any namespace to import this GrafanaDashboard.",
-              "title": "allowCrossNamespaceImport",
-              "type": "boolean"
-            },
-            "enabled": {
-              "default": false,
-              "description": "Render a grafana-operator GrafanaDashboard CR instead of the sidecar ConfigMap.",
-              "title": "enabled",
-              "type": "boolean"
-            },
-            "folder": {
-              "default": "",
-              "description": "Folder to create the dashboard in (Grafana folder name).",
-              "title": "folder",
-              "type": "string"
-            },
-            "matchLabels": {
-              "description": "spec.instanceSelector.matchLabels — selects which Grafana instance(s) load this dashboard.",
-              "required": [],
-              "title": "matchLabels",
-              "type": "object"
-            },
-            "resyncPeriod": {
-              "default": "10m",
-              "description": "How often grafana-operator re-checks the dashboard for updates.",
-              "title": "resyncPeriod",
-              "type": "string"
-            }
-          },
-          "required": [],
-          "title": "grafanaOperator",
-          "type": "object"
-        },
-        "label": {
-          "default": "grafana_dashboard",
-          "description": "Label the Grafana sidecar watches for (key: value). Adjust to your stack.",
-          "title": "label",
-          "type": "string"
-        },
-        "labelValue": {
-          "default": "1",
-          "title": "labelValue",
-          "type": "string"
-        },
-        "labels": {
-          "description": "Extra labels added to the dashboard object (ConfigMap or CR).",
-          "required": [],
-          "title": "labels",
-          "type": "object"
-        },
-        "namespace": {
-          "default": "",
-          "description": "Namespace for the dashboard object; defaults to the release namespace.",
-          "title": "namespace",
-          "type": "string"
-        }
-      },
-      "required": [],
-      "title": "grafanaDashboard",
-      "type": "object"
-    },
     "image": {
-      "description": "=============================================================================\nImages\n=============================================================================\nThree images ship with kopiur:\n  * controller — the operator (reconcilers); exposes /metrics.\n  * webhook    — the axum admission server (validating + mutating).\n  * mover      — the per-Job image (one Job per Backup/Restore/Maintenance run).\n\nPer ADR §G15 the mover image MUST be reproducibly pinned: prefer `digest`\nover a floating tag in production so a re-pulled `:latest` can never change\nwhat runs in a data-protection Job. When `digest` is set it wins over `tag`.",
+      "description": "=============================================================================\nController image\n=============================================================================\nThree images ship with kopiur:\n  * controller — the operator (reconcilers); exposes /metrics. Configured here.\n  * webhook    — the axum admission server; see webhook.image below.\n  * mover      — the per-Job image (one Job per Backup/Restore/Maintenance\n                 run); see mover.image below.\nWhen `digest` is set it wins over `tag` (tag defaults to .Chart.AppVersion).",
       "properties": {
-        "controller": {
-          "description": "Controller (operator) image.",
-          "properties": {
-            "digest": {
-              "default": "",
-              "description": "Pin by digest (e.g. \"sha256:...\"); takes precedence over tag.",
-              "title": "digest",
-              "type": "string"
-            },
-            "repository": {
-              "default": "home-operations/kopiur-controller",
-              "title": "repository",
-              "type": "string"
-            },
-            "tag": {
-              "default": "",
-              "description": "Defaults to .Chart.AppVersion when empty.",
-              "title": "tag",
-              "type": "string"
-            }
-          },
-          "required": [],
-          "title": "controller",
-          "type": "object"
-        },
-        "mover": {
-          "description": "Mover (per-Job) image. The controller reads this reference and stamps it\ninto every Job it creates. Digest-pinned recommended (ADR §G15).",
-          "properties": {
-            "digest": {
-              "default": "",
-              "description": "STRONGLY RECOMMENDED in production. Digest pin for the mover Job image.",
-              "title": "digest",
-              "type": "string"
-            },
-            "pullPolicy": {
-              "default": "IfNotPresent",
-              "description": "Pull policy used on the mover Job pods.",
-              "title": "pullPolicy",
-              "type": "string"
-            },
-            "repository": {
-              "default": "home-operations/kopiur-mover",
-              "title": "repository",
-              "type": "string"
-            },
-            "tag": {
-              "default": "",
-              "title": "tag",
-              "type": "string"
-            }
-          },
-          "required": [],
-          "title": "mover",
-          "type": "object"
+        "digest": {
+          "default": "",
+          "description": "Pin by digest (e.g. \"sha256:...\"); takes precedence over tag.",
+          "title": "digest",
+          "type": "string"
         },
         "pullPolicy": {
           "default": "IfNotPresent",
-          "description": "Default image pull policy for controller and webhook.",
+          "description": "Image pull policy for the controller.",
           "title": "pullPolicy",
           "type": "string"
         },
-        "registry": {
-          "default": "ghcr.io",
-          "description": "Container registry shared by all three images unless overridden per-image.",
-          "title": "registry",
+        "repository": {
+          "default": "ghcr.io/home-operations/kopiur-controller",
+          "description": "Full controller image repository (registry + path).",
+          "title": "repository",
           "type": "string"
         },
-        "webhook": {
-          "description": "Admission webhook image.",
-          "properties": {
-            "digest": {
-              "default": "",
-              "title": "digest",
-              "type": "string"
-            },
-            "repository": {
-              "default": "home-operations/kopiur-webhook",
-              "title": "repository",
-              "type": "string"
-            },
-            "tag": {
-              "default": "",
-              "title": "tag",
-              "type": "string"
-            }
-          },
-          "required": [],
-          "title": "webhook",
-          "type": "object"
+        "tag": {
+          "default": "",
+          "description": "Defaults to .Chart.AppVersion when empty.",
+          "title": "tag",
+          "type": "string"
         }
       },
       "required": [],
@@ -386,27 +158,69 @@
       "type": "object"
     },
     "imagePullSecrets": {
-      "description": "Image pull secrets applied to controller/webhook pods and mover Jobs.",
+      "description": "Image pull secrets for the controller pod (concatenated with\nglobal.imagePullSecrets; also reaches the webhook pod and mover Jobs).",
       "items": {
         "required": []
       },
       "title": "imagePullSecrets",
       "type": "array"
     },
-    "installCRDs": {
-      "default": true,
-      "description": "Install the 7 kopiur.home-operations.com CRDs as part of this release.\nWhen true the CRDs are rendered under templates/ (guarded by this flag) so\n`helm uninstall` removes them and `installCRDs: false` actually omits them.\nTrade-off: templated CRDs are subject to Helm's normal apply ordering and\n(unlike the special `crds/` directory) are NOT skipped on `helm upgrade`.\nThat is the behavior we want for an alpha API. If you manage CRDs out of band\n(GitOps applies deploy/crds/*.yaml directly), set this to false.",
-      "title": "installCRDs",
-      "type": "boolean"
-    },
     "installScope": {
-      "default": "namespaced",
-      "description": "\"namespaced\" (default) or \"cluster\".\n  namespaced — RBAC is a namespace-scoped Role/RoleBinding. The operator\n    manages kopiur.home-operations.com resources only in its own namespace. ClusterRepository\n    is NOT reconciled (it is a cluster-scoped kind and out of a Role's reach).\n  cluster    — RBAC is a ClusterRole/ClusterRoleBinding. The operator manages\n    kopiur.home-operations.com resources cluster-wide AND reconciles ClusterRepository.\nPer ADR §4.11 namespaced is the safer default; cluster scope is an explicit\nopt-in for platform teams running a shared backup tier.",
+      "default": "cluster",
+      "description": "=============================================================================\nInstall scope\n=============================================================================\n\"cluster\" (default) or \"namespaced\".\n  cluster    — RBAC is a ClusterRole/ClusterRoleBinding. The operator manages\n    kopiur.home-operations.com resources cluster-wide AND reconciles\n    ClusterRepository. This is the default because a namespace-scoped Role\n    silently disables the ClusterRepository kind (a cluster-scoped resource is\n    out of a Role's reach), turning kopiur into a shared-backup-tier operator\n    that can't do shared backup tiers.\n  namespaced — RBAC is a namespace-scoped Role/RoleBinding: the operator\n    manages resources only in its own namespace and ClusterRepository is NOT\n    reconciled. Choose this as the explicit least-privilege opt-down for a\n    single-team install where the reduced blast radius is worth losing\n    cluster-scoped repositories.",
       "title": "installScope",
       "type": "string"
     },
+    "leaderElection": {
+      "description": "Enable leader election. Required when replicaCount \u003e 1; harmless at 1.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "enabled",
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "title": "leaderElection",
+      "type": "object"
+    },
+    "livenessProbe": {
+      "description": "Liveness probe for the controller container. The whole probe is passed\nthrough with `toYaml`, so you can retune timings/thresholds or swap the scheme\nentirely; set to `{}` to drop the probe. `port: metrics` is the named\ncontainer port (metrics.port above).",
+      "properties": {
+        "httpGet": {
+          "properties": {
+            "path": {
+              "default": "/healthz",
+              "title": "path",
+              "type": "string"
+            },
+            "port": {
+              "default": "metrics",
+              "title": "port",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "httpGet",
+          "type": "object"
+        },
+        "initialDelaySeconds": {
+          "default": 10,
+          "title": "initialDelaySeconds",
+          "type": "integer"
+        },
+        "periodSeconds": {
+          "default": 15,
+          "title": "periodSeconds",
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "title": "livenessProbe",
+      "type": "object"
+    },
     "logging": {
-      "description": "=============================================================================\nLogging (stdout / `kubectl logs`)\n=============================================================================\nControls the fmt logging that every component writes to stdout. The controller\npasses RUST_LOG + KOPIUR_LOG_FORMAT through to mover Jobs, so a mover honors the\nsame level and format. Env var names match crates/telemetry/src/env.rs.",
+      "description": "=============================================================================\nLogging (stdout / `kubectl logs`, always on)\n=============================================================================\nControls the fmt logging that every component writes to stdout — the stream\n`kubectl logs` shows. The controller passes RUST_LOG + KOPIUR_LOG_FORMAT\nthrough to mover Jobs, so a mover honors the same level and format. This is a\nchart-wide concern (all three components honor it), which is why it stays a\nnamed top-level block rather than folding under the controller. Env var names\nmatch crates/telemetry/src/env.rs. (For pushing logs/traces to a collector,\nsee observability.otlp below — a different, optional path.)",
       "properties": {
         "format": {
           "default": "text",
@@ -415,8 +229,8 @@
           "type": "string"
         },
         "level": {
-          "default": "",
-          "description": "Log level / filter directive (RUST_LOG style: error|warn|info|debug|trace;\nper-target works too, e.g. \"info,kopia=debug\" to see kopia's own progress in\nmover logs). When empty, falls back to the deprecated `controller.logLevel`.",
+          "default": "info",
+          "description": "Log level / filter directive (RUST_LOG style: error|warn|info|debug|trace;\nper-target works too, e.g. \"info,kopia=debug\" to see kopia's own progress in\nmover logs).",
           "title": "level",
           "type": "string"
         }
@@ -426,19 +240,112 @@
       "type": "object"
     },
     "metrics": {
-      "description": "=============================================================================\nMetrics \u0026 observability\n=============================================================================",
+      "description": "=============================================================================\nController port \u0026 probes\n=============================================================================",
       "properties": {
-        "enabled": {
-          "default": true,
-          "description": "Expose a Service for the controller's /metrics endpoint.",
-          "title": "enabled",
-          "type": "boolean"
-        },
         "port": {
           "default": 8081,
-          "description": "Service port for /metrics.",
+          "description": "The controller's single operational port. Rendered into KOPIUR_HTTP_ADDR\nas \"[::]:\u003cport\u003e\" (dual-stack wildcard), co-hosting /metrics, /healthz and\n/readyz. The metrics Service and the probes both target this port.",
           "title": "port",
           "type": "integer"
+        }
+      },
+      "required": [],
+      "title": "metrics",
+      "type": "object"
+    },
+    "monitoring": {
+      "description": "=============================================================================\nMonitoring (Prometheus + Grafana)\n=============================================================================\nThe controller-scrape ServiceMonitor, the alerting PrometheusRule, and the\nGrafana dashboard(s), grouped under one umbrella. NOTE: the webhook's own\nServiceMonitor is NOT here — it lives at webhook.serviceMonitor because it is\nan HTTPS scrape of the webhook's TLS port, a materially different scrape config\nthat moves with the webhook component, not this umbrella. The split is\ndeliberate.",
+      "properties": {
+        "dashboards": {
+          "description": "Grafana dashboard(s) for the kopiur fleet. The same JSON lives in\ndeploy/dashboards/kopiur.json (the single source of truth, copied into the\nchart by `cargo xtask gen-all`) for manual import. By default it ships as a\nConfigMap labeled for the Grafana sidecar to auto-discover; flip\ngrafanaOperator.enabled to render a grafana-operator GrafanaDashboard CR from\nthe very same JSON instead.",
+          "properties": {
+            "annotations": {
+              "description": "Extra annotations added to the dashboard object (ConfigMap or CR).",
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "enabled": {
+              "default": false,
+              "description": "Create the dashboard (a sidecar ConfigMap by default).",
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "folder": {
+              "default": "",
+              "title": "folder",
+              "type": "string"
+            },
+            "folderAnnotation": {
+              "default": "",
+              "description": "Annotation setting the Grafana folder for the sidecar ConfigMap (optional).",
+              "title": "folderAnnotation",
+              "type": "string"
+            },
+            "grafanaOperator": {
+              "properties": {
+                "allowCrossNamespaceImport": {
+                  "default": true,
+                  "description": "Allow a Grafana in any namespace to import this GrafanaDashboard.",
+                  "title": "allowCrossNamespaceImport",
+                  "type": "boolean"
+                },
+                "enabled": {
+                  "default": false,
+                  "description": "Render a grafana-operator GrafanaDashboard CR instead of the sidecar ConfigMap.",
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "folder": {
+                  "default": "",
+                  "description": "Folder to create the dashboard in (Grafana folder name).",
+                  "title": "folder",
+                  "type": "string"
+                },
+                "matchLabels": {
+                  "description": "spec.instanceSelector.matchLabels — selects which Grafana instance(s) load this dashboard.",
+                  "required": [],
+                  "title": "matchLabels",
+                  "type": "object"
+                },
+                "resyncPeriod": {
+                  "default": "10m",
+                  "description": "How often grafana-operator re-checks the dashboard for updates.",
+                  "title": "resyncPeriod",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "grafanaOperator",
+              "type": "object"
+            },
+            "label": {
+              "default": "grafana_dashboard",
+              "description": "Label the Grafana sidecar watches for (key: value). Adjust to your stack.",
+              "title": "label",
+              "type": "string"
+            },
+            "labelValue": {
+              "default": "1",
+              "title": "labelValue",
+              "type": "string"
+            },
+            "labels": {
+              "description": "Extra labels added to the dashboard object (ConfigMap or CR).",
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            },
+            "namespace": {
+              "default": "",
+              "description": "Namespace for the dashboard object; defaults to the release namespace.",
+              "title": "namespace",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "dashboards",
+          "type": "object"
         },
         "prometheusRule": {
           "properties": {
@@ -469,7 +376,7 @@
           "properties": {
             "enabled": {
               "default": false,
-              "description": "Create a Prometheus-Operator ServiceMonitor. Requires the CRD to exist.",
+              "description": "Create a Prometheus-Operator ServiceMonitor scraping the controller's\n/metrics (plain HTTP). Requires the ServiceMonitor CRD to exist.",
               "title": "enabled",
               "type": "boolean"
             },
@@ -513,7 +420,44 @@
         }
       },
       "required": [],
-      "title": "metrics",
+      "title": "monitoring",
+      "type": "object"
+    },
+    "mover": {
+      "description": "=============================================================================\nMover (per-Job image)\n=============================================================================\nThe mover has no Deployment — the controller stamps one Job per\nBackup/Restore/Maintenance run, reading this image reference. Its security\ncontext and scheduling are controller-stamped, not chart values, so only the\nimage is configurable here.",
+      "properties": {
+        "image": {
+          "properties": {
+            "digest": {
+              "default": "",
+              "description": "Pin the mover image by digest so a re-pulled tag can never change what\nruns in a data-protection Job. STRONGLY RECOMMENDED in production.",
+              "title": "digest",
+              "type": "string"
+            },
+            "pullPolicy": {
+              "default": "IfNotPresent",
+              "description": "Pull policy used on the mover Job pods.",
+              "title": "pullPolicy",
+              "type": "string"
+            },
+            "repository": {
+              "default": "ghcr.io/home-operations/kopiur-mover",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "title": "tag",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "image",
+          "type": "object"
+        }
+      },
+      "required": [],
+      "title": "mover",
       "type": "object"
     },
     "nameOverride": {
@@ -522,8 +466,14 @@
       "title": "nameOverride",
       "type": "string"
     },
+    "nodeSelector": {
+      "description": "Scheduling controls (fall back to global.* when left empty).",
+      "required": [],
+      "title": "nodeSelector",
+      "type": "object"
+    },
     "observability": {
-      "description": "=============================================================================\nOpenTelemetry (OTLP) — traces, logs, and a metrics push, off by default\n=============================================================================\nWhen enabled, the controller, webhook, and mover Jobs export OTLP to the\nconfigured collector (the controller passes the same OTEL_* env to movers).\nMetrics are ALSO always available via the Prometheus /metrics pull endpoint;\nOTLP just adds a push path plus traces and logs. Env var names match\ncrates/telemetry/src/env.rs.",
+      "description": "=============================================================================\nOpenTelemetry (OTLP) — optional push of traces + logs (and a metrics push)\n=============================================================================\nSeparate from `logging` above (the always-on stdout stream): observability.otlp\nis the OPTIONAL push path. When enabled, the controller, webhook, and mover Jobs\nexport OTLP to the configured collector (the controller passes the same OTEL_*\nenv to movers). Metrics are ALSO always available via the Prometheus /metrics\npull endpoint; OTLP just adds a push path plus traces and logs. Env var names\nmatch crates/telemetry/src/env.rs.",
       "properties": {
         "otlp": {
           "properties": {
@@ -575,8 +525,37 @@
       "title": "observability",
       "type": "object"
     },
+    "podAnnotations": {
+      "required": [],
+      "title": "podAnnotations",
+      "type": "object"
+    },
+    "podDisruptionBudget": {
+      "description": "PodDisruptionBudget for the controller. Keeps a voluntary disruption (node\ndrain, cluster upgrade) from taking the controller to zero replicas. Only\nuseful with replicaCount \u003e 1.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "default": 1,
+          "title": "minAvailable",
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "title": "podDisruptionBudget",
+      "type": "object"
+    },
+    "podLabels": {
+      "description": "Extra pod labels / annotations.",
+      "required": [],
+      "title": "podLabels",
+      "type": "object"
+    },
     "podSecurityContext": {
-      "description": "=============================================================================\nPod security (shared defaults; per-component sections may override)\n=============================================================================\nNon-root uid 65534 (nobody) default, per ADR §4.9/§4.11 — distroless:nonroot.",
+      "description": "=============================================================================\nController pod security (controller only)\n=============================================================================\nThe controller may need a RELAXED context — e.g. runAsUser: 1000 + fsGroup to\nread a filesystem/NFS-backed repository for in-process kopia ops (which is why\nextraVolumes exists on it). The webhook is pure admission and keeps its own\nlocked-down context under webhook.* so relaxing the controller never loosens\nthe webhook. Non-root uid 65534 (nobody) by default — distroless:nonroot.",
       "properties": {
         "fsGroup": {
           "default": 65534,
@@ -615,6 +594,12 @@
       "title": "podSecurityContext",
       "type": "object"
     },
+    "priorityClassName": {
+      "default": "",
+      "description": "Pod-level priority class.",
+      "title": "priorityClassName",
+      "type": "string"
+    },
     "rbac": {
       "description": "=============================================================================\nExtra RBAC\n=============================================================================",
       "properties": {
@@ -627,6 +612,72 @@
       },
       "required": [],
       "title": "rbac",
+      "type": "object"
+    },
+    "readinessProbe": {
+      "description": "Readiness probe for the controller container (same passthrough as\nlivenessProbe; set to `{}` to drop it).",
+      "properties": {
+        "httpGet": {
+          "properties": {
+            "path": {
+              "default": "/readyz",
+              "title": "path",
+              "type": "string"
+            },
+            "port": {
+              "default": "metrics",
+              "title": "port",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "httpGet",
+          "type": "object"
+        },
+        "initialDelaySeconds": {
+          "default": 5,
+          "title": "initialDelaySeconds",
+          "type": "integer"
+        },
+        "periodSeconds": {
+          "default": 10,
+          "title": "periodSeconds",
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "title": "readinessProbe",
+      "type": "object"
+    },
+    "replicaCount": {
+      "default": 1,
+      "description": "=============================================================================\nController runtime behavior\n=============================================================================\nNumber of controller replicas. \u003e1 enables HA via leader election; only the\nelected leader reconciles, so deterministic jitter keeps schedules identical\nacross replicas and across failover. Pair \u003e1 with podDisruptionBudget and\ntopologySpreadConstraints below to make it genuinely highly-available.",
+      "title": "replicaCount",
+      "type": "integer"
+    },
+    "resources": {
+      "description": "=============================================================================\nController workload \u0026 scheduling  (controller only — webhook has its own)\n=============================================================================\nResource requests for the controller pod.\nNo limits by default. No CPU limit (CPU throttling on an operator only adds\nreconcile latency; the request reserves a fair share). No memory limit either:\nthe controller's RSS can *burst* on startup/restart, not just steady state\n(~120Mi) — on (re)start it reconciles every existing resource at once, spawning\nconcurrent in-process `kopia` subprocesses (whose RSS counts against this\ncontainer's cgroup) to list/connect a repository that may hold many snapshots.\nA memory limit that doesn't cover that burst OOMKills the controller, which\nthen crash-loops (OOM -\u003e restart -\u003e re-reconcile burst -\u003e OOM). Set a limit\nonly if you've measured your own ceiling. See crates/e2e/tests/lifecycle.rs.",
+      "properties": {
+        "requests": {
+          "properties": {
+            "cpu": {
+              "default": "50m",
+              "title": "cpu",
+              "type": "string"
+            },
+            "memory": {
+              "default": "128Mi",
+              "title": "memory",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "requests",
+          "type": "object"
+        }
+      },
+      "required": [],
+      "title": "resources",
       "type": "object"
     },
     "securityContext": {
@@ -674,6 +725,12 @@
           "title": "annotations",
           "type": "object"
         },
+        "automount": {
+          "default": true,
+          "description": "Mount the ServiceAccount token into the controller/webhook pods.",
+          "title": "automount",
+          "type": "boolean"
+        },
         "create": {
           "default": true,
           "description": "Create the ServiceAccount. Disable to bring your own.",
@@ -691,8 +748,29 @@
       "title": "serviceAccount",
       "type": "object"
     },
+    "streamingLists": {
+      "default": true,
+      "description": "Use the Kubernetes WatchList streaming-list API for the controller's\ncluster-wide watches, lowering peak memory during the initial resync by\nstreaming pages instead of buffering them (the startup burst the resources\nnote below warns about). On by default: WatchList is GA in Kubernetes 1.34\n(beta 1.32/1.33) and the chart's kubeVersion floor is 1.32. Set `false` if\nyour apiserver has the WatchList feature gate disabled — the watches degrade\nto paged lists either way, but turning it off skips the feature probe.",
+      "title": "streamingLists",
+      "type": "boolean"
+    },
+    "tolerations": {
+      "items": {
+        "required": []
+      },
+      "title": "tolerations",
+      "type": "array"
+    },
+    "topologySpreadConstraints": {
+      "description": "Spread controller replicas across nodes/zones. Only meaningful with\nreplicaCount \u003e 1; pairs with podDisruptionBudget so a drain can't collapse\nboth replicas onto one node and then evict them together.",
+      "items": {
+        "required": []
+      },
+      "title": "topologySpreadConstraints",
+      "type": "array"
+    },
     "webhook": {
-      "description": "=============================================================================\nAdmission webhook\n=============================================================================\nImplemented as a SEPARATE Deployment + Service (cleaner than folding it into\nthe controller) per ADR §5.3. The Service maps 443 -\u003e the container's 8443.",
+      "description": "=============================================================================\nAdmission webhook  (its own Deployment + Service + configs)\n=============================================================================\nA separate Deployment + Service, not folded into the controller. Everything\nthe webhook workload needs lives here (its own image, port, scheduling,\nsecurity context, PDB, spread, scrape) — a root-level key never touches it.",
       "properties": {
         "affinity": {
           "required": [],
@@ -730,31 +808,96 @@
           "title": "certManager",
           "type": "object"
         },
-        "containerPort": {
-          "default": 8443,
-          "description": "Port the webhook container listens on (must match listenAddr above).",
-          "title": "containerPort",
-          "type": "integer"
-        },
         "enabled": {
           "default": true,
           "description": "Deploy the webhook (Deployment + Service + Validating/Mutating configs).\nWhen false, validation falls back to the controller's defensive checks only.",
           "title": "enabled",
           "type": "boolean"
         },
+        "extraEnv": {
+          "description": "Extra environment variables for the webhook container (list of\n`{name, value}` / `{name, valueFrom}` entries), appended after the\noperator-managed env. Mirrors the root `extraEnv`.",
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
         "failurePolicy": {
           "default": "Fail",
-          "description": "failurePolicy for both webhook configurations: Fail (fail-closed,\nrecommended for a backup operator — ADR §7.2) or Ignore.",
+          "description": "failurePolicy for both webhook configurations: Fail (fail-closed,\nrecommended for a backup operator) or Ignore. Fail means a webhook outage\nblocks kopiur CR writes — see podDisruptionBudget below for why HA matters.",
           "title": "failurePolicy",
           "type": "string"
         },
-        "listenAddr": {
-          "default": "0.0.0.0:8443",
-          "description": "Address the webhook server binds to (env KOPIUR_WEBHOOK_ADDR).",
-          "title": "listenAddr",
-          "type": "string"
+        "image": {
+          "description": "Admission webhook image (see the controller `image` block for the\ndigest/tag rules).",
+          "properties": {
+            "digest": {
+              "default": "",
+              "title": "digest",
+              "type": "string"
+            },
+            "pullPolicy": {
+              "default": "IfNotPresent",
+              "title": "pullPolicy",
+              "type": "string"
+            },
+            "repository": {
+              "default": "ghcr.io/home-operations/kopiur-webhook",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "title": "tag",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "image",
+          "type": "object"
+        },
+        "livenessProbe": {
+          "description": "Liveness probe for the webhook container. Passed through with `toYaml`\n(retune timings/thresholds or swap the probe; `{}` drops it). The webhook\nonly serves HTTPS, so `scheme: HTTPS` on the named `https` port.",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "https",
+                  "title": "port",
+                  "type": "string"
+                },
+                "scheme": {
+                  "default": "HTTPS",
+                  "title": "scheme",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 15,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "livenessProbe",
+          "type": "object"
         },
         "nodeSelector": {
+          "description": "Scheduling controls (fall back to global.* when left empty).",
           "required": [],
           "title": "nodeSelector",
           "type": "object"
@@ -764,15 +907,119 @@
           "title": "podAnnotations",
           "type": "object"
         },
+        "podDisruptionBudget": {
+          "description": "PodDisruptionBudget for the webhook — the most important one to enable in\nHA. With failurePolicy: Fail, a node drain that evicts the only webhook\nreplica blocks every kopiur CR write until it reschedules; a PDB with\nreplicaCount \u003e 1 keeps one replica serving through the drain.",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "minAvailable": {
+              "default": 1,
+              "title": "minAvailable",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "podDisruptionBudget",
+          "type": "object"
+        },
         "podLabels": {
           "required": [],
           "title": "podLabels",
           "type": "object"
         },
+        "podSecurityContext": {
+          "description": "Pod security context for the webhook pod. Kept at the most locked-down\nposture (the webhook is pure admission and never touches a repository), so\nrelaxing the controller's context never loosens the webhook.",
+          "properties": {
+            "fsGroup": {
+              "default": 65534,
+              "title": "fsGroup",
+              "type": "integer"
+            },
+            "runAsGroup": {
+              "default": 65534,
+              "title": "runAsGroup",
+              "type": "integer"
+            },
+            "runAsNonRoot": {
+              "default": true,
+              "title": "runAsNonRoot",
+              "type": "boolean"
+            },
+            "runAsUser": {
+              "default": 65534,
+              "title": "runAsUser",
+              "type": "integer"
+            },
+            "seccompProfile": {
+              "properties": {
+                "type": {
+                  "default": "RuntimeDefault",
+                  "title": "type",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "seccompProfile",
+              "type": "object"
+            }
+          },
+          "required": [],
+          "title": "podSecurityContext",
+          "type": "object"
+        },
+        "port": {
+          "default": 8443,
+          "description": "The webhook's container port. Rendered into KOPIUR_WEBHOOK_ADDR as\n\"[::]:\u003cport\u003e\" (dual-stack wildcard); the Service maps 443 -\u003e this port.",
+          "title": "port",
+          "type": "integer"
+        },
         "priorityClassName": {
           "default": "",
           "title": "priorityClassName",
           "type": "string"
+        },
+        "readinessProbe": {
+          "description": "Readiness probe for the webhook container (same passthrough as\nlivenessProbe; set to `{}` to drop it).",
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "https",
+                  "title": "port",
+                  "type": "string"
+                },
+                "scheme": {
+                  "default": "HTTPS",
+                  "title": "scheme",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 10,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "readinessProbe",
+          "type": "object"
         },
         "replicaCount": {
           "default": 1,
@@ -780,7 +1027,7 @@
           "type": "integer"
         },
         "resources": {
-          "description": "No limits by default (see controller.resources). The webhook links the same\nOpenTelemetry/OTLP stack but does no kopia work, so it stays light; only the\nrequests are set to reserve a fair share.",
+          "description": "No limits by default (see the controller resources note). The webhook links\nthe same OpenTelemetry/OTLP stack but does no kopia work, so it stays light;\nonly the requests are set to reserve a fair share.",
           "properties": {
             "requests": {
               "properties": {
@@ -804,8 +1051,45 @@
           "title": "resources",
           "type": "object"
         },
+        "securityContext": {
+          "description": "Container security context for the webhook.",
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "properties": {
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "securityContext",
+          "type": "object"
+        },
         "serviceMonitor": {
-          "description": "The webhook serves /metrics on its TLS port (kopiur_webhook_admission_total).",
+          "description": "The webhook serves /metrics on its TLS port (kopiur_webhook_admission_total).\nThis ServiceMonitor stays on the webhook (not under monitoring:) because it\nis an HTTPS scrape of the webhook's own port — a different scrape config from\nthe controller's plain-HTTP one.",
           "properties": {
             "enabled": {
               "default": false,
@@ -871,11 +1155,25 @@
           },
           "title": "tolerations",
           "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "description": "Spread webhook replicas across nodes/zones (pairs with podDisruptionBudget).",
+          "items": {
+            "required": []
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
         }
       },
       "required": [],
       "title": "webhook",
       "type": "object"
+    },
+    "workerThreads": {
+      "default": 2,
+      "description": "Tokio worker threads for the controller runtime. The controller is I/O-bound,\nso a small pool is ample; the runtime default sizes to the host core count\n(ignoring the cgroup CPU quota), over-allocating worker threads — each a stack\nplus a malloc arena — on large nodes, inflating RSS for no throughput gain.\nRaise only for a reconcile-heavy deployment.",
+      "title": "workerThreads",
+      "type": "integer"
     }
   },
   "required": [],

@@ -156,6 +156,7 @@ nav:
   - User guide:
       - Getting started: getting-started.md
       - Installation: install.md
+      - Upgrading: upgrade.md
       - GitOps (Flux / Argo): gitops.md
       # NOTE: with `navigation.indexes` on, a page whose source file is named
       # index.md must be a SECTION index (first child of its own section). Listed
