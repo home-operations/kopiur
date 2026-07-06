@@ -267,6 +267,49 @@ impl ConnectSpec {
         }
     }
 
+    /// The environment-variable names kopia reads this backend's credentials from
+    /// **directly** (no intermediate file). These are exactly the vars the
+    /// replication mover remaps from their `KOPIUR_DEST_`-prefixed copies onto their
+    /// plain names for the `sync-to` subprocess, so the destination authenticates
+    /// with its own keys instead of the source's identically named ones (issue #200).
+    ///
+    /// Exhaustive over [`ConnectSpec`] so a new backend cannot compile until its
+    /// credential-delivery mechanism is decided. File-based backends (GCS/SFTP/
+    /// Rclone/Gdrive) deliver credentials as a materialized *file* whose path is on
+    /// argv, so they read no direct credential env var and return `&[]` — the mover
+    /// stages their destination file separately. `AWS_WEB_IDENTITY_TOKEN_FILE` and
+    /// the other ambient-chain *hints* are deliberately excluded: they belong to the
+    /// pod's ServiceAccount (a workload-identity destination), not to a credential
+    /// Secret, and must never be remapped or unset.
+    pub fn direct_credential_env_names(&self) -> &'static [&'static str] {
+        match self {
+            ConnectSpec::S3 { .. } => &[
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+            ],
+            // Static shared key / SAS token, plus the service-principal env trio
+            // (the same names kopia's static Azure auth reads).
+            ConnectSpec::Azure { .. } => &[
+                "AZURE_STORAGE_KEY",
+                "AZURE_STORAGE_SAS_TOKEN",
+                "AZURE_TENANT_ID",
+                "AZURE_CLIENT_ID",
+                "AZURE_CLIENT_SECRET",
+            ],
+            ConnectSpec::B2 { .. } => &["B2_KEY_ID", "B2_KEY"],
+            ConnectSpec::WebDav { .. } => &["KOPIA_WEBDAV_USERNAME", "KOPIA_WEBDAV_PASSWORD"],
+            // File-delivered (materialized to a path) or credential-free.
+            ConnectSpec::Filesystem { .. }
+            | ConnectSpec::Gcs { .. }
+            | ConnectSpec::Sftp { .. }
+            | ConnectSpec::Rclone { .. }
+            | ConnectSpec::Gdrive { .. }
+            | ConnectSpec::FromConfig { .. }
+            | ConnectSpec::Server { .. } => &[],
+        }
+    }
+
     /// The kopia subcommand args that select this backend, e.g.
     /// `["filesystem", "--path", "/repo"]`. Used by both connect and create.
     /// Credentials are expected in the environment, never here (see the type
@@ -730,10 +773,20 @@ impl KopiaClient {
     }
 
     /// Run kopia with the given subcommand args, returning raw output. Applies
-    /// `common_env` and inserts `common_args` immediately after the
-    /// subcommand. stdout and stderr are fully captured. Honors the default
-    /// timeout if set.
-    async fn run(&self, args: &[String]) -> Result<RawOutput, KopiaError> {
+    /// `common_env` and inserts `common_args` immediately after the subcommand,
+    /// plus a per-invocation environment overlay (`Some(value)` sets a variable,
+    /// `None` **unsets** an otherwise-inherited one — pass an empty map for the
+    /// common case). stdout and stderr are fully captured. Honors the default
+    /// timeout if set. Used by the replication mover
+    /// to point `kopia repository sync-to` at the *destination* backend's
+    /// credentials (remapped from their `KOPIUR_DEST_`-prefixed copies) while
+    /// clearing any source credential the destination does not set, so a stale
+    /// source `AWS_SESSION_TOKEN` (etc.) cannot leak into the destination auth.
+    async fn run_with_env(
+        &self,
+        args: &[String],
+        env_overlay: &BTreeMap<String, Option<String>>,
+    ) -> Result<RawOutput, KopiaError> {
         let display_args = args.join(" ");
         let mut cmd = Command::new(&self.binary);
         // Do not inherit the ambient environment's KOPIA_* unless the caller
@@ -741,6 +794,13 @@ impl KopiaClient {
         // fine. We only override what common_env specifies.
         for (k, v) in &self.common_env {
             cmd.env(k, v);
+        }
+        // Per-invocation overlay wins over both the inherited env and common_env.
+        for (k, v) in env_overlay {
+            match v {
+                Some(value) => cmd.env(k, value),
+                None => cmd.env_remove(k),
+            };
         }
         cmd.args(args);
         // Append common args (e.g. --no-check-for-updates) after the subcommand
@@ -849,7 +909,17 @@ impl KopiaClient {
     /// exit, builds a structured [`KopiaError::NonZeroExit`] with the stderr
     /// tail and a best-effort error class.
     async fn run_ok(&self, args: &[String]) -> Result<String, KopiaError> {
-        let out = self.run(args).await?;
+        self.run_ok_with_env(args, &BTreeMap::new()).await
+    }
+
+    /// [`Self::run_ok`] with a per-invocation environment overlay (see
+    /// [`Self::run_with_env`]).
+    async fn run_ok_with_env(
+        &self,
+        args: &[String],
+        env_overlay: &BTreeMap<String, Option<String>>,
+    ) -> Result<String, KopiaError> {
+        let out = self.run_with_env(args, env_overlay).await?;
         if out.code == Some(0) {
             Ok(out.stdout)
         } else {
@@ -955,8 +1025,28 @@ impl KopiaClient {
         destination: &ConnectSpec,
         delete_extra: bool,
     ) -> Result<(), KopiaError> {
+        self.repository_sync_to_with_env(destination, delete_extra, &BTreeMap::new())
+            .await
+    }
+
+    /// [`Self::repository_sync_to`] with a per-invocation environment overlay
+    /// applied to the `sync-to` subprocess only. The replication mover uses this to
+    /// give the **destination** backend its own credentials: it maps each of the
+    /// destination backend's env-delivered credential vars (`AWS_*`, `AZURE_*`, …)
+    /// from the `KOPIUR_DEST_`-prefixed copy in its environment, and unsets any that
+    /// the destination doesn't provide so a source credential cannot leak. The
+    /// *source* repository is read from the persisted connection config (kopia bakes
+    /// the source storage credentials in at `repository connect`), so overlaying the
+    /// plain credential names here cannot disturb the source read. `Some(v)` sets a
+    /// var, `None` removes it. Credentials travel via env, never argv.
+    pub async fn repository_sync_to_with_env(
+        &self,
+        destination: &ConnectSpec,
+        delete_extra: bool,
+        dest_env: &BTreeMap<String, Option<String>>,
+    ) -> Result<(), KopiaError> {
         let args = sync_to_args(destination, delete_extra);
-        self.run_ok(&args).await.map(|_| ())
+        self.run_ok_with_env(&args, dest_env).await.map(|_| ())
     }
 
     /// Create a snapshot of `source_path` with the given `tags`

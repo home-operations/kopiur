@@ -132,3 +132,26 @@ pub fn mover_creds_secrets(backend: &Backend, enc: &Encryption) -> Vec<String> {
         .map(|r| r.name)
         .collect()
 }
+
+/// Env-var prefix under which a replication mover receives the **destination**
+/// backend's credential Secret (`envFrom.prefix`). The source backend's Secret is
+/// delivered unprefixed (kopia reads the plain names at `repository connect` and
+/// persists them), so the two sides never collide even when both are the same
+/// backend family with different keys (issue #200). The mover reads these back to
+/// authenticate the `kopia repository sync-to` destination.
+///
+/// The credential env-var *names* a backend reads (`AWS_*`, …) live on
+/// [`ConnectSpec::direct_credential_env_names`](../../kopiur_kopia/client/enum.ConnectSpec.html)
+/// in the kopia crate — that is the type that knows kopia's env binding, and the
+/// replication mover builds its remap from the `ConnectSpec` it hands to `sync-to`.
+pub const DEST_ENV_PREFIX: &str = "KOPIUR_DEST_";
+
+#[cfg(test)]
+mod dest_env_tests {
+    use super::*;
+
+    #[test]
+    fn dest_env_prefix_is_stable() {
+        assert_eq!(DEST_ENV_PREFIX, "KOPIUR_DEST_");
+    }
+}

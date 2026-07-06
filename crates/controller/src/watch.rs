@@ -176,9 +176,10 @@ pub fn serviceaccount_to_cluster_repositories(
     })
 }
 
-/// RepositoryReplications that reference the changed `secret` as a *destination*
-/// credential (the destination encryption password and/or destination backend
-/// auth). A change to the *source* repository's Secret instead re-reconciles the
+/// RepositoryReplications that reference the changed `secret` as their *destination*
+/// backend's auth credential. (`sync-to` is a blob copy — the destination inherits
+/// the source repository's password, so there is no separate destination password to
+/// watch.) A change to the *source* repository's Secret instead re-reconciles the
 /// source `Repository`/`ClusterRepository`, which re-triggers this replication via
 /// the source-ref watch ([`repository_to_replications`]).
 pub fn secret_to_replications(
@@ -190,20 +191,10 @@ pub fn secret_to_replications(
     };
     select(store, |repl: &RepositoryReplication| {
         let repl_ns = repl.namespace();
-        match repl.spec.destination_encryption.as_ref() {
-            Some(enc) => repo_references_secret(
-                &repl.spec.destination,
-                enc,
-                repl_ns.as_deref(),
-                &sec_ns,
-                &sec_name,
-            ),
-            // No destination password: match only the destination backend's auth Secret.
-            None => io::backend_auth_secret_ref(&repl.spec.destination).is_some_and(|a| {
-                a.name == sec_name
-                    && a.namespace.as_deref().or(repl_ns.as_deref()) == Some(sec_ns.as_str())
-            }),
-        }
+        io::backend_auth_secret_ref(&repl.spec.destination).is_some_and(|a| {
+            a.name == sec_name
+                && a.namespace.as_deref().or(repl_ns.as_deref()) == Some(sec_ns.as_str())
+        })
     })
 }
 

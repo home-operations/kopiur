@@ -1493,18 +1493,34 @@ async fn run_replicate_flow(
         });
     }
 
-    // Materialize the DESTINATION's file-based credentials (SFTP key/GCS JSON/rclone)
-    // into a separate staging dir so they don't collide with the source's, then run
-    // sync-to. Env-only destinations (S3/Azure/B2/WebDAV/filesystem) pass through.
+    // The destination's credentials arrive under the KOPIUR_DEST_ env prefix so they
+    // never collide with the source's identically named ones (issue #200). Read them
+    // back prefixed: file-based dest creds (SFTP key / GCS JSON / rclone) are staged
+    // from the prefixed env into a *separate* dir; the ambient-chain hints of a
+    // workload-identity destination stay UNPREFIXED because they belong to the pod's
+    // ServiceAccount, not to a credential Secret.
+    let raw_env = |key: &str| std::env::var(key).ok();
     let mut dest = op.destination.to_connect_spec();
-    if let Err(e) = credentials::materialize(&mut dest, &credential_staging_dir().join("dest")) {
+    if let Err(e) =
+        credentials::materialize_with(&mut dest, &credential_staging_dir().join("dest"), &|key| {
+            credentials::dest_materialize_lookup(key, &raw_env)
+        })
+    {
         // The CredentialWrite/CredentialStagingDir variants already name the env
         // key, path, and fix — propagate them untouched.
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
         return Err(e);
     }
 
-    if let Err(e) = client.repository_sync_to(&dest, op.delete_extra).await {
+    // Direct-env destinations (S3/Azure/B2/WebDAV): remap the destination backend's
+    // credential vars from their prefixed copies for the sync-to subprocess only,
+    // unsetting any the destination does not set so a source credential cannot leak.
+    let dest_env = credentials::dest_env_overlay(&dest, &raw_env);
+
+    if let Err(e) = client
+        .repository_sync_to_with_env(&dest, op.delete_extra, &dest_env)
+        .await
+    {
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
         error!(class = %e.class(), "repository sync-to failed");
         return Err(MoverError::Kopia {

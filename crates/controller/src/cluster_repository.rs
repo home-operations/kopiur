@@ -753,7 +753,7 @@ async fn bootstrap_cluster_via_mover(
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
     );
-    let creds_secrets = io::mover_creds_secrets(backend, &repo.spec.encryption);
+    let creds_secrets = io::plain_creds(io::mover_creds_secrets(backend, &repo.spec.encryption));
     let owner = io::owner_ref_for(repo, "ClusterRepository")?;
     // The bootstrap Job runs in the credentials Secret's namespace (`job_ns`).
     // Resolve its run identity there: the user's workload-identity SA

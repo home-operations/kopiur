@@ -209,12 +209,20 @@ async fn spawn_replication_job(
         });
     let owner = io::owner_ref_for(repl, "RepositoryReplication")?;
 
-    // Defensive re-check of the admission rule (one validator, two callers): a
-    // same-kind static/workload-identity auth mix would let the static side's
-    // env leak into the workload-identity side's ambient credential chain.
+    // Defensive re-checks of the admission rules (one validator, two callers):
+    // (a) a same-kind static/workload-identity auth mix would leak the static side's
+    // env into the workload-identity side's ambient credential chain; (b) the
+    // destination's static credential Secret must co-reside with the Job (envFrom is
+    // namespace-local and replication does not project credentials).
     if let Err(e) =
         kopiur_api::validate::validate_replication_auth(&repo.backend, &repl.spec.destination)
     {
+        return Err(Error::Validation(e.to_string()));
+    }
+    if let Err(e) = kopiur_api::validate::validate_replication_destination_secret_namespace(
+        &repl.spec.destination,
+        namespace,
+    ) {
         return Err(Error::Validation(e.to_string()));
     }
     // One replicate pod touches BOTH backends: a workload identity on either
@@ -248,7 +256,33 @@ async fn spawn_replication_job(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = creds.names;
+    // Source repository credentials load verbatim — kopia reads the plain env-var
+    // names at `repository connect` and persists them into the connection config.
+    let mut creds_secrets = io::plain_creds(creds.names);
+
+    // The DESTINATION backend's own credentials (issue #200): one replicate pod
+    // touches TWO backends, so the destination Secret rides under `KOPIUR_DEST_`
+    // (`envFrom.prefix`) — its keys (`AWS_*`, …) must not collide with the source's
+    // identically named ones, and the mover remaps them for the `sync-to`
+    // subprocess only. It is NOT deduped against the source entries: a Secret shared
+    // by both sides is legitimately loaded twice (plain for the source, prefixed for
+    // the destination). Verify it is present before launching a Job that would
+    // otherwise hang on a missing-Secret `envFrom` (a workload-identity or
+    // filesystem destination carries no such Secret and is skipped).
+    if let Some(dest_secret) = io::backend_auth_secret_ref(&repl.spec.destination) {
+        let dest_names = [dest_secret.name.clone()];
+        let creds_ctx = io::CredsContext {
+            secret_names: &dest_names,
+            repo_kind: "RepositoryReplication destination",
+            repo_name: cr_name,
+            repo_secret_namespace: dest_secret.namespace.as_deref(),
+        };
+        io::ensure_creds_present(&ctx.client, namespace, &creds_ctx).await?;
+        creds_secrets.push(jobs::CredsEnvFrom::prefixed(
+            dest_secret.name.clone(),
+            kopiur_api::creds::DEST_ENV_PREFIX,
+        ));
+    }
 
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
@@ -526,7 +560,6 @@ mod tests {
                     auth: None,
                     tls: None,
                 }),
-                destination_encryption: None,
                 schedule: CronSpec {
                     cron: cron.into(),
                     jitter: None,

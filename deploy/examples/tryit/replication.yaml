@@ -14,15 +14,15 @@
 # fires quickly; a real mirror would be nightly (e.g. `0 5 * * *`).
 #
 # Fill in the one REPLACE_ME (KOPIA_PASSWORD) and apply once. The same password is
-# reused for the destination and the verifier: `sync-to` copies blobs verbatim, so
-# the mirror has the SAME format and encryption material as the source —
-# destinationEncryption is omitted on purpose. The verify-mirror Repository points
-# at the SAME on-disk path the destination wrote (/repo on its PVC), so a plain
+# reused for the destination and the verifier because `sync-to` copies blobs
+# verbatim, so the mirror has the SAME format and encryption material as the source
+# (there is no destination-password knob). The verify-mirror Repository points at
+# the SAME on-disk path the destination wrote (/repo on its PVC), so a plain
 # `kubectl apply` mirror is connectable as-is.
 #
 # Field shapes verified against crates/api (repository_replication.rs: sourceRef is
 # a RepositoryRef (kind defaults to Repository); destination is an externally-tagged
-# Backend; schedule={cron,jitter}; destinationEncryption optional; status.phase +
+# Backend; schedule={cron,jitter}; status.phase +
 # status.lastReplicated. externally-tagged backend.filesystem on every Repository).
 #
 # The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
@@ -179,7 +179,8 @@ spec:
       volume:
         pvc:
           name: kopia-repo-dst
-  # No destinationEncryption: the mirror reuses the source repo's password.
+  # The mirror reuses the source repo's password (sync-to is a blob copy); a
+  # filesystem destination needs no access credentials.
   # Every minute so the demo fires quickly; a real mirror would be nightly.
   schedule:
     cron: "* * * * *"

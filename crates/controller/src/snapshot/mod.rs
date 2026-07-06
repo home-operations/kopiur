@@ -954,7 +954,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         );
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the
     // mover Job is created. `status.hooks.preCompletedAt` makes the list run
@@ -1667,7 +1667,7 @@ async fn delete_snapshot_via_job(
     if creds.projected > 0 {
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotDelete(SnapshotDeleteOp {
@@ -1852,7 +1852,7 @@ async fn reconcile_pin(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotPin(SnapshotPinOp {

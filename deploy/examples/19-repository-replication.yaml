@@ -9,10 +9,13 @@
 # `sourceRef`. The destination is exactly one backend (the same externally-tagged
 # `Backend` shape used by Repository) and MUST differ from the source's backend.
 #
-# Encryption: omit `destinationEncryption` and the mirror reuses the SOURCE
-# repository's password — the common case for a true mirror, where sync-to copies
-# blobs verbatim (the format, including encryption material, is identical). Set it
-# only when the destination needs its own password.
+# Encryption is NOT a knob here: `sync-to` copies blobs verbatim, so the mirror
+# always reuses the SOURCE repository's format and password. Only the destination
+# backend's own ACCESS credentials (e.g. S3 keys) are configured, via its
+# `auth.secretRef` below. That Secret must live in THIS CR's namespace (the mover
+# loads it with envFrom, which is namespace-local) and use the same key names a
+# source Secret would (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY). The source and
+# destination may use entirely different credentials — they are kept separate.
 #
 # Field shapes verified against crates/api: sourceRef is a RepositoryRef
 # (kind defaults to Repository); destination is an externally-tagged Backend;
@@ -51,11 +54,11 @@ spec:
       prefix: prod/
       region: us-west-2
       auth:
+        # The destination backend's OWN credentials. Must be a Secret in this CR's
+        # namespace (envFrom is namespace-local); the mover delivers it under a
+        # KOPIUR_DEST_ prefix so it never collides with the source's keys.
         secretRef:
           name: offsite-mirror-creds
-  # Omit destinationEncryption to reuse the source repo's password (true mirror).
-  # destinationEncryption:
-  #   passwordSecretRef: { name: offsite-mirror-creds, key: KOPIA_PASSWORD }
   schedule:
     cron: "0 5 * * *" # nightly, after the 02:xx backups have landed
     jitter: 1h

@@ -209,6 +209,10 @@ pub const BUCKETS: &[&str] = &[
     // opt-in probe raises RepositoryVanished without recreating. Isolated so the
     // wipe can't clobber another scenario's repository.
     "kopiur-health-probe",
+    // RepositoryReplication to an S3 destination (crates/e2e/tests/replication.rs,
+    // the #200 regression guard): a filesystem source mirrors here, so `sync-to`
+    // only succeeds if the destination backend's OWN S3 credentials are injected.
+    "kopiur-repl-dst",
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see

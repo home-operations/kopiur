@@ -579,7 +579,7 @@ async fn spawn_maintenance_job(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
 
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Maintenance.
     let cache_volume = crate::cache::resolve_cache_volume(

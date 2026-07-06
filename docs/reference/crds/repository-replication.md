@@ -14,11 +14,7 @@ The `Repository` or `ClusterRepository` to mirror *from*. Credentials and connec
 
 The backend to mirror *to* — exactly one backend, expressed as the externally-tagged `Backend` enum (e.g. `destination: { s3: {…} }`), reused from the repository types. The destination **must differ from the source's backend**; the admission webhook rejects a same-backend mirror, since replicating a backend onto itself is meaningless.
 
-### `destinationEncryption`
-
-Encryption/password for the destination repository when it needs its own — for example a freshly-created mirror with a distinct password.
-
-**Omit this to mirror.** When absent, the destination uses the **source** repository's password. This is the common case for a true mirror: `sync-to` copies blobs verbatim, so the repository format (including the encryption material) is identical and a separate destination password would be wrong. Set it only when the destination is a distinct repository with its own credentials.
+The destination's own backend **access** credentials are supplied by its `auth.secretRef` (or `auth.workloadIdentity`), just like a source repository. `sync-to` is a blob-level copy, so the mirror always inherits the source repository's format and encryption password — there is no separate destination password. The destination credential `Secret` must live in the `RepositoryReplication`'s own namespace (the mover loads it with namespace-local `envFrom`; replication does not project credentials) and use the same key names a source Secret would. The source and destination may use different credentials — Kopiur delivers the destination Secret under a `KOPIUR_DEST_` env prefix so the two sides' keys never collide. See [Destination credentials](../../replication.md#destination-credentials).
 
 ### `schedule`
 

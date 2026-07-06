@@ -131,6 +131,42 @@ pub enum CacheVolume {
     },
 }
 
+/// One credential `Secret` exposed to the mover as `envFrom`, optionally under an
+/// env-var name `prefix`.
+///
+/// Almost every mover talks to a single backend and loads its Secret(s) verbatim
+/// (`prefix: None`) — kopia reads the plain names (`KOPIA_PASSWORD`, `AWS_*`, …).
+/// The replication mover is the exception: it touches two backends in one pod, so
+/// the **destination** Secret is delivered under [`kopiur_api::creds::DEST_ENV_PREFIX`]
+/// (`envFrom.prefix`) to keep its keys from colliding with the source's identically
+/// named ones (issue #200); the mover remaps the prefixed copies onto the plain
+/// names only for the `sync-to` subprocess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredsEnvFrom {
+    /// Name of the credential `Secret` (must reside in the Job's namespace).
+    pub name: String,
+    /// Env-var name prefix applied to every key (`envFrom.prefix`); `None` = verbatim.
+    pub prefix: Option<String>,
+}
+
+impl CredsEnvFrom {
+    /// A Secret loaded verbatim (no prefix) — the single-backend default.
+    pub fn plain(name: impl Into<String>) -> Self {
+        CredsEnvFrom {
+            name: name.into(),
+            prefix: None,
+        }
+    }
+
+    /// A Secret whose keys are exposed under `prefix` (the replication destination).
+    pub fn prefixed(name: impl Into<String>, prefix: impl Into<String>) -> Self {
+        CredsEnvFrom {
+            name: name.into(),
+            prefix: Some(prefix.into()),
+        }
+    }
+}
+
 /// A volume mounted into the mover pod at a path, from either a PVC or NFS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeMountSpec {
@@ -256,10 +292,13 @@ pub struct MoverJobInputs<'a> {
     /// Names of `Secret`s whose keys are exposed as env vars to the mover
     /// (`KOPIA_PASSWORD` from the encryption secret, plus backend credentials
     /// like `AWS_*` from the backend `auth.secretRef`). Each distinct secret
-    /// becomes one `envFrom` entry; callers dedupe identical names (the common
-    /// single-secret case collapses to one). Credentials NEVER come from the
-    /// work-spec ConfigMap (§4.10/§4.11). Empty only in tests / filesystem repos.
-    pub creds_secrets: Vec<String>,
+    /// becomes one `envFrom` entry (optionally prefixed — see [`CredsEnvFrom`]);
+    /// callers dedupe by `(name, prefix)`, so the common single-secret case
+    /// collapses to one while a Secret referenced both plain and prefixed (a
+    /// replication source+destination sharing one Secret) stays as two entries.
+    /// Credentials NEVER come from the work-spec ConfigMap (§4.10/§4.11). Empty
+    /// only in tests / filesystem repos.
+    pub creds_secrets: Vec<CredsEnvFrom>,
     /// Name of the ConfigMap the mover writes its bootstrap result into (set only
     /// for `BootstrapRepository` runs; `None` for backup/restore/delete).
     pub result_configmap: Option<&'a str>,
@@ -450,9 +489,10 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
             inputs
                 .creds_secrets
                 .iter()
-                .map(|secret| EnvFromSource {
+                .map(|c| EnvFromSource {
+                    prefix: c.prefix.clone(),
                     secret_ref: Some(SecretEnvSource {
-                        name: secret.clone(),
+                        name: c.name.clone(),
                         optional: Some(false),
                     }),
                     ..Default::default()
@@ -810,7 +850,7 @@ mod tests {
             labels,
             source_volume: None,
             repo_volume: None,
-            creds_secrets: Vec::new(),
+            creds_secrets: Vec::<CredsEnvFrom>::new(),
             result_configmap: None,
             service_account: Some("kopiur-operator"),
             passthrough_env: Vec::new(),
@@ -1035,7 +1075,7 @@ mod tests {
         let mut i = inputs(&ws, JobLimits::default());
         i.source_volume = Some(VolumeMountSpec::pvc("data-pvc", "/data", true));
         i.repo_volume = Some(VolumeMountSpec::pvc("repo-pvc", "/repo", false));
-        i.creds_secrets = vec!["kopia-creds".into()];
+        i.creds_secrets = vec![CredsEnvFrom::plain("kopia-creds")];
         i.image_pull_policy = Some("IfNotPresent");
 
         let job = build_job(&i);
@@ -1133,7 +1173,10 @@ mod tests {
         // the mover (one envFrom each), and the result ConfigMap name is exported.
         let ws = sample_work_spec();
         let mut i = inputs(&ws, JobLimits::default());
-        i.creds_secrets = vec!["kopia-password".into(), "s3-creds".into()];
+        i.creds_secrets = vec![
+            CredsEnvFrom::plain("kopia-password"),
+            CredsEnvFrom::plain("s3-creds"),
+        ];
         i.result_configmap = Some("repo-bootstrap");
 
         let job = build_job(&i);
@@ -1152,6 +1195,34 @@ mod tests {
             .find(|e| e.name == RESULT_CONFIGMAP_ENV)
             .expect("result configmap env present");
         assert_eq!(result_env.value.as_deref(), Some("repo-bootstrap"));
+    }
+
+    #[test]
+    fn prefixed_creds_secret_becomes_a_prefixed_envfrom() {
+        // The replication destination Secret rides under KOPIUR_DEST_ so its keys
+        // (AWS_*, …) do not collide with the source's identically named ones (#200).
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.creds_secrets = vec![
+            CredsEnvFrom::plain("source-creds"),
+            CredsEnvFrom::prefixed("dest-creds", "KOPIUR_DEST_"),
+        ];
+
+        let job = build_job(&i);
+        let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        let env_from = container.env_from.as_ref().expect("envFrom present");
+
+        // Source Secret is verbatim; destination Secret carries the prefix.
+        let source = env_from
+            .iter()
+            .find(|e| e.secret_ref.as_ref().map(|s| s.name.as_str()) == Some("source-creds"))
+            .expect("source envFrom");
+        assert_eq!(source.prefix, None);
+        let dest = env_from
+            .iter()
+            .find(|e| e.secret_ref.as_ref().map(|s| s.name.as_str()) == Some("dest-creds"))
+            .expect("dest envFrom");
+        assert_eq!(dest.prefix.as_deref(), Some("KOPIUR_DEST_"));
     }
 
     #[test]

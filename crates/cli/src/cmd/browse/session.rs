@@ -334,7 +334,11 @@ async fn create_session_job(
         target.repo.namespace.as_deref(),
         &target.repo.name,
     );
-    let creds_secrets = session_creds_secrets(&target.repo, ns)?;
+    // The browse session talks to a single repository; its Secret(s) load verbatim.
+    let creds_secrets: Vec<jobs::CredsEnvFrom> = session_creds_secrets(&target.repo, ns)?
+        .into_iter()
+        .map(jobs::CredsEnvFrom::plain)
+        .collect();
     let work_spec = session_work_spec(target, ttl);
     let image = resolve_mover_image(ctx).await?;
 

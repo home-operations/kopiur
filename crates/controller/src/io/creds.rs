@@ -199,6 +199,17 @@ pub fn projection_decision(consumer_enabled: bool, owner_allowed: bool) -> Proje
     }
 }
 
+/// Wrap credential Secret names as **verbatim** (unprefixed) `envFrom` entries —
+/// the single-backend default every mover but replication uses. kopia reads the
+/// plain env-var names (`KOPIA_PASSWORD`, `AWS_*`, …). The replication mover builds
+/// its own prefixed destination entry on top of these (issue #200).
+pub fn plain_creds(names: Vec<String>) -> Vec<crate::jobs::CredsEnvFrom> {
+    names
+        .into_iter()
+        .map(crate::jobs::CredsEnvFrom::plain)
+        .collect()
+}
+
 /// The credential Secret names a mover Job should load via `envFrom`, plus how
 /// many of them the operator actually projected (copied cross-namespace) this run.
 pub struct MoverCreds {
