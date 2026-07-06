@@ -54,9 +54,20 @@ pub struct SnapshotScheduleSpec {
     pub policy_selector: Option<LabelSelector>,
     /// Cron, jitter, timezone, and concurrency for the firing cadence.
     pub schedule: ScheduleSpec,
-    /// Maximum number of failed `Snapshot` CRs from this schedule to retain.
+    /// Maximum number of failed `Snapshot` CRs from this schedule to retain
+    /// (default `10`; `0` keeps none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_failed_jobs_history_limit")]
     pub failed_jobs_history_limit: Option<u32>,
+}
+
+/// schemars default for [`SnapshotScheduleSpec::failed_jobs_history_limit`] —
+/// [`DEFAULT_FAILED_JOBS_HISTORY_LIMIT`](crate::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
+/// (`10`), matching `effective_failed_jobs_history_limit`'s absent→CONST
+/// resolution. Returns the field's `Option` type so schemars 1 emits the
+/// schema `default:`.
+fn default_failed_jobs_history_limit() -> Option<u32> {
+    Some(crate::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
 }
 
 /// serde/schemars `default` for [`ScheduleSpec::run_on_create`] — `false`
@@ -194,6 +205,23 @@ mod tests {
         assert_eq!(crd.spec.names.kind, "SnapshotSchedule");
         assert_eq!(crd.spec.scope, "Namespaced");
         assert_eq!(crd.spec.versions[0].name, "v1alpha1");
+    }
+
+    #[test]
+    fn failed_jobs_history_limit_schema_default_matches_the_constant() {
+        // Context-free default surfaced in the schema (server-side-materialized);
+        // safe because effective_failed_jobs_history_limit maps absent → this value.
+        let crd = SnapshotSchedule::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["properties"]["failedJobsHistoryLimit"]["default"],
+            serde_json::json!(crate::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
+        );
+        assert_eq!(
+            crate::consts::effective_failed_jobs_history_limit(None),
+            crate::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT
+        );
     }
 
     #[test]

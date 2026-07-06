@@ -43,6 +43,18 @@ webhook:
   # explicit here so the harness intent is obvious.
   tls:
     mode: self
+  # Exercise the webhook.extraEnv passthrough end to end (a harmless marker var).
+  extraEnv:
+    - name: KOPIUR_E2E_WEBHOOK_MARKER
+      value: "1"
+
+# NOTE on bind addresses: this file deliberately does NOT override
+# controller.listenAddr / webhook.listenAddr, so the operator binds the chart
+# default dual-stack wildcard "[::]:8081" / "[::]:8443". That validates m00n's
+# dual-stack default in a live kind cluster: even though kind here is IPv4
+# single-stack, a "[::]" bind is dual-stack on Linux (net.ipv6.bindv6only=0) and
+# accepts the IPv4 kubelet probe. If a CI runner ever has IPv6 disabled in the
+# pod netns (a "[::]" bind then fails), pin these to "0.0.0.0:8081"/"0.0.0.0:8443".
 
 image:
   registry: docker.io
@@ -60,6 +72,14 @@ image:
 
 controller:
   logLevel: debug
+  # Exercise the probe passthrough: a retuned readiness probe (faster first
+  # check) proves values-driven probes render and the pod still goes Ready.
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: metrics
+    initialDelaySeconds: 3
+    periodSeconds: 10
   # The repo hostPath must be visible to the controller's in-process kopia
   # (filesystem connect/create). kopia's cache/logs/config come from the chart's
   # built-in writable kopia-cache emptyDir — deliberately NOT a manual workaround

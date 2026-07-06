@@ -51,24 +51,21 @@ spec:
             - name: KOPIUR_WEBHOOK_TLS_KEY
               value: /tls/tls.key
             {{- include "kopiur.otlpEnv" . | nindent 12 }}
+            {{- with .Values.webhook.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: https
               containerPort: {{ .Values.webhook.containerPort }}
               protocol: TCP
+          {{- with .Values.webhook.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: https
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            periodSeconds: 15
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.webhook.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: https
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.webhook.resources | nindent 12 }}
           securityContext:

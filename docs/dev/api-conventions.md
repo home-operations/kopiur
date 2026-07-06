@@ -49,6 +49,45 @@ Use `k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Condition}`
 
 Every credential/policy/identity/schedule surface is a **sub-object**, not a leaf field. Optionals: `#[serde(default, skip_serializing_if = "Option::is_none")] pub x: Option<T>`. Bools that default false: `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`. Vecs: `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
 
+## 4a. Schema defaults (`#[schemars(default = …)]`)
+
+A schemars `default` becomes a CRD `default:` that the **API server materializes
+server-side** (absent → present at admission), and it is what `kubectl explain`,
+the YAML language server, and the generated [field reference](../field-reference.md)
+show. schemars 1 does **not** pick up a `#[serde(default = "fn")]` on its own — pair
+it with `#[schemars(default = "fn")]`, and for an `Option<T>` field the fn must
+return the field's `Option` type (a bare `T` fails the `JsonSchema` derive):
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+#[schemars(default = "default_failed_jobs_history_limit")]
+pub failed_jobs_history_limit: Option<u32>,
+// ...
+fn default_failed_jobs_history_limit() -> Option<u32> { Some(DEFAULT_FAILED_JOBS_HISTORY_LIMIT) }
+```
+
+**Only emit a schema default where it is context-free** — where the controller
+resolves an absent field to *exactly* that constant (an `unwrap_or(CONST)` shape),
+and the field's meaning does not depend on where it sits. Materializing the value
+must be behavior-preserving. Do **NOT** emit one for a field whose effective
+default is context-dependent (origin/source/kind/webhook-resolved, or the lower
+link of an inheritance chain) — those stay `—` in the reference and state their
+resolution rule in the doc comment instead. Guard each added default with a test
+that walks `T::crd()` and asserts the schema `default` equals the constant (see
+`repository::tests::repository_schema_emits_context_free_defaults`); duration-string
+defaults additionally assert `parse("30m") == DEFAULT_…`.
+
+## 4b. Docs are generated — edit the doc comment, then `mise run gen`
+
+`docs/field-reference.md` is generated from the CRD schemas by `cargo xtask
+gen-docs` (folded into `mise run gen`) and drift-gated by `mise run gen-check`.
+The **field descriptions come from the Rust doc comments** in `crates/api`, so any
+`///` edit that changes a field's meaning, type, or default must be followed by
+`mise run gen` — otherwise `gen-check` fails in CI. Never hand-edit
+`field-reference.md`. Doc comments render as Markdown (rustdoc intra-doc links like
+`` [`X`] `` are stripped to `` `X` `` by the generator), so write them to read
+well in both `cargo doc` and the reference page.
+
 ## 5. Status
 
 Always carries `resolved.*` pinned values (ADR §4.2: resolved identity pinned at admission, never re-rendered). `conditions: Vec<Condition>` using the k8s-openapi type. Phase is a closed enum with a `#[default]` of `Pending`.

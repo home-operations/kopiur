@@ -191,14 +191,34 @@ controller:
   podLabels: {}
   podAnnotations: {}
   # -- Address the controller's HTTP server binds to (env KOPIUR_HTTP_ADDR;
-  # serves /metrics, /healthz, /readyz). Override on an IPv6-only/dual-stack
-  # cluster, where the kubelet cannot reach an IPv4-only bind (0.0.0.0) and
-  # probes never succeed — set "[::]:8081" there. Must agree on port with
+  # serves /metrics, /healthz, /readyz). Defaults to the dual-stack wildcard
+  # "[::]:8081", which serves both IPv4 and IPv6 kubelets (a wildcard IPv6 bind
+  # also accepts IPv4 on Linux when net.ipv6.bindv6only=0, the default).
+  # Override to "0.0.0.0:8081" only where IPv6 is disabled in the pod network
+  # namespace, where a "[::]" bind fails outright. Must agree on port with
   # probePort below (the Service and probes target that port, not whatever
   # this address happens to contain).
-  listenAddr: "0.0.0.0:8081"
+  listenAddr: "[::]:8081"
   # -- Liveness/readiness HTTP probe port on the controller (serves /healthz, /readyz, /metrics).
   probePort: 8081
+  # -- Liveness probe for the controller container. The whole probe is passed
+  # through with `toYaml`, so you can retune timings/thresholds or swap the
+  # scheme entirely; set to `{}` to drop the probe. `port: metrics` is the named
+  # container port (probePort above).
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: metrics
+    initialDelaySeconds: 10
+    periodSeconds: 15
+  # -- Readiness probe for the controller container (same passthrough as
+  # livenessProbe; set to `{}` to drop it).
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: metrics
+    initialDelaySeconds: 5
+    periodSeconds: 10
 
 # =============================================================================
 # Admission webhook
@@ -215,8 +235,11 @@ webhook:
   failurePolicy: Fail
   # -- timeoutSeconds for admission requests (1..30).
   timeoutSeconds: 10
-  # -- Address the webhook server binds to (env KOPIUR_WEBHOOK_ADDR).
-  listenAddr: "0.0.0.0:8443"
+  # -- Address the webhook server binds to (env KOPIUR_WEBHOOK_ADDR). Defaults
+  # to the dual-stack wildcard "[::]:8443" (serves both IPv4 and IPv6 API
+  # servers); override to "0.0.0.0:8443" only where IPv6 is disabled in the pod
+  # network namespace.
+  listenAddr: "[::]:8443"
   # -- Port the webhook container listens on (must match listenAddr above).
   containerPort: 8443
   # The webhook serves /metrics on its TLS port (kopiur_webhook_admission_total).
@@ -244,6 +267,29 @@ webhook:
   priorityClassName: ""
   podLabels: {}
   podAnnotations: {}
+  # -- Extra environment variables for the webhook container (list of
+  # `{name, value}` / `{name, valueFrom}` entries), appended after the
+  # operator-managed env. Mirrors `controller.extraEnv`.
+  extraEnv: []
+  # -- Liveness probe for the webhook container. Passed through with `toYaml`
+  # (retune timings/thresholds or swap the probe; `{}` drops it). The webhook
+  # only serves HTTPS, so `scheme: HTTPS` on the named `https` port.
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: https
+      scheme: HTTPS
+    initialDelaySeconds: 5
+    periodSeconds: 15
+  # -- Readiness probe for the webhook container (same passthrough as
+  # livenessProbe; set to `{}` to drop it).
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: https
+      scheme: HTTPS
+    initialDelaySeconds: 5
+    periodSeconds: 10
   # TLS for the webhook server. The webhook ALWAYS serves TLS (k8s requires
   # HTTPS for admission). How the serving cert is provisioned is chosen by
   # tls.mode below.

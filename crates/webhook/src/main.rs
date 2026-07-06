@@ -7,7 +7,7 @@
 //! binary builds and starts without any cert files present.
 //!
 //! Configuration (flag > env > default):
-//! - `--addr`     / `KOPIUR_WEBHOOK_ADDR`     bind address (default `0.0.0.0:8443`).
+//! - `--addr`     / `KOPIUR_WEBHOOK_ADDR`     bind address (default `[::]:8443`).
 //! - `--tls-cert` / `KOPIUR_WEBHOOK_TLS_CERT` PEM cert chain path (enables TLS with the key).
 //! - `--tls-key`  / `KOPIUR_WEBHOOK_TLS_KEY`  PEM private key path.
 //! - `RUST_LOG`                               tracing filter (default `info`).
@@ -70,7 +70,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    use anyhow::Context as _;
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "binding the webhook server to {addr}; if this host has IPv6 disabled a `[::]` bind \
+             fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (chart: webhook.listenAddr)",
+            addr.port()
+        )
+    })?;
     tracing::info!(%addr, "listening (http)");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -84,6 +91,7 @@ async fn serve_tls(
     cert_path: &str,
     key_path: &str,
 ) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use axum_server::Handle;
     use axum_server::tls_rustls::RustlsConfig;
 
@@ -111,7 +119,15 @@ async fn serve_tls(
     axum_server::bind_rustls(addr, config)
         .handle(handle)
         .serve(router.into_make_service())
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "binding the webhook TLS server to {addr}; if this host has IPv6 disabled a \
+                 `[::]` bind fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (chart: \
+                 webhook.listenAddr)",
+                addr.port()
+            )
+        })?;
     Ok(())
 }
 

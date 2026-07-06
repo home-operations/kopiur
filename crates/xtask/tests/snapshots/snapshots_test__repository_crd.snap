@@ -494,6 +494,7 @@ spec:
                       snapshots reflecting changes made outside this operator.
                     type: boolean
                   refreshInterval:
+                    default: 1h
                     description: |-
                       How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum
                       `30s`, default `1h`). Inert unless `periodicRefresh` is enabled.
@@ -584,6 +585,7 @@ spec:
                 nullable: true
                 properties:
                   indexBlobWarnThreshold:
+                    default: 1000
                     description: Index-blob count above which the reconciler raises the `IndexBlobHealth` warning (`0` disables).
                     format: int64
                     nullable: true
@@ -600,6 +602,7 @@ spec:
                           current behavior until a user opts in.
                         type: boolean
                       failureThreshold:
+                        default: 3
                         description: |-
                           How many *consecutive* failing probes to require before raising the loud
                           condition + event (default `3`). Debounces a single transient blip from
@@ -608,6 +611,7 @@ spec:
                         nullable: true
                         type: integer
                       interval:
+                        default: 30m
                         description: |-
                           How often to re-probe the backend (Go-style duration like `30m` or `1h`;
                           minimum `30s`, default `30m`). Inert unless `enabled`.
@@ -2344,6 +2348,7 @@ spec:
                           Ingress/LoadBalancer controller onto.
                         type: object
                       port:
+                        default: 51515
                         description: Listen/Service port. Defaults to [`DEFAULT_SERVER_PORT`] when omitted.
                         format: uint16
                         maximum: 65535.0

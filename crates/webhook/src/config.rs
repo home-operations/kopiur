@@ -15,8 +15,12 @@ pub const WEBHOOK_TLS_CERT_ENV: &str = "KOPIUR_WEBHOOK_TLS_CERT";
 pub const WEBHOOK_TLS_KEY_ENV: &str = "KOPIUR_WEBHOOK_TLS_KEY";
 
 /// Default bind address when [`WEBHOOK_ADDR_ENV`] is unset (k8s requires HTTPS
-/// for admission; the chart maps Service 443 → this container port).
-pub const DEFAULT_ADDR: &str = "0.0.0.0:8443";
+/// for admission; the chart maps Service 443 → this container port). Dual-stack
+/// `[::]` so a single bind serves both IPv4 and IPv6 API servers (a wildcard
+/// IPv6 bind also accepts IPv4 on Linux when `net.ipv6.bindv6only=0`, the
+/// default); override to `0.0.0.0:8443` only where IPv6 is disabled in the pod
+/// network namespace.
+pub const DEFAULT_ADDR: &str = "[::]:8443";
 
 /// How often the TLS server re-reads its cert/key files so an operator-rotated
 /// serving leaf (the `webhook.tls.mode: self` path — the controller rewrites the
@@ -63,8 +67,8 @@ fn parse_webhook_addr(value: &str) -> Result<SocketAddr, String> {
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
             "KOPIUR_WEBHOOK_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
-             0.0.0.0:8443 (IPv4), [::]:8443 (IPv6/dual-stack); unset it to use the default \
-             0.0.0.0:8443"
+             [::]:8443 (IPv6/dual-stack, the default), 0.0.0.0:8443 (IPv4-only, for hosts with \
+             IPv6 disabled); unset it to use the default [::]:8443"
         )
     })
 }

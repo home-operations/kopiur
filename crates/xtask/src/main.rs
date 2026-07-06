@@ -3,7 +3,8 @@
 //! Subcommands (dispatched on `std::env::args`, no clap):
 //!   * `gen-crds [--check]`  — write `deploy/crds/*.yaml` (one per CRD + bundle)
 //!   * `gen-rbac [--check]`  — write `deploy/rbac/*.yaml` (cluster + namespaced)
-//!   * `gen-all  [--check]`  — both of the above
+//!   * `gen-docs [--check]`  — write `docs/field-reference.md` from the schemas
+//!   * `gen-all  [--check]`  — all of the above (+ dashboards)
 //!
 //! `--check` generates everything in memory and compares it against the
 //! checked-in files, writing nothing and exiting non-zero on any drift. This is
@@ -14,11 +15,12 @@
 
 fn usage() {
     eprintln!(
-        "usage: cargo xtask <gen-crds|gen-rbac|gen-all> [--check]\n\
+        "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-all> [--check]\n\
          \n\
          gen-crds   generate deploy/crds/*.yaml from the kopiur-api CRD types\n\
          gen-rbac   generate deploy/rbac/*.yaml (ClusterRole + Role install modes)\n\
-         gen-all    run gen-crds then gen-rbac\n\
+         gen-docs   generate docs/field-reference.md from the CRD schemas\n\
+         gen-all    run gen-crds, gen-rbac, dashboards, and gen-docs\n\
          \n\
          --check    compare generated output against checked-in files; write\n\
                     nothing and exit non-zero if anything differs (CI drift guard)"
@@ -37,7 +39,7 @@ fn main() {
     let check = args.iter().skip(1).any(|a| a == "--check");
 
     match cmd {
-        "gen-crds" | "gen-rbac" | "gen-all" => match xtask::run(cmd, check) {
+        "gen-crds" | "gen-rbac" | "gen-docs" | "gen-all" => match xtask::run(cmd, check) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("error: {e:#}");
