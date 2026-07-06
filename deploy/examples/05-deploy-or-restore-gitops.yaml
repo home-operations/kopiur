@@ -1,4 +1,4 @@
-# Example 05 — Deploy-or-restore, the headline GitOps pattern (ADR-0001 §5.5)
+# Example 05 — Deploy-or-restore, the headline GitOps pattern
 #
 # Apply everything together. On a FRESH cluster against an EXISTING repo, the PVC
 # restores the latest snapshot before the app starts. On a fresh repo, the PVC
@@ -9,9 +9,9 @@
 #   * SnapshotSchedule — nightly backups going forward (runOnCreate: false).
 #   * Restore        — PASSIVE populator: source.fromPolicy + target.populator: {}
 #                      + onMissingSnapshot: Continue. A populator Restore is consumed
-#                      by a PVC's dataSourceRef as a volume populator (ADR §4.7,
-#                      ADR-0005 §9 — `target` is REQUIRED; populator intent is the
-#                      explicit empty `target.populator: {}`).
+#                      by a PVC's dataSourceRef as a volume populator (`target` is
+#                      REQUIRED; populator intent is the explicit empty
+#                      `target.populator: {}`).
 #   * PVC            — references the passive Restore via spec.dataSourceRef.
 #
 # `onMissingSnapshot: Continue` is the DEFAULT for fromPolicy; shown explicitly.
@@ -52,7 +52,7 @@ spec:
     fromPolicy:
       name: postgres-data
       offset: 0 # 0 = latest, 1 = previous, ...
-  # Explicit PASSIVE populator mode (ADR-0005 §9): no workload target at provision
+  # Explicit PASSIVE populator mode: no workload target at provision
   # time — the PVC below claims this Restore via spec.dataSourceRef.
   target:
     populator: {}

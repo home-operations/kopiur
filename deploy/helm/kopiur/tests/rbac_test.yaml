@@ -173,7 +173,7 @@ tests:
   - it: "leader election disabled drops the leases RBAC entirely (cluster)"
     set:
       installScope: cluster
-      controller.leaderElection.enabled: false
+      leaderElection.enabled: false
     asserts:
       - hasDocuments:
           count: 0
@@ -183,7 +183,7 @@ tests:
     set:
       installScope: namespaced
       webhook.enabled: false
-      controller.leaderElection.enabled: false
+      leaderElection.enabled: false
     template: role.tpl
     asserts:
       - notContains:

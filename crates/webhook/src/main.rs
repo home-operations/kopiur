@@ -74,7 +74,7 @@ async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
             "binding the webhook server to {addr}; if this host has IPv6 disabled a `[::]` bind \
-             fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (chart: webhook.listenAddr)",
+             fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via webhook.extraEnv)",
             addr.port()
         )
     })?;
@@ -123,8 +123,8 @@ async fn serve_tls(
         .with_context(|| {
             format!(
                 "binding the webhook TLS server to {addr}; if this host has IPv6 disabled a \
-                 `[::]` bind fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (chart: \
-                 webhook.listenAddr)",
+                 `[::]` bind fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via \
+                 webhook.extraEnv)",
                 addr.port()
             )
         })?;

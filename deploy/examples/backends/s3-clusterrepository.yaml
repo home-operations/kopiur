@@ -1,4 +1,4 @@
-# Backend: S3 as a shared ClusterRepository (ADR-0003 §3.1/§3.2)
+# Backend: S3 as a shared ClusterRepository
 #
 # The SAME S3 backend stanza, but on a cluster-scoped ClusterRepository owned by a
 # platform team and referenced by allow-listed tenant namespaces. Two things differ
@@ -49,7 +49,7 @@ spec:
     list:
       - billing
       - payments
-  # CEL expressions evaluated at admission, pinned to status (ADR-0004 §5). The
+  # CEL expressions evaluated at admission, pinned to status. The
   # CEL environment is `namespace`, `policyName`, `labels`, `annotations`.
   identityDefaults:
     hostnameExpr: "namespace"

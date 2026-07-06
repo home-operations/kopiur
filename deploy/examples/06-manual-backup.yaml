@@ -1,11 +1,11 @@
-# Example 06 — Manual one-shot backup (ADR-0001 §5.6)
+# Example 06 — Manual one-shot backup
 #
 # A Snapshot CR is the universal trigger: created by a SnapshotSchedule, by
 # `kubectl create`, or by any external system (Argo Events Sensor, Tekton Task,
 # GitHub Actions, a webhook handler). Trigger is separable from recipe (G17).
 #
 # For scheduled/manual backups the spec carries `policyRef`. `deletionPolicy` is
-# a closed enum: Delete (default for produced) | Retain | Orphan (ADR §4.5).
+# a closed enum: Delete (default for produced) | Retain | Orphan.
 # `tags` are arbitrary kopia snapshot tags.
 #
 # The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
@@ -28,7 +28,7 @@ spec:
   # Keep the Snapshot CR even when the next GFS prune runs.
   deletionPolicy: Retain
   # Pin the underlying kopia snapshot so GFS retention NEVER expires it — for a
-  # pre-migration / compliance hold (ADR-0005 §13(c)). Clear it to release the
+  # pre-migration / compliance hold. Clear it to release the
   # hold. `pin` exempts the snapshot from expiry; `deletionPolicy` governs what
   # happens to the snapshot when THIS CR is deleted — they're independent.
   pin: true

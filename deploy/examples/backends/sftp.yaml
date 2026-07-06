@@ -1,4 +1,4 @@
-# Backend: SFTP (ADR-0003 §3.1)
+# Backend: SFTP
 #
 # Connection identifiers (host/port/path/username) live in the Repository spec;
 # the SSH private key and known-hosts entry live in a Secret.

@@ -6,15 +6,16 @@
 
 {{ template "chart.homepageLine" . }}
 
-Requires Kubernetes **>= 1.24** — the CSI volume-populator path (`Restore` +
-`PVC.dataSourceRef`) needs the `AnyVolumeDataSource` machinery GA-gated from
-1.24+ (ADR §4.7).
+Requires Kubernetes **>= 1.32** — the floor matches the default
+`streamingLists: true` (the WatchList API is beta from 1.32, GA in 1.34). Set
+`streamingLists: false` on an apiserver with the feature gate disabled.
 
 ## TL;DR
 
 ```bash
-# namespaced install (default). The webhook cert is self-managed by default —
-# no cert-manager, no manual steps:
+# cluster install (default): manages kopiur objects cluster-wide and reconciles
+# ClusterRepository. The webhook cert is self-managed by default — no
+# cert-manager, no manual steps:
 helm install kopiur deploy/helm/kopiur \
   --namespace kopiur-system --create-namespace
 ```
@@ -23,17 +24,17 @@ See [`docs/install.md`](../../../docs/install.md) for the full quickstart and pr
 
 ## Install modes
 
-### Scope: `namespaced` (default) vs `cluster`
+### Scope: `cluster` (default) vs `namespaced`
 
 | `installScope` | RBAC | What it manages | `ClusterRepository` |
 |---|---|---|---|
-| `namespaced` | `Role` + `RoleBinding` | `kopiur.home-operations.com` objects in the **release namespace** only | not reconciled |
 | `cluster` | `ClusterRole` + `ClusterRoleBinding` | `kopiur.home-operations.com` objects **cluster-wide** | reconciled |
+| `namespaced` | `Role` + `RoleBinding` | `kopiur.home-operations.com` objects in the **release namespace** only | not reconciled |
 
-`namespaced` is the safer default (ADR §4.11). Choose `cluster` when a platform team runs a shared backup tier (a `ClusterRepository` referenced by many tenant namespaces).
+`cluster` is the default: a namespace-scoped `Role` can't reach the cluster-scoped `ClusterRepository` kind, so a namespaced install silently can't run a shared backup tier. Choose `namespaced` as the explicit least-privilege opt-down for a single-team install.
 
 ```bash
-helm install kopiur deploy/helm/kopiur --set installScope=cluster ...
+helm install kopiur deploy/helm/kopiur --set installScope=namespaced ...
 ```
 
 The RBAC rules are **synced from `cargo xtask gen-rbac`** (the checked-in `deploy/rbac/operator-*.yaml`), which derives the `kopiur.home-operations.com` permissions from the kube-rs `Resource` traits. The xtask is the source of truth; the chart templates carry a header comment to that effect and own only the names/labels.
@@ -50,9 +51,9 @@ In `self` mode the operator's ServiceAccount is granted the minimal extra RBAC t
 
 Disable the webhook entirely with `webhook.enabled=false` (validation then falls back to the controller's defensive checks only — not recommended).
 
-### CRD install toggle
+### CRDs
 
-`installCRDs: true` (default) renders the 7 CRDs as **templates** (not via Helm's special `crds/` directory) so the flag actually works and `helm upgrade` re-applies schema changes. Trade-off: `helm uninstall` will then delete the CRDs **and every `kopiur.home-operations.com` object in the cluster**. For decoupled CRD lifecycle (e.g. GitOps), set `installCRDs: false` and apply `deploy/crds/*.yaml` out of band.
+The 8 CRDs ship in the chart's special `crds/` directory. Helm installs them on `helm install`, and — because Helm never touches `crds/` on `helm upgrade` — an accidental `helm uninstall` leaves them (and every `kopiur.home-operations.com` object) untouched, exactly what you want for a backup operator. The flip side: a plain helm-CLI **upgrade** does not update the CRD schema as the `v1alpha1` API evolves. For a helm-CLI upgrade, apply the new schema yourself with `kubectl apply -f deploy/crds/`; GitOps tooling with a `CreateReplace` CRD policy (e.g. Flux) upgrades the `crds/`-shipped CRDs automatically.
 
 {{ template "chart.valuesSection" . }}
 

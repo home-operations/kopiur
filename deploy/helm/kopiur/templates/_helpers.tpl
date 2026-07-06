@@ -30,7 +30,8 @@ Chart name and version, as used by the helm.sh/chart label.
 {{- end }}
 
 {{/*
-Common labels.
+Common labels. Includes global.commonLabels (fleet-wide labelling) so every
+object the chart renders carries them.
 */}}
 {{- define "kopiur.labels" -}}
 helm.sh/chart: {{ include "kopiur.chart" . }}
@@ -40,6 +41,9 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: kopiur
+{{- with .Values.global.commonLabels }}
+{{ toYaml . }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -87,7 +91,7 @@ Controller component name.
 {{/*
 Mover identity. The controller mints — in each mover Job's (workload) namespace — a
 least-privilege ServiceAccount of this name bound to the mover Role/ClusterRole of
-the same name (ADR §4.12). Both names are passed to the controller via env so the
+the same name. Both names are passed to the controller via env so the
 runtime-minted objects match the chart-shipped role.
 */}}
 {{- define "kopiur.moverName" -}}
@@ -102,20 +106,79 @@ Webhook component name.
 {{- end }}
 
 {{/*
-Resolve an image reference: registry/repository@digest if digest set, else
-registry/repository:tag (tag defaults to .Chart.AppVersion).
-Usage: include "kopiur.image" (dict "root" $ "img" .Values.image.controller)
+Resolve an image reference from a component image block (repository is the full
+registry+path string): repository@digest if digest set, else repository:tag
+(tag defaults to .Chart.AppVersion).
+Usage: include "kopiur.image" (dict "root" $ "img" .Values.image)
+       include "kopiur.image" (dict "root" $ "img" .Values.webhook.image)
+       include "kopiur.image" (dict "root" $ "img" .Values.mover.image)
 */}}
 {{- define "kopiur.image" -}}
 {{- $root := .root -}}
 {{- $img := .img -}}
-{{- $registry := $root.Values.image.registry -}}
 {{- $repo := $img.repository -}}
 {{- if $img.digest -}}
-{{- printf "%s/%s@%s" $registry $repo $img.digest -}}
+{{- printf "%s@%s" $repo $img.digest -}}
 {{- else -}}
 {{- $tag := default $root.Chart.AppVersion $img.tag -}}
-{{- printf "%s/%s:%s" $registry $repo $tag -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Merged image pull secrets: global.imagePullSecrets concatenated with the
+top-level imagePullSecrets. Emits nothing when both are empty.
+Usage: {{- include "kopiur.imagePullSecrets" . | nindent 6 }}
+*/}}
+{{- define "kopiur.imagePullSecrets" -}}
+{{- $merged := concat (.Values.global.imagePullSecrets | default list) (.Values.imagePullSecrets | default list) -}}
+{{- with $merged }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+
+{{/*
+Global-merge helpers for the two named components (root = controller, webhook.*).
+Map-valued globals (nodeSelector, affinity) take the component value when it is
+set, else the global. List-valued globals (tolerations, topologySpreadConstraints)
+concatenate global + component. Each emits nothing when the merged value is empty,
+so callers can `with` the result.
+Usage: {{- with (include "kopiur.nodeSelector" (dict "root" $ "component" .Values.nodeSelector)) }}
+*/}}
+{{- define "kopiur.nodeSelector" -}}
+{{- $c := .component -}}
+{{- if $c -}}
+{{- toYaml $c -}}
+{{- else -}}
+{{- with .root.Values.global.nodeSelector -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kopiur.affinity" -}}
+{{- $c := .component -}}
+{{- if $c -}}
+{{- toYaml $c -}}
+{{- else -}}
+{{- with .root.Values.global.affinity -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kopiur.tolerations" -}}
+{{- $merged := concat (.root.Values.global.tolerations | default list) (.component | default list) -}}
+{{- with $merged -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kopiur.topologySpreadConstraints" -}}
+{{- $merged := concat (.root.Values.global.topologySpreadConstraints | default list) (.component | default list) -}}
+{{- with $merged -}}
+{{- toYaml . -}}
 {{- end -}}
 {{- end }}
 
@@ -170,14 +233,13 @@ Usage: {{- include "kopiur.otlpEnv" . | nindent 12 }}
 {{/*
 Logging environment for the controller + webhook (and, via the controller, mover
 Jobs — the controller forwards RUST_LOG + KOPIUR_LOG_FORMAT from its own env).
-RUST_LOG resolves from logging.level, falling back to the deprecated
-controller.logLevel. KOPIUR_LOG_FORMAT selects text|json. The env var NAMES match
-crates/telemetry/src/env.rs.
+RUST_LOG comes from logging.level; KOPIUR_LOG_FORMAT selects text|json. The env
+var NAMES match crates/telemetry/src/env.rs.
 Usage: {{- include "kopiur.loggingEnv" . | nindent 12 }}
 */}}
 {{- define "kopiur.loggingEnv" -}}
 - name: RUST_LOG
-  value: {{ .Values.logging.level | default .Values.controller.logLevel | quote }}
+  value: {{ .Values.logging.level | default "info" | quote }}
 - name: KOPIUR_LOG_FORMAT
   value: {{ .Values.logging.format | default "text" | quote }}
 {{- end }}

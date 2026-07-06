@@ -1,4 +1,4 @@
-# Example 17 — Restore from a shared ClusterRepository, into a fresh namespace (ADR-0003 §4.6/§4.11)
+# Example 17 — Restore from a shared ClusterRepository, into a fresh namespace
 #
 # Restoring from a shared `ClusterRepository` into a namespace that has never run a
 # backup hits a chicken-and-egg: the restore mover loads the repo credentials via

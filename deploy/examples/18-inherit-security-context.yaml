@@ -1,4 +1,4 @@
-# Example 18 — Inherit the mover's UID/GID from the workload (ADR-0003 §4.11)
+# Example 18 — Inherit the mover's UID/GID from the workload
 #
 # Instead of hard-coding `spec.mover.securityContext.runAsUser/runAsGroup` to
 # match the data owner (example 09), let the mover "run as whatever the app runs

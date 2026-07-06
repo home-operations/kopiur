@@ -18,7 +18,7 @@ tests:
 
   - it: pins the controller image by digest when set, overriding the tag
     set:
-      image.controller.digest: sha256:abc123
+      image.digest: sha256:abc123
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
@@ -26,7 +26,7 @@ tests:
 
   - it: stamps the digest-pinned mover image into the controller env
     set:
-      image.mover.digest: sha256:def456
+      mover.image.digest: sha256:def456
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -34,9 +34,9 @@ tests:
             name: KOPIUR_MOVER_IMAGE
             value: ghcr.io/home-operations/kopiur-mover@sha256:def456
 
-  - it: sets replicas from controller.replicaCount
+  - it: sets replicas from the root replicaCount (controller)
     set:
-      controller.replicaCount: 3
+      replicaCount: 3
     asserts:
       - equal:
           path: spec.replicas
@@ -51,17 +51,20 @@ tests:
           path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
           value: true
 
-  - it: defaults to namespaced scope (mover RoleKind = Role)
+  - it: namespaced scope stamps the mover RoleKind = Role
+    set:
+      installScope: namespaced
     asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --namespace=NAMESPACE
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: KOPIUR_MOVER_ROLE_KIND
             value: Role
 
-  - it: passes cluster-scope args when installScope is cluster
-    set:
-      installScope: cluster
+  - it: defaults to cluster scope (--cluster-scope, mover RoleKind = ClusterRole)
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
@@ -87,7 +90,7 @@ tests:
 
   - it: "leader election disabled passes --leader-elect=false and no Lease name"
     set:
-      controller.leaderElection.enabled: false
+      leaderElection.enabled: false
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
@@ -108,15 +111,18 @@ tests:
             name: KOPIUR_HTTP_ADDR
             value: "[::]:8081"
 
-  - it: stamps a custom controller listenAddr into the env
+  - it: renders the bind address from a custom metrics.port
     set:
-      controller.listenAddr: "0.0.0.0:8081"
+      metrics.port: 9090
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: KOPIUR_HTTP_ADDR
-            value: "0.0.0.0:8081"
+            value: "[::]:9090"
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 9090
 
   - it: renders the default controller probes
     asserts:
@@ -132,7 +138,7 @@ tests:
 
   - it: lets a user retune a controller probe timing
     set:
-      controller.readinessProbe.periodSeconds: 30
+      readinessProbe.periodSeconds: 30
     asserts:
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.periodSeconds
@@ -140,14 +146,14 @@ tests:
 
   - it: drops a controller probe when nulled out
     set:
-      controller.livenessProbe: null
+      livenessProbe: null
     asserts:
       - isNull:
           path: spec.template.spec.containers[0].livenessProbe
 
-  - it: appends controller.extraEnv after the managed env
+  - it: appends the root extraEnv after the managed env
     set:
-      controller.extraEnv:
+      extraEnv:
         - name: MY_EXTRA
           value: hello
     asserts:

@@ -1,0 +1,94 @@
+suite: per-component security contexts and global merge
+templates:
+  - deployment.tpl
+  - webhook-deployment.tpl
+tests:
+  - it: controller pod security context comes from the root podSecurityContext
+    template: deployment.tpl
+    set:
+      podSecurityContext.runAsUser: 1000
+      podSecurityContext.fsGroup: 1000
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 1000
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 1000
+
+  - it: relaxing the controller context does NOT loosen the webhook (per-component)
+    template: webhook-deployment.tpl
+    set:
+      podSecurityContext.runAsUser: 1000
+    asserts:
+      # The webhook keeps its own locked-down default, not the controller's.
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 65534
+
+  - it: the webhook honors its own podSecurityContext override
+    template: webhook-deployment.tpl
+    set:
+      webhook.podSecurityContext.runAsUser: 2000
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 2000
+
+  - it: controller nodeSelector falls back to global when unset
+    template: deployment.tpl
+    set:
+      global.nodeSelector:
+        disktype: ssd
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector.disktype
+          value: ssd
+
+  - it: controller tolerations concatenate global + component
+    template: deployment.tpl
+    set:
+      global.tolerations:
+        - key: global-t
+          operator: Exists
+      tolerations:
+        - key: comp-t
+          operator: Exists
+    asserts:
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: global-t
+            operator: Exists
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: comp-t
+            operator: Exists
+
+  - it: global.commonLabels are stamped on rendered objects
+    template: deployment.tpl
+    set:
+      global.commonLabels:
+        fleet: kopiur-prod
+    asserts:
+      - equal:
+          path: metadata.labels.fleet
+          value: kopiur-prod
+
+  - it: global + top-level imagePullSecrets are concatenated
+    template: deployment.tpl
+    set:
+      global.imagePullSecrets:
+        - name: global-creds
+      imagePullSecrets:
+        - name: local-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.imagePullSecrets
+          content:
+            name: global-creds
+      - contains:
+          path: spec.template.spec.imagePullSecrets
+          content:
+            name: local-creds

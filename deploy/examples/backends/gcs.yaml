@@ -1,4 +1,4 @@
-# Backend: Google Cloud Storage (ADR-0003 §3.1)
+# Backend: Google Cloud Storage
 #
 # Identifiers (bucket/prefix) live in the Repository spec; the service-account
 # key JSON lives in a Secret. kopia reads it as GOOGLE_APPLICATION_CREDENTIALS.

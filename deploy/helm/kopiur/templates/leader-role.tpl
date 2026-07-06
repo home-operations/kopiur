@@ -1,4 +1,4 @@
-{{- if and (eq .Values.installScope "cluster") .Values.controller.leaderElection.enabled -}}
+{{- if and (eq .Values.installScope "cluster") .Values.leaderElection.enabled -}}
 # Leader-election RBAC for the CLUSTER install (namespaced installs carry these
 # rules in the operator Role instead). The election Lease is namespace-local, so
 # this is deliberately a Role+RoleBinding paired with the operator ClusterRole —

@@ -1,4 +1,4 @@
-# Example 04 — Multi-PVC selector (ADR-0001 §5.4)
+# Example 04 — Multi-PVC selector
 #
 # Back up every PVC matching a label as one consistent group. Resolves volsync's
 # "one ReplicationSource = one PVC" limitation (G2).
@@ -26,7 +26,7 @@ spec:
           matchLabels:
             backup: include
       sourcePathStrategy: PvcName
-  # One consistent VolumeGroupSnapshot across all matched PVCs (ADR §4.9).
+  # One consistent VolumeGroupSnapshot across all matched PVCs.
   groupBy: VolumeGroupSnapshot
   retention:
     keepDaily: 14

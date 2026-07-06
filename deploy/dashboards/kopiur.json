@@ -568,7 +568,7 @@
       "id": 31,
       "type": "timeseries",
       "title": "Time since last verify",
-      "description": "Age of the most recent successful SnapshotPolicy verification (quick or deep). A growing value means backups aren't being integrity-checked — alert on staleness like the last-backup age (ADR-0005 §4).",
+      "description": "Age of the most recent successful SnapshotPolicy verification (quick or deep). A growing value means backups aren't being integrity-checked — alert on staleness like the last-backup age.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "s" } },
       "gridPos": { "h": 7, "w": 8, "x": 16, "y": 32 },

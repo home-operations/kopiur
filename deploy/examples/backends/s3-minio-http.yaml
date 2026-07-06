@@ -1,4 +1,4 @@
-# Backend: S3 — in-cluster MinIO / RustFS over plain HTTP (ADR-0003 §3.1)
+# Backend: S3 — in-cluster MinIO / RustFS over plain HTTP
 #
 # A variant of the S3 backend for an S3-compatible store reached over plain HTTP
 # (e.g. a MinIO/RustFS Service inside the cluster). kopia's S3 path assumes HTTPS,

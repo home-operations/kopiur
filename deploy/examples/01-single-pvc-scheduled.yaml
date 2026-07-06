@@ -1,4 +1,4 @@
-# Example 01 — Single PVC, scheduled daily (ADR-0001 §5.1)
+# Example 01 — Single PVC, scheduled daily
 #
 # The canonical first backup: one Repository (S3), one SnapshotPolicy (the recipe,
 # idempotent — runs nothing on its own), one SnapshotSchedule (the cron that
@@ -71,7 +71,7 @@ spec:
   sources:
     - pvc:
         name: postgres-data
-  # GFS retention is the ONLY successful-retention driver (ADR §4.4).
+  # GFS retention is the ONLY successful-retention driver.
   retention:
     keepDaily: 14
     keepWeekly: 4
@@ -88,9 +88,9 @@ spec:
   policyRef:
     name: postgres-data
   schedule:
-    # Jenkins-style H pins a deterministic per-schedule minute (ADR §4.1).
+    # Jenkins-style H pins a deterministic per-schedule minute.
     cron: "H 2 * * *"
     jitter: 30m
-    # GitOps-friendly default: do not fire immediately on create (ADR §4.1 / G3).
+    # GitOps-friendly default: do not fire immediately on create.
     runOnCreate: false
 # --8<-- [end:schedule]

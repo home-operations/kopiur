@@ -207,7 +207,15 @@ jobs:
               sha256:*) ;;
               *) echo "build produced no digest for ${comp} (got: '${digest}')"; exit 1 ;;
             esac
-            yq -i ".image.${comp}.digest = \"${digest}\"" deploy/helm/kopiur/values.yaml
+            # Per-component image paths after the chart flatten: the controller is
+            # the root `image`, the webhook and mover keep their named blocks.
+            case "${comp}" in
+              controller) path=".image.digest" ;;
+              webhook)    path=".webhook.image.digest" ;;
+              mover)      path=".mover.image.digest" ;;
+              *) echo "unknown component ${comp}"; exit 1 ;;
+            esac
+            yq -i "${path} = \"${digest}\"" deploy/helm/kopiur/values.yaml
             echo "pinned ${comp} -> ${digest}"
           done
 

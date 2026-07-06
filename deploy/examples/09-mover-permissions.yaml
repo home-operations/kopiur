@@ -1,10 +1,10 @@
-# Example 09 — Mover UID/GID & permissions (ADR-0003 §4.11/§G16)
+# Example 09 — Mover UID/GID & permissions
 #
 # The mover Job is what reads your PVC. It must run as a UID/GID that can READ the
 # data. By default movers run unprivileged as the image user (UID 65532) with a
 # hardened securityContext (runAsNonRoot, drop ALL caps, seccomp RuntimeDefault).
 #
-# WHERE to set the UID/GID — two layers (ADR-0004 §1/§2):
+# WHERE to set the UID/GID — two layers:
 #   * `Repository.spec.moverDefaults` — the SINGLE place to set PUID/PGID for the
 #     whole repository. Every mover it spawns (bootstrap, backup, restore,
 #     maintenance) inherits these. This is the new home of the old KOPIUR_PUID /
@@ -55,7 +55,7 @@ spec:
   # ── moverDefaults: the PUID/PGID story, set ONCE for the whole repository ─────
   # Every mover this repository spawns (bootstrap, backup, restore, maintenance)
   # inherits these. The old KOPIUR_PUID/KOPIUR_PGID env vars are gone — set the
-  # UID/GID here instead (ADR-0004 §1). Per-recipe `mover` blocks merge OVER this.
+  # UID/GID here instead. Per-recipe `mover` blocks merge OVER this.
   moverDefaults:
     securityContext:
       runAsUser: 1000 # PUID — the UID that owns the data on every PVC here

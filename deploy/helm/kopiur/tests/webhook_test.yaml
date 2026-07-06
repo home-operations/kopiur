@@ -26,15 +26,18 @@ tests:
             name: KOPIUR_WEBHOOK_ADDR
             value: "[::]:8443"
 
-  - it: stamps a custom webhook listenAddr into the env
+  - it: renders the webhook bind address from a custom webhook.port
     set:
-      webhook.listenAddr: "0.0.0.0:8443"
+      webhook.port: 9443
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: KOPIUR_WEBHOOK_ADDR
-            value: "0.0.0.0:8443"
+            value: "[::]:9443"
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 9443
 
   - it: renders the default webhook probes over HTTPS
     asserts:

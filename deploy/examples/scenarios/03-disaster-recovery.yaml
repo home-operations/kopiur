@@ -91,7 +91,7 @@ spec:
     fromPolicy:
       name: postgres-data
       offset: 0 # 0 = latest surviving snapshot
-  # ADR-0005 §9: `target` is REQUIRED; populator intent is the explicit empty form.
+  # `target` is REQUIRED; populator intent is the explicit empty form.
   target:
     populator: {}
   policy:

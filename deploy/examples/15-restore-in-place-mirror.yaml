@@ -1,4 +1,4 @@
-# Example 15 — In-place mirror restore into an existing PVC (ADR-0003 §4.6)
+# Example 15 — In-place mirror restore into an existing PVC
 #
 # Restore directly into an EXISTING PVC (`target.pvcRef`) and make it an EXACT mirror
 # of the snapshot with `options.enableFileDeletion: true` — files in the target that

@@ -1,4 +1,4 @@
-# Example 10 — Back up an NFS export directly (ADR-0003 §3.3)
+# Example 10 — Back up an NFS export directly
 #
 # A SnapshotPolicy whose source is an inline NFS export — no PersistentVolumeClaim.
 # The operator mounts the export read-only into the backup mover and kopia

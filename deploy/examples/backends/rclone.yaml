@@ -1,4 +1,4 @@
-# Backend: rclone (everything else) (ADR-0003 §3.1)
+# Backend: rclone (everything else)
 #
 # kopia shells out to `rclone`, so any rclone-supported provider works. The
 # `remotePath` is rclone's `remote:path` form; the remote must be defined in the

@@ -3,7 +3,7 @@
 # A backup you have never restored is a hope, not a guarantee. There are two ways
 # to prove restorability on a schedule:
 #
-#   0) FIRST-CLASS verification (ADR-0005 §4, RECOMMENDED). Put a `verification:`
+#   0) FIRST-CLASS verification (RECOMMENDED). Put a `verification:`
 #      block on the SnapshotPolicy and the operator runs it for you: a frequent
 #      blob-level `kopia snapshot verify` (quick) and a rarer scratch-restore test
 #      (deep) into an ephemeral PVC. An optional CEL `successExpr` asserts the
