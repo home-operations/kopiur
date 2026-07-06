@@ -83,6 +83,10 @@ docs/adr/        Architecture Decision Records (0003 is canonical)
 - [ADR-0003 — Kopiur, a Kopia-native backup operator in Rust](docs/adr/0003-kopiur-rust-operator.md)
 - [Example manifests](deploy/examples/)
 
+## Releases
+
+Release artifacts (archives, the Homebrew cask, the krew plugin manifest, SBOMs, and Cosign signatures) are built and published with [GoReleaser Pro](https://goreleaser.com/pro/). If it's useful to your own projects, consider [sponsoring its author](https://github.com/sponsors/caarlos0).
+
 ## License
 
 [AGPL-3.0-only](LICENSE)
