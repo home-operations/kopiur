@@ -12,7 +12,7 @@ use common::*;
 use kube::Api;
 use kube::api::{DeleteParams, PostParams};
 
-use kopiur_api::RepositoryReplication;
+use kopiur_api::{Repository, RepositoryReplication};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait_until};
 
 /// `RepositoryReplication` (ADR-0005 §13(d)): mirror a source filesystem repo to a
@@ -185,4 +185,106 @@ async fn repository_replication_mirrors_filesystem_source_to_s3_destination() {
     );
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
+}
+
+/// The definitive #200 guard: an **S3 source → S3 destination** replication where the
+/// two backends use DISJOINT, bucket-scoped MinIO users. The source user can write
+/// only the source bucket; the destination user only the destination bucket. So
+/// `kopia repository sync-to` — which reads the source and writes the destination in
+/// one process — succeeds ONLY if the mover authenticates the destination write with
+/// the DESTINATION user's keys (the `KOPIUR_DEST_` remap) while the source read keeps
+/// using the source's. If the remap were broken (destination fell back to the source's
+/// `AWS_*`), the write to the destination bucket would be denied and the run would
+/// never stamp `lastReplicated`. Passing therefore proves BOTH the collision-free
+/// separation AND that remapping `AWS_*` for the sync-to child does not break the
+/// source read (kopia persists the source storage creds into repository.config at
+/// connect).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    // MinIO with the two bucket-scoped users + their Secrets (in the operator ns,
+    // which is E2E_NAMESPACE, so the destination Secret co-resides with the CR).
+    world.ensure(&[Need::Minio]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    // Source S3 repository, writable ONLY by the source-scoped user. `create.enabled`
+    // bootstraps it — proving the source keys can write the source bucket.
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let src = "e2e-repl-s2s-src";
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Repository",
+                "metadata": { "name": src, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "backend": { "s3": {
+                        "bucket": consts::S3_REPL_SRC_BUCKET,
+                        "endpoint": consts::MINIO_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": { "name": consts::SECRET_S3_REPL_SRC } }
+                    }},
+                    "encryption": { "passwordSecretRef": { "name": consts::SECRET_S3_REPL_SRC, "key": consts::KEY_KOPIA_PASSWORD } },
+                    "create": { "enabled": true }
+                }
+            })),
+        )
+        .await
+        .expect("create source S3 repository");
+    wait_ready(&repos, src)
+        .await
+        .expect("source S3 repository bootstraps (source-scoped keys can write the source bucket)");
+
+    // Replicate to a DIFFERENT bucket writable ONLY by the destination-scoped user.
+    let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = "e2e-repl-s2s";
+    repls
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "RepositoryReplication",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "sourceRef": { "kind": "Repository", "name": src },
+                    "destination": { "s3": {
+                        "bucket": consts::S3_REPL_DST_BUCKET,
+                        "endpoint": consts::MINIO_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": { "name": consts::SECRET_S3_REPL_DST } }
+                    }},
+                    "schedule": { "cron": "* * * * *" }
+                }
+            })),
+        )
+        .await
+        .expect("create S3→S3 RepositoryReplication");
+
+    wait_until(
+        "S3→S3 replication records a successful run (status.lastReplicated)",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect("S3→S3 replication should succeed using the destination-scoped credentials");
+
+    wait_ready(&repls, name)
+        .await
+        .expect("the S3→S3 replication must heal Ready=True");
+
+    let _ = repls.delete(name, &DeleteParams::default()).await;
+    let _ = repos.delete(src, &DeleteParams::default()).await;
 }

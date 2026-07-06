@@ -443,6 +443,47 @@ pub fn mc_bucket_pod(ns: &str, name: &str) -> Pod {
         "mc anonymous set public local/{}\n",
         consts::WI_BUCKET
     ));
+    // S3→S3 replication isolation (#200): two MinIO users, each scoped by an IAM
+    // policy to exactly ONE bucket, so a replication mover can only mirror
+    // source→destination if it authenticates the `sync-to` write with the
+    // DESTINATION user's keys. Built via serde so the policy JSON is well-formed;
+    // `|| true` keeps a re-provisioned MinIO from aborting the shared bucket pod.
+    let bucket_policy = |bucket: &str| {
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:*"],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}"),
+                    format!("arn:aws:s3:::{bucket}/*"),
+                ],
+            }],
+        })
+        .to_string()
+    };
+    for (user, secret, bucket, policy) in [
+        (
+            consts::S3_REPL_SRC_KEY,
+            consts::S3_REPL_SRC_SECRET,
+            consts::S3_REPL_SRC_BUCKET,
+            "repl-src",
+        ),
+        (
+            consts::S3_REPL_DST_KEY,
+            consts::S3_REPL_DST_SECRET,
+            consts::S3_REPL_DST_BUCKET,
+            "repl-dst",
+        ),
+    ] {
+        script.push_str(&format!(
+            "printf '%s' '{json}' > /tmp/{policy}.json\n\
+             mc admin user add local {user} {secret} || true\n\
+             mc admin policy create local {policy} /tmp/{policy}.json || true\n\
+             mc admin policy attach local {policy} --user {user} || true\n",
+            json = bucket_policy(bucket),
+        ));
+    }
     from_json(json!({
         "apiVersion": "v1",
         "kind": "Pod",
