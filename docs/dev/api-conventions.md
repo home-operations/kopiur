@@ -1,6 +1,6 @@
 # kopiur-api conventions (READ BEFORE EDITING `crates/api`)
 
-These conventions are load-bearing — they were derived empirically against `kube 3.1` + `k8s-openapi 0.27` + `schemars 1.2` on Rust 1.95. Violating them breaks either CRD schema generation or compilation. ADR-0003 is the source of truth for _what_ the fields are; this file is _how_ to encode them in Rust.
+These conventions are load-bearing — they were derived empirically against `kube 3.1` + `k8s-openapi 0.27` + `schemars 1.2` on Rust 1.95 (and re-verified against `kube 4.0` + `k8s-openapi 0.28`, which generate byte-identical CRDs). Violating them breaks either CRD schema generation or compilation. ADR-0003 is the source of truth for _what_ the fields are; this file is _how_ to encode them in Rust.
 
 ## 1. CRD top-level types
 
