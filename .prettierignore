@@ -8,7 +8,7 @@ deploy/helm/kopiur/values.schema.json
 # serde_yaml generator output — letting oxfmt reformat them (e.g. re-indenting
 # block sequences) diverges from the generator and breaks the drift guard.
 deploy/crds/
-deploy/helm/kopiur/files/crds/
+deploy/helm/kopiur/crds/
 deploy/rbac/
 
 # Helm chart templates are Go-templated YAML (a `{{- if -}}` guard isn't valid

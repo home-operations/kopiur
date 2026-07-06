@@ -1,4 +1,4 @@
-# Backend: WebDAV (ADR-0003 §3.1)
+# Backend: WebDAV
 #
 # The collection URL lives in the Repository spec; HTTP basic-auth credentials
 # live in a Secret.

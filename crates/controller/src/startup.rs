@@ -22,6 +22,53 @@ use crate::leader;
 use crate::metrics::Metrics;
 use crate::webhook_tls;
 
+/// Resolve the effective streaming-list setting against the live apiserver.
+///
+/// kube's watcher does not degrade from WatchList to paged lists by itself, so we
+/// only enable streaming when the server actually supports it. Returns `false`
+/// immediately when streaming was not requested; otherwise probes the apiserver
+/// version and downgrades (with a warning) on a server that predates WatchList. A
+/// probe failure or unparseable version honors the configured value rather than
+/// silently disabling an explicitly-requested optimization.
+async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
+    if !configured {
+        return false;
+    }
+    let (major, minor) = match client.apiserver_version().await {
+        Ok(info) => (info.major, info.minor),
+        Err(e) => {
+            tracing::warn!(error = %e, "apiserver version probe failed; honoring streamingLists as configured");
+            return true;
+        }
+    };
+    let supported = watchlist_supported(&major, &minor);
+    if !supported {
+        tracing::warn!(
+            server_major = %major,
+            server_minor = %minor,
+            "streamingLists is on but the apiserver predates WatchList (beta in 1.32); \
+             using paged lists instead. Set streamingLists: false to silence this."
+        );
+    }
+    supported
+}
+
+/// Whether a Kubernetes apiserver of the given `major.minor` version ships the
+/// WatchList feature (beta and on by default from 1.32). The version strings come
+/// straight from `/version` and can carry suffixes (e.g. minor `"32+"` on some
+/// distributions), so we read the leading digit run. An unparseable version
+/// returns `true` (honor the configured request rather than second-guess it).
+fn watchlist_supported(major: &str, minor: &str) -> bool {
+    let leading_u32 = |s: &str| -> Option<u32> {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    };
+    match (leading_u32(major), leading_u32(minor)) {
+        (Some(maj), Some(min)) => (maj, min) >= (1, 32),
+        _ => true,
+    }
+}
+
 /// Build the controller manager and run every controller concurrently, plus the
 /// `/metrics` server, until shutdown.
 ///
@@ -188,10 +235,18 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
 
     tracing::info!("starting kopiur controllers");
 
+    // Gate WatchList streaming lists on the apiserver version. kube's watcher does
+    // NOT fall back from WatchList to paged lists on its own — if streaming is on
+    // and the server lacks the feature, the initial `sendInitialEvents` watch fails
+    // and the watcher retries the streaming path forever instead of degrading. So
+    // resolve it here: on a server that predates WatchList (beta, on by default
+    // from 1.32) we force paged lists regardless of config.
+    let streaming_lists = effective_streaming_lists(&client, config.streaming_lists).await;
+
     let controllers = spawn_all(
         client.clone(),
         ctx,
-        config.streaming_lists,
+        streaming_lists,
         config.watch_scope.clone(),
     );
 
@@ -368,4 +423,33 @@ fn spawn_webhook_tls_reconcile(client: Client, cfg: webhook_tls::WebhookTlsConfi
             };
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watchlist_supported;
+
+    #[test]
+    fn watchlist_supported_gates_on_1_32() {
+        // At or above 1.32 → supported.
+        assert!(watchlist_supported("1", "32"));
+        assert!(watchlist_supported("1", "34"));
+        assert!(watchlist_supported("2", "0"));
+        // Distribution version suffixes (EKS/GKE style) read the leading digits.
+        assert!(watchlist_supported("1", "32+"));
+        assert!(watchlist_supported("1", "33-eks-1234"));
+        // Below 1.32 → not supported (force paged lists).
+        assert!(!watchlist_supported("1", "31"));
+        assert!(!watchlist_supported("1", "24"));
+        assert!(!watchlist_supported("1", "31+"));
+    }
+
+    #[test]
+    fn watchlist_supported_honors_config_on_unparseable_version() {
+        // An unreadable version string must not silently disable an explicit
+        // streamingLists request — honor it (return true).
+        assert!(watchlist_supported("", ""));
+        assert!(watchlist_supported("x", "y"));
+        assert!(watchlist_supported("1", ""));
+    }
 }

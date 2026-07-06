@@ -1,4 +1,4 @@
-# Example 16 — Cross-namespace clone restore (ADR-0003 §4.6)
+# Example 16 — Cross-namespace clone restore
 #
 # Restore a snapshot taken in one namespace INTO another — e.g. clone production data
 # into a `staging` namespace to reproduce a bug against real data. The `snapshotRef`

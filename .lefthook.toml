@@ -29,5 +29,5 @@ exclude = ["deploy/helm/kopiur/values.schema.json"]
 [pre-commit.commands.format-yaml]
 exclude = [
   "deploy/crds/*.yaml",
-  "deploy/helm/kopiur/files/crds/*.yaml",
+  "deploy/helm/kopiur/crds/*.yaml",
 ]

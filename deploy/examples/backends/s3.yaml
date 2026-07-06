@@ -1,4 +1,4 @@
-# Backend: S3 / S3-compatible (ADR-0003 §3.1)
+# Backend: S3 / S3-compatible
 #
 # Amazon S3 and any S3-compatible store (MinIO, RustFS, Ceph RGW, Wasabi, ...).
 # Identifiers (bucket/prefix/endpoint/region) live in the Repository spec;

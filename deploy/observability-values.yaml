@@ -7,8 +7,9 @@
 #
 # See docs/dev/observability.md for the full metric list and details.
 
-metrics:
-  enabled: true
+# The controller's metrics Service is always created; the monitoring umbrella
+# wires up the Prometheus-Operator objects and the Grafana dashboard.
+monitoring:
   serviceMonitor:
     # Requires the Prometheus-Operator CRDs. Add labels here if your Prometheus
     # uses a serviceMonitorSelector.
@@ -18,17 +19,18 @@ metrics:
   prometheusRule:
     # Ships the kopiur alert rules (backup stale/failed, repo not ready, etc.).
     enabled: true
-    # A BackupConfig is "stale" if its last success is older than this (seconds).
+    # A SnapshotPolicy is "stale" if its last success is older than this (seconds).
     backupStaleAfterSeconds: 172800 # 48h
+  # Ship the Grafana dashboard as a ConfigMap the Grafana sidecar auto-discovers.
+  # Adjust `label`/`labelValue` to match your sidecar's watch label.
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
 
-# Ship the Grafana dashboard as a ConfigMap the Grafana sidecar auto-discovers.
-# Adjust `label`/`labelValue` to match your sidecar's watch label.
-grafanaDashboard:
-  enabled: true
-  label: grafana_dashboard
-  labelValue: "1"
-
-# Scrape the webhook's /metrics (served over its TLS port; self-signed by default).
+# Scrape the webhook's /metrics (served over its TLS port; self-signed by
+# default). This stays under `webhook:` — it's an HTTPS scrape of the webhook's
+# own port, distinct from the controller scrape in `monitoring:` above.
 webhook:
   serviceMonitor:
     enabled: true

@@ -2,17 +2,21 @@ suite: metrics-service
 templates:
   - metrics-service.tpl
 tests:
-  - it: renders the controller metrics Service by default
+  - it: always renders the controller metrics Service (no enable toggle)
     asserts:
       - isKind:
           of: Service
       - equal:
           path: metadata.name
           value: RELEASE-NAME-kopiur-controller-metrics
+      - equal:
+          path: spec.ports[0].port
+          value: 8081
 
-  - it: omits the Service when metrics.enabled is false
+  - it: honors a custom metrics.port
     set:
-      metrics.enabled: false
+      metrics.port: 9090
     asserts:
-      - hasDocuments:
-          count: 0
+      - equal:
+          path: spec.ports[0].port
+          value: 9090

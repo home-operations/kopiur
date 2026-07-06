@@ -67,7 +67,7 @@ pub const KOPIA_CACHE_DIR_ENV: &str = "KOPIUR_KOPIA_CACHE_DIR";
 /// (dual-stack: a wildcard IPv6 bind also accepts IPv4 on Linux when
 /// `net.ipv6.bindv6only=0`, the default). Set `0.0.0.0:8081` only on a host
 /// where IPv6 is disabled in the pod network namespace, where a `[::]` bind
-/// fails outright. The port must agree with the chart's `controller.probePort`
+/// fails outright. The port must agree with the chart's `metrics.port`
 /// (the Service/probes target that port, not whatever `KOPIUR_HTTP_ADDR`
 /// happens to contain). Mirrors the webhook's `KOPIUR_WEBHOOK_ADDR`
 /// (`kopiur_webhook::config::WEBHOOK_ADDR_ENV`).
@@ -76,7 +76,7 @@ pub const HTTP_ADDR_ENV: &str = "KOPIUR_HTTP_ADDR";
 /// Default address the controller's HTTP server (`/metrics`, `/healthz`,
 /// `/readyz`) binds to when [`HTTP_ADDR_ENV`] is unset. Dual-stack `[::]` so a
 /// single bind serves both IPv4 and IPv6 kubelets; matches the chart's
-/// `controller.probePort` (8081).
+/// `metrics.port` (8081).
 pub const HTTP_ADDR: &str = "[::]:8081";
 
 /// Number of tokio worker threads the controller runtime runs. The controller is
@@ -93,11 +93,12 @@ pub const WORKER_THREADS_ENV: &str = "KOPIUR_WORKER_THREADS";
 /// a reconcile-heavy deployment.
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 
-/// Opt-in: use the Kubernetes WatchList streaming-list API for the controller's
+/// Use the Kubernetes WatchList streaming-list API for the controller's
 /// cluster-wide watches, cutting peak memory during the initial list/resync by
 /// streaming pages instead of buffering a full page set. Requires apiserver support
-/// (the `WatchList` feature: beta in 1.32, GA in 1.34), so it is OFF by default —
-/// older clusters are unaffected. The chart exposes it as `controller.streamingLists`.
+/// (the `WatchList` feature: beta in 1.32, GA in 1.34). The env/flag default is
+/// off; the chart exposes it as `streamingLists` (default on, gated at startup on
+/// the apiserver version — see `startup::effective_streaming_lists`).
 pub const STREAMING_LISTS_ENV: &str = "KOPIUR_STREAMING_LISTS";
 
 /// Gate for Lease-based leader election (`--leader-elect`). The chart stamps

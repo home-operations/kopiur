@@ -1,4 +1,4 @@
-# Backend: Filesystem (PVC-backed) (ADR-0003 §3.1)
+# Backend: Filesystem (PVC-backed)
 #
 # A NAS/PVC repository: the operator mounts a PVC into the mover at `path` and
 # kopia writes the repository there. No object-store keys — only KOPIA_PASSWORD.

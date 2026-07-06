@@ -14,7 +14,16 @@
 # the in-cluster objects (PVCs, Secrets, MinIO) are provisioned from Rust
 # (crates/e2e `World`). Keep the paths in lockstep with crates/e2e/src/consts.rs
 # (HOSTPATH_REPO / HOSTPATH_RO_REPO) and the uid with consts::MOVER_UID.
+#
+# NOTE: after the chart flatten (issue #203) the controller's knobs live at the
+# ROOT — hence `logging.level`, `extraVolumes`, `readinessProbe` and the root
+# `image`/`podSecurityContext` here all configure the CONTROLLER; the webhook and
+# mover keep their own named blocks.
 installScope: cluster
+
+# Controller (and mover, via passthrough) log level. Chart default is `info`.
+logging:
+  level: debug
 
 # Feature permissions that grant the operator cluster-wide `secrets` write. Both
 # default OFF in the chart (least privilege), so the harness opts in explicitly:
@@ -29,6 +38,9 @@ features:
   kopiaUi:
     enabled: true
 
+# Controller pod security context (root = controller). The uid 65532 matches the
+# mover so the shared hostPath repo (written 0700 by kopia) is readable by both.
+# The webhook keeps its own locked-down default — it never touches the repo.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
@@ -37,8 +49,53 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
+# NOTE on bind addresses: this file deliberately does NOT override metrics.port /
+# webhook.port, so the operator binds the chart-default dual-stack wildcard
+# "[::]:8081" / "[::]:8443". That validates the dual-stack default in a live kind
+# cluster: even though kind here is IPv4 single-stack, a "[::]" bind is dual-stack
+# on Linux (net.ipv6.bindv6only=0) and accepts the IPv4 kubelet probe. If a CI
+# runner ever has IPv6 disabled in the pod netns (a "[::]" bind then fails), the
+# fix is a code/chart change to render "0.0.0.0:<port>" instead.
+
+# Controller image (root = controller). Locally-built `:e2e` images loaded into
+# kind; Never so kubelet uses the loaded image instead of pulling.
+image:
+  repository: docker.io/kopiur/controller
+  tag: e2e
+  pullPolicy: Never
+
+# The repo hostPath must be visible to the controller's in-process kopia
+# (filesystem connect/create). kopia's cache/logs/config come from the chart's
+# built-in writable kopia-cache emptyDir — deliberately NOT a manual workaround
+# here; that is exactly what the cache_and_events e2e guards.
+extraVolumes:
+  - name: repo
+    hostPath: { path: /kopiur-e2e/repo, type: Directory }
+  # A non-writable repo path (root-owned 0555 on the node) for the
+  # terminal-failure regression test (filesystem PermissionDenied hard-stop).
+  - name: ro-repo
+    hostPath: { path: /kopiur-e2e/ro-repo, type: Directory }
+extraVolumeMounts:
+  - name: repo
+    mountPath: /repo
+  - name: ro-repo
+    mountPath: /ro-repo
+
+# Exercise the probe passthrough: a retuned readiness probe (faster first check)
+# proves values-driven probes render and the pod still goes Ready.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: metrics
+  initialDelaySeconds: 3
+  periodSeconds: 10
+
 webhook:
   enabled: true
+  image:
+    repository: docker.io/kopiur/webhook
+    tag: e2e
+    pullPolicy: Never
   # tls.mode defaults to self — the controller mints + injects the cert. Kept
   # explicit here so the harness intent is obvious.
   tls:
@@ -48,51 +105,8 @@ webhook:
     - name: KOPIUR_E2E_WEBHOOK_MARKER
       value: "1"
 
-# NOTE on bind addresses: this file deliberately does NOT override
-# controller.listenAddr / webhook.listenAddr, so the operator binds the chart
-# default dual-stack wildcard "[::]:8081" / "[::]:8443". That validates m00n's
-# dual-stack default in a live kind cluster: even though kind here is IPv4
-# single-stack, a "[::]" bind is dual-stack on Linux (net.ipv6.bindv6only=0) and
-# accepts the IPv4 kubelet probe. If a CI runner ever has IPv6 disabled in the
-# pod netns (a "[::]" bind then fails), pin these to "0.0.0.0:8081"/"0.0.0.0:8443".
-
-image:
-  registry: docker.io
-  pullPolicy: Never
-  controller:
-    repository: kopiur/controller
-    tag: e2e
-  webhook:
-    repository: kopiur/webhook
-    tag: e2e
-  mover:
-    repository: kopiur/mover
+mover:
+  image:
+    repository: docker.io/kopiur/mover
     tag: e2e
     pullPolicy: Never
-
-controller:
-  logLevel: debug
-  # Exercise the probe passthrough: a retuned readiness probe (faster first
-  # check) proves values-driven probes render and the pod still goes Ready.
-  readinessProbe:
-    httpGet:
-      path: /readyz
-      port: metrics
-    initialDelaySeconds: 3
-    periodSeconds: 10
-  # The repo hostPath must be visible to the controller's in-process kopia
-  # (filesystem connect/create). kopia's cache/logs/config come from the chart's
-  # built-in writable kopia-cache emptyDir — deliberately NOT a manual workaround
-  # here; that is exactly what the cache_and_events e2e guards.
-  extraVolumes:
-    - name: repo
-      hostPath: { path: /kopiur-e2e/repo, type: Directory }
-    # A non-writable repo path (root-owned 0555 on the node) for the
-    # terminal-failure regression test (filesystem PermissionDenied hard-stop).
-    - name: ro-repo
-      hostPath: { path: /kopiur-e2e/ro-repo, type: Directory }
-  extraVolumeMounts:
-    - name: repo
-      mountPath: /repo
-    - name: ro-repo
-      mountPath: /ro-repo

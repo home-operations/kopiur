@@ -1,4 +1,4 @@
-# Backend: Filesystem over inline NFS (ADR-0003 §3.1)
+# Backend: Filesystem over inline NFS
 #
 # kopia has NO native NFS backend — NFS is reached through the *filesystem*
 # backend by mounting the export at `path`. This example points the repository at

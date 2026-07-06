@@ -1,4 +1,4 @@
-# Backend: Azure Blob with workload identity — AKS Workload Identity (ADR-0003 §3.1, §4.11)
+# Backend: Azure Blob with workload identity — AKS Workload Identity
 #
 # No storage key, no SAS token: the mover Jobs run as a ServiceAccount federated
 # to a Microsoft Entra application/managed identity. Kopiur labels the mover

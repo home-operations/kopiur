@@ -1,4 +1,3 @@
-{{- if .Values.metrics.enabled -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,4 +15,3 @@ spec:
       protocol: TCP
   selector:
     {{- include "kopiur.controller.selectorLabels" . | nindent 4 }}
-{{- end }}

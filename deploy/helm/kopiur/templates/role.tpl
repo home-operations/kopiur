@@ -1,7 +1,7 @@
 {{- if eq .Values.installScope "namespaced" -}}
 # RBAC rules SYNCED from `cargo xtask gen-rbac` (deploy/rbac/operator-role.yaml).
 # That xtask is the SOURCE OF TRUTH — it derives the kopiur.home-operations.com rules from the
-# kube-rs Resource traits (ADR §4.12). If you edit kopiur.home-operations.com permissions, edit the
+# kube-rs Resource traits. If you edit kopiur.home-operations.com permissions, edit the
 # xtask and re-run `cargo xtask gen-rbac`, then re-sync these rules. Names/labels
 # are Helm-templated so the chart owns them.
 #
@@ -127,7 +127,7 @@ rules:
     resources:
       - rolebindings
     verbs: [get, create, update, patch]
-  {{- if .Values.controller.leaderElection.enabled }}
+  {{- if .Values.leaderElection.enabled }}
   # Leader election (--leader-elect): the controller claims/renews ONE Lease in
   # the release namespace. get/update are resourceName-scoped to it; create
   # cannot be name-scoped (no resourceName at create time) but stays

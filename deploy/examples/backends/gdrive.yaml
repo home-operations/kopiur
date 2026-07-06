@@ -1,4 +1,4 @@
-# Backend: Google Drive — kopia native `gdrive` provider (ADR-0003 §3.1)
+# Backend: Google Drive — kopia native `gdrive` provider
 #
 # WARNING: kopia marks the `gdrive` provider EXPERIMENTAL / not maintained.
 # Prefer a native object store (S3/GCS/Azure/B2) where one is available. A native

@@ -1,7 +1,7 @@
 {{- if eq .Values.installScope "cluster" -}}
 # RBAC rules SYNCED from `cargo xtask gen-rbac` (deploy/rbac/operator-clusterrole.yaml).
 # That xtask is the SOURCE OF TRUTH — it derives the kopiur.home-operations.com rules from the
-# kube-rs Resource traits (ADR §4.12). If you edit kopiur.home-operations.com permissions, edit the
+# kube-rs Resource traits. If you edit kopiur.home-operations.com permissions, edit the
 # xtask and re-run `cargo xtask gen-rbac`, then re-sync these rules. Names/labels
 # are Helm-templated so the chart owns them.
 apiVersion: rbac.authorization.k8s.io/v1

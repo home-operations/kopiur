@@ -1,4 +1,4 @@
-# Backend: Azure Blob Storage — SAS-token auth (ADR-0003 §3.1)
+# Backend: Azure Blob Storage — SAS-token auth
 #
 # A variant of the Azure backend that authenticates with a SAS (shared access
 # signature) token scoped to the container, instead of the storage-account key.

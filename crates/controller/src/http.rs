@@ -36,7 +36,7 @@ pub(crate) async fn serve_http(metrics: Metrics, addr: std::net::SocketAddr) -> 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
             "binding the HTTP server to {addr}; if this host has IPv6 disabled a `[::]` bind \
-             fails — set KOPIUR_HTTP_ADDR=0.0.0.0:{} (chart: controller.listenAddr)",
+             fails — set KOPIUR_HTTP_ADDR=0.0.0.0:{} (via the chart's extraEnv)",
             addr.port()
         )
     })?;

@@ -1,4 +1,4 @@
-# Backend: GCS with workload identity — GKE Workload Identity (ADR-0003 §3.1, §4.11)
+# Backend: GCS with workload identity — GKE Workload Identity
 #
 # No service-account key JSON: the mover Jobs run as a Kubernetes ServiceAccount
 # bound to a Google service account, and kopia (given no --credentials-file)

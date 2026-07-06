@@ -8,8 +8,8 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   # replicaCount > 1 is HA: the elected leader reconciles, others stand by.
-  # Deterministic jitter (ADR §4.1) keeps schedules identical across failover.
-  replicas: {{ .Values.controller.replicaCount }}
+  # Deterministic jitter keeps schedules identical across replicas and failover.
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "kopiur.controller.selectorLabels" . | nindent 6 }}
@@ -17,36 +17,34 @@ spec:
     metadata:
       labels:
         {{- include "kopiur.controller.selectorLabels" . | nindent 8 }}
-        {{- with .Values.controller.podLabels }}
+        {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.controller.podAnnotations }}
+      {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "kopiur.serviceAccountName" . }}
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.controller.priorityClassName }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- include "kopiur.imagePullSecrets" . | nindent 6 }}
+      {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: controller
-          image: {{ include "kopiur.image" (dict "root" $ "img" .Values.image.controller) }}
+          image: {{ include "kopiur.image" (dict "root" $ "img" .Values.image) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --leader-elect={{ .Values.controller.leaderElection.enabled }}
+            - --leader-elect={{ .Values.leaderElection.enabled }}
             {{- if eq .Values.installScope "cluster" }}
             - --cluster-scope
             {{- else }}
             - --namespace={{ .Release.Namespace }}
             {{- end }}
-            {{- with .Values.controller.extraArgs }}
+            {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           env:
@@ -55,7 +53,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- if .Values.controller.leaderElection.enabled }}
+            {{- if .Values.leaderElection.enabled }}
             # Leader-election Lease name: the release fullname, so two releases
             # sharing a namespace never contend on the same Lease.
             - name: KOPIUR_LEASE_NAME
@@ -63,9 +61,9 @@ spec:
             {{- end }}
             # The mover image the controller stamps into every Backup/Restore Job.
             - name: KOPIUR_MOVER_IMAGE
-              value: {{ include "kopiur.image" (dict "root" $ "img" .Values.image.mover) | quote }}
+              value: {{ include "kopiur.image" (dict "root" $ "img" .Values.mover.image) | quote }}
             - name: KOPIUR_MOVER_PULL_POLICY
-              value: {{ .Values.image.mover.pullPolicy | quote }}
+              value: {{ .Values.mover.image.pullPolicy | quote }}
             # The mover PATCHes Backup/Restore .status, so its Job pods run as a
             # dedicated least-privilege ServiceAccount (NOT the operator SA and NOT
             # the namespace default). The controller mints this SA + a RoleBinding to
@@ -83,18 +81,18 @@ spec:
               value: {{ eq .Values.installScope "cluster" | ternary "ClusterRole" "Role" | quote }}
             # Runtime footprint controls (see docs/dev/watch-and-reconcile.md): the
             # tokio worker-thread cap (the runtime default sizes to host cores,
-            # ignoring the cgroup CPU quota) and the opt-in WatchList streaming list.
+            # ignoring the cgroup CPU quota) and the WatchList streaming list.
             - name: KOPIUR_WORKER_THREADS
-              value: {{ .Values.controller.workerThreads | quote }}
-            {{- if .Values.controller.streamingLists }}
+              value: {{ .Values.workerThreads | quote }}
+            {{- if .Values.streamingLists }}
             - name: KOPIUR_STREAMING_LISTS
               value: "true"
             {{- end }}
-            # Address the HTTP server (/metrics, /healthz, /readyz) binds to.
-            # Override on an IPv6-only/dual-stack cluster (e.g. "[::]:8081");
-            # must agree on port with controller.probePort below.
+            # Bind address for the HTTP server (/metrics, /healthz, /readyz),
+            # rendered "[::]:<port>" from metrics.port — the dual-stack wildcard
+            # serves both IPv4 and IPv6 kubelets.
             - name: KOPIUR_HTTP_ADDR
-              value: {{ .Values.controller.listenAddr | quote }}
+              value: {{ printf "[::]:%v" .Values.metrics.port | quote }}
             {{- if eq (include "kopiur.webhook.selfManaged" .) "true" }}
             # Self-managed webhook TLS (webhook.tls.mode: self): the controller
             # mints the serving cert into this Secret and injects caBundle into
@@ -111,23 +109,23 @@ spec:
               value: {{ include "kopiur.fullname" . }}-mutating
             {{- end }}
             {{- include "kopiur.otlpEnv" . | nindent 12 }}
-            {{- with .Values.controller.extraEnv }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: metrics
-              containerPort: {{ .Values.controller.probePort }}
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
-          {{- with .Values.controller.livenessProbe }}
+          {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.controller.readinessProbe }}
+          {{- with .Values.readinessProbe }}
           readinessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           resources:
-            {{- toYaml .Values.controller.resources | nindent 12 }}
+            {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           # The controller runs short, in-process kopia ops (repository
@@ -139,24 +137,28 @@ spec:
           volumeMounts:
             - name: kopia-cache
               mountPath: /var/cache/kopia
-            {{- with .Values.controller.extraVolumeMounts }}
+            {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
         - name: kopia-cache
           emptyDir: {}
-        {{- with .Values.controller.extraVolumes }}
+        {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.controller.nodeSelector }}
+      {{- with (include "kopiur.nodeSelector" (dict "root" $ "component" .Values.nodeSelector)) }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.affinity }}
+      {{- with (include "kopiur.affinity" (dict "root" $ "component" .Values.affinity)) }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.tolerations }}
+      {{- with (include "kopiur.tolerations" (dict "root" $ "component" .Values.tolerations)) }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with (include "kopiur.topologySpreadConstraints" (dict "root" $ "component" .Values.topologySpreadConstraints)) }}
+      topologySpreadConstraints:
+        {{- . | nindent 8 }}
       {{- end }}
