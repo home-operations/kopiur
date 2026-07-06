@@ -126,6 +126,8 @@ The 8 CRDs ship in the chart's special `crds/` directory. Helm treats that direc
 
 The CRDs and RBAC shipped by the chart are **generated** by `cargo xtask gen-crds` / `cargo xtask gen-rbac` and checked in under `deploy/crds/` and `deploy/rbac/`. Those xtasks are the source of truth.
 
+Upgrading **from 0.5.x to 0.6.0** is a special case: the CRDs used to be release-owned templates and moved into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first. See [Upgrading → 0.5.x → 0.6.0](upgrade.md#upgrading-05x--060-one-time-crd-migration) before you upgrade.
+
 ## First backup
 
 After install, create a repository and start backing up a PVC. The smallest end-to-end example is `deploy/examples/01-single-pvc-scheduled.yaml`:
@@ -169,9 +171,11 @@ See [`docs/dev/observability.md`](dev/observability.md) for the full metric list
 ## Upgrade / uninstall
 
 ```bash
-helm upgrade kopiur deploy/helm/kopiur -n kopiur-system   # re-applies CRD schema
-helm uninstall kopiur -n kopiur-system                     # see CRD caution above
+helm upgrade kopiur deploy/helm/kopiur -n kopiur-system   # does NOT touch crds/ — apply schema changes yourself (see CRD lifecycle)
+helm uninstall kopiur -n kopiur-system                     # leaves the crds/ CRDs (and your CRs) in place
 ```
+
+Upgrading **from 0.5.x** needs a one-time pre-step so the CRD move doesn't delete your resources — see [Upgrading](upgrade.md).
 
 ## See also
 
