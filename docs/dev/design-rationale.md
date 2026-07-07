@@ -237,10 +237,13 @@ name/key, so a rename with identical content must pass (locking it broke GitOps)
 ### RepositoryReplication
 
 - **`destination`** — externally-tagged `Backend`, must **differ** from the source
-  backend (webhook-enforced).
-- **`destinationEncryption`** — `kopia repository sync-to` copies blobs verbatim, so the
-  destination must share the source's format; omit this to reuse the source password (a
-  true mirror).
+  backend (webhook-enforced). Its `auth.secretRef` carries the destination backend's
+  own access credentials. `kopia repository sync-to` copies blobs verbatim, so the
+  mirror always shares the source's format and password — there is no destination
+  password knob. Because one mover pod touches both backends, the destination Secret
+  must co-reside in the CR's namespace and is delivered under a `KOPIUR_DEST_` env
+  prefix, then remapped for the `sync-to` subprocess so source/destination keys of the
+  same name (`AWS_*`, …) never collide.
 - **`mover`** — inherits the source repository's `moverDefaults`.
 
 ## Shared types

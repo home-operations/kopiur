@@ -2331,10 +2331,9 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `destination` | [union](#repositoryreplication-spec-destination) | **required** | The backend to mirror to; must differ from the source's backend (webhook-enforced). |
+| `destination` | [union](#repositoryreplication-spec-destination) | **required** | The backend to mirror to; must differ from the source's backend (webhook-enforced).<br>`kopia repository sync-to` is a blob-level copy: the destination inherits the source repository's format and encryption password verbatim, so there is no separate destination password to configure. The destination backend's own access credentials (e.g. S3 keys) ride its `auth.secretRef`, which — like the source's — must live in this CR's namespace. |
 | `schedule` | [object](#repositoryreplication-spec-schedule) | **required** | Cron and deterministic jitter for the replication runs. |
 | `sourceRef` | [object](#repositoryreplication-spec-sourceref) | **required** | Reference to the `Repository` or `ClusterRepository` to mirror from. |
-| `destinationEncryption` | [object](#repositoryreplication-spec-destinationencryption) | — | Encryption for the destination; omit to reuse the source repository password. |
 | `mover` | [object](#repositoryreplication-spec-mover) | — | Mover (Job pod) overrides for the replication run. |
 | `suspend` | boolean | — | Pause this replication; a suspended replication runs no syncs (default `false`). |
 
@@ -2594,20 +2593,6 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
 | `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
 | `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
-
-#### `spec.destinationEncryption` { #repositoryreplication-spec-destinationencryption }
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `passwordSecretRef` | [object](#repositoryreplication-spec-destinationencryption-passwordsecretref) | **required** | Repository password, always a Secret reference (never inline). |
-
-##### `spec.destinationEncryption.passwordSecretRef` { #repositoryreplication-spec-destinationencryption-passwordsecretref }
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `name` | string | **required** | Name of the `Secret`. |
-| `key` | string | — | Which key inside the `Secret` to read. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
 
 #### `spec.mover` { #repositoryreplication-spec-mover }
 

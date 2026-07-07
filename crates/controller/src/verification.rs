@@ -444,7 +444,7 @@ async fn spawn_verify_job(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
 
     // The verify mover inherits the repository's moverDefaults (security context,
     // placement, resources, TTL, cache) merged under the recipe's mover (ADR-0004

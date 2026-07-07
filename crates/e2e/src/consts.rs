@@ -68,6 +68,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "vfygate",
     "repl-src",
     "repl-dst",
+    "repl-s3-src",
     "projgate",
     "hooks",
     "gfs",
@@ -132,6 +133,28 @@ pub const SECRET_FS_CREDS: &str = "kopia-creds";
 pub const SECRET_S3_CREDS: &str = "kopia-s3-creds";
 /// Valid S3 keys but a WRONG repo password — exercises the safe-create guard.
 pub const SECRET_S3_BADPW: &str = "kopia-s3-badpw";
+
+// --- S3→S3 replication isolation (crates/e2e/tests/replication.rs, #200) ---------
+// Two DISJOINT, bucket-scoped MinIO users so a replication mover proves it uses the
+// DESTINATION's credentials (not the source's) for `sync-to`: the source user cannot
+// write the destination bucket, so if the KOPIUR_DEST_ remap were broken the sync-to
+// write would be denied and the run would never succeed.
+/// Repo password + the source-scoped S3 keys.
+pub const SECRET_S3_REPL_SRC: &str = "kopia-s3-repl-src";
+/// Repo password + the destination-scoped S3 keys.
+pub const SECRET_S3_REPL_DST: &str = "kopia-s3-repl-dst";
+/// Access key of the MinIO user allowed to write ONLY the source bucket.
+pub const S3_REPL_SRC_KEY: &str = "replsrcuser";
+/// Secret key of the source-scoped MinIO user (MinIO requires ≥8 chars).
+pub const S3_REPL_SRC_SECRET: &str = "replsrcsecret123";
+/// Access key of the MinIO user allowed to write ONLY the destination bucket.
+pub const S3_REPL_DST_KEY: &str = "repldstuser";
+/// Secret key of the destination-scoped MinIO user.
+pub const S3_REPL_DST_SECRET: &str = "repldstsecret123";
+/// Source bucket for the S3→S3 isolation scenario (writable only by [`S3_REPL_SRC_KEY`]).
+pub const S3_REPL_SRC_BUCKET: &str = "kopiur-repl-s2s-src";
+/// Destination bucket for the S3→S3 isolation scenario (writable only by [`S3_REPL_DST_KEY`]).
+pub const S3_REPL_DST_BUCKET: &str = "kopiur-repl-s2s-dst";
 
 /// The env key kopia/the mover read the repository password from.
 pub const KEY_KOPIA_PASSWORD: &str = "KOPIA_PASSWORD";
@@ -209,6 +232,14 @@ pub const BUCKETS: &[&str] = &[
     // opt-in probe raises RepositoryVanished without recreating. Isolated so the
     // wipe can't clobber another scenario's repository.
     "kopiur-health-probe",
+    // RepositoryReplication to an S3 destination (crates/e2e/tests/replication.rs,
+    // the #200 regression guard): a filesystem source mirrors here, so `sync-to`
+    // only succeeds if the destination backend's OWN S3 credentials are injected.
+    "kopiur-repl-dst",
+    // S3→S3 isolation scenario: each bucket is writable by exactly one scoped
+    // MinIO user, so a passing replication proves the destination creds are used.
+    S3_REPL_SRC_BUCKET,
+    S3_REPL_DST_BUCKET,
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see

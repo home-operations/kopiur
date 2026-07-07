@@ -518,6 +518,58 @@ fn replication_auth_both_wi_must_share_the_service_account() {
 }
 
 #[test]
+fn replication_destination_secret_in_another_namespace_is_rejected() {
+    use crate::backend::BackendAuth;
+    use crate::validate::backend::validate_replication_destination_secret_namespace;
+    let dest = s3_with_auth(Some(BackendAuth {
+        secret_ref: Some(crate::common::SecretRef {
+            name: "r2-creds".into(),
+            namespace: Some("other-ns".into()),
+        }),
+        workload_identity: None,
+    }));
+    let err = validate_replication_destination_secret_namespace(&dest, "team-a").unwrap_err();
+    let msg = err.to_string();
+    // What/why/fix: names the Secret, both namespaces, and why envFrom can't reach it.
+    assert!(msg.contains("r2-creds"), "{msg}");
+    assert!(msg.contains("other-ns") && msg.contains("team-a"), "{msg}");
+    assert!(msg.contains("envFrom"), "{msg}");
+}
+
+#[test]
+fn replication_destination_secret_same_or_absent_namespace_is_allowed() {
+    use crate::backend::{Backend, BackendAuth, FilesystemBackend};
+    use crate::validate::backend::validate_replication_destination_secret_namespace;
+    // Absent namespace = same namespace as the CR.
+    let absent = s3_with_auth(Some(BackendAuth {
+        secret_ref: Some(secret_ref("r2-creds")),
+        workload_identity: None,
+    }));
+    assert!(validate_replication_destination_secret_namespace(&absent, "team-a").is_ok());
+    // Explicit same namespace.
+    let same = s3_with_auth(Some(BackendAuth {
+        secret_ref: Some(crate::common::SecretRef {
+            name: "r2-creds".into(),
+            namespace: Some("team-a".into()),
+        }),
+        workload_identity: None,
+    }));
+    assert!(validate_replication_destination_secret_namespace(&same, "team-a").is_ok());
+    // Workload identity — no auth Secret at all.
+    let wi_dest = s3_with_auth(Some(BackendAuth {
+        secret_ref: None,
+        workload_identity: Some(wi("backup-mover")),
+    }));
+    assert!(validate_replication_destination_secret_namespace(&wi_dest, "team-a").is_ok());
+    // Filesystem — no credentials.
+    let fs = Backend::Filesystem(FilesystemBackend {
+        path: "/repo".into(),
+        volume: None,
+    });
+    assert!(validate_replication_destination_secret_namespace(&fs, "team-a").is_ok());
+}
+
+#[test]
 fn nfs_source_with_empty_server_is_rejected() {
     let src = Source {
         pvc: None,
@@ -1776,7 +1828,6 @@ fn replication_spec(
     RepositoryReplicationSpec {
         source_ref: source,
         destination: dest,
-        destination_encryption: None,
         schedule: CronSpec {
             cron: cron.into(),
             jitter: None,

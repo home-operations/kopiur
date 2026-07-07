@@ -26,8 +26,10 @@
 //! `staging_dir`, and is exhaustive over [`ConnectSpec`] so a new backend cannot
 //! compile until its credential story is decided here.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use kopiur_api::creds::DEST_ENV_PREFIX;
 use kopiur_kopia::ConnectSpec;
 use tracing::info;
 
@@ -172,6 +174,45 @@ pub fn ambient_aws_hints_present(lookup: &dyn Fn(&str) -> Option<String>) -> boo
     AMBIENT_AWS_HINT_ENVS
         .iter()
         .any(|k| lookup(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// The credential lookup a replication **destination** uses with [`materialize_with`]:
+/// file-based creds and static keys come from the [`DEST_ENV_PREFIX`]-prefixed env
+/// (so they never collide with the source's identically named ones, issue #200), but
+/// the ambient AWS chain *hints* stay UNPREFIXED — they belong to the pod's
+/// ServiceAccount (a workload-identity destination), not to a credential Secret, so a
+/// prefixed lookup would spuriously report them missing. `raw` reads the underlying
+/// environment (`|k| std::env::var(k).ok()` in the mover; a map in tests).
+pub fn dest_materialize_lookup(key: &str, raw: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if AMBIENT_AWS_HINT_ENVS.contains(&key) {
+        raw(key)
+    } else {
+        raw(&format!("{DEST_ENV_PREFIX}{key}"))
+    }
+}
+
+/// Build the `sync-to` environment overlay for a replication **destination**: for
+/// each credential env var the destination backend reads directly
+/// ([`ConnectSpec::direct_credential_env_names`]), take its [`DEST_ENV_PREFIX`]-prefixed
+/// value (`Some` → set the plain name) or `None` (→ unset it, so a source credential
+/// the destination does not provide — e.g. a stale `AWS_SESSION_TOKEN` — cannot leak
+/// into the destination auth). `raw` reads the underlying environment. The source
+/// repository's storage credentials are persisted in the kopia config at connect
+/// time, so overriding the plain names for the sync-to subprocess cannot disturb the
+/// source read.
+pub fn dest_env_overlay(
+    dest: &ConnectSpec,
+    raw: &dyn Fn(&str) -> Option<String>,
+) -> BTreeMap<String, Option<String>> {
+    dest.direct_credential_env_names()
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                raw(&format!("{DEST_ENV_PREFIX}{name}")),
+            )
+        })
+        .collect()
 }
 
 /// If `lookup(env_key)` yields a non-empty value, write it to
@@ -459,5 +500,82 @@ mod tests {
         // nothing — the credential is ambient, not a file.
         materialize(&mut spec, &dir).expect("materialize ambient s3");
         assert!(!dir.exists(), "ambient s3 must not create files");
+    }
+
+    fn s3() -> ConnectSpec {
+        ConnectSpec::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            prefix: None,
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+        }
+    }
+
+    #[test]
+    fn dest_materialize_lookup_prefixes_creds_but_not_ambient_hints() {
+        let env = BTreeMap::from([
+            // The destination's own file cred is provided prefixed...
+            (
+                format!("{DEST_ENV_PREFIX}{SFTP_KEY_DATA_ENV}"),
+                "DEST-KEY".to_string(),
+            ),
+            // ...while a same-named SOURCE cred sits unprefixed and must NOT be read.
+            (SFTP_KEY_DATA_ENV.to_string(), "SOURCE-KEY".to_string()),
+            // Ambient hints are pod-SA level and live unprefixed.
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE".to_string(),
+                "/var/run/token".to_string(),
+            ),
+        ]);
+        let raw = |k: &str| env.get(k).cloned();
+
+        // A credential key is read from the prefixed copy, never the source's.
+        assert_eq!(
+            dest_materialize_lookup(SFTP_KEY_DATA_ENV, &raw).as_deref(),
+            Some("DEST-KEY")
+        );
+        // An ambient hint is read UNPREFIXED (it belongs to the pod SA).
+        assert_eq!(
+            dest_materialize_lookup("AWS_WEB_IDENTITY_TOKEN_FILE", &raw).as_deref(),
+            Some("/var/run/token")
+        );
+    }
+
+    #[test]
+    fn dest_env_overlay_sets_provided_creds_and_unsets_the_rest() {
+        // Destination is S3 and provides only the key id + secret (no session token).
+        let env = BTreeMap::from([
+            (
+                format!("{DEST_ENV_PREFIX}AWS_ACCESS_KEY_ID"),
+                "dest-id".to_string(),
+            ),
+            (
+                format!("{DEST_ENV_PREFIX}AWS_SECRET_ACCESS_KEY"),
+                "dest-secret".to_string(),
+            ),
+        ]);
+        let overlay = dest_env_overlay(&s3(), &|k| env.get(k).cloned());
+
+        assert_eq!(
+            overlay.get("AWS_ACCESS_KEY_ID"),
+            Some(&Some("dest-id".to_string()))
+        );
+        assert_eq!(
+            overlay.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&Some("dest-secret".to_string()))
+        );
+        // The session token the destination didn't set is unset (None), so a stale
+        // source AWS_SESSION_TOKEN cannot leak into the destination auth.
+        assert_eq!(overlay.get("AWS_SESSION_TOKEN"), Some(&None));
+    }
+
+    #[test]
+    fn dest_env_overlay_is_empty_for_file_based_backends() {
+        // GCS/SFTP deliver via a materialized file, not a direct env var.
+        let overlay = dest_env_overlay(&sftp(None, None), &|_| None);
+        assert!(overlay.is_empty());
     }
 }

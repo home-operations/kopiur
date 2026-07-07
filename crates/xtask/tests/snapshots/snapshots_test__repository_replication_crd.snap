@@ -46,7 +46,14 @@ spec:
               Not `Eq`: `mover` transitively embeds k8s-openapi types.
             properties:
               destination:
-                description: The backend to mirror to; must differ from the source's backend (webhook-enforced).
+                description: |-
+                  The backend to mirror to; must differ from the source's backend (webhook-enforced).
+
+                  `kopia repository sync-to` is a blob-level copy: the destination inherits the
+                  source repository's format and encryption password verbatim, so there is no
+                  separate destination password to configure. The destination backend's own
+                  access credentials (e.g. S3 keys) ride its `auth.secretRef`, which — like the
+                  source's — must live in this CR's namespace.
                 oneOf:
                 - required:
                   - s3
@@ -444,30 +451,6 @@ spec:
                     required:
                     - url
                     type: object
-                type: object
-              destinationEncryption:
-                description: Encryption for the destination; omit to reuse the source repository password.
-                nullable: true
-                properties:
-                  passwordSecretRef:
-                    description: Repository password, always a Secret reference (never inline).
-                    properties:
-                      key:
-                        description: Which key inside the `Secret` to read.
-                        nullable: true
-                        type: string
-                      name:
-                        description: Name of the `Secret`.
-                        type: string
-                      namespace:
-                        description: Namespace of the `Secret`; absent = same namespace as the referrer.
-                        nullable: true
-                        type: string
-                    required:
-                    - name
-                    type: object
-                required:
-                - passwordSecretRef
                 type: object
               mover:
                 description: Mover (Job pod) overrides for the replication run.

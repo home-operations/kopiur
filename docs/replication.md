@@ -90,11 +90,35 @@ The full apply-ready manifest — including the destination-backend `Secret` —
 | Field | What it does |
 | --- | --- |
 | `sourceRef` | The repository to mirror from (`Repository`/`ClusterRepository`; `kind` defaults to `Repository`). |
-| `destination` | The backend to mirror to. Externally tagged (`destination.s3`, `destination.filesystem`, …). Must differ from the source backend. |
-| `destinationEncryption` | A distinct password for the destination repository. **Omit it** to reuse the source repository's password — the common case for a true mirror, where `sync-to` copies blobs verbatim and the format (including encryption material) is identical. |
+| `destination` | The backend to mirror to. Externally tagged (`destination.s3`, `destination.filesystem`, …). Must differ from the source backend. Its `auth.secretRef` supplies the destination backend's **own** access credentials — see [Destination credentials](#destination-credentials). |
 | `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported, like a `SnapshotSchedule`). |
 | `mover` | Per-run mover overrides (resources, scheduling, security context). Inherits the source repository's `moverDefaults`. |
 | `suspend` | Pause replication without deleting the CR. |
+
+## Destination credentials
+
+`kopia repository sync-to` is a **blob-level copy**: the destination inherits the
+source repository's format and encryption password verbatim, so there is no separate
+destination password to configure. What the destination *does* need is its own
+backend **access** credentials — for example the S3 keys for the mirror bucket — set
+via `destination.<backend>.auth.secretRef` (or `workloadIdentity`), exactly like a
+source repository's backend auth.
+
+Two rules the webhook enforces, because the replication runs in one mover pod that
+talks to both backends:
+
+- **Co-residence.** The destination's credential `Secret` must live in the
+  `RepositoryReplication`'s own namespace. The mover loads it with `envFrom`, which is
+  namespace-local, and replication does not project credentials across namespaces.
+- **Same key names as a source Secret** (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `B2_KEY_ID`/`B2_KEY`, `KOPIA_WEBDAV_*`, or the file-based
+  `KOPIA_SFTP_KEY_DATA` / `KOPIA_GCS_CREDENTIALS` / `KOPIA_RCLONE_CONFIG`).
+
+The source and destination may use **entirely different credentials** — even two
+different accounts on the same provider (e.g. mirroring MinIO → Cloudflare R2, or one
+S3 account to another). Kopiur delivers the destination Secret to the pod under a
+`KOPIUR_DEST_` env prefix and remaps it for the `sync-to` step only, so the two
+sides' identically named keys never collide.
 
 ## Watching it
 

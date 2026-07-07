@@ -206,6 +206,19 @@ impl World {
                 .into(),
             builders::opaque_secret(consts::OPERATOR_NS, consts::SECRET_S3_BADPW, &s3_badpw())
                 .into(),
+            // Bucket-scoped credentials for the S3→S3 replication isolation scenario.
+            builders::opaque_secret(
+                consts::OPERATOR_NS,
+                consts::SECRET_S3_REPL_SRC,
+                &s3_repl_src_creds(),
+            )
+            .into(),
+            builders::opaque_secret(
+                consts::OPERATOR_NS,
+                consts::SECRET_S3_REPL_DST,
+                &s3_repl_dst_creds(),
+            )
+            .into(),
         ];
         apply_all(&self.client, &fixtures).await?;
         wait::deployment_ready(&self.client, consts::OPERATOR_NS, "minio").await?;
@@ -433,5 +446,29 @@ fn s3_badpw() -> [(&'static str, &'static str); 3] {
         (consts::KEY_KOPIA_PASSWORD, consts::KOPIA_BADPW),
         (consts::KEY_AWS_ACCESS_KEY_ID, consts::MINIO_USER),
         (consts::KEY_AWS_SECRET_ACCESS_KEY, consts::MINIO_PASS),
+    ]
+}
+
+/// Repo password + the SOURCE-scoped S3 keys (can write only the source bucket).
+fn s3_repl_src_creds() -> [(&'static str, &'static str); 3] {
+    [
+        (consts::KEY_KOPIA_PASSWORD, consts::KOPIA_PASSWORD),
+        (consts::KEY_AWS_ACCESS_KEY_ID, consts::S3_REPL_SRC_KEY),
+        (
+            consts::KEY_AWS_SECRET_ACCESS_KEY,
+            consts::S3_REPL_SRC_SECRET,
+        ),
+    ]
+}
+
+/// Repo password + the DESTINATION-scoped S3 keys (can write only the dest bucket).
+fn s3_repl_dst_creds() -> [(&'static str, &'static str); 3] {
+    [
+        (consts::KEY_KOPIA_PASSWORD, consts::KOPIA_PASSWORD),
+        (consts::KEY_AWS_ACCESS_KEY_ID, consts::S3_REPL_DST_KEY),
+        (
+            consts::KEY_AWS_SECRET_ACCESS_KEY,
+            consts::S3_REPL_DST_SECRET,
+        ),
     ]
 }

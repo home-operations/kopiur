@@ -9,7 +9,7 @@
 //! transition-guarded status) exactly like `Maintenance`.
 
 use crate::backend::Backend;
-use crate::common::{CronSpec, Encryption, MoverSpec, RepositoryRef};
+use crate::common::{CronSpec, MoverSpec, RepositoryRef};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -39,10 +39,13 @@ pub struct RepositoryReplicationSpec {
     /// Reference to the `Repository` or `ClusterRepository` to mirror from.
     pub source_ref: RepositoryRef,
     /// The backend to mirror to; must differ from the source's backend (webhook-enforced).
+    ///
+    /// `kopia repository sync-to` is a blob-level copy: the destination inherits the
+    /// source repository's format and encryption password verbatim, so there is no
+    /// separate destination password to configure. The destination backend's own
+    /// access credentials (e.g. S3 keys) ride its `auth.secretRef`, which — like the
+    /// source's — must live in this CR's namespace.
     pub destination: Backend,
-    /// Encryption for the destination; omit to reuse the source repository password.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination_encryption: Option<Encryption>,
     /// Cron and deterministic jitter for the replication runs.
     pub schedule: CronSpec,
     /// Mover (Job pod) overrides for the replication run.
@@ -149,10 +152,6 @@ destination:
     auth:
       secretRef:
         name: offsite-creds
-destinationEncryption:
-  passwordSecretRef:
-    name: offsite-creds
-    key: KOPIA_PASSWORD
 schedule:
   cron: "0 5 * * *"
   jitter: 1h
@@ -168,7 +167,6 @@ suspend: false
         }
         assert_eq!(spec.schedule.cron, "0 5 * * *");
         assert_eq!(spec.schedule.jitter.as_deref(), Some("1h"));
-        assert!(spec.destination_encryption.is_some());
         assert!(!spec.suspend);
 
         let json = serde_json::to_value(&spec).expect("serialize");
@@ -179,20 +177,37 @@ suspend: false
     }
 
     #[test]
-    fn destination_encryption_is_optional() {
-        // A true mirror reuses the source password — destinationEncryption absent.
+    fn minimal_true_mirror_spec_omits_optionals() {
+        // A true mirror reuses the source password (sync-to is a blob copy), so there
+        // is no destination-encryption knob to set.
         let yaml = r#"
 sourceRef: { name: nas-primary }
 destination: { filesystem: { path: /mirror } }
 schedule: { cron: "0 6 * * 0" }
 "#;
         let spec: RepositoryReplicationSpec = from_yaml(yaml);
-        assert!(spec.destination_encryption.is_none());
         // sourceRef.kind defaults to Repository.
         assert_eq!(spec.source_ref.kind, RepositoryKind::Repository);
         let json = serde_json::to_value(&spec).unwrap();
-        assert!(json.get("destinationEncryption").is_none());
         assert!(json.get("suspend").is_none());
+    }
+
+    #[test]
+    fn stored_cr_with_removed_destination_encryption_still_deserializes() {
+        // The field was removed (sync-to is a blob copy; it never did anything). A CR
+        // stored while the field existed must still round-trip: serde silently drops
+        // the now-unknown key (no `deny_unknown_fields`), so existing objects keep
+        // reconciling instead of failing to decode.
+        let yaml = r#"
+sourceRef: { name: nas-primary }
+destination: { filesystem: { path: /mirror } }
+destinationEncryption:
+  passwordSecretRef: { name: legacy-creds, key: KOPIA_PASSWORD }
+schedule: { cron: "0 6 * * 0" }
+"#;
+        let spec: RepositoryReplicationSpec = from_yaml(yaml);
+        assert_eq!(spec.source_ref.name, "nas-primary");
+        assert_eq!(spec.schedule.cron, "0 6 * * 0");
     }
 
     #[test]

@@ -251,7 +251,7 @@ Instead of hard-coding the mover's UID/GID (example 09), `spec.mover.inheritSecu
 
 ## Example 19 — Repository replication
 
-Mirror a repository's blobs to a **second** backend on a schedule (`kopia repository sync-to`) — the off-site copy that makes a 3-2-1 strategy. A `RepositoryReplication` is namespaced, references its source via `sourceRef`, and writes to a `destination` backend that must differ from the source. Omit `destinationEncryption` to reuse the source repo's password (a true mirror). See [Repository replication](replication.md).
+Mirror a repository's blobs to a **second** backend on a schedule (`kopia repository sync-to`) — the off-site copy that makes a 3-2-1 strategy. A `RepositoryReplication` is namespaced, references its source via `sourceRef`, and writes to a `destination` backend that must differ from the source. The destination's own access credentials ride its `auth.secretRef` (co-resident in the CR's namespace); `sync-to` is a blob copy, so the mirror reuses the source repo's password. See [Repository replication](replication.md).
 
 ```yaml
 --8<-- "deploy/examples/19-repository-replication.yaml"

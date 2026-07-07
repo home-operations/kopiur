@@ -209,12 +209,20 @@ async fn spawn_replication_job(
         });
     let owner = io::owner_ref_for(repl, "RepositoryReplication")?;
 
-    // Defensive re-check of the admission rule (one validator, two callers): a
-    // same-kind static/workload-identity auth mix would let the static side's
-    // env leak into the workload-identity side's ambient credential chain.
+    // Defensive re-checks of the admission rules (one validator, two callers):
+    // (a) a same-kind static/workload-identity auth mix would leak the static side's
+    // env into the workload-identity side's ambient credential chain; (b) the
+    // destination's static credential Secret must co-reside with the Job (envFrom is
+    // namespace-local and replication does not project credentials).
     if let Err(e) =
         kopiur_api::validate::validate_replication_auth(&repo.backend, &repl.spec.destination)
     {
+        return Err(Error::Validation(e.to_string()));
+    }
+    if let Err(e) = kopiur_api::validate::validate_replication_destination_secret_namespace(
+        &repl.spec.destination,
+        namespace,
+    ) {
         return Err(Error::Validation(e.to_string()));
     }
     // One replicate pod touches BOTH backends: a workload identity on either
@@ -248,7 +256,24 @@ async fn spawn_replication_job(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = creds.names;
+    // The DESTINATION backend's own credentials (issue #200): one replicate pod
+    // touches TWO backends. Verify the destination Secret is present before launching
+    // a Job that would otherwise hang on a missing-Secret `envFrom` (a workload-
+    // identity or filesystem destination carries no such Secret and is skipped).
+    let dest_secret = io::backend_auth_secret_ref(&repl.spec.destination);
+    if let Some(secret) = dest_secret {
+        let dest_names = [secret.name.clone()];
+        let creds_ctx = io::CredsContext {
+            secret_names: &dest_names,
+            repo_kind: "RepositoryReplication destination",
+            repo_name: cr_name,
+            repo_secret_namespace: secret.namespace.as_deref(),
+        };
+        io::ensure_creds_present(&ctx.client, namespace, &creds_ctx).await?;
+    }
+    // Source Secrets load verbatim (kopia reads the plain names at connect and
+    // persists them); the destination Secret rides under `KOPIUR_DEST_`.
+    let creds_secrets = replication_creds_env_from(creds.names, dest_secret);
 
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
@@ -355,6 +380,29 @@ pub fn due_slot(
         Ok(slot) if now >= slot => Some(slot),
         _ => None,
     }
+}
+
+/// Assemble the replication mover's `envFrom` credential set (issue #200): the
+/// SOURCE repository's Secrets verbatim, plus the DESTINATION backend's Secret under
+/// the [`DEST_ENV_PREFIX`](kopiur_api::creds::DEST_ENV_PREFIX) so its keys can't
+/// collide with the source's identically named ones (the mover remaps them for the
+/// `sync-to` subprocess only). The destination is appended WITHOUT deduping against
+/// the source: a Secret referenced by both sides is loaded twice — once plain for the
+/// source, once prefixed for the destination — because kopia reads the two copies
+/// under different env-var names. A workload-identity or filesystem destination has
+/// no auth Secret (`None`) and contributes nothing.
+fn replication_creds_env_from(
+    source_names: Vec<String>,
+    dest_secret: Option<&kopiur_api::common::SecretRef>,
+) -> Vec<jobs::CredsEnvFrom> {
+    let mut creds = io::plain_creds(source_names);
+    if let Some(secret) = dest_secret {
+        creds.push(jobs::CredsEnvFrom::prefixed(
+            secret.name.clone(),
+            kopiur_api::creds::DEST_ENV_PREFIX,
+        ));
+    }
+    creds
 }
 
 /// The next cron slot for this replication strictly after `after` (croner + jitter,
@@ -526,7 +574,6 @@ mod tests {
                     auth: None,
                     tls: None,
                 }),
-                destination_encryption: None,
                 schedule: CronSpec {
                     cron: cron.into(),
                     jitter: None,
@@ -649,5 +696,56 @@ mod tests {
         }
         assert_eq!(ws.repository.kind_str(), "Filesystem");
         assert_eq!(ws.target_ref.kind, "RepositoryReplication");
+    }
+
+    #[test]
+    fn creds_put_source_plain_and_destination_prefixed() {
+        use kopiur_api::common::SecretRef;
+        // A source with a password + backend Secret; the destination brings its own.
+        let out = replication_creds_env_from(
+            vec!["src-pw".into(), "src-s3".into()],
+            Some(&SecretRef {
+                name: "dst-s3".into(),
+                namespace: None,
+            }),
+        );
+        assert_eq!(
+            out,
+            vec![
+                jobs::CredsEnvFrom::plain("src-pw"),
+                jobs::CredsEnvFrom::plain("src-s3"),
+                jobs::CredsEnvFrom::prefixed("dst-s3", "KOPIUR_DEST_"),
+            ]
+        );
+    }
+
+    #[test]
+    fn creds_shared_secret_is_loaded_twice_not_deduped() {
+        use kopiur_api::common::SecretRef;
+        // Same Secret name on both sides must appear BOTH plain (source) and prefixed
+        // (destination) — kopia reads the two copies under different env-var names, so
+        // collapsing them to one entry would strip the destination's credentials (#200).
+        let out = replication_creds_env_from(
+            vec!["shared".into()],
+            Some(&SecretRef {
+                name: "shared".into(),
+                namespace: None,
+            }),
+        );
+        assert_eq!(
+            out,
+            vec![
+                jobs::CredsEnvFrom::plain("shared"),
+                jobs::CredsEnvFrom::prefixed("shared", "KOPIUR_DEST_"),
+            ]
+        );
+    }
+
+    #[test]
+    fn creds_workload_identity_or_filesystem_destination_adds_nothing() {
+        // A destination with no auth Secret (workload identity / filesystem) → only
+        // the source entries, none prefixed.
+        let out = replication_creds_env_from(vec!["src-pw".into()], None);
+        assert_eq!(out, vec![jobs::CredsEnvFrom::plain("src-pw")]);
     }
 }

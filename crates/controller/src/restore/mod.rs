@@ -1448,7 +1448,7 @@ async fn run_restore_mover(
         );
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
     }
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {
         username: "restore".into(),

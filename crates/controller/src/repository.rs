@@ -738,7 +738,7 @@ async fn bootstrap_via_mover(
         },
     )
     .await?;
-    let creds_secrets = creds.names;
+    let creds_secrets = io::plain_creds(creds.names);
     let mut labels = BTreeMap::new();
     labels.insert(
         "kopiur.home-operations.com/repository".to_string(),

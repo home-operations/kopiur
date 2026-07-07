@@ -484,6 +484,50 @@ fn verify_args_builds_flags() {
 }
 
 #[test]
+fn direct_credential_env_names_per_backend() {
+    let s3 = ConnectSpec::S3 {
+        bucket: "b".into(),
+        endpoint: None,
+        prefix: None,
+        region: None,
+        disable_tls: false,
+        disable_tls_verification: false,
+        ambient_credentials: false,
+    };
+    assert_eq!(
+        s3.direct_credential_env_names(),
+        &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN"
+        ]
+    );
+    // Ambient-chain hints are NOT listed (they belong to the pod SA, not a Secret).
+    assert!(
+        !s3.direct_credential_env_names()
+            .contains(&"AWS_WEB_IDENTITY_TOKEN_FILE")
+    );
+
+    let b2 = ConnectSpec::B2 {
+        bucket: "b".into(),
+        prefix: None,
+    };
+    assert_eq!(b2.direct_credential_env_names(), &["B2_KEY_ID", "B2_KEY"]);
+
+    // File-delivered and credential-free backends read no direct credential env var.
+    let gcs = ConnectSpec::Gcs {
+        bucket: "b".into(),
+        prefix: None,
+        credentials_file: None,
+    };
+    assert!(gcs.direct_credential_env_names().is_empty());
+    let fs = ConnectSpec::Filesystem {
+        path: "/repo".into(),
+    };
+    assert!(fs.direct_credential_env_names().is_empty());
+}
+
+#[test]
 fn sync_to_args_builds_destination_and_flags() {
     // ADR-0005 §13(d): destination backend args (+ optional --delete). `--must-exist`
     // is OMITTED (its kopia default is false; `--must-exist=false` is a parse error).
@@ -531,6 +575,67 @@ fn sync_to_args_builds_destination_and_flags() {
             "--delete"
         ]
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A shim standing in for `kopia`: it records the two credential env vars it was
+    // spawned with, then exits 0 (a successful sync-to).
+    let dir = std::env::temp_dir().join(format!("kopiur-syncenv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("kopia");
+    let out = dir.join("env.out");
+    {
+        let mut f = std::fs::File::create(&shim).unwrap();
+        write!(
+            f,
+            "#!/bin/sh\necho \"KEY=${{AWS_ACCESS_KEY_ID:-<unset>}} TOKEN=${{AWS_SESSION_TOKEN:-<unset>}}\" > \"$KOPIUR_SYNCENV_OUT\"\nexit 0\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Source credentials arrive as common_env (as they do in the mover pod).
+    let client = KopiaClient::builder()
+        .binary(&shim)
+        .env("AWS_ACCESS_KEY_ID", "source-key")
+        .env("AWS_SESSION_TOKEN", "source-token")
+        .env("KOPIUR_SYNCENV_OUT", out.to_str().unwrap())
+        .build();
+    let dest = ConnectSpec::Filesystem {
+        path: "/mirror".into(),
+    };
+
+    // No overlay → the source credentials pass through unchanged.
+    client.repository_sync_to(&dest, false).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "KEY=source-key TOKEN=source-token"
+    );
+
+    // Overlay → the destination key replaces the source's, and the session token
+    // (which the destination does not set) is unset so it can't leak.
+    let overlay = BTreeMap::from([
+        (
+            "AWS_ACCESS_KEY_ID".to_string(),
+            Some("dest-key".to_string()),
+        ),
+        ("AWS_SESSION_TOKEN".to_string(), None),
+    ]);
+    client
+        .repository_sync_to_with_env(&dest, false, &overlay)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "KEY=dest-key TOKEN=<unset>"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

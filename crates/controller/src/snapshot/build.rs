@@ -17,16 +17,16 @@ use kube::ResourceExt;
 use crate::consts::{API_VERSION, CONFIG_LABEL, ORIGIN_LABEL};
 use crate::error::{Error, Result};
 use crate::io::{self, ResolvedRepository};
-use crate::jobs::{JobLimits, VolumeMountSpec};
+use crate::jobs::{CredsEnvFrom, JobLimits, VolumeMountSpec};
 
 /// Build everything a backup run needs: the work spec, the source volume mount
 /// (PVC or inline NFS), the repo volume mount (filesystem only), and the
-/// credentials Secret name.
+/// credentials `envFrom` entries.
 pub(super) type SnapshotRun<'a> = (
     MoverWorkSpec,
     Option<VolumeMountSpec>,
     Option<VolumeMountSpec>,
-    Vec<String>,
+    Vec<CredsEnvFrom>,
 );
 pub(super) fn build_backup_run(
     _backup: &Snapshot,
@@ -88,7 +88,7 @@ pub(super) fn build_backup_run(
         }
     };
 
-    let creds_secrets = io::mover_creds_secrets(&repo.backend, &repo.encryption);
+    let creds_secrets = io::plain_creds(io::mover_creds_secrets(&repo.backend, &repo.encryption));
 
     // Effective kopia cache budgets: the repository's cacheDefaults overlaid by this
     // recipe's mover.cache (ADR §3.1).

@@ -199,3 +199,37 @@ pub fn validate_replication_auth(
         }
     }
 }
+
+/// A `RepositoryReplication`'s **destination** credential Secret is reachable from
+/// the mover Job. The replicate Job runs in the CR's own namespace and loads the
+/// destination backend's keys via `envFrom`, which is namespace-local — a Secret
+/// in another namespace can never be read. `RepositoryReplication` deliberately has
+/// no `credentialProjection`, so an out-of-namespace destination `auth.secretRef`
+/// is a dead reference the Job would hang on (`CreateContainerConfigError`).
+/// Reject it at admission with an actionable message instead. An absent
+/// `namespace` means "same namespace as the CR" and is always legal; a workload-
+/// identity or filesystem destination carries no auth Secret and is unaffected.
+/// `cr_namespace` is the replication CR's own namespace.
+pub fn validate_replication_destination_secret_namespace(
+    destination: &crate::backend::Backend,
+    cr_namespace: &str,
+) -> ValidationResult {
+    let Some(secret_ref) = crate::creds::backend_auth_secret_ref(destination) else {
+        return Ok(());
+    };
+    match secret_ref.namespace.as_deref() {
+        Some(ns) if ns != cr_namespace => Err(ValidationError::InvalidFieldValue {
+            field: "destination backend auth.secretRef.namespace".to_string(),
+            reason: format!(
+                "the replication mover Job runs in namespace {cr_namespace:?} and loads the \
+                 destination credentials via envFrom, which is namespace-local, but the Secret \
+                 {name:?} is pinned to namespace {ns:?} — the Job could never read it. \
+                 RepositoryReplication does not project credentials across namespaces; put the \
+                 destination Secret in {cr_namespace:?} (omit `namespace`, or set it to \
+                 {cr_namespace:?})",
+                name = secret_ref.name,
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
