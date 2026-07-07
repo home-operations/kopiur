@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.7.0](https://github.com/home-operations/kopiur/compare/0.6.0...0.7.0) (2026-07-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** Update Rust crate croner (2.2.0 → 3.0.1) ([#45](https://github.com/home-operations/kopiur/issues/45))
+* **controller:** inject replication destination credentials into the sync-to mover ([#200](https://github.com/home-operations/kopiur/issues/200)) (#207)
+* **deps:** Update Rust crate kube (3.1.0 → 4.0.0) ([#124](https://github.com/home-operations/kopiur/issues/124))
+
+### Features
+
+* **deps:** update opentelemetry-rust monorepo (0.31.0 → 0.32.0) ([#169](https://github.com/home-operations/kopiur/issues/169)) ([355999f](https://github.com/home-operations/kopiur/commit/355999fd8379d9fde158b9a6376d38c958c5308e))
+* **deps:** Update Rust crate croner (2.2.0 → 3.0.1) ([#45](https://github.com/home-operations/kopiur/issues/45)) ([0af8060](https://github.com/home-operations/kopiur/commit/0af806016a2b516695ea4cf7b30f3c885bbf8516))
+* **deps:** Update Rust crate kube (3.1.0 → 4.0.0) ([#124](https://github.com/home-operations/kopiur/issues/124)) ([12d299c](https://github.com/home-operations/kopiur/commit/12d299cdb03c425c97cf66c57f950345cec08d52))
+* **deps:** update rust crate rand (0.9.4 → 0.10.2) ([#102](https://github.com/home-operations/kopiur/issues/102)) ([b908d94](https://github.com/home-operations/kopiur/commit/b908d942a2c8e3f9aed18aee895dd85cb4585ce8))
+* **deps:** update rust crate reqwest (0.12.28 → 0.13.4) ([#84](https://github.com/home-operations/kopiur/issues/84)) ([55cef3b](https://github.com/home-operations/kopiur/commit/55cef3bc3a41f28d7960819d473fd72ed3091fb4))
+
+
+### Bug Fixes
+
+* **controller:** inject replication destination credentials into the sync-to mover ([#200](https://github.com/home-operations/kopiur/issues/200)) ([#207](https://github.com/home-operations/kopiur/issues/207)) ([b787657](https://github.com/home-operations/kopiur/commit/b7876572e22a931d9f5119fef029702f4ad43423))
+* **deps:** re-resolve Cargo.lock after concurrent dependency merges ([c8765f6](https://github.com/home-operations/kopiur/commit/c8765f6c8b252b55955363bb83661937452a7f48))
+
+
+### Documentation
+
+* credit GoReleaser Pro in the README ([#212](https://github.com/home-operations/kopiur/issues/212)) ([620bc88](https://github.com/home-operations/kopiur/commit/620bc88b0d7d67404ce168a7dbf649d7dd8e52f5))
+* **upgrade:** add 0.5.x → 0.6.0 CRD migration guide ([#209](https://github.com/home-operations/kopiur/issues/209)) ([603eddb](https://github.com/home-operations/kopiur/commit/603eddbb91ec32eaf8bde9723daaf5097bd9cfff))
+* **upgrade:** further clarify exactly how to upgrade from 0.5.x -&gt; 0.6.x ([cf4ea98](https://github.com/home-operations/kopiur/commit/cf4ea986f44f5c8d5a9428fea0ffe04414c356c4))
+* **upgrade:** make the steps explicit, fix the CRD selector, cover Flux ([eac6fff](https://github.com/home-operations/kopiur/commit/eac6fff3fe914f92a1b315e6994661fefa9ddac0))
+
+
+### Miscellaneous Chores
+
+* **deps:** lock file maintenance ([#186](https://github.com/home-operations/kopiur/issues/186)) ([7290972](https://github.com/home-operations/kopiur/commit/7290972dd3f61ed6b8cc2b137abcac2374ee8467))
+* **krew:** kopiur 0.6.0 manifest ([c3cd1ed](https://github.com/home-operations/kopiur/commit/c3cd1ed80c9f2c56041f8d4f56b54d6f8ffc7e5b))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.26 → 0.11.27) ([#211](https://github.com/home-operations/kopiur/issues/211)) ([da2ab78](https://github.com/home-operations/kopiur/commit/da2ab78962753c9e765e58c0a0c44dcb5b231346))
+* **mise:** Update tool oxfmt (0.57.0 → 0.58.0) ([#213](https://github.com/home-operations/kopiur/issues/213)) ([93486ab](https://github.com/home-operations/kopiur/commit/93486ab88bd59efaecf66c25f0ea852725382003))
+* **mise:** Update tool rust (1.95.0 → 1.96.1) ([#180](https://github.com/home-operations/kopiur/issues/180)) ([02b7aeb](https://github.com/home-operations/kopiur/commit/02b7aeb78aa26c2e0ffc0cc35477e77fe832d55c))
+
 ## [0.6.0](https://github.com/home-operations/kopiur/compare/0.5.2...0.6.0) (2026-07-06)
 
 
