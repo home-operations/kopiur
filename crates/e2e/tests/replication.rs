@@ -236,7 +236,10 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
         )
         .await
         .expect("create source S3 repository");
-    wait_ready(&repos, src)
+    // Gate on phase, not a `Ready` condition: a namespaced `Repository`'s bootstrap
+    // success writes `phase: Ready` + a `Bootstrapped` condition — it never emits a
+    // kstatus `Ready` condition, so `wait_ready` would time out every run.
+    wait_phase(&repos, src, "Ready")
         .await
         .expect("source S3 repository bootstraps (source-scoped keys can write the source bucket)");
 
