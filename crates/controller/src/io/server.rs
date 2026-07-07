@@ -15,13 +15,8 @@ use crate::error::{Error, Result};
 /// Generate a random alphanumeric UI password (used by `Generate` auth, written
 /// once into an operator-owned Secret).
 pub fn random_password() -> String {
-    use rand::Rng;
-    use rand::distr::Alphanumeric;
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect()
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), 32)
 }
 
 /// Read a single key's value from a Secret as a UTF-8 string.
