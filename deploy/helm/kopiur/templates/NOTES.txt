@@ -4,7 +4,8 @@ Install scope: {{ .Values.installScope }}{{ if eq .Values.installScope "cluster"
 CRDs: shipped in the chart's crds/ directory — installed on `helm install`, but
       Helm never upgrades them on `helm upgrade`. For a helm-CLI upgrade, apply
       the new schema yourself: kubectl apply -f deploy/crds/ (GitOps CreateReplace
-      handles this automatically).
+      handles this automatically). Upgrading FROM 0.5.x is a one-time special case
+      (the CRDs moved into crds/) — see docs/upgrade.md before upgrading.
 Webhook: {{ if .Values.webhook.enabled }}enabled (failurePolicy={{ .Values.webhook.failurePolicy }}){{ else }}disabled{{ end }}
 
 1. Verify the controller is running:

@@ -137,16 +137,18 @@ and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
   cluster. Owner-ref mapping is unaffected by the filter.
 - **Metadata-only referent watches.** The credential `Secret`, TLS-CA `ConfigMap`,
   workload-identity `ServiceAccount`, and privileged-opt-in `Namespace` watches feed
-  `Controller::watches_stream` a `metadata_watcher` stream (`referent_meta`), not a
-  full `watcher`. Every referent mapper needs only the changed object's name/namespace
-  (the spec/data it scans lives in the referrer `Store`), so `.data`/`.spec`/`.status`
-  never cross the wire — no `Secret` plaintext is ever pulled into the controller (a
-  memory **and** security win). We additionally drop `managedFields` + `annotations`
-  (the largest remaining `ObjectMeta` bytes, unused by every mapper). Per the
+  `Controller::watches_stream` a `watcher` over `Api<PartialObjectMeta<K>>`
+  (`referent_meta`) — kube serves such an `Api` via metadata-only requests — not a
+  full-object `watcher`. Every referent mapper needs only the changed object's
+  name/namespace (the spec/data it scans lives in the referrer `Store`), so
+  `.data`/`.spec`/`.status` never cross the wire — no `Secret` plaintext is ever
+  pulled into the controller (a memory **and** security win). We additionally drop
+  `managedFields` + `annotations` (the largest remaining `ObjectMeta` bytes, unused by
+  every mapper). Per the
   [kube.rs optimization guide](https://kube.rs/controllers/optimization/), this is the
-  highest-leverage watch change (metadata_watcher alone ≈ 60% for Pods; field pruning
-  adds ≈ 30%). Requires the kube `unstable-runtime` feature (no stable `watches_stream`
-  in 3.1).
+  highest-leverage watch change (metadata-only watching alone ≈ 60% for Pods; field
+  pruning adds ≈ 30%). Requires the kube `unstable-runtime` feature (`watches_stream`
+  is still unstable in kube 4.0).
 - **Worker-thread cap.** `main.rs` builds the tokio runtime with
   `config::worker_threads()` (`KOPIUR_WORKER_THREADS`, default 2) instead of
   `Runtime::new()`'s default — `available_parallelism()` sizes to the *host* core count,
