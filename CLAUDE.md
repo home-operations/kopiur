@@ -91,7 +91,7 @@ add controller-runtime dependencies to `crates/api`.
 | Maintenance         | Default-managed: `Repository`/`ClusterRepository` `spec.maintenance` (default-on) is projected into an _owned_ `Maintenance` CR; an externally-authored `Maintenance` is always honored (never duplicated), even with `enabled: false`. ClusterRepo placement: `spec.maintenance.namespace` else `KOPIUR_NAMESPACE`. |
 
 Pinned deps (Rust 1.95): `kube` 4.0, `k8s-openapi` 0.28 (feature `v1_33`,
-`schemars` on), `schemars` 1, `axum` 0.8, `croner` 2, `cel` 0.14.
+`schemars` on), `schemars` 1, `axum` 0.8, `croner` 3, `cel` 0.14.
 
 ## Build / test / verify
 

@@ -90,7 +90,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 
 # Scheduling / expressions
-croner = "2"
+croner = "3"
 # IANA timezone database for evaluating cron schedules in a user-specified zone
 # (CronSpec.timezone / ScheduleSpec.timezone / MaintenanceSchedule.timezone). Pure,
 # tokio-free, so it is safe in the api crate alongside chrono.
