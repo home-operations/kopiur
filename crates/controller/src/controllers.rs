@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::{
 use kube::core::PartialObjectMeta;
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher::Config as WatcherConfig;
-use kube::runtime::{Controller, WatchStreamExt, metadata_watcher, reflector, watcher};
+use kube::runtime::{Controller, WatchStreamExt, reflector, watcher};
 use kube::{Api, Client, ResourceExt};
 
 use kopiur_api::common::RepositoryKind;
@@ -48,8 +48,9 @@ where
 /// A metadata-only trigger stream for an external referent `K`
 /// (`Secret`/`ConfigMap`/`ServiceAccount`/`Namespace`). The referent mappers in
 /// [`crate::watch`] need only the changed object's name/namespace — never its
-/// `.data`/`.spec`/`.status` — so `metadata_watcher` keeps those payloads off the
-/// wire entirely (no `Secret` plaintext ever reaches the controller, a memory AND
+/// `.data`/`.spec`/`.status` — so watching `Api<PartialObjectMeta<K>>` (which
+/// kube serves via metadata-only requests) keeps those payloads off the wire
+/// entirely (no `Secret` plaintext ever reaches the controller, a memory AND
 /// security win) and we additionally drop `managedFields` + `annotations` (the
 /// largest remaining `ObjectMeta` bytes, unused by every mapper) before the events
 /// fan in. Fed to [`Controller::watches_stream`] in place of a full-object
@@ -59,7 +60,7 @@ where
 /// scopes it to the install scope — a namespaced install must not register a
 /// cluster-wide (Role-RBAC-forbidden) referent watch.
 fn referent_meta<K>(
-    api: Api<K>,
+    api: Api<PartialObjectMeta<K>>,
     cfg: &WatcherConfig,
 ) -> impl Stream<Item = Result<PartialObjectMeta<K>, watcher::Error>> + Send + use<K>
 where
@@ -70,7 +71,7 @@ where
         + Send
         + 'static,
 {
-    metadata_watcher(api, cfg.clone())
+    watcher(api, cfg.clone())
         .modify(|m| {
             m.metadata.managed_fields = None;
             m.metadata.annotations = None;

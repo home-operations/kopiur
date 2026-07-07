@@ -15,8 +15,8 @@ kopiur-mover = { workspace = true }
 kopiur-telemetry = { workspace = true }
 # `ws` enables pods/exec (AttachedProcess) for SnapshotPolicy workloadExec hooks (ADR §4.8).
 # `unstable-runtime` enables `Controller::watches_stream`, so referent Secret/ConfigMap
-# watches can be fed a `metadata_watcher` stream (no `.data` over the wire) — kube 3.1 has
-# no stable equivalent. Pinned to 3.1; revisit if a stable stream API lands.
+# watches can be fed a metadata-only `watcher` over `Api<PartialObjectMeta<K>>` (no `.data`
+# over the wire) — still unstable in kube 4.0; revisit if a stable stream API lands.
 kube = { workspace = true, features = ["client", "runtime", "derive", "rustls-tls", "ws", "unstable-runtime"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
