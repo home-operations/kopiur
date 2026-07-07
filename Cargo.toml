@@ -76,8 +76,13 @@ opentelemetry-appender-tracing = "0.31"
 tracing-opentelemetry = "0.32"
 url = "2"
 # HTTP client for SnapshotPolicy `httpRequest` hooks (ADR §4.8). rustls-only,
-# matching the kube/webhook TLS stack — never openssl.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-tls"] }
+# matching the kube/webhook TLS stack — never openssl. reqwest 0.13 replaced the
+# old `rustls-tls` feature: `rustls-no-provider` defers the CryptoProvider to
+# the process default (we install ring in every binary's startup before any
+# hook runs). Server roots come from rustls-platform-verifier (the system trust
+# store; the distroless images ship the ca-certificates bundle) — 0.13.4 removed
+# the bundled `webpki-roots` feature outright.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # CLI (kubectl plugin) argument parsing
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
