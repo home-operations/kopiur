@@ -55,29 +55,36 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.14"
 # OpenTelemetry / OTLP. Matrix confirmed to compile on Rust 1.95 with the
-# prometheus 0.14 pin above (opentelemetry-prometheus 0.31 shares it). OTLP
+# prometheus 0.14 pin above (opentelemetry-prometheus 0.32 shares it). OTLP
 # export is runtime/env-gated; these add no behavior unless an endpoint is set.
-opentelemetry = { version = "0.31", features = ["metrics", "trace", "logs"] }
-opentelemetry_sdk = { version = "0.31", features = [
+# NOTE: tracing-opentelemetry versions OFFSET the monorepo by +1 (0.33 ↔ otel
+# 0.32) — bump it in lockstep or the graph splits into two otel versions.
+opentelemetry = { version = "0.32", features = ["metrics", "trace", "logs"] }
+opentelemetry_sdk = { version = "0.32", features = [
     "rt-tokio",
     "metrics",
     "trace",
     "logs",
     "experimental_metrics_custom_reader",
 ] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic",
     "trace",
     "metrics",
     "logs",
 ] }
-opentelemetry-prometheus = "0.31"
-opentelemetry-appender-tracing = "0.31"
-tracing-opentelemetry = "0.32"
+opentelemetry-prometheus = "0.32"
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
 url = "2"
 # HTTP client for SnapshotPolicy `httpRequest` hooks (ADR §4.8). rustls-only,
-# matching the kube/webhook TLS stack — never openssl.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# matching the kube/webhook TLS stack — never openssl. reqwest 0.13 replaced the
+# old `rustls-tls` feature: `rustls-no-provider` defers the CryptoProvider to
+# the process default (we install ring in every binary's startup before any
+# hook runs). Server roots come from rustls-platform-verifier (the system trust
+# store; the distroless images ship the ca-certificates bundle) — 0.13.4 removed
+# the bundled `webpki-roots` feature outright.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # CLI (kubectl plugin) argument parsing
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
