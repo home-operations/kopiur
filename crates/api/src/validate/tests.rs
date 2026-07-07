@@ -1068,6 +1068,23 @@ fn malformed_cron_is_rejected() {
     }
 }
 
+#[test]
+fn six_and_seven_field_crons_stay_rejected() {
+    // The accepted grammar is standard 5-field cron ONLY. croner 3's default
+    // parser accepts optional seconds (6 fields) and year (7 fields); kopiur
+    // pins both off (jitter::cron_parser) — widening the grammar would bypass
+    // substitute_h's positional field math and change scheduling semantics.
+    for expr in ["*/30 * * * * *", "0 0 2 * * 1", "0 0 2 * * 1 2030"] {
+        assert!(
+            matches!(
+                validate_cron(expr),
+                Err(ValidationError::InvalidCron { .. })
+            ),
+            "{expr} (6/7-field) should be rejected"
+        );
+    }
+}
+
 // --- validate_repository_no_inline_retention ---
 
 #[test]

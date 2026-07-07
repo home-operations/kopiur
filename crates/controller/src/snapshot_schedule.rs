@@ -60,8 +60,8 @@ pub fn next_fire(
     tz: Tz,
 ) -> Result<DateTime<Utc>> {
     let resolved = jitter::substitute_h(cron_expr, seed);
-    let cron = croner::Cron::new(&resolved)
-        .parse()
+    let cron = jitter::cron_parser()
+        .parse(&resolved)
         .map_err(|e| Error::InvalidSchedule(format!("{resolved}: {e}")))?;
     // Evaluate the cron in the target zone so a wall-clock field like `0 2 * * *`
     // means 02:00 *there* (DST-correct), then convert the chosen instant back to UTC

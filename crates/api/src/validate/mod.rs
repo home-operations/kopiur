@@ -219,7 +219,7 @@ pub fn validate_cron(expr: &str) -> ValidationResult {
         .map(|f| if f == "H" { "0" } else { f })
         .collect::<Vec<_>>()
         .join(" ");
-    match croner::Cron::new(&probe).parse() {
+    match crate::jitter::cron_parser().parse(&probe) {
         Ok(_) => Ok(()),
         Err(e) => Err(ValidationError::InvalidCron {
             expr: expr.to_string(),

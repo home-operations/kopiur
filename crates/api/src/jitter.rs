@@ -16,7 +16,7 @@
 //!
 //! ### Cron `H`
 //!
-//! `croner` 2.x does not implement Jenkins-style `H`. Kopiur treats `H` as
+//! `croner` does not implement Jenkins-style `H`. Kopiur treats `H` as
 //! "deterministic hashed jitter within the field's range," resolved *here* (not in
 //! the cron parser). [`substitute_h`] rewrites each `H` in a 5-field cron to a
 //! concrete value derived from the same FNV hash of the seed, so the resolved
@@ -139,6 +139,19 @@ pub fn substitute_h(expr: &str, seed: &str) -> String {
         })
         .collect();
     resolved.join(" ")
+}
+
+/// The ONE cron grammar Kopiur accepts: standard 5-field expressions. croner 3
+/// defaults to *optional* seconds and year fields (6/7-field Quartz-style
+/// patterns would parse), which would silently widen the admission-validated
+/// CRD surface and break [`substitute_h`]'s positional field math — every
+/// parse in the workspace (webhook validator AND controller scheduler) must go
+/// through this parser so the grammar cannot drift between them.
+pub fn cron_parser() -> croner::parser::CronParser {
+    croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Disallowed)
+        .year(croner::parser::Year::Disallowed)
+        .build()
 }
 
 #[cfg(test)]
