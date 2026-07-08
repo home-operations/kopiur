@@ -1,10 +1,12 @@
 //! Real kopia filesystem round-trip integration test.
 //!
 //! Gated behind the `integration` feature and `#[ignore]` by default so the
-//! hermetic `cargo test` never invokes the real binary. Run with:
+//! hermetic `cargo test` never invokes the real binary (the `integration`
+//! feature lifts the `#[ignore]`, so it is not needed on the command line).
+//! Run with:
 //!
 //! ```text
-//! cargo test -p kopiur-kopia --features integration -- --ignored
+//! cargo test -p kopiur-kopia --features integration
 //! ```
 //!
 //! It creates a filesystem repo in a tempdir, snapshots a tempdir with known
@@ -325,6 +327,9 @@ async fn sync_to_accepts_parallel_and_tristate_flags() {
             &SyncToOptions {
                 parallel: Some(2),
                 times: Some(false),
+                must_exist: Some(false),
+                update: Some(false),
+                max_upload_speed_bytes_per_second: Some(1_000_000),
                 ..Default::default()
             },
         )
