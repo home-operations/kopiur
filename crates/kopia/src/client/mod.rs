@@ -485,6 +485,37 @@ pub struct RestoreOptions {
     pub parallel: Option<u32>,
 }
 
+/// Options for `kopia repository sync-to` (ADR-0005 §13(d) / issue #216). Every
+/// field's `None`/`false` reproduces kopia's own default — an all-`None`,
+/// `delete_extra: false` instance yields the exact same argv `sync_to_args`
+/// produced before this struct existed. The tri-state booleans map to kopia's
+/// `--[no-]flag` grammar, same as [`RestoreOptions`]: `Some(true)` → `--flag`,
+/// `Some(false)` → `--no-flag`, `None` → omit (kopia default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncToOptions {
+    /// `--parallel`: copy parallelism to the destination (kopia default `1` —
+    /// sequential; the root cause of #216's multi-week initial-seed times).
+    pub parallel: Option<u32>,
+    /// `--delete`: prune destination-only blobs for a true mirror (kopia
+    /// default `false` — additive sync, never removes destination content).
+    pub delete_extra: bool,
+    /// `--[no-]must-exist`: fail instead of initializing the destination's
+    /// repository-format blob (kopia default `false`).
+    pub must_exist: Option<bool>,
+    /// `--[no-]times`: synchronize blob modification times to the destination,
+    /// when supported (kopia default `true`).
+    pub times: Option<bool>,
+    /// `--[no-]update`: update blobs already present at the destination when
+    /// the source copy is newer (kopia default `true`).
+    pub update: Option<bool>,
+    /// `--max-download-speed`: cap read throughput from the source, bytes/sec
+    /// (kopia default: unlimited).
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`: cap write throughput to the destination, bytes/sec
+    /// (kopia default: unlimited).
+    pub max_upload_speed_bytes_per_second: Option<i64>,
+}
+
 /// Policy fields kopia applies via `kopia policy set`. Mirrors the operator's
 /// `SnapshotPolicy.spec.policy` without depending on the api crate, so the kopia
 /// crate stays controller-agnostic. The caller translates the CRD policy into
@@ -1011,21 +1042,21 @@ impl KopiaClient {
     }
 
     /// Mirror the *connected* repository's blobs to a destination backend
-    /// (`kopia repository sync-to <destination> [flags]`), ADR-0005 §13(d). The
-    /// caller must already be connected to the **source** repository; this copies
-    /// its blobs to `destination`. The destination's backend args are built by
-    /// `ConnectSpec::backend_args` (the same builder connect/create use), so a new
-    /// backend variant is wired through automatically. `--must-exist=false` lets the
-    /// first sync create the destination layout; `--delete` (when `delete_extra`)
-    /// prunes blobs at the destination no longer present at the source (a true
-    /// mirror). Destination credentials are supplied via the environment, never on
-    /// argv, exactly like connect/create. Success is exit code 0.
+    /// (`kopia repository sync-to <destination> [flags]`), ADR-0005 §13(d) / issue
+    /// #216. The caller must already be connected to the **source** repository;
+    /// this copies its blobs to `destination`. The destination's backend args are
+    /// built by `ConnectSpec::backend_args` (the same builder connect/create use),
+    /// so a new backend variant is wired through automatically. `opts` carries the
+    /// tuning knobs (parallelism, `--delete`, the must-exist/times/update
+    /// tri-states, throughput caps) — see [`SyncToOptions`]. Destination
+    /// credentials are supplied via the environment, never on argv, exactly like
+    /// connect/create. Success is exit code 0.
     pub async fn repository_sync_to(
         &self,
         destination: &ConnectSpec,
-        delete_extra: bool,
+        opts: &SyncToOptions,
     ) -> Result<(), KopiaError> {
-        self.repository_sync_to_with_env(destination, delete_extra, &BTreeMap::new())
+        self.repository_sync_to_with_env(destination, opts, &BTreeMap::new())
             .await
     }
 
@@ -1042,10 +1073,10 @@ impl KopiaClient {
     pub async fn repository_sync_to_with_env(
         &self,
         destination: &ConnectSpec,
-        delete_extra: bool,
+        opts: &SyncToOptions,
         dest_env: &BTreeMap<String, Option<String>>,
     ) -> Result<(), KopiaError> {
-        let args = sync_to_args(destination, delete_extra);
+        let args = sync_to_args(destination, opts);
         self.run_ok_with_env(&args, dest_env).await.map(|_| ())
     }
 
@@ -1576,19 +1607,34 @@ fn connect_args(spec: &ConnectSpec, cache: CacheTuning, readonly: bool) -> Vec<S
 }
 
 /// Build the args for `kopia repository sync-to <destination> [flags]`. Pure so it
-/// is unit-testable without spawning kopia (ADR-0005 §13(d)). The destination's
-/// backend selection reuses `ConnectSpec::backend_args`, so every backend is wired
-/// through. `--must-exist=false` allows the first sync to create the destination
-/// layout; `--delete` prunes destination-only blobs for a true mirror.
-fn sync_to_args(destination: &ConnectSpec, delete_extra: bool) -> Vec<String> {
+/// is unit-testable without spawning kopia (ADR-0005 §13(d) / issue #216). The
+/// destination's backend selection reuses `ConnectSpec::backend_args`, so every
+/// backend is wired through. `--must-exist`/`--times`/`--update` are kopia
+/// (kingpin) BOOLEAN flags: `--must-exist=false` is a parse error (`unexpected
+/// false`) — but the `--no-must-exist`/`--no-times`/`--no-update` negated forms
+/// ARE accepted (smoke-tested against kopia 0.23.1), so [`push_tristate`] is used
+/// for all three exactly like `snapshot restore`'s tri-states. `None` on any
+/// field omits its flag entirely, leaving kopia's own default in effect.
+fn sync_to_args(destination: &ConnectSpec, opts: &SyncToOptions) -> Vec<String> {
     let mut args = vec!["repository".into(), "sync-to".into()];
     args.extend(destination.backend_args());
-    // `--must-exist` is a kopia (kingpin) BOOLEAN flag: present (`--must-exist`) or
-    // absent — `--must-exist=false` is a parse error (`unexpected false`). Its default
-    // is false (sync-to initializes the destination if it isn't yet a repository),
-    // exactly what a mirror wants, so omit it rather than emit an invalid `=false`.
-    if delete_extra {
+    if let Some(p) = opts.parallel {
+        args.push("--parallel".into());
+        args.push(p.to_string());
+    }
+    if opts.delete_extra {
         args.push("--delete".into());
+    }
+    push_tristate(&mut args, "must-exist", opts.must_exist);
+    push_tristate(&mut args, "times", opts.times);
+    push_tristate(&mut args, "update", opts.update);
+    if let Some(s) = opts.max_download_speed_bytes_per_second {
+        args.push("--max-download-speed".into());
+        args.push(s.to_string());
+    }
+    if let Some(s) = opts.max_upload_speed_bytes_per_second {
+        args.push("--max-upload-speed".into());
+        args.push(s.to_string());
     }
     args
 }

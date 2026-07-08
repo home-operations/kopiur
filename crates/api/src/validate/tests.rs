@@ -1852,6 +1852,7 @@ fn replication_spec(
         },
         mover: None,
         suspend: false,
+        sync: None,
     }
 }
 
@@ -1919,6 +1920,72 @@ fn replication_rejects_invalid_destination_backend_content() {
     assert!(
         errs.iter()
             .any(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+    );
+}
+
+#[test]
+fn replication_sync_all_zero_is_valid() {
+    // #216: a `sync` block is optional and every field individually optional;
+    // a fully-populated but in-range block must not error.
+    use crate::backend::{Backend, S3Backend};
+    use crate::repository_replication::SyncOptions;
+    let mut spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        Backend::S3(S3Backend {
+            bucket: "mirror".into(),
+            prefix: None,
+            endpoint: None,
+            region: None,
+            auth: None,
+            tls: None,
+        }),
+        "0 5 * * *",
+    );
+    spec.sync = Some(SyncOptions {
+        parallel: Some(4),
+        delete_extra: true,
+        must_exist: Some(false),
+        times: Some(true),
+        update: Some(false),
+        max_download_speed_bytes_per_second: Some(1_000_000),
+        max_upload_speed_bytes_per_second: Some(500_000),
+    });
+    assert!(validate_repository_replication(&spec).is_empty());
+}
+
+#[test]
+fn replication_sync_rejects_zero_parallel_and_zero_speeds() {
+    // #216: `parallel`/the speed caps must be >= 1 — 0 is meaningless for a copy
+    // parallelism or a throughput cap, and would otherwise silently reach kopia's
+    // argv as `--parallel 0` etc.
+    use crate::backend::{Backend, S3Backend};
+    use crate::repository_replication::SyncOptions;
+    let mut spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        Backend::S3(S3Backend {
+            bucket: "mirror".into(),
+            prefix: None,
+            endpoint: None,
+            region: None,
+            auth: None,
+            tls: None,
+        }),
+        "0 5 * * *",
+    );
+    spec.sync = Some(SyncOptions {
+        parallel: Some(0),
+        max_download_speed_bytes_per_second: Some(0),
+        max_upload_speed_bytes_per_second: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_repository_replication(&spec);
+    let invalid_count = errs
+        .iter()
+        .filter(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+        .count();
+    assert_eq!(
+        invalid_count, 3,
+        "parallel + both speed caps must each be rejected independently, got {errs:?}"
     );
 }
 

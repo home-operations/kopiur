@@ -28,6 +28,22 @@ Mover (Job pod) overrides for the replication run — resources, scheduling, sec
 
 Pause this replication declaratively (default `false`). A suspended `RepositoryReplication` is skipped by its own reconcile — no sync runs — and the state is surfaced via a condition.
 
+### `sync`
+
+Tuning knobs for the underlying `kopia repository sync-to` invocation (issue #216). Every field is optional; an absent `sync` block, or an absent field within it, reproduces kopia's own default for that flag — see [Tuning the sync](../../replication.md#tuning-the-sync).
+
+| Field | kopia flag | Meaning |
+| --- | --- | --- |
+| `parallel` | `--parallel` | Concurrent blob-copy workers (kopia default `1` — sequential; the main knob for a slow initial seed). |
+| `deleteExtra` | `--delete` | Prune destination-only blobs for a true mirror (kopia default `false` — additive sync). **Deletes destination content** — see the safety note in the guide. |
+| `mustExist` | `--[no-]must-exist` | Fail instead of initializing the destination's repository-format blob (kopia default `false`). |
+| `times` | `--[no-]times` | Synchronize blob modification times to the destination, when supported (kopia default `true`). |
+| `update` | `--[no-]update` | Update blobs already present at the destination when the source copy is newer (kopia default `true`). |
+| `maxDownloadSpeedBytesPerSecond` | `--max-download-speed` | Cap read throughput from the source, bytes/sec (kopia default: unlimited). |
+| `maxUploadSpeedBytesPerSecond` | `--max-upload-speed` | Cap write throughput to the destination, bytes/sec (kopia default: unlimited). |
+
+`parallel` and the two speed caps must be `>= 1` when set (admission-webhook enforced).
+
 ## `status`
 
 ### `phase`

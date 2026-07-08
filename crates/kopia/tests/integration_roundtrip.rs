@@ -16,7 +16,8 @@
 use std::collections::BTreeMap;
 
 use kopiur_kopia::{
-    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, VerifyOptions,
+    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, SyncToOptions,
+    VerifyOptions,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -267,5 +268,85 @@ async fn verbs_roundtrip() {
     assert!(
         !restore_dir.path().join("skip.tmp").exists(),
         "ignored file should not be in the snapshot/restore"
+    );
+}
+
+/// Real-kopia guard for issue #216: `kopia repository sync-to` accepts the
+/// tuning flags `sync_to_args` builds — `--parallel`, the `--no-*` tri-state
+/// forms (`--no-times`), and the throughput caps — against a real filesystem
+/// destination. This is the permanent regression guard for the kingpin
+/// flag-form risk noted on `sync_to_args`/`push_tristate`: a bad flag SHAPE
+/// (e.g. `--must-exist=false`) would fail here even though the pure arg-builder
+/// unit tests only check the argv shape, not that kopia accepts it.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn sync_to_accepts_parallel_and_tristate_flags() {
+    let source_repo_dir = tempfile::tempdir().unwrap();
+    let dest_repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"hello sync-to\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: source_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("source repository create");
+    client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("syncuser@synchost:/data"),
+        )
+        .await
+        .expect("snapshot create");
+
+    // `--parallel 2 --no-times`: the exact flag combo the brief calls out as
+    // smoke-tested against kopia 0.23.1. A wrong flag GRAMMAR (e.g.
+    // `--must-exist=false` instead of `--no-must-exist`) fails here with a
+    // kopia argv-parse error, not a silently-wrong result.
+    client
+        .repository_sync_to(
+            &ConnectSpec::Filesystem {
+                path: dest_repo_dir.path().to_path_buf(),
+            },
+            &SyncToOptions {
+                parallel: Some(2),
+                times: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync-to with --parallel 2 --no-times should succeed");
+
+    // The destination is now itself a connectable repository with the mirrored
+    // snapshot — proving the copy (not just a successful exit code) happened.
+    let dest_config_dir = config_dir.path().join("dest");
+    std::fs::create_dir_all(&dest_config_dir).unwrap();
+    let dest_client = isolated_client(&dest_config_dir);
+    dest_client
+        .repository_connect(
+            &ConnectSpec::Filesystem {
+                path: dest_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+        )
+        .await
+        .expect("connect to the sync-to destination");
+    let list = dest_client
+        .snapshot_list(None)
+        .await
+        .expect("list destination snapshots");
+    assert_eq!(
+        list.len(),
+        1,
+        "the mirrored snapshot must appear at the destination"
     );
 }

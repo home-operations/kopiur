@@ -10,7 +10,10 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams};
+
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::ConfigMap;
 
 use kopiur_api::{Repository, RepositoryReplication};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait_until};
@@ -62,14 +65,65 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
                     // PVC root regardless of the mount path, so the `repl-dst` verifier
                     // (which mounts the same PVC at `/repo`) still reads the mirror.
                     "destination": { "filesystem": { "path": "/repo-dst", "volume": { "pvc": { "name": consts::isolated_repo_pvc("repl-dst") } } } },
-                    "schedule": { "cron": "* * * * *" }
+                    "schedule": { "cron": "* * * * *" },
+                    // #216: sync-to tuning — asserted both at the mover's actual
+                    // behavior (the run still succeeds/records lastReplicated with a
+                    // real `--parallel`/`--delete` on argv) AND at the work-spec
+                    // ConfigMap contract below (the seam where a regression would
+                    // silently drop the knobs while the run still succeeded).
+                    "sync": { "parallel": 2, "deleteExtra": true }
                 }
             })),
         )
         .await
         .expect("create RepositoryReplication to a second filesystem repo");
 
-    // Within a couple of minutes a replication runs and records lastReplicated.
+    // The work-spec ConfigMap (same name as the per-slot mover Job) carries the
+    // #216 sync knobs — the controller→mover contract, mirroring the
+    // `policy_knobs` compression/upload-knobs pattern.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let selector = format!(
+        "app.kubernetes.io/component=replication,kopiur.home-operations.com/replication={name}"
+    );
+    let job_name = wait_until(
+        "a replication mover Job is created",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let list = jobs.list(&ListParams::default().labels(&selector)).await?;
+            Ok(list.items.into_iter().find_map(|j| j.metadata.name))
+        },
+    )
+    .await
+    .expect("a replication mover Job should be created");
+    let cm = cms
+        .get(&job_name)
+        .await
+        .expect("replication work-spec ConfigMap");
+    let spec_json = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("work-spec.json"))
+        .expect("work-spec.json key");
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+    let replicate = spec
+        .pointer("/operation/replicate")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        replicate.get("parallel").and_then(|v| v.as_i64()),
+        Some(2),
+        "sync.parallel must reach the mover contract; replicate: {replicate}"
+    );
+    assert_eq!(
+        replicate.get("deleteExtra").and_then(|v| v.as_bool()),
+        Some(true),
+        "sync.deleteExtra must reach the mover contract; replicate: {replicate}"
+    );
+
+    // Within a couple of minutes a replication runs and records lastReplicated —
+    // proving kopia actually accepted `--parallel 2 --delete` on argv.
     wait_until(
         "RepositoryReplication records a successful run (status.lastReplicated)",
         default_timeout(),

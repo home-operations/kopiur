@@ -542,6 +542,31 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
     {
         errs.push(e);
     }
+    if let Some(sync) = &spec.sync {
+        if let Some(p) = sync.parallel
+            && let Some(e) = require_min("RepositoryReplication spec.sync.parallel", p.into(), 1)
+        {
+            errs.push(e);
+        }
+        if let Some(s) = sync.max_download_speed_bytes_per_second
+            && let Some(e) = require_min(
+                "RepositoryReplication spec.sync.maxDownloadSpeedBytesPerSecond",
+                s,
+                1,
+            )
+        {
+            errs.push(e);
+        }
+        if let Some(s) = sync.max_upload_speed_bytes_per_second
+            && let Some(e) = require_min(
+                "RepositoryReplication spec.sync.maxUploadSpeedBytesPerSecond",
+                s,
+                1,
+            )
+        {
+            errs.push(e);
+        }
+    }
     errs
 }
 

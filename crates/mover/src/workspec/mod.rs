@@ -645,6 +645,51 @@ pub struct ReplicateOp {
     /// (additive sync) — safer, so a misconfigured destination is never emptied.
     #[serde(default)]
     pub delete_extra: bool,
+    /// `--parallel`: copy parallelism to the destination (issue #216; kopia
+    /// default `1` — sequential). `#[serde(default)]` so old-wire work-spec JSON
+    /// (stamped before this field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--[no-]must-exist`: fail instead of initializing the destination's
+    /// repository-format blob (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_exist: Option<bool>,
+    /// `--[no-]times`: synchronize blob modification times to the destination
+    /// (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub times: Option<bool>,
+    /// `--[no-]update`: update blobs already present at the destination when the
+    /// source copy is newer (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<bool>,
+    /// `--max-download-speed`: cap read throughput from the source, bytes/sec
+    /// (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`: cap write throughput to the destination, bytes/sec
+    /// (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_speed_bytes_per_second: Option<i64>,
+}
+
+impl ReplicateOp {
+    /// Project this op's sync-tuning fields into a
+    /// [`SyncToOptions`](kopiur_kopia::SyncToOptions) for
+    /// `KopiaClient::repository_sync_to_with_env`. Pure so the field → option
+    /// mapping is unit-testable without a kopia binary (the regression guard for
+    /// this whole gap class: plumbing that exists but a hardcoded `None` never
+    /// reaches it).
+    pub fn sync_options(&self) -> kopiur_kopia::SyncToOptions {
+        kopiur_kopia::SyncToOptions {
+            parallel: self.parallel,
+            delete_extra: self.delete_extra,
+            must_exist: self.must_exist,
+            times: self.times,
+            update: self.update,
+            max_download_speed_bytes_per_second: self.max_download_speed_bytes_per_second,
+            max_upload_speed_bytes_per_second: self.max_upload_speed_bytes_per_second,
+        }
+    }
 }
 
 /// Payload for a browse-session run (M7a). The session pod connects read-only,

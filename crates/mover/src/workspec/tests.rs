@@ -900,6 +900,12 @@ fn replicate_roundtrip_and_wire_shape() {
                 ambient_credentials: false,
             },
             delete_extra: true,
+            parallel: Some(8),
+            must_exist: Some(false),
+            times: Some(true),
+            update: Some(false),
+            max_download_speed_bytes_per_second: Some(1_000_000),
+            max_upload_speed_bytes_per_second: Some(500_000),
         }),
         // The source repository the mover connects to.
         identity: ResolvedIdentity {
@@ -928,6 +934,18 @@ fn replicate_roundtrip_and_wire_shape() {
         "mirror"
     );
     assert_eq!(v["operation"]["replicate"]["deleteExtra"], true);
+    assert_eq!(v["operation"]["replicate"]["parallel"], 8);
+    assert_eq!(v["operation"]["replicate"]["mustExist"], false);
+    assert_eq!(v["operation"]["replicate"]["times"], true);
+    assert_eq!(v["operation"]["replicate"]["update"], false);
+    assert_eq!(
+        v["operation"]["replicate"]["maxDownloadSpeedBytesPerSecond"],
+        1_000_000
+    );
+    assert_eq!(
+        v["operation"]["replicate"]["maxUploadSpeedBytesPerSecond"],
+        500_000
+    );
     // The destination converts to the kopia client connect spec.
     if let Operation::Replicate(op) = &spec.operation {
         assert_eq!(
@@ -942,7 +960,49 @@ fn replicate_roundtrip_and_wire_shape() {
                 ambient_credentials: false,
             }
         );
+        // #216 controller-glue guard: every new op field reaches the kopia
+        // client's SyncToOptions — no dormant plumbing.
+        assert_eq!(
+            op.sync_options(),
+            kopiur_kopia::SyncToOptions {
+                parallel: Some(8),
+                delete_extra: true,
+                must_exist: Some(false),
+                times: Some(true),
+                update: Some(false),
+                max_download_speed_bytes_per_second: Some(1_000_000),
+                max_upload_speed_bytes_per_second: Some(500_000),
+            }
+        );
     } else {
         panic!("expected replicate op");
     }
+}
+
+#[test]
+fn replicate_op_old_wire_decodes_with_sync_fields_defaulted() {
+    // #216: a work-spec ConfigMap written before `sync` tuning existed (just
+    // `destination` + `deleteExtra`) must still decode — the mover pairs one
+    // controller+mover image per Job, but old ConfigMaps can persist across a
+    // rolling restart. `#[serde(default)]` on every new field is the guard.
+    let legacy = serde_json::json!({
+        "destination": { "filesystem": { "path": "/mirror" } },
+        "deleteExtra": true,
+    });
+    let op: ReplicateOp = serde_json::from_value(legacy).expect("legacy replicate op decodes");
+    assert!(op.delete_extra);
+    assert_eq!(op.parallel, None);
+    assert_eq!(op.must_exist, None);
+    assert_eq!(op.times, None);
+    assert_eq!(op.update, None);
+    assert_eq!(op.max_download_speed_bytes_per_second, None);
+    assert_eq!(op.max_upload_speed_bytes_per_second, None);
+    // All-None sync fields reproduce today's SyncToOptions exactly.
+    assert_eq!(
+        op.sync_options(),
+        kopiur_kopia::SyncToOptions {
+            delete_extra: true,
+            ..Default::default()
+        }
+    );
 }

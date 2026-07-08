@@ -1518,7 +1518,7 @@ async fn run_replicate_flow(
     let dest_env = credentials::dest_env_overlay(&dest, &raw_env);
 
     if let Err(e) = client
-        .repository_sync_to_with_env(&dest, op.delete_extra, &dest_env)
+        .repository_sync_to_with_env(&dest, &op.sync_options(), &dest_env)
         .await
     {
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;

@@ -340,12 +340,19 @@ pub fn build_replication_work_spec(
     namespace: &str,
     cr_name: &str,
 ) -> MoverWorkSpec {
+    let sync = repl.spec.sync.unwrap_or_default();
     MoverWorkSpec {
         version: 1,
         operation: Operation::Replicate(ReplicateOp {
             destination: backend_to_repository_connect(&repl.spec.destination),
             // Additive sync by default (never prune the destination automatically).
-            delete_extra: false,
+            delete_extra: sync.delete_extra,
+            parallel: sync.parallel,
+            must_exist: sync.must_exist,
+            times: sync.times,
+            update: sync.update,
+            max_download_speed_bytes_per_second: sync.max_download_speed_bytes_per_second,
+            max_upload_speed_bytes_per_second: sync.max_upload_speed_bytes_per_second,
         }),
         // Replication does not snapshot; a stable sentinel identity (like maintenance).
         identity: ResolvedIdentity {
@@ -581,6 +588,7 @@ mod tests {
                 },
                 mover: None,
                 suspend: false,
+                sync: None,
             },
         );
         r.metadata.uid = Some("uid-repl-1".into());
@@ -691,11 +699,51 @@ mod tests {
             Operation::Replicate(op) => {
                 assert_eq!(op.destination.kind_str(), "S3");
                 assert!(!op.delete_extra);
+                // No `spec.sync` set → every knob defaults, reproducing today's argv.
+                assert_eq!(op.parallel, None);
+                assert_eq!(op.must_exist, None);
+                assert_eq!(op.times, None);
+                assert_eq!(op.update, None);
+                assert_eq!(op.max_download_speed_bytes_per_second, None);
+                assert_eq!(op.max_upload_speed_bytes_per_second, None);
             }
             other => panic!("expected replicate op, got {}", other.kind_str()),
         }
         assert_eq!(ws.repository.kind_str(), "Filesystem");
         assert_eq!(ws.target_ref.kind, "RepositoryReplication");
+    }
+
+    #[test]
+    fn work_spec_maps_every_sync_field_to_the_replicate_op() {
+        // #216 controller-glue guard: this is the regression test for the exact
+        // bug class the whole change exists to kill — `spec.sync` plumbed through
+        // to CRD/validator/workspec but the controller still hardcoding `None`.
+        // Every field set on `spec.sync` must land on the corresponding `op` field.
+        use kopiur_api::repository_replication::SyncOptions;
+        let mut r = repl_with("0 5 * * *", None);
+        r.spec.sync = Some(SyncOptions {
+            parallel: Some(6),
+            delete_extra: true,
+            must_exist: Some(true),
+            times: Some(false),
+            update: Some(true),
+            max_download_speed_bytes_per_second: Some(2_000_000),
+            max_upload_speed_bytes_per_second: Some(3_000_000),
+        });
+        let repo = sample_repo();
+        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite");
+        match &ws.operation {
+            Operation::Replicate(op) => {
+                assert_eq!(op.parallel, Some(6));
+                assert!(op.delete_extra);
+                assert_eq!(op.must_exist, Some(true));
+                assert_eq!(op.times, Some(false));
+                assert_eq!(op.update, Some(true));
+                assert_eq!(op.max_download_speed_bytes_per_second, Some(2_000_000));
+                assert_eq!(op.max_upload_speed_bytes_per_second, Some(3_000_000));
+            }
+            other => panic!("expected replicate op, got {}", other.kind_str()),
+        }
     }
 
     #[test]

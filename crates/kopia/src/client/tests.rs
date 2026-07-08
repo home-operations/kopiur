@@ -529,8 +529,9 @@ fn direct_credential_env_names_per_backend() {
 
 #[test]
 fn sync_to_args_builds_destination_and_flags() {
-    // ADR-0005 §13(d): destination backend args (+ optional --delete). `--must-exist`
-    // is OMITTED (its kopia default is false; `--must-exist=false` is a parse error).
+    // ADR-0005 §13(d) / issue #216: destination backend args + tuning flags.
+    // All-`None`/`false` opts must yield EXACTLY today's argv (no dormant knob
+    // sneaks a flag in when nothing was configured).
     let dest = ConnectSpec::S3 {
         bucket: "mirror".into(),
         endpoint: Some("https://offsite".into()),
@@ -541,7 +542,7 @@ fn sync_to_args_builds_destination_and_flags() {
         ambient_credentials: false,
     };
     assert_eq!(
-        sync_to_args(&dest, false),
+        sync_to_args(&dest, &SyncToOptions::default()),
         vec![
             "repository",
             "sync-to",
@@ -554,18 +555,24 @@ fn sync_to_args_builds_destination_and_flags() {
             "us-east-1",
         ]
     );
-    // No `--must-exist=false` (it would fail kopia's flag parser).
+    // No `must-exist`/`times`/`update` flag at all when unset.
     assert!(
-        !sync_to_args(&dest, false)
+        !sync_to_args(&dest, &SyncToOptions::default())
             .iter()
-            .any(|a| a.contains("must-exist"))
+            .any(|a| a.contains("must-exist") || a.contains("times") || a.contains("update"))
     );
     // delete_extra appends --delete (a true mirror).
     let fs = ConnectSpec::Filesystem {
         path: "/mirror".into(),
     };
     assert_eq!(
-        sync_to_args(&fs, true),
+        sync_to_args(
+            &fs,
+            &SyncToOptions {
+                delete_extra: true,
+                ..Default::default()
+            }
+        ),
         vec![
             "repository",
             "sync-to",
@@ -574,6 +581,55 @@ fn sync_to_args_builds_destination_and_flags() {
             "/mirror",
             "--delete"
         ]
+    );
+}
+
+#[test]
+fn sync_to_args_builds_parallel_and_tristates_and_speeds() {
+    // #216: --parallel is the headline fix; the tri-states use the SAME
+    // --no-* negated form as `snapshot restore` (push_tristate), not the
+    // `policy set` `--flag=false` grammar.
+    let fs = ConnectSpec::Filesystem {
+        path: "/mirror".into(),
+    };
+    let opts = SyncToOptions {
+        parallel: Some(8),
+        delete_extra: false,
+        must_exist: Some(false),
+        times: Some(true),
+        update: Some(false),
+        max_download_speed_bytes_per_second: Some(1_000_000),
+        max_upload_speed_bytes_per_second: Some(500_000),
+    };
+    assert_eq!(
+        sync_to_args(&fs, &opts),
+        vec![
+            "repository",
+            "sync-to",
+            "filesystem",
+            "--path",
+            "/mirror",
+            "--parallel",
+            "8",
+            "--no-must-exist",
+            "--times",
+            "--no-update",
+            "--max-download-speed",
+            "1000000",
+            "--max-upload-speed",
+            "500000",
+        ]
+    );
+    // The `Some(true)` form emits the bare (non-negated) flag.
+    assert!(
+        sync_to_args(
+            &fs,
+            &SyncToOptions {
+                must_exist: Some(true),
+                ..Default::default()
+            }
+        )
+        .contains(&"--must-exist".to_string())
     );
 }
 
@@ -611,7 +667,10 @@ async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
     };
 
     // No overlay → the source credentials pass through unchanged.
-    client.repository_sync_to(&dest, false).await.unwrap();
+    client
+        .repository_sync_to(&dest, &SyncToOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&out).unwrap().trim(),
         "KEY=source-key TOKEN=source-token"
@@ -627,7 +686,7 @@ async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
         ("AWS_SESSION_TOKEN".to_string(), None),
     ]);
     client
-        .repository_sync_to_with_env(&dest, false, &overlay)
+        .repository_sync_to_with_env(&dest, &SyncToOptions::default(), &overlay)
         .await
         .unwrap();
     assert_eq!(

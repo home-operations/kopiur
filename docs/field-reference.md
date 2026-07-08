@@ -2336,6 +2336,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | `sourceRef` | [object](#repositoryreplication-spec-sourceref) | **required** | Reference to the `Repository` or `ClusterRepository` to mirror from. |
 | `mover` | [object](#repositoryreplication-spec-mover) | — | Mover (Job pod) overrides for the replication run. |
 | `suspend` | boolean | — | Pause this replication; a suspended replication runs no syncs (default `false`). |
+| `sync` | [object](#repositoryreplication-spec-sync) | — | Tuning knobs for the underlying `kopia repository sync-to` invocation (issue #216). `None` reproduces today's behavior: sequential copy (`--parallel` unset), additive sync (no `--delete`), kopia's own `--must-exist`/`--times`/`--update` defaults, and no throughput cap. |
 
 #### `spec.destination` { #repositoryreplication-spec-destination }
 
@@ -2637,6 +2638,18 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | --- | --- | --- | --- |
 | `podSelector` | core/v1 LabelSelector | **required** | Label selector matching the workload pod(s) to read context/hooks from. |
 | `container` | string | — | Which container within the matched pod; absent uses the first/only container. |
+
+#### `spec.sync` { #repositoryreplication-spec-sync }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `deleteExtra` | boolean | — | `--delete`: prune destination-only blobs so the mirror is an exact copy (kopia default `false` — additive sync, never removes destination content). Named `deleteExtra`, not kopia's bare `delete`: a `delete: true` key on backup-adjacent YAML is dangerously ambiguous at a glance.<br>CAUTION: with this `true`, blobs present at the destination but absent from the source are deleted on every run. |
+| `maxDownloadSpeedBytesPerSecond` | integer | — | `--max-download-speed`: cap read throughput from the source, in bytes/sec (kopia default: unlimited). |
+| `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput to the destination, in bytes/sec (kopia default: unlimited). |
+| `mustExist` | boolean | — | `--[no-]must-exist`: fail the sync instead of initializing the destination's repository-format blob (kopia default `false` — sync-to may create the destination layout on first run). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of concurrent blob-copy workers (kopia default `1` — sequential, the root cause of #216's multi-week seed times to R2). |
+| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `true`). |
+| `update` | boolean | — | `--[no-]update`: update blobs already present at the destination when the source copy is newer (kopia default `true`). |
 
 ### `status` { #repositoryreplication-status }
 
