@@ -65,6 +65,14 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(e);
     }
+    // `snapshot create --upload-limit-mb` (M4 flag sweep, issue #216): a count
+    // knob, must be at least 1 (0 or negative disables the flag's own purpose).
+    if let Some(u) = &spec.upload
+        && let Some(mb) = u.limit_mb
+        && let Some(e) = require_min("SnapshotPolicy spec.upload.limitMb", mb, 1)
+    {
+        errs.push(e);
+    }
     // Data-loss guard: a retention that selects no snapshots prunes EVERY Snapshot the
     // moment it runs. `retention: None` means "don't prune" (safe) and is not flagged;
     // only an explicit but empty/all-zero retention is the trap.

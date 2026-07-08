@@ -25,6 +25,10 @@ spec:
     name: postgres-data
   tags:
     reason: "pre-schema-migration"
+  # Free-form text recorded on the kopia snapshot manifest itself
+  # (`snapshot create --description`, up to 1024 characters). Per-invocation
+  # by nature — scheduled/discovered Snapshots never set this.
+  description: "pre-upgrade snapshot before the v14→v15 migration"
   # Keep the Snapshot CR even when the next GFS prune runs.
   deletionPolicy: Retain
   # Pin the underlying kopia snapshot so GFS retention NEVER expires it — for a

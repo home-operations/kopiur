@@ -116,12 +116,22 @@ failing outright. Each flag defaults `false` (kopia's fail-on-error default):
 `ignoreDirErrors` (`--ignore-dir-errors`) past unreadable directories, and
 `ignoreUnknownTypes` (`--ignore-unknown-types`) past entries of unknown type.
 
+`failFast` (`--fail-fast`, default `false`) is the opposite kind of knob: it
+aborts the snapshot at the *first* error instead of collecting and continuing.
+It rides `kopia snapshot create`'s own argv (not `policy set`), which is why it
+lives here beside its semantic opposites rather than under `upload`.
+
 ### `upload`
 
 Upload parallelism (kopia's upload policy). `maxParallelSnapshots`
 (`--max-parallel-snapshots`) is how many sources snapshot concurrently;
 `maxParallelFileReads` (`--max-parallel-file-reads`) is file-read concurrency
-within a snapshot. Absent knobs leave kopia's default.
+within a snapshot. `limitMb` (`--upload-limit-mb`, kopia default: unlimited)
+aborts the snapshot once this many MB have been uploaded — named `limitMb`
+rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter. Like
+`failFast`, it is a `snapshot create` argv flag, not a `policy set` knob, but
+lives here beside its parallelism siblings. Absent knobs leave kopia's
+default.
 
 ### `verification`
 

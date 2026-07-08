@@ -212,6 +212,105 @@ async fn compression_and_upload_knobs_reach_the_mover_contract() {
         .expect("the tuned backup should succeed (kopia accepted the policy flags)");
 }
 
+/// M4 flag sweep (issue #216 category sweep): `errorHandling.failFast` +
+/// `upload.limitMb` (recipe, `SnapshotPolicy`) and `description`
+/// (per-invocation, `Snapshot`) all reach the controller→mover work-spec
+/// ConfigMap as `SnapshotOp` fields (`snapshot create` argv, NOT `policy set`
+/// knobs — so they must NOT appear under `operation.snapshot.policy`), and
+/// kopia accepts them (`Succeeded`).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn snapshot_create_knobs_reach_the_mover_contract() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_knobs_repo(&client).await;
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cfg = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-create-knobs-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({
+            "errorHandling": { "failFast": true },
+            "upload": { "limitMb": 100 }
+        }),
+    );
+    let _ = configs.create(&PostParams::default(), &cr(cfg)).await;
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-create-knobs",
+                "e2e-create-knobs-cfg",
+                serde_json::json!({ "description": "e2e m4 flag sweep" }),
+            )),
+        )
+        .await;
+
+    // The work-spec ConfigMap (same name as the mover Job) carries all three
+    // knobs directly on `operation.snapshot` — NOT under `.policy` (the
+    // `policy set` args), proving the recipe/invocation split holds end to end.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = wait_for_job(&jobs, "e2e-create-knobs").await;
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cm = cms
+        .get("e2e-create-knobs")
+        .await
+        .expect("work-spec ConfigMap");
+    let spec_json = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("work-spec.json"))
+        .expect("work-spec.json key");
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+    let snapshot_op = spec
+        .pointer("/operation/snapshot")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        snapshot_op.get("failFast").and_then(|v| v.as_bool()),
+        Some(true),
+        "errorHandling.failFast must reach SnapshotOp; op: {snapshot_op}"
+    );
+    assert_eq!(
+        snapshot_op.get("uploadLimitMb").and_then(|v| v.as_i64()),
+        Some(100),
+        "upload.limitMb must reach SnapshotOp as uploadLimitMb; op: {snapshot_op}"
+    );
+    assert_eq!(
+        snapshot_op.get("description").and_then(|v| v.as_str()),
+        Some("e2e m4 flag sweep"),
+        "Snapshot.spec.description must reach SnapshotOp; op: {snapshot_op}"
+    );
+    // Recipe knobs must NOT leak into the `policy set` args.
+    let policy = snapshot_op
+        .get("policy")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        policy.get("failFast").is_none(),
+        "failFast must not leak into policy set args; policy: {policy}"
+    );
+    assert!(
+        policy.get("limitMb").is_none(),
+        "limitMb must not leak into policy set args; policy: {policy}"
+    );
+
+    // End-to-end close: kopia accepted the flags.
+    wait_phase(&backups, "e2e-create-knobs", "Succeeded")
+        .await
+        .expect("the tuned backup should succeed (kopia accepted --fail-fast/--upload-limit-mb/--description)");
+}
+
 // --- task PR4: default `files.ignoreRules` OS-artifact excludes ---
 
 /// Seed the test's OWN dynamic source PVC (never the shared `e2e-src` — content

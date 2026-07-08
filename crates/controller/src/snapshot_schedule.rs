@@ -781,6 +781,9 @@ async fn create_scheduled_backup(
             failure_policy: None,
             deletion_policy: None,
             pin: false,
+            // Scheduled backups never carry a templated description (out of
+            // scope for M4 — description is per-invocation only).
+            description: None,
         },
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
@@ -1166,6 +1169,7 @@ mod tests {
                     failure_policy: None,
                     deletion_policy: None,
                     pin: false,
+                    description: None,
                 },
             );
             s.status = Some(SnapshotStatus {

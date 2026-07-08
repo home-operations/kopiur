@@ -507,6 +507,7 @@ mod tests {
                 failure_policy: None,
                 deletion_policy: None,
                 pin: false,
+                description: None,
             },
         );
         b.status = Some(SnapshotStatus {
@@ -632,6 +633,7 @@ mod tests {
                 failure_policy: None,
                 deletion_policy: None,
                 pin: false,
+                description: None,
             },
         );
         running.status = Some(SnapshotStatus {

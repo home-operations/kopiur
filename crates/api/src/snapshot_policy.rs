@@ -344,6 +344,12 @@ pub struct ErrorHandling {
     /// Continue past entries of unknown type (`--ignore-unknown-types`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore_unknown_types: bool,
+    /// Abort the snapshot at the first error instead of collecting and
+    /// continuing (`snapshot create --fail-fast`; kopia default: false). This
+    /// is a `snapshot create` argv flag, not a `policy set` knob, but lives
+    /// beside its semantic opposites (`ignore*Errors`) for discoverability.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fail_fast: bool,
 }
 
 /// Upload parallelism (kopia's upload policy); absent knobs leave kopia's default.
@@ -356,6 +362,13 @@ pub struct Upload {
     /// `--max-parallel-file-reads`: file-read concurrency within a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_file_reads: Option<i64>,
+    /// `snapshot create --upload-limit-mb`: abort the snapshot once this many
+    /// MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb`
+    /// rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter;
+    /// like `failFast`, this is a `snapshot create` argv flag, not a `policy
+    /// set` knob, but lives here beside its parallelism siblings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_mb: Option<i64>,
 }
 
 /// First-class backup verification proving snapshots are restorable; opt-in, with quick and deep tiers.
@@ -1018,9 +1031,11 @@ errorHandling:
   ignoreFileErrors: true
   ignoreDirErrors: false
   ignoreUnknownTypes: true
+  failFast: true
 upload:
   maxParallelSnapshots: 4
   maxParallelFileReads: 8
+  limitMb: 100
 suspend: true
 "#;
         let spec: SnapshotPolicySpec = from_yaml(yaml);
@@ -1028,15 +1043,19 @@ suspend: true
         assert!(eh.ignore_file_errors);
         assert!(!eh.ignore_dir_errors);
         assert!(eh.ignore_unknown_types);
+        assert!(eh.fail_fast);
         let up = spec.upload.as_ref().expect("upload");
         assert_eq!(up.max_parallel_snapshots, Some(4));
         assert_eq!(up.max_parallel_file_reads, Some(8));
+        assert_eq!(up.limit_mb, Some(100));
         assert!(spec.suspend);
 
         let json = serde_json::to_value(&spec).expect("serialize");
         assert_eq!(json["suspend"], true);
         assert_eq!(json["errorHandling"]["ignoreFileErrors"], true);
+        assert_eq!(json["errorHandling"]["failFast"], true);
         assert_eq!(json["upload"]["maxParallelSnapshots"], 4);
+        assert_eq!(json["upload"]["limitMb"], 100);
         let reparsed: SnapshotPolicySpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
 

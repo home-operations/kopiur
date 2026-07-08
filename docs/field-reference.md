@@ -1317,6 +1317,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `failFast` | boolean | — | Abort the snapshot at the first error instead of collecting and continuing (`snapshot create --fail-fast`; kopia default: false). This is a `snapshot create` argv flag, not a `policy set` knob, but lives beside its semantic opposites (`ignore*Errors`) for discoverability. |
 | `ignoreDirErrors` | boolean | — | Continue the snapshot when a directory cannot be read (`--ignore-dir-errors`). |
 | `ignoreFileErrors` | boolean | — | Continue the snapshot when a file cannot be read (`--ignore-file-errors`). |
 | `ignoreUnknownTypes` | boolean | — | Continue past entries of unknown type (`--ignore-unknown-types`). |
@@ -1537,6 +1538,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `limitMb` | integer | — | `snapshot create --upload-limit-mb`: abort the snapshot once this many MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb` rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter; like `failFast`, this is a `snapshot create` argv flag, not a `policy set` knob, but lives here beside its parallelism siblings. |
 | `maxParallelFileReads` | integer | — | `--max-parallel-file-reads`: file-read concurrency within a snapshot. |
 | `maxParallelSnapshots` | integer | — | `--max-parallel-snapshots`: how many sources snapshot concurrently. |
 
@@ -1647,6 +1649,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `deletionPolicy` | enum: Delete \| Retain \| Orphan | — | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
+| `description` | string | —<br><sub>maxLength 1024</sub> | Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`). Per-invocation by nature — scheduled/discovered `Snapshot`s never set this (no templated descriptions). |
 | `failurePolicy` | [object](#snapshot-spec-failurepolicy) | — | Mover Job retry and deadline limits for this run. |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |

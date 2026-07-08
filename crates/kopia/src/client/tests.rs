@@ -534,6 +534,71 @@ fn restore_args_m2_flag_sweep_all_new_tristates_and_delete_extra() {
 }
 
 #[test]
+fn snapshot_create_args_default_is_todays_argv() {
+    // M4 flag sweep (issue #216 category sweep): all-default `opts` must
+    // reproduce the pre-M4 argv byte-for-byte — no dormant knob sneaks a flag
+    // in when nothing was set.
+    let mut tags = BTreeMap::new();
+    tags.insert("app".to_string(), "db".to_string());
+    assert_eq!(
+        snapshot_create_args("/data", &tags, None, &SnapshotCreateOptions::default()),
+        vec!["snapshot", "create", "/data", "--json", "--tags", "app:db"]
+    );
+    assert_eq!(
+        snapshot_create_args(
+            "/data",
+            &BTreeMap::new(),
+            Some("u@h:/data"),
+            &SnapshotCreateOptions::default()
+        ),
+        vec![
+            "snapshot",
+            "create",
+            "/data",
+            "--json",
+            "--override-source",
+            "u@h:/data"
+        ]
+    );
+}
+
+#[test]
+fn snapshot_create_args_fail_fast_upload_limit_and_description() {
+    // Smoke-tested against pinned kopia 0.23.1: `snapshot create --fail-fast
+    // --upload-limit-mb 100 --description "smoke test"` is accepted.
+    let opts = SnapshotCreateOptions {
+        fail_fast: Some(true),
+        upload_limit_mb: Some(100),
+        description: Some("smoke test".to_string()),
+    };
+    assert_eq!(
+        snapshot_create_args("/data", &BTreeMap::new(), None, &opts),
+        vec![
+            "snapshot",
+            "create",
+            "/data",
+            "--json",
+            "--fail-fast",
+            "--upload-limit-mb",
+            "100",
+            "--description",
+            "smoke test"
+        ]
+    );
+    // `fail_fast: Some(false)` emits the negated kingpin form, same grammar as
+    // `snapshot restore`'s tri-states (push_tristate), not `policy set`'s
+    // valued tri-states.
+    let opts_false = SnapshotCreateOptions {
+        fail_fast: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        snapshot_create_args("/data", &BTreeMap::new(), None, &opts_false),
+        vec!["snapshot", "create", "/data", "--json", "--no-fail-fast"]
+    );
+}
+
+#[test]
 fn verify_args_builds_flags() {
     assert_eq!(
         verify_args(&VerifyOptions::default()),

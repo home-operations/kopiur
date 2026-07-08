@@ -307,6 +307,7 @@ fn dummy_backup() -> Snapshot {
             failure_policy: None,
             deletion_policy: None,
             pin: false,
+            description: None,
         },
     )
 }
@@ -458,6 +459,84 @@ fn build_backup_run_maps_pvc_source_to_pvc_mount() {
         }
     );
     assert_eq!(src.mount_path, "/pvc/pg-data");
+}
+
+#[test]
+fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() {
+    // M4 flag sweep (issue #216 category sweep): `failFast`/`limitMb` (the
+    // recipe's `SnapshotPolicy.spec.{errorHandling,upload}`) and `description`
+    // (this run's `Snapshot.spec`) all land on `SnapshotOp` — they are
+    // `snapshot create` argv flags, not `policy set` knobs, so they must NOT
+    // appear on `op.policy` (`PolicyArgsSpec`).
+    use kopiur_api::snapshot_policy::{ErrorHandling, PvcSource, Source, Upload};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "pg-data".into(),
+            }),
+            pvc_selector: None,
+            nfs: None,
+            source_path_override: None,
+            source_path_strategy: None,
+        },
+    );
+    cfg.spec.error_handling = Some(ErrorHandling {
+        fail_fast: true,
+        ..Default::default()
+    });
+    cfg.spec.upload = Some(Upload {
+        limit_mb: Some(250),
+        ..Default::default()
+    });
+    let mut backup = dummy_backup();
+    backup.spec.description = Some("pre-upgrade snapshot".into());
+    let repo = resolved_s3_repo();
+    let (ws, _source_volume, _repo, _creds) =
+        build_backup_run(&backup, &cfg, &repo, "ns", "pg").unwrap();
+    let op = match &ws.operation {
+        Operation::Snapshot(op) => op,
+        other => panic!("expected a Snapshot op, got {}", other.kind_str()),
+    };
+    assert_eq!(op.fail_fast, Some(true));
+    assert_eq!(op.upload_limit_mb, Some(250));
+    assert_eq!(op.description.as_deref(), Some("pre-upgrade snapshot"));
+
+    // The non-leak guard: `PolicyArgsSpec` structurally has no failFast/limitMb
+    // fields, and this proves it at the JSON boundary too.
+    let policy_json = serde_json::to_value(&op.policy).unwrap();
+    assert!(policy_json.get("failFast").is_none());
+    assert!(policy_json.get("limitMb").is_none());
+
+    // Absent errorHandling/upload/description ⇒ None on SnapshotOp (kopia's
+    // own defaults, today's argv).
+    let (ws2, ..) = build_backup_run(
+        &dummy_backup(),
+        &config_with_source(
+            "pg2",
+            Source {
+                pvc: Some(PvcSource {
+                    name: "pg-data".into(),
+                }),
+                pvc_selector: None,
+                nfs: None,
+                source_path_override: None,
+                source_path_strategy: None,
+            },
+        ),
+        &repo,
+        "ns",
+        "pg2",
+    )
+    .unwrap();
+    match &ws2.operation {
+        Operation::Snapshot(op2) => {
+            assert_eq!(op2.fail_fast, None);
+            assert_eq!(op2.upload_limit_mb, None);
+            assert_eq!(op2.description, None);
+        }
+        other => panic!("expected a Snapshot op, got {}", other.kind_str()),
+    }
 }
 
 #[test]

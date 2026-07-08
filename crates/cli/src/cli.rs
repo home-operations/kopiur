@@ -673,6 +673,11 @@ pub struct SnapshotNowArgs {
     #[arg(long)]
     pub pin: bool,
 
+    /// Free-form text recorded on the kopia snapshot manifest
+    /// (`snapshot create --description`).
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
     /// Mover Job retry budget (Job backoffLimit).
     #[arg(long, value_name = "N")]
     pub backoff_limit: Option<i32>,

@@ -429,3 +429,57 @@ async fn restore_accepts_m2_flag_sweep_and_deletes_extra_files() {
         "stale.txt should have been deleted by --delete-extra"
     );
 }
+
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn snapshot_create_accepts_m4_flag_sweep_and_records_the_description() {
+    // M4 flag sweep (issue #216 category sweep): `snapshot create --fail-fast
+    // --upload-limit-mb <n> --description <text>` is accepted by real kopia
+    // (smoke-tested against 0.23.1 in the design doc; this is the permanent
+    // guard), and the description round-trips onto the created snapshot's
+    // JSON (not just accepted argv).
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"m4 flag sweep\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+
+    let created = client
+        .snapshot_create_with(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("m4user@m4host:/data"),
+            &kopiur_kopia::SnapshotCreateOptions {
+                fail_fast: Some(true),
+                upload_limit_mb: Some(100),
+                description: Some("m4 flag sweep smoke test".to_string()),
+            },
+        )
+        .await
+        .expect("snapshot create --fail-fast --upload-limit-mb 100 --description should succeed");
+    assert_eq!(created.description, "m4 flag sweep smoke test");
+
+    // `snapshot list` shows the same description was actually persisted on
+    // the manifest, not just echoed back by `create`'s own JSON.
+    let list = client
+        .snapshot_list(None)
+        .await
+        .expect("snapshot list after m4 create");
+    let entry = list
+        .iter()
+        .find(|e| e.id == created.id)
+        .expect("created snapshot present in list");
+    assert_eq!(entry.description, "m4 flag sweep smoke test");
+}

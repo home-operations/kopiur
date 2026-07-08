@@ -299,17 +299,23 @@ errorHandling:
     ignoreFileErrors: true # --ignore-file-errors: skip unreadable files
     ignoreDirErrors: false # --ignore-dir-errors: skip unreadable directories
     ignoreUnknownTypes: true # --ignore-unknown-types: skip sockets/devices/...
+    failFast: false # --fail-fast: abort at the FIRST error instead of collecting and continuing
 ```
+
+`failFast` is the opposite kind of knob from its three siblings above — it makes the snapshot _less_ tolerant of errors, not more. It's a `kopia snapshot create` argv flag (not a `policy set` knob), which is why it lives here beside its semantic opposites rather than under `upload`.
 
 ### upload — parallelism
 
-kopia's upload policy; both knobs optional (absent leaves kopia's default):
+kopia's upload policy; every knob is optional (absent leaves kopia's default):
 
 ```yaml
 upload:
     maxParallelSnapshots: 4 # --max-parallel-snapshots: concurrent sources
     maxParallelFileReads: 8 # --max-parallel-file-reads: file-read concurrency
+    limitMb: 500 # --upload-limit-mb: abort the snapshot after this many MB uploaded (kopia default: unlimited)
 ```
+
+`limitMb` is named to avoid the `upload.uploadLimitMb` stutter. Like `failFast`, it's a `snapshot create` argv flag, not a `policy set` knob, but lives here beside its parallelism siblings.
 
 ### verification — prove the snapshots are restorable
 
@@ -529,6 +535,16 @@ Set it per-`Snapshot` (`spec.deletionPolicy`) or set the recipe-wide default wit
 spec:
     policyRef: { name: postgres-data }
     pin: true # GFS retention will skip this snapshot until you clear pin
+```
+
+### `description` — annotate a one-off run
+
+`Snapshot.spec.description` (up to 1024 characters) records free-form text on the kopia snapshot manifest (`snapshot create --description`). It's per-invocation by nature — a `SnapshotSchedule`'s children and `discovered` backups never set it — so use it on a manual `Snapshot` or `kubectl kopiur snapshot now --description` to note *why* this particular run exists:
+
+```yaml
+spec:
+    policyRef: { name: postgres-data }
+    description: pre-upgrade snapshot before the v14→v15 migration
 ```
 
 ### `failurePolicy` — retry & deadline for the mover Job

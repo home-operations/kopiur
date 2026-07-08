@@ -100,6 +100,33 @@ pub struct SnapshotOp {
     /// (ADR-0005 §13(b)/§13(f), ADR-0004 §4b). Empty ⇒ leave kopia's defaults.
     #[serde(default, skip_serializing_if = "PolicyArgsSpec::is_empty")]
     pub policy: PolicyArgsSpec,
+    /// `snapshot create --[no-]fail-fast` (M4 flag sweep, issue #216 category
+    /// sweep). Resolved from `SnapshotPolicy.spec.errorHandling.failFast`.
+    /// `#[serde(default)]` so old-wire work-spec JSON (stamped before this
+    /// field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    /// `snapshot create --upload-limit-mb` (M4 flag sweep). Resolved from
+    /// `SnapshotPolicy.spec.upload.limitMb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_mb: Option<i64>,
+    /// `snapshot create --description` (M4 flag sweep). Per-invocation, from
+    /// `Snapshot.spec.description` (not the recipe) — scheduled/discovered
+    /// runs never set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl SnapshotOp {
+    /// Translate the carried `snapshot create` flags into the kopia client's
+    /// options. Pure so the workspec→kopia-client mapping is unit-testable.
+    pub fn create_options(&self) -> kopiur_kopia::SnapshotCreateOptions {
+        kopiur_kopia::SnapshotCreateOptions {
+            fail_fast: self.fail_fast,
+            upload_limit_mb: self.upload_limit_mb,
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Serializable mirror of [`kopiur_kopia::PolicyArgs`] for the work spec (the kopia
@@ -1102,6 +1129,9 @@ impl Default for MoverOptions {
 ///         source_path: "/data".into(),
 ///         tags: BTreeMap::new(),
 ///         policy: Default::default(),
+///         fail_fast: None,
+///         upload_limit_mb: None,
+///         description: None,
 ///     }),
 ///     identity: ResolvedIdentity {
 ///         username: "mydb".into(),

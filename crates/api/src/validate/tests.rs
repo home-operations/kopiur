@@ -1231,6 +1231,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         policy_ref: None,
         tags: None,
         failure_policy: None,
+        description: None,
         deletion_policy: Some(DeletionPolicy::Delete),
         pin: false,
     };
@@ -2999,6 +3000,44 @@ fn backup_config_validates_verification_tuning_knobs() {
         "{:?}",
         validate_backup_config(&ok)
     );
+}
+
+#[test]
+fn backup_config_rejects_zero_upload_limit_mb() {
+    // M4 flag sweep (issue #216 category sweep): `upload.limitMb` is a count
+    // knob (require_min, same shared validator as the M2/M3 sweeps).
+    let zero: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         upload:\n  limitMb: 0\n",
+    );
+    let errs = validate_backup_config(&zero);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotPolicy spec.upload.limitMb"
+        )),
+        "expected a limitMb rejection, got: {errs:?}"
+    );
+
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         upload:\n  limitMb: 100\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+
+    // Absent ⇒ no error (limitMb is opt-in).
+    let absent: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(validate_backup_config(&absent).is_empty());
 }
 
 // --- identity shape validation ---

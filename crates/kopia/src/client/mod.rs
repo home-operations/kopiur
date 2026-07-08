@@ -472,6 +472,24 @@ pub struct VerifyOptions {
     pub file_queue_length: Option<u32>,
 }
 
+/// Options for `kopia snapshot create` (M4 flag sweep, issue #216 category
+/// sweep). All-default reproduces kopia's own defaults / today's argv:
+/// `fail_fast: None` (kopia default: keep going past per-file errors, subject
+/// to the `errorHandling.ignore*Errors` policy knobs), `upload_limit_mb: None`
+/// (kopia default: unlimited), `description: None` (kopia default: empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotCreateOptions {
+    /// `--[no-]fail-fast`: abort the snapshot at the first error instead of
+    /// collecting and continuing (kopia default: false — collect and continue).
+    pub fail_fast: Option<bool>,
+    /// `--upload-limit-mb`: abort the snapshot once this many MB have been
+    /// uploaded (kopia default: 0 — unlimited).
+    pub upload_limit_mb: Option<i64>,
+    /// `--description`: free-form text recorded on the snapshot manifest
+    /// (kopia default: empty).
+    pub description: Option<String>,
+}
+
 /// Options for `kopia restore` / `kopia snapshot restore`. The tri-state
 /// booleans map to kopia's `--[no-]flag` form: `Some(true)` → `--flag`,
 /// `Some(false)` → `--no-flag`, `None` → omit (kopia default). M2 flag sweep
@@ -1109,7 +1127,8 @@ impl KopiaClient {
     }
 
     /// Create a snapshot of `source_path` with the given `tags`
-    /// (`key:value`). Returns the parsed create result.
+    /// (`key:value`) and kopia's own defaults for `snapshot create`'s tuning
+    /// knobs. Returns the parsed create result.
     ///
     /// `override_source`, when set, is passed to kopia as `--override-source`
     /// (format `username@hostname:path`). This is how Kopiur records snapshots
@@ -1123,20 +1142,28 @@ impl KopiaClient {
         tags: &BTreeMap<String, String>,
         override_source: Option<&str>,
     ) -> Result<SnapshotCreateResult, KopiaError> {
-        let mut args = vec![
-            "snapshot".into(),
-            "create".into(),
-            source_path.to_string(),
-            "--json".into(),
-        ];
-        if let Some(src) = override_source {
-            args.push("--override-source".into());
-            args.push(src.to_string());
-        }
-        for (k, v) in tags {
-            args.push("--tags".into());
-            args.push(format!("{k}:{v}"));
-        }
+        self.snapshot_create_with(
+            source_path,
+            tags,
+            override_source,
+            &SnapshotCreateOptions::default(),
+        )
+        .await
+    }
+
+    /// Create a snapshot honoring the operator's [`SnapshotCreateOptions`]
+    /// (`failFast`, `uploadLimitMb`, `description` — M4 flag sweep, issue #216).
+    /// Same identity/tags contract as [`Self::snapshot_create`], which now
+    /// delegates here with an all-default `opts` (byte-for-byte the same argv
+    /// as before this option struct existed).
+    pub async fn snapshot_create_with(
+        &self,
+        source_path: &str,
+        tags: &BTreeMap<String, String>,
+        override_source: Option<&str>,
+        opts: &SnapshotCreateOptions,
+    ) -> Result<SnapshotCreateResult, KopiaError> {
+        let args = snapshot_create_args(source_path, tags, override_source, opts);
         self.run_json(&args, "snapshot create result").await
     }
 
@@ -1612,6 +1639,45 @@ fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String
     if let Some(p) = opts.parallel {
         args.push("--parallel".into());
         args.push(p.to_string());
+    }
+    args
+}
+
+/// Build the args for `kopia snapshot create <source> --json [flags]` plus
+/// options. Pure so it is unit-testable without spawning kopia. `--fail-fast`
+/// is a kingpin `--[no-]flag` tri-state (smoke-tested against the pinned
+/// kopia 0.23.1: `snapshot create --fail-fast --upload-limit-mb 100
+/// --description "smoke test"` is accepted; the real-kopia integration test
+/// in `crates/kopia/tests/integration_roundtrip.rs` is the permanent guard).
+/// All-default `opts` reproduces the pre-M4 argv byte-for-byte (tested).
+fn snapshot_create_args(
+    source_path: &str,
+    tags: &BTreeMap<String, String>,
+    override_source: Option<&str>,
+    opts: &SnapshotCreateOptions,
+) -> Vec<String> {
+    let mut args = vec![
+        "snapshot".into(),
+        "create".into(),
+        source_path.to_string(),
+        "--json".into(),
+    ];
+    if let Some(src) = override_source {
+        args.push("--override-source".into());
+        args.push(src.to_string());
+    }
+    for (k, v) in tags {
+        args.push("--tags".into());
+        args.push(format!("{k}:{v}"));
+    }
+    push_tristate(&mut args, "fail-fast", opts.fail_fast);
+    if let Some(mb) = opts.upload_limit_mb {
+        args.push("--upload-limit-mb".into());
+        args.push(mb.to_string());
+    }
+    if let Some(desc) = &opts.description {
+        args.push("--description".into());
+        args.push(desc.clone());
     }
     args
 }

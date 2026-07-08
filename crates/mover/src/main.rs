@@ -401,7 +401,12 @@ async fn run_operation(
                 }
             }
             let result = client
-                .snapshot_create(&op.source_path, &op.tags, Some(&override_source))
+                .snapshot_create_with(
+                    &op.source_path,
+                    &op.tags,
+                    Some(&override_source),
+                    &op.create_options(),
+                )
                 .await
                 .map_err(kopia(KopiaOp::SnapshotCreate))?;
             // kopia exits non-zero (→ a classified `PermissionDenied` failure above) when

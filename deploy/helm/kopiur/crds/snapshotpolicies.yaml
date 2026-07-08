@@ -85,6 +85,13 @@ spec:
                 description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
                 nullable: true
                 properties:
+                  failFast:
+                    description: |-
+                      Abort the snapshot at the first error instead of collecting and
+                      continuing (`snapshot create --fail-fast`; kopia default: false). This
+                      is a `snapshot create` argv flag, not a `policy set` knob, but lives
+                      beside its semantic opposites (`ignore*Errors`) for discoverability.
+                    type: boolean
                   ignoreDirErrors:
                     description: Continue the snapshot when a directory cannot be read (`--ignore-dir-errors`).
                     type: boolean
@@ -978,6 +985,16 @@ spec:
                 description: Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`).
                 nullable: true
                 properties:
+                  limitMb:
+                    description: |-
+                      `snapshot create --upload-limit-mb`: abort the snapshot once this many
+                      MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb`
+                      rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter;
+                      like `failFast`, this is a `snapshot create` argv flag, not a `policy
+                      set` knob, but lives here beside its parallelism siblings.
+                    format: int64
+                    nullable: true
+                    type: integer
                   maxParallelFileReads:
                     description: '`--max-parallel-file-reads`: file-read concurrency within a snapshot.'
                     format: int64

@@ -45,6 +45,13 @@ pub struct SnapshotSpec {
     /// Exempt this snapshot from GFS retention.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin: bool,
+    /// Free-form text recorded on the kopia snapshot manifest
+    /// (`snapshot create --description`). Per-invocation by nature —
+    /// scheduled/discovered `Snapshot`s never set this (no templated
+    /// descriptions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 1024))]
+    pub description: Option<String>,
 }
 
 /// How a `Snapshot` came to exist. Canonical value mirrored from the

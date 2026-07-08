@@ -32,6 +32,9 @@ fn backup_roundtrip() {
             source_path: "/data".into(),
             tags,
             policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -48,6 +51,56 @@ fn backup_roundtrip() {
     };
     assert_eq!(roundtrip(&spec), spec);
     assert_eq!(spec.operation.kind_str(), "Snapshot");
+}
+
+#[test]
+fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
+    // M4 flag sweep (issue #216 category sweep): failFast/uploadLimitMb/
+    // description round-trip on the wire, serialize under their camelCase
+    // names, and `create_options()` carries them into the kopia client's
+    // `SnapshotCreateOptions` unchanged.
+    let op = SnapshotOp {
+        source_path: "/data".into(),
+        tags: BTreeMap::new(),
+        policy: Default::default(),
+        fail_fast: Some(true),
+        upload_limit_mb: Some(250),
+        description: Some("pre-upgrade snapshot".into()),
+    };
+    let json = serde_json::to_value(&op).unwrap();
+    assert_eq!(json["failFast"], true);
+    assert_eq!(json["uploadLimitMb"], 250);
+    assert_eq!(json["description"], "pre-upgrade snapshot");
+    let reparsed: SnapshotOp = serde_json::from_value(json).unwrap();
+    assert_eq!(reparsed, op);
+    assert_eq!(
+        op.create_options(),
+        kopiur_kopia::SnapshotCreateOptions {
+            fail_fast: Some(true),
+            upload_limit_mb: Some(250),
+            description: Some("pre-upgrade snapshot".into()),
+        }
+    );
+}
+
+#[test]
+fn snapshot_op_old_wire_decodes_with_m4_fields_defaulted() {
+    // A work-spec ConfigMap written before M4 (just sourcePath/tags/policy)
+    // must still decode — `#[serde(default)]` on every new field is the
+    // guard, and the all-None result reproduces the pre-M4 `snapshot create`
+    // argv exactly (SnapshotCreateOptions::default()).
+    let legacy = serde_json::json!({
+        "sourcePath": "/data",
+        "tags": {"app": "mydb"},
+    });
+    let op: SnapshotOp = serde_json::from_value(legacy).expect("legacy snapshot op decodes");
+    assert_eq!(op.fail_fast, None);
+    assert_eq!(op.upload_limit_mb, None);
+    assert_eq!(op.description, None);
+    assert_eq!(
+        op.create_options(),
+        kopiur_kopia::SnapshotCreateOptions::default()
+    );
 }
 
 #[test]
@@ -350,6 +403,9 @@ fn externally_tagged_operation_shape() {
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -678,10 +734,15 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
             ignore_file_errors: true,
             ignore_dir_errors: false,
             ignore_unknown_types: true,
+            // M4 flag sweep: `failFast` is a `snapshot create` argv flag, not a
+            // `policy set` knob — it must NOT leak into `PolicyArgsSpec` below.
+            fail_fast: true,
         }),
         upload: Some(Upload {
             max_parallel_snapshots: Some(4),
             max_parallel_file_reads: Some(8),
+            // Same non-leak guard as `fail_fast` above, for `limitMb`.
+            limit_mb: Some(100),
         }),
         verification: None,
         preflight: None,
@@ -703,6 +764,14 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     assert_eq!(p.max_parallel_file_reads, Some(8));
     assert_eq!(p.extra_args, vec!["--one-file-system".to_string()]);
     assert!(!p.is_empty());
+    // M4 flag sweep: `errorHandling.failFast`/`upload.limitMb` are `snapshot
+    // create` argv flags (they ride `SnapshotOp`, not `policy set`), so they
+    // must not appear anywhere on the wire `PolicyArgsSpec` produces —
+    // `PolicyArgsSpec` structurally has no such fields, and this proves it at
+    // the JSON boundary too.
+    let policy_json = serde_json::to_value(&p).unwrap();
+    assert!(policy_json.get("failFast").is_none());
+    assert!(policy_json.get("limitMb").is_none());
 
     // The kopia args builder emits the expected flags (end-to-end into argv).
     let args = p.to_kopia();
