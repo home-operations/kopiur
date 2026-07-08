@@ -462,9 +462,76 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
                 }),
                 spec: Some(pod_spec),
             },
+            // Surface ProgressDeadlineExceeded after 5 min; cap stale ReplicaSets.
+            progress_deadline_seconds: Some(300),
+            revision_history_limit: Some(2),
             ..Default::default()
         }),
         status: None,
+    }
+}
+
+/// The readiness classification of a server Deployment, surfaced as a
+/// `ServerReady` condition on the owning Repository/ClusterRepository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerReadiness {
+    /// ≥1 available replica.
+    Ready,
+    /// `Progressing=False` — rollout stalled past `progressDeadlineSeconds`.
+    ProgressDeadlineExceeded {
+        /// Message from the Deployment's `Progressing` condition.
+        message: String,
+    },
+    /// 0 available replicas (starting or crash-looping).
+    NotAvailable {
+        /// Human-readable detail (available replica count).
+        message: String,
+    },
+}
+
+impl ServerReadiness {
+    /// Map to `(status, reason, message)` for `upsert_condition`.
+    pub fn to_condition_input(&self) -> (bool, &'static str, String) {
+        match self {
+            Self::Ready => (true, "ServerReady", "kopia UI server is running".into()),
+            Self::ProgressDeadlineExceeded { message } => {
+                (false, "ServerProgressDeadlineExceeded", message.clone())
+            }
+            Self::NotAvailable { message } => (false, "ServerNotAvailable", message.clone()),
+        }
+    }
+}
+
+/// Classify a server Deployment's readiness from its `.status`. Returns `None`
+/// when the Deployment has no status yet; the Deployment watch re-triggers once
+/// the controller populates it.
+pub fn classify_server_deployment(dep: &Deployment) -> Option<ServerReadiness> {
+    let status = dep.status.as_ref()?;
+
+    // ProgressDeadlineExceeded takes priority.
+    if let Some(conditions) = status.conditions.as_ref() {
+        for c in conditions {
+            if c.type_ == "Progressing" && c.status == "False" {
+                return Some(ServerReadiness::ProgressDeadlineExceeded {
+                    message: c
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "rollout stalled (ProgressDeadlineExceeded)".into()),
+                });
+            }
+        }
+    }
+
+    // ≥1 available replica → Ready.
+    if status.available_replicas.unwrap_or(0) >= 1 {
+        Some(ServerReadiness::Ready)
+    } else {
+        Some(ServerReadiness::NotAvailable {
+            message: format!(
+                "server pod is not yet available (availableReplicas: {})",
+                status.available_replicas.unwrap_or(0)
+            ),
+        })
     }
 }
 

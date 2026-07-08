@@ -126,6 +126,13 @@ pub const MAINTENANCE_CONFIGURED_CONDITION: &str = "MaintenanceConfigured";
 /// outage. Wire-visible (the kubectl plugin's `status` reads it).
 pub const INDEX_BLOB_HEALTH_CONDITION: &str = "IndexBlobHealth";
 
+/// `Repository`/`ClusterRepository` condition reporting whether the kopia web-UI
+/// server (`spec.server`) is ready. `True` = ≥1 available replica; `False` with
+/// reason `ServerNotAvailable` / `ServerProgressDeadlineExceeded` / `ServerDisabled`.
+/// Non-blocking: the repository stays `Ready`. Wire-visible so `kubectl wait
+/// --for=condition=ServerReady` works.
+pub const SERVER_READY_CONDITION: &str = "ServerReady";
+
 /// Default `spec.health.indexBlobWarnThreshold`: the index-blob count above which
 /// the reconciler warns that maintenance isn't keeping up. A freshly-compacted
 /// repo sits near zero; a wedged-maintenance repo climbs unbounded (a real one

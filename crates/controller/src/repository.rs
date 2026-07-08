@@ -16,8 +16,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::DeleteParams;
 use kube::runtime::controller::Action;
 use kube::{Api, Resource, ResourceExt};
@@ -33,7 +35,10 @@ use kopiur_mover::workspec::{
 };
 
 use crate::catalog;
-use crate::consts::{API_VERSION, BOOTSTRAP_JOB_DEADLINE_SECS, REPOSITORY_BOOTSTRAPPED_CONDITION};
+use crate::consts::{
+    API_VERSION, BOOTSTRAP_JOB_DEADLINE_SECS, REPOSITORY_BOOTSTRAPPED_CONDITION,
+    SERVER_READY_CONDITION,
+};
 use crate::context::Context;
 use crate::error::{Error, Result, TERMINAL_HEARTBEAT, error_policy_for};
 use crate::health;
@@ -510,9 +515,61 @@ async fn reconcile_repository_server(
     };
 
     let outcome = reconcile_server(&rc).await?;
-    if let Some(status) = server_status_json(&outcome) {
+    let generation = repo.metadata.generation;
+
+    let mut patch = server_status_json(&outcome).unwrap_or_else(|| serde_json::json!({}));
+
+    // Surface ServerReady from the live Deployment (Active), or mark it disabled
+    // (Cleared). Noop leaves existing conditions untouched.
+    let existing_conditions: Vec<Condition> = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+
+    let updated_conditions = match &outcome {
+        crate::server::ServerOutcome::Active(pin) => {
+            let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &pin.namespace);
+            let readiness = dep_api
+                .get(&crate::server::server_object_name(rc.instance))
+                .await
+                .ok()
+                .as_ref()
+                .and_then(crate::server::classify_server_deployment);
+            readiness.map(|r| {
+                let (status, reason, message) = r.to_condition_input();
+                io::upsert_condition(
+                    &existing_conditions,
+                    SERVER_READY_CONDITION,
+                    status,
+                    reason,
+                    &message,
+                    generation,
+                )
+            })
+        }
+        crate::server::ServerOutcome::Cleared => Some(io::upsert_condition(
+            &existing_conditions,
+            SERVER_READY_CONDITION,
+            false,
+            "ServerDisabled",
+            "server is not configured",
+            generation,
+        )),
+        crate::server::ServerOutcome::Noop => None,
+    };
+
+    if let Some(conds) = updated_conditions {
+        patch["conditions"] = serde_json::to_value(&conds).unwrap();
+    }
+
+    if patch.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         let api: Api<Repository> = Api::namespaced(ctx.client.clone(), namespace);
-        io::patch_status(&api, name, status).await?;
+        let current = repo
+            .status
+            .as_ref()
+            .and_then(|s| serde_json::to_value(s).ok());
+        io::patch_status_if_changed(&api, name, current.as_ref(), patch).await?;
     }
     Ok(())
 }

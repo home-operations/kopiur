@@ -45,6 +45,7 @@ mimalloc = { workspace = true }
 rand = "0.10"
 
 [dev-dependencies]
+serde_yaml = { workspace = true }
 serial_test = { workspace = true }
 tower = { workspace = true }
 http = "1"

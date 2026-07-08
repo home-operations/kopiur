@@ -1,5 +1,12 @@
 use super::*;
 
+/// YAML → JSON value → typed, the cluster's parse path (avoids serde_yaml's
+/// broken externally-tagged-enum encoding). See api::testutil.
+fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
+    let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml -> json value");
+    serde_json::from_value(value).expect("json value -> typed")
+}
+
 fn api_error(code: u16) -> crate::error::Error {
     use kube::core::Status;
     crate::error::Error::Kube(kube::Error::Api(Box::new(Status {
@@ -140,6 +147,9 @@ fn deployment_is_single_replica_recreate_with_probe() {
     let spec = dep.spec.unwrap();
     assert_eq!(spec.replicas, Some(1));
     assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
+    // Hygiene fields: surface ProgressDeadlineExceeded and cap stale ReplicaSets.
+    assert_eq!(spec.progress_deadline_seconds, Some(300));
+    assert_eq!(spec.revision_history_limit, Some(2));
     // The selector must be a SUBSET of the pod template labels (or the Service
     // can't route / the Deployment is rejected). The template additionally
     // carries the `managed-by` label so the controller's scoped watches see it.
@@ -395,4 +405,160 @@ fn plan_teardown_when_disabled_but_observed() {
 #[test]
 fn plan_noop_when_nothing_desired_or_observed() {
     assert_eq!(plan_server(None, None), ServerAction::Noop);
+}
+
+#[test]
+fn classify_returns_none_when_no_status() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    assert!(classify_server_deployment(&dep).is_none());
+}
+
+#[test]
+fn classify_returns_ready_when_available_replicas_gte_1() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  availableReplicas: 1
+  conditions:
+    - type: Available
+      status: "True"
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    assert_eq!(r, ServerReadiness::Ready);
+}
+
+#[test]
+fn classify_returns_ready_with_multiple_replicas() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  availableReplicas: 3
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    assert_eq!(r, ServerReadiness::Ready);
+}
+
+#[test]
+fn classify_returns_not_available_when_zero_replicas() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  availableReplicas: 0
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    match r {
+        ServerReadiness::NotAvailable { message } => {
+            assert!(message.contains("availableReplicas: 0"));
+        }
+        other => panic!("expected NotAvailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_returns_not_available_when_no_available_replicas_field() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  conditions:
+    - type: Available
+      status: "False"
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    match r {
+        ServerReadiness::NotAvailable { message } => {
+            assert!(message.contains("availableReplicas: 0"));
+        }
+        other => panic!("expected NotAvailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_returns_progress_deadline_exceeded() {
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  availableReplicas: 0
+  conditions:
+    - type: Progressing
+      status: "False"
+      reason: ProgressDeadlineExceeded
+      message: "ReplicaSet has timed out progressing"
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    match r {
+        ServerReadiness::ProgressDeadlineExceeded { message } => {
+            assert!(message.contains("timed out progressing"));
+        }
+        other => panic!("expected ProgressDeadlineExceeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_progress_deadline_even_with_zero_available_replicas() {
+    // Progressing=False wins over available_replicas=0.
+    let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+status:
+  availableReplicas: 0
+  conditions:
+    - type: Progressing
+      status: "False"
+      reason: ProgressDeadlineExceeded
+      message: "Rollout timed out"
+    - type: Available
+      status: "False"
+"#;
+    let dep: Deployment = from_yaml(yaml);
+    let r = classify_server_deployment(&dep).unwrap();
+    assert!(matches!(
+        r,
+        ServerReadiness::ProgressDeadlineExceeded { .. }
+    ));
+}
+
+#[test]
+fn classify_condition_input_mapping() {
+    let (s, r, m) = ServerReadiness::Ready.to_condition_input();
+    assert!(s && r == "ServerReady" && m == "kopia UI server is running");
+
+    let na = ServerReadiness::NotAvailable {
+        message: "0 ready".into(),
+    };
+    let (s, r, m) = na.to_condition_input();
+    assert!(!s && r == "ServerNotAvailable" && m == "0 ready");
+
+    let pd = ServerReadiness::ProgressDeadlineExceeded {
+        message: "stalled".into(),
+    };
+    let (s, r, m) = pd.to_condition_input();
+    assert!(!s && r == "ServerProgressDeadlineExceeded" && m == "stalled");
 }
