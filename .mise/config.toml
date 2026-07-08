@@ -16,7 +16,7 @@ config_roots = ["crates/e2e"]
 
 [tools]
 rust = { version = "1.96.1", components = "rustfmt,clippy,llvm-tools-preview" }
-lefthook = "2.1.9"
+lefthook = "2.1.10"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
 # npm backend uses mise's own node+npm and never falls through to a system
