@@ -408,3 +408,98 @@ fn pvc_is_bound_reads_volume_name_or_phase() {
         "metadata": { "name": "p" }, "spec": {}, "status": { "phase": "Pending" },
     }))));
 }
+
+// --- restore_flags (M2 flag sweep controller-glue guard) ---
+
+#[test]
+fn restore_flags_absent_options_map_to_all_none() {
+    // No `spec.options` set → every knob defaults, reproducing today's argv.
+    let flags = restore_flags(&None);
+    assert_eq!(flags.ignore_permission_errors, None);
+    assert_eq!(flags.write_files_atomically, None);
+    assert_eq!(flags.parallel, None);
+    assert_eq!(flags.write_sparse_files, None);
+    assert_eq!(flags.skip_owners, None);
+    assert_eq!(flags.skip_permissions, None);
+    assert_eq!(flags.skip_times, None);
+    assert_eq!(flags.overwrite_files, None);
+    assert_eq!(flags.overwrite_directories, None);
+    assert_eq!(flags.overwrite_symlinks, None);
+    assert_eq!(flags.ignore_errors, None);
+    assert_eq!(flags.skip_existing, None);
+    assert!(!flags.delete_extra);
+}
+
+#[test]
+fn restore_flags_maps_every_options_field() {
+    use kopiur_api::restore::RestoreOptions;
+    let flags = restore_flags(&Some(RestoreOptions {
+        enable_file_deletion: false,
+        ignore_permission_errors: Some(true),
+        write_files_atomically: Some(false),
+        parallel: Some(6),
+        write_sparse_files: Some(true),
+        skip_owners: Some(false),
+        skip_permissions: Some(true),
+        skip_times: Some(false),
+        overwrite_files: Some(true),
+        overwrite_directories: Some(false),
+        overwrite_symlinks: Some(true),
+        ignore_errors: Some(false),
+        skip_existing: Some(true),
+    }));
+    assert_eq!(flags.ignore_permission_errors, Some(true));
+    assert_eq!(flags.write_files_atomically, Some(false));
+    assert_eq!(flags.parallel, Some(6));
+    assert_eq!(flags.write_sparse_files, Some(true));
+    assert_eq!(flags.skip_owners, Some(false));
+    assert_eq!(flags.skip_permissions, Some(true));
+    assert_eq!(flags.skip_times, Some(false));
+    assert_eq!(flags.overwrite_files, Some(true));
+    assert_eq!(flags.overwrite_directories, Some(false));
+    assert_eq!(flags.overwrite_symlinks, Some(true));
+    assert_eq!(flags.ignore_errors, Some(false));
+    assert_eq!(flags.skip_existing, Some(true));
+    assert!(!flags.delete_extra);
+}
+
+#[test]
+fn restore_flags_enable_file_deletion_regression() {
+    // THE regression test for the confirmed bug: `enableFileDeletion: true` was
+    // documented as "exact mirror" deletion, settable via CRD/CLI/migrate, but
+    // consumed by nothing — the controller only ever read
+    // ignore_permission_errors/write_files_atomically. This must now map
+    // through to `delete_extra`, which `RestoreOp::restore_options()` turns
+    // into `Some(true)` and `restore_args` turns into `--delete-extra`.
+    use kopiur_api::restore::RestoreOptions;
+    let flags = restore_flags(&Some(RestoreOptions {
+        enable_file_deletion: true,
+        ..Default::default()
+    }));
+    assert!(
+        flags.delete_extra,
+        "enableFileDeletion: true must set delete_extra on the mover work-spec"
+    );
+
+    // End-to-end through the mover's RestoreOp -> kopia client RestoreOptions ->
+    // argv, proving the whole chain (not just this one hop).
+    let op = RestoreOp {
+        source: RestoreSelection::Snapshot("s".into()),
+        target_path: "/data".into(),
+        anchor: Default::default(),
+        ignore_permission_errors: flags.ignore_permission_errors,
+        write_files_atomically: flags.write_files_atomically,
+        parallel: flags.parallel,
+        write_sparse_files: flags.write_sparse_files,
+        skip_owners: flags.skip_owners,
+        skip_permissions: flags.skip_permissions,
+        skip_times: flags.skip_times,
+        overwrite_files: flags.overwrite_files,
+        overwrite_directories: flags.overwrite_directories,
+        overwrite_symlinks: flags.overwrite_symlinks,
+        ignore_errors: flags.ignore_errors,
+        skip_existing: flags.skip_existing,
+        delete_extra: flags.delete_extra,
+    };
+    assert_eq!(op.restore_options().delete_extra, Some(true));
+}

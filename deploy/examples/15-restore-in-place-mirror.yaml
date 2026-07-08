@@ -2,16 +2,22 @@
 #
 # Restore directly into an EXISTING PVC (`target.pvcRef`) and make it an EXACT mirror
 # of the snapshot with `options.enableFileDeletion: true` — files in the target that
-# aren't in the snapshot are DELETED. This is the faithful "put it back exactly how
-# it was" restore.
+# aren't in the snapshot are DELETED (kopia's `--delete-extra`). This is the faithful
+# "put it back exactly how it was" restore.
 #
 # !! Use deliberately. By default a restore is ADDITIVE (writes the snapshot's files,
 #    leaves everything else). enableFileDeletion makes it destructive — point it at
 #    the wrong PVC and it wipes the extra files. Scale the app DOWN first so nothing
 #    is writing the target during the restore.
 #
+# Also shows `options.parallel` (restore parallelism, kopia default 8) and
+# `options.skipTimes` (skip restoring file modification times) — two of the M2
+# flag-sweep tuning knobs, all of which mirror kopia's own `snapshot restore` flags.
+#
 # Field shapes verified against crates/api: target.pvcRef = { name }; options =
-# { enableFileDeletion, ignorePermissionErrors?, writeFilesAtomically? }.
+# { enableFileDeletion, ignorePermissionErrors?, writeFilesAtomically?, parallel?,
+#   writeSparseFiles?, skipOwners?, skipPermissions?, skipTimes?, overwriteFiles?,
+#   overwriteDirectories?, overwriteSymlinks?, ignoreErrors?, skipExisting? }.
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Restore
@@ -27,9 +33,11 @@ spec:
     pvcRef:
       name: postgres-data
   options:
-    enableFileDeletion: true # EXACT mirror — delete target files not in the snapshot
+    enableFileDeletion: true # EXACT mirror — delete target files not in the snapshot (--delete-extra)
     ignorePermissionErrors: true
     writeFilesAtomically: true
+    parallel: 4 # restore parallelism; kopia default 8
+    skipTimes: true # don't restore file modification times
   # Match the UID/GID that owns the data so the rewritten files land correctly.
   mover:
     securityContext:

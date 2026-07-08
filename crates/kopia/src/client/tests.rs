@@ -437,8 +437,9 @@ fn restore_args_tristate_and_flags() {
         ignore_permission_errors: Some(false),
         write_files_atomically: Some(true),
         overwrite_files: Some(false),
-        skip_existing: true,
+        skip_existing: Some(true),
         parallel: Some(4),
+        ..Default::default()
     };
     assert_eq!(
         restore_args("s", "/t", &opts),
@@ -454,6 +455,81 @@ fn restore_args_tristate_and_flags() {
             "--parallel",
             "4"
         ]
+    );
+}
+
+#[test]
+fn restore_args_m2_flag_sweep_all_new_tristates_and_delete_extra() {
+    // M2 flag sweep (issue #216 gap analysis): every new tri-state, in the
+    // `Some(false)` → `--no-*` form, plus `delete_extra` — the
+    // `enableFileDeletion` bug-fix's client-layer regression guard.
+    let opts = RestoreOptions {
+        overwrite_directories: Some(false),
+        overwrite_symlinks: Some(false),
+        write_sparse_files: Some(false),
+        skip_owners: Some(false),
+        skip_permissions: Some(false),
+        skip_times: Some(false),
+        ignore_errors: Some(false),
+        delete_extra: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        restore_args("s", "/t", &opts),
+        vec![
+            "snapshot",
+            "restore",
+            "s",
+            "/t",
+            "--no-overwrite-directories",
+            "--no-overwrite-symlinks",
+            "--no-write-sparse-files",
+            "--no-skip-owners",
+            "--no-skip-permissions",
+            "--no-skip-times",
+            "--no-ignore-errors",
+            "--no-delete-extra",
+        ]
+    );
+
+    // The `Some(true)` form emits the bare (non-negated) flag — this is the
+    // regression test for the `enableFileDeletion` bug: today's code has NO
+    // path that can ever produce `--delete-extra` on argv.
+    let all_true = RestoreOptions {
+        overwrite_directories: Some(true),
+        overwrite_symlinks: Some(true),
+        write_sparse_files: Some(true),
+        skip_owners: Some(true),
+        skip_permissions: Some(true),
+        skip_times: Some(true),
+        ignore_errors: Some(true),
+        skip_existing: Some(true),
+        delete_extra: Some(true),
+        ..Default::default()
+    };
+    let argv = restore_args("s", "/t", &all_true);
+    for flag in [
+        "--overwrite-directories",
+        "--overwrite-symlinks",
+        "--write-sparse-files",
+        "--skip-owners",
+        "--skip-permissions",
+        "--skip-times",
+        "--ignore-errors",
+        "--skip-existing",
+        "--delete-extra",
+    ] {
+        assert!(
+            argv.contains(&flag.to_string()),
+            "{flag} missing in {argv:?}"
+        );
+    }
+
+    // All-`None` (the zero-value default) is byte-for-byte identical to the
+    // pre-M2 bare argv (no dormant knob sneaks a flag in when nothing was set).
+    assert_eq!(
+        restore_args("s", "/t", &RestoreOptions::default()),
+        vec!["snapshot", "restore", "s", "/t"]
     );
 }
 

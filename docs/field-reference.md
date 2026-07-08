@@ -2032,9 +2032,19 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enableFileDeletion` | boolean | — | Delete files in the target that are not present in the snapshot (exact mirror); off by default. |
+| `enableFileDeletion` | boolean | — | Delete files in the target that are not present in the snapshot (exact mirror); off by default. Wired to kopia's `--[no-]delete-extra` (previously a silent no-op — see issue #216 gap sweep). |
+| `ignoreErrors` | boolean | — | `--[no-]ignore-errors`: ignore all restore errors and continue (kopia default `false`). |
 | `ignorePermissionErrors` | boolean | — | Continue past permission errors during restore (default true). |
+| `overwriteDirectories` | boolean | — | `--[no-]overwrite-directories`: overwrite existing directories in the target (kopia default `true`). |
+| `overwriteFiles` | boolean | — | `--[no-]overwrite-files`: overwrite existing files in the target (kopia default `true`). |
+| `overwriteSymlinks` | boolean | — | `--[no-]overwrite-symlinks`: overwrite existing symlinks in the target (kopia default `true`). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: restore parallelism (kopia default `8`; `1` disables parallelism). |
+| `skipExisting` | boolean | — | `--[no-]skip-existing`: skip files/symlinks that already exist in the target (kopia default `false`). |
+| `skipOwners` | boolean | — | `--[no-]skip-owners`: skip restoring file owners (kopia default `false`). |
+| `skipPermissions` | boolean | — | `--[no-]skip-permissions`: skip restoring file permissions (kopia default `false`). |
+| `skipTimes` | boolean | — | `--[no-]skip-times`: skip restoring file modification times (kopia default `false`). |
 | `writeFilesAtomically` | boolean | — | Write files atomically via a temp file + rename (default true). |
+| `writeSparseFiles` | boolean | — | `--[no-]write-sparse-files`: attempt to write files sparsely, allocating the minimum disk space needed (kopia default `false`). |
 
 #### `spec.policy` { #restore-spec-policy }
 

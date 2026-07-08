@@ -1455,14 +1455,9 @@ async fn run_restore_mover(
         hostname: namespace.to_string(),
         source_path: target_path.clone(),
     };
-    // Carry the Restore CRD's options (ADR §4.6) through to the mover so kopia
-    // honors them. `None` lets kopia use its defaults.
-    let (ignore_permission_errors, write_files_atomically) = restore
-        .spec
-        .options
-        .as_ref()
-        .map(|o| (o.ignore_permission_errors, o.write_files_atomically))
-        .unwrap_or((None, None));
+    // Carry the Restore CRD's options (ADR §4.6, M2 flag sweep) through to the
+    // mover so kopia honors them. `None` lets kopia use its defaults.
+    let flags = restore_flags(&restore.spec.options);
     // Effective cache config (repository cacheDefaults overlaid by this restore's
     // mover.cache, ADR §3.1) drives both the connect budgets and the cache volume.
     let effective_cache = crate::cache::effective_cache(
@@ -1483,8 +1478,19 @@ async fn run_restore_mover(
             source: selection.clone(),
             target_path: target_path.clone(),
             anchor,
-            ignore_permission_errors,
-            write_files_atomically,
+            ignore_permission_errors: flags.ignore_permission_errors,
+            write_files_atomically: flags.write_files_atomically,
+            parallel: flags.parallel,
+            write_sparse_files: flags.write_sparse_files,
+            skip_owners: flags.skip_owners,
+            skip_permissions: flags.skip_permissions,
+            skip_times: flags.skip_times,
+            overwrite_files: flags.overwrite_files,
+            overwrite_directories: flags.overwrite_directories,
+            overwrite_symlinks: flags.overwrite_symlinks,
+            ignore_errors: flags.ignore_errors,
+            skip_existing: flags.skip_existing,
+            delete_extra: flags.delete_extra,
         }),
         identity,
         repository: restore_connect(&repo)?,
@@ -1963,6 +1969,51 @@ async fn resolve_restore_repository(
 /// Map a resolved repository backend to the mover connect spec for a restore.
 fn restore_connect(repo: &ResolvedRepository) -> Result<RepositoryConnect> {
     crate::snapshot::repository_connect_pub(repo)
+}
+
+/// The `Restore` CRD's kopia restore behavior knobs (ADR §4.6, M2 flag sweep),
+/// carried through to the mover work-spec's `RestoreOp`.
+struct RestoreFlags {
+    ignore_permission_errors: Option<bool>,
+    write_files_atomically: Option<bool>,
+    parallel: Option<u32>,
+    write_sparse_files: Option<bool>,
+    skip_owners: Option<bool>,
+    skip_permissions: Option<bool>,
+    skip_times: Option<bool>,
+    overwrite_files: Option<bool>,
+    overwrite_directories: Option<bool>,
+    overwrite_symlinks: Option<bool>,
+    ignore_errors: Option<bool>,
+    skip_existing: Option<bool>,
+    delete_extra: bool,
+}
+
+/// Map `Restore.spec.options` onto the mover work-spec's restore flags. Pure so
+/// it is unit-testable without a cluster — the regression guard for the M2 gap
+/// sweep's bug class: plumbing that exists end-to-end (CRD field → workspec →
+/// kopia client) but the controller never reads the field (`enableFileDeletion`
+/// was exactly this: settable via CRD/CLI/migrate, consumed by nothing, so a
+/// user's "exact mirror" restore was silently additive). An absent `options`
+/// block maps every field to its all-`None`/`false` zero value, reproducing
+/// today's argv exactly.
+fn restore_flags(options: &Option<kopiur_api::restore::RestoreOptions>) -> RestoreFlags {
+    let o = options.clone().unwrap_or_default();
+    RestoreFlags {
+        ignore_permission_errors: o.ignore_permission_errors,
+        write_files_atomically: o.write_files_atomically,
+        parallel: o.parallel,
+        write_sparse_files: o.write_sparse_files,
+        skip_owners: o.skip_owners,
+        skip_permissions: o.skip_permissions,
+        skip_times: o.skip_times,
+        overwrite_files: o.overwrite_files,
+        overwrite_directories: o.overwrite_directories,
+        overwrite_symlinks: o.overwrite_symlinks,
+        ignore_errors: o.ignore_errors,
+        skip_existing: o.skip_existing,
+        delete_extra: o.enable_file_deletion,
+    }
 }
 
 /// Mover `Job` limits from the restore's `failurePolicy`, falling back to ADR

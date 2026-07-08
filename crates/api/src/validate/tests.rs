@@ -713,6 +713,38 @@ fn restore_pvc_target_requires_capacity() {
 }
 
 #[test]
+fn restore_options_parallel_must_be_at_least_one() {
+    // M2 flag sweep: options.parallel is a count knob (require_min, same shared
+    // helper as RepositoryReplication.spec.sync.parallel) — 0 would otherwise
+    // silently reach kopia's argv as `--parallel 0`.
+    use crate::common::ObjectRef;
+    use crate::restore::RestoreOptions;
+    let mut spec = restore_with(
+        RestoreSource::SnapshotRef(ObjectRef {
+            name: "b".into(),
+            namespace: None,
+        }),
+        None,
+    );
+    spec.options = Some(RestoreOptions {
+        parallel: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_restore_spec(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidFieldValue { field, .. } if field.contains("parallel"))),
+        "expected an InvalidFieldValue for options.parallel, got {errs:?}"
+    );
+
+    spec.options = Some(RestoreOptions {
+        parallel: Some(4),
+        ..Default::default()
+    });
+    assert!(validate_restore_spec(&spec).is_empty());
+}
+
+#[test]
 fn restore_as_of_must_be_rfc3339_and_message_says_how_to_fix() {
     use crate::restore::FromPolicy;
     let spec = restore_with(

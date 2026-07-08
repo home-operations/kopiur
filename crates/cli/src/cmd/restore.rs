@@ -30,6 +30,41 @@ fn source_token(args: &RestoreArgs) -> &str {
     }
 }
 
+/// Build `spec.options` from the parsed flags, or `None` when nothing was set
+/// (so a bare restore carries no optional noise on the wire). Split out of
+/// [`build_restore`] so its 13-flag "is anything set" check doesn't compound
+/// that function's cognitive complexity with the source/target dispatch.
+fn restore_options_from_args(args: &RestoreArgs) -> Option<RestoreOptions> {
+    let anything_set = args.enable_file_deletion
+        || args.ignore_permission_errors.is_some()
+        || args.write_files_atomically.is_some()
+        || args.parallel.is_some()
+        || args.write_sparse_files.is_some()
+        || args.skip_owners.is_some()
+        || args.skip_permissions.is_some()
+        || args.skip_times.is_some()
+        || args.overwrite_files.is_some()
+        || args.overwrite_directories.is_some()
+        || args.overwrite_symlinks.is_some()
+        || args.ignore_errors.is_some()
+        || args.skip_existing.is_some();
+    anything_set.then_some(RestoreOptions {
+        enable_file_deletion: args.enable_file_deletion,
+        ignore_permission_errors: args.ignore_permission_errors,
+        write_files_atomically: args.write_files_atomically,
+        parallel: args.parallel,
+        write_sparse_files: args.write_sparse_files,
+        skip_owners: args.skip_owners,
+        skip_permissions: args.skip_permissions,
+        skip_times: args.skip_times,
+        overwrite_files: args.overwrite_files,
+        overwrite_directories: args.overwrite_directories,
+        overwrite_symlinks: args.overwrite_symlinks,
+        ignore_errors: args.ignore_errors,
+        skip_existing: args.skip_existing,
+    })
+}
+
 /// Build the `Restore` CR from the parsed flags. Pure — `now` is injected so
 /// names are deterministic under test. The exactly-one-of invariants are
 /// enforced by clap groups; this maps each flag set 1:1 onto the
@@ -79,18 +114,7 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
         namespace: args.repository_namespace.clone(),
     });
 
-    let options = if args.enable_file_deletion
-        || args.ignore_permission_errors.is_some()
-        || args.write_files_atomically.is_some()
-    {
-        Some(RestoreOptions {
-            enable_file_deletion: args.enable_file_deletion,
-            ignore_permission_errors: args.ignore_permission_errors,
-            write_files_atomically: args.write_files_atomically,
-        })
-    } else {
-        None
-    };
+    let options = restore_options_from_args(args);
 
     let policy = if args.on_missing_snapshot.is_some() || args.wait_timeout.is_some() {
         Some(RestorePolicy {
@@ -518,6 +542,54 @@ mod tests {
         assert_eq!(spec["failurePolicy"]["activeDeadlineSeconds"], 600);
         assert_eq!(spec["repository"]["kind"], "ClusterRepository");
         assert_eq!(spec["repository"]["name"], "nas");
+    }
+
+    #[test]
+    fn every_m2_flag_sweep_option_flag_lands_in_the_spec() {
+        // M2 flag sweep: EVERY new kopia restore tuning flag must round-trip
+        // (the same bug class `every_option_flag_lands_in_the_spec` guards for
+        // the original three options, split into its own test so this doesn't
+        // compound that test's cognitive complexity).
+        let args = parse(&[
+            "--from-snapshot",
+            "snap1",
+            "--to-pvc",
+            "data",
+            "--parallel",
+            "4",
+            "--write-sparse-files",
+            "true",
+            "--skip-owners",
+            "true",
+            "--skip-permissions",
+            "false",
+            "--skip-times",
+            "true",
+            "--overwrite-files",
+            "false",
+            "--overwrite-directories",
+            "false",
+            "--overwrite-symlinks",
+            "true",
+            "--ignore-errors",
+            "false",
+            "--skip-existing",
+            "true",
+        ]);
+        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let opts = &wire["spec"]["options"];
+        assert_eq!(opts["parallel"], 4);
+        assert_eq!(opts["writeSparseFiles"], true);
+        assert_eq!(opts["skipOwners"], true);
+        assert_eq!(opts["skipPermissions"], false);
+        assert_eq!(opts["skipTimes"], true);
+        assert_eq!(opts["overwriteFiles"], false);
+        assert_eq!(opts["overwriteDirectories"], false);
+        assert_eq!(opts["overwriteSymlinks"], true);
+        assert_eq!(opts["ignoreErrors"], false);
+        assert_eq!(opts["skipExisting"], true);
+        // Untouched flags stay absent.
+        assert!(opts.get("enableFileDeletion").is_none());
     }
 
     #[test]

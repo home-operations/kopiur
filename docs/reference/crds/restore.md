@@ -30,7 +30,9 @@ The repository to read from. Derived from `source` when omitted; **required only
 
 ### `options`
 
-kopia restore-behavior knobs: `enableFileDeletion` (delete files in the target absent from the snapshot, making the target an exact mirror — off by default, so restores are additive and safe), `ignorePermissionErrors` (continue past permission errors, default true), and `writeFilesAtomically` (temp-file + rename, default true).
+kopia restore-behavior knobs; every field's default is kopia's own default (unset ⇒ kopia decides), so an absent `options` block reproduces plain, additive `kopia snapshot restore` behavior. The core three: `enableFileDeletion` (delete files in the target absent from the snapshot, making the target an exact mirror — off by default, so restores are additive and safe; drives kopia's `--delete-extra`), `ignorePermissionErrors` (continue past permission errors, default true), and `writeFilesAtomically` (temp-file + rename, default true).
+
+The rest mirror `kopia snapshot restore`'s own flags one-to-one and are all tri-state (`true`/`false`/absent) booleans except `parallel`: `parallel` (restore parallelism; kopia default `8`), `writeSparseFiles`, `skipOwners`, `skipPermissions`, `skipTimes`, `overwriteFiles`, `overwriteDirectories`, `overwriteSymlinks`, `ignoreErrors`, and `skipExisting`. See the [field reference](../../field-reference.md) for kopia's per-flag default.
 
 ### `policy`
 

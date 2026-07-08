@@ -141,6 +141,9 @@ options:
     enableFileDeletion: false # default: additive restore (don't delete extra files in the target)
     ignorePermissionErrors: true # default true
     writeFilesAtomically: true # default true
+    parallel: 4 # restore parallelism; kopia default 8
+    skipTimes: true # skip restoring file modification times
+    overwriteFiles: true # overwrite existing files in the target
 policy:
     onMissingSnapshot: Fail # see table below
     waitTimeout: 5m # how long to wait for the source snapshot to appear
@@ -151,6 +154,8 @@ policy:
 By default a restore is **additive** — it writes the snapshot's files and leaves anything else in the target alone. `enableFileDeletion: true` deletes files in the target that aren't in the snapshot, making it an exact mirror. Use it deliberately.
 
 ///
+
+`options` also exposes the rest of `kopia snapshot restore`'s own tuning flags directly, one field per flag: `writeSparseFiles`, `skipOwners`, `skipPermissions`, `skipTimes`, `overwriteFiles`, `overwriteDirectories`, `overwriteSymlinks`, `ignoreErrors`, and `skipExisting` (all tri-state — `true`/`false`/absent, where absent means "let kopia decide") plus `parallel` (a count). See the [field reference](field-reference.md) for kopia's per-flag default.
 
 ### `onMissingSnapshot` — fail-closed vs proceed
 
@@ -275,9 +280,13 @@ The full `Restore` surface, with the examples that exercise each. `source` is th
 | `target.pvc` | Create a new PVC and restore into it (`{ name, storageClassName?, capacity?, accessModes? }`). | The safe default — restore beside the original, verify, cut over. ([03](examples.md#example-03--restore-by-picking-a-snapshot)) |
 | `target.pvcRef` | Restore into an **existing** PVC (`{ name }`). | In-place restore (scale the app down first). ([15](examples.md#example-15--in-place-mirror-restore)) |
 | `target.populator` | Explicit passive volume-populator source (`populator: {}`). | GitOps deploy-or-restore via a PVC `dataSourceRef`. ([05](examples.md#example-05--deploy-or-restore-gitops)) |
-| `options.enableFileDeletion` | Delete target files not in the snapshot (exact **mirror**). Default `false` (additive). | A faithful in-place restore — destructive, use deliberately. ([15](examples.md#example-15--in-place-mirror-restore)) |
+| `options.enableFileDeletion` | Delete target files not in the snapshot (exact **mirror**); wired to kopia's `--delete-extra`. Default `false` (additive). | A faithful in-place restore — destructive, use deliberately. ([15](examples.md#example-15--in-place-mirror-restore)) |
 | `options.ignorePermissionErrors` | Complete and _report_ permission problems vs. fail hard. Default `true`. | `false` to fail-closed when exact permissions matter. |
 | `options.writeFilesAtomically` | Write via a temp file + rename. Default `true`. | Rarely changed. |
+| `options.parallel` | Restore parallelism (`--parallel`). Kopia default `8`. | Large restores on fast storage/network. |
+| `options.writeSparseFiles` / `skipOwners` / `skipPermissions` / `skipTimes` | Tri-state passthroughs to kopia's `--[no-]write-sparse-files` / `--[no-]skip-owners` / `--[no-]skip-permissions` / `--[no-]skip-times`. Absent ⇒ kopia's own default. | Sparse-file-heavy targets; cross-platform restores where owners/permissions/times don't translate. |
+| `options.overwriteFiles` / `overwriteDirectories` / `overwriteSymlinks` | Tri-state passthroughs to kopia's `--[no-]overwrite-*` (kopia default `true` for all three). | `false` to refuse clobbering an existing target. |
+| `options.ignoreErrors` / `skipExisting` | Tri-state passthroughs to kopia's `--[no-]ignore-errors` / `--[no-]skip-existing`. Kopia default `false` for both. | Best-effort restores; resuming a partially-written target. |
 | `policy.onMissingSnapshot` | `Fail` (explicit sources) vs `Continue` (fromPolicy default). | `Fail` for deliberate recoveries; `Continue` for deploy-or-restore. |
 | `policy.waitTimeout` | How long to wait for the source snapshot to appear. | Sources that may lag behind the Restore being applied. |
 | `mover.securityContext` / `podSecurityContext` | Container UID/GID, and the pod-level `fsGroup` that makes a fresh target volume writable. | Own restored files as the app's UID; populate a fresh PVC as non-root (`fsGroup`). See [Mover, cache & failure policy](#mover-cache--failure-policy). ([12](examples.md#example-12--restore-mover-cache--failure-policy)) |

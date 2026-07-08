@@ -370,10 +370,51 @@ pub struct RestoreOp {
     /// use its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_files_atomically: Option<bool>,
+    /// `--parallel` (M2 flag sweep). `#[serde(default)]` so old-wire work-spec
+    /// JSON (stamped before this field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--[no-]write-sparse-files` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_sparse_files: Option<bool>,
+    /// `--[no-]skip-owners` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_owners: Option<bool>,
+    /// `--[no-]skip-permissions` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_permissions: Option<bool>,
+    /// `--[no-]skip-times` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_times: Option<bool>,
+    /// `--[no-]overwrite-files` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_files: Option<bool>,
+    /// `--[no-]overwrite-directories` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_directories: Option<bool>,
+    /// `--[no-]overwrite-symlinks` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_symlinks: Option<bool>,
+    /// `--[no-]ignore-errors` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_errors: Option<bool>,
+    /// `--[no-]skip-existing` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_existing: Option<bool>,
+    /// `--[no-]delete-extra`: mirrors Restore CRD `options.enableFileDeletion`
+    /// (`false` by default). Fixes the bug where `enableFileDeletion` was
+    /// settable via CRD/CLI/migrate but consumed by nothing — kopia never
+    /// received `--delete-extra`, so an "exact mirror" restore was silently
+    /// additive.
+    #[serde(default)]
+    pub delete_extra: bool,
 }
 
 impl RestoreOp {
     /// Translate the carried restore flags into the kopia client's options.
+    /// Every field is mapped explicitly (no `..Default::default()` swallowing a
+    /// field silently) — this is the regression guard for the M2 gap-sweep bug
+    /// class: plumbing that exists end-to-end but a field never reaches it.
     ///
     /// ```
     /// use kopiur_mover::workspec::{RestoreOp, RestoreSelection};
@@ -384,16 +425,42 @@ impl RestoreOp {
     ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
     ///     write_files_atomically: Some(true),
+    ///     parallel: Some(4),
+    ///     write_sparse_files: Some(true),
+    ///     skip_owners: Some(true),
+    ///     skip_permissions: Some(false),
+    ///     skip_times: Some(true),
+    ///     overwrite_files: Some(false),
+    ///     overwrite_directories: Some(false),
+    ///     overwrite_symlinks: Some(true),
+    ///     ignore_errors: Some(false),
+    ///     skip_existing: Some(true),
+    ///     delete_extra: true,
     /// };
     /// let opts = op.restore_options();
     /// assert_eq!(opts.ignore_permission_errors, Some(false));
     /// assert_eq!(opts.write_files_atomically, Some(true));
+    /// assert_eq!(opts.parallel, Some(4));
+    /// assert_eq!(opts.delete_extra, Some(true));
     /// ```
     pub fn restore_options(&self) -> kopiur_kopia::RestoreOptions {
         kopiur_kopia::RestoreOptions {
             ignore_permission_errors: self.ignore_permission_errors,
             write_files_atomically: self.write_files_atomically,
-            ..Default::default()
+            parallel: self.parallel,
+            write_sparse_files: self.write_sparse_files,
+            skip_owners: self.skip_owners,
+            skip_permissions: self.skip_permissions,
+            skip_times: self.skip_times,
+            overwrite_files: self.overwrite_files,
+            overwrite_directories: self.overwrite_directories,
+            overwrite_symlinks: self.overwrite_symlinks,
+            ignore_errors: self.ignore_errors,
+            skip_existing: self.skip_existing,
+            // `enableFileDeletion` stays a plain bool at the CRD/work-spec layer
+            // (no tri-state is exposed); `false` omits the flag entirely, exactly
+            // reproducing today's (additive) argv.
+            delete_extra: self.delete_extra.then_some(true),
         }
     }
 }

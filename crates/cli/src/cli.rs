@@ -495,6 +495,46 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "BOOL")]
     pub write_files_atomically: Option<bool>,
 
+    /// Restore parallelism (kopia default: 8; 1 disables parallelism).
+    #[arg(long, value_name = "N")]
+    pub parallel: Option<u32>,
+
+    /// Whether restored files are written sparsely (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub write_sparse_files: Option<bool>,
+
+    /// Whether file owners are skipped during restore (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub skip_owners: Option<bool>,
+
+    /// Whether file permissions are skipped during restore (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub skip_permissions: Option<bool>,
+
+    /// Whether file times are skipped during restore (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub skip_times: Option<bool>,
+
+    /// Whether existing files in the target are overwritten (kopia default: true).
+    #[arg(long, value_name = "BOOL")]
+    pub overwrite_files: Option<bool>,
+
+    /// Whether existing directories in the target are overwritten (kopia default: true).
+    #[arg(long, value_name = "BOOL")]
+    pub overwrite_directories: Option<bool>,
+
+    /// Whether existing symlinks in the target are overwritten (kopia default: true).
+    #[arg(long, value_name = "BOOL")]
+    pub overwrite_symlinks: Option<bool>,
+
+    /// Whether all restore errors are ignored (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub ignore_errors: Option<bool>,
+
+    /// Whether files/symlinks already present in the target are skipped (kopia default: false).
+    #[arg(long, value_name = "BOOL")]
+    pub skip_existing: Option<bool>,
+
     // --- missing-snapshot policy ---
     /// What to do when no snapshot matches (operator default: fail, except
     /// continue for --from-policy).

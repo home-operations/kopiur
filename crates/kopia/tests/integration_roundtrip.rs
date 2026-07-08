@@ -350,3 +350,77 @@ async fn sync_to_accepts_parallel_and_tristate_flags() {
         "the mirrored snapshot must appear at the destination"
     );
 }
+
+/// Real-kopia guard for the M2 restore flag sweep (issue #216 gap analysis):
+/// `kopia snapshot restore` accepts `--parallel 2`, `--skip-times`, and —
+/// critically — `--delete-extra`, the flag `enableFileDeletion` was
+/// **previously unable to reach at all** (a silent no-op bug: the CRD field
+/// existed, but `kopiur_kopia::RestoreOptions` had no `delete_extra` field and
+/// `restore_args` never emitted the flag). Restoring into a target that
+/// already contains a file NOT present in the snapshot proves `--delete-extra`
+/// actually deletes it — not just that kopia accepted the flag on argv.
+///
+/// Per the semantic gotcha: `--delete-extra` only takes effect if the restore
+/// itself succeeds, and kopia's `overwrite-directories` default is already
+/// `true`, so this test must NOT pass `--no-overwrite-directories` (that would
+/// make the restore fail against the pre-populated, non-empty target).
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn restore_accepts_m2_flag_sweep_and_deletes_extra_files() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let restore_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("keep.txt"), b"from the snapshot\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+    let created = client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("m2user@m2host:/data"),
+        )
+        .await
+        .expect("snapshot create");
+
+    // Pre-populate the restore target with a file NOT in the snapshot — the
+    // thing `--delete-extra` is supposed to remove. Without `enableFileDeletion`
+    // wired up, this file would silently survive the restore (the additive-only
+    // bug this milestone fixes).
+    std::fs::write(restore_dir.path().join("stale.txt"), b"leftover\n").unwrap();
+
+    client
+        .snapshot_restore_with(
+            &created.id,
+            restore_dir.path().to_str().unwrap(),
+            &RestoreOptions {
+                parallel: Some(2),
+                skip_times: Some(true),
+                delete_extra: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restore with --parallel 2 --skip-times --delete-extra should succeed");
+
+    // The snapshot's content is present...
+    let kept = std::fs::read(restore_dir.path().join("keep.txt")).expect("keep.txt restored");
+    assert_eq!(kept, b"from the snapshot\n");
+    // ...and the pre-existing extra file is GONE — proving kopia actually
+    // accepted and acted on `--delete-extra`, not just that argv parsed.
+    assert!(
+        !restore_dir.path().join("stale.txt").exists(),
+        "stale.txt should have been deleted by --delete-extra"
+    );
+}

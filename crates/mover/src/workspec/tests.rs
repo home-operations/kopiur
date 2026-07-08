@@ -63,6 +63,17 @@ fn restore_roundtrip() {
             },
             ignore_permission_errors: Some(true),
             write_files_atomically: Some(false),
+            parallel: Some(4),
+            write_sparse_files: Some(true),
+            skip_owners: Some(false),
+            skip_permissions: Some(true),
+            skip_times: Some(false),
+            overwrite_files: Some(true),
+            overwrite_directories: Some(false),
+            overwrite_symlinks: Some(true),
+            ignore_errors: Some(false),
+            skip_existing: Some(true),
+            delete_extra: true,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -91,6 +102,43 @@ fn restore_roundtrip() {
     // The externally-tagged source serializes under its own camelCase key.
     let v = serde_json::to_value(&spec).unwrap();
     assert_eq!(v["operation"]["restore"]["source"]["snapshot"], "abc123");
+    // M2 flag sweep: every new leaf field reaches the wire, camelCased.
+    let restore = &v["operation"]["restore"];
+    assert_eq!(restore["parallel"], 4);
+    assert_eq!(restore["writeSparseFiles"], true);
+    assert_eq!(restore["skipOwners"], false);
+    assert_eq!(restore["skipPermissions"], true);
+    assert_eq!(restore["skipTimes"], false);
+    assert_eq!(restore["overwriteFiles"], true);
+    assert_eq!(restore["overwriteDirectories"], false);
+    assert_eq!(restore["overwriteSymlinks"], true);
+    assert_eq!(restore["ignoreErrors"], false);
+    assert_eq!(restore["skipExisting"], true);
+    assert_eq!(restore["deleteExtra"], true);
+    // Controller-glue guard: every field reaches the kopia client's options —
+    // no dormant plumbing (the M2 gap-sweep bug class).
+    if let Operation::Restore(op) = &spec.operation {
+        assert_eq!(
+            op.restore_options(),
+            kopiur_kopia::RestoreOptions {
+                ignore_permission_errors: Some(true),
+                write_files_atomically: Some(false),
+                parallel: Some(4),
+                write_sparse_files: Some(true),
+                skip_owners: Some(false),
+                skip_permissions: Some(true),
+                skip_times: Some(false),
+                overwrite_files: Some(true),
+                overwrite_directories: Some(false),
+                overwrite_symlinks: Some(true),
+                ignore_errors: Some(false),
+                skip_existing: Some(true),
+                delete_extra: Some(true),
+            }
+        );
+    } else {
+        panic!("expected restore op");
+    }
 }
 
 #[test]
@@ -112,6 +160,17 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
             anchor: SnapshotAnchor::default(),
             ignore_permission_errors: None,
             write_files_atomically: None,
+            parallel: None,
+            write_sparse_files: None,
+            skip_owners: None,
+            skip_permissions: None,
+            skip_times: None,
+            overwrite_files: None,
+            overwrite_directories: None,
+            overwrite_symlinks: None,
+            ignore_errors: None,
+            skip_existing: None,
+            delete_extra: false,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -463,10 +522,26 @@ fn restore_op_maps_options_and_defaults_absent() {
         anchor: SnapshotAnchor::default(),
         ignore_permission_errors: Some(false),
         write_files_atomically: Some(true),
+        parallel: Some(2),
+        write_sparse_files: None,
+        skip_owners: None,
+        skip_permissions: None,
+        skip_times: Some(true),
+        overwrite_files: None,
+        overwrite_directories: None,
+        overwrite_symlinks: None,
+        ignore_errors: None,
+        skip_existing: None,
+        delete_extra: true,
     };
     let opts = op.restore_options();
     assert_eq!(opts.ignore_permission_errors, Some(false));
     assert_eq!(opts.write_files_atomically, Some(true));
+    assert_eq!(opts.parallel, Some(2));
+    assert_eq!(opts.skip_times, Some(true));
+    // Regression guard: `enableFileDeletion`/`delete_extra: true` must map to
+    // `Some(true)` — the exact bug this milestone fixes.
+    assert_eq!(opts.delete_extra, Some(true));
 
     // A wire payload with just the source + path still deserializes (option/anchor
     // fields default), mapping to kopia defaults (None/empty).
@@ -475,6 +550,44 @@ fn restore_op_maps_options_and_defaults_absent() {
     assert_eq!(parsed.ignore_permission_errors, None);
     assert_eq!(parsed.restore_options().write_files_atomically, None);
     assert!(parsed.anchor.is_empty());
+    assert!(!parsed.delete_extra);
+    assert_eq!(parsed.restore_options().delete_extra, None);
+}
+
+#[test]
+fn restore_op_old_wire_decodes_with_m2_fields_defaulted() {
+    // M2 flag sweep: a work-spec ConfigMap written before this milestone's
+    // fields existed (just source/targetPath/anchor/the original two options)
+    // must still decode — `#[serde(default)]` on every new field is the guard.
+    let legacy = serde_json::json!({
+        "source": { "snapshot": "s" },
+        "targetPath": "/data",
+        "ignorePermissionErrors": true,
+        "writeFilesAtomically": false,
+    });
+    let op: RestoreOp = serde_json::from_value(legacy).expect("legacy restore op decodes");
+    assert_eq!(op.ignore_permission_errors, Some(true));
+    assert_eq!(op.write_files_atomically, Some(false));
+    assert_eq!(op.parallel, None);
+    assert_eq!(op.write_sparse_files, None);
+    assert_eq!(op.skip_owners, None);
+    assert_eq!(op.skip_permissions, None);
+    assert_eq!(op.skip_times, None);
+    assert_eq!(op.overwrite_files, None);
+    assert_eq!(op.overwrite_directories, None);
+    assert_eq!(op.overwrite_symlinks, None);
+    assert_eq!(op.ignore_errors, None);
+    assert_eq!(op.skip_existing, None);
+    assert!(!op.delete_extra);
+    // All-None/false new fields reproduce today's RestoreOptions exactly.
+    assert_eq!(
+        op.restore_options(),
+        kopiur_kopia::RestoreOptions {
+            ignore_permission_errors: Some(true),
+            write_files_atomically: Some(false),
+            ..Default::default()
+        }
+    );
 }
 
 #[test]

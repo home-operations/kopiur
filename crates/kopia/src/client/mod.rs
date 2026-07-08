@@ -470,17 +470,41 @@ pub struct VerifyOptions {
 
 /// Options for `kopia restore` / `kopia snapshot restore`. The tri-state
 /// booleans map to kopia's `--[no-]flag` form: `Some(true)` → `--flag`,
-/// `Some(false)` → `--no-flag`, `None` → omit (kopia default).
+/// `Some(false)` → `--no-flag`, `None` → omit (kopia default). M2 flag sweep
+/// (issue #216 gap analysis) added everything below `overwrite_files`; all of
+/// them, plus `delete_extra`, were previously either absent or dormant (the
+/// mover's `RestoreOp::restore_options()` dropped them via `..Default::default()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreOptions {
     /// `--[no-]ignore-permission-errors` (kopia default: true).
     pub ignore_permission_errors: Option<bool>,
     /// `--[no-]write-files-atomically`.
     pub write_files_atomically: Option<bool>,
-    /// `--[no-]overwrite-files`.
+    /// `--[no-]overwrite-files` (kopia default: true).
     pub overwrite_files: Option<bool>,
-    /// `--skip-existing`: skip files/symlinks that already exist in the target.
-    pub skip_existing: bool,
+    /// `--[no-]overwrite-directories` (kopia default: true).
+    pub overwrite_directories: Option<bool>,
+    /// `--[no-]overwrite-symlinks` (kopia default: true).
+    pub overwrite_symlinks: Option<bool>,
+    /// `--[no-]write-sparse-files` (kopia default: false).
+    pub write_sparse_files: Option<bool>,
+    /// `--[no-]skip-owners` (kopia default: false).
+    pub skip_owners: Option<bool>,
+    /// `--[no-]skip-permissions` (kopia default: false).
+    pub skip_permissions: Option<bool>,
+    /// `--[no-]skip-times` (kopia default: false).
+    pub skip_times: Option<bool>,
+    /// `--[no-]ignore-errors` (kopia default: false).
+    pub ignore_errors: Option<bool>,
+    /// `--[no-]skip-existing`: skip files/symlinks that already exist in the
+    /// target (kopia default: false). A genuine kingpin tri-state, not a
+    /// presence-only flag — widened from a bare `bool`.
+    pub skip_existing: Option<bool>,
+    /// `--[no-]delete-extra`: delete files/directories/symlinks present in the
+    /// restore path but absent from the snapshot (kopia default: false). Backs
+    /// `Restore.spec.options.enableFileDeletion`, which was previously a silent
+    /// no-op — this struct had no field for it at all.
+    pub delete_extra: Option<bool>,
     /// `--parallel`: restore parallelism (1 disables).
     pub parallel: Option<u32>,
 }
@@ -1545,7 +1569,11 @@ pub fn split_policy_scopes(mut policy: PolicyArgs) -> (PolicyArgs, Option<Policy
 }
 
 /// Build the args for `kopia snapshot restore <id> <target>` plus options. Pure
-/// so it is unit-testable without spawning kopia.
+/// so it is unit-testable without spawning kopia. Every `--[no-]flag` form here
+/// was smoke-tested against the pinned kopia 0.23.1 (`kopia snapshot restore
+/// --help`); the real-kopia integration test in
+/// `crates/kopia/tests/integration_roundtrip.rs` is the permanent guard that
+/// kopia actually accepts them, not just that the argv shape looks right.
 fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String> {
     let mut args = vec![
         "snapshot".into(),
@@ -1564,9 +1592,19 @@ fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String
         opts.write_files_atomically,
     );
     push_tristate(&mut args, "overwrite-files", opts.overwrite_files);
-    if opts.skip_existing {
-        args.push("--skip-existing".into());
-    }
+    push_tristate(
+        &mut args,
+        "overwrite-directories",
+        opts.overwrite_directories,
+    );
+    push_tristate(&mut args, "overwrite-symlinks", opts.overwrite_symlinks);
+    push_tristate(&mut args, "write-sparse-files", opts.write_sparse_files);
+    push_tristate(&mut args, "skip-owners", opts.skip_owners);
+    push_tristate(&mut args, "skip-permissions", opts.skip_permissions);
+    push_tristate(&mut args, "skip-times", opts.skip_times);
+    push_tristate(&mut args, "ignore-errors", opts.ignore_errors);
+    push_tristate(&mut args, "skip-existing", opts.skip_existing);
+    push_tristate(&mut args, "delete-extra", opts.delete_extra);
     if let Some(p) = opts.parallel {
         args.push("--parallel".into());
         args.push(p.to_string());
