@@ -27,10 +27,13 @@ spec:
     verification:
         quick: # blob-level `kopia snapshot verify`, often
             schedule: { cron: "0 4 * * *", jitter: 30m }
+            parallel: 8 # --parallel: verification parallelism (kopia default: 8)
+            maxErrors: 0 # --max-errors: stop after this many errors (0 = stop at first)
         deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
             schedule: { cron: "0 5 * * 0", jitter: 1h }
             capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
             storageClassName: fast-ssd # StorageClass for that PVC (omit = cluster default)
+            parallel: 4 # restore --parallel: deep verify IS a restore under the hood
         successExpr: "stats.files > 0 && stats.errors == 0" # CEL pass/fail predicate
         verifyFilesPercent: 10 # how much of each file `quick` actually reads
 ```
@@ -39,6 +42,10 @@ spec:
   full scratch-restore into a throwaway volume (then discarded). Both tiers nest
   their cron under `schedule:` (`quick.schedule`, `deep.schedule`); `deep` additionally
   carries the scratch-volume knobs below. Schedule each independently.
+- **`quick` tuning** — `parallel`/`fileParallelism`/`fileQueueLength`/`maxErrors` map
+  directly onto `kopia snapshot verify`'s own flags; all optional, absent leaves
+  kopia's default. `deep.parallel` is the analogous knob for the scratch-restore
+  (`restore --parallel`).
 - **Gated until there's something to verify** — a brand-new policy does not spawn a
   verify Job before it has a first successful backup (or, for an adopted repository,
   discovered snapshots already in it). See

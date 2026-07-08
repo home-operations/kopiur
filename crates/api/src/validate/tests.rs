@@ -2932,6 +2932,75 @@ fn backup_config_validates_verification() {
     );
 }
 
+#[test]
+fn backup_config_validates_verification_tuning_knobs() {
+    // Zero is rejected for the count knobs (>= 1) on both tiers.
+    for (yaml, field) in [
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    parallel: 0\n",
+            "SnapshotPolicy spec.verification.quick.parallel",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    fileParallelism: 0\n",
+            "SnapshotPolicy spec.verification.quick.fileParallelism",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    fileQueueLength: 0\n",
+            "SnapshotPolicy spec.verification.quick.fileQueueLength",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  deep:\n    schedule: { cron: \"0 5 * * 0\" }\n    parallel: 0\n",
+            "SnapshotPolicy spec.verification.deep.parallel",
+        ),
+    ] {
+        let spec: SnapshotPolicySpec = crate::testutil::from_yaml(yaml);
+        let errs = validate_backup_config(&spec);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field: f, .. } if f == field
+            )),
+            "expected a rejection of {field}, got: {errs:?}"
+        );
+    }
+
+    // maxErrors: 0 is kopia's own default ("stop at first error") — unconstrained,
+    // never rejected.
+    let max_errors_zero: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    maxErrors: 0\n",
+    );
+    assert!(
+        validate_backup_config(&max_errors_zero).is_empty(),
+        "{:?}",
+        validate_backup_config(&max_errors_zero)
+    );
+
+    // Positive values on all knobs are accepted.
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  \
+           quick:\n    schedule: { cron: \"0 4 * * *\" }\n    parallel: 2\n    \
+             fileParallelism: 4\n    fileQueueLength: 100\n    maxErrors: 1\n  \
+           deep:\n    schedule: { cron: \"0 5 * * 0\" }\n    parallel: 2\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+}
+
 // --- identity shape validation ---
 
 #[test]

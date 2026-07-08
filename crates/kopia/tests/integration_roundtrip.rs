@@ -221,14 +221,19 @@ async fn verbs_roundtrip() {
         "ignore policy should exclude *.tmp"
     );
 
-    // Verify integrity (read 100% of files).
+    // Verify integrity (read 100% of files). Also exercises the M3 (issue #216
+    // category sweep) tuning knobs `--file-parallelism`/`--file-queue-length`
+    // against the real kopia binary — the permanent regression guard that kopia
+    // actually accepts these flag forms, not just that the argv shape looks right.
     client
         .snapshot_verify(&VerifyOptions {
             verify_files_percent: Some(100),
+            file_parallelism: Some(2),
+            file_queue_length: Some(100),
             ..Default::default()
         })
         .await
-        .expect("verify");
+        .expect("verify with file-parallelism/file-queue-length");
 
     // Restore honoring options (atomic writes, ignore permission errors).
     client

@@ -1357,7 +1357,17 @@ async fn run_verify_flow(
                 error!(class = %err.kopia_class(), "deep verify scratch path not writable");
                 return Err(err);
             }
-            if let Err(e) = client.snapshot_restore(&id, &d.scratch_path).await {
+            if let Err(e) = client
+                .snapshot_restore_with(
+                    &id,
+                    &d.scratch_path,
+                    &kopiur_kopia::RestoreOptions {
+                        parallel: d.parallel,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
                 error!(class = %e.class(), "deep verify scratch-restore failed");
                 return Err(MoverError::Kopia {

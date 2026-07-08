@@ -543,6 +543,8 @@ fn verify_args_builds_flags() {
         verify_files_percent: Some(10),
         max_errors: Some(3),
         parallel: Some(8),
+        file_parallelism: None,
+        file_queue_length: None,
     };
     assert_eq!(
         verify_args(&opts),
@@ -555,6 +557,31 @@ fn verify_args_builds_flags() {
             "3",
             "--parallel",
             "8"
+        ]
+    );
+
+    // The two new knobs (M3 / issue #216 category sweep) — each independently absent
+    // by default, and both emitted in kopia's `snapshot verify --help` order when set.
+    let opts_full = VerifyOptions {
+        verify_files_percent: None,
+        max_errors: Some(1),
+        parallel: Some(2),
+        file_parallelism: Some(4),
+        file_queue_length: Some(100),
+    };
+    assert_eq!(
+        verify_args(&opts_full),
+        vec![
+            "snapshot",
+            "verify",
+            "--max-errors",
+            "1",
+            "--parallel",
+            "2",
+            "--file-parallelism",
+            "4",
+            "--file-queue-length",
+            "100"
         ]
     );
 }

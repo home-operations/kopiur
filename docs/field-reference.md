@@ -1555,6 +1555,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `schedule` | [object](#snapshotpolicy-spec-verification-deep-schedule) | **required** | Cron + jitter for the deep restore-test (e.g. weekly). |
 | `capacity` | string | — | Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`. |
+| `parallel` | integer | —<br><sub>min 0</sub> | `restore --parallel`: restore parallelism for the scratch-restore (deep verify IS a restore under the hood); absent leaves kopia's default. |
 | `storageClassName` | string | — | StorageClass for the ephemeral scratch PVC; absent uses the cluster default (only with `capacity`). |
 
 ###### `spec.verification.deep.schedule` { #snapshotpolicy-spec-verification-deep-schedule }
@@ -1569,6 +1570,10 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `fileParallelism` | integer | —<br><sub>min 0</sub> | `--file-parallelism`: parallelism for file verification (kopia default: unset). |
+| `fileQueueLength` | integer | —<br><sub>min 0</sub> | `--file-queue-length`: queue length for file verification (kopia default: 20000). |
+| `maxErrors` | integer | —<br><sub>min 0</sub> | `--max-errors`: stop after this many errors (kopia default: 0, meaning stop at the first error). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: verification parallelism (kopia default: 8). |
 | `schedule` | [object](#snapshotpolicy-spec-verification-quick-schedule) | — | Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled. |
 
 ###### `spec.verification.quick.schedule` { #snapshotpolicy-spec-verification-quick-schedule }

@@ -393,6 +393,19 @@ pub struct QuickVerification {
     /// Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<CronSpec>,
+    /// `--parallel`: verification parallelism (kopia default: 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--file-parallelism`: parallelism for file verification (kopia default: unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_parallelism: Option<u32>,
+    /// `--file-queue-length`: queue length for file verification (kopia default: 20000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_queue_length: Option<u32>,
+    /// `--max-errors`: stop after this many errors (kopia default: 0, meaning stop
+    /// at the first error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_errors: Option<u32>,
 }
 
 /// Deep (scratch-restore) verification: restore the latest snapshot into an ephemeral volume, then discard.
@@ -407,6 +420,10 @@ pub struct DeepVerification {
     /// Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
+    /// `restore --parallel`: restore parallelism for the scratch-restore (deep verify
+    /// IS a restore under the hood); absent leaves kopia's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
 }
 
 /// Pre/post snapshot hook lists.
@@ -1146,6 +1163,63 @@ verification:
             quick.schedule.is_none(),
             "old flat `quick: {{cron: ...}}` must decode with schedule: None (quick disabled)"
         );
+    }
+
+    #[test]
+    fn verification_quick_and_deep_tuning_knobs_roundtrip() {
+        // M3 (issue #216 category sweep): quick gains `--parallel`/`--file-parallelism`/
+        // `--file-queue-length`/`--max-errors`; deep gains `--parallel` (it restores
+        // under the hood). All optional, absent ⇒ kopia's own default.
+        let yaml = r#"
+repository: { kind: Repository, name: r }
+sources: [ { pvc: { name: d } } ]
+verification:
+  quick:
+    schedule: { cron: "0 4 * * *" }
+    parallel: 2
+    fileParallelism: 4
+    fileQueueLength: 100
+    maxErrors: 1
+  deep:
+    schedule: { cron: "0 5 * * 0" }
+    parallel: 2
+"#;
+        let spec: SnapshotPolicySpec = from_yaml(yaml);
+        let v = spec.verification.as_ref().expect("verification");
+        let quick = v.quick.as_ref().expect("quick");
+        assert_eq!(quick.parallel, Some(2));
+        assert_eq!(quick.file_parallelism, Some(4));
+        assert_eq!(quick.file_queue_length, Some(100));
+        assert_eq!(quick.max_errors, Some(1));
+        let deep = v.deep.as_ref().expect("deep");
+        assert_eq!(deep.parallel, Some(2));
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["verification"]["quick"]["parallel"], 2);
+        assert_eq!(json["verification"]["quick"]["fileParallelism"], 4);
+        assert_eq!(json["verification"]["quick"]["fileQueueLength"], 100);
+        assert_eq!(json["verification"]["quick"]["maxErrors"], 1);
+        assert_eq!(json["verification"]["deep"]["parallel"], 2);
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent ⇒ None, and the keys are omitted entirely (no dormant defaults).
+        let bare_yaml = r#"
+repository: { kind: Repository, name: r }
+sources: [ { pvc: { name: d } } ]
+verification:
+  quick:
+    schedule: { cron: "0 4 * * *" }
+  deep:
+    schedule: { cron: "0 5 * * 0" }
+"#;
+        let bare: SnapshotPolicySpec = from_yaml(bare_yaml);
+        let bv = bare.verification.as_ref().expect("verification");
+        assert!(bv.quick.as_ref().unwrap().parallel.is_none());
+        assert!(bv.deep.as_ref().unwrap().parallel.is_none());
+        let bare_json = serde_json::to_value(&bare).expect("serialize");
+        assert!(bare_json["verification"]["quick"].get("parallel").is_none());
+        assert!(bare_json["verification"]["deep"].get("parallel").is_none());
     }
 
     #[test]

@@ -354,9 +354,34 @@ async fn snapshot_verify_passes_flags() {
             verify_files_percent: Some(5),
             max_errors: Some(0),
             parallel: None,
+            file_parallelism: None,
+            file_queue_length: None,
         })
         .await
         .expect("verify flags must pass through");
+}
+
+#[tokio::test]
+async fn snapshot_verify_passes_parallelism_flags() {
+    // M3 (issue #216 category sweep): the two new tuning knobs must reach argv too.
+    // Smoke-tested against the pinned kopia 0.23.1: `snapshot verify --parallel 2
+    // --file-parallelism 4 --file-queue-length 100 --max-errors 1` is accepted;
+    // `verify_args`'s own field order (max-errors, parallel, file-parallelism,
+    // file-queue-length) is just as valid to kopia's kingpin parser.
+    let s = argv_gate_shim(
+        "snapshot verify --max-errors 1 --parallel 2 --file-parallelism 4 --file-queue-length 100",
+    );
+    let client = client_for(&s);
+    client
+        .snapshot_verify(&VerifyOptions {
+            verify_files_percent: None,
+            max_errors: Some(1),
+            parallel: Some(2),
+            file_parallelism: Some(4),
+            file_queue_length: Some(100),
+        })
+        .await
+        .expect("verify parallelism flags must pass through");
 }
 
 #[tokio::test]

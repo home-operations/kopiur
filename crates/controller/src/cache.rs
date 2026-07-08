@@ -212,6 +212,7 @@ mod tests {
             },
             storage_class_name: storage_class.map(str::to_string),
             capacity: capacity.map(str::to_string),
+            parallel: None,
         }
     }
 

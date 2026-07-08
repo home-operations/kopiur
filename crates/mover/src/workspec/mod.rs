@@ -653,6 +653,14 @@ pub struct QuickVerify {
     /// `--parallel`: verification parallelism.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel: Option<u32>,
+    /// `--file-parallelism`: parallelism for file verification. `#[serde(default)]`
+    /// so old-wire work specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_parallelism: Option<u32>,
+    /// `--file-queue-length`: queue length for file verification. `#[serde(default)]`
+    /// so old-wire work specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_queue_length: Option<u32>,
 }
 
 impl QuickVerify {
@@ -662,6 +670,8 @@ impl QuickVerify {
             verify_files_percent: self.verify_files_percent,
             max_errors: self.max_errors,
             parallel: self.parallel,
+            file_parallelism: self.file_parallelism,
+            file_queue_length: self.file_queue_length,
         }
     }
 }
@@ -680,6 +690,11 @@ pub struct DeepVerify {
     /// the identity); `None` lets the mover resolve the latest itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+    /// `restore --parallel`: restore parallelism for the scratch-restore (deep
+    /// verify IS a restore under the hood). `#[serde(default)]` so old-wire work
+    /// specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
 }
 
 /// Payload for a verification run (ADR-0005 §4). Owns its own connect lifecycle

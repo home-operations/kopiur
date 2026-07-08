@@ -111,6 +111,36 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                     }
                 }
             }
+            // `kopia snapshot verify` tuning knobs: counts must be at least 1.
+            // `maxErrors` is deliberately unconstrained — 0 is a valid, meaningful
+            // value (kopia's own default, "stop at the first error").
+            if let Some(p) = q.parallel
+                && let Some(e) = require_min(
+                    "SnapshotPolicy spec.verification.quick.parallel",
+                    p.into(),
+                    1,
+                )
+            {
+                errs.push(e);
+            }
+            if let Some(p) = q.file_parallelism
+                && let Some(e) = require_min(
+                    "SnapshotPolicy spec.verification.quick.fileParallelism",
+                    p.into(),
+                    1,
+                )
+            {
+                errs.push(e);
+            }
+            if let Some(p) = q.file_queue_length
+                && let Some(e) = require_min(
+                    "SnapshotPolicy spec.verification.quick.fileQueueLength",
+                    p.into(),
+                    1,
+                )
+            {
+                errs.push(e);
+            }
         }
         if let Some(d) = &v.deep {
             if let Err(e) = validate_cron(&d.schedule.cron) {
@@ -123,6 +153,16 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 "spec.verification.deep.schedule.jitter",
                 d.schedule.jitter.as_deref(),
             ) {
+                errs.push(e);
+            }
+            // `restore --parallel` under the hood (deep verify IS a restore).
+            if let Some(p) = d.parallel
+                && let Some(e) = require_min(
+                    "SnapshotPolicy spec.verification.deep.parallel",
+                    p.into(),
+                    1,
+                )
+            {
                 errs.push(e);
             }
         }

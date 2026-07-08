@@ -464,8 +464,12 @@ pub struct VerifyOptions {
     pub verify_files_percent: Option<u8>,
     /// `--max-errors`: stop after this many errors (0 = never stop early).
     pub max_errors: Option<u32>,
-    /// `--parallel`: verification parallelism.
+    /// `--parallel`: verification parallelism (kopia default: 8).
     pub parallel: Option<u32>,
+    /// `--file-parallelism`: parallelism for file verification (kopia default: unset).
+    pub file_parallelism: Option<u32>,
+    /// `--file-queue-length`: queue length for file verification (kopia default: 20000).
+    pub file_queue_length: Option<u32>,
 }
 
 /// Options for `kopia restore` / `kopia snapshot restore`. The tri-state
@@ -1626,6 +1630,14 @@ fn verify_args(opts: &VerifyOptions) -> Vec<String> {
     if let Some(p) = opts.parallel {
         args.push("--parallel".into());
         args.push(p.to_string());
+    }
+    if let Some(p) = opts.file_parallelism {
+        args.push("--file-parallelism".into());
+        args.push(p.to_string());
+    }
+    if let Some(q) = opts.file_queue_length {
+        args.push("--file-queue-length".into());
+        args.push(q.to_string());
     }
     args
 }

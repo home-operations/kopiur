@@ -6220,6 +6220,14 @@ spec:
                         description: Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`.
                         nullable: true
                         type: string
+                      parallel:
+                        description: |-
+                          `restore --parallel`: restore parallelism for the scratch-restore (deep verify
+                          IS a restore under the hood); absent leaves kopia's default.
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter for the deep restore-test (e.g. weekly).
                         properties:
@@ -6252,6 +6260,32 @@ spec:
                       lives under `quick.schedule` (matching `deep.schedule`), see [`QuickVerification`].
                     nullable: true
                     properties:
+                      fileParallelism:
+                        description: '`--file-parallelism`: parallelism for file verification (kopia default: unset).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      fileQueueLength:
+                        description: '`--file-queue-length`: queue length for file verification (kopia default: 20000).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      maxErrors:
+                        description: |-
+                          `--max-errors`: stop after this many errors (kopia default: 0, meaning stop
+                          at the first error).
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      parallel:
+                        description: '`--parallel`: verification parallelism (kopia default: 8).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
                         nullable: true

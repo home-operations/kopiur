@@ -906,6 +906,8 @@ fn verify_quick_roundtrip_and_wire_shape() {
                 verify_files_percent: Some(10),
                 max_errors: Some(3),
                 parallel: None,
+                file_parallelism: None,
+                file_queue_length: None,
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
         }),
@@ -963,6 +965,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
             tier: VerifyTier::Deep(DeepVerify {
                 scratch_path: "/scratch".into(),
                 snapshot_id: Some("k99".into()),
+                parallel: None,
             }),
             success_expr: None,
         }),
@@ -994,6 +997,62 @@ fn verify_deep_roundtrip_and_wire_shape() {
     } else {
         panic!("expected verify op");
     }
+}
+
+// --- M3 (issue #216 category sweep): quick tuning knobs + deep restore parallelism ---
+
+#[test]
+fn quick_verify_tuning_knobs_roundtrip_and_map_to_kopia() {
+    let q = QuickVerify {
+        verify_files_percent: Some(10),
+        max_errors: Some(1),
+        parallel: Some(2),
+        file_parallelism: Some(4),
+        file_queue_length: Some(100),
+    };
+    let v: serde_json::Value = serde_json::to_value(&q).unwrap();
+    assert_eq!(v["parallel"], 2);
+    assert_eq!(v["fileParallelism"], 4);
+    assert_eq!(v["fileQueueLength"], 100);
+    let reparsed: QuickVerify = serde_json::from_value(v).unwrap();
+    assert_eq!(reparsed, q);
+
+    let kopia = q.to_kopia();
+    assert_eq!(kopia.parallel, Some(2));
+    assert_eq!(kopia.file_parallelism, Some(4));
+    assert_eq!(kopia.file_queue_length, Some(100));
+}
+
+#[test]
+fn quick_verify_old_wire_json_without_new_knobs_still_decodes() {
+    // Pre-M3 work-spec ConfigMaps only ever carried these three keys. A mover
+    // upgraded ahead of a controller still writing the old shape must not wedge.
+    let old = r#"{"verifyFilesPercent":10,"maxErrors":3}"#;
+    let parsed: QuickVerify = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.verify_files_percent, Some(10));
+    assert_eq!(parsed.max_errors, Some(3));
+    assert!(parsed.parallel.is_none());
+    assert!(parsed.file_parallelism.is_none());
+    assert!(parsed.file_queue_length.is_none());
+}
+
+#[test]
+fn deep_verify_parallel_roundtrips_and_old_wire_json_still_decodes() {
+    let d = DeepVerify {
+        scratch_path: "/scratch".into(),
+        snapshot_id: Some("k1".into()),
+        parallel: Some(2),
+    };
+    let v: serde_json::Value = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["parallel"], 2);
+    let reparsed: DeepVerify = serde_json::from_value(v).unwrap();
+    assert_eq!(reparsed, d);
+
+    // Pre-M3 work-spec ConfigMaps had no `parallel` key.
+    let old = r#"{"scratchPath":"/scratch","snapshotId":"k1"}"#;
+    let parsed: DeepVerify = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.scratch_path, "/scratch");
+    assert!(parsed.parallel.is_none());
 }
 
 // --- §13(d) replicate op ---
