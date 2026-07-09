@@ -151,6 +151,14 @@ jobs:
           - shard: reshape-async
             bins: "verification replication"
             backends: false
+          # Staging deadline + staged-PVC overrides/bind race (#198, #223): the
+          # deadline tests quiesce kube-system/snapshot-controller (they own
+          # VolumeSnapshot status while it's down), which no other test may
+          # race, so this shard owns its cluster. Needs the CSI snapshot stack.
+          - shard: staging
+            bins: "staging_deadline staging_overrides"
+            backends: false
+            csi: true
           # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
           # SecurityContextCompatible reconcile condition. Filesystem only.
           - shard: security-context-compat
