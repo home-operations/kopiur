@@ -813,9 +813,9 @@ async fn bootstrap_via_mover(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, &job_name, &cm, &job).await?;
+    let cm = jobs::build_result_config_map(&inputs);
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, namespace, &job_name, Some(&cm), &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored.
     // A health-probe re-run of an already-`Ready` repo keeps its phase `Ready`
     // (`keep_ready_on_launch`) so backups/replication are never paused while the

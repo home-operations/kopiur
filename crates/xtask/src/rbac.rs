@@ -162,10 +162,10 @@ fn kopia_crd_rules(include_cluster_crds: bool) -> Vec<PolicyRule> {
 fn workload_rules() -> Vec<PolicyRule> {
     vec![
         // Mover pods + exec for pre/post hooks; PVCs for snapshot/restore I/O;
-        // events for surfacing reconcile outcomes; configmaps carry the mover
-        // work spec AND (for repository bootstrap) receive the mover's result
-        // patch — the mover runs as this SA, so its result write reuses these
-        // configmaps verbs (no separate rule needed).
+        // events for surfacing reconcile outcomes; configmaps carry the
+        // repository-bootstrap result channel (and the sweep reaps LEGACY
+        // per-run work-spec ConfigMaps) — the mover runs as this SA, so its
+        // result write reuses these configmaps verbs (no separate rule needed).
         rule(
             &[""],
             &[
@@ -317,9 +317,9 @@ fn webhook_cert_secret_rules() -> Vec<PolicyRule> {
 /// The minimal RBAC a mover Job actually uses, verified against `crates/mover/src/`:
 /// it PATCHes the owning CR's `.status` subresource (the target kind is dynamic —
 /// `backups`, `restores`, `repositories`, `clusterrepositories`, `maintenances`)
-/// and PATCHes the work-spec `ConfigMap` to write the repository-bootstrap result.
+/// and PATCHes the result `ConfigMap` to write the repository-bootstrap result.
 /// Nothing else — credentials are env-mounted (no `secrets` access) and the work
-/// spec is a mounted volume (no `configmaps` get for it). This is deliberately a
+/// spec rides the Job's own pod env (no `configmaps` get for it). This is deliberately a
 /// tiny subset of [`workload_rules`]; the mover runs as its own least-privilege SA.
 ///
 /// `cluster` decides whether `clusterrepositories/status` is included. The

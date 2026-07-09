@@ -133,22 +133,17 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     let job_name = replication_job_name(&name, slot);
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
-            // Success: the mover stamped status; sleep until the next slot.
-            // Drop the per-slot work-spec ConfigMap now — it is owned by the
-            // long-lived RepositoryReplication CR, so left alone one accumulates
-            // per slot, forever. The Job stays until its TTL: it is the
-            // slot-handled marker (deleting it early would re-fire the slot).
-            Some(true) => {
-                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
-                Ok(Action::requeue(cap(next_wakeup(
-                    repl,
-                    now,
-                    Some(slot),
-                    repo_tz,
-                ))))
-            }
-            // Failure: same CM reap. The failed Job lingers to its TTL as the
-            // bounded-retry backoff; the retry re-spawn recreates the ConfigMap.
+            // Success: the mover stamped status; sleep until the next slot. The
+            // terminal Job (its env carries the whole run spec) self-reaps via
+            // its TTL — nothing else to clean up.
+            Some(true) => Ok(Action::requeue(cap(next_wakeup(
+                repl,
+                now,
+                Some(slot),
+                repo_tz,
+            )))),
+            // Failure: the failed Job lingers to its TTL as the bounded-retry
+            // backoff (and keeps the pod logs).
             Some(false) => {
                 patch_ready_if_changed(
                     &api,
@@ -160,7 +155,6 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
                     Some("Failed"),
                 )
                 .await?;
-                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
             None => Ok(Action::requeue(REQUEUE_RUNNING)),
@@ -335,9 +329,8 @@ async fn spawn_replication_job(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, namespace, job_name, None, &job).await?;
     Ok(())
 }
 

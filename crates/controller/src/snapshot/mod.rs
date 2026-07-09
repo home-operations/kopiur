@@ -205,41 +205,20 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // still Active. Tearing the staged PVC + mover pod down now would
             // strand an unschedulable replacement pod (#103) — gate the reap on
             // the Job being terminal (or already gone).
-            // The Job GET below serves both concerns, but ONLY within the
-            // window where the Job can still exist: while staged objects await
-            // teardown, or within the reap lookback of the run's endTime.
-            // Beyond that (Snapshot CRs live indefinitely) the GET would be a
-            // guaranteed 404 on every 600s heartbeat, forever — the orphan
-            // sweep owns any straggler ConfigMap instead.
-            let staged = backup
+            if backup
                 .status
                 .as_ref()
                 .and_then(|s| s.staged.as_ref())
-                .is_some();
-            let end_time = backup
-                .status
-                .as_ref()
-                .and_then(|s| s.timing.as_ref())
-                .and_then(|t| t.end_time.as_deref());
-            if staged || finished_recently(end_time, chrono::Utc::now()) {
+                .is_some()
+            {
                 let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
                 let job = job_api.get_opt(&name).await?;
-                if staged {
-                    if !staged_teardown_ready(job.as_ref()) {
-                        // The owned-Job watch re-triggers us when the Job reaches
-                        // Complete; the requeue is a backstop for a missed event.
-                        return Ok(Action::requeue(Duration::from_secs(15)));
-                    }
-                    io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                if !staged_teardown_ready(job.as_ref()) {
+                    // The owned-Job watch re-triggers us when the Job reaches
+                    // Complete; the requeue is a backstop for a missed event.
+                    return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                // The work-spec ConfigMap is only needed while the mover pod
-                // runs; Snapshot CRs are the durable backup record, so a CM
-                // left to owner-ref GC accumulates forever (one per run). Reap
-                // it once the Job is observed terminal; the Job itself is left
-                // to its ttlSecondsAfterFinished (pod logs stay reachable).
-                if work_spec_reapable(job.as_ref()) {
-                    io::reap_work_spec_cm(&ctx.client, &namespace, &name).await;
-                }
+                io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             }
             // §13(c): spec.pin stays live after the mover Job is gone.
             return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
@@ -298,16 +277,6 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                 }
             }
-            // The COMMON failure path lands here, not in the `Some(false)` Job
-            // branch below: the mover stamps `phase: Failed` before its pod
-            // exits, so by the time the Job is observed terminal the run
-            // decision is already TerminalFailed. Reap the work-spec ConfigMap
-            // once the Job is terminal (mirrors SucceededSteadyState); the
-            // failed Job itself keeps the pod logs until its TTL.
-            let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-            if work_spec_reapable(job_api.get_opt(&name).await?.as_ref()) {
-                io::reap_work_spec_cm(&ctx.client, &namespace, &name).await;
-            }
             return Ok(Action::await_change());
         }
         RunDecision::Wait => return Ok(Action::await_change()),
@@ -352,9 +321,6 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 {
                     io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
                 }
-                // The Job is terminal: drop the work-spec ConfigMap now (the Job
-                // stays until its TTL so pod logs remain reachable).
-                io::reap_work_spec_cm(&ctx.client, &namespace, &name).await;
                 // §13(c): reconcile kopia-side pin state with spec.pin once the
                 // snapshot exists. A no-op when already in the desired state.
                 return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
@@ -426,11 +392,6 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 {
                     io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
                 }
-                // Drop the work-spec ConfigMap for the failed run too — a Failed
-                // Snapshot outside a schedule's failedJobsHistoryLimit (manual or
-                // hook-aborted) is never pruned, so its CM would leak forever.
-                // The failed Job keeps the pod logs until its TTL.
-                io::reap_work_spec_cm(&ctx.client, &namespace, &name).await;
                 return Ok(Action::requeue(Duration::from_secs(120)));
             }
             None => {
@@ -462,14 +423,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                     // Delete the wedged Job *and its pod* (Background cascade) so the
                     // kubelet stops retrying immediately — don't wait for TTL/ownerRef
-                    // GC — and its work-spec ConfigMap with it. BEST-EFFORT: a delete
-                    // error must not abort this pass — the staged-source cleanup below
-                    // would be skipped and never retried (the follow-up reconciles
-                    // route to TerminalFailed, which reaps neither).
-                    if let Err(e) = io::delete_mover_run(&ctx.client, &namespace, &name).await {
-                        tracing::warn!(backup = %name, error = %e,
-                            "wedged mover teardown failed (Job runs to its deadline; sweep reaps the ConfigMap)");
-                    }
+                    // GC. BEST-EFFORT: a delete error must not abort this pass — the
+                    // staged-source cleanup below would be skipped and never retried
+                    // (the follow-up reconciles route to TerminalFailed).
+                    let _ = job_api.delete(&name, &DeleteParams::background()).await;
                     if backup
                         .status
                         .as_ref()
@@ -1272,9 +1229,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, &namespace, &name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, &namespace, &name, None, &job).await?;
 
     io::patch_status(
         &api,
@@ -1818,9 +1774,8 @@ async fn delete_snapshot_via_job(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, job_ns, &job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, job_ns, &job_name, None, &job).await?;
     io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
     tracing::info!(backup = %name, %snapshot_id, job_namespace = %job_ns, "created SnapshotDelete Job");
     Ok(Action::requeue(Duration::from_secs(15)))
@@ -1985,8 +1940,7 @@ async fn reconcile_pin(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
+    let job = jobs::build_job(&inputs)?;
     // Durably mark "a pin mover exists" BEFORE the Job lands (the `Pinned`
     // condition is the gate that decides whether steady passes look for one) —
     // a crash between the two leaves only a spurious per-pass GET, never an
@@ -2000,7 +1954,7 @@ async fn reconcile_pin(
         backup.meta().generation,
     );
     io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    io::apply_mover_objects(&ctx.client, namespace, &job_name, &cm, &job).await?;
+    io::apply_mover_objects(&ctx.client, namespace, &job_name, None, &job).await?;
     tracing::info!(backup = %name, %snapshot_id, ?action, "created SnapshotPin Job");
     Ok(Action::requeue(Duration::from_secs(15)))
 }
@@ -2142,7 +2096,6 @@ async fn handle_pin_job(
                 backup.meta().generation,
             );
             io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-            io::reap_work_spec_cm(&ctx.client, namespace, job_name).await;
             tracing::warn!(backup = %name, "snapshot pin Job failed; backing off");
             Ok(Action::requeue(Duration::from_secs(120)))
         }
@@ -2491,39 +2444,6 @@ fn staged_teardown_ready(job: Option<&Job>) -> bool {
         None => true,
         Some(j) => job_terminal_state(j).is_some(),
     }
-}
-
-/// Whether a run's work-spec ConfigMap may be reaped: the same-named Job must be
-/// observed terminal (`restartPolicy: Never` + a terminal Job means no pod will
-/// mount the ConfigMap again). An ABSENT Job deliberately returns `false`: the
-/// TTL controller already reaped the run and the periodic orphan sweep owns that
-/// case — reaping here too would re-issue a delete on every steady-state pass,
-/// forever. Shared with the Restore reconciler (same Job/ConfigMap contract).
-pub(crate) fn work_spec_reapable(job: Option<&Job>) -> bool {
-    job.is_some_and(|j| job_terminal_state(j).is_some())
-}
-
-/// How long after a run's `timing.endTime` the steady-state pass keeps looking
-/// for its mover Job (to reap the work-spec ConfigMap). Generously above any
-/// sane `ttlSecondsAfterFinished`; beyond it the Job is certainly gone and the
-/// orphan sweep owns any leftover ConfigMap.
-pub(crate) const REAP_LOOKBACK_SECS: i64 = 24 * 3600;
-
-/// Whether an RFC3339 `timing.endTime` is within [`REAP_LOOKBACK_SECS`] of
-/// `now` — the only window where a terminal CR's steady heartbeat needs a
-/// mover-Job GET to reap the work-spec ConfigMap. Absent/unparseable endTime →
-/// `false`: the orphan sweep is the backstop, and long-lived terminal records
-/// (Snapshot CRs live indefinitely by design) stop paying an apiserver GET on
-/// every heartbeat, forever. Shared with the Restore reconciler.
-pub(crate) fn finished_recently(
-    end_time: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    end_time
-        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
-        .is_some_and(|end| {
-            (now - end.with_timezone(&chrono::Utc)).num_seconds() < REAP_LOOKBACK_SECS
-        })
 }
 
 /// `error_policy` for the `Snapshot` controller.

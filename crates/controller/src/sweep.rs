@@ -1,20 +1,17 @@
-//! Periodic sweep for **orphaned mover work-spec ConfigMaps**.
+//! Periodic sweep for **LEGACY per-run work-spec ConfigMaps** (#224).
 //!
-//! Every mover run applies a work-spec `ConfigMap` + `Job` pair
-//! ([`crate::io::apply_mover_objects`]). The Job self-reaps via
-//! `ttlSecondsAfterFinished`, and the reconcilers now delete the ConfigMap as
-//! soon as they observe the Job terminal — but a ConfigMap whose Job is already
-//! gone is invisible to those transition paths: nothing knows its name anymore
-//! (per-slot verify/replication names, or a controller that was down across the
-//! whole Job lifetime), and its owner reference points at a long-lived CR
-//! (`Snapshot`/`SnapshotPolicy`/…) that keeps it alive indefinitely. Clusters
-//! upgraded from operator versions that never deleted work-spec ConfigMaps hold
-//! hundreds of such orphans (one per historical run).
+//! Current operator versions embed the mover work spec in the Job's pod env —
+//! a run is exactly ONE object, cleaned up by its `ttlSecondsAfterFinished`,
+//! and no per-run ConfigMap exists at all. Earlier versions instead mounted
+//! the spec from a sidecar ConfigMap owner-referenced to a long-lived CR
+//! (`Snapshot`/`SnapshotPolicy`/…) with no delete path: the Job self-reaped
+//! via its TTL, the ConfigMap had no TTL mechanism, and one accumulated per
+//! run, forever — clusters held hundreds (one per historical backup).
 //!
-//! This module heals them: a leader-only background task periodically lists the
-//! kopiur-managed ConfigMaps and deletes the stale work-spec ones. The decision
-//! kernel ([`sweep_candidates`]) is pure and conservative — a ConfigMap is only
-//! an orphan when ALL of these hold:
+//! This module heals upgraded clusters: a leader-only background task
+//! periodically lists the kopiur-managed ConfigMaps and deletes the stale
+//! work-spec ones. The decision kernel ([`sweep_candidates`]) is pure and
+//! conservative — a ConfigMap is only an orphan when ALL of these hold:
 //!
 //! 1. labelled `app.kubernetes.io/managed-by=kopiur` (server-side pre-filtered,
 //!    re-checked here),

@@ -296,27 +296,35 @@ pub async fn wait_for_job(jobs: &Api<Job>, name: &str) -> Job {
     .unwrap_or_else(|_| panic!("mover Job {name} should be created"))
 }
 
-/// Wait for a mover run's work-spec `ConfigMap` and return it. The right sync
-/// point for asserting the controller→mover work-spec contract: the ConfigMap
-/// is applied BEFORE its same-named Job and deleted only after the Job is
-/// observed terminal (the ConfigMap-leak fix) — so, unlike syncing on the Job
-/// (which outlives the ConfigMap by its TTL), a poll from run creation observes
-/// it for at least the whole pod lifetime. A sub-second poll makes even an
-/// implausibly fast create→run→reap cycle (pod startup alone takes seconds)
-/// unable to slip between two samples.
+/// The env var carrying a mover run's inline work-spec JSON — the controller↔
+/// mover contract these tests assert at the wire level, so it is a deliberate
+/// LITERAL here (an accidental rename in either crate must fail this suite).
 #[allow(dead_code)] // each test binary compiles `common` separately; not all use it
-pub async fn wait_for_work_spec_cm(
-    cms: &Api<k8s_openapi::api::core::v1::ConfigMap>,
-    name: &str,
-) -> k8s_openapi::api::core::v1::ConfigMap {
-    wait_until(
-        &format!("work-spec ConfigMap {name} created"),
-        default_timeout(),
-        std::time::Duration::from_millis(500),
-        || async { cms.get_opt(name).await },
-    )
-    .await
-    .unwrap_or_else(|_| panic!("work-spec ConfigMap {name} should be created"))
+pub const WORK_SPEC_ENV: &str = "KOPIUR_WORK_SPEC";
+
+/// Extract + parse the inline work-spec JSON from a mover Job's pod env. The
+/// spec rides the Job itself (#224 — no per-run ConfigMap exists), so this
+/// reads the full controller→mover contract from the one run object, which
+/// outlives the run by its `ttlSecondsAfterFinished` — no race with completion.
+#[allow(dead_code)]
+pub fn work_spec_json_from_job(job: &Job) -> serde_json::Value {
+    let raw = job
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .and_then(|env| env.iter().find(|e| e.name == WORK_SPEC_ENV))
+        .and_then(|e| e.value.clone())
+        .expect("mover Job carries the inline work-spec env");
+    serde_json::from_str(&raw).expect("work-spec env parses as JSON")
+}
+
+/// Wait for the mover Job named `name` and return its parsed work-spec JSON.
+#[allow(dead_code)]
+pub async fn wait_for_work_spec_json(jobs: &Api<Job>, name: &str) -> serde_json::Value {
+    let job = wait_for_job(jobs, name).await;
+    work_spec_json_from_job(&job)
 }
 
 /// The mover container's container-level `securityContext` from a Job's pod template.

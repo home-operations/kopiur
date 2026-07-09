@@ -19,12 +19,11 @@ use std::collections::BTreeMap;
 use crate::workspec::MoverWorkSpec;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvFromSource,
-    EphemeralVolumeSource, NFSVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement,
-    NodeSelectorTerm, PersistentVolumeClaimSpec, PersistentVolumeClaimTemplate,
-    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec,
-    ResourceRequirements, SecretEnvSource, SecurityContext, Toleration, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    Affinity, ConfigMap, Container, EmptyDirVolumeSource, EnvFromSource, EphemeralVolumeSource,
+    NFSVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimTemplate, PersistentVolumeClaimVolumeSource,
+    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SecretEnvSource,
+    SecurityContext, Toleration, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -35,21 +34,51 @@ use kopiur_api::consts::API_VERSION;
 /// `:latest` is deliberately avoided (G15) — callers should pin a digest/tag.
 pub const DEFAULT_MOVER_IMAGE: &str = "ghcr.io/home-operations/kopiur-mover:v0.1.0";
 
-/// Path inside the mover pod where the work-spec ConfigMap is mounted.
-pub const WORK_SPEC_MOUNT: &str = "/etc/kopiur";
 /// Path inside the deep-verify mover pod the scratch-restore writes into. Part of
 /// the controller↔mover contract: the work-spec `scratch_path`, the Job's scratch
 /// `VolumeMount`, and the mover's writability preflight + restore target all
 /// reference this single constant so they can never drift (centralize-config).
 pub const DEEP_SCRATCH_PATH: &str = "/scratch";
-/// File name of the work spec within the mount.
+/// Data key the LEGACY per-run work-spec ConfigMaps carried (operator versions
+/// that mounted the spec instead of embedding it in the Job env). Still
+/// referenced by the controller's orphan sweep, which reaps those leftovers.
 pub const WORK_SPEC_FILE: &str = "work-spec.json";
-/// Env var the mover reads for the work-spec path. Sourced from the mover
-/// crate's single definition so the controller↔mover contract can't drift.
-pub const WORK_SPEC_ENV: &str = crate::env::WORK_SPEC_PATH;
+/// Env var carrying the inline work-spec JSON. Sourced from the mover crate's
+/// single definition so the controller↔mover contract can't drift.
+pub const WORK_SPEC_ENV: &str = crate::env::WORK_SPEC;
 /// Env var naming the ConfigMap the mover writes a bootstrap result into (set
 /// only for `BootstrapRepository` Jobs). Single definition shared with the mover.
 pub const RESULT_CONFIGMAP_ENV: &str = crate::env::RESULT_CONFIGMAP;
+
+/// Upper bound on the serialized work spec [`build_job`] will embed in the pod
+/// env. Linux caps a single `execve` string ("NAME=value") at `MAX_ARG_STRLEN`
+/// (128 KiB) — an env var over that makes the container fail at exec time with
+/// an inscrutable runtime error, so the builder refuses eagerly with an
+/// actionable one instead. Real work specs are ~1 KiB; only a pathological
+/// recipe (hundreds of KiB of ignore rules / hooks) can approach this.
+pub const MAX_WORK_SPEC_BYTES: usize = 100 * 1024;
+
+/// Why [`build_job`] refused to build. Closed enum with what/why/fix messages
+/// so every caller (controller reconcilers, the CLI browse spawner) surfaces
+/// the same actionable text.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildJobError {
+    /// The work spec could not be JSON-encoded (never, for the closed types —
+    /// but propagated rather than panicked).
+    #[error("the work spec could not be JSON-encoded: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// The serialized work spec exceeds what a pod env var can carry.
+    #[error(
+        "the serialized work spec is {bytes} bytes, over the {MAX_WORK_SPEC_BYTES}-byte limit \
+         a pod environment variable can carry (Linux MAX_ARG_STRLEN is 128 KiB). The recipe \
+         is pathologically large — trim the policy (ignore rules, hooks, extra args) or split \
+         the source across policies"
+    )]
+    TooLarge {
+        /// Size of the serialized work spec.
+        bytes: usize,
+    },
+}
 
 /// Built-in `Job.spec.activeDeadlineSeconds` applied by [`build_job`] when a
 /// recipe's `failurePolicy.activeDeadlineSeconds` is unset. A generous 48h
@@ -350,14 +379,15 @@ fn managed_labels(inputs: &MoverJobInputs<'_>) -> BTreeMap<String, String> {
     labels
 }
 
-/// Build the `ConfigMap` carrying the serialized work spec. Returns a
-/// serialization error only if the work spec can't be JSON-encoded (never, for
-/// the closed types — but propagated rather than panicked).
-pub fn build_config_map(inputs: &MoverJobInputs<'_>) -> Result<ConfigMap, serde_json::Error> {
-    let json = serde_json::to_string_pretty(inputs.work_spec)?;
-    let mut data = BTreeMap::new();
-    data.insert(WORK_SPEC_FILE.to_string(), json);
-    Ok(ConfigMap {
+/// Build the RESULT `ConfigMap` for a bootstrap/probe run — the out-of-band
+/// channel the mover PATCHes `result.json` into (see
+/// [`crate::bootstrap::RESULT_CONFIGMAP_KEY`]) and the controller reads back
+/// AFTER the Job may already be TTL-reaped. Created empty: the work spec
+/// itself rides the Job env ([`WORK_SPEC_ENV`]), so this exists only for the
+/// flows that need data to OUTLIVE the Job. Deliberately carries no
+/// `work-spec.json` key — that key is what the orphan sweep targets.
+pub fn build_result_config_map(inputs: &MoverJobInputs<'_>) -> ConfigMap {
+    ConfigMap {
         metadata: ObjectMeta {
             name: Some(inputs.name.to_string()),
             namespace: Some(inputs.namespace.to_string()),
@@ -365,9 +395,9 @@ pub fn build_config_map(inputs: &MoverJobInputs<'_>) -> Result<ConfigMap, serde_
             owner_references: Some(vec![inputs.owner.clone()]),
             ..Default::default()
         },
-        data: Some(data),
+        data: None,
         ..Default::default()
-    })
+    }
 }
 
 /// The `Volume` source (the `name` is set by the caller) for the mover's kopia
@@ -412,29 +442,32 @@ fn cache_volume_source(cache: &CacheVolume) -> Volume {
     }
 }
 
-/// Build the mover `Job` that mounts the work-spec ConfigMap and runs the
-/// kopiur-mover image. `restartPolicy: Never`; backoff/deadline from limits.
-pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
+/// Build the mover `Job` that carries the serialized work spec INLINE in its
+/// pod env ([`WORK_SPEC_ENV`]) and runs the kopiur-mover image.
+/// `restartPolicy: Never`; backoff/deadline from limits.
+///
+/// Embedding the spec in the Job — instead of a sidecar ConfigMap — means a
+/// run is exactly ONE Kubernetes object whose `ttlSecondsAfterFinished` cleans
+/// up everything, structurally eliminating the per-run ConfigMap leak (#224);
+/// it is also immutable after spawn (pod templates can't be edited) and shows
+/// the full controller→mover contract in one `kubectl get job -o yaml`.
+/// Refuses a spec over [`MAX_WORK_SPEC_BYTES`] with an actionable error.
+pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
+    let work_spec_json = serde_json::to_string(inputs.work_spec)?;
+    if work_spec_json.len() > MAX_WORK_SPEC_BYTES {
+        return Err(BuildJobError::TooLarge {
+            bytes: work_spec_json.len(),
+        });
+    }
+
     // The container security context is fully resolved upstream (hardened ⊂
     // moverDefaults ⊂ recipe, ADR-0004 §2); apply it verbatim.
     let sec_ctx = inputs.security_context.clone();
 
-    // Volumes + mounts: always the work-spec ConfigMap; plus the source PVC
-    // (read-only, for Snapshot) and the repo PVC (read-write, filesystem backend).
-    let mut volumes = vec![Volume {
-        name: "work-spec".to_string(),
-        config_map: Some(ConfigMapVolumeSource {
-            name: inputs.name.to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }];
-    let mut volume_mounts = vec![VolumeMount {
-        name: "work-spec".to_string(),
-        mount_path: WORK_SPEC_MOUNT.to_string(),
-        read_only: Some(true),
-        ..Default::default()
-    }];
+    // Volumes + mounts: the source PVC (read-only, for Snapshot) and the repo
+    // PVC (read-write, filesystem backend); the work spec needs none (env).
+    let mut volumes = vec![];
+    let mut volume_mounts = vec![];
 
     // Writable cache/logs/config for kopia. kopia defaults these under $HOME,
     // which is /nonexistent on distroless:nonroot; without this volume (and the
@@ -501,14 +534,14 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
         )
     };
 
-    // Work-spec path env, plus any passthrough (OTLP + RUST_LOG/KOPIUR_LOG_FORMAT)
+    // Inline work-spec env, plus any passthrough (OTLP + RUST_LOG/KOPIUR_LOG_FORMAT)
     // so the mover exports to the same collector and logs at the same level/format
     // as the controller.
     let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
     let mut env = vec![
         k8s_openapi::api::core::v1::EnvVar {
             name: WORK_SPEC_ENV.to_string(),
-            value: Some(format!("{WORK_SPEC_MOUNT}/{WORK_SPEC_FILE}")),
+            value: Some(work_spec_json),
             value_from: None,
         },
         // Redirect kopia's cache/logs/config onto the writable emptyDir mounted
@@ -592,7 +625,7 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
         ..Default::default()
     };
 
-    Job {
+    Ok(Job {
         metadata: ObjectMeta {
             name: Some(inputs.name.to_string()),
             namespace: Some(inputs.namespace.to_string()),
@@ -622,7 +655,7 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Job {
             ..Default::default()
         }),
         status: None,
-    }
+    })
 }
 
 /// The well-known node label carrying a node's hostname — the topology key a
@@ -868,7 +901,7 @@ mod tests {
     fn readiness_exec_renders_a_probe_only_when_set() {
         // Default (every operator mover): no probe — a batch Job is "done", not "ready".
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         assert!(
             job.spec.unwrap().template.spec.unwrap().containers[0]
                 .readiness_probe
@@ -882,7 +915,7 @@ mod tests {
             "/usr/local/bin/kopiur-mover".to_string(),
             "ready".to_string(),
         ]);
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let probe = job.spec.unwrap().template.spec.unwrap().containers[0]
             .readiness_probe
             .clone()
@@ -900,7 +933,7 @@ mod tests {
         // The mover PATCHes the owning CR's status, so the pod must run as the
         // operator SA, not the namespace `default` SA.
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let sa = job
             .spec
             .unwrap()
@@ -912,19 +945,46 @@ mod tests {
     }
 
     #[test]
-    fn config_map_carries_serialized_work_spec() {
+    fn job_env_carries_serialized_work_spec() {
         let ws = sample_work_spec();
-        let cm = build_config_map(&inputs(&ws, JobLimits::default())).unwrap();
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let env = &pod.containers[0].env.as_ref().unwrap()[0];
+        assert_eq!(env.name, WORK_SPEC_ENV);
+        // The serialized spec round-trips back to the same MoverWorkSpec.
+        let parsed: MoverWorkSpec = serde_json::from_str(env.value.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed, ws);
+    }
+
+    #[test]
+    fn result_config_map_is_result_only_and_cr_owned() {
+        let ws = sample_work_spec();
+        let cm = build_result_config_map(&inputs(&ws, JobLimits::default()));
         assert_eq!(cm.metadata.name.as_deref(), Some("db-1"));
         assert_eq!(cm.metadata.namespace.as_deref(), Some("prod"));
-        let body = &cm.data.as_ref().unwrap()[WORK_SPEC_FILE];
-        // The serialized spec round-trips back to the same MoverWorkSpec.
-        let parsed: MoverWorkSpec = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed, ws);
+        // No work-spec payload: the spec rides the Job env, and the absent
+        // `work-spec.json` key keeps the orphan sweep from ever matching it.
+        assert!(cm.data.is_none());
         // Owner reference present so GC reaps it with the CR.
         assert_eq!(
             cm.metadata.owner_references.as_ref().unwrap()[0].uid,
             "uid-123"
+        );
+    }
+
+    #[test]
+    fn build_job_refuses_an_oversized_work_spec() {
+        let mut ws = sample_work_spec();
+        // Inflate past MAX_WORK_SPEC_BYTES via a pathological ignore list.
+        if let Operation::Snapshot(op) = &mut ws.operation {
+            op.policy.ignore = vec!["x".repeat(1024); MAX_WORK_SPEC_BYTES / 1024 + 8];
+        }
+        let err = build_job(&inputs(&ws, JobLimits::default())).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, BuildJobError::TooLarge { .. }), "{msg}");
+        assert!(
+            msg.contains("MAX_ARG_STRLEN") || msg.contains("128 KiB"),
+            "{msg}"
         );
     }
 
@@ -936,7 +996,7 @@ mod tests {
             active_deadline_seconds: Some(7200),
             ttl_seconds_after_finished: Some(3600),
         };
-        let job = build_job(&inputs(&ws, limits));
+        let job = build_job(&inputs(&ws, limits)).unwrap();
         let spec = job.spec.as_ref().unwrap();
         assert_eq!(spec.backoff_limit, Some(5));
         assert_eq!(spec.active_deadline_seconds, Some(7200));
@@ -953,7 +1013,7 @@ mod tests {
         // A default-limits Job must not set ttlSecondsAfterFinished (owner-ref GC
         // reaps one-Job-per-CR runs; no regression for backup/restore).
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         assert_eq!(
             job.spec.unwrap().ttl_seconds_after_finished,
             None,
@@ -969,20 +1029,20 @@ mod tests {
             "kopiur.home-operations.com/maintenance-slot".to_string(),
             "2026-06-06T03:00:00+00:00".to_string(),
         )]);
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         assert_eq!(
             job.metadata.annotations.unwrap()["kopiur.home-operations.com/maintenance-slot"],
             "2026-06-06T03:00:00+00:00"
         );
         // Empty annotations must leave the field unset (no churn for other runs).
-        let bare = build_job(&inputs(&ws, JobLimits::default()));
+        let bare = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         assert!(bare.metadata.annotations.is_none());
     }
 
     #[test]
     fn job_uses_hardened_security_context_by_default() {
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let sc = job.spec.unwrap().template.spec.unwrap().containers[0]
             .security_context
             .clone()
@@ -1009,7 +1069,7 @@ mod tests {
             run_as_non_root: Some(true),
             ..Default::default()
         };
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let sc = job.spec.unwrap().template.spec.unwrap().containers[0]
             .security_context
             .clone()
@@ -1033,7 +1093,7 @@ mod tests {
             fs_group_change_policy: Some("OnRootMismatch".to_string()),
             ..Default::default()
         });
-        let pod = build_job(&i).spec.unwrap().template.spec.unwrap();
+        let pod = build_job(&i).unwrap().spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.containers[0]
                 .security_context
@@ -1064,7 +1124,7 @@ mod tests {
         // must still carry the built-in wall-clock cap so it can never linger
         // Active forever.
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         assert_eq!(
             job.spec.unwrap().active_deadline_seconds,
             Some(DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS),
@@ -1081,7 +1141,7 @@ mod tests {
         i.creds_secrets = vec![CredsEnvFrom::plain("kopia-creds")];
         i.image_pull_policy = Some("IfNotPresent");
 
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         let vols = pod.volumes.as_ref().unwrap();
 
@@ -1138,7 +1198,7 @@ mod tests {
             false,
         ));
 
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         let vols = pod.volumes.as_ref().unwrap();
 
@@ -1182,7 +1242,7 @@ mod tests {
         ];
         i.result_configmap = Some("repo-bootstrap");
 
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
 
         let env_from = container.env_from.as_ref().expect("envFrom present");
@@ -1211,7 +1271,7 @@ mod tests {
             CredsEnvFrom::prefixed("dest-creds", "KOPIUR_DEST_"),
         ];
 
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let env_from = container.env_from.as_ref().expect("envFrom present");
 
@@ -1229,14 +1289,15 @@ mod tests {
     }
 
     #[test]
-    fn job_without_pvcs_or_secret_has_only_work_spec_and_cache_volumes() {
+    fn job_without_pvcs_or_secret_has_only_the_cache_volume() {
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         let vols = pod.volumes.as_ref().unwrap();
-        // work-spec ConfigMap + the always-present writable kopia cache emptyDir.
+        // Only the always-present writable kopia cache emptyDir — the work
+        // spec rides the pod env, not a mounted ConfigMap (#224).
         let names: Vec<&str> = vols.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, vec!["work-spec", "kopia-cache"]);
+        assert_eq!(names, vec!["kopia-cache"]);
         assert!(pod.containers[0].env_from.is_none());
     }
 
@@ -1247,7 +1308,7 @@ mod tests {
     #[test]
     fn job_mounts_writable_kopia_cache_volume_and_env() {
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
 
         // emptyDir volume present.
@@ -1300,7 +1361,7 @@ mod tests {
     fn job_without_scratch_volume_mounts_no_scratch() {
         // Default inputs (every non-deep-verify run): no scratch volume/mount.
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert!(
             !pod.volumes
@@ -1326,7 +1387,7 @@ mod tests {
         let ws = sample_work_spec();
         let mut i = inputs(&ws, JobLimits::default());
         i.scratch_volume = Some(CacheVolume::EmptyDir);
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
 
         // An emptyDir scratch volume is present...
@@ -1368,7 +1429,7 @@ mod tests {
             capacity: "50Gi".into(),
             storage_class: Some("fast-ssd".into()),
         });
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         let vol = pod
             .volumes
@@ -1401,7 +1462,7 @@ mod tests {
     fn pod_security_context_flows_to_the_mover_pod() {
         // Default: no pod-level securityContext on the mover pod (minimal spec).
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         assert!(
             job.spec
                 .as_ref()
@@ -1417,7 +1478,7 @@ mod tests {
             fs_group: Some(1000),
             ..Default::default()
         });
-        let job = build_job(&i);
+        let job = build_job(&i).unwrap();
         let psc = job
             .spec
             .unwrap()
@@ -1449,7 +1510,7 @@ mod tests {
             node_affinity: Some(NodeAffinity::default()),
             ..Default::default()
         });
-        let pod = build_job(&i).spec.unwrap().template.spec.unwrap();
+        let pod = build_job(&i).unwrap().spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.node_selector.unwrap()["disktype"], "ssd");
         assert_eq!(
             pod.tolerations.unwrap()[0].key.as_deref(),
@@ -1459,6 +1520,7 @@ mod tests {
 
         // Unset → pod placement fields stay None (no churn for the common case).
         let bare = build_job(&inputs(&ws, JobLimits::default()))
+            .unwrap()
             .spec
             .unwrap()
             .template
@@ -1505,17 +1567,19 @@ mod tests {
     }
 
     #[test]
-    fn job_mounts_work_spec_configmap_with_matching_env() {
+    fn job_needs_no_work_spec_volume() {
+        // The run is exactly ONE Kubernetes object: no sidecar ConfigMap, no
+        // work-spec mount — the spec rides the pod env (#224).
         let ws = sample_work_spec();
-        let job = build_job(&inputs(&ws, JobLimits::default()));
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
-        let vol = &pod.volumes.as_ref().unwrap()[0];
-        assert_eq!(vol.config_map.as_ref().unwrap().name, "db-1");
-        let env = &pod.containers[0].env.as_ref().unwrap()[0];
-        assert_eq!(env.name, WORK_SPEC_ENV);
-        assert_eq!(
-            env.value.as_deref(),
-            Some(format!("{WORK_SPEC_MOUNT}/{WORK_SPEC_FILE}").as_str())
-        );
+        let names: Vec<_> = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(!names.contains(&"work-spec"), "volumes: {names:?}");
     }
 }

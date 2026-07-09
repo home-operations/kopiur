@@ -137,7 +137,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // is NOT terminal here — see `phase_is_terminal_at_guard`.)
     match restore.status.as_ref().and_then(|s| s.phase) {
         Some(phase) if phase_is_terminal_at_guard(phase, state) => {
-            return steady_terminal_restore(restore, ctx, &api, &namespace, &name, phase).await;
+            return steady_terminal_restore(restore, &api, &name, phase).await;
         }
         _ => {}
     }
@@ -1142,9 +1142,7 @@ enum MoverOutcome {
 /// Self-gated by `kstatus_settled_for`, so a healed Restore never re-patches.
 async fn steady_terminal_restore(
     restore: &Restore,
-    ctx: &Context,
     api: &Api<Restore>,
-    namespace: &str,
     name: &str,
     phase: RestorePhase,
 ) -> Result<Action> {
@@ -1170,35 +1168,12 @@ async fn steady_terminal_restore(
         };
         io::patch_status(api, name, status).await?;
     }
-    // The COMMON terminal path lands here, not in `run_restore_mover`'s
-    // terminal arms: the mover stamps the terminal phase before its pod exits,
-    // and this guard then short-circuits every later reconcile. Reap the
-    // work-spec ConfigMap once the direct-restore mover Job (named after the
-    // Restore) is observed terminal; the Job keeps the pod logs until its TTL.
-    // Gated on the run having finished within the reap lookback — beyond it
-    // the Job is certainly TTL-reaped and the GET would 404 on every heartbeat
-    // for as long as the Restore CR lives (the orphan sweep owns stragglers).
-    // A populator restore has no Job of this name (its `-populate` artifacts
-    // are `finalize_populator`'s) — a one-time absent-Job GET there.
-    let end_time = restore
-        .status
-        .as_ref()
-        .and_then(|s| s.timing.as_ref())
-        .and_then(|t| t.end_time.as_deref());
-    if crate::snapshot::finished_recently(end_time, chrono::Utc::now()) {
-        let job_api: Api<k8s_openapi::api::batch::v1::Job> =
-            Api::namespaced(ctx.client.clone(), namespace);
-        if crate::snapshot::work_spec_reapable(job_api.get_opt(name).await?.as_ref()) {
-            io::reap_work_spec_cm(&ctx.client, namespace, name).await;
-        }
-    }
     Ok(Action::requeue(std::time::Duration::from_secs(600)))
 }
 
-/// Classify an EXISTING restore mover Job into a [`MoverOutcome`], reaping the
-/// work-spec ConfigMap at terminal (the Job stays until its TTL so pod logs
-/// remain reachable) and tearing down a wedged mover. Split from
-/// [`run_restore_mover`] so both stay under the complexity ratchet.
+/// Classify an EXISTING restore mover Job into a [`MoverOutcome`], tearing
+/// down a wedged mover. Split from [`run_restore_mover`] so both stay under
+/// the complexity ratchet.
 async fn observe_restore_mover(
     ctx: &Context,
     restore: &Restore,
@@ -1207,20 +1182,10 @@ async fn observe_restore_mover(
     job: &k8s_openapi::api::batch::v1::Job,
 ) -> Result<MoverOutcome> {
     Ok(match crate::snapshot::job_terminal_state(job) {
-        // Terminal either way: drop the work-spec ConfigMap now. Idempotent —
-        // the mover usually stamps the terminal phase before the Job goes
-        // terminal, in which case the entry guard short-circuits future
-        // reconciles and the periodic orphan sweep reaps the ConfigMap instead.
-        Some(true) => {
-            io::reap_work_spec_cm(&ctx.client, namespace, job_name).await;
-            MoverOutcome::Succeeded {
-                duration_secs: restore_job_duration_seconds(job),
-            }
-        }
-        Some(false) => {
-            io::reap_work_spec_cm(&ctx.client, namespace, job_name).await;
-            MoverOutcome::Failed
-        }
+        Some(true) => MoverOutcome::Succeeded {
+            duration_secs: restore_job_duration_seconds(job),
+        },
+        Some(false) => MoverOutcome::Failed,
         // A mover that can't START (impossible securityContext, bad image,
         // unschedulable) never terminates, so backoffLimit never trips — fail fast
         // past the pod-startup deadline instead of hanging to the 48h backstop.
@@ -1231,16 +1196,16 @@ async fn observe_restore_mover(
             if let io::WedgedVerdict::Wedged { reason, message } =
                 io::wedged_pod_verdict(&ctx.client, namespace, job_name, grace).await?
             {
-                // Reap the wedged Job (cascade) so the kubelet stops retrying,
-                // and its work-spec ConfigMap with it. BEST-EFFORT: an error here
-                // must not abort before `MoverOutcome::Wedged` reaches the caller —
-                // a partial teardown (Job gone, error surfaced) would otherwise
-                // leave the Restore un-Failed and the retry would spawn a fresh
-                // wedged mover, cycling instead of failing fast.
-                if let Err(e) = io::delete_mover_run(&ctx.client, namespace, job_name).await {
-                    tracing::warn!(restore = %job_name, error = %e,
-                        "wedged mover teardown failed (Job runs to its deadline; sweep reaps the ConfigMap)");
-                }
+                // Reap the wedged Job (cascade) so the kubelet stops retrying.
+                // BEST-EFFORT: an error must not abort before
+                // `MoverOutcome::Wedged` reaches the caller — the Restore would
+                // stay un-Failed and the retry would spawn a fresh wedged
+                // mover, cycling instead of failing fast.
+                let job_api: Api<k8s_openapi::api::batch::v1::Job> =
+                    Api::namespaced(ctx.client.clone(), namespace);
+                let _ = job_api
+                    .delete(job_name, &kube::api::DeleteParams::background())
+                    .await;
                 MoverOutcome::Wedged {
                     message: crate::snapshot::wedged_pod_message(&reason, &message, grace),
                 }
@@ -1646,9 +1611,8 @@ async fn run_restore_mover(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, namespace, job_name, None, &job).await?;
     let source_label = match selection {
         RestoreSelection::Snapshot(id) => format!("snapshot {id}"),
         RestoreSelection::Resolve(sel) => {

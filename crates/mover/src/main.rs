@@ -199,8 +199,7 @@ async fn run(cli: &MoverCli) -> Result<()> {
     // client (the rustls-tls backend panics without it). Idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let spec_path = work_spec_path(cli.work_spec.clone())?;
-    let spec = load_work_spec(&spec_path)?;
+    let spec = resolve_work_spec(cli.work_spec.clone())?;
     let operation = spec.operation.kind_str().to_string();
     info!(
         operation = %operation,
@@ -1712,15 +1711,26 @@ impl MoverMetrics {
     }
 }
 
-/// Locate the run-once work spec: positional arg, else [`env::WORK_SPEC_PATH`].
-/// The env fallback is deliberately manual (not clap `#[arg(env)]`) — see
+/// Load the run-once work spec. Resolution order:
+/// 1. a positional path arg (manual/debug invocations),
+/// 2. the INLINE JSON in [`env::WORK_SPEC`] (how the controller passes it —
+///    embedded in the Job env so the run is one self-cleaning object, #224),
+/// 3. a file at [`env::WORK_SPEC_PATH`] (legacy ConfigMap-mounting Jobs).
+///
+/// The env fallbacks are deliberately manual (not clap `#[arg(env)]`) — see
 /// [`kopiur_mover::cli`].
-fn work_spec_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_work_spec(arg: Option<PathBuf>) -> Result<MoverWorkSpec> {
     if let Some(arg) = arg {
-        return Ok(arg);
+        return load_work_spec(&arg);
+    }
+    if let Ok(inline) = std::env::var(kopiur_mover::env::WORK_SPEC) {
+        return serde_json::from_str(&inline).map_err(|source| MoverError::WorkSpecParse {
+            path: PathBuf::from(format!("${}", kopiur_mover::env::WORK_SPEC)),
+            source,
+        });
     }
     if let Ok(env) = std::env::var(WORK_SPEC_PATH) {
-        return Ok(PathBuf::from(env));
+        return load_work_spec(&PathBuf::from(env));
     }
     Err(MoverError::WorkSpecPathMissing)
 }

@@ -13,12 +13,13 @@ mod common;
 
 use common::{
     cr, ensure_repo, observed_snapshot_count, repository_json, snapshot_json, snapshot_policy_json,
-    wait_for_work_spec_cm, wait_phase,
+    wait_for_work_spec_json, wait_phase,
 };
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 
-use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::Pod;
 
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, builders, consts, wait};
@@ -124,8 +125,8 @@ async fn ignore_file_errors_lets_snapshot_complete() {
     );
 }
 
-/// `compression` + `upload` knobs reach the controller→mover work-spec ConfigMap
-/// (the contract the mover's `kopia policy set` consumes — its flag construction
+/// `compression` + `upload` knobs reach the controller→mover work-spec (the
+/// Job-embedded contract the mover's `kopia policy set` consumes — its flag
 /// is unit-tested in `crates/kopia`), and kopia accepts them (`Succeeded`: a bad
 /// compressor would fail the mover's policy-set step).
 #[tokio::test]
@@ -166,19 +167,11 @@ async fn compression_and_upload_knobs_reach_the_mover_contract() {
         )
         .await;
 
-    // The work-spec ConfigMap (same name as the mover Job) carries the knobs.
-    // Sync on the ConfigMap itself, not the Job: the ConfigMap is applied
-    // BEFORE the Job and deleted only after the Job is observed terminal (the
-    // ConfigMap-leak fix), so this read can never race the reap.
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = wait_for_work_spec_cm(&cms, "e2e-knobs").await;
-    let spec_json = cm
-        .data
-        .as_ref()
-        .and_then(|d| d.get("work-spec.json"))
-        .expect("work-spec.json key");
-    let spec: serde_json::Value =
-        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+    // The mover Job's inline work-spec env carries the knobs (#224: the spec
+    // rides the Job itself — no per-run ConfigMap). The Job outlives the run
+    // by its TTL, so this read never races completion.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let spec = wait_for_work_spec_json(&jobs, "e2e-knobs").await;
     let policy = spec
         .pointer("/operation/snapshot/policy")
         .unwrap_or(&serde_json::Value::Null);
@@ -259,15 +252,8 @@ async fn snapshot_create_knobs_reach_the_mover_contract() {
     // The work-spec ConfigMap (same name as the mover Job) carries all three
     // knobs directly on `operation.snapshot` — NOT under `.policy` (the
     // `policy set` args), proving the recipe/invocation split holds end to end.
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = wait_for_work_spec_cm(&cms, "e2e-create-knobs").await;
-    let spec_json = cm
-        .data
-        .as_ref()
-        .and_then(|d| d.get("work-spec.json"))
-        .expect("work-spec.json key");
-    let spec: serde_json::Value =
-        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let spec = wait_for_work_spec_json(&jobs, "e2e-create-knobs").await;
     let snapshot_op = spec
         .pointer("/operation/snapshot")
         .unwrap_or(&serde_json::Value::Null);

@@ -20,28 +20,33 @@ use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
 use crate::error::{Error, Result};
 
-/// Apply both the work-spec `ConfigMap` and the mover `Job` (server-side).
-/// Both carry the owner reference so GC reaps them with the CR (§4.10).
+/// Apply a mover run's objects (server-side): the `Job` (which carries the
+/// work spec inline in its pod env) and, for bootstrap/probe runs only, the
+/// result `ConfigMap` the mover PATCHes its outcome into. Everything carries
+/// the owner reference so GC reaps it with the CR (§4.10); the Job's
+/// `ttlSecondsAfterFinished` handles the interim.
 pub async fn apply_mover_objects(
     client: &kube::Client,
     namespace: &str,
     name: &str,
-    config_map: &ConfigMap,
+    result_config_map: Option<&ConfigMap>,
     job: &Job,
 ) -> Result<()> {
-    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    apply(&cm_api, name, config_map).await?;
+    if let Some(config_map) = result_config_map {
+        let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+        apply(&cm_api, name, config_map).await?;
+    }
     let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
     apply(&job_api, name, job).await?;
     Ok(())
 }
 
-/// Delete only the work-spec `ConfigMap` of a mover run, tolerating a 404 (owner
-/// GC or an earlier pass may have won). The Job is deliberately left to its
-/// `ttlSecondsAfterFinished` — it carries the pod logs and, for the slot-based
-/// reconcilers, is the durable "slot handled" marker until the TTL reaps it.
-/// Callers must only invoke this once the same-named Job is observed terminal
-/// (no pod will mount the ConfigMap again).
+/// Delete the same-named `ConfigMap` of a mover run, tolerating a 404 (owner
+/// GC or an earlier pass may have won). Today that ConfigMap exists only for
+/// bootstrap/probe runs (the result channel); for every other run kind this is
+/// a no-op 404 in the steady state, and cleans up the LEGACY per-run work-spec
+/// ConfigMap left by operator versions that mounted the spec instead of
+/// embedding it in the Job env.
 pub async fn delete_work_spec_cm(
     client: &kube::Client,
     namespace: &str,
@@ -56,30 +61,14 @@ pub async fn delete_work_spec_cm(
     Ok(())
 }
 
-/// Best-effort [`delete_work_spec_cm`] for the pure-hygiene call sites: a
-/// failed delete is only a DEFERRED cleanup (the periodic orphan sweep is the
-/// backstop), so it must never fail the reconcile that carried it — e.g. an
-/// admission policy denying ConfigMap deletes must not turn every completed
-/// maintenance slot into a reconcile error.
-pub async fn reap_work_spec_cm(client: &kube::Client, namespace: &str, job_name: &str) {
-    if let Err(e) = delete_work_spec_cm(client, namespace, job_name).await {
-        tracing::warn!(
-            configmap = %job_name, namespace = %namespace, error = %e,
-            "work-spec ConfigMap cleanup failed (deferred to the orphan sweep)"
-        );
-    }
-}
-
-/// Delete a mover run being torn down: the Job (background propagation, so its
-/// pods are reaped too) AND its same-named work-spec `ConfigMap`, both tolerating
-/// a 404 (the kube TTL controller may have reaped the Job first). Only for runs
-/// observed terminal or being force-failed (wedged) — never against a run whose
-/// pod may still mount the ConfigMap.
+/// Delete a mover run being consumed: the Job (background propagation, so its
+/// pods are reaped too) AND its same-named `ConfigMap` (the bootstrap result
+/// channel, or a legacy work-spec leftover), both tolerating a 404 (the kube
+/// TTL controller may have reaped the Job first). Only for runs observed
+/// terminal or being force-failed.
 ///
 /// Propagates non-404 errors: the bootstrap/probe consumers rely on the delete
 /// for their consume-exactly-once semantics, so a failure there must requeue.
-/// Wedged-teardown call sites wrap this best-effort instead — aborting a
-/// reconcile mid-teardown would skip the staged-source cleanup that follows.
 pub async fn delete_mover_run(
     client: &kube::Client,
     namespace: &str,

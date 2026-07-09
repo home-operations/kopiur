@@ -124,10 +124,10 @@ End a warm browse session early (it expires by TTL anyway):
 ```console
 $ kubectl kopiur session end nightly-20260611-030012 -n media   # via a snapshot in that repo
 $ kubectl kopiur session end --repository nas -n media          # or the repository directly
-session kopiur-browse-nas-1a2b3c4d ended (Job + work-spec ConfigMap deleted)
+session kopiur-browse-nas-1a2b3c4d ended (Job deleted)
 ```
 
-Deletes the session Job and its work-spec ConfigMap. When no session is open
+Deletes the session Job (the session's whole spec rides the Job). When no session is open
 it says so and exits 0 — safe to run from cleanup scripts. Sessions are also
 labeled (`kopiur.home-operations.com/session=browse`) so a plain
 `kubectl delete job -l kopiur.home-operations.com/session=browse` works too.
@@ -208,7 +208,7 @@ kopiur:/config> quit
 
 ```console
 $ kubectl kopiur session end nightly-manual-20260611030012 -n media
-session kopiur-browse-nas-1a2b3c4d ended (Job + work-spec ConfigMap deleted)
+session kopiur-browse-nas-1a2b3c4d ended (Job deleted)
 ```
 
 /// note | Illustrative output

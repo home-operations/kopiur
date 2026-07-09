@@ -171,8 +171,8 @@ same `logTail`/`failure` fields appear on a failed `Restore`.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
 
-/// note | The Job stays, the ConfigMap doesn't
-A finished run's mover **Job** (and its pod logs, as above) sticks around until its `ttlSecondsAfterFinished` (default 1h). The run's **work-spec ConfigMap** is deleted as soon as the run finishes — it only carried the instructions the controller handed the mover, which are derived from your CRs, so there is nothing in it to debug. If you don't see per-run ConfigMaps anymore: that's the fix for the leak where one accumulated per run, forever. See [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
+/// note | The run is one object — the Job
+A finished run's mover **Job** (and its pod logs, as above) sticks around until its `ttlSecondsAfterFinished` (default 1h). The instructions the controller handed the mover ride the Job itself — `kubectl get job <name> -o yaml` shows them in the pod env as `KOPIUR_WORK_SPEC`. If you don't see per-run work-spec ConfigMaps anymore: they no longer exist — that's the fix for the leak where one accumulated per run, forever (#224). See [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
 ///
 
 ## Backup `Succeeded` but is **incomplete** (`filesFailed > 0`)

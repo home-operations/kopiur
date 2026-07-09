@@ -831,9 +831,9 @@ async fn bootstrap_cluster_via_mover(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, &job_ns, &job_name, &cm, &job).await?;
+    let cm = jobs::build_result_config_map(&inputs);
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, &job_ns, &job_name, Some(&cm), &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored. A
     // health-probe re-run keeps the phase `Ready` so backups/replication aren't paused.
     let mut create_status = if keep_ready_on_launch {

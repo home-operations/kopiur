@@ -114,19 +114,21 @@ pub enum MoverError {
         message: String,
     },
 
-    /// No work-spec path was provided at all.
+    /// No work spec was provided at all.
     #[error(
-        "no work spec path: pass it as the first arg or set {}",
+        "no work spec: pass a path as the first arg, or set {} (inline JSON, how the \
+         controller passes it) or {} (a file path)",
+        crate::env::WORK_SPEC,
         crate::env::WORK_SPEC_PATH
     )]
     WorkSpecPathMissing,
 
     /// The work-spec file could not be read.
     #[error(
-        "failed to read the work spec at {}: {source}. The controller mounts it via the \
-         work-spec ConfigMap — check the Job's volume mount and {}",
+        "failed to read the work spec at {}: {source} — check the path (for a \
+         controller-created Job the spec is inline in the {} env instead)",
         .path.display(),
-        crate::env::WORK_SPEC_PATH
+        crate::env::WORK_SPEC
     )]
     WorkSpecRead {
         /// The path that could not be read.
@@ -533,7 +535,9 @@ mod tests {
         };
         let msg = read.to_string();
         assert!(msg.contains("/spec/work.json"), "{msg}");
-        assert!(msg.contains("work-spec ConfigMap"), "{msg}");
+        // The fix points at the inline-env contract (the controller no longer
+        // mounts a work-spec ConfigMap).
+        assert!(msg.contains("KOPIUR_WORK_SPEC"), "{msg}");
     }
 
     #[test]

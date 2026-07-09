@@ -304,16 +304,20 @@ Re-add the annotation (re-apply the bundle's `namespace` section, or `kubectl an
 
 ## Run artifacts & cleanup
 
-Every mover run consists of exactly two Kubernetes objects, applied together and cleaned up on different clocks:
+A mover run is exactly **one Kubernetes object: the `Job`**. The controller embeds the run's instructions (the *work spec*, serialized JSON) directly in the Job's pod environment as `KOPIUR_WORK_SPEC` — there is no per-run ConfigMap, Secret, or other sidecar object. That means:
 
-- **The mover `Job`** (and its pod) lives until its `ttlSecondsAfterFinished` — 1 hour by default, tunable per recipe (`spec.mover.ttlSecondsAfterFinished`) or repository-wide (`spec.moverDefaults.ttlSecondsAfterFinished`). Kopiur never deletes a finished Job early: the pod logs are your debugging record, and `kubectl kopiur logs` resolves them through the Job for as long as the TTL keeps it around.
-- **The work-spec `ConfigMap`** (same name as the Job, one key `work-spec.json` — the controller→mover contract) is needed only while the pod runs. The controller **deletes it as soon as it observes the Job terminal**, succeeded or failed. Its contents are derived from your CRs, so nothing debuggable is lost — the spec that produced a run can always be reconstructed from the `SnapshotPolicy`/`Snapshot`.
+- **One clock cleans up everything.** The Job (and its pod) lives until its `ttlSecondsAfterFinished` — 1 hour by default, tunable per recipe (`spec.mover.ttlSecondsAfterFinished`) or repository-wide (`spec.moverDefaults.ttlSecondsAfterFinished`). Kopiur never deletes a finished Job early: the pod logs are your debugging record, and `kubectl kopiur logs` resolves them through the Job for as long as the TTL keeps it around.
+- **The full controller→mover contract is inspectable in one place**: `kubectl get job <name> -o yaml` shows the pod template *and* the exact work spec the mover ran, for the Job's whole lifetime. The work spec never contains credentials — those reach the mover via `envFrom` Secret references.
 
-Without that delete the ConfigMaps accumulated forever: they are owner-referenced to long-lived CRs (a `Snapshot` is the durable record of a backup; a `SnapshotPolicy` or `RepositoryReplication` never goes away), so Kubernetes GC alone never reaped them — an hourly backup leaked one ConfigMap per hour, per app.
+The one exception is repository **bootstrap/probe** runs, which additionally create a small result `ConfigMap` (same name as the Job) the mover writes its outcome into — needed because the controller may read the result after the Job is already gone. It is one fixed-name object per repository, consumed and deleted by the controller; it cannot accumulate.
 
-### The orphan sweep
+/// note | Why not a ConfigMap?
+Operator versions up to 0.7.0 mounted the work spec from a per-run ConfigMap. The Job self-reaped via its TTL, but ConfigMaps have no TTL mechanism and were owner-referenced to long-lived CRs (a `Snapshot` is the durable record of a backup; a `SnapshotPolicy` never goes away) — so one ConfigMap leaked per run, forever (issue #224: 605 in one reported cluster). Embedding the spec in the Job removes the second object, and with it the entire leak class.
+///
 
-A ConfigMap whose Job is *already gone* (reaped by its TTL while the operator was down, or left behind by operator versions before the fix) is invisible to the transition-time cleanup. A leader-only background sweep heals those: every 6 hours it lists Kopiur-managed ConfigMaps and deletes work-spec ones that have **no same-named Job** and are **older than 1 hour**. Bootstrap result ConfigMaps (`result.json`) and anything a live run still mounts are never touched. On upgrade, clusters that accumulated historical work-spec ConfigMaps converge automatically — no `kubectl` cleanup needed.
+### The legacy-ConfigMap sweep
+
+Clusters upgraded from versions that created per-run work-spec ConfigMaps still hold the historical leftovers. A leader-only background sweep heals them: every 6 hours it lists Kopiur-managed ConfigMaps and deletes work-spec ones (data key `work-spec.json`) that have **no same-named Job** and are **older than 1 hour**. Bootstrap result ConfigMaps and anything a live legacy run still mounts are never touched. On upgrade, the backlog drains automatically — no `kubectl` cleanup needed.
 
 Two environment variables tune it (set via the chart's controller `extraEnv`):
 
@@ -322,11 +326,7 @@ Two environment variables tune it (set via the chart's controller `extraEnv`):
 | `KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS` | `21600` (6h) | Sweep cadence; `0` disables the sweep entirely. |
 | `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` | `3600` (1h) | Minimum ConfigMap age before it may be reaped. |
 
-Each pass increments the `kopiur_work_spec_cms_swept_total` counter on `/metrics`, so you can watch a backlog drain after an upgrade.
-
-/// note | "Where did the ConfigMap go?"
-If you previously inspected `work-spec.json` after a run finished, do it while the run is in flight — or read the equivalent fields from the CR spec/status. The Job (and pod logs) remain available until the TTL either way.
-///
+Each pass increments the `kopiur_work_spec_cms_swept_total` counter on `/metrics`, so you can watch the backlog drain after an upgrade.
 
 ## Troubleshooting
 

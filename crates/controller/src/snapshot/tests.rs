@@ -933,66 +933,6 @@ fn staged_teardown_proceeds_on_terminal_or_absent_job() {
     assert!(staged_teardown_ready(None), "absent Job → reap");
 }
 
-// The work-spec ConfigMap-leak fix: the ConfigMap is reaped only when the Job
-// is OBSERVED terminal. Note the deliberate contrast with staged teardown on
-// an absent Job: teardown proceeds (nothing left to strand), but the ConfigMap
-// reap does NOT (the orphan sweep owns that case — re-issuing a delete on every
-// steady-state pass would chatter forever).
-#[test]
-fn work_spec_reap_requires_an_observed_terminal_job() {
-    use k8s_openapi::api::batch::v1::JobStatus;
-    let running = job_with_status(Some(JobStatus {
-        active: Some(1),
-        ..Default::default()
-    }));
-    let complete = job_with_status(Some(JobStatus {
-        conditions: Some(vec![job_condition("Complete", "True")]),
-        succeeded: Some(1),
-        ..Default::default()
-    }));
-    let failed = job_with_status(Some(JobStatus {
-        conditions: Some(vec![job_condition("Failed", "True")]),
-        ..Default::default()
-    }));
-    assert!(
-        !work_spec_reapable(Some(&running)),
-        "a running Job's pod still mounts the ConfigMap"
-    );
-    assert!(!work_spec_reapable(Some(&job_with_status(None))));
-    assert!(work_spec_reapable(Some(&complete)), "Complete → reap");
-    assert!(
-        work_spec_reapable(Some(&failed)),
-        "Failed → reap too (manual Failed Snapshots are never pruned; the Job keeps the logs)"
-    );
-    assert!(
-        !work_spec_reapable(None),
-        "absent Job → the sweep's case, not the reconciler's"
-    );
-}
-
-// The steady-state Job GET is gated on the run having finished within the reap
-// lookback: Snapshot CRs live indefinitely, so an ungated GET would 404 on
-// every 600s heartbeat, forever, for every historical backup.
-#[test]
-fn finished_recently_bounds_the_steady_state_job_get() {
-    let now = chrono::Utc::now();
-    let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
-    let ancient = (now - chrono::Duration::days(30)).to_rfc3339();
-    assert!(finished_recently(Some(&recent), now));
-    assert!(
-        !finished_recently(Some(&ancient), now),
-        "a month-old backup's Job is certainly TTL-reaped — no GET"
-    );
-    assert!(
-        !finished_recently(None, now),
-        "no endTime → the orphan sweep owns cleanup, not the heartbeat"
-    );
-    assert!(
-        !finished_recently(Some("not-a-timestamp"), now),
-        "unparseable endTime must not re-enable the forever-GET"
-    );
-}
-
 // The pin-Job lookup gate: never-pinned Snapshots (the overwhelmingly common
 // case) skip the per-heartbeat GET; anything that ever spawned a pin mover —
 // including one whose spec.pin was toggled back mid-flight — stays findable

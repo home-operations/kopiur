@@ -1,17 +1,18 @@
-//! e2e regression guards for the **work-spec ConfigMap leak** (the "605
-//! ConfigMaps" report): every mover run applies a work-spec `ConfigMap` + `Job`
-//! pair, owner-referenced to a long-lived CR. The Job self-reaps via
+//! e2e regression guards for the **work-spec ConfigMap leak** (#224, the "605
+//! ConfigMaps" report): mover runs used to apply a work-spec `ConfigMap` +
+//! `Job` pair, owner-referenced to a long-lived CR. The Job self-reaped via
 //! `ttlSecondsAfterFinished`, but nothing ever deleted the ConfigMap — it lived
 //! as long as its owner (a `Snapshot` CR is the durable backup record, a
 //! `SnapshotPolicy`/`RepositoryReplication` is permanent), so one ConfigMap
 //! accumulated per run, forever.
 //!
-//! The fix has two halves, each guarded here:
-//! 1. **Transition reap** — a reconciler deletes the ConfigMap as soon as it
-//!    observes the Job terminal (the Job stays until its TTL: pod logs).
-//! 2. **Orphan sweep** — a leader-only periodic pass reaps work-spec ConfigMaps
-//!    whose Job is already gone (pre-fix leftovers, reap-before-observe). The
-//!    harness values (`deploy/e2e/values.yaml`) run it on a fast cadence.
+//! The fix is structural, and both halves are guarded here:
+//! 1. **No per-run ConfigMap exists at all** — the work spec rides the mover
+//!    Job's own pod env, so a run is exactly ONE object whose TTL cleans up
+//!    everything.
+//! 2. **Orphan sweep** — a leader-only periodic pass reaps the LEGACY
+//!    work-spec ConfigMaps left by pre-fix operator versions. The harness
+//!    values (`deploy/e2e/values.yaml`) run it on a fast cadence.
 //!
 //! Plus the pin-consumption bug the audit surfaced: a stale terminal
 //! `{name}-pin` Job satisfied the next pin toggle's "Job succeeded" check, so
@@ -140,43 +141,37 @@ async fn create_snapshot(
     backups
 }
 
-/// Wait until the work-spec ConfigMap named `name` is gone.
-async fn wait_cm_reaped(cms: &Api<ConfigMap>, name: &str) {
-    wait_until(
-        &format!("work-spec ConfigMap {name} reaped"),
-        default_timeout(),
-        poll_interval(),
-        || async { Ok(cms.get_opt(name).await?.is_none().then_some(())) },
-    )
-    .await
-    .expect("the controller should delete the work-spec ConfigMap at Job-terminal");
+/// Assert the run named `name` has NO same-named ConfigMap — the work spec
+/// rides the Job env, so a per-run ConfigMap existing at any point is the
+/// leak regression.
+async fn assert_no_work_spec_cm(cms: &Api<ConfigMap>, name: &str, when: &str) {
+    assert!(
+        cms.get_opt(name).await.expect("get ConfigMap").is_none(),
+        "run {name} has a per-run work-spec ConfigMap ({when}) — the spec must ride the Job env"
+    );
 }
 
-/// Assert the ConfigMap named `name` does not reappear during [`QUIET_WINDOW`].
+/// Assert no ConfigMap named `name` appears during [`QUIET_WINDOW`].
 async fn assert_cm_stays_gone(cms: &Api<ConfigMap>, name: &str, while_doing: &str) {
     let deadline = tokio::time::Instant::now() + QUIET_WINDOW;
     while tokio::time::Instant::now() < deadline {
-        if cms.get_opt(name).await.expect("get ConfigMap").is_some() {
-            panic!(
-                "work-spec ConfigMap {name} was re-created while {while_doing} — a reconcile \
-                 is re-applying mover objects for a terminal run"
-            );
-        }
+        assert_no_work_spec_cm(cms, name, while_doing).await;
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
 // ---------------------------------------------------------------------------
-// 1. Succeeded backup: ConfigMap reaped at Job-terminal, Job left to its TTL.
+// 1. Succeeded backup: no per-run ConfigMap exists at any point; the Job (its
+//    env carries the whole spec) is left to its TTL.
 // ---------------------------------------------------------------------------
 
 /// THE leak report: one work-spec ConfigMap per (hourly) backup, forever. The
-/// fixed controller deletes the ConfigMap once it observes the mover Job
-/// terminal — while the Job (default 1h TTL) is still present, proving the reap
-/// is the controller's transition-time delete rather than TTL or owner GC.
+/// fix is structural — the spec rides the mover Job's pod env, so no per-run
+/// ConfigMap is ever created, while the Job (default 1h TTL) still carries the
+/// full controller→mover contract and the pod logs.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn succeeded_backup_reaps_work_spec_cm_and_keeps_job() {
+async fn succeeded_backup_creates_no_work_spec_cm_and_keeps_job() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -206,21 +201,28 @@ async fn succeeded_backup_reaps_work_spec_cm_and_keeps_job() {
         .await
         .expect("Snapshot should reach Succeeded");
 
-    // The controller reaps the ConfigMap once it observes the Job terminal.
-    wait_cm_reaped(&cms, "e2e-leak-ok").await;
-
-    // The Job must still be there (default 1h TTL): pod logs stay reachable,
-    // user-set TTLs are honored — the leak fix must not eat the Job.
+    // No per-run ConfigMap was created; the Job (default 1h TTL) is present
+    // and carries the work spec inline.
+    assert_no_work_spec_cm(&cms, "e2e-leak-ok", "after Succeeded").await;
+    let job = jobs
+        .get_opt("e2e-leak-ok")
+        .await
+        .expect("get mover Job")
+        .expect("the succeeded mover Job must persist to its TTL");
+    let has_spec_env = job
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .is_some_and(|env| env.iter().any(|e| e.name == "KOPIUR_WORK_SPEC"));
     assert!(
-        jobs.get_opt("e2e-leak-ok")
-            .await
-            .expect("get mover Job")
-            .is_some(),
-        "the succeeded mover Job must outlive the ConfigMap reap (it self-reaps via its TTL)"
+        has_spec_env,
+        "the mover Job must carry the inline work-spec env"
     );
 
-    // Poke the Snapshot (any watch event re-reconciles it — it owns the CM, so
-    // the deletion event already did once): the ConfigMap must STAY gone.
+    // Poke the Snapshot (any watch event re-reconciles it): no ConfigMap may
+    // appear — a terminal run must not re-apply mover objects.
     let poke = serde_json::json!({
         "metadata": { "annotations": { "kopiur-e2e/leak-poke": "1" } }
     });
@@ -244,13 +246,13 @@ async fn succeeded_backup_reaps_work_spec_cm_and_keeps_job() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Failed backup: ConfigMap reaped too (manual Failed Snapshots are never
-//    pruned, so their ConfigMaps would leak unbounded); Job kept for logs.
+// 2. Failed backup: no per-run ConfigMap either (manual Failed Snapshots are
+//    never pruned, so a ConfigMap would leak unbounded); Job kept for logs.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn failed_backup_reaps_work_spec_cm_and_keeps_job() {
+async fn failed_backup_creates_no_work_spec_cm_and_keeps_job() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -281,7 +283,7 @@ async fn failed_backup_reaps_work_spec_cm_and_keeps_job() {
         .await
         .expect("poisoned Snapshot should end Failed");
 
-    wait_cm_reaped(&cms, "e2e-leak-fail").await;
+    assert_no_work_spec_cm(&cms, "e2e-leak-fail", "after Failed").await;
     assert!(
         jobs.get_opt("e2e-leak-fail")
             .await
@@ -292,7 +294,7 @@ async fn failed_backup_reaps_work_spec_cm_and_keeps_job() {
     assert_cm_stays_gone(
         &cms,
         "e2e-leak-fail",
-        "waiting after a Failed Snapshot's CM reap",
+        "waiting after a Failed Snapshot went terminal",
     )
     .await;
 }
@@ -360,9 +362,9 @@ async fn pin_toggle_after_success_runs_a_fresh_pin_job() {
     .await
     .expect("the pin mover must record status.pinned = true");
 
-    // Regression assert #1: the terminal pin Job (and its ConfigMap) is
-    // CONSUMED once its result is recorded. On the buggy code both linger for
-    // the Job's TTL (1h) — this wait times out.
+    // Regression assert #1: the terminal pin Job is CONSUMED once its result
+    // is recorded. On the buggy code it lingers for its TTL (1h) — this wait
+    // times out.
     wait_until(
         "terminal pin Job consumed",
         default_timeout(),
@@ -377,7 +379,7 @@ async fn pin_toggle_after_success_runs_a_fresh_pin_job() {
     )
     .await
     .expect("the succeeded pin Job must be consumed after status.pinned is recorded");
-    wait_cm_reaped(&cms, "e2e-leak-pin-pin").await;
+    assert_no_work_spec_cm(&cms, "e2e-leak-pin-pin", "after pin-Job consumption").await;
 
     // Unpin — and require a FRESH pin Job to appear while the flip completes.
     // On the buggy code (stale Job satisfying the success check) the flip
@@ -429,13 +431,12 @@ async fn pin_toggle_after_success_runs_a_fresh_pin_job() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Restore: same contract as backups — ConfigMap reaped at Job-terminal
-//    (via the terminal entry guard: the mover stamps `Completed` first).
+// 4. Restore: same contract as backups — no per-run ConfigMap; Job to its TTL.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn completed_restore_reaps_work_spec_cm_and_keeps_job() {
+async fn completed_restore_creates_no_work_spec_cm_and_keeps_job() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -508,20 +509,19 @@ async fn completed_restore_reaps_work_spec_cm_and_keeps_job() {
         .await
         .expect("Restore should reach Completed");
 
-    // The terminal guard reaps the ConfigMap once the restore Job is observed
-    // terminal; the Job (default 1h TTL) must survive it.
-    wait_cm_reaped(&cms, "e2e-leak-restore").await;
+    // No per-run ConfigMap was created; the Job (default 1h TTL) persists.
+    assert_no_work_spec_cm(&cms, "e2e-leak-restore", "after Completed").await;
     assert!(
         jobs.get_opt("e2e-leak-restore")
             .await
             .expect("get restore Job")
             .is_some(),
-        "the completed restore Job must outlive the ConfigMap reap (it self-reaps via its TTL)"
+        "the completed restore Job must persist to its TTL"
     );
     assert_cm_stays_gone(
         &cms,
         "e2e-leak-restore",
-        "waiting after a Completed Restore's CM reap",
+        "waiting after a Completed Restore",
     )
     .await;
 }
