@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 
 use kopiur_api::{ClusterRepository, Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
@@ -1199,7 +1199,7 @@ async fn restore_options_flag_sweep_reaches_work_spec_and_completes() {
     let client = world.client().clone();
     ensure_seed_backup(&client).await;
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
 
     let name = "e2e-r-flags";
     cleanup_restore(&restores, name).await;
@@ -1216,23 +1216,19 @@ async fn restore_options_flag_sweep_reaches_work_spec_and_completes() {
         .await
         .expect("create Restore with an options flag sweep");
 
-    // The work-spec ConfigMap shares the mover Job's name, which for a
-    // pvc-create target (restore_json's default) equals the Restore's own name.
-    let cm = wait_until(
-        "restore work-spec ConfigMap is created",
-        default_timeout(),
-        poll_interval(),
-        || async { cms.get_opt(name).await },
-    )
-    .await
-    .expect("restore work-spec ConfigMap should be created");
-    let spec_json = cm
-        .data
+    // The mover Job (named after the Restore for a pvc-create target) carries
+    // the work spec inline in its pod env (#224 — no per-run ConfigMap).
+    let job = wait_for_job(&jobs, name).await;
+    let raw = job
+        .spec
         .as_ref()
-        .and_then(|d| d.get("work-spec.json"))
-        .expect("work-spec.json key");
-    let spec: serde_json::Value =
-        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .and_then(|env| env.iter().find(|e| e.name == "KOPIUR_WORK_SPEC"))
+        .and_then(|e| e.value.clone())
+        .expect("restore Job carries the inline work-spec env");
+    let spec: serde_json::Value = serde_json::from_str(&raw).expect("work-spec env parses as JSON");
     let restore_op = spec
         .pointer("/operation/restore")
         .unwrap_or(&serde_json::Value::Null);

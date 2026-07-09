@@ -6,6 +6,30 @@ the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which mo
 the CRDs between two Helm mechanisms and needs one deliberate step to avoid data
 loss. Read that section before you cross it.
 
+## After 0.7.0: per-run work-spec ConfigMaps no longer exist (no action needed)
+
+Versions after 0.7.0 fix a resource leak: every mover run (backup, restore,
+verify, replication, maintenance, pin) left its `work-spec.json` ConfigMap
+behind forever — clusters with hourly schedules accumulated hundreds. The fix
+is structural, and both halves are automatic:
+
+- The controller now **embeds the work spec in the mover Job's pod env**
+  (`KOPIUR_WORK_SPEC`) — a run is one object, and no per-run ConfigMap is
+  created at all. The Job still lingers to its `ttlSecondsAfterFinished`
+  (default 1h) — pod logs and `kubectl kopiur logs` are unaffected, and
+  `kubectl get job <name> -o yaml` now shows the full run spec in one place.
+  (Repository bootstrap/probe keeps one fixed-name result ConfigMap per
+  repository, consumed and deleted by the controller.)
+- A periodic **legacy sweep** (default: every 6h, ConfigMaps older than 1h with
+  no matching Job) deletes the work-spec ConfigMaps accumulated by earlier
+  versions, so existing clusters converge on their own after the upgrade — no
+  `kubectl` cleanup required. Watch the backlog drain via the
+  `kopiur_work_spec_cms_swept_total` counter.
+
+If any tooling of yours read the per-run ConfigMaps, read the Job's
+`KOPIUR_WORK_SPEC` env instead. Details and tuning knobs:
+[Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
+
 ## Upgrading 0.5.x → 0.6.0 (one-time CRD migration)
 
 /// danger | 0.5.x → 0.6.0 is a breaking upgrade — read this first

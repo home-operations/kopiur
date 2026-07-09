@@ -824,7 +824,7 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
             let job_name = kube::ResourceExt::name_any(&job);
             session::delete_session(ctx, &ns, &job_name).await?;
             Ok(CmdOutput::ok(format!(
-                "session {job_name} ended (Job + work-spec ConfigMap deleted)\n"
+                "session {job_name} ended (Job deleted)\n"
             )))
         }
         None => Ok(CmdOutput::ok(format!(

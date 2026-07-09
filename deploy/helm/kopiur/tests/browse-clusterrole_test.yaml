@@ -45,12 +45,14 @@ tests:
             apiGroups: [batch]
             resources: [jobs]
             verbs: [create, get, list, delete]
+      # `session end` only best-effort-deletes a LEGACY session's work-spec
+      # ConfigMap (the session spec rides the Job env today, #224).
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: [configmaps]
-            verbs: [create, get, delete]
+            verbs: [delete]
       - contains:
           path: rules
           content:

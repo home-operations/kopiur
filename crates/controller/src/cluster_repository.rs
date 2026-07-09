@@ -695,18 +695,7 @@ async fn bootstrap_cluster_via_mover(
                     )
                 {
                     tracing::debug!(repo = %name, "recycling finished bootstrap Job for a catalog refresh");
-                    job_api
-                        .delete(&job_name, &kube::api::DeleteParams::background())
-                        .await?;
-                    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &job_ns);
-                    match cm_api
-                        .delete(&job_name, &kube::api::DeleteParams::default())
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-                        Err(e) => return Err(Error::Kube(e)),
-                    }
+                    io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
                 finalize_cluster_bootstrap(
@@ -842,9 +831,9 @@ async fn bootstrap_cluster_via_mover(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, &job_ns, &job_name, &cm, &job).await?;
+    let cm = jobs::build_result_config_map(&inputs);
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, &job_ns, &job_name, Some(&cm), &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored. A
     // health-probe re-run keeps the phase `Ready` so backups/replication aren't paused.
     let mut create_status = if keep_ready_on_launch {
@@ -1194,25 +1183,7 @@ async fn finalize_cluster_probe_failure(
 /// Delete a finished cluster bootstrap Job + its result ConfigMap (in the creds
 /// Secret's namespace), tolerating a 404. Consumes a probe Job exactly once.
 async fn delete_cluster_bootstrap_job(ctx: &Context, job_ns: &str, job_name: &str) -> Result<()> {
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
-    match job_api
-        .delete(job_name, &kube::api::DeleteParams::background())
-        .await
-    {
-        Ok(_) => {}
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-        Err(e) => return Err(Error::Kube(e)),
-    }
-    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), job_ns);
-    match cm_api
-        .delete(job_name, &kube::api::DeleteParams::default())
-        .await
-    {
-        Ok(_) => {}
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-        Err(e) => return Err(Error::Kube(e)),
-    }
-    Ok(())
+    io::delete_mover_run(&ctx.client, job_ns, job_name).await
 }
 
 /// The steady-state requeue for a `ClusterRepository`, shortened to the

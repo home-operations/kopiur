@@ -31,12 +31,13 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
-/// Wait for a verify Job matching `selector`, then return its work-spec
-/// ConfigMap's `work-spec.json`, parsed. Verify Job names are per-slot
+/// Wait for a verify Job matching `selector`, then return its inline work-spec
+/// env (`KOPIUR_WORK_SPEC`), parsed. Verify Job names are per-slot
 /// (`<policy>-vfy-<q|d>-<unix_slot>`, [`crate::verify_job_name`] in the
-/// controller), not deterministic like other mover Jobs, so the CM is looked up
-/// by the FOUND Job's own name (the controller applies the CM under the same
-/// name as the Job — `io::apply_mover_objects`) rather than a name built here.
+/// controller), not deterministic like other mover Jobs, so the spec is read
+/// from the FOUND Job. The spec rides the Job itself (#224 — no per-run
+/// ConfigMap), and the Job outlives the slot by its TTL, so this never races
+/// completion.
 async fn verify_work_spec_json(client: &kube::Client, selector: &str) -> serde_json::Value {
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let job = wait_until(
@@ -50,18 +51,16 @@ async fn verify_work_spec_json(client: &kube::Client, selector: &str) -> serde_j
     )
     .await
     .expect("a verify Job should be spawned");
-    let job_name = job.metadata.name.expect("Job has a name");
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = cms
-        .get(&job_name)
-        .await
-        .unwrap_or_else(|_| panic!("work-spec ConfigMap {job_name}"));
-    let spec_json = cm
-        .data
+    let raw = job
+        .spec
         .as_ref()
-        .and_then(|d| d.get("work-spec.json"))
-        .expect("work-spec.json key");
-    serde_json::from_str(spec_json).expect("work-spec parses as JSON")
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .and_then(|env| env.iter().find(|e| e.name == "KOPIUR_WORK_SPEC"))
+        .and_then(|e| e.value.clone())
+        .expect("verify Job carries the inline work-spec env");
+    serde_json::from_str(&raw).expect("work-spec env parses as JSON")
 }
 
 /// Verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.quick` with an
@@ -160,6 +159,29 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
         Some(1),
         "verification.quick.maxErrors must reach the mover contract; quick: {quick}"
     );
+
+    // Leak guard (the "605 ConfigMaps" fix, #224): a verify slot creates NO
+    // per-run ConfigMap at all — the spec rides the Job env. Per-slot names
+    // used to accumulate one ConfigMap per slot on the long-lived
+    // SnapshotPolicy, forever.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let lp = ListParams::default().labels(
+        "app.kubernetes.io/component=verify,\
+         kopiur.home-operations.com/verify=e2e-verify-policy",
+    );
+    for job in jobs.list(&lp).await.expect("list verify Jobs").items {
+        let Some(job_name) = job.metadata.name else {
+            continue;
+        };
+        assert!(
+            cms.get_opt(&job_name)
+                .await
+                .expect("query ConfigMap")
+                .is_none(),
+            "verify slot {job_name} must not create a per-run work-spec ConfigMap (leak guard)"
+        );
+    }
 }
 
 /// Deep verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.deep` drives

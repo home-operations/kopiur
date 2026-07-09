@@ -189,7 +189,7 @@ pub struct BrowseArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum SessionCommand {
     /// End the warm browse session holding a repository open (deletes its
-    /// Job + work-spec ConfigMap). A no-op when no session exists.
+    /// Job). A no-op when no session exists.
     End(SessionEndArgs),
 }
 

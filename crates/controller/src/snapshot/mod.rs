@@ -422,7 +422,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     ctx.metrics
                         .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                     // Delete the wedged Job *and its pod* (Background cascade) so the
-                    // kubelet stops retrying immediately — don't wait for TTL/ownerRef GC.
+                    // kubelet stops retrying immediately — don't wait for TTL/ownerRef
+                    // GC. BEST-EFFORT: a delete error must not abort this pass — the
+                    // staged-source cleanup below would be skipped and never retried
+                    // (the follow-up reconciles route to TerminalFailed).
                     let _ = job_api.delete(&name, &DeleteParams::background()).await;
                     if backup
                         .status
@@ -1226,9 +1229,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, &namespace, &name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, &namespace, &name, None, &job).await?;
 
     io::patch_status(
         &api,
@@ -1772,9 +1774,8 @@ async fn delete_snapshot_via_job(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, job_ns, &job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, job_ns, &job_name, None, &job).await?;
     io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
     tracing::info!(backup = %name, %snapshot_id, job_namespace = %job_ns, "created SnapshotDelete Job");
     Ok(Action::requeue(Duration::from_secs(15)))
@@ -1797,6 +1798,22 @@ async fn reconcile_pin(
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
     let steady = Action::requeue(Duration::from_secs(600));
     let action = pin_decision(desired, observed);
+    let job_name = format!("{name}-pin");
+
+    // Cost gate: the common never-pinned Snapshot (spec.pin unset, no pin ever
+    // ran) skips the per-pass Job GET entirely. A pin mover may only exist once
+    // one was spawned, and spawning durably marks the CR first (the `Pinned`
+    // condition, upserted BEFORE the Job is applied) — so this gate can never
+    // hide a leftover pin Job, including one from a mid-flight spec toggle
+    // back to `pin: false` before the mover finished.
+    if action == PinAction::NoOp && !pin_job_may_exist(backup) {
+        return Ok(steady);
+    }
+
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    if let Some(job) = job_api.get_opt(&job_name).await? {
+        return handle_pin_job(backup, ctx, api, namespace, name, &job_name, &job, action).await;
+    }
     if action == PinAction::NoOp {
         return Ok(steady);
     }
@@ -1810,24 +1827,6 @@ async fn reconcile_pin(
         // Not resolved yet (e.g. object-store mover hasn't PATCHed the id) — retry.
         return Ok(Action::requeue(Duration::from_secs(30)));
     };
-
-    let job_name = format!("{name}-pin");
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    if let Some(job) = job_api.get_opt(&job_name).await? {
-        match job_terminal_state(&job) {
-            Some(true) => {
-                // Record the new observed pin state so the next reconcile is a NoOp.
-                io::patch_status(api, name, serde_json::json!({ "pinned": desired })).await?;
-                tracing::info!(backup = %name, %snapshot_id, pin = desired, "snapshot pin reconciled");
-                return Ok(steady);
-            }
-            Some(false) => {
-                tracing::warn!(backup = %name, "snapshot pin Job failed; backing off");
-                return Ok(Action::requeue(Duration::from_secs(120)));
-            }
-            None => return Ok(Action::requeue(Duration::from_secs(15))),
-        }
-    }
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
@@ -1880,6 +1879,13 @@ async fn reconcile_pin(
         "kopiur.home-operations.com/op".to_string(),
         "snapshot-pin".to_string(),
     );
+    // Stamp the direction the Job APPLIES, so its terminal state is later
+    // reconciled by what it did — not by whatever spec.pin says at that moment.
+    let pin_target = matches!(action, PinAction::Pin);
+    let annotations = BTreeMap::from([(
+        crate::consts::PIN_TARGET_ANNOTATION.to_string(),
+        pin_target.to_string(),
+    )]);
     let repo_volume =
         io::filesystem_repo_mount_source(&repo.backend).map(|source| VolumeMountSpec {
             source,
@@ -1929,16 +1935,197 @@ async fn reconcile_pin(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
-        annotations: Default::default(),
+        annotations,
         cache_volume: Default::default(),
         scratch_volume: None,
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, &job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    // Durably mark "a pin mover exists" BEFORE the Job lands (the `Pinned`
+    // condition is the gate that decides whether steady passes look for one) —
+    // a crash between the two leaves only a spurious per-pass GET, never an
+    // unobserved Job.
+    let conditions = io::upsert_condition_status(
+        &fresh_conditions(api, name, backup).await,
+        crate::consts::PINNED_CONDITION,
+        "Unknown",
+        "PinJobRunning",
+        "a SnapshotPin mover Job is applying spec.pin",
+        backup.meta().generation,
+    );
+    io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
+    io::apply_mover_objects(&ctx.client, namespace, &job_name, None, &job).await?;
     tracing::info!(backup = %name, %snapshot_id, ?action, "created SnapshotPin Job");
     Ok(Action::requeue(Duration::from_secs(15)))
+}
+
+/// Whether a `{name}-pin` mover Job may exist for this Snapshot — the cheap,
+/// cache-only gate for the steady-state pin-Job lookup. True once anything pin
+/// ever happened: `spec.pin` set, `status.pinned` recorded, or the `Pinned`
+/// condition present (upserted BEFORE every pin Job is applied, so a mover
+/// spawned for a since-reverted `spec.pin` is still findable).
+fn pin_job_may_exist(backup: &Snapshot) -> bool {
+    backup.spec.pin
+        || backup.status.as_ref().is_some_and(|s| {
+            s.pinned.is_some()
+                || s.conditions
+                    .iter()
+                    .any(|c| c.type_ == crate::consts::PINNED_CONDITION)
+        })
+}
+
+/// The pin state a `{name}-pin` Job was spawned to apply, from
+/// [`crate::consts::PIN_TARGET_ANNOTATION`]. `None` for a legacy Job from an
+/// operator version that didn't stamp it (its outcome can't be attributed, so
+/// it is consumed without recording).
+fn pin_job_target(job: &Job) -> Option<bool> {
+    job.metadata
+        .annotations
+        .as_ref()?
+        .get(crate::consts::PIN_TARGET_ANNOTATION)?
+        .parse()
+        .ok()
+}
+
+/// The freshest `status.conditions` for `name`, falling back to the cached
+/// copy. The pin paths rewrite the whole conditions array (status writes are
+/// JSON merge patches), so basing the upsert on the live object — not the
+/// reflector cache — shrinks the window where a just-written condition from a
+/// concurrent reconcile pass would be clobbered.
+async fn fresh_conditions(
+    api: &Api<Snapshot>,
+    name: &str,
+    backup: &Snapshot,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    match api.get_opt(name).await {
+        Ok(Some(latest)) => latest.status.map(|s| s.conditions).unwrap_or_default(),
+        _ => backup
+            .status
+            .as_ref()
+            .map(|s| s.conditions.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether a FAILED pin Job's direction is still what the current decision
+/// wants — if not (the spec toggled past it, or nothing is wanted anymore) the
+/// stale Job is consumed instead of kept as a retry-backoff marker. Pure so
+/// the direction-vs-decision matrix is unit-tested.
+fn pin_job_still_wanted(target: Option<bool>, action: PinAction) -> bool {
+    match (target, action) {
+        (Some(t), PinAction::Pin) => t,
+        (Some(t), PinAction::Unpin) => !t,
+        // Legacy direction-less Job: assume it was this action's attempt.
+        (None, PinAction::Pin | PinAction::Unpin) => true,
+        (_, PinAction::NoOp) => false,
+    }
+}
+
+/// The requeue after consuming a leftover pin Job: near-immediate when a pin
+/// action is still pending (the spawn path runs next pass), steady otherwise.
+fn post_pin_consume_action(action: PinAction) -> Action {
+    match action {
+        PinAction::NoOp => Action::requeue(Duration::from_secs(600)),
+        PinAction::Pin | PinAction::Unpin => Action::requeue(Duration::from_secs(5)),
+    }
+}
+
+/// Reconcile an EXISTING `{name}-pin` Job against the desired/observed pin
+/// state. The Job carries the direction it applied ([`pin_job_target`]), so a
+/// terminal Job is consumed by what it DID — never by what `spec.pin` happens
+/// to say now. That closes both silent-divergence shapes: a stale succeeded
+/// Job can't satisfy the opposite toggle, and a pin that completed after a
+/// mid-flight spec flip is still recorded (the next pass then spawns the
+/// corrective mover).
+#[allow(clippy::too_many_arguments)]
+async fn handle_pin_job(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    job_name: &str,
+    job: &Job,
+    action: PinAction,
+) -> Result<Action> {
+    let observed = backup.status.as_ref().and_then(|s| s.pinned);
+    let target = pin_job_target(job);
+    match job_terminal_state(job) {
+        // Still running — wait, whatever the current decision is (a mid-flight
+        // toggle is reconciled from the terminal outcome, below).
+        None => Ok(Action::requeue(Duration::from_secs(15))),
+        Some(true) => match target {
+            // The mover applied `t` and status doesn't say so yet: record the
+            // kopia truth (even if spec.pin has since flipped — the next pass
+            // recomputes the decision from the accurate observed state and
+            // spawns the corrective mover). The Job is consumed on a LATER
+            // pass, once this write is visible in the cache — deleting it here
+            // would race the reflector (the deletion event can re-reconcile
+            // against a stale `status.pinned` and respawn a spurious mover).
+            Some(t) if observed != Some(t) => {
+                record_pin_outcome(backup, api, name, t).await?;
+                Ok(Action::requeue(Duration::from_secs(5)))
+            }
+            // Outcome already recorded (or a legacy direction-less Job whose
+            // result can't be attributed): consume it so it can never satisfy
+            // a future toggle, then act on the (now accurate) decision.
+            _ => {
+                io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+                Ok(post_pin_consume_action(action))
+            }
+        },
+        Some(false) => {
+            // The mover failed: kopia's pin state is unchanged (= `observed`).
+            // A failed Job whose direction is still wanted stays until its TTL
+            // — it keeps the pod logs AND is the natural retry backoff (the
+            // TTL reap re-enters the spawn path; deleting it now would respawn
+            // immediately on the deletion event, hot-looping a persistent
+            // failure). A STALE failed Job (direction no longer wanted, or
+            // nothing wanted at all) is consumed instead so it can't block —
+            // or mis-satisfy — a future toggle.
+            if !pin_job_still_wanted(target, action) {
+                io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+                return Ok(post_pin_consume_action(action));
+            }
+            let conditions = io::upsert_condition(
+                &fresh_conditions(api, name, backup).await,
+                crate::consts::PINNED_CONDITION,
+                observed.unwrap_or(false),
+                crate::consts::PIN_JOB_FAILED_REASON,
+                "the SnapshotPin mover Job failed; see the Job/pod logs",
+                backup.meta().generation,
+            );
+            io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
+            tracing::warn!(backup = %name, "snapshot pin Job failed; backing off");
+            Ok(Action::requeue(Duration::from_secs(120)))
+        }
+    }
+}
+
+/// Record a pin mover's applied state (`status.pinned` + the `Pinned`
+/// condition) — the kopia truth, independent of the currently-desired spec.
+async fn record_pin_outcome(
+    backup: &Snapshot,
+    api: &Api<Snapshot>,
+    name: &str,
+    pinned: bool,
+) -> Result<()> {
+    let conditions = io::upsert_condition(
+        &fresh_conditions(api, name, backup).await,
+        crate::consts::PINNED_CONDITION,
+        pinned,
+        "PinReconciled",
+        "the SnapshotPin mover Job ran",
+        backup.meta().generation,
+    );
+    io::patch_status(
+        api,
+        name,
+        serde_json::json!({ "pinned": pinned, "conditions": conditions }),
+    )
+    .await?;
+    tracing::info!(backup = %name, pin = pinned, "snapshot pin recorded");
+    Ok(())
 }
 
 /// On a Job's terminal success, pin phase=Succeeded and the resulting kopia

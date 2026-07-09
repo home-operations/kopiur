@@ -258,16 +258,15 @@ async fn workload_identity_s3_full_pipeline_without_static_keys() {
         vec![WI_SECRET.to_string()],
         "envFrom must carry ONLY the password Secret — no backend keys"
     );
-    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> =
-        Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let work_spec_cm = cms
-        .get("e2e-wi-backup")
-        .await
-        .expect("work-spec ConfigMap exists");
-    let work_spec = work_spec_cm
-        .data
-        .as_ref()
-        .and_then(|d| d.values().next().cloned())
+    // The work spec rides the Job's own env (#224 — no per-run ConfigMap), so
+    // the ambient-credential flag is asserted on the same object.
+    let work_spec = pod_spec.containers[0]
+        .env
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|e| e.name == "KOPIUR_WORK_SPEC")
+        .and_then(|e| e.value.clone())
         .unwrap_or_default();
     assert!(
         work_spec.contains("ambientCredentials"),

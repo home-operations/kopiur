@@ -320,8 +320,8 @@ impl ExecSession {
     }
 }
 
-/// Create the session Job (FIRST, so it can own the ConfigMap) and its
-/// work-spec ConfigMap, returning the Job name.
+/// Create the session Job (the work spec rides its pod env — the session is
+/// one self-cleaning object), returning the Job name.
 async fn create_session_job(
     ctx: &KubeCtx,
     target: &BrowseTarget,
@@ -407,7 +407,12 @@ async fn create_session_job(
         readiness_exec: Some(vec![SESSION_MOVER_BIN.to_string(), "ready".to_string()]),
     };
 
-    let job = jobs::build_job(&inputs);
+    // The session is ONE object: the Job carries the work spec inline in its
+    // pod env, so there is no sidecar ConfigMap to create (or leak — #224).
+    let job = jobs::build_job(&inputs).map_err(|source| CliError::Serialization {
+        what: "browse session work spec",
+        source: Box::new(source),
+    })?;
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
     eprintln!(
         "starting browse session {name} (repository {})…",
@@ -415,8 +420,7 @@ async fn create_session_job(
     );
     let created = match jobs_api.create(&PostParams::default(), &job).await {
         Ok(created) => created,
-        // A concurrent CLI won the race: the session exists — reuse it (the
-        // winner also creates the ConfigMap; skip ours).
+        // A concurrent CLI won the race: the session exists — reuse it.
         Err(kube::Error::Api(ae)) if ae.code == 409 => {
             eprintln!("a concurrent command already started this session; joining it");
             return Ok(name);
@@ -432,50 +436,6 @@ async fn create_session_job(
             ));
         }
     };
-
-    // The ConfigMap is owned by the JOB (not the repository) so `session end`
-    // and the Job TTL cascade-delete it.
-    let mut cm = jobs::build_config_map(&inputs).map_err(|source| CliError::Serialization {
-        what: "browse session work spec",
-        source: source.into(),
-    })?;
-    cm.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: "batch/v1".into(),
-        kind: "Job".into(),
-        name: created.name_any(),
-        uid: created.uid().unwrap_or_default(),
-        controller: Some(true),
-        block_owner_deletion: Some(false),
-    }]);
-    let cms: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), ns);
-    match cms.create(&PostParams::default(), &cm).await {
-        Ok(_) => {}
-        // A leftover CM under the deterministic name (e.g. from a session whose
-        // Job the TTL controller already reaped): replace it.
-        Err(kube::Error::Api(ae)) if ae.code == 409 => {
-            let _ = cms.delete(&name, &DeleteParams::default()).await;
-            cms.create(&PostParams::default(), &cm).await.map_err(|e| {
-                classify_kube(
-                    "create",
-                    "ConfigMap",
-                    "configmaps",
-                    Some(ns),
-                    Some(&name),
-                    e,
-                )
-            })?;
-        }
-        Err(e) => {
-            return Err(classify_kube(
-                "create",
-                "ConfigMap",
-                "configmaps",
-                Some(ns),
-                Some(&name),
-                e,
-            ));
-        }
-    }
     Ok(created.name_any())
 }
 
@@ -677,9 +637,10 @@ pub async fn find_session_job(
         .find(|j| j.metadata.name.as_deref() == Some(expected.as_str())))
 }
 
-/// Delete a session Job (background propagation reaps its pod and the
-/// Job-owned ConfigMap; the ConfigMap is deleted explicitly too for
-/// promptness).
+/// Delete a session Job (background propagation reaps its pod). The session's
+/// whole spec rides the Job env, so the Job is the only object. The trailing
+/// best-effort ConfigMap delete cleans up a LEGACY session's work-spec
+/// ConfigMap (CLI versions that mounted the spec) — a 404 no-op otherwise.
 pub async fn delete_session(
     ctx: &KubeCtx,
     namespace: &str,

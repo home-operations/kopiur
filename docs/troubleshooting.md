@@ -171,6 +171,10 @@ same `logTail`/`failure` fields appear on a failed `Restore`.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
 
+/// note | The run is one object — the Job
+A finished run's mover **Job** (and its pod logs, as above) sticks around until its `ttlSecondsAfterFinished` (default 1h). The instructions the controller handed the mover ride the Job itself — `kubectl get job <name> -o yaml` shows them in the pod env as `KOPIUR_WORK_SPEC`. If you don't see per-run work-spec ConfigMaps anymore: they no longer exist — that's the fix for the leak where one accumulated per run, forever (#224). See [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
+///
+
 ## Backup `Succeeded` but is **incomplete** (`filesFailed > 0`)
 
 By default an unreadable file is **fatal** — the backup fails loudly with `PermissionDenied` (above), so nothing is silent. But if you set an `errorHandling.ignoreFileErrors`/`ignoreDirErrors` policy, kopia **completes** the snapshot while *skipping* the files it couldn't read. Kopiur surfaces that so it isn't silent: the excluded count rides on `status.stats.filesFailed`, and the controller sets `SecurityContextCompatible=False` + a Warning Event.

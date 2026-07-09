@@ -78,36 +78,36 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
         .await
         .expect("create RepositoryReplication to a second filesystem repo");
 
-    // The work-spec ConfigMap (same name as the per-slot mover Job) carries the
-    // #216 sync knobs — the controller→mover contract, mirroring the
-    // `policy_knobs` compression/upload-knobs pattern.
+    // The per-slot mover Job's inline work-spec env carries the #216 sync
+    // knobs — the controller→mover contract, mirroring the `policy_knobs`
+    // compression/upload-knobs pattern. The spec rides the Job itself (#224 —
+    // no per-run ConfigMap), and the Job outlives the slot by its TTL.
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let selector = format!(
         "app.kubernetes.io/component=replication,kopiur.home-operations.com/replication={name}"
     );
-    let job_name = wait_until(
+    let job = wait_until(
         "a replication mover Job is created",
         default_timeout(),
         poll_interval(),
         || async {
             let list = jobs.list(&ListParams::default().labels(&selector)).await?;
-            Ok(list.items.into_iter().find_map(|j| j.metadata.name))
+            Ok(list.items.into_iter().next())
         },
     )
     .await
     .expect("a replication mover Job should be created");
-    let cm = cms
-        .get(&job_name)
-        .await
-        .expect("replication work-spec ConfigMap");
-    let spec_json = cm
-        .data
+    let raw = job
+        .spec
         .as_ref()
-        .and_then(|d| d.get("work-spec.json"))
-        .expect("work-spec.json key");
-    let spec: serde_json::Value =
-        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .and_then(|env| env.iter().find(|e| e.name == "KOPIUR_WORK_SPEC"))
+        .and_then(|e| e.value.clone())
+        .expect("replication Job carries the inline work-spec env");
+    let spec: serde_json::Value = serde_json::from_str(&raw).expect("work-spec env parses as JSON");
     let replicate = spec
         .pointer("/operation/replicate")
         .unwrap_or(&serde_json::Value::Null);
@@ -155,6 +155,28 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
         count >= 1,
         "the destination repository must hold the mirrored snapshot, got {count}"
     );
+
+    // Leak guard (the "605 ConfigMaps" fix, #224): a replication slot creates
+    // NO per-run ConfigMap at all — the spec rides the Job env. Per-slot names
+    // used to accumulate one ConfigMap per slot on the long-lived
+    // RepositoryReplication CR, forever.
+    for job in jobs
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .expect("list replication Jobs")
+        .items
+    {
+        let Some(job_name) = job.metadata.name else {
+            continue;
+        };
+        assert!(
+            cms.get_opt(&job_name)
+                .await
+                .expect("query ConfigMap")
+                .is_none(),
+            "replication slot {job_name} must not create a per-run work-spec ConfigMap"
+        );
+    }
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
 }

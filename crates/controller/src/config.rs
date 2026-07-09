@@ -138,6 +138,31 @@ pub const WEBHOOK_MUTATING_CONFIG_ENV: &str = "KOPIUR_WEBHOOK_MUTATING_CONFIG";
 /// chart's `webhook.tls.secretName` default.
 pub const DEFAULT_WEBHOOK_SECRET_NAME: &str = "kopiur-webhook-tls";
 
+/// Cadence (seconds) of the orphaned work-spec ConfigMap sweep
+/// ([`crate::sweep`]): reaps mover work-spec ConfigMaps whose Job is already
+/// gone (TTL-reaped before the reconciler could observe it, or left behind by
+/// operator versions that never deleted them). `0` disables the sweep.
+/// Defaults to [`DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS`]. Reachable via the
+/// chart's `controller.extraEnv`.
+pub const WORK_SPEC_SWEEP_INTERVAL_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS";
+
+/// Fallback sweep cadence when [`WORK_SPEC_SWEEP_INTERVAL_ENV`] is unset: 6h.
+/// The transition-time cleanup in the reconcilers handles the steady state;
+/// the sweep is a backstop, so a slow cadence is ample.
+pub const DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
+/// Minimum age (seconds) a work-spec ConfigMap must reach before the sweep may
+/// reap it, closing the ConfigMap-applied-before-Job window (the ConfigMap and
+/// Job are applied in sequence) and any controller-crash-mid-spawn gap.
+/// Defaults to [`DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS`]; lower it only in
+/// tests. Reachable via the chart's `controller.extraEnv`.
+pub const WORK_SPEC_SWEEP_MIN_AGE_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS";
+
+/// Fallback sweep minimum age when [`WORK_SPEC_SWEEP_MIN_AGE_ENV`] is unset: 1h
+/// (a spawned run's Job lands within seconds of its ConfigMap; 1h is a
+/// comfortable margin over any apply/crash window).
+pub const DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS: i64 = 3600;
+
 /// Steady-state cadence for re-checking the webhook cert for rotation and
 /// re-asserting the `caBundle`. The leaf is long-lived and renewed well before
 /// expiry, so a slow cadence is ample once the cert is established.
@@ -260,6 +285,18 @@ pub struct ControllerArgs {
     /// never contend on the same Lease.
     #[arg(long, env = LEASE_NAME_ENV)]
     pub lease_name: Option<String>,
+
+    /// Cadence (seconds) of the orphaned work-spec ConfigMap sweep; 0 disables.
+    #[arg(long, env = WORK_SPEC_SWEEP_INTERVAL_ENV,
+          default_value_t = DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS,
+          value_parser = parse_sweep_interval)]
+    pub work_spec_sweep_interval_secs: u64,
+
+    /// Minimum age (seconds) before the sweep may reap a work-spec ConfigMap.
+    #[arg(long, env = WORK_SPEC_SWEEP_MIN_AGE_ENV,
+          default_value_t = DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS,
+          value_parser = parse_sweep_min_age)]
+    pub work_spec_sweep_min_age_secs: i64,
 
     /// Cluster-scoped install: watch every namespace and reconcile
     /// ClusterRepository. The chart stamps it for `installScope: cluster`.
@@ -471,6 +508,10 @@ pub struct ControllerConfig {
     pub watch_scope: WatchScope,
     /// Leader election, when enabled (`--leader-elect`).
     pub leader_election: Option<LeaderElection>,
+    /// Cadence (seconds) of the orphaned work-spec ConfigMap sweep; 0 disables.
+    pub work_spec_sweep_interval_secs: u64,
+    /// Minimum age (seconds) before the sweep may reap a work-spec ConfigMap.
+    pub work_spec_sweep_min_age_secs: i64,
 }
 
 impl ControllerArgs {
@@ -545,6 +586,8 @@ impl ControllerArgs {
             webhook_mutating_config: nonempty(self.webhook_mutating_config),
             watch_scope,
             leader_election,
+            work_spec_sweep_interval_secs: self.work_spec_sweep_interval_secs,
+            work_spec_sweep_min_age_secs: self.work_spec_sweep_min_age_secs.max(0),
         })
     }
 }
@@ -563,6 +606,35 @@ fn parse_http_addr(value: &str) -> Result<SocketAddr, String> {
             "KOPIUR_HTTP_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
              [::]:8081 (IPv6/dual-stack, the default), 0.0.0.0:8081 (IPv4-only, for hosts with \
              IPv6 disabled); unset it to use the default [::]:8081"
+        )
+    })
+}
+
+/// Value parser for [`WORK_SPEC_SWEEP_INTERVAL_ENV`]. An empty value means
+/// "unset" (the chart can render an env var as `""`); `0` disables the sweep.
+fn parse_sweep_interval(value: &str) -> Result<u64, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS);
+    }
+    value.parse::<u64>().map_err(|_| {
+        format!(
+            "KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS='{value}' is not a valid interval; use a \
+             number of seconds (0 disables the sweep); unset it to use the default \
+             {DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS}"
+        )
+    })
+}
+
+/// Value parser for [`WORK_SPEC_SWEEP_MIN_AGE_ENV`]. An empty value means
+/// "unset"; negative values are clamped to 0 in `resolve()`.
+fn parse_sweep_min_age(value: &str) -> Result<i64, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS);
+    }
+    value.parse::<i64>().map_err(|_| {
+        format!(
+            "KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS='{value}' is not a valid age; use a number of \
+             seconds; unset it to use the default {DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS}"
         )
     })
 }

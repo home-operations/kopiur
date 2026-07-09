@@ -26,7 +26,7 @@ What each rule is **for**, grouped by purpose:
 | --- | --- | --- |
 | `kopiur.home-operations.com` → all 8 CRDs (`repositories`, `snapshotpolicies`, `snapshots`, `snapshotschedules`, `restores`, `maintenances`, `repositoryreplications`, `clusterrepositories`†) | get, list, watch, create, update, patch, delete | Reconcile every kind; schedules **create** `Snapshot` CRs; repositories **create** owned `Maintenance` CRs; retention **deletes** pruned `Snapshot` CRs. |
 | same group → each CRD's `/status` and `/finalizers` | get, update, patch | Status is written via server-side apply (**a PATCH — `patch` is required, not just `update`**); finalizers gate snapshot deletion. |
-| core → `pods`, `persistentvolumeclaims`, `configmaps` | get, list, watch, create, update, patch, delete | Resolve workload pods for `inheritSecurityContextFrom` and hooks; create restore-target / cache PVCs; write the mover work-spec ConfigMap. |
+| core → `pods`, `persistentvolumeclaims`, `configmaps` | get, list, watch, create, update, patch, delete | Resolve workload pods for `inheritSecurityContextFrom` and hooks; create restore-target / cache PVCs; write the bootstrap result ConfigMap and sweep legacy work-spec ConfigMaps. |
 | core → `pods/exec` | create, get | Run `hooks.beforeSnapshot/afterSnapshot` `workloadExec` commands inside the workload pod (quiesce/resume). |
 | core → `events` **and** `events.k8s.io` → `events` | create, patch | The kube `Recorder` writes `events.k8s.io/v1` Events; **both** groups are needed (a common gotcha — without `events.k8s.io` every event write 403s). |
 | core → `secrets` | get, list, watch, create, patch | Read repository credential Secrets (and re-reconcile when they change); **create/patch** is the credential-projection feature (copying a repo's Secret into a consumer namespace) and the self-managed webhook TLS Secret. |
@@ -50,7 +50,7 @@ The mover is deliberately tiny — it can **only** report its result:
 | API group → resources | Verbs | Why |
 | --- | --- | --- |
 | `kopiur.home-operations.com` → every CRD's `/status` | get, patch | Patch progress and the terminal result (snapshot id, stats, timing, `logTail`, `failure`) onto the CR that owns the Job. |
-| core → `configmaps` | get, patch | Read its work-spec; write bootstrap results back to the result ConfigMap. |
+| core → `configmaps` | get, patch | Write bootstrap results back to the result ConfigMap (the work spec itself rides the Job env). |
 
 It cannot read Secrets (credentials arrive via `envFrom` on the Job), cannot
 create or delete anything, and cannot touch other namespaces.
@@ -96,7 +96,7 @@ user to browsing snapshots in that one namespace):
 | `kopiur.home-operations.com` → `clusterrepositories` | get | Same chain for cluster-scoped repositories. |
 | `apps` → `deployments` | get, list | Resolve the mover image from the controller Deployment (sessions run exactly what the operator runs). |
 | `batch` → `jobs` | create, get, list, delete | Find-or-create the read-only session Job; `session end`. |
-| core → `configmaps` | create, get, delete | The session's work-spec ConfigMap (owned by the Job). |
+| core → `configmaps` | delete | `session end` cleans up a legacy session's work-spec ConfigMap (the spec rides the Job env today). |
 | core → `pods` | get, list, watch | Wait for the session pod to become Ready. |
 | core → `pods/log` | get | Surface the pod's logs when the session fails to start. |
 | core → `pods/exec` | create | The read path: exec the closed kopia read-command set. |

@@ -354,9 +354,13 @@ pub async fn verify_step(
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped lastVerified; sleep until the next slot.
+            // The terminal Job (its env carries the whole run spec) self-reaps
+            // via its TTL — it is the slot-handled marker until then.
             Some(true) => Ok(Some(
                 next_verify_wakeup(verification, &seed, Some(now), now, repo_tz).min(REQUEUE_CAP),
             )),
+            // Failure: the failed Job lingers to its TTL as the bounded-retry
+            // backoff (and keeps the pod logs).
             Some(false) => Ok(Some(REQUEUE_FAILED)),
             None => Ok(Some(REQUEUE_RUNNING)),
         },
@@ -525,9 +529,8 @@ async fn spawn_verify_job(
         },
         readiness_exec: None,
     };
-    let cm = jobs::build_config_map(&inputs)?;
-    let job = jobs::build_job(&inputs);
-    io::apply_mover_objects(&ctx.client, namespace, job_name, &cm, &job).await?;
+    let job = jobs::build_job(&inputs)?;
+    io::apply_mover_objects(&ctx.client, namespace, job_name, None, &job).await?;
     Ok(())
 }
 

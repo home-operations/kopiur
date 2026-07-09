@@ -246,6 +246,14 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  field(s) named above and re-apply."
             ),
         ),
+        // Same user contract as Validation: the run cannot start until the
+        // recipe shrinks (or, for the never-in-practice serialize arm, until
+        // the version skew is fixed) — the message carries the what/why/fix.
+        Error::BuildJob(_) => (
+            INVALID_SPEC_REASON,
+            FIX_SPEC_ACTION,
+            format!("{err}. The run will not start until this is corrected."),
+        ),
         Error::MissingDependency(_) => (
             MISSING_DEPENDENCY_REASON,
             CHECK_REFERENCES_ACTION,

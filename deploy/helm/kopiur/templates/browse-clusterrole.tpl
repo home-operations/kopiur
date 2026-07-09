@@ -41,11 +41,12 @@ rules:
     resources:
       - jobs
     verbs: [create, get, list, delete]
-  # The session's work-spec ConfigMap (owned by the Job; created/deleted with it).
+  # `session end` best-effort-deletes a LEGACY session's work-spec ConfigMap
+  # (CLI versions that mounted the spec; today the spec rides the Job env).
   - apiGroups: [""]
     resources:
       - configmaps
-    verbs: [create, get, delete]
+    verbs: [delete]
   # Wait for the session pod to become Ready; surface its logs on failure.
   - apiGroups: [""]
     resources:

@@ -607,6 +607,27 @@ async fn yielded_maintenance_slot_is_not_respawned_after_its_job_is_ttl_reaped()
     .await
     .expect("yielded slots must durably record lastHandledAt");
 
+    // Leak guard (the "605 ConfigMaps" fix): a handled slot's work-spec
+    // ConfigMap is deleted when the slot is recorded — the per-slot Jobs may
+    // still be waiting on their TTL, but no ConfigMap may remain.
+    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "handled maintenance slots' work-spec ConfigMaps reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let list = cms.list(&Default::default()).await?;
+            Ok(list
+                .items
+                .iter()
+                .all(|c| !c.name_any().starts_with("e2e-ttl-yield-"))
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("handled maintenance slots must not leave work-spec ConfigMaps behind");
+
     // The mover recorded the yield, and the controller surfaces it as a real
     // health signal: maintenance is NOT running (GC/compaction is not
     // happening) — Ready=False / MaintenanceYielding with the remediation.

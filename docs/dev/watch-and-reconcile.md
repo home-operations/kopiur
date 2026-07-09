@@ -130,7 +130,7 @@ The controller is cluster-scoped and watches several core/v1 kinds across every
 namespace, so its RSS is dominated by what it lists/watches and how the allocator
 and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
 
-- **Scoped owned watches.** Owned children (mover `Job`s, work-spec `ConfigMap`s)
+- **Scoped owned watches.** Owned children (mover `Job`s, bootstrap-result `ConfigMap`s)
   ALWAYS carry `app.kubernetes.io/managed-by=kopiur` (`io::finalizer::child_labels`),
   so they are watched via `owns_with` + a server-side label selector (`owned_cfg`):
   the controller lists/watches only *kopiur's* Jobs/ConfigMaps, not every one in the

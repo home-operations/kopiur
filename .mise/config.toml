@@ -101,7 +101,7 @@ set -eu
 # the worst offender — so a NEW overly-complex function fails immediately
 # even while the legacy offenders are still being paid down. Refactored one
 # under the threshold? Lower BUDGET to match (the task reminds you).
-BUDGET=32
+BUDGET=31
 COUNT=$(cargo clippy --workspace --all-targets --all-features --locked -q -- -W clippy::cognitive_complexity 2>&1 \
   | grep -A1 'cognitive complexity of' | grep -oE '[-]{2}> [^ ]+' | sort -u | wc -l)
 echo "==> functions above the cognitive-complexity threshold: $COUNT (budget: $BUDGET)"

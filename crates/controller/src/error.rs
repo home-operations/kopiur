@@ -60,6 +60,13 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// The mover Job builder refused ([`kopiur_mover::jobs::BuildJobError`]):
+    /// either the work spec can't be JSON-encoded (structural) or it exceeds
+    /// what a pod env var can carry (a pathological recipe — terminal until the
+    /// spec shrinks, so it maps to Validation semantics via the error message).
+    #[error("mover Job build failed: {0}")]
+    BuildJob(#[from] kopiur_mover::jobs::BuildJobError),
+
     /// A cron expression failed to parse at scheduling time. Structural.
     #[error("invalid schedule: {0}")]
     InvalidSchedule(String),
@@ -154,6 +161,7 @@ impl Error {
             Error::Validation(_)
             | Error::BlockedOnGrant(_)
             | Error::Serialization(_)
+            | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
             | Error::Invariant(_) => ErrorClass::Structural,
         }

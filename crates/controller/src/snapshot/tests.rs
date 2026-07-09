@@ -932,3 +932,89 @@ fn staged_teardown_proceeds_on_terminal_or_absent_job() {
     // TTL-reaped, or a discovered Snapshot that never owned a Job.
     assert!(staged_teardown_ready(None), "absent Job → reap");
 }
+
+// The pin-Job lookup gate: never-pinned Snapshots (the overwhelmingly common
+// case) skip the per-heartbeat GET; anything that ever spawned a pin mover —
+// including one whose spec.pin was toggled back mid-flight — stays findable
+// via the `Pinned` condition upserted before every pin Job is applied.
+#[test]
+fn pin_job_may_exist_covers_every_marker() {
+    fn snap(pin: bool, pinned: Option<bool>, with_condition: bool) -> Snapshot {
+        let mut s = dummy_backup();
+        s.spec.pin = pin;
+        let conditions = if with_condition {
+            io::upsert_condition_status(
+                &[],
+                crate::consts::PINNED_CONDITION,
+                "Unknown",
+                "PinJobRunning",
+                "a SnapshotPin mover Job is applying spec.pin",
+                None,
+            )
+        } else {
+            Vec::new()
+        };
+        s.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            pinned,
+            conditions,
+            ..Default::default()
+        });
+        s
+    }
+    assert!(
+        !pin_job_may_exist(&snap(false, None, false)),
+        "never pinned"
+    );
+    assert!(pin_job_may_exist(&snap(true, None, false)), "spec.pin set");
+    assert!(
+        pin_job_may_exist(&snap(false, Some(false), false)),
+        "pin recorded"
+    );
+    assert!(
+        pin_job_may_exist(&snap(false, None, true)),
+        "mid-flight toggle-back: the spawn-time condition keeps the Job findable"
+    );
+}
+
+// A FAILED pin Job is kept (as the TTL-based retry-backoff marker) only while
+// its direction is still what the decision wants; a stale one is consumed so
+// it can't block — or mis-satisfy — a future toggle.
+#[test]
+fn pin_job_still_wanted_matrix() {
+    // Direction matches the pending action → keep as backoff.
+    assert!(pin_job_still_wanted(Some(true), PinAction::Pin));
+    assert!(pin_job_still_wanted(Some(false), PinAction::Unpin));
+    // Direction contradicts the pending action → stale, consume.
+    assert!(!pin_job_still_wanted(Some(false), PinAction::Pin));
+    assert!(!pin_job_still_wanted(Some(true), PinAction::Unpin));
+    // Nothing pending at all → any failed Job is stale.
+    assert!(!pin_job_still_wanted(Some(true), PinAction::NoOp));
+    assert!(!pin_job_still_wanted(None, PinAction::NoOp));
+    // Legacy direction-less Job: assume it was this action's attempt.
+    assert!(pin_job_still_wanted(None, PinAction::Pin));
+    assert!(pin_job_still_wanted(None, PinAction::Unpin));
+}
+
+// A pin Job is consumed by the direction it APPLIED (the annotation), never by
+// the currently-desired spec.pin — a stale Job must not satisfy the opposite
+// toggle.
+#[test]
+fn pin_job_target_reads_the_direction_annotation() {
+    let mut job = Job::default();
+    assert_eq!(pin_job_target(&job), None, "legacy Job: unattributable");
+    job.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        crate::consts::PIN_TARGET_ANNOTATION.to_string(),
+        "true".to_string(),
+    )]));
+    assert_eq!(pin_job_target(&job), Some(true));
+    job.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        crate::consts::PIN_TARGET_ANNOTATION.to_string(),
+        "false".to_string(),
+    )]));
+    assert_eq!(pin_job_target(&job), Some(false));
+    job.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        crate::consts::PIN_TARGET_ANNOTATION.to_string(),
+        "garbage".to_string(),
+    )]));
+    assert_eq!(pin_job_target(&job), None, "unparseable = unattributable");
+}

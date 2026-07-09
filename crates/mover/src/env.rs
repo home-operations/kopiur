@@ -16,8 +16,18 @@
 //! assert!(env::READY_MARKER.starts_with(kopiur_kopia::env::DEFAULT_CACHE_DIR));
 //! ```
 
-/// Path to the mounted work-spec JSON (the controller↔mover contract). The
-/// controller sets this on the Job; the mover reads it (falling back to `argv[1]`).
+/// The work-spec JSON itself, inline (the controller↔mover contract). The
+/// controller embeds the serialized [`crate::workspec::MoverWorkSpec`] directly
+/// in the Job's pod env — the run needs exactly ONE Kubernetes object, whose
+/// `ttlSecondsAfterFinished` cleans up everything (the per-run work-spec
+/// ConfigMap this replaces had no TTL mechanism and leaked one per run,
+/// forever). Takes precedence over [`WORK_SPEC_PATH`].
+pub const WORK_SPEC: &str = "KOPIUR_WORK_SPEC";
+
+/// Path to a work-spec JSON file — the fallback for [`WORK_SPEC`]: manual
+/// `kopiur-mover <path>` invocations, and Jobs created by operator versions
+/// that mounted the work spec as a ConfigMap. The mover reads it when
+/// [`WORK_SPEC`] is unset (falling back further to `argv[1]`).
 pub const WORK_SPEC_PATH: &str = "KOPIUR_WORK_SPEC_PATH";
 
 /// Optional override for the `kopia` binary path (defaults to `kopia` on PATH).
