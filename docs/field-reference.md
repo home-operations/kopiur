@@ -1532,7 +1532,9 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `timeout` | string | — | How long the staged `VolumeSnapshot` may take to become `readyToUse` (measured from its creation) before the backup is failed (Go-style duration like `10m` or `1h`; default `10m`). A transient CSI/ snapshot-controller error during the wait is retried, never fatal on its own — only this deadline fails staging. A zero duration (`0`/`0s`) waits indefinitely. Raise this for backends whose snapshots take long to become ready (e.g. cloud snapshots of large volumes). |
+| `accessModes` | []enum: ReadWriteOnce \| ReadOnlyMany \| ReadWriteMany \| ReadWriteOncePod | — | Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes. `ReadOnlyMany` pairs with snapshot-backed read-only classes (e.g. CephFS `backingSnapshot`); the mover always mounts the staged PVC read-only regardless of the mode. |
+| `storageClassName` | string | — | StorageClass for the **staged PVC** — the temporary PVC restored from the CSI `VolumeSnapshot` (`copyMethod: Snapshot`) or cloned from the source (`copyMethod: Clone`). Absent ⇒ the staged PVC copies the source PVC's class. Must belong to the **same CSI driver** as the source (staging fails fast on a mismatch). Flagship use: a rook-ceph CephFS class with `backingSnapshot: "true"`, which mounts the snapshot shallowly (metadata-only, near-instant, read-only) instead of running a full subvolume clone that can take many minutes on small-file-heavy volumes. |
+| `timeout` | string | — | How long each staging phase may take before the backup is failed (Go-style duration like `10m` or `1h`; default `10m`): first the staged `VolumeSnapshot` becoming `readyToUse` (measured from its creation), then — on an `Immediate`-binding StorageClass — the staged PVC binding (a fresh budget measured from the PVC's creation, covering the CSI restore/clone). A transient CSI/snapshot-controller error during either wait is retried, never fatal on its own — only this deadline fails staging. A zero duration (`0`/`0s`) waits indefinitely. Raise this for backends whose snapshots or clones take long (e.g. cloud snapshots of large volumes, CephFS full clones of small-file-heavy volumes). |
 
 #### `spec.upload` { #snapshotpolicy-spec-upload }
 
@@ -1769,6 +1771,8 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `copyMethod` | string | — | The resolved capture method (`Snapshot` or `Clone`) that produced this stage. |
 | `pvcName` | string | — | Name of the staged `PersistentVolumeClaim` the mover mounts in place of the live source PVC. |
 | `ready` | boolean | — | `true` once the stage is ready for the mover. |
+| `stagingTimeoutSeconds` | integer | — | The resolved `spec.staging.timeout` (seconds) pinned when the stage was stamped, so the running-Job staged-PVC bind watchdog never re-resolves a policy that may have been edited or deleted mid-run. `0` = wait indefinitely. |
+| `storageClassName` | string | — | StorageClass of the staged PVC — `spec.staging.storageClassName` when set, else the source PVC's class. Pinned for observability (e.g. confirming a CephFS shallow-clone class actually took effect). |
 | `volumeSnapshotName` | string | — | Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only). |
 
 #### `status.stats` { #snapshot-status-stats }
@@ -1967,7 +1971,7 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the PVC to create. |
-| `accessModes` | []string | — | Access modes for the new PVC (e.g. `["ReadWriteOnce"]`). |
+| `accessModes` | []enum: ReadWriteOnce \| ReadOnlyMany \| ReadWriteMany \| ReadWriteOncePod | — | Access modes for the new PVC; empty defaults to `ReadWriteOnce`. Closed enum in the schema; a non-canonical value persisted before enforcement decodes as `PvcAccessMode::Unknown` and is rejected per-CR with the value quoted (webhook + reconciler, via `validate_access_modes`) instead of poisoning the typed watcher. |
 | `capacity` | string | — | Requested size of the new PVC (e.g. `100Gi`). |
 | `storageClassName` | string | — | StorageClass for the new PVC; absent uses the cluster default. |
 

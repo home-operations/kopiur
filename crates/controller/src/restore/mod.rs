@@ -1792,10 +1792,16 @@ async fn ensure_restore_target_pvc(
             template.name
         ))
     })?;
-    let access_modes = if template.access_modes.is_empty() {
+    // `Unknown` (legacy stored) modes never reach here: `validate_restore` runs at
+    // reconcile entry and rejects them per-CR with the value quoted.
+    let access_modes: Vec<String> = if template.access_modes.is_empty() {
         vec!["ReadWriteOnce".to_string()]
     } else {
-        template.access_modes.clone()
+        template
+            .access_modes
+            .iter()
+            .map(|m| m.mode_str().to_string())
+            .collect()
     };
     let pvc: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",

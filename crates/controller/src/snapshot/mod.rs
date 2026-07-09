@@ -39,7 +39,7 @@ use crate::consts::{
     HOOKS_SUCCEEDED_CONDITION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
     PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
     SECURITY_CONTEXT_COMPATIBLE_REASON, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
-    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON, STAGING_WAITING_REASON,
+    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -277,6 +277,29 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
                 }
             }
+            // Reap any CSI staging objects the run created. The primary reap runs
+            // at the Failed transition itself (the wedge / staging-failure /
+            // Job-failed arms), but a transient API error there — or a crash
+            // between the phase patch and the cleanup — would otherwise leak the
+            // VolumeSnapshot (holding a backend snapshot) until the CR is deleted,
+            // because nothing else re-enters cleanup for a Failed Snapshot. This
+            // mirrors the Succeeded steady-state reap: gated on the Job being
+            // terminal-or-gone (#103 — reaping under an Active Job strands an
+            // unschedulable replacement pod), idempotent no-op once the objects
+            // are gone.
+            if backup
+                .status
+                .as_ref()
+                .and_then(|s| s.staged.as_ref())
+                .is_some()
+            {
+                let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+                let job = job_api.get_opt(&name).await?;
+                if !staged_teardown_ready(job.as_ref()) {
+                    return Ok(Action::requeue(Duration::from_secs(15)));
+                }
+                io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+            }
             return Ok(Action::await_change());
         }
         RunDecision::Wait => return Ok(Action::await_change()),
@@ -395,6 +418,38 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Ok(Action::requeue(Duration::from_secs(120)));
             }
             None => {
+                // Staged-PVC bind watchdog, FIRST: on a WaitForFirstConsumer class the
+                // CSI restore/clone only starts when the mover pod schedules, so a slow
+                // or hung bind leaves the pod Pending on a Pending claim. While the PVC
+                // is provisioning the pod cannot be "wedged" — judging it so at the
+                // 300 s pod-startup deadline and reaping the VolumeSnapshot mid-restore
+                // was the forgejo/CephFS hourly hard-fail. Bound by the staging budget
+                // PINNED at stamp time (the policy may be edited/deleted mid-run), it
+                // fails with the same actionable reason as the pre-Job bind gate.
+                match staged_pvc_watchdog(backup, ctx, &namespace).await? {
+                    StagedPvcWatch::Provisioning => {
+                        return Ok(Action::requeue(Duration::from_secs(30)));
+                    }
+                    StagedPvcWatch::Expired { reason, message } => {
+                        io::patch_status(
+                            &api,
+                            &name,
+                            snapshot_ready_status(backup, SnapshotPhase::Failed, reason, &message),
+                        )
+                        .await?;
+                        ctx.metrics.inc_snapshot_completed(
+                            "failed",
+                            &namespace,
+                            backup_policy(backup),
+                        );
+                        // Stop the kubelet's retry loop, then reap the staged objects
+                        // (PVC before VS — the delete order that is safe mid-restore).
+                        let _ = job_api.delete(&name, &DeleteParams::background()).await;
+                        io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                        return Ok(Action::requeue(Duration::from_secs(120)));
+                    }
+                    StagedPvcWatch::Clear => {}
+                }
                 // A wedged pod (impossible securityContext, missing image, Unschedulable)
                 // never reaches a terminal phase, so `backoffLimit` never trips and only
                 // the long `activeDeadlineSeconds` backstop would ever stop it — meanwhile
@@ -1060,17 +1115,26 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         "volumeSnapshotName": staged.volume_snapshot_name,
                         "pvcName": staged.pvc_name,
                         "ready": true,
+                        "storageClassName": staged.storage_class_name,
+                        "stagingTimeoutSeconds": staged.staging_timeout_seconds,
                     },
                 }),
             )
             .await?;
             Some(staged.pvc_name)
         }
-        io::StagingOutcome::Waiting(msg) => {
-            // The VolumeSnapshot isn't readyToUse yet — a normal, transient wait.
-            // The message may carry the VolumeSnapshot's (possibly transient)
-            // `status.error` as diagnostic context; that is NOT a failure — see
-            // `StagingOutcome::Failed` for the deadline that is (issue #198).
+        io::StagingOutcome::Waiting {
+            reason,
+            message: msg,
+        } => {
+            // The stage isn't usable yet — a normal, transient wait. Two flavors,
+            // named by the carried `reason`: the VolumeSnapshot becoming readyToUse
+            // (`WaitingForVolumeSnapshot`) and the staged PVC binding on an
+            // Immediate class (`WaitingForStagedPvcBind` — the CSI restore/clone is
+            // provisioning). The message may carry the VolumeSnapshot's (possibly
+            // transient) `status.error` as diagnostic context; that is NOT a
+            // failure — see `StagingOutcome::Failed` for the deadline that is
+            // (issue #198).
             let existing = backup
                 .status
                 .as_ref()
@@ -1080,7 +1144,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 &existing,
                 SOURCE_STAGED_CONDITION,
                 false,
-                STAGING_WAITING_REASON,
+                reason,
                 &msg,
                 backup.meta().generation,
             );
@@ -1107,7 +1171,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // `Ok(await_change)` — deliberately NOT an `Error::Validation`, whose
             // generic `InvalidSpec` event would tell the user to fix a spec that
             // isn't broken.
-            let status = snapshot_ready_status_with_condition(
+            let mut status = snapshot_ready_status_with_condition(
                 backup,
                 SnapshotPhase::Failed,
                 reason,
@@ -1115,6 +1179,31 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 SOURCE_STAGED_CONDITION,
                 false,
             );
+            // Stamp the staged block (deterministic names, `ready: false`) even on
+            // failure: every cleanup site is gated on `status.staged.is_some()`,
+            // and without this stamp a staging-phase failure left an
+            // already-created VolumeSnapshot (applied BEFORE the readyToUse
+            // deadline is evaluated) holding a backend snapshot until CR deletion.
+            let staging_timeout_seconds = kopiur_api::resolve_timeout(
+                config
+                    .spec
+                    .staging
+                    .as_ref()
+                    .and_then(|s| s.timeout.as_deref()),
+                crate::consts::DEFAULT_STAGING_TIMEOUT,
+            )
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+            status["staged"] = serde_json::json!({
+                "copyMethod": format!("{:?}", config.spec.copy_method),
+                // Clone never creates a VolumeSnapshot — don't record a name that
+                // could never exist.
+                "volumeSnapshotName": (config.spec.copy_method != kopiur_api::CopyMethod::Clone)
+                    .then(|| io::volume_snapshot_name(&name)),
+                "pvcName": io::staged_pvc_name(&name),
+                "ready": false,
+                "stagingTimeoutSeconds": staging_timeout_seconds,
+            });
             let current = serde_json::to_value(&backup.status).ok();
             let wrote = io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
             if wrote {
@@ -1137,6 +1226,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 ctx.metrics
                     .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
             }
+            // Reap whatever staging already created, NOW (idempotent, 404-tolerant,
+            // PVC-before-VS — the snapshot-controller's as-source-protection
+            // finalizer drains an in-flight restore safely). The stamped `staged`
+            // block also lets the terminal-path gates re-issue this on any later
+            // reconcile, covering a crash between the patch above and this call.
+            io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             return Ok(Action::await_change());
         }
     };
@@ -2443,6 +2538,78 @@ fn staged_teardown_ready(job: Option<&Job>) -> bool {
     match job {
         None => true,
         Some(j) => job_terminal_state(j).is_some(),
+    }
+}
+
+/// What the running-Job staged-PVC bind watchdog observed.
+enum StagedPvcWatch {
+    /// No staged source, or the staged PVC is Bound/absent — proceed to the
+    /// normal wedged-pod check.
+    Clear,
+    /// The staged PVC is still Pending within the pinned staging budget — the
+    /// mover pod cannot start yet and is NOT wedged; just requeue.
+    Provisioning,
+    /// The staged PVC is unbound past the pinned budget (or `Lost`) — terminal,
+    /// with the same reason/message family as the pre-Job bind gate.
+    Expired {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// IO half of the staged-PVC bind watchdog: read the staged PVC named in
+/// `status.staged` and run it through the same pure [`io::pvc_bind_outcome`]
+/// decision the pre-Job gate uses — the PVC's own `status.phase` is ground truth,
+/// version-independent, where scheduler `Unschedulable`/`SchedulerError` message
+/// text is not. The budget is `status.staged.stagingTimeoutSeconds` (pinned at
+/// stamp time — never re-resolved from a policy that may have been edited or
+/// deleted mid-run); a legacy stamp without the field gets the default budget
+/// rather than an indefinite wait.
+async fn staged_pvc_watchdog(
+    backup: &Snapshot,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<StagedPvcWatch> {
+    let Some(staged) = backup.status.as_ref().and_then(|s| s.staged.as_ref()) else {
+        return Ok(StagedPvcWatch::Clear);
+    };
+    let Some(pvc_name) = staged.pvc_name.as_deref() else {
+        return Ok(StagedPvcWatch::Clear);
+    };
+    let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        Api::namespaced(ctx.client.clone(), namespace);
+    // A missing staged PVC is not this watchdog's problem (already reaped, or a
+    // race with cleanup) — the wedge check / terminal paths handle the rest.
+    let Some(pvc) = pvc_api.get_opt(pvc_name).await? else {
+        return Ok(StagedPvcWatch::Clear);
+    };
+    let timeout = staged_watchdog_budget(staged.staging_timeout_seconds);
+    Ok(
+        match io::pvc_bind_outcome(
+            &io::staged_pvc_observation(&pvc),
+            namespace,
+            pvc_name,
+            staged.storage_class_name.as_deref(),
+            timeout,
+            chrono::Utc::now(),
+        ) {
+            io::PvcBindWait::Bound => StagedPvcWatch::Clear,
+            io::PvcBindWait::Waiting(_) => StagedPvcWatch::Provisioning,
+            io::PvcBindWait::Failed { reason, message } => {
+                StagedPvcWatch::Expired { reason, message }
+            }
+        },
+    )
+}
+
+/// The watchdog's bind budget from the pinned `status.staged.stagingTimeoutSeconds`:
+/// `0` = the user's explicit "wait indefinitely"; absent (a stamp from before the
+/// field existed) = the default staging budget, never an accidental infinite wait.
+fn staged_watchdog_budget(pinned_seconds: Option<i64>) -> Option<std::time::Duration> {
+    match pinned_seconds {
+        Some(0) => None,
+        Some(s) if s > 0 => Some(std::time::Duration::from_secs(s as u64)),
+        _ => Some(crate::consts::DEFAULT_STAGING_TIMEOUT),
     }
 }
 

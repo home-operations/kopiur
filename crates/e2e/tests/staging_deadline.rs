@@ -512,5 +512,30 @@ async fn timeout_body(client: &kube::Client, prefix: &str) -> anyhow::Result<()>
              ({invalid_spec} found) — there is no spec problem to fix"
         );
     }
+
+    // Leak regression: a staging-phase failure must REAP the VolumeSnapshot it
+    // already created (the VS is applied BEFORE the readyToUse deadline is
+    // evaluated). Pre-fix code never stamped `status.staged` on a staging failure,
+    // so every `status.staged.is_some()` cleanup gate skipped and the VS held a
+    // backend snapshot until the CR itself was deleted.
+    wait_until(
+        "failed staging's VolumeSnapshot reaped",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(vs_api.get_opt(&vs_name).await?.is_none().then_some(())) },
+    )
+    .await
+    .context("the VolumeSnapshot of a staging-failed backup must be cleaned up")?;
+    // And `status.staged` records the failed stage (`ready: false`) — the gate the
+    // terminal-path cleanups key on.
+    let staged = status_json(&backups, prefix)
+        .await
+        .get("staged")
+        .cloned()
+        .unwrap_or_default();
+    ensure!(
+        staged.get("ready").and_then(|v| v.as_bool()) == Some(false),
+        "status.staged must be stamped (ready: false) on a staging failure: {staged}"
+    );
     Ok(())
 }

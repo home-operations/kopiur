@@ -94,7 +94,7 @@ What Kopiur does about it, per situation:
 
 ### Backing up an RWOP volume with `Snapshot` or `Clone` — no downtime (recommended)
 
-With [`copyMethod: Snapshot` (or `Clone`)](copy-methods.md), the mover **never mounts your live volume**. Kopiur takes a CSI VolumeSnapshot (or CSI clone) of the source — a storage-layer operation that the RWOP mount exclusivity does not restrict — provisions a temporary staged PVC from it, and runs kopia against that stage. The staged PVC inherits your source's access modes, RWOP included, but the mover is its **only** pod, so the exclusivity is satisfied. Your app keeps running, untouched.
+With [`copyMethod: Snapshot` (or `Clone`)](copy-methods.md), the mover **never mounts your live volume**. Kopiur takes a CSI VolumeSnapshot (or CSI clone) of the source — a storage-layer operation that the RWOP mount exclusivity does not restrict — provisions a temporary staged PVC from it, and runs kopia against that stage. By default the staged PVC inherits your source's access modes, RWOP included, but the mover is its **only** pod, so the exclusivity is satisfied. Your app keeps running, untouched. (`spec.staging.accessModes` can override the staged PVC's modes — e.g. `[ReadOnlyMany]` for a snapshot-backed read-only class like CephFS `backingSnapshot`; see [Copy methods → staging overrides](copy-methods.md#staging-overrides).)
 
 This is the recommended way to back up RWOP volumes, and you almost certainly already have what it needs: RWOP itself requires a CSI driver, and most CSI drivers that ship RWOP support also ship snapshots.
 

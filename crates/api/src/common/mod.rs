@@ -343,6 +343,121 @@ pub struct ObjectRef {
     pub namespace: Option<String>,
 }
 
+/// A PersistentVolumeClaim access mode as a closed set — `ReadWriteOnce`,
+/// `ReadOnlyMany`, `ReadWriteMany`, `ReadWriteOncePod` — so a typo is rejected by
+/// the CRD schema itself instead of surfacing as a provisioner error at the first
+/// backup or restore run.
+///
+/// Deliberately **no `Default`** (unlike other unit enums here): everywhere this
+/// type appears, an absent/empty list means "inherit from context" — the source
+/// PVC's modes for a staged PVC, `ReadWriteOnce` for a restore-created PVC — so
+/// there is no context-free default value to name.
+///
+/// The extra [`PvcAccessMode::Unknown`] variant exists ONLY so values persisted
+/// before this field was schema-enforced still **deserialize** instead of erroring
+/// the typed watch stream for the whole Kind (one legacy CR must never wedge every
+/// other CR's reconciliation). It is hidden from the CRD schema — the apiserver
+/// rejects non-canonical strings on every new write — and
+/// [`crate::validate::validate_access_modes`] rejects it loudly per-CR with the
+/// offending value quoted.
+///
+/// ```
+/// use kopiur_api::common::PvcAccessMode;
+///
+/// // Canonical values round-trip as bare k8s strings.
+/// assert_eq!(serde_json::to_value(PvcAccessMode::ReadOnlyMany).unwrap(), "ReadOnlyMany");
+/// let m: PvcAccessMode = serde_json::from_value(serde_json::json!("ReadWriteOnce")).unwrap();
+/// assert_eq!(m, PvcAccessMode::ReadWriteOnce);
+///
+/// // A legacy/bogus stored string decodes (never a watcher-poisoning error) into
+/// // `Unknown`, preserving the value verbatim for the rejection message — and it
+/// // re-serializes to the same string, so a read-modify-write never mutates it.
+/// let m: PvcAccessMode = serde_json::from_value(serde_json::json!("ReadWriteOnze")).unwrap();
+/// assert_eq!(m, PvcAccessMode::Unknown("ReadWriteOnze".into()));
+/// assert_eq!(serde_json::to_value(&m).unwrap(), "ReadWriteOnze");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PvcAccessMode {
+    /// Mounted read-write by a single node (`RWO`).
+    ReadWriteOnce,
+    /// Mounted read-only by many nodes (`ROX`) — e.g. a CephFS `backingSnapshot`
+    /// shallow-clone staged PVC.
+    ReadOnlyMany,
+    /// Mounted read-write by many nodes (`RWX`).
+    ReadWriteMany,
+    /// Mounted read-write by a single **pod** (`RWOP`); the apiserver requires it
+    /// to be the sole mode on a PVC.
+    ReadWriteOncePod,
+    /// A non-canonical stored value (pre-schema-enforcement legacy data). Never
+    /// admissible on a new write (not in the CRD schema); consumers reject it via
+    /// [`crate::validate::validate_access_modes`] with the value quoted, instead
+    /// of a serde error that would poison the typed watcher.
+    Unknown(String),
+}
+
+impl PvcAccessMode {
+    /// The four canonical Kubernetes access-mode strings — the CRD schema `enum`
+    /// and the "valid values" list in rejection messages, from one source.
+    pub const CANONICAL: [&'static str; 4] = [
+        "ReadWriteOnce",
+        "ReadOnlyMany",
+        "ReadWriteMany",
+        "ReadWriteOncePod",
+    ];
+
+    /// The k8s wire string (exhaustive; `Unknown` echoes the stored value verbatim).
+    pub fn mode_str(&self) -> &str {
+        match self {
+            PvcAccessMode::ReadWriteOnce => "ReadWriteOnce",
+            PvcAccessMode::ReadOnlyMany => "ReadOnlyMany",
+            PvcAccessMode::ReadWriteMany => "ReadWriteMany",
+            PvcAccessMode::ReadWriteOncePod => "ReadWriteOncePod",
+            PvcAccessMode::Unknown(s) => s,
+        }
+    }
+
+    /// Parse a **canonical** k8s access-mode string; `None` for anything else.
+    /// The migrate tool uses this to refuse a non-canonical VolSync value up
+    /// front instead of passing it through to a doomed `kubectl apply`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ReadWriteOnce" => Some(PvcAccessMode::ReadWriteOnce),
+            "ReadOnlyMany" => Some(PvcAccessMode::ReadOnlyMany),
+            "ReadWriteMany" => Some(PvcAccessMode::ReadWriteMany),
+            "ReadWriteOncePod" => Some(PvcAccessMode::ReadWriteOncePod),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for PvcAccessMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.mode_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PvcAccessMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(PvcAccessMode::parse(&s).unwrap_or(PvcAccessMode::Unknown(s)))
+    }
+}
+
+impl JsonSchema for PvcAccessMode {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PvcAccessMode".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Only the canonical values: `Unknown` is a decode-compat artifact for
+        // legacy stored data, never an admissible write.
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A Kubernetes PersistentVolumeClaim access mode.",
+            "enum": PvcAccessMode::CANONICAL,
+        })
+    }
+}
+
 /// Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted.
 /// Produced backups default to `Delete`; discovered snapshots are forced to `Retain`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]

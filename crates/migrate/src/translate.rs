@@ -77,6 +77,40 @@ impl Translation {
     }
 }
 
+/// Map a VolSync `accessModes` list onto `target.pvc.accessModes`, refusing any
+/// non-canonical mode up front: kopiur's CRD schema is a closed enum
+/// ([`kopiur_api::common::PvcAccessMode`]), so passing a bogus value through would
+/// only fail later, at `kubectl apply`. A refused list is recorded `Unmappable`
+/// (drives `--strict`) and the emitted Restore omits `accessModes` entirely — the
+/// created PVC then defaults to `ReadWriteOnce`.
+pub(crate) fn map_access_modes(
+    t: &mut Translation,
+    pvc: &mut serde_json::Value,
+    field: &str,
+    modes: &[String],
+) {
+    let bad: Vec<&str> = modes
+        .iter()
+        .filter(|m| kopiur_api::common::PvcAccessMode::parse(m).is_none())
+        .map(String::as_str)
+        .collect();
+    if bad.is_empty() {
+        pvc["accessModes"] = serde_json::json!(modes);
+        t.mapped(field, "Restore.spec.target.pvc.accessModes");
+    } else {
+        t.unmappable(
+            field,
+            &format!(
+                "{bad:?} is not a Kubernetes access mode (valid: {}); kopiur's CRD schema \
+                 would reject it at apply time, so it is not carried over. The emitted \
+                 Restore omits accessModes (the created PVC defaults to ReadWriteOnce) — \
+                 fix the VolSync value and re-run, or set target.pvc.accessModes by hand.",
+                kopiur_api::common::PvcAccessMode::CANONICAL.join(", ")
+            ),
+        );
+    }
+}
+
 /// Translate one restic ReplicationSource into a SnapshotPolicy (+ optional
 /// SnapshotSchedule). `repository_ref` is the kopiur repository the policy
 /// should point at (an existing one via `--repository`, or the one
@@ -372,11 +406,7 @@ pub fn translate_destination(
             });
             t.mapped("spec.restic.capacity", "Restore.spec.target.pvc.capacity");
             if let Some(modes) = &restic.access_modes {
-                pvc["accessModes"] = serde_json::json!(modes);
-                t.mapped(
-                    "spec.restic.accessModes",
-                    "Restore.spec.target.pvc.accessModes",
-                );
+                map_access_modes(&mut t, &mut pvc, "spec.restic.accessModes", modes);
             }
             if let Some(class) = &restic.storage_class_name {
                 pvc["storageClassName"] = serde_json::json!(class);
@@ -879,5 +909,41 @@ mod tests {
         }));
         // GCS: no carry (file PATH vs JSON CONTENT mismatch — caller notes it).
         assert!(cred_plan(BackendScheme::Gcs).is_empty());
+    }
+
+    #[test]
+    fn map_access_modes_refuses_non_canonical_values() {
+        // kopiur's CRD schema is a closed enum: passing a bogus VolSync mode
+        // through would only fail later, at `kubectl apply` — refuse it up front
+        // as Unmappable (drives --strict) and omit accessModes entirely.
+        let mut t = Translation::default();
+        let mut pvc = serde_json::json!({ "name": "x" });
+        map_access_modes(
+            &mut t,
+            &mut pvc,
+            "spec.restic.accessModes",
+            &["ReadWriteOnce".into(), "ReadWriteOnze".into()],
+        );
+        assert!(pvc.get("accessModes").is_none(), "{pvc}");
+        assert!(t.has_unmappable);
+        let note = t
+            .notes
+            .iter()
+            .find(|n| n.field == "spec.restic.accessModes")
+            .expect("a note for the refused field");
+        let rendered = serde_json::to_string(note).unwrap();
+        assert!(rendered.contains("ReadWriteOnze"), "{rendered}");
+        assert!(rendered.contains("ReadWriteOncePod"), "{rendered}");
+
+        // A canonical list passes straight through.
+        let mut t = Translation::default();
+        map_access_modes(
+            &mut t,
+            &mut pvc,
+            "spec.restic.accessModes",
+            &["ReadOnlyMany".into()],
+        );
+        assert_eq!(pvc["accessModes"], serde_json::json!(["ReadOnlyMany"]));
+        assert!(!t.has_unmappable);
     }
 }
