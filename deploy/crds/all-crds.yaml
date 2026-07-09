@@ -5304,6 +5304,13 @@ spec:
                 description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
                 nullable: true
                 properties:
+                  failFast:
+                    description: |-
+                      Abort the snapshot at the first error instead of collecting and
+                      continuing (`snapshot create --fail-fast`; kopia default: false). This
+                      is a `snapshot create` argv flag, not a `policy set` knob, but lives
+                      beside its semantic opposites (`ignore*Errors`) for discoverability.
+                    type: boolean
                   ignoreDirErrors:
                     description: Continue the snapshot when a directory cannot be read (`--ignore-dir-errors`).
                     type: boolean
@@ -6197,6 +6204,16 @@ spec:
                 description: Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`).
                 nullable: true
                 properties:
+                  limitMb:
+                    description: |-
+                      `snapshot create --upload-limit-mb`: abort the snapshot once this many
+                      MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb`
+                      rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter;
+                      like `failFast`, this is a `snapshot create` argv flag, not a `policy
+                      set` knob, but lives here beside its parallelism siblings.
+                    format: int64
+                    nullable: true
+                    type: integer
                   maxParallelFileReads:
                     description: '`--max-parallel-file-reads`: file-read concurrency within a snapshot.'
                     format: int64
@@ -6220,6 +6237,14 @@ spec:
                         description: Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`.
                         nullable: true
                         type: string
+                      parallel:
+                        description: |-
+                          `restore --parallel`: restore parallelism for the scratch-restore (deep verify
+                          IS a restore under the hood); absent leaves kopia's default.
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter for the deep restore-test (e.g. weekly).
                         properties:
@@ -6252,6 +6277,32 @@ spec:
                       lives under `quick.schedule` (matching `deep.schedule`), see [`QuickVerification`].
                     nullable: true
                     properties:
+                      fileParallelism:
+                        description: '`--file-parallelism`: parallelism for file verification (kopia default: unset).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      fileQueueLength:
+                        description: '`--file-queue-length`: queue length for file verification (kopia default: 20000).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      maxErrors:
+                        description: |-
+                          `--max-errors`: stop after this many errors (kopia default: 0, meaning stop
+                          at the first error).
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      parallel:
+                        description: '`--parallel`: verification parallelism (kopia default: 8).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
                         nullable: true
@@ -6454,6 +6505,15 @@ spec:
                 - Delete
                 - Retain
                 - Orphan
+                nullable: true
+                type: string
+              description:
+                description: |-
+                  Free-form text recorded on the kopia snapshot manifest
+                  (`snapshot create --description`). Per-invocation by nature —
+                  scheduled/discovered `Snapshot`s never set this (no templated
+                  descriptions).
+                maxLength: 1024
                 nullable: true
                 type: string
               failurePolicy:
@@ -7513,14 +7573,66 @@ spec:
                 nullable: true
                 properties:
                   enableFileDeletion:
-                    description: Delete files in the target that are not present in the snapshot (exact mirror); off by default.
+                    description: |-
+                      Delete files in the target that are not present in the snapshot (exact mirror); off by default.
+                      Wired to kopia's `--[no-]delete-extra` (previously a silent no-op — see issue #216 gap sweep).
+                    type: boolean
+                  ignoreErrors:
+                    description: '`--[no-]ignore-errors`: ignore all restore errors and continue (kopia default `false`).'
+                    nullable: true
                     type: boolean
                   ignorePermissionErrors:
                     description: Continue past permission errors during restore (default true).
                     nullable: true
                     type: boolean
+                  overwriteDirectories:
+                    description: |-
+                      `--[no-]overwrite-directories`: overwrite existing directories in the target
+                      (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                  overwriteFiles:
+                    description: '`--[no-]overwrite-files`: overwrite existing files in the target (kopia default `true`).'
+                    nullable: true
+                    type: boolean
+                  overwriteSymlinks:
+                    description: |-
+                      `--[no-]overwrite-symlinks`: overwrite existing symlinks in the target
+                      (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                  parallel:
+                    description: '`--parallel`: restore parallelism (kopia default `8`; `1` disables parallelism).'
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  skipExisting:
+                    description: |-
+                      `--[no-]skip-existing`: skip files/symlinks that already exist in the target
+                      (kopia default `false`).
+                    nullable: true
+                    type: boolean
+                  skipOwners:
+                    description: '`--[no-]skip-owners`: skip restoring file owners (kopia default `false`).'
+                    nullable: true
+                    type: boolean
+                  skipPermissions:
+                    description: '`--[no-]skip-permissions`: skip restoring file permissions (kopia default `false`).'
+                    nullable: true
+                    type: boolean
+                  skipTimes:
+                    description: '`--[no-]skip-times`: skip restoring file modification times (kopia default `false`).'
+                    nullable: true
+                    type: boolean
                   writeFilesAtomically:
                     description: Write files atomically via a temp file + rename (default true).
+                    nullable: true
+                    type: boolean
+                  writeSparseFiles:
+                    description: |-
+                      `--[no-]write-sparse-files`: attempt to write files sparsely, allocating the
+                      minimum disk space needed (kopia default `false`).
                     nullable: true
                     type: boolean
                 type: object
@@ -9465,6 +9577,66 @@ spec:
               suspend:
                 description: Pause this replication; a suspended replication runs no syncs (default `false`).
                 type: boolean
+              sync:
+                description: |-
+                  Tuning knobs for the underlying `kopia repository sync-to` invocation
+                  (issue #216). `None` reproduces today's behavior: sequential copy
+                  (`--parallel` unset), additive sync (no `--delete`), kopia's own
+                  `--must-exist`/`--times`/`--update` defaults, and no throughput cap.
+                nullable: true
+                properties:
+                  deleteExtra:
+                    description: |-
+                      `--delete`: prune destination-only blobs so the mirror is an exact copy
+                      (kopia default `false` — additive sync, never removes destination
+                      content). Named `deleteExtra`, not kopia's bare `delete`: a `delete: true`
+                      key on backup-adjacent YAML is dangerously ambiguous at a glance.
+
+                      CAUTION: with this `true`, blobs present at the destination but absent
+                      from the source are deleted on every run.
+                    type: boolean
+                  maxDownloadSpeedBytesPerSecond:
+                    description: |-
+                      `--max-download-speed`: cap read throughput from the source, in
+                      bytes/sec (kopia default: unlimited).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  maxUploadSpeedBytesPerSecond:
+                    description: |-
+                      `--max-upload-speed`: cap write throughput to the destination, in
+                      bytes/sec (kopia default: unlimited).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  mustExist:
+                    description: |-
+                      `--[no-]must-exist`: fail the sync instead of initializing the
+                      destination's repository-format blob (kopia default `false` — sync-to may
+                      create the destination layout on first run).
+                    nullable: true
+                    type: boolean
+                  parallel:
+                    description: |-
+                      `--parallel`: number of concurrent blob-copy workers (kopia default `1` —
+                      sequential, the root cause of #216's multi-week seed times to R2).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  times:
+                    description: |-
+                      `--[no-]times`: synchronize blob modification times to the destination,
+                      when the destination backend supports it (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                  update:
+                    description: |-
+                      `--[no-]update`: update blobs already present at the destination when the
+                      source copy is newer (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                type: object
             required:
             - destination
             - schedule

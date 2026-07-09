@@ -116,12 +116,22 @@ failing outright. Each flag defaults `false` (kopia's fail-on-error default):
 `ignoreDirErrors` (`--ignore-dir-errors`) past unreadable directories, and
 `ignoreUnknownTypes` (`--ignore-unknown-types`) past entries of unknown type.
 
+`failFast` (`--fail-fast`, default `false`) is the opposite kind of knob: it
+aborts the snapshot at the *first* error instead of collecting and continuing.
+It rides `kopia snapshot create`'s own argv (not `policy set`), which is why it
+lives here beside its semantic opposites rather than under `upload`.
+
 ### `upload`
 
 Upload parallelism (kopia's upload policy). `maxParallelSnapshots`
 (`--max-parallel-snapshots`) is how many sources snapshot concurrently;
 `maxParallelFileReads` (`--max-parallel-file-reads`) is file-read concurrency
-within a snapshot. Absent knobs leave kopia's default.
+within a snapshot. `limitMb` (`--upload-limit-mb`, kopia default: unlimited)
+aborts the snapshot once this many MB have been uploaded — named `limitMb`
+rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter. Like
+`failFast`, it is a `snapshot create` argv flag, not a `policy set` knob, but
+lives here beside its parallelism siblings. Absent knobs leave kopia's
+default.
 
 ### `verification`
 
@@ -129,18 +139,26 @@ First-class backup verification that proves snapshots are **restorable**, not ju
 that maintenance ran. Opt-in: when absent, no verification runs. Two tiers, both
 shaped `{ schedule: CronSpec, ... }`:
 
-- `quick` — a `QuickVerification { schedule?: CronSpec }`: the frequent blob-level
-  `kopia snapshot verify`. `quick.schedule` absent means no quick verification.
-  `verifyFilesPercent` (`--verify-files-percent`, a sibling of `quick`/`deep` on
-  `verification` itself) tunes how many files it verifies fully (absent leaves
-  kopia's default).
-- `deep` — a `DeepVerification { schedule: CronSpec, storageClassName?, capacity? }`:
-  the rarer scratch-restore restorability test, which restores the latest snapshot
-  into an ephemeral volume, sanity-checks it, then discards it. `deep.schedule` is
-  its cron+jitter (e.g. weekly); `deep.capacity` sizes the ephemeral scratch PVC
-  (e.g. `10Gi`) — absent falls back to a node-ephemeral `emptyDir`;
-  `deep.storageClassName` picks the scratch PVC's StorageClass (absent uses the
-  cluster default, and only applies when `capacity` is set).
+- `quick` — a `QuickVerification { schedule?: CronSpec, parallel?, fileParallelism?,
+  fileQueueLength?, maxErrors? }`: the frequent blob-level `kopia snapshot verify`.
+  `quick.schedule` absent means no quick verification. `verifyFilesPercent`
+  (`--verify-files-percent`, a sibling of `quick`/`deep` on `verification` itself)
+  tunes how many files it verifies fully (absent leaves kopia's default). The four
+  tuning knobs map directly onto `kopia snapshot verify`'s own flags — `parallel`
+  (`--parallel`, kopia default 8), `fileParallelism` (`--file-parallelism`),
+  `fileQueueLength` (`--file-queue-length`, kopia default 20000), and `maxErrors`
+  (`--max-errors`, kopia default 0 — stop at the first error); all optional, and
+  `maxErrors` is the only one left unconstrained at admission (0 is a meaningful
+  value, not a footgun) — the other three must be `>= 1` when set.
+- `deep` — a `DeepVerification { schedule: CronSpec, storageClassName?, capacity?,
+  parallel? }`: the rarer scratch-restore restorability test, which restores the
+  latest snapshot into an ephemeral volume, sanity-checks it, then discards it.
+  `deep.schedule` is its cron+jitter (e.g. weekly); `deep.capacity` sizes the
+  ephemeral scratch PVC (e.g. `10Gi`) — absent falls back to a node-ephemeral
+  `emptyDir`; `deep.storageClassName` picks the scratch PVC's StorageClass (absent
+  uses the cluster default, and only applies when `capacity` is set); `deep.parallel`
+  maps onto `restore --parallel` — deep verify IS a restore under the hood, so this
+  is the restore's own parallelism knob, not a separate concept.
 - `successExpr` — a CEL pass/fail predicate over the verify result, applied to both
   tiers. The environment exposes `stats{files,bytes,errors}`, `snapshot`, and (deep
   only) `restored{files,checksumMatches}`; returning `false` fails the run, killing

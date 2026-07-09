@@ -32,6 +32,10 @@ What happens to the underlying kopia snapshot when this CR is deleted. The defau
 
 Exempt this snapshot from GFS retention. When `true` the reconciler applies a kopia snapshot pin and the GFS pruner never selects it for deletion — useful for pre-migration or compliance holds. Clearing it removes the pin. Defaults to `false`.
 
+### `description`
+
+Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`), up to 1024 characters. Per-invocation by nature — a `SnapshotSchedule`'s children and `discovered` backups never set this; use it on a manual `Snapshot` (or `kubectl kopiur snapshot now --description`) to annotate one-off runs, e.g. `pre-upgrade snapshot`.
+
 ## `status`
 
 The status is rich; `discovered` snapshots populate it without any spec.

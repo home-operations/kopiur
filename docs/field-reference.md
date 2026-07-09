@@ -1317,6 +1317,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `failFast` | boolean | — | Abort the snapshot at the first error instead of collecting and continuing (`snapshot create --fail-fast`; kopia default: false). This is a `snapshot create` argv flag, not a `policy set` knob, but lives beside its semantic opposites (`ignore*Errors`) for discoverability. |
 | `ignoreDirErrors` | boolean | — | Continue the snapshot when a directory cannot be read (`--ignore-dir-errors`). |
 | `ignoreFileErrors` | boolean | — | Continue the snapshot when a file cannot be read (`--ignore-file-errors`). |
 | `ignoreUnknownTypes` | boolean | — | Continue past entries of unknown type (`--ignore-unknown-types`). |
@@ -1537,6 +1538,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `limitMb` | integer | — | `snapshot create --upload-limit-mb`: abort the snapshot once this many MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb` rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter; like `failFast`, this is a `snapshot create` argv flag, not a `policy set` knob, but lives here beside its parallelism siblings. |
 | `maxParallelFileReads` | integer | — | `--max-parallel-file-reads`: file-read concurrency within a snapshot. |
 | `maxParallelSnapshots` | integer | — | `--max-parallel-snapshots`: how many sources snapshot concurrently. |
 
@@ -1555,6 +1557,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `schedule` | [object](#snapshotpolicy-spec-verification-deep-schedule) | **required** | Cron + jitter for the deep restore-test (e.g. weekly). |
 | `capacity` | string | — | Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`. |
+| `parallel` | integer | —<br><sub>min 0</sub> | `restore --parallel`: restore parallelism for the scratch-restore (deep verify IS a restore under the hood); absent leaves kopia's default. |
 | `storageClassName` | string | — | StorageClass for the ephemeral scratch PVC; absent uses the cluster default (only with `capacity`). |
 
 ###### `spec.verification.deep.schedule` { #snapshotpolicy-spec-verification-deep-schedule }
@@ -1569,6 +1572,10 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `fileParallelism` | integer | —<br><sub>min 0</sub> | `--file-parallelism`: parallelism for file verification (kopia default: unset). |
+| `fileQueueLength` | integer | —<br><sub>min 0</sub> | `--file-queue-length`: queue length for file verification (kopia default: 20000). |
+| `maxErrors` | integer | —<br><sub>min 0</sub> | `--max-errors`: stop after this many errors (kopia default: 0, meaning stop at the first error). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: verification parallelism (kopia default: 8). |
 | `schedule` | [object](#snapshotpolicy-spec-verification-quick-schedule) | — | Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled. |
 
 ###### `spec.verification.quick.schedule` { #snapshotpolicy-spec-verification-quick-schedule }
@@ -1642,6 +1649,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `deletionPolicy` | enum: Delete \| Retain \| Orphan | — | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
+| `description` | string | —<br><sub>maxLength 1024</sub> | Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`). Per-invocation by nature — scheduled/discovered `Snapshot`s never set this (no templated descriptions). |
 | `failurePolicy` | [object](#snapshot-spec-failurepolicy) | — | Mover Job retry and deadline limits for this run. |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
@@ -2032,9 +2040,19 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enableFileDeletion` | boolean | — | Delete files in the target that are not present in the snapshot (exact mirror); off by default. |
+| `enableFileDeletion` | boolean | — | Delete files in the target that are not present in the snapshot (exact mirror); off by default. Wired to kopia's `--[no-]delete-extra` (previously a silent no-op — see issue #216 gap sweep). |
+| `ignoreErrors` | boolean | — | `--[no-]ignore-errors`: ignore all restore errors and continue (kopia default `false`). |
 | `ignorePermissionErrors` | boolean | — | Continue past permission errors during restore (default true). |
+| `overwriteDirectories` | boolean | — | `--[no-]overwrite-directories`: overwrite existing directories in the target (kopia default `true`). |
+| `overwriteFiles` | boolean | — | `--[no-]overwrite-files`: overwrite existing files in the target (kopia default `true`). |
+| `overwriteSymlinks` | boolean | — | `--[no-]overwrite-symlinks`: overwrite existing symlinks in the target (kopia default `true`). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: restore parallelism (kopia default `8`; `1` disables parallelism). |
+| `skipExisting` | boolean | — | `--[no-]skip-existing`: skip files/symlinks that already exist in the target (kopia default `false`). |
+| `skipOwners` | boolean | — | `--[no-]skip-owners`: skip restoring file owners (kopia default `false`). |
+| `skipPermissions` | boolean | — | `--[no-]skip-permissions`: skip restoring file permissions (kopia default `false`). |
+| `skipTimes` | boolean | — | `--[no-]skip-times`: skip restoring file modification times (kopia default `false`). |
 | `writeFilesAtomically` | boolean | — | Write files atomically via a temp file + rename (default true). |
+| `writeSparseFiles` | boolean | — | `--[no-]write-sparse-files`: attempt to write files sparsely, allocating the minimum disk space needed (kopia default `false`). |
 
 #### `spec.policy` { #restore-spec-policy }
 
@@ -2336,6 +2354,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | `sourceRef` | [object](#repositoryreplication-spec-sourceref) | **required** | Reference to the `Repository` or `ClusterRepository` to mirror from. |
 | `mover` | [object](#repositoryreplication-spec-mover) | — | Mover (Job pod) overrides for the replication run. |
 | `suspend` | boolean | — | Pause this replication; a suspended replication runs no syncs (default `false`). |
+| `sync` | [object](#repositoryreplication-spec-sync) | — | Tuning knobs for the underlying `kopia repository sync-to` invocation (issue #216). `None` reproduces today's behavior: sequential copy (`--parallel` unset), additive sync (no `--delete`), kopia's own `--must-exist`/`--times`/`--update` defaults, and no throughput cap. |
 
 #### `spec.destination` { #repositoryreplication-spec-destination }
 
@@ -2637,6 +2656,18 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | --- | --- | --- | --- |
 | `podSelector` | core/v1 LabelSelector | **required** | Label selector matching the workload pod(s) to read context/hooks from. |
 | `container` | string | — | Which container within the matched pod; absent uses the first/only container. |
+
+#### `spec.sync` { #repositoryreplication-spec-sync }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `deleteExtra` | boolean | — | `--delete`: prune destination-only blobs so the mirror is an exact copy (kopia default `false` — additive sync, never removes destination content). Named `deleteExtra`, not kopia's bare `delete`: a `delete: true` key on backup-adjacent YAML is dangerously ambiguous at a glance.<br>CAUTION: with this `true`, blobs present at the destination but absent from the source are deleted on every run. |
+| `maxDownloadSpeedBytesPerSecond` | integer | — | `--max-download-speed`: cap read throughput from the source, in bytes/sec (kopia default: unlimited). |
+| `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput to the destination, in bytes/sec (kopia default: unlimited). |
+| `mustExist` | boolean | — | `--[no-]must-exist`: fail the sync instead of initializing the destination's repository-format blob (kopia default `false` — sync-to may create the destination layout on first run). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of concurrent blob-copy workers (kopia default `1` — sequential, the root cause of #216's multi-week seed times to R2). |
+| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `true`). |
+| `update` | boolean | — | `--[no-]update`: update blobs already present at the destination when the source copy is newer (kopia default `true`). |
 
 ### `status` { #repositoryreplication-status }
 

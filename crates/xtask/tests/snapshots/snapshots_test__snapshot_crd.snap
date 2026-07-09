@@ -49,6 +49,15 @@ spec:
                 - Orphan
                 nullable: true
                 type: string
+              description:
+                description: |-
+                  Free-form text recorded on the kopia snapshot manifest
+                  (`snapshot create --description`). Per-invocation by nature —
+                  scheduled/discovered `Snapshot`s never set this (no templated
+                  descriptions).
+                maxLength: 1024
+                nullable: true
+                type: string
               failurePolicy:
                 description: Mover Job retry and deadline limits for this run.
                 nullable: true

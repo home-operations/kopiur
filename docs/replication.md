@@ -94,6 +94,42 @@ The full apply-ready manifest — including the destination-backend `Secret` —
 | `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported, like a `SnapshotSchedule`). |
 | `mover` | Per-run mover overrides (resources, scheduling, security context). Inherits the source repository's `moverDefaults`. |
 | `suspend` | Pause replication without deleting the CR. |
+| `sync` | Tuning knobs for the underlying `kopia repository sync-to` invocation — see [Tuning the sync](#tuning-the-sync) below. |
+
+## Tuning the sync
+
+By default `sync-to` copies blobs **one at a time**: fine for a small repository, but
+an initial seed of a large one to a slow or high-latency destination (object storage
+in particular) can take days to weeks at roughly one object per second. `spec.sync`
+exposes the kopia flags that speed this up and otherwise tune the copy:
+
+```yaml
+spec:
+  sync:
+    parallel: 8 # concurrent blob-copy workers (kopia default: 1 — sequential)
+    deleteExtra: false # prune destination-only blobs for a true mirror (default: false)
+    mustExist: false # fail instead of initializing the destination (default: false)
+    times: true # sync blob modification times, when supported (default: true)
+    update: true # update blobs already at the destination when newer (default: true)
+    maxDownloadSpeedBytesPerSecond: 50000000 # cap source read throughput
+    maxUploadSpeedBytesPerSecond: 20000000 # cap destination write throughput
+```
+
+Every field is independently optional; omitting `sync` entirely (or any field within
+it) reproduces kopia's own default for that flag — raising `parallel` is the main
+knob most users reach for.
+
+/// warning | `deleteExtra` deletes destination content
+
+`deleteExtra` maps to kopia's `--delete`: with it `true`, every run **deletes** blobs
+present at the destination but no longer present at the source, turning the mirror
+into an exact copy rather than an additive one. This is the correct behavior for a
+true 3-2-1 mirror, but it means a mistaken or emptied source repository will prune the
+destination's copies too on the next scheduled run. It is named `deleteExtra` here
+(not kopia's bare `delete`) precisely so a `deleteExtra: true` reads as deliberate
+rather than being mistaken for a leftover default.
+
+///
 
 ## Destination credentials
 

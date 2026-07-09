@@ -1,10 +1,12 @@
 //! Real kopia filesystem round-trip integration test.
 //!
 //! Gated behind the `integration` feature and `#[ignore]` by default so the
-//! hermetic `cargo test` never invokes the real binary. Run with:
+//! hermetic `cargo test` never invokes the real binary (the `integration`
+//! feature lifts the `#[ignore]`, so it is not needed on the command line).
+//! Run with:
 //!
 //! ```text
-//! cargo test -p kopiur-kopia --features integration -- --ignored
+//! cargo test -p kopiur-kopia --features integration
 //! ```
 //!
 //! It creates a filesystem repo in a tempdir, snapshots a tempdir with known
@@ -16,7 +18,8 @@
 use std::collections::BTreeMap;
 
 use kopiur_kopia::{
-    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, VerifyOptions,
+    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, SyncToOptions,
+    VerifyOptions,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -220,14 +223,19 @@ async fn verbs_roundtrip() {
         "ignore policy should exclude *.tmp"
     );
 
-    // Verify integrity (read 100% of files).
+    // Verify integrity (read 100% of files). Also exercises the M3 (issue #216
+    // category sweep) tuning knobs `--file-parallelism`/`--file-queue-length`
+    // against the real kopia binary — the permanent regression guard that kopia
+    // actually accepts these flag forms, not just that the argv shape looks right.
     client
         .snapshot_verify(&VerifyOptions {
             verify_files_percent: Some(100),
+            file_parallelism: Some(2),
+            file_queue_length: Some(100),
             ..Default::default()
         })
         .await
-        .expect("verify");
+        .expect("verify with file-parallelism/file-queue-length");
 
     // Restore honoring options (atomic writes, ignore permission errors).
     client
@@ -268,4 +276,215 @@ async fn verbs_roundtrip() {
         !restore_dir.path().join("skip.tmp").exists(),
         "ignored file should not be in the snapshot/restore"
     );
+}
+
+/// Real-kopia guard for issue #216: `kopia repository sync-to` accepts the
+/// tuning flags `sync_to_args` builds — `--parallel`, the `--no-*` tri-state
+/// forms (`--no-times`), and the throughput caps — against a real filesystem
+/// destination. This is the permanent regression guard for the kingpin
+/// flag-form risk noted on `sync_to_args`/`push_tristate`: a bad flag SHAPE
+/// (e.g. `--must-exist=false`) would fail here even though the pure arg-builder
+/// unit tests only check the argv shape, not that kopia accepts it.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn sync_to_accepts_parallel_and_tristate_flags() {
+    let source_repo_dir = tempfile::tempdir().unwrap();
+    let dest_repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"hello sync-to\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: source_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("source repository create");
+    client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("syncuser@synchost:/data"),
+        )
+        .await
+        .expect("snapshot create");
+
+    // `--parallel 2 --no-times`: the exact flag combo the brief calls out as
+    // smoke-tested against kopia 0.23.1. A wrong flag GRAMMAR (e.g.
+    // `--must-exist=false` instead of `--no-must-exist`) fails here with a
+    // kopia argv-parse error, not a silently-wrong result.
+    client
+        .repository_sync_to(
+            &ConnectSpec::Filesystem {
+                path: dest_repo_dir.path().to_path_buf(),
+            },
+            &SyncToOptions {
+                parallel: Some(2),
+                times: Some(false),
+                must_exist: Some(false),
+                update: Some(false),
+                max_upload_speed_bytes_per_second: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync-to with --parallel 2 --no-times should succeed");
+
+    // The destination is now itself a connectable repository with the mirrored
+    // snapshot — proving the copy (not just a successful exit code) happened.
+    let dest_config_dir = config_dir.path().join("dest");
+    std::fs::create_dir_all(&dest_config_dir).unwrap();
+    let dest_client = isolated_client(&dest_config_dir);
+    dest_client
+        .repository_connect(
+            &ConnectSpec::Filesystem {
+                path: dest_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+        )
+        .await
+        .expect("connect to the sync-to destination");
+    let list = dest_client
+        .snapshot_list(None)
+        .await
+        .expect("list destination snapshots");
+    assert_eq!(
+        list.len(),
+        1,
+        "the mirrored snapshot must appear at the destination"
+    );
+}
+
+/// Real-kopia guard for the M2 restore flag sweep (issue #216 gap analysis):
+/// `kopia snapshot restore` accepts `--parallel 2`, `--skip-times`, and —
+/// critically — `--delete-extra`, the flag `enableFileDeletion` was
+/// **previously unable to reach at all** (a silent no-op bug: the CRD field
+/// existed, but `kopiur_kopia::RestoreOptions` had no `delete_extra` field and
+/// `restore_args` never emitted the flag). Restoring into a target that
+/// already contains a file NOT present in the snapshot proves `--delete-extra`
+/// actually deletes it — not just that kopia accepted the flag on argv.
+///
+/// Per the semantic gotcha: `--delete-extra` only takes effect if the restore
+/// itself succeeds, and kopia's `overwrite-directories` default is already
+/// `true`, so this test must NOT pass `--no-overwrite-directories` (that would
+/// make the restore fail against the pre-populated, non-empty target).
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn restore_accepts_m2_flag_sweep_and_deletes_extra_files() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let restore_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("keep.txt"), b"from the snapshot\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+    let created = client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("m2user@m2host:/data"),
+        )
+        .await
+        .expect("snapshot create");
+
+    // Pre-populate the restore target with a file NOT in the snapshot — the
+    // thing `--delete-extra` is supposed to remove. Without `enableFileDeletion`
+    // wired up, this file would silently survive the restore (the additive-only
+    // bug this milestone fixes).
+    std::fs::write(restore_dir.path().join("stale.txt"), b"leftover\n").unwrap();
+
+    client
+        .snapshot_restore_with(
+            &created.id,
+            restore_dir.path().to_str().unwrap(),
+            &RestoreOptions {
+                parallel: Some(2),
+                skip_times: Some(true),
+                delete_extra: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restore with --parallel 2 --skip-times --delete-extra should succeed");
+
+    // The snapshot's content is present...
+    let kept = std::fs::read(restore_dir.path().join("keep.txt")).expect("keep.txt restored");
+    assert_eq!(kept, b"from the snapshot\n");
+    // ...and the pre-existing extra file is GONE — proving kopia actually
+    // accepted and acted on `--delete-extra`, not just that argv parsed.
+    assert!(
+        !restore_dir.path().join("stale.txt").exists(),
+        "stale.txt should have been deleted by --delete-extra"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn snapshot_create_accepts_m4_flag_sweep_and_records_the_description() {
+    // M4 flag sweep (issue #216 category sweep): `snapshot create --fail-fast
+    // --upload-limit-mb <n> --description <text>` is accepted by real kopia
+    // (smoke-tested against 0.23.1 in the design doc; this is the permanent
+    // guard), and the description round-trips onto the created snapshot's
+    // JSON (not just accepted argv).
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"m4 flag sweep\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+
+    let created = client
+        .snapshot_create_with(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("m4user@m4host:/data"),
+            &kopiur_kopia::SnapshotCreateOptions {
+                fail_fast: Some(true),
+                upload_limit_mb: Some(100),
+                description: Some("m4 flag sweep smoke test".to_string()),
+            },
+        )
+        .await
+        .expect("snapshot create --fail-fast --upload-limit-mb 100 --description should succeed");
+    assert_eq!(created.description, "m4 flag sweep smoke test");
+
+    // `snapshot list` shows the same description was actually persisted on
+    // the manifest, not just echoed back by `create`'s own JSON.
+    let list = client
+        .snapshot_list(None)
+        .await
+        .expect("snapshot list after m4 create");
+    let entry = list
+        .iter()
+        .find(|e| e.id == created.id)
+        .expect("created snapshot present in list");
+    assert_eq!(entry.description, "m4 flag sweep smoke test");
 }

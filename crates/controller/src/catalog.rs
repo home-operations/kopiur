@@ -600,6 +600,9 @@ async fn materialize_discovered(
             deletion_policy: Some(DeletionPolicy::Retain),
             // Discovered snapshots are not pinned by the operator.
             pin: false,
+            // Discovered snapshots never carry a templated description (out
+            // of scope for M4 — description is per-invocation only).
+            description: None,
         },
     );
     backup.metadata = io::child_meta(&cr_name, namespace, labels, Some(owner.clone()));
@@ -1114,6 +1117,7 @@ mod tests {
                     failure_policy: None,
                     deletion_policy: None,
                     pin: false,
+                    description: None,
                 },
             );
             let mut labels = BTreeMap::new();

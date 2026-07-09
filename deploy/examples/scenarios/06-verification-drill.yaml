@@ -50,6 +50,12 @@ spec:
       schedule:
         cron: "0 4 * * *"
         jitter: 30m
+      # Tuning knobs map directly onto `kopia snapshot verify`'s own flags; all
+      # optional, absent leaves kopia's default.
+      parallel: 8 # --parallel (kopia default: 8)
+      fileParallelism: 4 # --file-parallelism
+      fileQueueLength: 20000 # --file-queue-length (kopia default: 20000)
+      maxErrors: 0 # --max-errors (kopia default: 0, stop at the first error)
     # Deep: scratch-restore the latest snapshot into a throwaway volume, weekly.
     deep:
       schedule:
@@ -60,6 +66,8 @@ spec:
       # emptyDir. storageClassName only applies when capacity is set (omit = default).
       capacity: 100Gi
       storageClassName: fast-ssd
+      # restore --parallel: deep verify IS a restore under the hood.
+      parallel: 4
     # CEL pass/fail over the result — a verify with 0 files or any error FAILS.
     successExpr: "stats.files > 0 && stats.errors == 0"
     verifyFilesPercent: 10 # how much of each file `quick` reads fully

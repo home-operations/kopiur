@@ -52,6 +52,7 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
             failure_policy,
             deletion_policy: args.deletion_policy.map(Into::into),
             pin: args.pin,
+            description: args.description.clone(),
         },
     );
     snapshot.metadata.namespace = Some(namespace.to_string());
@@ -272,6 +273,7 @@ mod tests {
             tags: vec![],
             deletion_policy: None,
             pin: false,
+            description: None,
             backoff_limit: None,
             active_deadline_seconds: None,
             pod_startup_deadline_seconds: None,
@@ -302,7 +304,13 @@ mod tests {
         );
         assert_eq!(wire["spec"]["policyRef"]["name"], "nightly");
         // Unset options must be ABSENT on the wire, not null/false noise.
-        for key in ["tags", "failurePolicy", "deletionPolicy", "pin"] {
+        for key in [
+            "tags",
+            "failurePolicy",
+            "deletionPolicy",
+            "pin",
+            "description",
+        ] {
             assert!(wire["spec"].get(key).is_none(), "{key} should be absent");
         }
         let reparsed: Snapshot = serde_json::from_value(wire).unwrap();
@@ -317,6 +325,7 @@ mod tests {
         a.tags = vec![("reason".into(), "pre-upgrade".into())];
         a.deletion_policy = Some(DeletionPolicyArg::Retain);
         a.pin = true;
+        a.description = Some("pre-upgrade snapshot".into());
         a.backoff_limit = Some(0);
         a.active_deadline_seconds = Some(120);
         let wire = serde_json::to_value(build_snapshot(&a, "media", at())).unwrap();
@@ -324,6 +333,7 @@ mod tests {
         assert_eq!(wire["spec"]["tags"]["reason"], "pre-upgrade");
         assert_eq!(wire["spec"]["deletionPolicy"], "Retain");
         assert_eq!(wire["spec"]["pin"], true);
+        assert_eq!(wire["spec"]["description"], "pre-upgrade snapshot");
         assert_eq!(wire["spec"]["failurePolicy"]["backoffLimit"], 0);
         assert_eq!(wire["spec"]["failurePolicy"]["activeDeadlineSeconds"], 120);
     }

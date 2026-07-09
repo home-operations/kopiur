@@ -713,6 +713,38 @@ fn restore_pvc_target_requires_capacity() {
 }
 
 #[test]
+fn restore_options_parallel_must_be_at_least_one() {
+    // M2 flag sweep: options.parallel is a count knob (require_min, same shared
+    // helper as RepositoryReplication.spec.sync.parallel) — 0 would otherwise
+    // silently reach kopia's argv as `--parallel 0`.
+    use crate::common::ObjectRef;
+    use crate::restore::RestoreOptions;
+    let mut spec = restore_with(
+        RestoreSource::SnapshotRef(ObjectRef {
+            name: "b".into(),
+            namespace: None,
+        }),
+        None,
+    );
+    spec.options = Some(RestoreOptions {
+        parallel: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_restore_spec(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidFieldValue { field, .. } if field.contains("parallel"))),
+        "expected an InvalidFieldValue for options.parallel, got {errs:?}"
+    );
+
+    spec.options = Some(RestoreOptions {
+        parallel: Some(4),
+        ..Default::default()
+    });
+    assert!(validate_restore_spec(&spec).is_empty());
+}
+
+#[test]
 fn restore_as_of_must_be_rfc3339_and_message_says_how_to_fix() {
     use crate::restore::FromPolicy;
     let spec = restore_with(
@@ -1199,6 +1231,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         policy_ref: None,
         tags: None,
         failure_policy: None,
+        description: None,
         deletion_policy: Some(DeletionPolicy::Delete),
         pin: false,
     };
@@ -1852,6 +1885,7 @@ fn replication_spec(
         },
         mover: None,
         suspend: false,
+        sync: None,
     }
 }
 
@@ -1919,6 +1953,72 @@ fn replication_rejects_invalid_destination_backend_content() {
     assert!(
         errs.iter()
             .any(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+    );
+}
+
+#[test]
+fn replication_sync_all_zero_is_valid() {
+    // #216: a `sync` block is optional and every field individually optional;
+    // a fully-populated but in-range block must not error.
+    use crate::backend::{Backend, S3Backend};
+    use crate::repository_replication::SyncOptions;
+    let mut spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        Backend::S3(S3Backend {
+            bucket: "mirror".into(),
+            prefix: None,
+            endpoint: None,
+            region: None,
+            auth: None,
+            tls: None,
+        }),
+        "0 5 * * *",
+    );
+    spec.sync = Some(SyncOptions {
+        parallel: Some(4),
+        delete_extra: true,
+        must_exist: Some(false),
+        times: Some(true),
+        update: Some(false),
+        max_download_speed_bytes_per_second: Some(1_000_000),
+        max_upload_speed_bytes_per_second: Some(500_000),
+    });
+    assert!(validate_repository_replication(&spec).is_empty());
+}
+
+#[test]
+fn replication_sync_rejects_zero_parallel_and_zero_speeds() {
+    // #216: `parallel`/the speed caps must be >= 1 — 0 is meaningless for a copy
+    // parallelism or a throughput cap, and would otherwise silently reach kopia's
+    // argv as `--parallel 0` etc.
+    use crate::backend::{Backend, S3Backend};
+    use crate::repository_replication::SyncOptions;
+    let mut spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        Backend::S3(S3Backend {
+            bucket: "mirror".into(),
+            prefix: None,
+            endpoint: None,
+            region: None,
+            auth: None,
+            tls: None,
+        }),
+        "0 5 * * *",
+    );
+    spec.sync = Some(SyncOptions {
+        parallel: Some(0),
+        max_download_speed_bytes_per_second: Some(0),
+        max_upload_speed_bytes_per_second: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_repository_replication(&spec);
+    let invalid_count = errs
+        .iter()
+        .filter(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+        .count();
+    assert_eq!(
+        invalid_count, 3,
+        "parallel + both speed caps must each be rejected independently, got {errs:?}"
     );
 }
 
@@ -2831,6 +2931,113 @@ fn backup_config_validates_verification() {
         "{:?}",
         validate_backup_config(&no_quick)
     );
+}
+
+#[test]
+fn backup_config_validates_verification_tuning_knobs() {
+    // Zero is rejected for the count knobs (>= 1) on both tiers.
+    for (yaml, field) in [
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    parallel: 0\n",
+            "SnapshotPolicy spec.verification.quick.parallel",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    fileParallelism: 0\n",
+            "SnapshotPolicy spec.verification.quick.fileParallelism",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    fileQueueLength: 0\n",
+            "SnapshotPolicy spec.verification.quick.fileQueueLength",
+        ),
+        (
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: data } } ]\n\
+             verification:\n  deep:\n    schedule: { cron: \"0 5 * * 0\" }\n    parallel: 0\n",
+            "SnapshotPolicy spec.verification.deep.parallel",
+        ),
+    ] {
+        let spec: SnapshotPolicySpec = crate::testutil::from_yaml(yaml);
+        let errs = validate_backup_config(&spec);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field: f, .. } if f == field
+            )),
+            "expected a rejection of {field}, got: {errs:?}"
+        );
+    }
+
+    // maxErrors: 0 is kopia's own default ("stop at first error") — unconstrained,
+    // never rejected.
+    let max_errors_zero: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  quick:\n    schedule: { cron: \"0 4 * * *\" }\n    maxErrors: 0\n",
+    );
+    assert!(
+        validate_backup_config(&max_errors_zero).is_empty(),
+        "{:?}",
+        validate_backup_config(&max_errors_zero)
+    );
+
+    // Positive values on all knobs are accepted.
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         verification:\n  \
+           quick:\n    schedule: { cron: \"0 4 * * *\" }\n    parallel: 2\n    \
+             fileParallelism: 4\n    fileQueueLength: 100\n    maxErrors: 1\n  \
+           deep:\n    schedule: { cron: \"0 5 * * 0\" }\n    parallel: 2\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+}
+
+#[test]
+fn backup_config_rejects_zero_upload_limit_mb() {
+    // M4 flag sweep (issue #216 category sweep): `upload.limitMb` is a count
+    // knob (require_min, same shared validator as the M2/M3 sweeps).
+    let zero: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         upload:\n  limitMb: 0\n",
+    );
+    let errs = validate_backup_config(&zero);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotPolicy spec.upload.limitMb"
+        )),
+        "expected a limitMb rejection, got: {errs:?}"
+    );
+
+    let ok: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         upload:\n  limitMb: 100\n",
+    );
+    assert!(
+        validate_backup_config(&ok).is_empty(),
+        "{:?}",
+        validate_backup_config(&ok)
+    );
+
+    // Absent ⇒ no error (limitMb is opt-in).
+    let absent: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(validate_backup_config(&absent).is_empty());
 }
 
 // --- identity shape validation ---

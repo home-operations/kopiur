@@ -803,6 +803,9 @@ mod tests {
                 source_path: "/data".into(),
                 tags: BTreeMap::new(),
                 policy: Default::default(),
+                fail_fast: None,
+                upload_limit_mb: None,
+                description: None,
             }),
             identity: ResolvedIdentity {
                 username: "db".into(),

@@ -865,6 +865,66 @@ spec:
               suspend:
                 description: Pause this replication; a suspended replication runs no syncs (default `false`).
                 type: boolean
+              sync:
+                description: |-
+                  Tuning knobs for the underlying `kopia repository sync-to` invocation
+                  (issue #216). `None` reproduces today's behavior: sequential copy
+                  (`--parallel` unset), additive sync (no `--delete`), kopia's own
+                  `--must-exist`/`--times`/`--update` defaults, and no throughput cap.
+                nullable: true
+                properties:
+                  deleteExtra:
+                    description: |-
+                      `--delete`: prune destination-only blobs so the mirror is an exact copy
+                      (kopia default `false` — additive sync, never removes destination
+                      content). Named `deleteExtra`, not kopia's bare `delete`: a `delete: true`
+                      key on backup-adjacent YAML is dangerously ambiguous at a glance.
+
+                      CAUTION: with this `true`, blobs present at the destination but absent
+                      from the source are deleted on every run.
+                    type: boolean
+                  maxDownloadSpeedBytesPerSecond:
+                    description: |-
+                      `--max-download-speed`: cap read throughput from the source, in
+                      bytes/sec (kopia default: unlimited).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  maxUploadSpeedBytesPerSecond:
+                    description: |-
+                      `--max-upload-speed`: cap write throughput to the destination, in
+                      bytes/sec (kopia default: unlimited).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  mustExist:
+                    description: |-
+                      `--[no-]must-exist`: fail the sync instead of initializing the
+                      destination's repository-format blob (kopia default `false` — sync-to may
+                      create the destination layout on first run).
+                    nullable: true
+                    type: boolean
+                  parallel:
+                    description: |-
+                      `--parallel`: number of concurrent blob-copy workers (kopia default `1` —
+                      sequential, the root cause of #216's multi-week seed times to R2).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  times:
+                    description: |-
+                      `--[no-]times`: synchronize blob modification times to the destination,
+                      when the destination backend supports it (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                  update:
+                    description: |-
+                      `--[no-]update`: update blobs already present at the destination when the
+                      source copy is newer (kopia default `true`).
+                    nullable: true
+                    type: boolean
+                type: object
             required:
             - destination
             - schedule

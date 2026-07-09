@@ -401,7 +401,12 @@ async fn run_operation(
                 }
             }
             let result = client
-                .snapshot_create(&op.source_path, &op.tags, Some(&override_source))
+                .snapshot_create_with(
+                    &op.source_path,
+                    &op.tags,
+                    Some(&override_source),
+                    &op.create_options(),
+                )
                 .await
                 .map_err(kopia(KopiaOp::SnapshotCreate))?;
             // kopia exits non-zero (→ a classified `PermissionDenied` failure above) when
@@ -1357,7 +1362,17 @@ async fn run_verify_flow(
                 error!(class = %err.kopia_class(), "deep verify scratch path not writable");
                 return Err(err);
             }
-            if let Err(e) = client.snapshot_restore(&id, &d.scratch_path).await {
+            if let Err(e) = client
+                .snapshot_restore_with(
+                    &id,
+                    &d.scratch_path,
+                    &kopiur_kopia::RestoreOptions {
+                        parallel: d.parallel,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
                 error!(class = %e.class(), "deep verify scratch-restore failed");
                 return Err(MoverError::Kopia {
@@ -1518,7 +1533,7 @@ async fn run_replicate_flow(
     let dest_env = credentials::dest_env_overlay(&dest, &raw_env);
 
     if let Err(e) = client
-        .repository_sync_to_with_env(&dest, op.delete_extra, &dest_env)
+        .repository_sync_to_with_env(&dest, &op.sync_options(), &dest_env)
         .await
     {
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;

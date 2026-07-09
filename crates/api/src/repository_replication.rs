@@ -54,6 +54,56 @@ pub struct RepositoryReplicationSpec {
     /// Pause this replication; a suspended replication runs no syncs (default `false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
+    /// Tuning knobs for the underlying `kopia repository sync-to` invocation
+    /// (issue #216). `None` reproduces today's behavior: sequential copy
+    /// (`--parallel` unset), additive sync (no `--delete`), kopia's own
+    /// `--must-exist`/`--times`/`--update` defaults, and no throughput cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncOptions>,
+}
+
+/// Tuning knobs for `kopia repository sync-to` (issue #216): copy parallelism,
+/// destination pruning, and the blob-sync tri-states/throughput caps kopia
+/// exposes on the command. Every field's `None`/`false` reproduces kopia's own
+/// default, so an absent `sync` block is exactly today's behavior. Pure scalars
+/// (no k8s-openapi embeds), so this derives `Eq` unlike its parent spec.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOptions {
+    /// `--parallel`: number of concurrent blob-copy workers (kopia default `1` —
+    /// sequential, the root cause of #216's multi-week seed times to R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--delete`: prune destination-only blobs so the mirror is an exact copy
+    /// (kopia default `false` — additive sync, never removes destination
+    /// content). Named `deleteExtra`, not kopia's bare `delete`: a `delete: true`
+    /// key on backup-adjacent YAML is dangerously ambiguous at a glance.
+    ///
+    /// CAUTION: with this `true`, blobs present at the destination but absent
+    /// from the source are deleted on every run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete_extra: bool,
+    /// `--[no-]must-exist`: fail the sync instead of initializing the
+    /// destination's repository-format blob (kopia default `false` — sync-to may
+    /// create the destination layout on first run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_exist: Option<bool>,
+    /// `--[no-]times`: synchronize blob modification times to the destination,
+    /// when the destination backend supports it (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub times: Option<bool>,
+    /// `--[no-]update`: update blobs already present at the destination when the
+    /// source copy is newer (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<bool>,
+    /// `--max-download-speed`: cap read throughput from the source, in
+    /// bytes/sec (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`: cap write throughput to the destination, in
+    /// bytes/sec (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_speed_bytes_per_second: Option<i64>,
 }
 
 /// Lifecycle phase of a replication.
@@ -190,6 +240,68 @@ schedule: { cron: "0 6 * * 0" }
         assert_eq!(spec.source_ref.kind, RepositoryKind::Repository);
         let json = serde_json::to_value(&spec).unwrap();
         assert!(json.get("suspend").is_none());
+        // #216: no `sync` block set → the field is entirely absent on the wire,
+        // reproducing today's argv exactly (no dormant defaults sneak in).
+        assert!(spec.sync.is_none());
+        assert!(json.get("sync").is_none());
+    }
+
+    #[test]
+    fn sync_options_roundtrip_full_block() {
+        // #216: every `spec.sync` tuning knob round-trips through the cluster's
+        // YAML → serde_json::Value → typed path.
+        let yaml = r#"
+sourceRef: { name: nas-primary }
+destination: { filesystem: { path: /mirror } }
+schedule: { cron: "0 5 * * *" }
+sync:
+  parallel: 8
+  deleteExtra: true
+  mustExist: false
+  times: true
+  update: false
+  maxDownloadSpeedBytesPerSecond: 1000000
+  maxUploadSpeedBytesPerSecond: 500000
+"#;
+        let spec: RepositoryReplicationSpec = from_yaml(yaml);
+        let sync = spec.sync.expect("sync block set");
+        assert_eq!(sync.parallel, Some(8));
+        assert!(sync.delete_extra);
+        assert_eq!(sync.must_exist, Some(false));
+        assert_eq!(sync.times, Some(true));
+        assert_eq!(sync.update, Some(false));
+        assert_eq!(sync.max_download_speed_bytes_per_second, Some(1_000_000));
+        assert_eq!(sync.max_upload_speed_bytes_per_second, Some(500_000));
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["sync"]["parallel"], 8);
+        assert_eq!(json["sync"]["deleteExtra"], true);
+        assert_eq!(json["sync"]["mustExist"], false);
+        let reparsed: RepositoryReplicationSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn sync_options_omits_unset_leaf_fields() {
+        // A `sync` block that only sets `parallel` must not serialize the other
+        // (unset) knobs — `deleteExtra`'s `false` default also skips (Not::not).
+        let yaml = r#"
+sourceRef: { name: nas-primary }
+destination: { filesystem: { path: /mirror } }
+schedule: { cron: "0 5 * * *" }
+sync:
+  parallel: 4
+"#;
+        let spec: RepositoryReplicationSpec = from_yaml(yaml);
+        let json = serde_json::to_value(&spec).unwrap();
+        let sync_json = &json["sync"];
+        assert_eq!(sync_json["parallel"], 4);
+        assert!(sync_json.get("deleteExtra").is_none());
+        assert!(sync_json.get("mustExist").is_none());
+        assert!(sync_json.get("times").is_none());
+        assert!(sync_json.get("update").is_none());
+        assert!(sync_json.get("maxDownloadSpeedBytesPerSecond").is_none());
+        assert!(sync_json.get("maxUploadSpeedBytesPerSecond").is_none());
     }
 
     #[test]

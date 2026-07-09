@@ -85,6 +85,13 @@ spec:
                 description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
                 nullable: true
                 properties:
+                  failFast:
+                    description: |-
+                      Abort the snapshot at the first error instead of collecting and
+                      continuing (`snapshot create --fail-fast`; kopia default: false). This
+                      is a `snapshot create` argv flag, not a `policy set` knob, but lives
+                      beside its semantic opposites (`ignore*Errors`) for discoverability.
+                    type: boolean
                   ignoreDirErrors:
                     description: Continue the snapshot when a directory cannot be read (`--ignore-dir-errors`).
                     type: boolean
@@ -978,6 +985,16 @@ spec:
                 description: Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`).
                 nullable: true
                 properties:
+                  limitMb:
+                    description: |-
+                      `snapshot create --upload-limit-mb`: abort the snapshot once this many
+                      MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb`
+                      rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter;
+                      like `failFast`, this is a `snapshot create` argv flag, not a `policy
+                      set` knob, but lives here beside its parallelism siblings.
+                    format: int64
+                    nullable: true
+                    type: integer
                   maxParallelFileReads:
                     description: '`--max-parallel-file-reads`: file-read concurrency within a snapshot.'
                     format: int64
@@ -1001,6 +1018,14 @@ spec:
                         description: Size of the ephemeral scratch PVC (e.g. `10Gi`); absent falls back to a node-ephemeral `emptyDir`.
                         nullable: true
                         type: string
+                      parallel:
+                        description: |-
+                          `restore --parallel`: restore parallelism for the scratch-restore (deep verify
+                          IS a restore under the hood); absent leaves kopia's default.
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter for the deep restore-test (e.g. weekly).
                         properties:
@@ -1033,6 +1058,32 @@ spec:
                       lives under `quick.schedule` (matching `deep.schedule`), see [`QuickVerification`].
                     nullable: true
                     properties:
+                      fileParallelism:
+                        description: '`--file-parallelism`: parallelism for file verification (kopia default: unset).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      fileQueueLength:
+                        description: '`--file-queue-length`: queue length for file verification (kopia default: 20000).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      maxErrors:
+                        description: |-
+                          `--max-errors`: stop after this many errors (kopia default: 0, meaning stop
+                          at the first error).
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      parallel:
+                        description: '`--parallel`: verification parallelism (kopia default: 8).'
+                        format: uint32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
                       schedule:
                         description: Cron + jitter + timezone for the frequent blob-level verify; absent ⇒ quick tier disabled.
                         nullable: true

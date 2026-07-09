@@ -464,25 +464,102 @@ pub struct VerifyOptions {
     pub verify_files_percent: Option<u8>,
     /// `--max-errors`: stop after this many errors (0 = never stop early).
     pub max_errors: Option<u32>,
-    /// `--parallel`: verification parallelism.
+    /// `--parallel`: verification parallelism (kopia default: 8).
     pub parallel: Option<u32>,
+    /// `--file-parallelism`: parallelism for file verification (kopia default: unset).
+    pub file_parallelism: Option<u32>,
+    /// `--file-queue-length`: queue length for file verification (kopia default: 20000).
+    pub file_queue_length: Option<u32>,
+}
+
+/// Options for `kopia snapshot create` (M4 flag sweep, issue #216 category
+/// sweep). All-default reproduces kopia's own defaults / today's argv:
+/// `fail_fast: None` (kopia default: keep going past per-file errors, subject
+/// to the `errorHandling.ignore*Errors` policy knobs), `upload_limit_mb: None`
+/// (kopia default: unlimited), `description: None` (kopia default: empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotCreateOptions {
+    /// `--[no-]fail-fast`: abort the snapshot at the first error instead of
+    /// collecting and continuing (kopia default: false — collect and continue).
+    pub fail_fast: Option<bool>,
+    /// `--upload-limit-mb`: abort the snapshot once this many MB have been
+    /// uploaded (kopia default: 0 — unlimited).
+    pub upload_limit_mb: Option<i64>,
+    /// `--description`: free-form text recorded on the snapshot manifest
+    /// (kopia default: empty).
+    pub description: Option<String>,
 }
 
 /// Options for `kopia restore` / `kopia snapshot restore`. The tri-state
 /// booleans map to kopia's `--[no-]flag` form: `Some(true)` → `--flag`,
-/// `Some(false)` → `--no-flag`, `None` → omit (kopia default).
+/// `Some(false)` → `--no-flag`, `None` → omit (kopia default). M2 flag sweep
+/// (issue #216 gap analysis) added everything below `overwrite_files`; all of
+/// them, plus `delete_extra`, were previously either absent or dormant (the
+/// mover's `RestoreOp::restore_options()` dropped them via `..Default::default()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreOptions {
     /// `--[no-]ignore-permission-errors` (kopia default: true).
     pub ignore_permission_errors: Option<bool>,
     /// `--[no-]write-files-atomically`.
     pub write_files_atomically: Option<bool>,
-    /// `--[no-]overwrite-files`.
+    /// `--[no-]overwrite-files` (kopia default: true).
     pub overwrite_files: Option<bool>,
-    /// `--skip-existing`: skip files/symlinks that already exist in the target.
-    pub skip_existing: bool,
+    /// `--[no-]overwrite-directories` (kopia default: true).
+    pub overwrite_directories: Option<bool>,
+    /// `--[no-]overwrite-symlinks` (kopia default: true).
+    pub overwrite_symlinks: Option<bool>,
+    /// `--[no-]write-sparse-files` (kopia default: false).
+    pub write_sparse_files: Option<bool>,
+    /// `--[no-]skip-owners` (kopia default: false).
+    pub skip_owners: Option<bool>,
+    /// `--[no-]skip-permissions` (kopia default: false).
+    pub skip_permissions: Option<bool>,
+    /// `--[no-]skip-times` (kopia default: false).
+    pub skip_times: Option<bool>,
+    /// `--[no-]ignore-errors` (kopia default: false).
+    pub ignore_errors: Option<bool>,
+    /// `--[no-]skip-existing`: skip files/symlinks that already exist in the
+    /// target (kopia default: false). A genuine kingpin tri-state, not a
+    /// presence-only flag — widened from a bare `bool`.
+    pub skip_existing: Option<bool>,
+    /// `--[no-]delete-extra`: delete files/directories/symlinks present in the
+    /// restore path but absent from the snapshot (kopia default: false). Backs
+    /// `Restore.spec.options.enableFileDeletion`, which was previously a silent
+    /// no-op — this struct had no field for it at all.
+    pub delete_extra: Option<bool>,
     /// `--parallel`: restore parallelism (1 disables).
     pub parallel: Option<u32>,
+}
+
+/// Options for `kopia repository sync-to` (ADR-0005 §13(d) / issue #216). Every
+/// field's `None`/`false` reproduces kopia's own default — an all-`None`,
+/// `delete_extra: false` instance yields the exact same argv `sync_to_args`
+/// produced before this struct existed. The tri-state booleans map to kopia's
+/// `--[no-]flag` grammar, same as [`RestoreOptions`]: `Some(true)` → `--flag`,
+/// `Some(false)` → `--no-flag`, `None` → omit (kopia default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncToOptions {
+    /// `--parallel`: copy parallelism to the destination (kopia default `1` —
+    /// sequential; the root cause of #216's multi-week initial-seed times).
+    pub parallel: Option<u32>,
+    /// `--delete`: prune destination-only blobs for a true mirror (kopia
+    /// default `false` — additive sync, never removes destination content).
+    pub delete_extra: bool,
+    /// `--[no-]must-exist`: fail instead of initializing the destination's
+    /// repository-format blob (kopia default `false`).
+    pub must_exist: Option<bool>,
+    /// `--[no-]times`: synchronize blob modification times to the destination,
+    /// when supported (kopia default `true`).
+    pub times: Option<bool>,
+    /// `--[no-]update`: update blobs already present at the destination when
+    /// the source copy is newer (kopia default `true`).
+    pub update: Option<bool>,
+    /// `--max-download-speed`: cap read throughput from the source, bytes/sec
+    /// (kopia default: unlimited).
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`: cap write throughput to the destination, bytes/sec
+    /// (kopia default: unlimited).
+    pub max_upload_speed_bytes_per_second: Option<i64>,
 }
 
 /// Policy fields kopia applies via `kopia policy set`. Mirrors the operator's
@@ -1011,21 +1088,21 @@ impl KopiaClient {
     }
 
     /// Mirror the *connected* repository's blobs to a destination backend
-    /// (`kopia repository sync-to <destination> [flags]`), ADR-0005 §13(d). The
-    /// caller must already be connected to the **source** repository; this copies
-    /// its blobs to `destination`. The destination's backend args are built by
-    /// `ConnectSpec::backend_args` (the same builder connect/create use), so a new
-    /// backend variant is wired through automatically. `--must-exist=false` lets the
-    /// first sync create the destination layout; `--delete` (when `delete_extra`)
-    /// prunes blobs at the destination no longer present at the source (a true
-    /// mirror). Destination credentials are supplied via the environment, never on
-    /// argv, exactly like connect/create. Success is exit code 0.
+    /// (`kopia repository sync-to <destination> [flags]`), ADR-0005 §13(d) / issue
+    /// #216. The caller must already be connected to the **source** repository;
+    /// this copies its blobs to `destination`. The destination's backend args are
+    /// built by `ConnectSpec::backend_args` (the same builder connect/create use),
+    /// so a new backend variant is wired through automatically. `opts` carries the
+    /// tuning knobs (parallelism, `--delete`, the must-exist/times/update
+    /// tri-states, throughput caps) — see [`SyncToOptions`]. Destination
+    /// credentials are supplied via the environment, never on argv, exactly like
+    /// connect/create. Success is exit code 0.
     pub async fn repository_sync_to(
         &self,
         destination: &ConnectSpec,
-        delete_extra: bool,
+        opts: &SyncToOptions,
     ) -> Result<(), KopiaError> {
-        self.repository_sync_to_with_env(destination, delete_extra, &BTreeMap::new())
+        self.repository_sync_to_with_env(destination, opts, &BTreeMap::new())
             .await
     }
 
@@ -1042,15 +1119,16 @@ impl KopiaClient {
     pub async fn repository_sync_to_with_env(
         &self,
         destination: &ConnectSpec,
-        delete_extra: bool,
+        opts: &SyncToOptions,
         dest_env: &BTreeMap<String, Option<String>>,
     ) -> Result<(), KopiaError> {
-        let args = sync_to_args(destination, delete_extra);
+        let args = sync_to_args(destination, opts);
         self.run_ok_with_env(&args, dest_env).await.map(|_| ())
     }
 
     /// Create a snapshot of `source_path` with the given `tags`
-    /// (`key:value`). Returns the parsed create result.
+    /// (`key:value`) and kopia's own defaults for `snapshot create`'s tuning
+    /// knobs. Returns the parsed create result.
     ///
     /// `override_source`, when set, is passed to kopia as `--override-source`
     /// (format `username@hostname:path`). This is how Kopiur records snapshots
@@ -1064,20 +1142,28 @@ impl KopiaClient {
         tags: &BTreeMap<String, String>,
         override_source: Option<&str>,
     ) -> Result<SnapshotCreateResult, KopiaError> {
-        let mut args = vec![
-            "snapshot".into(),
-            "create".into(),
-            source_path.to_string(),
-            "--json".into(),
-        ];
-        if let Some(src) = override_source {
-            args.push("--override-source".into());
-            args.push(src.to_string());
-        }
-        for (k, v) in tags {
-            args.push("--tags".into());
-            args.push(format!("{k}:{v}"));
-        }
+        self.snapshot_create_with(
+            source_path,
+            tags,
+            override_source,
+            &SnapshotCreateOptions::default(),
+        )
+        .await
+    }
+
+    /// Create a snapshot honoring the operator's [`SnapshotCreateOptions`]
+    /// (`failFast`, `uploadLimitMb`, `description` — M4 flag sweep, issue #216).
+    /// Same identity/tags contract as [`Self::snapshot_create`], which now
+    /// delegates here with an all-default `opts` (byte-for-byte the same argv
+    /// as before this option struct existed).
+    pub async fn snapshot_create_with(
+        &self,
+        source_path: &str,
+        tags: &BTreeMap<String, String>,
+        override_source: Option<&str>,
+        opts: &SnapshotCreateOptions,
+    ) -> Result<SnapshotCreateResult, KopiaError> {
+        let args = snapshot_create_args(source_path, tags, override_source, opts);
         self.run_json(&args, "snapshot create result").await
     }
 
@@ -1514,7 +1600,11 @@ pub fn split_policy_scopes(mut policy: PolicyArgs) -> (PolicyArgs, Option<Policy
 }
 
 /// Build the args for `kopia snapshot restore <id> <target>` plus options. Pure
-/// so it is unit-testable without spawning kopia.
+/// so it is unit-testable without spawning kopia. Every `--[no-]flag` form here
+/// was smoke-tested against the pinned kopia 0.23.1 (`kopia snapshot restore
+/// --help`); the real-kopia integration test in
+/// `crates/kopia/tests/integration_roundtrip.rs` is the permanent guard that
+/// kopia actually accepts them, not just that the argv shape looks right.
 fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String> {
     let mut args = vec![
         "snapshot".into(),
@@ -1533,12 +1623,61 @@ fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String
         opts.write_files_atomically,
     );
     push_tristate(&mut args, "overwrite-files", opts.overwrite_files);
-    if opts.skip_existing {
-        args.push("--skip-existing".into());
-    }
+    push_tristate(
+        &mut args,
+        "overwrite-directories",
+        opts.overwrite_directories,
+    );
+    push_tristate(&mut args, "overwrite-symlinks", opts.overwrite_symlinks);
+    push_tristate(&mut args, "write-sparse-files", opts.write_sparse_files);
+    push_tristate(&mut args, "skip-owners", opts.skip_owners);
+    push_tristate(&mut args, "skip-permissions", opts.skip_permissions);
+    push_tristate(&mut args, "skip-times", opts.skip_times);
+    push_tristate(&mut args, "ignore-errors", opts.ignore_errors);
+    push_tristate(&mut args, "skip-existing", opts.skip_existing);
+    push_tristate(&mut args, "delete-extra", opts.delete_extra);
     if let Some(p) = opts.parallel {
         args.push("--parallel".into());
         args.push(p.to_string());
+    }
+    args
+}
+
+/// Build the args for `kopia snapshot create <source> --json [flags]` plus
+/// options. Pure so it is unit-testable without spawning kopia. `--fail-fast`
+/// is a kingpin `--[no-]flag` tri-state (smoke-tested against the pinned
+/// kopia 0.23.1: `snapshot create --fail-fast --upload-limit-mb 100
+/// --description "smoke test"` is accepted; the real-kopia integration test
+/// in `crates/kopia/tests/integration_roundtrip.rs` is the permanent guard).
+/// All-default `opts` reproduces the pre-M4 argv byte-for-byte (tested).
+fn snapshot_create_args(
+    source_path: &str,
+    tags: &BTreeMap<String, String>,
+    override_source: Option<&str>,
+    opts: &SnapshotCreateOptions,
+) -> Vec<String> {
+    let mut args = vec![
+        "snapshot".into(),
+        "create".into(),
+        source_path.to_string(),
+        "--json".into(),
+    ];
+    if let Some(src) = override_source {
+        args.push("--override-source".into());
+        args.push(src.to_string());
+    }
+    for (k, v) in tags {
+        args.push("--tags".into());
+        args.push(format!("{k}:{v}"));
+    }
+    push_tristate(&mut args, "fail-fast", opts.fail_fast);
+    if let Some(mb) = opts.upload_limit_mb {
+        args.push("--upload-limit-mb".into());
+        args.push(mb.to_string());
+    }
+    if let Some(desc) = &opts.description {
+        args.push("--description".into());
+        args.push(desc.clone());
     }
     args
 }
@@ -1558,6 +1697,14 @@ fn verify_args(opts: &VerifyOptions) -> Vec<String> {
         args.push("--parallel".into());
         args.push(p.to_string());
     }
+    if let Some(p) = opts.file_parallelism {
+        args.push("--file-parallelism".into());
+        args.push(p.to_string());
+    }
+    if let Some(q) = opts.file_queue_length {
+        args.push("--file-queue-length".into());
+        args.push(q.to_string());
+    }
     args
 }
 
@@ -1576,19 +1723,34 @@ fn connect_args(spec: &ConnectSpec, cache: CacheTuning, readonly: bool) -> Vec<S
 }
 
 /// Build the args for `kopia repository sync-to <destination> [flags]`. Pure so it
-/// is unit-testable without spawning kopia (ADR-0005 §13(d)). The destination's
-/// backend selection reuses `ConnectSpec::backend_args`, so every backend is wired
-/// through. `--must-exist=false` allows the first sync to create the destination
-/// layout; `--delete` prunes destination-only blobs for a true mirror.
-fn sync_to_args(destination: &ConnectSpec, delete_extra: bool) -> Vec<String> {
+/// is unit-testable without spawning kopia (ADR-0005 §13(d) / issue #216). The
+/// destination's backend selection reuses `ConnectSpec::backend_args`, so every
+/// backend is wired through. `--must-exist`/`--times`/`--update` are kopia
+/// (kingpin) BOOLEAN flags: `--must-exist=false` is a parse error (`unexpected
+/// false`) — but the `--no-must-exist`/`--no-times`/`--no-update` negated forms
+/// ARE accepted (smoke-tested against kopia 0.23.1), so [`push_tristate`] is used
+/// for all three exactly like `snapshot restore`'s tri-states. `None` on any
+/// field omits its flag entirely, leaving kopia's own default in effect.
+fn sync_to_args(destination: &ConnectSpec, opts: &SyncToOptions) -> Vec<String> {
     let mut args = vec!["repository".into(), "sync-to".into()];
     args.extend(destination.backend_args());
-    // `--must-exist` is a kopia (kingpin) BOOLEAN flag: present (`--must-exist`) or
-    // absent — `--must-exist=false` is a parse error (`unexpected false`). Its default
-    // is false (sync-to initializes the destination if it isn't yet a repository),
-    // exactly what a mirror wants, so omit it rather than emit an invalid `=false`.
-    if delete_extra {
+    if let Some(p) = opts.parallel {
+        args.push("--parallel".into());
+        args.push(p.to_string());
+    }
+    if opts.delete_extra {
         args.push("--delete".into());
+    }
+    push_tristate(&mut args, "must-exist", opts.must_exist);
+    push_tristate(&mut args, "times", opts.times);
+    push_tristate(&mut args, "update", opts.update);
+    if let Some(s) = opts.max_download_speed_bytes_per_second {
+        args.push("--max-download-speed".into());
+        args.push(s.to_string());
+    }
+    if let Some(s) = opts.max_upload_speed_bytes_per_second {
+        args.push("--max-upload-speed".into());
+        args.push(s.to_string());
     }
     args
 }

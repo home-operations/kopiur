@@ -204,11 +204,16 @@ pub struct PvcTemplate {
     pub access_modes: Vec<String>,
 }
 
-/// kopia restore behavior knobs.
+/// kopia restore behavior knobs (M2 flag sweep). Every `Option` field's `None`
+/// reproduces kopia's own default — an all-`None`, `enableFileDeletion: false`
+/// instance yields the exact same `restore_args` argv produced before these
+/// fields existed. The tri-state booleans map to kopia's `--[no-]flag` grammar
+/// (`Some(true)` → `--flag`, `Some(false)` → `--no-flag`, `None` → omit).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreOptions {
     /// Delete files in the target that are not present in the snapshot (exact mirror); off by default.
+    /// Wired to kopia's `--[no-]delete-extra` (previously a silent no-op — see issue #216 gap sweep).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_file_deletion: bool,
     /// Continue past permission errors during restore (default true).
@@ -217,6 +222,40 @@ pub struct RestoreOptions {
     /// Write files atomically via a temp file + rename (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_files_atomically: Option<bool>,
+    /// `--parallel`: restore parallelism (kopia default `8`; `1` disables parallelism).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--[no-]write-sparse-files`: attempt to write files sparsely, allocating the
+    /// minimum disk space needed (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_sparse_files: Option<bool>,
+    /// `--[no-]skip-owners`: skip restoring file owners (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_owners: Option<bool>,
+    /// `--[no-]skip-permissions`: skip restoring file permissions (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_permissions: Option<bool>,
+    /// `--[no-]skip-times`: skip restoring file modification times (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_times: Option<bool>,
+    /// `--[no-]overwrite-files`: overwrite existing files in the target (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_files: Option<bool>,
+    /// `--[no-]overwrite-directories`: overwrite existing directories in the target
+    /// (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_directories: Option<bool>,
+    /// `--[no-]overwrite-symlinks`: overwrite existing symlinks in the target
+    /// (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_symlinks: Option<bool>,
+    /// `--[no-]ignore-errors`: ignore all restore errors and continue (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_errors: Option<bool>,
+    /// `--[no-]skip-existing`: skip files/symlinks that already exist in the target
+    /// (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_existing: Option<bool>,
 }
 
 /// How the restore reacts to a missing snapshot and how long it waits.
@@ -491,6 +530,83 @@ policy:
         let json = serde_json::to_value(&spec).expect("serialize");
         let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn restore_options_full_flag_sweep_roundtrip() {
+        // M2 flag sweep: every new `options` knob round-trips through the cluster's
+        // YAML → serde_json::Value → typed path.
+        let yaml = r#"
+source: { snapshotRef: { name: b } }
+target: { pvcRef: { name: d } }
+options:
+  enableFileDeletion: true
+  ignorePermissionErrors: false
+  writeFilesAtomically: true
+  parallel: 4
+  writeSparseFiles: true
+  skipOwners: true
+  skipPermissions: false
+  skipTimes: true
+  overwriteFiles: false
+  overwriteDirectories: false
+  overwriteSymlinks: true
+  ignoreErrors: false
+  skipExisting: true
+"#;
+        let spec: RestoreSpec = from_yaml(yaml);
+        let o = spec.options.as_ref().expect("options set");
+        assert!(o.enable_file_deletion);
+        assert_eq!(o.ignore_permission_errors, Some(false));
+        assert_eq!(o.write_files_atomically, Some(true));
+        assert_eq!(o.parallel, Some(4));
+        assert_eq!(o.write_sparse_files, Some(true));
+        assert_eq!(o.skip_owners, Some(true));
+        assert_eq!(o.skip_permissions, Some(false));
+        assert_eq!(o.skip_times, Some(true));
+        assert_eq!(o.overwrite_files, Some(false));
+        assert_eq!(o.overwrite_directories, Some(false));
+        assert_eq!(o.overwrite_symlinks, Some(true));
+        assert_eq!(o.ignore_errors, Some(false));
+        assert_eq!(o.skip_existing, Some(true));
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["options"]["parallel"], 4);
+        assert_eq!(json["options"]["skipExisting"], true);
+        let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn restore_options_omits_unset_leaf_fields() {
+        // A minimal `options` block that only sets `enableFileDeletion` must not
+        // serialize the other (unset) knobs.
+        let yaml = r#"
+source: { snapshotRef: { name: b } }
+target: { pvcRef: { name: d } }
+options:
+  enableFileDeletion: true
+"#;
+        let spec: RestoreSpec = from_yaml(yaml);
+        let json = serde_json::to_value(&spec).unwrap();
+        let opts_json = &json["options"];
+        assert_eq!(opts_json["enableFileDeletion"], true);
+        for key in [
+            "ignorePermissionErrors",
+            "writeFilesAtomically",
+            "parallel",
+            "writeSparseFiles",
+            "skipOwners",
+            "skipPermissions",
+            "skipTimes",
+            "overwriteFiles",
+            "overwriteDirectories",
+            "overwriteSymlinks",
+            "ignoreErrors",
+            "skipExisting",
+        ] {
+            assert!(opts_json.get(key).is_none(), "{key} should be absent");
+        }
     }
 
     #[test]

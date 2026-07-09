@@ -29,7 +29,7 @@ pub(super) type SnapshotRun<'a> = (
     Vec<CredsEnvFrom>,
 );
 pub(super) fn build_backup_run(
-    _backup: &Snapshot,
+    backup: &Snapshot,
     config: &SnapshotPolicy,
     repo: &ResolvedRepository,
     namespace: &str,
@@ -108,6 +108,18 @@ pub(super) fn build_backup_run(
             // (compression / files / errorHandling / upload / extraArgs). Wired so
             // these never stay inert (ADR-0005 §13(b)/§13(f), ADR-0004 §4b).
             policy: policy_args_for(config),
+            // `snapshot create` argv flags (M4 flag sweep, issue #216 category
+            // sweep) — NOT `policy set` knobs, so they ride here rather than
+            // `policy_args_for`'s `PolicyArgsSpec`. `failFast`/`limitMb` are
+            // the recipe's (`SnapshotPolicy`); `description` is this run's
+            // (`Snapshot.spec`), matching the recipe/invocation split.
+            fail_fast: config
+                .spec
+                .error_handling
+                .as_ref()
+                .and_then(|e| e.fail_fast.then_some(true)),
+            upload_limit_mb: config.spec.upload.as_ref().and_then(|u| u.limit_mb),
+            description: backup.spec.description.clone(),
         }),
         identity,
         repository: repository_connect(repo)?,

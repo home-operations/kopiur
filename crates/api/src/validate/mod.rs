@@ -86,6 +86,20 @@ pub fn validate_nfs_volume(nfs: &NfsVolume, context: &str) -> ValidationResult {
     Ok(())
 }
 
+/// A numeric knob must be at least `min` — the shared one-liner behind every
+/// `Option<u32>` count / `Option<i64>` bytes-per-second field (e.g.
+/// `RepositoryReplication.spec.sync.parallel`), so the rule and its message
+/// shape are written once instead of re-derived per field. `field` names the
+/// exact path for the message (e.g. `"RepositoryReplication spec.sync.parallel"`).
+/// Callers only invoke this for a `Some` value — an absent knob is always valid
+/// and never reaches this helper.
+pub fn require_min(field: &str, value: i64, min: i64) -> Option<ValidationError> {
+    (value < min).then(|| ValidationError::InvalidFieldValue {
+        field: field.to_string(),
+        reason: format!("must be >= {min} (got {value})"),
+    })
+}
+
 /// Validate a `MoverSpec`. `inheritSecurityContextFrom` copies **both** the workload
 /// pod's container and pod security contexts, so it is **mutually exclusive** with
 /// **both** explicit `securityContext` and `podSecurityContext`: the mover's effective

@@ -299,17 +299,23 @@ errorHandling:
     ignoreFileErrors: true # --ignore-file-errors: skip unreadable files
     ignoreDirErrors: false # --ignore-dir-errors: skip unreadable directories
     ignoreUnknownTypes: true # --ignore-unknown-types: skip sockets/devices/...
+    failFast: false # --fail-fast: abort at the FIRST error instead of collecting and continuing
 ```
+
+`failFast` is the opposite kind of knob from its three siblings above — it makes the snapshot _less_ tolerant of errors, not more. It's a `kopia snapshot create` argv flag (not a `policy set` knob), which is why it lives here beside its semantic opposites rather than under `upload`.
 
 ### upload — parallelism
 
-kopia's upload policy; both knobs optional (absent leaves kopia's default):
+kopia's upload policy; every knob is optional (absent leaves kopia's default):
 
 ```yaml
 upload:
     maxParallelSnapshots: 4 # --max-parallel-snapshots: concurrent sources
     maxParallelFileReads: 8 # --max-parallel-file-reads: file-read concurrency
+    limitMb: 500 # --upload-limit-mb: abort the snapshot after this many MB uploaded (kopia default: unlimited)
 ```
+
+`limitMb` is named to avoid the `upload.uploadLimitMb` stutter. Like `failFast`, it's a `snapshot create` argv flag, not a `policy set` knob, but lives here beside its parallelism siblings.
 
 ### verification — prove the snapshots are restorable
 
@@ -319,13 +325,20 @@ Opt-in. When absent, nothing runs. When set, the operator runs a frequent blob-l
 verification:
     quick: # blob-level `kopia snapshot verify`, often
         schedule: { cron: "0 4 * * *", jitter: 30m }
+        parallel: 8 # --parallel: verification parallelism (kopia default: 8)
+        fileParallelism: 4 # --file-parallelism: parallelism for file verification
+        fileQueueLength: 20000 # --file-queue-length (kopia default: 20000)
+        maxErrors: 0 # --max-errors: stop after this many errors (0 = stop at first)
     deep: # scratch-restore the latest snapshot into a throwaway volume, rarely
         schedule: { cron: "0 5 * * 0", jitter: 1h }
         capacity: 100Gi # size a fresh ephemeral PVC for the restore (omit = emptyDir)
         storageClassName: fast-ssd # StorageClass for that PVC (omit = cluster default)
+        parallel: 4 # restore --parallel: deep verify IS a restore under the hood
     successExpr: "stats.files > 0 && stats.errors == 0" # CEL pass/fail predicate
     verifyFilesPercent: 10 # how much of each file `quick` reads fully
 ```
+
+`quick`'s four tuning knobs (`parallel`, `fileParallelism`, `fileQueueLength`, `maxErrors`) map directly onto `kopia snapshot verify`'s own flags; all are optional and absent leaves kopia's own default. `deep.parallel` maps onto `restore --parallel` — the deep tier restores the snapshot under the hood, so its parallelism knob lives with the rest of the restore-shaped config. `maxErrors: 0` is kopia's own default (stop at the very first error), so it's deliberately unconstrained at admission — unlike the count knobs, which must be `>= 1`.
 
 **Two tiers, because there are two different questions.** `quick` asks _"are the
 repository blobs and indexes intact?"_ — it runs `kopia snapshot verify`, reads
@@ -522,6 +535,16 @@ Set it per-`Snapshot` (`spec.deletionPolicy`) or set the recipe-wide default wit
 spec:
     policyRef: { name: postgres-data }
     pin: true # GFS retention will skip this snapshot until you clear pin
+```
+
+### `description` — annotate a one-off run
+
+`Snapshot.spec.description` (up to 1024 characters) records free-form text on the kopia snapshot manifest (`snapshot create --description`). It's per-invocation by nature — a `SnapshotSchedule`'s children and `discovered` backups never set it — so use it on a manual `Snapshot` or `kubectl kopiur snapshot now --description` to note *why* this particular run exists:
+
+```yaml
+spec:
+    policyRef: { name: postgres-data }
+    description: pre-upgrade snapshot before the v14→v15 migration
 ```
 
 ### `failurePolicy` — retry & deadline for the mover Job

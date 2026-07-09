@@ -100,6 +100,33 @@ pub struct SnapshotOp {
     /// (ADR-0005 §13(b)/§13(f), ADR-0004 §4b). Empty ⇒ leave kopia's defaults.
     #[serde(default, skip_serializing_if = "PolicyArgsSpec::is_empty")]
     pub policy: PolicyArgsSpec,
+    /// `snapshot create --[no-]fail-fast` (M4 flag sweep, issue #216 category
+    /// sweep). Resolved from `SnapshotPolicy.spec.errorHandling.failFast`.
+    /// `#[serde(default)]` so old-wire work-spec JSON (stamped before this
+    /// field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    /// `snapshot create --upload-limit-mb` (M4 flag sweep). Resolved from
+    /// `SnapshotPolicy.spec.upload.limitMb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_mb: Option<i64>,
+    /// `snapshot create --description` (M4 flag sweep). Per-invocation, from
+    /// `Snapshot.spec.description` (not the recipe) — scheduled/discovered
+    /// runs never set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl SnapshotOp {
+    /// Translate the carried `snapshot create` flags into the kopia client's
+    /// options. Pure so the workspec→kopia-client mapping is unit-testable.
+    pub fn create_options(&self) -> kopiur_kopia::SnapshotCreateOptions {
+        kopiur_kopia::SnapshotCreateOptions {
+            fail_fast: self.fail_fast,
+            upload_limit_mb: self.upload_limit_mb,
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Serializable mirror of [`kopiur_kopia::PolicyArgs`] for the work spec (the kopia
@@ -370,10 +397,51 @@ pub struct RestoreOp {
     /// use its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_files_atomically: Option<bool>,
+    /// `--parallel` (M2 flag sweep). `#[serde(default)]` so old-wire work-spec
+    /// JSON (stamped before this field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--[no-]write-sparse-files` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_sparse_files: Option<bool>,
+    /// `--[no-]skip-owners` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_owners: Option<bool>,
+    /// `--[no-]skip-permissions` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_permissions: Option<bool>,
+    /// `--[no-]skip-times` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_times: Option<bool>,
+    /// `--[no-]overwrite-files` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_files: Option<bool>,
+    /// `--[no-]overwrite-directories` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_directories: Option<bool>,
+    /// `--[no-]overwrite-symlinks` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_symlinks: Option<bool>,
+    /// `--[no-]ignore-errors` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_errors: Option<bool>,
+    /// `--[no-]skip-existing` (M2 flag sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_existing: Option<bool>,
+    /// `--[no-]delete-extra`: mirrors Restore CRD `options.enableFileDeletion`
+    /// (`false` by default). Fixes the bug where `enableFileDeletion` was
+    /// settable via CRD/CLI/migrate but consumed by nothing — kopia never
+    /// received `--delete-extra`, so an "exact mirror" restore was silently
+    /// additive.
+    #[serde(default)]
+    pub delete_extra: bool,
 }
 
 impl RestoreOp {
     /// Translate the carried restore flags into the kopia client's options.
+    /// Every field is mapped explicitly (no `..Default::default()` swallowing a
+    /// field silently) — this is the regression guard for the M2 gap-sweep bug
+    /// class: plumbing that exists end-to-end but a field never reaches it.
     ///
     /// ```
     /// use kopiur_mover::workspec::{RestoreOp, RestoreSelection};
@@ -384,16 +452,42 @@ impl RestoreOp {
     ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
     ///     write_files_atomically: Some(true),
+    ///     parallel: Some(4),
+    ///     write_sparse_files: Some(true),
+    ///     skip_owners: Some(true),
+    ///     skip_permissions: Some(false),
+    ///     skip_times: Some(true),
+    ///     overwrite_files: Some(false),
+    ///     overwrite_directories: Some(false),
+    ///     overwrite_symlinks: Some(true),
+    ///     ignore_errors: Some(false),
+    ///     skip_existing: Some(true),
+    ///     delete_extra: true,
     /// };
     /// let opts = op.restore_options();
     /// assert_eq!(opts.ignore_permission_errors, Some(false));
     /// assert_eq!(opts.write_files_atomically, Some(true));
+    /// assert_eq!(opts.parallel, Some(4));
+    /// assert_eq!(opts.delete_extra, Some(true));
     /// ```
     pub fn restore_options(&self) -> kopiur_kopia::RestoreOptions {
         kopiur_kopia::RestoreOptions {
             ignore_permission_errors: self.ignore_permission_errors,
             write_files_atomically: self.write_files_atomically,
-            ..Default::default()
+            parallel: self.parallel,
+            write_sparse_files: self.write_sparse_files,
+            skip_owners: self.skip_owners,
+            skip_permissions: self.skip_permissions,
+            skip_times: self.skip_times,
+            overwrite_files: self.overwrite_files,
+            overwrite_directories: self.overwrite_directories,
+            overwrite_symlinks: self.overwrite_symlinks,
+            ignore_errors: self.ignore_errors,
+            skip_existing: self.skip_existing,
+            // `enableFileDeletion` stays a plain bool at the CRD/work-spec layer
+            // (no tri-state is exposed); `false` omits the flag entirely, exactly
+            // reproducing today's (additive) argv.
+            delete_extra: self.delete_extra.then_some(true),
         }
     }
 }
@@ -586,6 +680,14 @@ pub struct QuickVerify {
     /// `--parallel`: verification parallelism.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel: Option<u32>,
+    /// `--file-parallelism`: parallelism for file verification. `#[serde(default)]`
+    /// so old-wire work specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_parallelism: Option<u32>,
+    /// `--file-queue-length`: queue length for file verification. `#[serde(default)]`
+    /// so old-wire work specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_queue_length: Option<u32>,
 }
 
 impl QuickVerify {
@@ -595,6 +697,8 @@ impl QuickVerify {
             verify_files_percent: self.verify_files_percent,
             max_errors: self.max_errors,
             parallel: self.parallel,
+            file_parallelism: self.file_parallelism,
+            file_queue_length: self.file_queue_length,
         }
     }
 }
@@ -613,6 +717,11 @@ pub struct DeepVerify {
     /// the identity); `None` lets the mover resolve the latest itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+    /// `restore --parallel`: restore parallelism for the scratch-restore (deep
+    /// verify IS a restore under the hood). `#[serde(default)]` so old-wire work
+    /// specs (predating this field) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
 }
 
 /// Payload for a verification run (ADR-0005 §4). Owns its own connect lifecycle
@@ -645,6 +754,51 @@ pub struct ReplicateOp {
     /// (additive sync) — safer, so a misconfigured destination is never emptied.
     #[serde(default)]
     pub delete_extra: bool,
+    /// `--parallel`: copy parallelism to the destination (issue #216; kopia
+    /// default `1` — sequential). `#[serde(default)]` so old-wire work-spec JSON
+    /// (stamped before this field existed) still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--[no-]must-exist`: fail instead of initializing the destination's
+    /// repository-format blob (kopia default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_exist: Option<bool>,
+    /// `--[no-]times`: synchronize blob modification times to the destination
+    /// (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub times: Option<bool>,
+    /// `--[no-]update`: update blobs already present at the destination when the
+    /// source copy is newer (kopia default `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<bool>,
+    /// `--max-download-speed`: cap read throughput from the source, bytes/sec
+    /// (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`: cap write throughput to the destination, bytes/sec
+    /// (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_speed_bytes_per_second: Option<i64>,
+}
+
+impl ReplicateOp {
+    /// Project this op's sync-tuning fields into a
+    /// [`SyncToOptions`](kopiur_kopia::SyncToOptions) for
+    /// `KopiaClient::repository_sync_to_with_env`. Pure so the field → option
+    /// mapping is unit-testable without a kopia binary (the regression guard for
+    /// this whole gap class: plumbing that exists but a hardcoded `None` never
+    /// reaches it).
+    pub fn sync_options(&self) -> kopiur_kopia::SyncToOptions {
+        kopiur_kopia::SyncToOptions {
+            parallel: self.parallel,
+            delete_extra: self.delete_extra,
+            must_exist: self.must_exist,
+            times: self.times,
+            update: self.update,
+            max_download_speed_bytes_per_second: self.max_download_speed_bytes_per_second,
+            max_upload_speed_bytes_per_second: self.max_upload_speed_bytes_per_second,
+        }
+    }
 }
 
 /// Payload for a browse-session run (M7a). The session pod connects read-only,
@@ -975,6 +1129,9 @@ impl Default for MoverOptions {
 ///         source_path: "/data".into(),
 ///         tags: BTreeMap::new(),
 ///         policy: Default::default(),
+///         fail_fast: None,
+///         upload_limit_mb: None,
+///         description: None,
 ///     }),
 ///     identity: ResolvedIdentity {
 ///         username: "mydb".into(),

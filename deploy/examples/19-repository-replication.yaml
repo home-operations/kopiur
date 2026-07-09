@@ -62,6 +62,15 @@ spec:
   schedule:
     cron: "0 5 * * *" # nightly, after the 02:xx backups have landed
     jitter: 1h
+  # Tuning for `kopia repository sync-to` (issue #216). Every field is optional;
+  # omitting `sync` (or any field within it) reproduces kopia's own default.
+  # `parallel` is the main knob: sync-to copies blobs one at a time by default,
+  # so a large initial seed to a slow/high-latency destination can otherwise
+  # take days. `deleteExtra` (kopia's `--delete`) prunes destination-only blobs
+  # for a true mirror — left `false` (additive) here since it deletes
+  # destination content; see docs/replication.md#tuning-the-sync.
+  sync:
+    parallel: 8
   # Pause replication without deleting the CR.
   suspend: false
 # --8<-- [end:replication]

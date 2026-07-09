@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 
 use kopiur_api::{ClusterRepository, Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
@@ -1176,6 +1176,88 @@ async fn restore_completed_reports_kstatus_ready() {
         Some(1),
         "the Completed patch must stamp observedGeneration; status: {s}"
     );
+    cleanup_restore(&restores, name).await;
+}
+
+/// M2 flag sweep (issue #216 gap analysis): `Restore.spec.options.{parallel,
+/// overwriteFiles,skipTimes}` must reach the mover's work-spec ConfigMap
+/// contract (asserted directly on the ConfigMap, mirroring the RepositoryReplication
+/// `sync` knobs e2e pattern — the seam where a regression would silently drop
+/// the knobs while the run still succeeded) AND the restore must still
+/// complete with the snapshot's content intact, proving kopia actually
+/// accepted the flags on argv rather than merely that the CRD field parsed.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn restore_options_flag_sweep_reaches_work_spec_and_completes() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_seed_backup(&client).await;
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let name = "e2e-r-flags";
+    cleanup_restore(&restores, name).await;
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(restore_json(
+                name,
+                serde_json::json!({
+                    "options": { "parallel": 2, "overwriteFiles": true, "skipTimes": true }
+                }),
+            )),
+        )
+        .await
+        .expect("create Restore with an options flag sweep");
+
+    // The work-spec ConfigMap shares the mover Job's name, which for a
+    // pvc-create target (restore_json's default) equals the Restore's own name.
+    let cm = wait_until(
+        "restore work-spec ConfigMap is created",
+        default_timeout(),
+        poll_interval(),
+        || async { cms.get_opt(name).await },
+    )
+    .await
+    .expect("restore work-spec ConfigMap should be created");
+    let spec_json = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("work-spec.json"))
+        .expect("work-spec.json key");
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).expect("work-spec parses as JSON");
+    let restore_op = spec
+        .pointer("/operation/restore")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        restore_op.get("parallel").and_then(|v| v.as_i64()),
+        Some(2),
+        "options.parallel must reach the mover contract; restore: {restore_op}"
+    );
+    assert_eq!(
+        restore_op.get("overwriteFiles").and_then(|v| v.as_bool()),
+        Some(true),
+        "options.overwriteFiles must reach the mover contract; restore: {restore_op}"
+    );
+    assert_eq!(
+        restore_op.get("skipTimes").and_then(|v| v.as_bool()),
+        Some(true),
+        "options.skipTimes must reach the mover contract; restore: {restore_op}"
+    );
+
+    // Within the run, kopia must actually accept `--parallel 2 --overwrite-files
+    // --skip-times` — a bad flag SHAPE would fail here, not just in the CM check.
+    wait_phase(&restores, name, "Completed")
+        .await
+        .expect("restore with the M2 flag sweep must complete");
+
     cleanup_restore(&restores, name).await;
 }
 

@@ -32,6 +32,9 @@ fn backup_roundtrip() {
             source_path: "/data".into(),
             tags,
             policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -51,6 +54,56 @@ fn backup_roundtrip() {
 }
 
 #[test]
+fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
+    // M4 flag sweep (issue #216 category sweep): failFast/uploadLimitMb/
+    // description round-trip on the wire, serialize under their camelCase
+    // names, and `create_options()` carries them into the kopia client's
+    // `SnapshotCreateOptions` unchanged.
+    let op = SnapshotOp {
+        source_path: "/data".into(),
+        tags: BTreeMap::new(),
+        policy: Default::default(),
+        fail_fast: Some(true),
+        upload_limit_mb: Some(250),
+        description: Some("pre-upgrade snapshot".into()),
+    };
+    let json = serde_json::to_value(&op).unwrap();
+    assert_eq!(json["failFast"], true);
+    assert_eq!(json["uploadLimitMb"], 250);
+    assert_eq!(json["description"], "pre-upgrade snapshot");
+    let reparsed: SnapshotOp = serde_json::from_value(json).unwrap();
+    assert_eq!(reparsed, op);
+    assert_eq!(
+        op.create_options(),
+        kopiur_kopia::SnapshotCreateOptions {
+            fail_fast: Some(true),
+            upload_limit_mb: Some(250),
+            description: Some("pre-upgrade snapshot".into()),
+        }
+    );
+}
+
+#[test]
+fn snapshot_op_old_wire_decodes_with_m4_fields_defaulted() {
+    // A work-spec ConfigMap written before M4 (just sourcePath/tags/policy)
+    // must still decode — `#[serde(default)]` on every new field is the
+    // guard, and the all-None result reproduces the pre-M4 `snapshot create`
+    // argv exactly (SnapshotCreateOptions::default()).
+    let legacy = serde_json::json!({
+        "sourcePath": "/data",
+        "tags": {"app": "mydb"},
+    });
+    let op: SnapshotOp = serde_json::from_value(legacy).expect("legacy snapshot op decodes");
+    assert_eq!(op.fail_fast, None);
+    assert_eq!(op.upload_limit_mb, None);
+    assert_eq!(op.description, None);
+    assert_eq!(
+        op.create_options(),
+        kopiur_kopia::SnapshotCreateOptions::default()
+    );
+}
+
+#[test]
 fn restore_roundtrip() {
     let spec = MoverWorkSpec {
         version: 2,
@@ -63,6 +116,17 @@ fn restore_roundtrip() {
             },
             ignore_permission_errors: Some(true),
             write_files_atomically: Some(false),
+            parallel: Some(4),
+            write_sparse_files: Some(true),
+            skip_owners: Some(false),
+            skip_permissions: Some(true),
+            skip_times: Some(false),
+            overwrite_files: Some(true),
+            overwrite_directories: Some(false),
+            overwrite_symlinks: Some(true),
+            ignore_errors: Some(false),
+            skip_existing: Some(true),
+            delete_extra: true,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -91,6 +155,43 @@ fn restore_roundtrip() {
     // The externally-tagged source serializes under its own camelCase key.
     let v = serde_json::to_value(&spec).unwrap();
     assert_eq!(v["operation"]["restore"]["source"]["snapshot"], "abc123");
+    // M2 flag sweep: every new leaf field reaches the wire, camelCased.
+    let restore = &v["operation"]["restore"];
+    assert_eq!(restore["parallel"], 4);
+    assert_eq!(restore["writeSparseFiles"], true);
+    assert_eq!(restore["skipOwners"], false);
+    assert_eq!(restore["skipPermissions"], true);
+    assert_eq!(restore["skipTimes"], false);
+    assert_eq!(restore["overwriteFiles"], true);
+    assert_eq!(restore["overwriteDirectories"], false);
+    assert_eq!(restore["overwriteSymlinks"], true);
+    assert_eq!(restore["ignoreErrors"], false);
+    assert_eq!(restore["skipExisting"], true);
+    assert_eq!(restore["deleteExtra"], true);
+    // Controller-glue guard: every field reaches the kopia client's options —
+    // no dormant plumbing (the M2 gap-sweep bug class).
+    if let Operation::Restore(op) = &spec.operation {
+        assert_eq!(
+            op.restore_options(),
+            kopiur_kopia::RestoreOptions {
+                ignore_permission_errors: Some(true),
+                write_files_atomically: Some(false),
+                parallel: Some(4),
+                write_sparse_files: Some(true),
+                skip_owners: Some(false),
+                skip_permissions: Some(true),
+                skip_times: Some(false),
+                overwrite_files: Some(true),
+                overwrite_directories: Some(false),
+                overwrite_symlinks: Some(true),
+                ignore_errors: Some(false),
+                skip_existing: Some(true),
+                delete_extra: Some(true),
+            }
+        );
+    } else {
+        panic!("expected restore op");
+    }
 }
 
 #[test]
@@ -112,6 +213,17 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
             anchor: SnapshotAnchor::default(),
             ignore_permission_errors: None,
             write_files_atomically: None,
+            parallel: None,
+            write_sparse_files: None,
+            skip_owners: None,
+            skip_permissions: None,
+            skip_times: None,
+            overwrite_files: None,
+            overwrite_directories: None,
+            overwrite_symlinks: None,
+            ignore_errors: None,
+            skip_existing: None,
+            delete_extra: false,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -291,6 +403,9 @@ fn externally_tagged_operation_shape() {
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -463,10 +578,26 @@ fn restore_op_maps_options_and_defaults_absent() {
         anchor: SnapshotAnchor::default(),
         ignore_permission_errors: Some(false),
         write_files_atomically: Some(true),
+        parallel: Some(2),
+        write_sparse_files: None,
+        skip_owners: None,
+        skip_permissions: None,
+        skip_times: Some(true),
+        overwrite_files: None,
+        overwrite_directories: None,
+        overwrite_symlinks: None,
+        ignore_errors: None,
+        skip_existing: None,
+        delete_extra: true,
     };
     let opts = op.restore_options();
     assert_eq!(opts.ignore_permission_errors, Some(false));
     assert_eq!(opts.write_files_atomically, Some(true));
+    assert_eq!(opts.parallel, Some(2));
+    assert_eq!(opts.skip_times, Some(true));
+    // Regression guard: `enableFileDeletion`/`delete_extra: true` must map to
+    // `Some(true)` — the exact bug this milestone fixes.
+    assert_eq!(opts.delete_extra, Some(true));
 
     // A wire payload with just the source + path still deserializes (option/anchor
     // fields default), mapping to kopia defaults (None/empty).
@@ -475,6 +606,44 @@ fn restore_op_maps_options_and_defaults_absent() {
     assert_eq!(parsed.ignore_permission_errors, None);
     assert_eq!(parsed.restore_options().write_files_atomically, None);
     assert!(parsed.anchor.is_empty());
+    assert!(!parsed.delete_extra);
+    assert_eq!(parsed.restore_options().delete_extra, None);
+}
+
+#[test]
+fn restore_op_old_wire_decodes_with_m2_fields_defaulted() {
+    // M2 flag sweep: a work-spec ConfigMap written before this milestone's
+    // fields existed (just source/targetPath/anchor/the original two options)
+    // must still decode — `#[serde(default)]` on every new field is the guard.
+    let legacy = serde_json::json!({
+        "source": { "snapshot": "s" },
+        "targetPath": "/data",
+        "ignorePermissionErrors": true,
+        "writeFilesAtomically": false,
+    });
+    let op: RestoreOp = serde_json::from_value(legacy).expect("legacy restore op decodes");
+    assert_eq!(op.ignore_permission_errors, Some(true));
+    assert_eq!(op.write_files_atomically, Some(false));
+    assert_eq!(op.parallel, None);
+    assert_eq!(op.write_sparse_files, None);
+    assert_eq!(op.skip_owners, None);
+    assert_eq!(op.skip_permissions, None);
+    assert_eq!(op.skip_times, None);
+    assert_eq!(op.overwrite_files, None);
+    assert_eq!(op.overwrite_directories, None);
+    assert_eq!(op.overwrite_symlinks, None);
+    assert_eq!(op.ignore_errors, None);
+    assert_eq!(op.skip_existing, None);
+    assert!(!op.delete_extra);
+    // All-None/false new fields reproduce today's RestoreOptions exactly.
+    assert_eq!(
+        op.restore_options(),
+        kopiur_kopia::RestoreOptions {
+            ignore_permission_errors: Some(true),
+            write_files_atomically: Some(false),
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -565,10 +734,15 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
             ignore_file_errors: true,
             ignore_dir_errors: false,
             ignore_unknown_types: true,
+            // M4 flag sweep: `failFast` is a `snapshot create` argv flag, not a
+            // `policy set` knob — it must NOT leak into `PolicyArgsSpec` below.
+            fail_fast: true,
         }),
         upload: Some(Upload {
             max_parallel_snapshots: Some(4),
             max_parallel_file_reads: Some(8),
+            // Same non-leak guard as `fail_fast` above, for `limitMb`.
+            limit_mb: Some(100),
         }),
         verification: None,
         preflight: None,
@@ -590,6 +764,14 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     assert_eq!(p.max_parallel_file_reads, Some(8));
     assert_eq!(p.extra_args, vec!["--one-file-system".to_string()]);
     assert!(!p.is_empty());
+    // M4 flag sweep: `errorHandling.failFast`/`upload.limitMb` are `snapshot
+    // create` argv flags (they ride `SnapshotOp`, not `policy set`), so they
+    // must not appear anywhere on the wire `PolicyArgsSpec` produces —
+    // `PolicyArgsSpec` structurally has no such fields, and this proves it at
+    // the JSON boundary too.
+    let policy_json = serde_json::to_value(&p).unwrap();
+    assert!(policy_json.get("failFast").is_none());
+    assert!(policy_json.get("limitMb").is_none());
 
     // The kopia args builder emits the expected flags (end-to-end into argv).
     let args = p.to_kopia();
@@ -793,6 +975,8 @@ fn verify_quick_roundtrip_and_wire_shape() {
                 verify_files_percent: Some(10),
                 max_errors: Some(3),
                 parallel: None,
+                file_parallelism: None,
+                file_queue_length: None,
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
         }),
@@ -850,6 +1034,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
             tier: VerifyTier::Deep(DeepVerify {
                 scratch_path: "/scratch".into(),
                 snapshot_id: Some("k99".into()),
+                parallel: None,
             }),
             success_expr: None,
         }),
@@ -883,6 +1068,62 @@ fn verify_deep_roundtrip_and_wire_shape() {
     }
 }
 
+// --- M3 (issue #216 category sweep): quick tuning knobs + deep restore parallelism ---
+
+#[test]
+fn quick_verify_tuning_knobs_roundtrip_and_map_to_kopia() {
+    let q = QuickVerify {
+        verify_files_percent: Some(10),
+        max_errors: Some(1),
+        parallel: Some(2),
+        file_parallelism: Some(4),
+        file_queue_length: Some(100),
+    };
+    let v: serde_json::Value = serde_json::to_value(&q).unwrap();
+    assert_eq!(v["parallel"], 2);
+    assert_eq!(v["fileParallelism"], 4);
+    assert_eq!(v["fileQueueLength"], 100);
+    let reparsed: QuickVerify = serde_json::from_value(v).unwrap();
+    assert_eq!(reparsed, q);
+
+    let kopia = q.to_kopia();
+    assert_eq!(kopia.parallel, Some(2));
+    assert_eq!(kopia.file_parallelism, Some(4));
+    assert_eq!(kopia.file_queue_length, Some(100));
+}
+
+#[test]
+fn quick_verify_old_wire_json_without_new_knobs_still_decodes() {
+    // Pre-M3 work-spec ConfigMaps only ever carried these three keys. A mover
+    // upgraded ahead of a controller still writing the old shape must not wedge.
+    let old = r#"{"verifyFilesPercent":10,"maxErrors":3}"#;
+    let parsed: QuickVerify = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.verify_files_percent, Some(10));
+    assert_eq!(parsed.max_errors, Some(3));
+    assert!(parsed.parallel.is_none());
+    assert!(parsed.file_parallelism.is_none());
+    assert!(parsed.file_queue_length.is_none());
+}
+
+#[test]
+fn deep_verify_parallel_roundtrips_and_old_wire_json_still_decodes() {
+    let d = DeepVerify {
+        scratch_path: "/scratch".into(),
+        snapshot_id: Some("k1".into()),
+        parallel: Some(2),
+    };
+    let v: serde_json::Value = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["parallel"], 2);
+    let reparsed: DeepVerify = serde_json::from_value(v).unwrap();
+    assert_eq!(reparsed, d);
+
+    // Pre-M3 work-spec ConfigMaps had no `parallel` key.
+    let old = r#"{"scratchPath":"/scratch","snapshotId":"k1"}"#;
+    let parsed: DeepVerify = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.scratch_path, "/scratch");
+    assert!(parsed.parallel.is_none());
+}
+
 // --- §13(d) replicate op ---
 
 #[test]
@@ -900,6 +1141,12 @@ fn replicate_roundtrip_and_wire_shape() {
                 ambient_credentials: false,
             },
             delete_extra: true,
+            parallel: Some(8),
+            must_exist: Some(false),
+            times: Some(true),
+            update: Some(false),
+            max_download_speed_bytes_per_second: Some(1_000_000),
+            max_upload_speed_bytes_per_second: Some(500_000),
         }),
         // The source repository the mover connects to.
         identity: ResolvedIdentity {
@@ -928,6 +1175,18 @@ fn replicate_roundtrip_and_wire_shape() {
         "mirror"
     );
     assert_eq!(v["operation"]["replicate"]["deleteExtra"], true);
+    assert_eq!(v["operation"]["replicate"]["parallel"], 8);
+    assert_eq!(v["operation"]["replicate"]["mustExist"], false);
+    assert_eq!(v["operation"]["replicate"]["times"], true);
+    assert_eq!(v["operation"]["replicate"]["update"], false);
+    assert_eq!(
+        v["operation"]["replicate"]["maxDownloadSpeedBytesPerSecond"],
+        1_000_000
+    );
+    assert_eq!(
+        v["operation"]["replicate"]["maxUploadSpeedBytesPerSecond"],
+        500_000
+    );
     // The destination converts to the kopia client connect spec.
     if let Operation::Replicate(op) = &spec.operation {
         assert_eq!(
@@ -942,7 +1201,49 @@ fn replicate_roundtrip_and_wire_shape() {
                 ambient_credentials: false,
             }
         );
+        // #216 controller-glue guard: every new op field reaches the kopia
+        // client's SyncToOptions — no dormant plumbing.
+        assert_eq!(
+            op.sync_options(),
+            kopiur_kopia::SyncToOptions {
+                parallel: Some(8),
+                delete_extra: true,
+                must_exist: Some(false),
+                times: Some(true),
+                update: Some(false),
+                max_download_speed_bytes_per_second: Some(1_000_000),
+                max_upload_speed_bytes_per_second: Some(500_000),
+            }
+        );
     } else {
         panic!("expected replicate op");
     }
+}
+
+#[test]
+fn replicate_op_old_wire_decodes_with_sync_fields_defaulted() {
+    // #216: a work-spec ConfigMap written before `sync` tuning existed (just
+    // `destination` + `deleteExtra`) must still decode — the mover pairs one
+    // controller+mover image per Job, but old ConfigMaps can persist across a
+    // rolling restart. `#[serde(default)]` on every new field is the guard.
+    let legacy = serde_json::json!({
+        "destination": { "filesystem": { "path": "/mirror" } },
+        "deleteExtra": true,
+    });
+    let op: ReplicateOp = serde_json::from_value(legacy).expect("legacy replicate op decodes");
+    assert!(op.delete_extra);
+    assert_eq!(op.parallel, None);
+    assert_eq!(op.must_exist, None);
+    assert_eq!(op.times, None);
+    assert_eq!(op.update, None);
+    assert_eq!(op.max_download_speed_bytes_per_second, None);
+    assert_eq!(op.max_upload_speed_bytes_per_second, None);
+    // All-None sync fields reproduce today's SyncToOptions exactly.
+    assert_eq!(
+        op.sync_options(),
+        kopiur_kopia::SyncToOptions {
+            delete_extra: true,
+            ..Default::default()
+        }
+    );
 }

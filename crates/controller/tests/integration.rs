@@ -188,6 +188,7 @@ async fn backup_gets_finalizer_and_delete_path_removes_cr() {
             failure_policy: None,
             deletion_policy: Some(kopiur_api::DeletionPolicy::Orphan),
             pin: false,
+            description: None,
         },
     );
     b.finalizers_mut()

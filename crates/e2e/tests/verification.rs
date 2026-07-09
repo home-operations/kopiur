@@ -27,8 +27,42 @@ use kube::Api;
 use kube::api::{ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::ConfigMap;
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
+
+/// Wait for a verify Job matching `selector`, then return its work-spec
+/// ConfigMap's `work-spec.json`, parsed. Verify Job names are per-slot
+/// (`<policy>-vfy-<q|d>-<unix_slot>`, [`crate::verify_job_name`] in the
+/// controller), not deterministic like other mover Jobs, so the CM is looked up
+/// by the FOUND Job's own name (the controller applies the CM under the same
+/// name as the Job — `io::apply_mover_objects`) rather than a name built here.
+async fn verify_work_spec_json(client: &kube::Client, selector: &str) -> serde_json::Value {
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let job = wait_until(
+        "verify mover Job created",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let lp = ListParams::default().labels(selector);
+            Ok(jobs.list(&lp).await?.items.into_iter().next())
+        },
+    )
+    .await
+    .expect("a verify Job should be spawned");
+    let job_name = job.metadata.name.expect("Job has a name");
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cm = cms
+        .get(&job_name)
+        .await
+        .unwrap_or_else(|_| panic!("work-spec ConfigMap {job_name}"));
+    let spec_json = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("work-spec.json"))
+        .expect("work-spec.json key");
+    serde_json::from_str(spec_json).expect("work-spec parses as JSON")
+}
 
 /// Verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.quick` with an
 /// every-minute cron and a `successExpr` over the result drives a `kopia snapshot
@@ -53,10 +87,20 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
 
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     // Patch verification onto the existing policy: every-minute quick verify, gated by
-    // a successExpr asserting the verify reported zero errors.
+    // a successExpr asserting the verify reported zero errors. Also sets the M3
+    // (issue #216 category sweep) tuning knobs — parallel/fileParallelism/
+    // fileQueueLength/maxErrors — the regression guard for the dormant-plumbing bug
+    // where the controller hardcoded `max_errors: None, parallel: None` regardless
+    // of what the CRD carried.
     let patch = serde_json::json!({
         "spec": { "verification": {
-            "quick": { "schedule": { "cron": "* * * * *" } },
+            "quick": {
+                "schedule": { "cron": "* * * * *" },
+                "parallel": 2,
+                "fileParallelism": 4,
+                "fileQueueLength": 100,
+                "maxErrors": 1
+            },
             "successExpr": "stats.errors == 0"
         } }
     });
@@ -85,6 +129,36 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
     .await
     .expect(
         "a passing quick verify (successExpr stats.errors == 0) must stamp status.lastVerified",
+    );
+
+    // The work-spec ConfigMap the mover actually ran against carries the tuning
+    // knobs — not just that the run succeeded, but that the knobs reached the
+    // mover contract (`operation.verify.tier.quick.*`).
+    let selector = "app.kubernetes.io/component=verify,\
+                    kopiur.home-operations.com/verify=e2e-verify-policy";
+    let spec = verify_work_spec_json(&client, selector).await;
+    let quick = spec
+        .pointer("/operation/verify/tier/quick")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        quick.get("parallel").and_then(|v| v.as_i64()),
+        Some(2),
+        "verification.quick.parallel must reach the mover contract; quick: {quick}"
+    );
+    assert_eq!(
+        quick.get("fileParallelism").and_then(|v| v.as_i64()),
+        Some(4),
+        "verification.quick.fileParallelism must reach the mover contract; quick: {quick}"
+    );
+    assert_eq!(
+        quick.get("fileQueueLength").and_then(|v| v.as_i64()),
+        Some(100),
+        "verification.quick.fileQueueLength must reach the mover contract; quick: {quick}"
+    );
+    assert_eq!(
+        quick.get("maxErrors").and_then(|v| v.as_i64()),
+        Some(1),
+        "verification.quick.maxErrors must reach the mover contract; quick: {quick}"
     );
 }
 
@@ -120,10 +194,12 @@ async fn verification_deep_scratch_restore_stamps_last_verified() {
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     // Every-minute deep verify, capacity/storageClassName UNSET -> emptyDir scratch
     // (the path that regressed). The successExpr exercises the deep-only `restored`
-    // environment, so a stamped lastVerified proves the scratch-restore ran.
+    // environment, so a stamped lastVerified proves the scratch-restore ran. Also
+    // sets `parallel` (M3 / issue #216 category sweep): deep verify IS a restore
+    // under the hood, so this maps to `restore --parallel` in the mover.
     let patch = serde_json::json!({
         "spec": { "verification": {
-            "deep": { "schedule": { "cron": "* * * * *" } },
+            "deep": { "schedule": { "cron": "* * * * *" }, "parallel": 2 },
             "successExpr": "restored.files >= 0 && restored.checksumMatches"
         } }
     });
@@ -152,6 +228,20 @@ async fn verification_deep_scratch_restore_stamps_last_verified() {
     .expect(
         "a passing deep verify must mount a writable /scratch (emptyDir) and stamp \
          status.lastVerified — failure here is the `mkdir /scratch: permission denied` regression",
+    );
+
+    // The work-spec ConfigMap carries `parallel` through to the mover contract
+    // (`operation.verify.tier.deep.parallel`).
+    let selector = "app.kubernetes.io/component=verify,\
+                    kopiur.home-operations.com/verify=e2e-vfy-deep-policy";
+    let spec = verify_work_spec_json(&client, selector).await;
+    let deep = spec
+        .pointer("/operation/verify/tier/deep")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        deep.get("parallel").and_then(|v| v.as_i64()),
+        Some(2),
+        "verification.deep.parallel must reach the mover contract; deep: {deep}"
     );
 }
 

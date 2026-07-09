@@ -543,15 +543,25 @@ pub fn build_verify_work_spec(
     tier: VerifyTierKind,
 ) -> MoverWorkSpec {
     let tier = match tier {
+        // M3 (issue #216 category sweep): quick.parallel/fileParallelism/
+        // fileQueueLength/maxErrors were dormant plumbing — the workspec and kopia
+        // client already supported them, but this arm hardcoded `None`, silently
+        // dropping any value the user set on `verification.quick`.
         VerifyTierKind::Quick => VerifyTier::Quick(QuickVerify {
             verify_files_percent: verification.verify_files_percent,
-            max_errors: None,
-            parallel: None,
+            max_errors: verification.quick.as_ref().and_then(|q| q.max_errors),
+            parallel: verification.quick.as_ref().and_then(|q| q.parallel),
+            file_parallelism: verification.quick.as_ref().and_then(|q| q.file_parallelism),
+            file_queue_length: verification
+                .quick
+                .as_ref()
+                .and_then(|q| q.file_queue_length),
         }),
         VerifyTierKind::Deep => VerifyTier::Deep(DeepVerify {
             scratch_path: DEEP_SCRATCH_PATH.to_string(),
             // The mover resolves the latest snapshot for the identity itself.
             snapshot_id: None,
+            parallel: verification.deep.as_ref().and_then(|d| d.parallel),
         }),
     };
     // The source identity (first source) so a deep restore targets the right path.
@@ -733,6 +743,10 @@ mod tests {
                     jitter: None,
                     timezone: None,
                 }),
+                parallel: None,
+                file_parallelism: None,
+                file_queue_length: None,
+                max_errors: None,
             }),
             deep: deep.map(|c| DeepVerification {
                 schedule: CronSpec {
@@ -742,6 +756,7 @@ mod tests {
                 },
                 storage_class_name: None,
                 capacity: None,
+                parallel: None,
             }),
             success_expr: None,
             verify_files_percent: None,
@@ -789,7 +804,10 @@ mod tests {
         // must treat it as "quick tier disabled" — never due, no panic/wedge. (New
         // writes of this shape are blocked at admission.)
         let v = Verification {
-            quick: Some(QuickVerification { schedule: None }),
+            quick: Some(QuickVerification {
+                schedule: None,
+                ..Default::default()
+            }),
             deep: None,
             success_expr: None,
             verify_files_percent: None,
@@ -1089,6 +1107,51 @@ mod tests {
     }
 
     #[test]
+    fn quick_work_spec_maps_tuning_knobs_not_hardcoded_none() {
+        // M3 (issue #216 category sweep) regression: `verification.quick.{parallel,
+        // fileParallelism,fileQueueLength,maxErrors}` are dormant plumbing without
+        // this mapping — the workspec and kopia client already support them, but
+        // `build_verify_work_spec` used to hardcode `max_errors: None, parallel:
+        // None` (and never had the other two at all), silently dropping every value
+        // a user set. This must fail on the pre-fix hardcoded-`None` mapping.
+        let mut v = verification(Some("0 4 * * *"), None);
+        v.quick = Some(QuickVerification {
+            schedule: Some(CronSpec {
+                cron: "0 4 * * *".into(),
+                jitter: None,
+                timezone: None,
+            }),
+            parallel: Some(2),
+            file_parallelism: Some(4),
+            file_queue_length: Some(100),
+            max_errors: Some(1),
+        });
+        let policy = sample_policy(v.clone());
+        let repo = sample_repo();
+        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick);
+        match &ws.operation {
+            Operation::Verify(op) => match &op.tier {
+                VerifyTier::Quick(q) => {
+                    assert_eq!(q.parallel, Some(2), "parallel must reach the workspec");
+                    assert_eq!(
+                        q.file_parallelism,
+                        Some(4),
+                        "fileParallelism must reach the workspec"
+                    );
+                    assert_eq!(
+                        q.file_queue_length,
+                        Some(100),
+                        "fileQueueLength must reach the workspec"
+                    );
+                    assert_eq!(q.max_errors, Some(1), "maxErrors must reach the workspec");
+                }
+                other => panic!("expected quick tier, got {}", other.kind_str()),
+            },
+            other => panic!("expected verify op, got {}", other.kind_str()),
+        }
+    }
+
+    #[test]
     fn deep_work_spec_carries_deep_tier_with_scratch_path() {
         let v = verification(None, Some("0 5 * * 0"));
         let policy = sample_policy(v.clone());
@@ -1099,6 +1162,35 @@ mod tests {
                 VerifyTier::Deep(d) => {
                     assert_eq!(d.scratch_path, DEEP_SCRATCH_PATH);
                     assert!(d.snapshot_id.is_none());
+                }
+                other => panic!("expected deep tier, got {}", other.kind_str()),
+            },
+            other => panic!("expected verify op, got {}", other.kind_str()),
+        }
+    }
+
+    #[test]
+    fn deep_work_spec_maps_parallel_not_hardcoded_none() {
+        // M3 regression, deep side: `verification.deep.parallel` must reach
+        // `DeepVerify.parallel` (the mover maps it into `restore --parallel`).
+        let mut v = verification(None, Some("0 5 * * 0"));
+        v.deep = Some(DeepVerification {
+            schedule: CronSpec {
+                cron: "0 5 * * 0".into(),
+                jitter: None,
+                timezone: None,
+            },
+            storage_class_name: None,
+            capacity: None,
+            parallel: Some(2),
+        });
+        let policy = sample_policy(v.clone());
+        let repo = sample_repo();
+        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep);
+        match &ws.operation {
+            Operation::Verify(op) => match &op.tier {
+                VerifyTier::Deep(d) => {
+                    assert_eq!(d.parallel, Some(2), "parallel must reach the workspec");
                 }
                 other => panic!("expected deep tier, got {}", other.kind_str()),
             },
@@ -1170,6 +1262,7 @@ mod tests {
                 },
                 storage_class_name: storage_class.map(Into::into),
                 capacity: capacity.map(Into::into),
+                parallel: None,
             }),
             success_expr: None,
             verify_files_percent: None,

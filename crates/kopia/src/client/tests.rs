@@ -437,8 +437,9 @@ fn restore_args_tristate_and_flags() {
         ignore_permission_errors: Some(false),
         write_files_atomically: Some(true),
         overwrite_files: Some(false),
-        skip_existing: true,
+        skip_existing: Some(true),
         parallel: Some(4),
+        ..Default::default()
     };
     assert_eq!(
         restore_args("s", "/t", &opts),
@@ -458,6 +459,146 @@ fn restore_args_tristate_and_flags() {
 }
 
 #[test]
+fn restore_args_m2_flag_sweep_all_new_tristates_and_delete_extra() {
+    // M2 flag sweep (issue #216 gap analysis): every new tri-state, in the
+    // `Some(false)` → `--no-*` form, plus `delete_extra` — the
+    // `enableFileDeletion` bug-fix's client-layer regression guard.
+    let opts = RestoreOptions {
+        overwrite_directories: Some(false),
+        overwrite_symlinks: Some(false),
+        write_sparse_files: Some(false),
+        skip_owners: Some(false),
+        skip_permissions: Some(false),
+        skip_times: Some(false),
+        ignore_errors: Some(false),
+        delete_extra: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        restore_args("s", "/t", &opts),
+        vec![
+            "snapshot",
+            "restore",
+            "s",
+            "/t",
+            "--no-overwrite-directories",
+            "--no-overwrite-symlinks",
+            "--no-write-sparse-files",
+            "--no-skip-owners",
+            "--no-skip-permissions",
+            "--no-skip-times",
+            "--no-ignore-errors",
+            "--no-delete-extra",
+        ]
+    );
+
+    // The `Some(true)` form emits the bare (non-negated) flag — this is the
+    // regression test for the `enableFileDeletion` bug: today's code has NO
+    // path that can ever produce `--delete-extra` on argv.
+    let all_true = RestoreOptions {
+        overwrite_directories: Some(true),
+        overwrite_symlinks: Some(true),
+        write_sparse_files: Some(true),
+        skip_owners: Some(true),
+        skip_permissions: Some(true),
+        skip_times: Some(true),
+        ignore_errors: Some(true),
+        skip_existing: Some(true),
+        delete_extra: Some(true),
+        ..Default::default()
+    };
+    let argv = restore_args("s", "/t", &all_true);
+    for flag in [
+        "--overwrite-directories",
+        "--overwrite-symlinks",
+        "--write-sparse-files",
+        "--skip-owners",
+        "--skip-permissions",
+        "--skip-times",
+        "--ignore-errors",
+        "--skip-existing",
+        "--delete-extra",
+    ] {
+        assert!(
+            argv.contains(&flag.to_string()),
+            "{flag} missing in {argv:?}"
+        );
+    }
+
+    // All-`None` (the zero-value default) is byte-for-byte identical to the
+    // pre-M2 bare argv (no dormant knob sneaks a flag in when nothing was set).
+    assert_eq!(
+        restore_args("s", "/t", &RestoreOptions::default()),
+        vec!["snapshot", "restore", "s", "/t"]
+    );
+}
+
+#[test]
+fn snapshot_create_args_default_is_todays_argv() {
+    // M4 flag sweep (issue #216 category sweep): all-default `opts` must
+    // reproduce the pre-M4 argv byte-for-byte — no dormant knob sneaks a flag
+    // in when nothing was set.
+    let mut tags = BTreeMap::new();
+    tags.insert("app".to_string(), "db".to_string());
+    assert_eq!(
+        snapshot_create_args("/data", &tags, None, &SnapshotCreateOptions::default()),
+        vec!["snapshot", "create", "/data", "--json", "--tags", "app:db"]
+    );
+    assert_eq!(
+        snapshot_create_args(
+            "/data",
+            &BTreeMap::new(),
+            Some("u@h:/data"),
+            &SnapshotCreateOptions::default()
+        ),
+        vec![
+            "snapshot",
+            "create",
+            "/data",
+            "--json",
+            "--override-source",
+            "u@h:/data"
+        ]
+    );
+}
+
+#[test]
+fn snapshot_create_args_fail_fast_upload_limit_and_description() {
+    // Smoke-tested against pinned kopia 0.23.1: `snapshot create --fail-fast
+    // --upload-limit-mb 100 --description "smoke test"` is accepted.
+    let opts = SnapshotCreateOptions {
+        fail_fast: Some(true),
+        upload_limit_mb: Some(100),
+        description: Some("smoke test".to_string()),
+    };
+    assert_eq!(
+        snapshot_create_args("/data", &BTreeMap::new(), None, &opts),
+        vec![
+            "snapshot",
+            "create",
+            "/data",
+            "--json",
+            "--fail-fast",
+            "--upload-limit-mb",
+            "100",
+            "--description",
+            "smoke test"
+        ]
+    );
+    // `fail_fast: Some(false)` emits the negated kingpin form, same grammar as
+    // `snapshot restore`'s tri-states (push_tristate), not `policy set`'s
+    // valued tri-states.
+    let opts_false = SnapshotCreateOptions {
+        fail_fast: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        snapshot_create_args("/data", &BTreeMap::new(), None, &opts_false),
+        vec!["snapshot", "create", "/data", "--json", "--no-fail-fast"]
+    );
+}
+
+#[test]
 fn verify_args_builds_flags() {
     assert_eq!(
         verify_args(&VerifyOptions::default()),
@@ -467,6 +608,8 @@ fn verify_args_builds_flags() {
         verify_files_percent: Some(10),
         max_errors: Some(3),
         parallel: Some(8),
+        file_parallelism: None,
+        file_queue_length: None,
     };
     assert_eq!(
         verify_args(&opts),
@@ -479,6 +622,31 @@ fn verify_args_builds_flags() {
             "3",
             "--parallel",
             "8"
+        ]
+    );
+
+    // The two new knobs (M3 / issue #216 category sweep) — each independently absent
+    // by default, and both emitted in kopia's `snapshot verify --help` order when set.
+    let opts_full = VerifyOptions {
+        verify_files_percent: None,
+        max_errors: Some(1),
+        parallel: Some(2),
+        file_parallelism: Some(4),
+        file_queue_length: Some(100),
+    };
+    assert_eq!(
+        verify_args(&opts_full),
+        vec![
+            "snapshot",
+            "verify",
+            "--max-errors",
+            "1",
+            "--parallel",
+            "2",
+            "--file-parallelism",
+            "4",
+            "--file-queue-length",
+            "100"
         ]
     );
 }
@@ -529,8 +697,9 @@ fn direct_credential_env_names_per_backend() {
 
 #[test]
 fn sync_to_args_builds_destination_and_flags() {
-    // ADR-0005 §13(d): destination backend args (+ optional --delete). `--must-exist`
-    // is OMITTED (its kopia default is false; `--must-exist=false` is a parse error).
+    // ADR-0005 §13(d) / issue #216: destination backend args + tuning flags.
+    // All-`None`/`false` opts must yield EXACTLY today's argv (no dormant knob
+    // sneaks a flag in when nothing was configured).
     let dest = ConnectSpec::S3 {
         bucket: "mirror".into(),
         endpoint: Some("https://offsite".into()),
@@ -541,7 +710,7 @@ fn sync_to_args_builds_destination_and_flags() {
         ambient_credentials: false,
     };
     assert_eq!(
-        sync_to_args(&dest, false),
+        sync_to_args(&dest, &SyncToOptions::default()),
         vec![
             "repository",
             "sync-to",
@@ -554,18 +723,24 @@ fn sync_to_args_builds_destination_and_flags() {
             "us-east-1",
         ]
     );
-    // No `--must-exist=false` (it would fail kopia's flag parser).
+    // No `must-exist`/`times`/`update` flag at all when unset.
     assert!(
-        !sync_to_args(&dest, false)
+        !sync_to_args(&dest, &SyncToOptions::default())
             .iter()
-            .any(|a| a.contains("must-exist"))
+            .any(|a| a.contains("must-exist") || a.contains("times") || a.contains("update"))
     );
     // delete_extra appends --delete (a true mirror).
     let fs = ConnectSpec::Filesystem {
         path: "/mirror".into(),
     };
     assert_eq!(
-        sync_to_args(&fs, true),
+        sync_to_args(
+            &fs,
+            &SyncToOptions {
+                delete_extra: true,
+                ..Default::default()
+            }
+        ),
         vec![
             "repository",
             "sync-to",
@@ -574,6 +749,55 @@ fn sync_to_args_builds_destination_and_flags() {
             "/mirror",
             "--delete"
         ]
+    );
+}
+
+#[test]
+fn sync_to_args_builds_parallel_and_tristates_and_speeds() {
+    // #216: --parallel is the headline fix; the tri-states use the SAME
+    // --no-* negated form as `snapshot restore` (push_tristate), not the
+    // `policy set` `--flag=false` grammar.
+    let fs = ConnectSpec::Filesystem {
+        path: "/mirror".into(),
+    };
+    let opts = SyncToOptions {
+        parallel: Some(8),
+        delete_extra: false,
+        must_exist: Some(false),
+        times: Some(true),
+        update: Some(false),
+        max_download_speed_bytes_per_second: Some(1_000_000),
+        max_upload_speed_bytes_per_second: Some(500_000),
+    };
+    assert_eq!(
+        sync_to_args(&fs, &opts),
+        vec![
+            "repository",
+            "sync-to",
+            "filesystem",
+            "--path",
+            "/mirror",
+            "--parallel",
+            "8",
+            "--no-must-exist",
+            "--times",
+            "--no-update",
+            "--max-download-speed",
+            "1000000",
+            "--max-upload-speed",
+            "500000",
+        ]
+    );
+    // The `Some(true)` form emits the bare (non-negated) flag.
+    assert!(
+        sync_to_args(
+            &fs,
+            &SyncToOptions {
+                must_exist: Some(true),
+                ..Default::default()
+            }
+        )
+        .contains(&"--must-exist".to_string())
     );
 }
 
@@ -611,7 +835,10 @@ async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
     };
 
     // No overlay → the source credentials pass through unchanged.
-    client.repository_sync_to(&dest, false).await.unwrap();
+    client
+        .repository_sync_to(&dest, &SyncToOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&out).unwrap().trim(),
         "KEY=source-key TOKEN=source-token"
@@ -627,7 +854,7 @@ async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
         ("AWS_SESSION_TOKEN".to_string(), None),
     ]);
     client
-        .repository_sync_to_with_env(&dest, false, &overlay)
+        .repository_sync_to_with_env(&dest, &SyncToOptions::default(), &overlay)
         .await
         .unwrap();
     assert_eq!(
