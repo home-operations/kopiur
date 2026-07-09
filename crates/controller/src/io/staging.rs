@@ -35,7 +35,7 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind, ObjectMeta};
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{CopyMethod, SnapshotPolicy};
+use kopiur_api::{CopyMethod, SnapshotPolicy, StagingSpec};
 
 use super::apply::{FIELD_MANAGER, apply};
 use super::child_labels;
@@ -79,6 +79,14 @@ pub struct StagedSource {
     pub volume_snapshot_name: Option<String>,
     /// The resolved capture method (`Snapshot`/`Clone`) — recorded to status.
     pub copy_method: &'static str,
+    /// StorageClass actually written to the staged PVC's spec — the
+    /// `spec.staging.storageClassName` override when set, else the source PVC's
+    /// class. Recorded to status so a shallow-clone setup is observable.
+    pub storage_class_name: Option<String>,
+    /// The resolved staging timeout in seconds (`0` = wait indefinitely), pinned
+    /// to status so the running-Job staged-PVC bind watchdog never re-resolves a
+    /// policy that may have been edited or deleted mid-run.
+    pub staging_timeout_seconds: i64,
 }
 
 /// What [`resolve_staging`] decided. The reconciler maps this to status/conditions/
@@ -89,12 +97,22 @@ pub enum StagingOutcome {
     NotApplicable,
     /// The stage is provisioned and ready; mount [`StagedSource::pvc_name`].
     Ready(StagedSource),
-    /// The VolumeSnapshot is not `readyToUse` yet — requeue (transient). The message is
-    /// for a `SourceStaged=False` / `Pending` condition. A `status.error` on the
-    /// VolumeSnapshot lands HERE (not `Failed`) while the staging deadline has not
-    /// passed: external-snapshotter sets it transiently (e.g. a benign 409-conflict
-    /// retry) and clears it on the next successful sync, so first sight is never fatal.
-    Waiting(String),
+    /// The stage is not usable yet — requeue (transient). Two waits share this
+    /// variant, distinguished by `reason` (both `SourceStaged=False` / `Pending`):
+    /// the VolumeSnapshot becoming `readyToUse`
+    /// ([`crate::consts::STAGING_WAITING_REASON`]) and the staged PVC binding on an
+    /// `Immediate` StorageClass ([`crate::consts::STAGED_PVC_BINDING_REASON`]). A
+    /// `status.error` on the VolumeSnapshot lands HERE (not `Failed`) while the
+    /// staging deadline has not passed: external-snapshotter sets it transiently
+    /// (e.g. a benign 409-conflict retry) and clears it on the next successful
+    /// sync, so first sight is never fatal.
+    Waiting {
+        /// kstatus condition reason (a stable PascalCase token) naming WHICH wait.
+        reason: &'static str,
+        /// Deterministic-per-object message (embeds the fixed deadline, never
+        /// `now()`), so steady-state reconciles don't churn status.
+        message: String,
+    },
     /// The stage cannot be produced (no snapshot stack / no class / source not
     /// CSI-provisioned / the VolumeSnapshot missed the staging deadline). The reconciler
     /// fails the Snapshot with this `reason` + actionable `message`. **Terminal** for
@@ -125,6 +143,26 @@ pub const REASON_STAGING_TIMEOUT: &str = "StagingTimedOut";
 /// Condition reason: the source PVC isn't CSI-provisioned (no StorageClass), so it
 /// can't be snapshotted/cloned.
 pub const REASON_SOURCE_NOT_CSI: &str = "SourceNotCSIProvisioned";
+/// Condition reason: `spec.staging.storageClassName` names a StorageClass that does
+/// not exist.
+pub const REASON_STAGED_CLASS_NOT_FOUND: &str = "StagedClassNotFound";
+/// Condition reason: `spec.staging.storageClassName` names a StorageClass whose
+/// provisioner differs from the source PVC's CSI driver — a VolumeSnapshot restore /
+/// volume clone can only be provisioned by the source's own driver, so the staged
+/// PVC would never bind. Caught up front instead of as an opaque bind timeout.
+pub const REASON_STAGED_CLASS_MISMATCH: &str = "StagedClassMismatch";
+/// Condition reason: the staged PVC did not reach `Bound` within the staging
+/// deadline (`spec.staging.timeout`) — the CSI restore/clone from the source is
+/// still provisioning (e.g. a CephFS full subvolume clone of a small-file-heavy
+/// volume) or the class cannot provision it at all. Pre-fix, this window fell
+/// under the generic 300 s wedged-pod deadline, whose cleanup deleted the
+/// VolumeSnapshot while the restore was still consuming it (the forgejo/CephFS
+/// hourly hard-fail).
+pub const REASON_STAGED_PVC_BIND_TIMEOUT: &str = "StagedPvcBindTimeout";
+/// Condition reason: the staged PVC reports phase `Lost` — its bound
+/// PersistentVolume disappeared. Terminal immediately (no point waiting out the
+/// bind deadline; the stage can never become usable).
+pub const REASON_STAGED_PVC_LOST: &str = "StagedPvcLost";
 
 /// Appended to every `StagingOutcome::Failed` message whose fix is "set copyMethod:
 /// Direct" — since `copyMethod` now *defaults* to `Snapshot` (as of this release), a user
@@ -400,8 +438,10 @@ pub fn staged_pvc_size(restore_size: Option<&str>, source_request: Option<&str>)
     }
 }
 
-/// Build the staged PVC: copies the source PVC's `accessModes`/`storageClassName`/
-/// `volumeMode`, sets `dataSource`, requests `max(restoreSize, source)` storage, and is
+/// Build the staged PVC: `accessModes`/`storageClassName` come from the
+/// `spec.staging` overrides when set, else are copied from the source PVC;
+/// `volumeMode` is always copied (the mover reads files — no override exists).
+/// Sets `dataSource`, requests `max(restoreSize, source)` storage, and is
 /// owner-referenced + managed-by labelled.
 pub fn build_staged_pvc(
     name: &str,
@@ -409,6 +449,7 @@ pub fn build_staged_pvc(
     source_pvc: &PersistentVolumeClaim,
     data_source: TypedLocalObjectReference,
     restore_size: Option<&str>,
+    staging: Option<&StagingSpec>,
     owner: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> PersistentVolumeClaim {
     let src = source_pvc.spec.clone().unwrap_or_default();
@@ -423,6 +464,18 @@ pub fn build_staged_pvc(
         requests: Some(BTreeMap::from([("storage".to_string(), Quantity(s))])),
         limits: None,
     });
+    let access_modes = staging
+        .filter(|s| !s.access_modes.is_empty())
+        .map(|s| {
+            s.access_modes
+                .iter()
+                .map(|m| m.mode_str().to_string())
+                .collect()
+        })
+        .or(src.access_modes);
+    let storage_class_name = staging
+        .and_then(|s| s.storage_class_name.clone())
+        .or(src.storage_class_name);
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -435,14 +488,55 @@ pub fn build_staged_pvc(
             ..Default::default()
         },
         spec: Some(PersistentVolumeClaimSpec {
-            access_modes: src.access_modes,
-            storage_class_name: src.storage_class_name,
+            access_modes,
+            storage_class_name,
             volume_mode: src.volume_mode,
             data_source: Some(data_source),
             resources,
             ..Default::default()
         }),
         status: None,
+    }
+}
+
+/// Preflight `spec.staging.storageClassName` against the source's CSI driver.
+/// **Pure** (the StorageClass read is the caller's): `override_provisioner` is the
+/// override class's `provisioner` (`None` = the class does not exist);
+/// `source_provisioner` is the source PVC's (`None` = unknown — e.g. a `Clone`
+/// source without a class — so the mismatch check is skipped). Without this, a
+/// wrong-driver override presents as an opaque bind timeout many minutes later:
+/// the override class's provisioner ignores a foreign VolumeSnapshotContent/PVC
+/// forever.
+pub(crate) fn staged_class_preflight(
+    override_class: &str,
+    override_provisioner: Option<&str>,
+    source_provisioner: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let Some(op) = override_provisioner else {
+        return Some((
+            REASON_STAGED_CLASS_NOT_FOUND,
+            format!(
+                "spec.staging.storageClassName `{override_class}` does not exist; create it, \
+                 point the override at an existing StorageClass of the source's CSI driver, \
+                 or remove the override to stage on the source PVC's own class. This \
+                 Snapshot is terminal — the next scheduled run (or a new Snapshot) retries"
+            ),
+        ));
+    };
+    match source_provisioner {
+        Some(sp) if op != sp => Some((
+            REASON_STAGED_CLASS_MISMATCH,
+            format!(
+                "spec.staging.storageClassName `{override_class}` is provisioned by `{op}`, \
+                 but the source PVC's CSI driver is `{sp}` — a VolumeSnapshot restore or \
+                 volume clone can only be provisioned by the source's own driver, so the \
+                 staged PVC would never bind. Point the override at a class of driver \
+                 `{sp}` (e.g. a CephFS `backingSnapshot: \"true\"` class of the same \
+                 driver), or remove the override. This Snapshot is terminal — the next \
+                 scheduled run (or a new Snapshot) retries"
+            ),
+        )),
+        _ => None,
     }
 }
 
@@ -680,6 +774,229 @@ pub(crate) fn vs_wait_outcome(
     }
 }
 
+/// `StorageClass.volumeBindingMode` as staging cares about it. Unset ⇒ `Immediate`
+/// (the Kubernetes API default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingMode {
+    /// The PVC binds (and the CSI restore/clone runs) at provision time — the bind
+    /// gate must wait for `Bound` before minting the mover Job.
+    Immediate,
+    /// Binding happens when the first consuming pod schedules — the pre-Job gate
+    /// skips the wait (the running-Job watchdog covers a hung bind instead).
+    WaitForFirstConsumer,
+}
+
+/// Classify a `StorageClass.volumeBindingMode` string; unset ⇒ `Immediate`.
+pub(crate) fn effective_binding_mode(volume_binding_mode: Option<&str>) -> BindingMode {
+    match volume_binding_mode {
+        Some("WaitForFirstConsumer") => BindingMode::WaitForFirstConsumer,
+        _ => BindingMode::Immediate,
+    }
+}
+
+/// One observation of the staged PVC's state, as read from the cluster. Plain data
+/// so [`pvc_bind_outcome`] — the decision over it — stays pure (mirrors
+/// [`VsObservation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedPvcObservation {
+    /// `status.phase` (`Pending`/`Bound`/`Lost`).
+    pub phase: Option<String>,
+    /// `metadata.creationTimestamp` — the bind-deadline anchor. Stable across the
+    /// idempotent SSA re-applies each reconcile performs.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Extract a [`StagedPvcObservation`] from a read PVC (pure — shared by the
+/// pre-Job bind gate and the running-Job watchdog in the snapshot reconciler).
+pub(crate) fn staged_pvc_observation(pvc: &PersistentVolumeClaim) -> StagedPvcObservation {
+    StagedPvcObservation {
+        phase: pvc.status.as_ref().and_then(|s| s.phase.clone()),
+        created_at: pvc
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t.0.as_second(), 0)),
+    }
+}
+
+/// What [`pvc_bind_outcome`] decided about an observed staged PVC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PvcBindWait {
+    /// `Bound` — the stage is usable. Overrides the deadline: an operator restart
+    /// after a slow-but-successful bind must not terminally fail a good stage.
+    Bound,
+    /// Still binding, deadline not passed — hold `Pending` and requeue.
+    Waiting(String),
+    /// Bind deadline passed (or the PVC is `Lost`) — terminal for this Snapshot CR.
+    Failed {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// Render the class portion of a bind message: the known class name, or a neutral
+/// phrase when the staged PVC rides the source's/cluster-default class.
+fn bind_class_phrase(class: Option<&str>) -> String {
+    match class {
+        Some(c) => format!("StorageClass `{c}`"),
+        None => "its StorageClass".to_string(),
+    }
+}
+
+/// Decide the bind-wait outcome for one staged-PVC observation. Pure /
+/// clock-injected, mirroring [`vs_wait_outcome`] exactly: `Bound` is checked FIRST
+/// (ready wins over deadline), a missing `creationTimestamp` is never expired, the
+/// deadline is `created_at + timeout` (`timeout == None` ⇒ indefinite), and the
+/// Waiting message embeds the fixed RFC3339 deadline — deterministic per PVC, so
+/// `patch_status_if_changed` doesn't churn. `Lost` is terminal immediately: the
+/// bound PV vanished and no amount of waiting brings the stage back.
+pub(crate) fn pvc_bind_outcome(
+    obs: &StagedPvcObservation,
+    ns: &str,
+    pvc_name: &str,
+    class: Option<&str>,
+    timeout: Option<std::time::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PvcBindWait {
+    match obs.phase.as_deref() {
+        Some("Bound") => return PvcBindWait::Bound,
+        Some("Lost") => {
+            return PvcBindWait::Failed {
+                reason: REASON_STAGED_PVC_LOST,
+                message: format!(
+                    "staged PVC `{ns}/{pvc_name}` reports phase Lost — its bound \
+                     PersistentVolume disappeared, so the stage can never become usable; \
+                     check the CSI driver / PV lifecycle. This Snapshot is terminal — the \
+                     next scheduled run (or a new Snapshot) retries"
+                ),
+            };
+        }
+        _ => {}
+    }
+    let deadline = match (timeout, obs.created_at) {
+        (Some(t), Some(created)) => chrono::Duration::from_std(t).ok().map(|d| created + d),
+        _ => None,
+    };
+    let expired = deadline.is_some_and(|d| now >= d);
+    if !expired {
+        let mut msg = format!(
+            "waiting for staged PVC `{ns}/{pvc_name}` ({}) to bind; the CSI restore/clone \
+             from the source is provisioning",
+            bind_class_phrase(class)
+        );
+        match deadline {
+            // Deterministic per-PVC (creationTimestamp + timeout are fixed), so the
+            // condition message doesn't churn status on every reconcile.
+            Some(d) => msg.push_str(&format!(
+                "; staging fails at {} if still unbound",
+                d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )),
+            None => msg.push_str("; waiting indefinitely (spec.staging.timeout: 0)"),
+        }
+        return PvcBindWait::Waiting(msg);
+    }
+    let waited = fmt_go_duration(timeout.expect("expired implies a timeout"));
+    PvcBindWait::Failed {
+        reason: REASON_STAGED_PVC_BIND_TIMEOUT,
+        message: format!(
+            "staged PVC `{ns}/{pvc_name}` did not reach Bound within {waited} \
+             (spec.staging.timeout; default 10m) — the CSI restore/clone from the source \
+             is still provisioning, or {} cannot provision it; check `kubectl describe \
+             pvc -n {ns} {pvc_name}` and the CSI provisioner logs, raise \
+             spec.staging.timeout if the copy is just slow, or (CephFS) stage on a \
+             `backingSnapshot: \"true\"` class via spec.staging.storageClassName for a \
+             near-instant shallow mount instead of a full clone. This Snapshot is \
+             terminal — the next scheduled run (or a new Snapshot) retries",
+            bind_class_phrase(class)
+        ),
+    }
+}
+
+/// The staged PVC's *effective* StorageClass name: what its spec pins, else the
+/// cluster's default-annotated class (what the PV controller will use), else
+/// `None` (nothing to look up — the bind gate then skips, preserving pre-gate
+/// behavior for classless setups).
+async fn effective_staged_class(
+    client: &kube::Client,
+    staged: &PersistentVolumeClaim,
+) -> Result<Option<String>> {
+    if let Some(c) = staged_class_of(staged) {
+        return Ok(Some(c));
+    }
+    let sc_api: Api<StorageClass> = Api::all(client.clone());
+    let classes = sc_api.list(&ListParams::default()).await?;
+    Ok(classes
+        .items
+        .into_iter()
+        .find(|sc| {
+            sc.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("storageclass.kubernetes.io/is-default-class"))
+                .is_some_and(|v| v == "true")
+        })
+        .and_then(|sc| sc.metadata.name))
+}
+
+/// Gate `Ready` on the staged PVC actually binding when its StorageClass binds
+/// `Immediate` (the CSI restore/clone runs at provision time — a mover Job minted
+/// now would sit Unschedulable on the unbound claim until the wedged-pod deadline
+/// killed the run *and the VolumeSnapshot under the in-flight restore*).
+/// `WaitForFirstConsumer` classes return immediately: their bind happens at pod
+/// schedule, and the running-Job watchdog covers a hang there. Returns `None` when
+/// the gate passes (mint the Job) or `Some(outcome)` to surface instead. A class
+/// that has vanished mid-flight is treated as `Immediate` (the API default), so a
+/// never-binding PVC becomes a bounded, actionable failure rather than a wedge.
+async fn staged_pvc_bind_gate(
+    client: &kube::Client,
+    pvc_api: &Api<PersistentVolumeClaim>,
+    ns: &str,
+    staged: &PersistentVolumeClaim,
+    pvc_name: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<StagingOutcome>> {
+    let Some(class) = effective_staged_class(client, staged).await? else {
+        return Ok(None);
+    };
+    let sc_api: Api<StorageClass> = Api::all(client.clone());
+    let binding = sc_api
+        .get_opt(&class)
+        .await?
+        .map(|sc| effective_binding_mode(sc.volume_binding_mode.as_deref()))
+        .unwrap_or(BindingMode::Immediate);
+    match binding {
+        BindingMode::WaitForFirstConsumer => Ok(None),
+        BindingMode::Immediate => {
+            let outcome = match pvc_api.get_opt(pvc_name).await? {
+                // SSA create still propagating → requeue.
+                None => PvcBindWait::Waiting(format!(
+                    "waiting for staged PVC `{ns}/{pvc_name}` ({}) to bind; the CSI \
+                     restore/clone from the source is provisioning",
+                    bind_class_phrase(Some(&class))
+                )),
+                Some(pvc) => pvc_bind_outcome(
+                    &staged_pvc_observation(&pvc),
+                    ns,
+                    pvc_name,
+                    Some(&class),
+                    timeout,
+                    chrono::Utc::now(),
+                ),
+            };
+            Ok(match outcome {
+                PvcBindWait::Bound => None,
+                PvcBindWait::Waiting(message) => Some(StagingOutcome::Waiting {
+                    reason: crate::consts::STAGED_PVC_BINDING_REASON,
+                    message,
+                }),
+                PvcBindWait::Failed { reason, message } => {
+                    Some(StagingOutcome::Failed { reason, message })
+                }
+            })
+        }
+    }
+}
+
 /// Resolve staging for a backup. Performs the cluster IO (preflight, create
 /// VolumeSnapshot, wait `readyToUse`, create staged PVC) and returns a [`StagingOutcome`]
 /// — **no** status side effects (the reconciler maps the outcome). Idempotent: every
@@ -731,12 +1048,44 @@ pub async fn resolve_staging(
 
     let staged_pvc = staged_pvc_name(snapshot_cr);
     let vs_name = volume_snapshot_name(snapshot_cr);
+    let staging = policy.spec.staging.as_ref();
+
+    // The staging deadline budget — bounds the VolumeSnapshot readyToUse wait and
+    // the staged-PVC bind wait (each phase gets a fresh budget anchored at its
+    // object's creation), and is pinned to status for the running-Job watchdog.
+    let timeout = kopiur_api::resolve_timeout(
+        staging.and_then(|s| s.timeout.as_deref()),
+        crate::consts::DEFAULT_STAGING_TIMEOUT,
+    );
+    let staging_timeout_seconds = timeout.map(|d| d.as_secs() as i64).unwrap_or(0);
+
+    // Source provisioner (CSI driver): required for `Snapshot` class selection, and
+    // the reference for the staged-class preflight (both methods).
+    let provisioner = source_provisioner(client, &source_pvc).await?;
+
+    // Fail fast on a bad `spec.staging.storageClassName` — missing, or on a
+    // different driver than the source — instead of letting the staged PVC sit
+    // Pending until the bind deadline with no explanation.
+    if let Some(override_class) = staging.and_then(|s| s.storage_class_name.as_deref()) {
+        let sc_api: Api<StorageClass> = Api::all(client.clone());
+        let override_provisioner = sc_api
+            .get_opt(override_class)
+            .await?
+            .map(|sc| sc.provisioner);
+        if let Some((reason, message)) = staged_class_preflight(
+            override_class,
+            override_provisioner.as_deref(),
+            provisioner.as_deref(),
+        ) {
+            return Ok(StagingOutcome::Failed { reason, message });
+        }
+    }
 
     // `Snapshot` needs a VolumeSnapshotClass + a ready VolumeSnapshot; `Clone` stages
     // straight from the source PVC.
     if copy_method != CopyMethod::Clone {
         // Provisioner (CSI driver) of the source — required to match a class.
-        let Some(provisioner) = source_provisioner(client, &source_pvc).await? else {
+        let Some(provisioner) = provisioner else {
             return Ok(StagingOutcome::Failed {
                 reason: REASON_SOURCE_NOT_CSI,
                 message: source_not_csi_message(ns, source_name),
@@ -786,25 +1135,25 @@ pub async fn resolve_staging(
         // Wait for readyToUse, bounded by the staging deadline (issue #198): a
         // `status.error` alone is never fatal — external-snapshotter sets it during
         // benign retry loops — only the deadline fails staging.
-        let timeout = kopiur_api::resolve_timeout(
-            policy
-                .spec
-                .staging
-                .as_ref()
-                .and_then(|s| s.timeout.as_deref()),
-            crate::consts::DEFAULT_STAGING_TIMEOUT,
-        );
         let restore_size = match read_volume_snapshot(client, ns, &vs_name).await? {
             // Not visible yet (SSA create still propagating) → requeue.
             None => {
-                return Ok(StagingOutcome::Waiting(format!(
-                    "waiting for VolumeSnapshot `{ns}/{vs_name}` to become readyToUse"
-                )));
+                return Ok(StagingOutcome::Waiting {
+                    reason: crate::consts::STAGING_WAITING_REASON,
+                    message: format!(
+                        "waiting for VolumeSnapshot `{ns}/{vs_name}` to become readyToUse"
+                    ),
+                });
             }
             Some(obs) => {
                 match vs_wait_outcome(&obs, ns, &vs_name, &class, timeout, chrono::Utc::now()) {
                     VsWait::Ready { restore_size } => restore_size,
-                    VsWait::Waiting(msg) => return Ok(StagingOutcome::Waiting(msg)),
+                    VsWait::Waiting(message) => {
+                        return Ok(StagingOutcome::Waiting {
+                            reason: crate::consts::STAGING_WAITING_REASON,
+                            message,
+                        });
+                    }
                     VsWait::Failed { reason, message } => {
                         return Ok(StagingOutcome::Failed { reason, message });
                     }
@@ -819,13 +1168,23 @@ pub async fn resolve_staging(
             &source_pvc,
             data_source,
             restore_size.as_deref(),
+            staging,
             owner.clone(),
         );
         apply(&pvc_api, &staged_pvc, &staged).await?;
+        // Gate on the bind for Immediate classes: minting the Job while the CSI
+        // restore is in flight is exactly the wedge-then-delete-the-VS race.
+        if let Some(outcome) =
+            staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout).await?
+        {
+            return Ok(outcome);
+        }
         return Ok(StagingOutcome::Ready(StagedSource {
+            storage_class_name: staged_class_of(&staged),
             pvc_name: staged_pvc,
             volume_snapshot_name: Some(vs_name),
             copy_method: "Snapshot",
+            staging_timeout_seconds,
         }));
     }
 
@@ -837,14 +1196,34 @@ pub async fn resolve_staging(
         &source_pvc,
         data_source,
         None,
+        staging,
         owner.clone(),
     );
     apply(&pvc_api, &staged_pvc, &staged).await?;
+    // Same bind gate as the Snapshot tail — a CSI full clone is the SLOWEST staging
+    // method there is, so skipping the gate here would reproduce the original bug
+    // verbatim for `copyMethod: Clone`.
+    if let Some(outcome) =
+        staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout).await?
+    {
+        return Ok(outcome);
+    }
     Ok(StagingOutcome::Ready(StagedSource {
+        storage_class_name: staged_class_of(&staged),
         pvc_name: staged_pvc,
         volume_snapshot_name: None,
         copy_method: "Clone",
+        staging_timeout_seconds,
     }))
+}
+
+/// The `storageClassName` actually written to a built staged PVC's spec — the single
+/// source for what `status.staged.storageClassName` records.
+fn staged_class_of(staged: &PersistentVolumeClaim) -> Option<String> {
+    staged
+        .spec
+        .as_ref()
+        .and_then(|s| s.storage_class_name.clone())
 }
 
 /// Reap the staged objects a backup created (idempotent; 404-tolerant). Deletes the
@@ -1076,7 +1455,8 @@ mod tests {
         };
         let ds = data_source_for(CopyMethod::Snapshot, "src", "vs");
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let staged = build_staged_pvc("db-src", "ns", &source, ds, Some("0"), owner);
+        // Regression pin: no staging overrides ⇒ the source's shape is copied verbatim.
+        let staged = build_staged_pvc("db-src", "ns", &source, ds, Some("0"), None, owner);
         let spec = staged.spec.unwrap();
         assert_eq!(
             spec.access_modes.as_deref(),
@@ -1098,6 +1478,137 @@ mod tests {
         let ds = spec.data_source.unwrap();
         assert_eq!(ds.kind, "VolumeSnapshot");
         assert_eq!(ds.name, "vs");
+    }
+
+    /// A source PVC with the common `fast`/RWO/Filesystem shape, for the override tests.
+    fn override_test_source() -> PersistentVolumeClaim {
+        PersistentVolumeClaim {
+            spec: Some(PersistentVolumeClaimSpec {
+                access_modes: Some(vec!["ReadWriteOnce".into()]),
+                storage_class_name: Some("fast".into()),
+                volume_mode: Some("Filesystem".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn staged_pvc_honors_staging_overrides() {
+        use kopiur_api::common::PvcAccessMode;
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
+        let source = override_test_source();
+
+        // Both overrides set — the CephFS shallow-clone recipe.
+        let staging = StagingSpec {
+            storage_class_name: Some("cephfs-shallow".into()),
+            access_modes: vec![PvcAccessMode::ReadOnlyMany],
+            ..Default::default()
+        };
+        let ds = data_source_for(CopyMethod::Snapshot, "src", "vs");
+        let staged = build_staged_pvc("db-src", "ns", &source, ds, None, Some(&staging), owner);
+        let spec = staged.spec.as_ref().unwrap();
+        assert_eq!(spec.storage_class_name.as_deref(), Some("cephfs-shallow"));
+        assert_eq!(
+            spec.access_modes.as_deref(),
+            Some(["ReadOnlyMany".to_string()].as_slice())
+        );
+        // volumeMode has no override — always copied from the source.
+        assert_eq!(spec.volume_mode.as_deref(), Some("Filesystem"));
+        // `staged_class_of` (the status.staged.storageClassName source) sees the override.
+        assert_eq!(staged_class_of(&staged).as_deref(), Some("cephfs-shallow"));
+    }
+
+    #[test]
+    fn staged_pvc_overrides_are_independent_and_empty_modes_inherit() {
+        use kopiur_api::common::PvcAccessMode;
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
+        let source = override_test_source();
+
+        // Class-only override: modes still inherited.
+        let staging = StagingSpec {
+            storage_class_name: Some("cephfs-shallow".into()),
+            ..Default::default()
+        };
+        let ds = data_source_for(CopyMethod::Clone, "src", "vs");
+        let staged = build_staged_pvc(
+            "db-src",
+            "ns",
+            &source,
+            ds,
+            None,
+            Some(&staging),
+            owner.clone(),
+        );
+        let spec = staged.spec.as_ref().unwrap();
+        assert_eq!(spec.storage_class_name.as_deref(), Some("cephfs-shallow"));
+        assert_eq!(
+            spec.access_modes.as_deref(),
+            Some(["ReadWriteOnce".to_string()].as_slice()),
+            "unset accessModes must inherit the source's"
+        );
+
+        // Modes-only override: class still inherited. An empty modes vec = no override.
+        let staging = StagingSpec {
+            access_modes: vec![PvcAccessMode::ReadOnlyMany],
+            ..Default::default()
+        };
+        let ds = data_source_for(CopyMethod::Clone, "src", "vs");
+        let staged = build_staged_pvc("db-src", "ns", &source, ds, None, Some(&staging), owner);
+        let spec = staged.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.storage_class_name.as_deref(),
+            Some("fast"),
+            "unset storageClassName must inherit the source's"
+        );
+        assert_eq!(
+            spec.access_modes.as_deref(),
+            Some(["ReadOnlyMany".to_string()].as_slice())
+        );
+    }
+
+    // --- staged_class_preflight: fail fast on a missing / wrong-driver override ---
+
+    #[test]
+    fn staged_class_preflight_passes_matching_and_unknown_source_driver() {
+        // Same driver → no complaint.
+        assert_eq!(
+            staged_class_preflight(
+                "cephfs-shallow",
+                Some("cephfs.csi.ceph.com"),
+                Some("cephfs.csi.ceph.com")
+            ),
+            None
+        );
+        // Unknown source driver (e.g. Clone from a classless PVC) → can't compare,
+        // don't block; a real mismatch then surfaces at the bind deadline.
+        assert_eq!(
+            staged_class_preflight("cephfs-shallow", Some("cephfs.csi.ceph.com"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn staged_class_preflight_rejects_missing_class_and_wrong_driver() {
+        let (reason, msg) =
+            staged_class_preflight("nope", None, Some("cephfs.csi.ceph.com")).unwrap();
+        assert_eq!(reason, REASON_STAGED_CLASS_NOT_FOUND);
+        assert!(msg.contains("`nope`"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+
+        let (reason, msg) = staged_class_preflight(
+            "ebs-class",
+            Some("ebs.csi.aws.com"),
+            Some("cephfs.csi.ceph.com"),
+        )
+        .unwrap();
+        assert_eq!(reason, REASON_STAGED_CLASS_MISMATCH);
+        assert!(msg.contains("ebs.csi.aws.com"), "{msg}");
+        assert!(msg.contains("cephfs.csi.ceph.com"), "{msg}");
+        assert!(
+            msg.contains("would never bind"),
+            "the why must be spelled out: {msg}"
+        );
     }
 
     // --- cleanup_plan ---
@@ -1345,5 +1856,152 @@ mod tests {
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
         let vs2 = build_volume_snapshot("db-snap", "ns", "db", None, owner);
         assert!(vs2.data["spec"].get("volumeSnapshotClassName").is_none());
+    }
+
+    // --- effective_binding_mode: unset ⇒ Immediate (the k8s API default) ---
+
+    #[test]
+    fn binding_mode_defaults_to_immediate() {
+        assert_eq!(effective_binding_mode(None), BindingMode::Immediate);
+        assert_eq!(
+            effective_binding_mode(Some("Immediate")),
+            BindingMode::Immediate
+        );
+        assert_eq!(
+            effective_binding_mode(Some("WaitForFirstConsumer")),
+            BindingMode::WaitForFirstConsumer
+        );
+    }
+
+    // --- pvc_bind_outcome: mirrors the vs_wait_outcome decision matrix ---
+
+    fn pvc_obs(phase: Option<&str>, age: Option<std::time::Duration>) -> StagedPvcObservation {
+        StagedPvcObservation {
+            phase: phase.map(str::to_string),
+            created_at: age.map(|a| t0() - chrono::Duration::from_std(a).unwrap()),
+        }
+    }
+
+    fn bind_decide(o: &StagedPvcObservation, timeout: Option<std::time::Duration>) -> PvcBindWait {
+        pvc_bind_outcome(
+            o,
+            "selfhosted",
+            "forgejo-src",
+            Some("cephfs"),
+            timeout,
+            t0(),
+        )
+    }
+
+    #[test]
+    fn bound_wins_even_past_the_deadline() {
+        // Operator down while a slow bind completed: a Bound PVC is a usable stage,
+        // never a terminal failure (mirrors vs_wait_outcome's ready-first rule).
+        let o = pvc_obs(Some("Bound"), Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(bind_decide(&o, TEN_MIN), PvcBindWait::Bound);
+    }
+
+    #[test]
+    fn pending_within_deadline_waits_with_the_fixed_deadline_named() {
+        let o = pvc_obs(Some("Pending"), Some(std::time::Duration::from_secs(1)));
+        match bind_decide(&o, TEN_MIN) {
+            PvcBindWait::Waiting(msg) => {
+                assert!(msg.contains("selfhosted/forgejo-src"), "{msg}");
+                assert!(msg.contains("StorageClass `cephfs`"), "{msg}");
+                assert!(
+                    msg.contains("staging fails at 2026-07-04T18:39:59Z"),
+                    "deterministic deadline (no now()) so status doesn't churn: {msg}"
+                );
+            }
+            other => panic!("a fresh Pending PVC must be Waiting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_past_deadline_fails_with_the_knob_and_the_shallow_clone_fix() {
+        // THE forgejo/CephFS scenario: an 8.5-minute full subvolume clone with a
+        // bounded budget must become an actionable terminal failure — not a
+        // MoverPodWedged that deletes the VolumeSnapshot mid-restore.
+        let o = pvc_obs(Some("Pending"), Some(std::time::Duration::from_secs(600)));
+        match bind_decide(&o, TEN_MIN) {
+            PvcBindWait::Failed { reason, message } => {
+                assert_eq!(reason, REASON_STAGED_PVC_BIND_TIMEOUT);
+                assert!(message.contains("within 10m"), "{message}");
+                assert!(message.contains("spec.staging.timeout"), "{message}");
+                assert!(
+                    message.contains("backingSnapshot") && message.contains("storageClassName"),
+                    "the CephFS shallow-clone fix must be named: {message}"
+                );
+                assert!(
+                    message.contains("next scheduled run (or a new Snapshot) retries"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed at the deadline, got {other:?}"),
+        }
+        // One second earlier: still waiting.
+        let o = pvc_obs(Some("Pending"), Some(std::time::Duration::from_secs(599)));
+        assert!(matches!(bind_decide(&o, TEN_MIN), PvcBindWait::Waiting(_)));
+    }
+
+    #[test]
+    fn lost_pvc_is_terminal_immediately() {
+        // No point waiting out the deadline: the bound PV vanished, the stage can
+        // never recover.
+        let o = pvc_obs(Some("Lost"), Some(std::time::Duration::from_secs(1)));
+        match bind_decide(&o, TEN_MIN) {
+            PvcBindWait::Failed { reason, message } => {
+                assert_eq!(reason, REASON_STAGED_PVC_LOST);
+                assert!(message.contains("Lost"), "{message}");
+            }
+            other => panic!("Lost must be terminal on sight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_creation_timestamp_and_zero_timeout_never_expire() {
+        // Just-created / not-yet-persisted read: no anchor, not expired.
+        let o = pvc_obs(Some("Pending"), None);
+        assert!(matches!(bind_decide(&o, TEN_MIN), PvcBindWait::Waiting(_)));
+        // spec.staging.timeout: 0 → indefinite, message says so.
+        let o = pvc_obs(
+            Some("Pending"),
+            Some(std::time::Duration::from_secs(86_400)),
+        );
+        match bind_decide(&o, None) {
+            PvcBindWait::Waiting(msg) => {
+                assert!(msg.contains("waiting indefinitely"), "{msg}");
+            }
+            other => panic!("no timeout must wait forever, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_message_without_a_known_class_stays_readable() {
+        let o = pvc_obs(Some("Pending"), Some(std::time::Duration::from_secs(1)));
+        match pvc_bind_outcome(&o, "ns", "db-src", None, TEN_MIN, t0()) {
+            PvcBindWait::Waiting(msg) => {
+                assert!(msg.contains("its StorageClass"), "{msg}");
+            }
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+    }
+
+    // --- staged_pvc_observation extraction ---
+
+    #[test]
+    fn staged_pvc_observation_reads_phase_and_creation() {
+        use k8s_openapi::api::core::v1::PersistentVolumeClaimStatus;
+        let pvc = PersistentVolumeClaim {
+            status: Some(PersistentVolumeClaimStatus {
+                phase: Some("Pending".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let obs = staged_pvc_observation(&pvc);
+        assert_eq!(obs.phase.as_deref(), Some("Pending"));
+        // No creationTimestamp on a fresh object → no deadline anchor.
+        assert_eq!(obs.created_at, None);
     }
 }

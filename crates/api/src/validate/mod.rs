@@ -15,7 +15,7 @@
 //! An empty vec means valid.
 
 use crate::backend::NfsVolume;
-use crate::common::{FailurePolicy, MoverSpec, RepositoryMode};
+use crate::common::{FailurePolicy, MoverSpec, PvcAccessMode, RepositoryMode};
 use crate::error::{ValidationError, ValidationResult};
 use crate::server::{ServerAuth, ServerSpec};
 use crate::snapshot_policy::Source;
@@ -84,6 +84,63 @@ pub fn validate_nfs_volume(nfs: &NfsVolume, context: &str) -> ValidationResult {
         });
     }
     Ok(())
+}
+
+/// Validate a PVC access-modes list wherever one appears (`spec.staging.accessModes`,
+/// `restore.target.pvc.accessModes`). Three rules, one place, both callers (webhook
+/// at admission, controller defensively):
+///
+///   * every entry must be canonical — an [`PvcAccessMode::Unknown`] value is either
+///     a legacy stored string from before schema enforcement or a typo, and no PVC
+///     could ever be provisioned from it;
+///   * no duplicates;
+///   * `ReadWriteOncePod` must be the **sole** mode — the apiserver rejects the
+///     combination at PVC-create time, so catching it here fails at admission with
+///     the reason instead of wedging the first run in a create-retry loop.
+///
+/// `field` names the exact path for the message. Accumulates so every bad entry is
+/// reported in one apply.
+pub fn validate_access_modes(field: &str, modes: &[PvcAccessMode]) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, mode) in modes.iter().enumerate() {
+        if let PvcAccessMode::Unknown(value) = mode {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: format!("{field}[{i}]"),
+                reason: format!(
+                    "{value:?} is not a Kubernetes access mode (valid: {}). No PVC can be \
+                     provisioned from it — if this value was stored before kopiur enforced \
+                     the schema, it was already broken then; edit the resource to one of the \
+                     valid modes.",
+                    PvcAccessMode::CANONICAL.join(", ")
+                ),
+            });
+        }
+        if !seen.insert(mode.mode_str().to_string()) {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: format!("{field}[{i}]"),
+                reason: format!(
+                    "duplicate access mode {:?}; list each mode at most once",
+                    mode.mode_str()
+                ),
+            });
+        }
+    }
+    if modes.len() > 1
+        && modes
+            .iter()
+            .any(|m| matches!(m, PvcAccessMode::ReadWriteOncePod))
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: field.to_string(),
+            reason: "ReadWriteOncePod may not be combined with other access modes — the \
+                     apiserver rejects such a PVC at create time, so the run would wedge in \
+                     a retry loop instead of failing here. Use ReadWriteOncePod alone, or \
+                     drop it."
+                .to_string(),
+        });
+    }
+    errs
 }
 
 /// A numeric knob must be at least `min` — the shared one-liner behind every

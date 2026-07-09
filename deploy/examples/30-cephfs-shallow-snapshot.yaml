@@ -1,0 +1,72 @@
+# Example 30 — CephFS shallow snapshot staging (spec.staging.storageClassName)
+#
+# copyMethod: Snapshot normally restores the CSI VolumeSnapshot into a staged PVC
+# on the SOURCE's StorageClass. On CephFS that restore is a FULL subvolume clone —
+# metadata-bound, so a volume with many small files (git servers, maildirs,
+# node_modules-shaped data) can take many minutes to clone even at ~100 MB, and a
+# slow clone burns the whole staging budget doing setup instead of backup.
+#
+# The fix: point the STAGED PVC (and only it — your app's PVC is untouched) at a
+# rook-ceph StorageClass with `backingSnapshot: "true"`. ceph-csi then mounts the
+# snapshot SHALLOWLY — a metadata-only, read-only view, ready in seconds — instead
+# of copying every file. Shallow volumes are read-only by design, hence
+# `accessModes: [ReadOnlyMany]`; the kopia mover always mounts the staged source
+# read-only anyway, so nothing else changes.
+#
+# Maps to SnapshotPolicy.spec.staging.{storageClassName,accessModes}
+# (crates/api/src/snapshot_policy.rs::StagingSpec). Both fields apply to
+# copyMethod Snapshot AND Clone; absent they inherit from the source PVC.
+# The override class MUST belong to the same CSI driver as the source — kopiur
+# fails fast with `StagedClassMismatch` if it doesn't.
+#
+# Requires: rook-ceph / ceph-csi with CephFS (shallow volumes need ceph-csi >= 3.7)
+# and the CSI snapshot stack. Adjust clusterID/fsName/secret names to your rook
+# install (these are the rook-ceph defaults).
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cephfs-backingsnapshot
+provisioner: rook-ceph.cephfs.csi.ceph.com # SAME driver as your source PVC's class
+parameters:
+  clusterID: rook-ceph
+  fsName: ceph-filesystem
+  # The load-bearing line: restore-from-snapshot mounts the snapshot shallowly
+  # (metadata-only, read-only, near-instant) instead of a full subvolume clone.
+  backingSnapshot: "true"
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: false
+volumeBindingMode: Immediate
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: forgejo
+  namespace: forgejo
+spec:
+  repository:
+    name: primary # an existing Repository/ClusterRepository (see examples 01-03)
+  copyMethod: Snapshot
+  staging:
+    # Stage on the shallow class above instead of the source's own class.
+    storageClassName: cephfs-backingsnapshot
+    # Shallow CephFS volumes are read-only; request them as ReadOnlyMany.
+    accessModes: [ReadOnlyMany]
+    # With a shallow mount the stage is ready in seconds, so the default 10m
+    # budget is generous. Without the override, a CephFS full clone of a
+    # small-file-heavy volume can need MORE than 10m — if you must full-clone,
+    # raise this instead (it bounds both the VolumeSnapshot readyToUse wait and
+    # the staged PVC's bind).
+    timeout: 10m
+  sources:
+    - pvc:
+        name: forgejo-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 8

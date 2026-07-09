@@ -115,6 +115,19 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}
     }
+    // Access modes on a create-target PVC: canonical/unique/RWOP-sole. Fail-fast on
+    // the first problem (this validator's contract); the accumulate wrapper reports
+    // the rest. A legacy stored value decodes as `PvcAccessMode::Unknown` (never a
+    // watcher-poisoning serde error) and is rejected HERE, per-CR, with the value
+    // quoted — the controller calls this defensively on every reconcile, so the
+    // rejection reaches the user as a Warning Event + structural backoff.
+    if let RestoreTarget::Pvc(t) = &spec.target
+        && let Some(e) = validate_access_modes("restore.target.pvc.accessModes", &t.access_modes)
+            .into_iter()
+            .next()
+    {
+        return Err(e);
+    }
     // `pvcConsumer` derives the workload from a *backup source* PVC; a restore has no such
     // source (it writes a target whose consumer may not exist yet), so it is backup-only.
     if let Some(m) = &spec.mover {

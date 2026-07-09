@@ -209,6 +209,11 @@ pub const SOURCE_STAGED_REASON: &str = "SourceStaged";
 /// `reason` for [`SOURCE_STAGED_CONDITION`] = `False` while the VolumeSnapshot is
 /// still becoming `readyToUse` (a transient, requeued wait — not a failure).
 pub const STAGING_WAITING_REASON: &str = "WaitingForVolumeSnapshot";
+/// `reason` for [`SOURCE_STAGED_CONDITION`] = `False` while the staged PVC (on an
+/// `Immediate`-binding StorageClass) is still binding — the CSI restore/clone from
+/// the source is provisioning. A transient, requeued wait bounded by the staging
+/// deadline; the terminal counterpart is `io::staging::REASON_STAGED_PVC_BIND_TIMEOUT`.
+pub const STAGED_PVC_BINDING_REASON: &str = "WaitingForStagedPvcBind";
 /// Event `action` (remediation hint) for a staging preflight failure: install the
 /// CSI snapshot stack / VolumeSnapshotClass, or set `copyMethod: Direct`.
 pub const FIX_SNAPSHOT_STACK_ACTION: &str = "InstallSnapshotStackOrUseDirect";

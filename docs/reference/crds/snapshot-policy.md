@@ -58,6 +58,30 @@ snapshot stack. See [Copy methods](../../copy-methods.md).
 
 The `VolumeSnapshotClass` used when `copyMethod` is `Snapshot` or `Clone`.
 
+### `staging`
+
+Knobs for the CSI capture (`copyMethod: Snapshot`/`Clone`) that runs before the
+mover:
+
+- `timeout` — the staging deadline budget (Go-style duration, default `10m`,
+  `"0"` = wait indefinitely). Bounds the `VolumeSnapshot` becoming `readyToUse`
+  **and** — as a fresh budget — the staged PVC binding (the CSI restore/clone
+  window), both pre-Job on `Immediate` classes and while the mover Job runs on
+  `WaitForFirstConsumer` classes.
+- `storageClassName` — StorageClass for the **staged PVC** only (absent ⇒ copy
+  the source PVC's class). Must belong to the **same CSI driver** as the source;
+  a mismatch fails fast with `StagedClassMismatch`. Flagship use: a rook-ceph
+  CephFS class with `backingSnapshot: "true"` for a near-instant shallow
+  read-only mount instead of a minutes-long full subvolume clone.
+- `accessModes` — access modes for the staged PVC (absent ⇒ copy the source's);
+  a closed enum of the four Kubernetes modes. `[ReadOnlyMany]` pairs with
+  snapshot-backed read-only classes; the mover always mounts the stage
+  read-only regardless.
+
+The two overrides need a staged PVC to act on, so they are **rejected at
+admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources. See
+[Copy methods → staging overrides](../../copy-methods.md#staging-overrides).
+
 ### `groupBy`
 
 Multi-PVC consistency grouping. `VolumeGroupSnapshot` (the default for multi-PVC

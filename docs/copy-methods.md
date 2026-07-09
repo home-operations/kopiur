@@ -77,10 +77,10 @@ $ kubectl -n kopiur-tryit wait --for=jsonpath='{.status.phase}'=Succeeded \
     snapshot/app-data-snapshot --timeout=5m
 $ kubectl -n kopiur-tryit get snapshot app-data-snapshot \
     -o jsonpath='{.status.staged}'
-{"copyMethod":"Snapshot","volumeSnapshotName":"app-data-snapshot-...","pvcName":"app-data-snapshot-src","ready":true}
+{"copyMethod":"Snapshot","volumeSnapshotName":"app-data-snapshot-...","pvcName":"app-data-snapshot-src","ready":true,"storageClassName":"...","stagingTimeoutSeconds":600}
 ```
 
-*(Illustrative: `volumeSnapshotName` is generated; the rest is exact.)*
+*(Illustrative: `volumeSnapshotName` is generated and `storageClassName` is your class; the rest is exact.)*
 
 **4. Confirm the stage was reaped and the live PVC was never mounted.** Kopiur cleans up the staged objects on completion:
 
@@ -129,7 +129,10 @@ spec:
 
 ### How long staging may wait (`spec.staging.timeout`)
 
-The wait for `readyToUse` is bounded by a **staging deadline**, measured from the `VolumeSnapshot`'s creation:
+Staging has a **deadline budget** that bounds each of its phases:
+
+1. The `VolumeSnapshot` becoming `readyToUse` — measured from the VolumeSnapshot's creation.
+2. The **staged PVC binding** — a *fresh* budget measured from the staged PVC's creation. On an `Immediate`-binding StorageClass the CSI restore/clone runs at provision time and Kopiur waits for `Bound` **before** creating the mover Job (so a slow restore can never strand an unschedulable mover, and the VolumeSnapshot is never torn down under an in-flight restore). On a `WaitForFirstConsumer` class the bind happens when the mover pod schedules — Kopiur then keeps watching the staged PVC *while the Job runs* and fails the backup with the same reason if the bind blows the budget.
 
 ```yaml
 spec:
@@ -140,10 +143,10 @@ spec:
 ```
 
 - **Default `10m`** — plenty for drivers that cut snapshots in seconds (most local/on-cluster CSI), and bounded so a broken driver can't hold a `Snapshot` `Pending` forever and silently starve a `concurrencyPolicy: Forbid` schedule.
-- **Raise it** for backends whose snapshots take long to become ready — e.g. cloud snapshots of large volumes (the first EBS snapshot of a big volume can take well over 10 minutes).
+- **Raise it** for backends whose snapshots or restores take long — e.g. cloud snapshots of large volumes (the first EBS snapshot of a big volume can take well over 10 minutes), or a **CephFS full-clone restore of a small-file-heavy volume** (see [staging overrides](#staging-overrides) for the shallow-clone alternative that makes it near-instant instead).
 - **`timeout: "0"`** waits indefinitely (never fails on the deadline).
 
-Only this deadline fails staging. If it expires the backup goes `Failed` with reason `VolumeSnapshotFailed` (the snapshot was still reporting an error) or `StagingTimedOut` (no error — the driver/snapshot-controller is stuck), and the message names this field. A `Failed` backup is terminal; the next scheduled run (or a new `Snapshot`) retries.
+Only this deadline fails staging. If it expires the backup goes `Failed` with reason `VolumeSnapshotFailed` (the snapshot was still reporting an error), `StagingTimedOut` (no error — the driver/snapshot-controller is stuck), or `StagedPvcBindTimeout` (the snapshot was fine but the staged PVC never bound — the restore/clone is still provisioning or can't provision), and the message names this field. A `Failed` backup is terminal; the next scheduled run (or a new `Snapshot`) retries — and Kopiur reaps whatever staging objects the failed run already created.
 
 !!! note "A `VolumeSnapshot` error during the wait is NOT a failure"
     The snapshot-controller routinely reports **transient** errors on a perfectly healthy `VolumeSnapshot` — most commonly a benign `409 Conflict` (`"the object has been modified; please apply your changes to the latest version and try again"`) while it adds finalizers, which its own retry clears a moment later. Kopiur surfaces such errors on the `SourceStaged` condition for visibility but keeps waiting; it declares `VolumeSnapshotFailed` only if the snapshot is still not `readyToUse` when the staging deadline passes.
@@ -165,7 +168,36 @@ Use it when your CSI driver supports cloning (`CLONE_VOLUME`) but not snapshots.
 ```
 
 !!! warning "Clone requires driver support"
-    If your driver can't clone the volume, the staged PVC stays `Pending` and the backup never starts. If you see that, check the staged PVC's events (`kubectl describe pvc <snapshot-name>-src`) and use `Snapshot` or `Direct` instead.
+    If your driver can't clone the volume, the staged PVC stays `Pending` and the backup fails with `StagedPvcBindTimeout` once the [staging deadline](#how-long-staging-may-wait-specstagingtimeout) passes. If you see that, check the staged PVC's events (`kubectl describe pvc <snapshot-name>-src`) and use `Snapshot` or `Direct` instead.
+
+---
+
+## Staging overrides
+
+By default the staged PVC copies its `storageClassName` and `accessModes` **from the source PVC**. Two optional `spec.staging` fields override that — for the staged PVC only; your application's PVC is never touched:
+
+```yaml
+spec:
+    copyMethod: Snapshot   # overrides apply to Snapshot AND Clone
+    staging:
+        storageClassName: cephfs-backingsnapshot  # class for the STAGED PVC
+        accessModes: [ReadOnlyMany]                # modes for the STAGED PVC
+```
+
+- **`storageClassName`** — stage on a different class of the **same CSI driver**, typically one with different *restore parameters*. Kopiur verifies the driver matches up front and fails fast with `StagedClassMismatch` if it doesn't (a foreign driver can never provision from your source's snapshot — without the check you'd get an opaque bind timeout instead).
+- **`accessModes`** — request different modes for the stage (e.g. `[ReadOnlyMany]` for a snapshot-backed read-only class). The mover always mounts the staged source read-only regardless.
+- Both are meaningless without a staged PVC, so they're **rejected at admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources.
+
+### The flagship use: CephFS shallow snapshots
+
+On CephFS, restoring a VolumeSnapshot into a staged PVC is a **full subvolume clone** — an MDS-metadata-bound copy of every file. For a volume with many small files (a git server's loose objects, maildirs), that clone can take *many minutes* even at ~100 MB, blowing the staging budget on setup. ceph-csi's answer is a StorageClass with `backingSnapshot: "true"`: restore-from-snapshot then mounts the snapshot **shallowly** — metadata-only, read-only, ready in seconds. Point `spec.staging.storageClassName` at such a class and the whole problem disappears:
+
+```yaml
+--8<-- "deploy/examples/30-cephfs-shallow-snapshot.yaml"
+```
+
+!!! note "Same driver, shallow-capable versions, delete order"
+    The shallow class must use the **same provisioner** as your source's class (kopiur enforces this). CephFS shallow volumes need ceph-csi ≥ 3.7 and are read-only by design — request them `ReadOnlyMany`. ceph-csi reference-tracks the backing snapshot, and Kopiur always deletes the staged PVC **before** the VolumeSnapshot, so the cleanup order is safe for shallow mounts.
 
 ---
 
@@ -207,6 +239,11 @@ If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapsho
 | `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The VolumeSnapshot was **still reporting an error when the staging deadline passed** (`spec.staging.timeout`, default `10m`) — transient errors during the wait are retried, never fatal on their own. | Read the message (it includes the driver's last error); fix the class/driver, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run (or a new `Snapshot`) retries. |
 | `SourceStaged=False`, reason **`StagingTimedOut`** | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported **no error** — the CSI driver / snapshot-controller is stuck or very slow. | Check the driver and the snapshot-controller; raise `spec.staging.timeout` (or set it to `"0"` to wait indefinitely) if the backend is just slow. |
 | `SourceStaged=False`, reason **`SourceNotCSIProvisioned`** | The source PVC has no `StorageClass` (a static/hostPath volume) — nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |
-| Backup stuck `Pending`, staged PVC `Pending` | `WaitForFirstConsumer` (normal — binds when the mover starts) **or** the driver can't clone (for `Clone`). | If it never binds, `kubectl describe pvc <name>-src` for the driver event; switch method if cloning is unsupported. |
+| `SourceStaged=False`, reason **`StagedClassNotFound`** | `spec.staging.storageClassName` names a StorageClass that doesn't exist. | Create the class, point the override at an existing one, or remove the override to stage on the source's class. |
+| `SourceStaged=False`, reason **`StagedClassMismatch`** | `spec.staging.storageClassName` is on a **different CSI driver** than the source — its provisioner can never restore/clone from your source, so the staged PVC would never bind. | Point the override at a class of the source's driver (the message names both), or remove it. |
+| `SourceStaged=False`, reason **`WaitingForStagedPvcBind`** (`Pending`, transient) | The staged PVC is still binding — the CSI restore/clone from the source is provisioning. Normal for slow restores; bounded by the [staging deadline](#how-long-staging-may-wait-specstagingtimeout). | Nothing, usually — it either binds or fails at the deadline with the row below. |
+| `SourceStaged=False` / phase `Failed`, reason **`StagedPvcBindTimeout`** | The staged PVC never reached `Bound` within `spec.staging.timeout` — the restore/clone is still provisioning (e.g. a CephFS **full clone** of a small-file-heavy volume) or the class can't provision it. | `kubectl describe pvc <name>-src` + the CSI provisioner logs; raise `spec.staging.timeout` if the copy is just slow, or (CephFS) stage on a [`backingSnapshot: "true"` shallow class](#the-flagship-use-cephfs-shallow-snapshots). |
+| Phase `Failed`, reason **`StagedPvcLost`** | The staged PVC reports `Lost` — its bound PV disappeared mid-stage. | Check the CSI driver / PV lifecycle; the next scheduled run retries. |
+| Backup stuck `Pending`, staged PVC `Pending` | `WaitForFirstConsumer` (normal — binds when the mover starts) **or** the driver can't clone (for `Clone`). | If it never binds, the backup fails at the staging deadline with `StagedPvcBindTimeout`; `kubectl describe pvc <name>-src` for the driver event; switch method if cloning is unsupported. |
 
 See also [Troubleshooting → Multi-Attach](troubleshooting.md) for the `Direct`-mode co-location path.

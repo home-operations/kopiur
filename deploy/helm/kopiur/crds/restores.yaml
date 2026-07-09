@@ -639,8 +639,19 @@ spec:
                     description: Operator creates the PVC.
                     properties:
                       accessModes:
-                        description: Access modes for the new PVC (e.g. `["ReadWriteOnce"]`).
+                        description: |-
+                          Access modes for the new PVC; empty defaults to `[ReadWriteOnce]`. Closed
+                          enum in the schema; a non-canonical value persisted before enforcement
+                          decodes as [`PvcAccessMode::Unknown`] and is rejected per-CR with the
+                          value quoted (webhook + reconciler, via `validate_access_modes`) instead
+                          of poisoning the typed watcher.
                         items:
+                          description: A Kubernetes PersistentVolumeClaim access mode.
+                          enum:
+                          - ReadWriteOnce
+                          - ReadOnlyMany
+                          - ReadWriteMany
+                          - ReadWriteOncePod
                           type: string
                         type: array
                       capacity:

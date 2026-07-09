@@ -4,7 +4,7 @@
 use crate::backend::NfsVolume;
 use crate::common::{
     CredentialProjection, CronSpec, DeletionPolicy, Identity, MoverSpec, PodSelector,
-    RepositoryRef, ResolvedIdentity, Retention,
+    PvcAccessMode, RepositoryRef, ResolvedIdentity, Retention,
 };
 use k8s_openapi::api::batch::v1::JobSpec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
@@ -241,15 +241,34 @@ pub enum CopyMethod {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StagingSpec {
-    /// How long the staged `VolumeSnapshot` may take to become `readyToUse`
-    /// (measured from its creation) before the backup is failed (Go-style
-    /// duration like `10m` or `1h`; default `10m`). A transient CSI/
-    /// snapshot-controller error during the wait is retried, never fatal on its
-    /// own — only this deadline fails staging. A zero duration (`0`/`0s`) waits
-    /// indefinitely. Raise this for backends whose snapshots take long to become
-    /// ready (e.g. cloud snapshots of large volumes).
+    /// How long each staging phase may take before the backup is failed (Go-style
+    /// duration like `10m` or `1h`; default `10m`): first the staged
+    /// `VolumeSnapshot` becoming `readyToUse` (measured from its creation), then —
+    /// on an `Immediate`-binding StorageClass — the staged PVC binding (a fresh
+    /// budget measured from the PVC's creation, covering the CSI restore/clone).
+    /// A transient CSI/snapshot-controller error during either wait is retried,
+    /// never fatal on its own — only this deadline fails staging. A zero duration
+    /// (`0`/`0s`) waits indefinitely. Raise this for backends whose snapshots or
+    /// clones take long (e.g. cloud snapshots of large volumes, CephFS full clones
+    /// of small-file-heavy volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// StorageClass for the **staged PVC** — the temporary PVC restored from the
+    /// CSI `VolumeSnapshot` (`copyMethod: Snapshot`) or cloned from the source
+    /// (`copyMethod: Clone`). Absent ⇒ the staged PVC copies the source PVC's
+    /// class. Must belong to the **same CSI driver** as the source (staging fails
+    /// fast on a mismatch). Flagship use: a rook-ceph CephFS class with
+    /// `backingSnapshot: "true"`, which mounts the snapshot shallowly
+    /// (metadata-only, near-instant, read-only) instead of running a full
+    /// subvolume clone that can take many minutes on small-file-heavy volumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+    /// Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes.
+    /// `[ReadOnlyMany]` pairs with snapshot-backed read-only classes (e.g. CephFS
+    /// `backingSnapshot`); the mover always mounts the staged PVC read-only
+    /// regardless of the mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_modes: Vec<PvcAccessMode>,
 }
 
 /// Multi-PVC grouping strategy. Defaults to a consistent group snapshot across
@@ -666,11 +685,83 @@ mod tests {
         assert_eq!(
             spec.staging,
             Some(StagingSpec {
-                timeout: Some("30m".to_string())
+                timeout: Some("30m".to_string()),
+                ..Default::default()
             })
         );
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["staging"]["timeout"], "30m");
+    }
+
+    #[test]
+    fn staging_overrides_round_trip_and_are_elided_when_absent() {
+        // The staged-PVC override pair (storageClassName + accessModes) round-trips
+        // through the cluster's parse path; absent fields are skip-elided so
+        // "inherit from the source PVC" stays representable as absence.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             staging: { timeout: 30m, storageClassName: cephfs-shallow, accessModes: [ReadOnlyMany] }\n",
+        );
+        let st = spec.staging.as_ref().unwrap();
+        assert_eq!(st.storage_class_name.as_deref(), Some("cephfs-shallow"));
+        assert_eq!(st.access_modes, vec![PvcAccessMode::ReadOnlyMany]);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["staging"]["storageClassName"], "cephfs-shallow");
+        assert_eq!(
+            json["staging"]["accessModes"],
+            serde_json::json!(["ReadOnlyMany"])
+        );
+
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             staging: { timeout: 30m }\n",
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json["staging"].get("storageClassName").is_none());
+        assert!(json["staging"].get("accessModes").is_none());
+    }
+
+    #[test]
+    fn staging_access_modes_legacy_value_decodes_to_unknown_not_an_error() {
+        // Graceful-decode contract: a non-canonical stored mode deserializes into
+        // `Unknown` (rejected later by the shared validator, per-CR) instead of a
+        // serde error that would wedge the typed watcher for every SnapshotPolicy.
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             staging: { accessModes: [ReadWriteOnze] }\n",
+        );
+        assert_eq!(
+            spec.staging.unwrap().access_modes,
+            vec![PvcAccessMode::Unknown("ReadWriteOnze".into())]
+        );
+    }
+
+    #[test]
+    fn staging_access_modes_render_a_closed_enum_in_the_crd_schema() {
+        // First `Vec<unit-enum>` in the API crate: pin that the generated CRD
+        // schema is `items: {type: string, enum: [...]}` with exactly the four
+        // canonical modes — and does NOT leak the legacy-decode `Unknown` variant.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let items = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["staging"]["properties"]["accessModes"]["items"];
+        assert_eq!(
+            items["type"], "string",
+            "items must be strings; got {items}"
+        );
+        assert_eq!(
+            items["enum"],
+            serde_json::json!([
+                "ReadWriteOnce",
+                "ReadOnlyMany",
+                "ReadWriteMany",
+                "ReadWriteOncePod"
+            ]),
+            "items enum must be exactly the canonical modes; got {items}"
+        );
     }
 
     #[test]

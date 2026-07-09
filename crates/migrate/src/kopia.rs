@@ -1385,10 +1385,11 @@ pub fn translate_destination(
             });
             t.mapped("spec.kopia.capacity", "Restore.spec.target.pvc.capacity");
             if let Some(modes) = &kopia.access_modes {
-                pvc["accessModes"] = serde_json::json!(modes);
-                t.mapped(
+                crate::translate::map_access_modes(
+                    &mut t,
+                    &mut pvc,
                     "spec.kopia.accessModes",
-                    "Restore.spec.target.pvc.accessModes",
+                    modes,
                 );
             }
             if let Some(class) = &kopia.storage_class_name {

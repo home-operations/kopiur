@@ -193,6 +193,17 @@ pub struct StagedSources {
     /// `true` once the stage is ready for the mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// StorageClass of the staged PVC — `spec.staging.storageClassName` when set,
+    /// else the source PVC's class. Pinned for observability (e.g. confirming a
+    /// CephFS shallow-clone class actually took effect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+    /// The resolved `spec.staging.timeout` (seconds) pinned when the stage was
+    /// stamped, so the running-Job staged-PVC bind watchdog never re-resolves a
+    /// policy that may have been edited or deleted mid-run. `0` = wait
+    /// indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_timeout_seconds: Option<i64>,
 }
 
 /// When each hook list completed.

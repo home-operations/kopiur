@@ -2,7 +2,8 @@
 //! populator source. ADR-0001 §3.6, ADR-0003 §4.6.
 
 use crate::common::{
-    CredentialProjection, FailurePolicy, MoverSpec, ObjectRef, RepositoryRef, ResolvedIdentity,
+    CredentialProjection, FailurePolicy, MoverSpec, ObjectRef, PvcAccessMode, RepositoryRef,
+    ResolvedIdentity,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -199,9 +200,13 @@ pub struct PvcTemplate {
     /// Requested size of the new PVC (e.g. `100Gi`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
-    /// Access modes for the new PVC (e.g. `["ReadWriteOnce"]`).
+    /// Access modes for the new PVC; empty defaults to `[ReadWriteOnce]`. Closed
+    /// enum in the schema; a non-canonical value persisted before enforcement
+    /// decodes as [`PvcAccessMode::Unknown`] and is rejected per-CR with the
+    /// value quoted (webhook + reconciler, via `validate_access_modes`) instead
+    /// of poisoning the typed watcher.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub access_modes: Vec<String>,
+    pub access_modes: Vec<PvcAccessMode>,
 }
 
 /// kopia restore behavior knobs (M2 flag sweep). Every `Option` field's `None`
@@ -518,7 +523,7 @@ policy:
         match target {
             RestoreTarget::Pvc(t) => {
                 assert_eq!(t.name, "postgres-data-restored");
-                assert_eq!(t.access_modes, vec!["ReadWriteOnce".to_string()]);
+                assert_eq!(t.access_modes, vec![PvcAccessMode::ReadWriteOnce]);
             }
             other => panic!("expected Pvc, got {}", other.kind_str()),
         }
@@ -530,6 +535,56 @@ policy:
         let json = serde_json::to_value(&spec).expect("serialize");
         let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
         assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn restore_pvc_access_modes_render_a_closed_enum_in_the_crd_schema() {
+        // The Vec<String> → Vec<PvcAccessMode> migration must surface in the CRD:
+        // items are a closed string enum (apiserver rejects typos on new writes),
+        // and the legacy-decode `Unknown` variant never appears.
+        let crd = Restore::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let items = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["target"]["properties"]["pvc"]["properties"]["accessModes"]["items"];
+        assert_eq!(
+            items["type"], "string",
+            "items must be strings; got {items}"
+        );
+        assert_eq!(
+            items["enum"],
+            serde_json::json!([
+                "ReadWriteOnce",
+                "ReadOnlyMany",
+                "ReadWriteMany",
+                "ReadWriteOncePod"
+            ]),
+            "items enum must be exactly the canonical modes; got {items}"
+        );
+    }
+
+    #[test]
+    fn restore_legacy_access_mode_decodes_to_unknown_not_an_error() {
+        // A pre-enforcement stored Restore with a bogus mode must still
+        // deserialize (a serde error would poison the typed watch stream for the
+        // whole Kind) — the value lands in `Unknown`, verbatim, and the shared
+        // validator rejects it per-CR with the value quoted.
+        let spec: RestoreSpec = from_yaml(
+            "source: { snapshotRef: { name: b } }\n\
+             target: { pvc: { name: restored, capacity: 10Gi, accessModes: [ReadWriteOnze] } }\n",
+        );
+        match &spec.target {
+            RestoreTarget::Pvc(t) => assert_eq!(
+                t.access_modes,
+                vec![PvcAccessMode::Unknown("ReadWriteOnze".into())]
+            ),
+            other => panic!("expected Pvc, got {}", other.kind_str()),
+        }
+        // And it re-serializes unchanged (read-modify-write never mutates it).
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["target"]["pvc"]["accessModes"],
+            serde_json::json!(["ReadWriteOnze"])
+        );
     }
 
     #[test]

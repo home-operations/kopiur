@@ -3147,3 +3147,195 @@ fn source_path_fork_matches_by_pvc_name() {
     // Same effective path (both default) → allowed.
     assert!(detect_source_path_fork(&mk(None), &mk(None), true, false).is_none());
 }
+
+// --- validate_access_modes (shared: staging + restore target) ---
+
+#[test]
+fn access_modes_accept_canonical_unique_lists() {
+    use crate::common::PvcAccessMode as M;
+    assert!(validate_access_modes("f", &[]).is_empty());
+    assert!(validate_access_modes("f", &[M::ReadOnlyMany]).is_empty());
+    assert!(validate_access_modes("f", &[M::ReadWriteOnce, M::ReadWriteMany]).is_empty());
+    // RWOP alone is exactly what the apiserver allows.
+    assert!(validate_access_modes("f", &[M::ReadWriteOncePod]).is_empty());
+}
+
+#[test]
+fn access_modes_reject_unknown_with_the_value_and_valid_set_quoted() {
+    use crate::common::PvcAccessMode as M;
+    let errs = validate_access_modes(
+        "spec.staging.accessModes",
+        &[M::Unknown("ReadWriteOnze".into())],
+    );
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let msg = errs[0].to_string();
+    assert!(msg.contains("spec.staging.accessModes[0]"), "{msg}");
+    assert!(
+        msg.contains("ReadWriteOnze"),
+        "the bad value must be quoted: {msg}"
+    );
+    assert!(
+        msg.contains("ReadWriteOnce") && msg.contains("ReadWriteOncePod"),
+        "the valid set must be listed: {msg}"
+    );
+}
+
+#[test]
+fn access_modes_reject_duplicates_and_rwop_combinations() {
+    use crate::common::PvcAccessMode as M;
+    let errs = validate_access_modes("f", &[M::ReadWriteOnce, M::ReadWriteOnce]);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].to_string().contains("duplicate"), "{errs:?}");
+
+    // The apiserver invariant: RWOP must be the sole mode — caught at admission
+    // instead of wedging the first run in a PVC-create retry loop.
+    let errs = validate_access_modes("f", &[M::ReadWriteOncePod, M::ReadOnlyMany]);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].to_string().contains("ReadWriteOncePod"), "{errs:?}");
+}
+
+// --- validate_staging: staged-PVC overrides need a staged PVC to act on ---
+
+#[test]
+fn staging_overrides_accepted_for_snapshot_and_clone_pvc_sources() {
+    for method in ["Snapshot", "Clone"] {
+        let spec: SnapshotPolicySpec = crate::testutil::from_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             copyMethod: {method}\n\
+             sources: [ {{ pvc: {{ name: data }} }} ]\n\
+             staging: {{ storageClassName: cephfs-shallow, accessModes: [ReadOnlyMany] }}\n"
+        ));
+        assert!(
+            validate_backup_config(&spec).is_empty(),
+            "{method} + overrides must be valid"
+        );
+    }
+}
+
+#[test]
+fn staging_overrides_rejected_for_direct_copy_method() {
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Direct\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         staging: { storageClassName: cephfs-shallow }\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(msg.contains("spec.staging.storageClassName"), "{msg}");
+    assert!(msg.contains("Direct"), "{msg}");
+    assert!(
+        msg.contains("Snapshot/Clone"),
+        "the fix must be named: {msg}"
+    );
+
+    // Direct + a bare staging.timeout stays admitted (pre-existing leniency:
+    // tightening it would reject persisted objects on re-apply).
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Direct\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         staging: { timeout: 5m }\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty());
+}
+
+#[test]
+fn staging_overrides_rejected_for_nfs_and_pvc_selector_sources() {
+    // NFS is read directly, never staged.
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas.lan, path: /export/data } } ]\n\
+         staging: { accessModes: [ReadOnlyMany] }\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(msg.contains("spec.staging.accessModes"), "{msg}");
+    assert!(msg.contains("NFS"), "{msg}");
+
+    // pvcSelector expansion skips staging, so an override would be silently inert.
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } } } ]\n\
+         staging: { storageClassName: cephfs-shallow }\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(msg.contains("pvcSelector"), "{msg}");
+}
+
+#[test]
+fn staging_unknown_access_mode_rejected_via_backup_config() {
+    // The legacy-decode `Unknown` value is rejected by the SHARED validator, so the
+    // webhook (admission) and controller (defensive) both refuse it identically.
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         staging: { accessModes: [ReadWriteOnze] }\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(msg.contains("ReadWriteOnze"), "{msg}");
+}
+
+#[test]
+fn restore_pvc_target_rejects_unknown_and_rwop_combo_access_modes() {
+    use crate::common::{ObjectRef, PvcAccessMode as M};
+    use crate::restore::PvcTemplate;
+    let mut spec = restore_with(
+        RestoreSource::SnapshotRef(ObjectRef {
+            name: "b".into(),
+            namespace: None,
+        }),
+        None,
+    );
+    // A legacy stored (or force-applied) bogus mode: rejected per-CR with the
+    // value quoted — this is the graceful path for pre-enforcement data.
+    spec.target = RestoreTarget::Pvc(PvcTemplate {
+        name: "restored".into(),
+        storage_class_name: None,
+        capacity: Some("10Gi".into()),
+        access_modes: vec![M::Unknown("ReadWriteOnze".into())],
+    });
+    let err = validate_restore(&spec).unwrap_err();
+    assert!(err.to_string().contains("ReadWriteOnze"), "{err}");
+    assert!(
+        err.to_string().contains("restore.target.pvc.accessModes"),
+        "{err}"
+    );
+
+    // RWOP combined with another mode: the apiserver would reject the PVC.
+    spec.target = RestoreTarget::Pvc(PvcTemplate {
+        name: "restored".into(),
+        storage_class_name: None,
+        capacity: Some("10Gi".into()),
+        access_modes: vec![M::ReadWriteOncePod, M::ReadWriteOnce],
+    });
+    let err = validate_restore(&spec).unwrap_err();
+    assert!(err.to_string().contains("ReadWriteOncePod"), "{err}");
+
+    // A canonical single mode passes.
+    spec.target = RestoreTarget::Pvc(PvcTemplate {
+        name: "restored".into(),
+        storage_class_name: None,
+        capacity: Some("10Gi".into()),
+        access_modes: vec![M::ReadOnlyMany],
+    });
+    assert!(validate_restore(&spec).is_ok());
+}

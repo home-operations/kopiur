@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot::{Origin, SnapshotSpec};
-use crate::snapshot_policy::{Hook, SnapshotPolicySpec};
+use crate::snapshot_policy::{CopyMethod, Hook, SnapshotPolicySpec};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 
 /// Validate a `SnapshotPolicy` spec, accumulating all problems.
@@ -180,20 +180,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
-    // Staging: the timeout must parse — rejected at admission rather than silently
-    // falling back to the default at the first backup run.
-    if let Some(st) = &spec.staging
-        && let Some(t) = &st.timeout
-        && crate::duration::parse_go_duration(t).is_none()
-    {
-        errs.push(ValidationError::InvalidFieldValue {
-            field: "spec.staging.timeout".to_string(),
-            reason: format!(
-                "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
-                 for the default (10m), or 0 to wait for the VolumeSnapshot indefinitely"
-            ),
-        });
-    }
+    errs.extend(validate_staging(spec));
     // Preflight: the timeout must parse, check names must be unique + non-blank, and
     // each check expression must compile + trial-evaluate to a bool with no
     // out-of-scope variable — rejected at admission rather than at the first run.
@@ -243,6 +230,83 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 }
             }
         }
+    }
+    errs
+}
+
+/// Validate `spec.staging` (+ its interplay with `copyMethod` and the sources):
+///
+///   * `timeout` must parse — rejected at admission rather than silently falling
+///     back to the default at the first backup run.
+///   * `accessModes` entries must be canonical/unique, and `ReadWriteOncePod`
+///     sole ([`validate_access_modes`]).
+///   * The staged-PVC override fields (`storageClassName`/`accessModes`) must have
+///     a staged PVC to act on — rejected for `copyMethod: Direct` (no staged PVC
+///     at all), an NFS source (never staged), and `pvcSelector` sources (staging
+///     is skipped for selector expansion). The pre-existing `timeout` and
+///     `volumeSnapshotClassName` stay deliberately lenient in those combinations —
+///     tightening them now would reject already-persisted objects on re-apply.
+fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    let Some(st) = &spec.staging else {
+        return errs;
+    };
+    if let Some(t) = &st.timeout
+        && crate::duration::parse_go_duration(t).is_none()
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.staging.timeout".to_string(),
+            reason: format!(
+                "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
+                 for the default (10m), or 0 to wait for the VolumeSnapshot indefinitely"
+            ),
+        });
+    }
+    errs.extend(validate_access_modes(
+        "spec.staging.accessModes",
+        &st.access_modes,
+    ));
+    let overrides: Vec<&str> = [
+        (
+            "spec.staging.storageClassName",
+            st.storage_class_name.is_some(),
+        ),
+        ("spec.staging.accessModes", !st.access_modes.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+    if overrides.is_empty() {
+        return errs;
+    }
+    let overrides = overrides.join(" / ");
+    match spec.copy_method {
+        CopyMethod::Direct => errs.push(ValidationError::InvalidFieldValue {
+            field: overrides.clone(),
+            reason: "copyMethod: Direct mounts the live source PVC — there is no staged PVC \
+                     to override. Remove the staged-PVC override(s), or use copyMethod: \
+                     Snapshot/Clone."
+                .to_string(),
+        }),
+        CopyMethod::Snapshot | CopyMethod::Clone => {}
+    }
+    if spec.sources.iter().any(|s| s.nfs.is_some()) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: overrides.clone(),
+            reason: "an NFS source is read directly and never staged, so a staged-PVC \
+                     override is meaningless with it; remove the override(s) or use a PVC \
+                     source for copyMethod: Snapshot/Clone"
+                .to_string(),
+        });
+    }
+    if spec.sources.iter().any(|s| s.pvc_selector.is_some()) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: overrides,
+            reason: "pvcSelector sources are not CSI-staged (staging applies to single-PVC \
+                     sources only), so a staged-PVC override would be silently ignored; \
+                     remove the override(s) or use a `pvc:` source"
+                .to_string(),
+        });
     }
     errs
 }

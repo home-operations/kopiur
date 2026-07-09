@@ -907,3 +907,47 @@ fn effective_timezone_unset_invalid_default_falls_back_to_utc() {
     assert_eq!(tz, chrono_tz::Tz::UTC);
     assert!(amb.is_none());
 }
+
+// --- PvcAccessMode: closed schema, graceful legacy decode ---
+
+#[test]
+fn pvc_access_mode_schema_lists_only_canonical_values() {
+    // `Unknown` is a decode-compat artifact for legacy stored data and must NEVER
+    // be admissible: the schema enum is exactly the four canonical k8s strings.
+    let schema = schemars::schema_for!(PvcAccessMode);
+    let json = serde_json::to_value(&schema).unwrap();
+    assert_eq!(
+        json["enum"],
+        serde_json::json!([
+            "ReadWriteOnce",
+            "ReadOnlyMany",
+            "ReadWriteMany",
+            "ReadWriteOncePod"
+        ]),
+        "schema enum must be exactly the canonical set; got {json}"
+    );
+    assert_eq!(json["type"], "string", "got {json}");
+}
+
+#[test]
+fn pvc_access_mode_parse_and_mode_str_are_inverse_on_canonical() {
+    for s in PvcAccessMode::CANONICAL {
+        let parsed = PvcAccessMode::parse(s).expect("canonical value must parse");
+        assert!(!matches!(parsed, PvcAccessMode::Unknown(_)));
+        assert_eq!(parsed.mode_str(), s);
+    }
+    // Case matters (k8s wire strings are exact) — shorthand/typos don't parse.
+    assert_eq!(PvcAccessMode::parse("rwo"), None);
+    assert_eq!(PvcAccessMode::parse("readwriteonce"), None);
+}
+
+#[test]
+fn pvc_access_mode_legacy_value_decodes_to_unknown_and_roundtrips() {
+    // The load-bearing property: a bogus stored string must DECODE (a serde error
+    // here would poison the typed watch stream for the whole Kind) and must
+    // re-serialize unchanged, so a read-modify-write never mutates legacy data.
+    let m: PvcAccessMode = serde_json::from_value(serde_json::json!("ReadWriteOnze")).unwrap();
+    assert_eq!(m, PvcAccessMode::Unknown("ReadWriteOnze".into()));
+    assert_eq!(m.mode_str(), "ReadWriteOnze");
+    assert_eq!(serde_json::to_value(&m).unwrap(), "ReadWriteOnze");
+}

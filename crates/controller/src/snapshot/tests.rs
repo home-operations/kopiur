@@ -1018,3 +1018,26 @@ fn pin_job_target_reads_the_direction_annotation() {
     )]));
     assert_eq!(pin_job_target(&job), None, "unparseable = unattributable");
 }
+
+// --- staged_watchdog_budget: the pinned bind budget's three states ---
+
+#[test]
+fn staged_watchdog_budget_pins_zero_absent_and_positive() {
+    // Explicit 0 = the user's "wait indefinitely".
+    assert_eq!(staged_watchdog_budget(Some(0)), None);
+    // A positive pin is used verbatim.
+    assert_eq!(
+        staged_watchdog_budget(Some(90)),
+        Some(std::time::Duration::from_secs(90))
+    );
+    // A legacy stamp without the field (or a nonsense negative) gets the default
+    // budget — never an accidental infinite wait.
+    assert_eq!(
+        staged_watchdog_budget(None),
+        Some(crate::consts::DEFAULT_STAGING_TIMEOUT)
+    );
+    assert_eq!(
+        staged_watchdog_budget(Some(-5)),
+        Some(crate::consts::DEFAULT_STAGING_TIMEOUT)
+    );
+}

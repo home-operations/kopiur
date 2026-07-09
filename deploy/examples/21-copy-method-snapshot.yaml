@@ -26,11 +26,13 @@ spec:
     name: primary
   copyMethod: Snapshot
   volumeSnapshotClassName: csi-rbd-snapclass # optional; omit to use the driver default
-  # Optional: how long the VolumeSnapshot may take to become readyToUse before the
-  # backup fails (default 10m; "0" waits indefinitely). Transient CSI/snapshot-
-  # controller errors during the wait are retried — only this deadline fails staging.
-  # Raise it for backends whose snapshots are slow to become ready (e.g. cloud
-  # snapshots of large volumes).
+  # Optional: the staging deadline budget (default 10m; "0" waits indefinitely).
+  # Bounds the VolumeSnapshot becoming readyToUse AND (a fresh budget) the staged
+  # PVC's bind — the CSI restore window. Transient CSI/snapshot-controller errors
+  # during the wait are retried — only this deadline fails staging. Raise it for
+  # backends whose snapshots or restores are slow (e.g. cloud snapshots of large
+  # volumes). `staging` also takes storageClassName/accessModes overrides for the
+  # staged PVC — see example 30 (CephFS backingSnapshot shallow staging).
   staging:
     timeout: 10m
   sources:

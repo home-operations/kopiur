@@ -325,6 +325,22 @@ spec:
                     description: '`true` once the stage is ready for the mover.'
                     nullable: true
                     type: boolean
+                  stagingTimeoutSeconds:
+                    description: |-
+                      The resolved `spec.staging.timeout` (seconds) pinned when the stage was
+                      stamped, so the running-Job staged-PVC bind watchdog never re-resolves a
+                      policy that may have been edited or deleted mid-run. `0` = wait
+                      indefinitely.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  storageClassName:
+                    description: |-
+                      StorageClass of the staged PVC — `spec.staging.storageClassName` when set,
+                      else the source PVC's class. Pinned for observability (e.g. confirming a
+                      CephFS shallow-clone class actually took effect).
+                    nullable: true
+                    type: string
                   volumeSnapshotName:
                     description: 'Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only).'
                     nullable: true

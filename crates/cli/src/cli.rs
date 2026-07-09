@@ -478,8 +478,13 @@ pub struct RestoreArgs {
     pub storage_class: Option<String>,
 
     /// Access mode of the created PVC, repeatable (e.g. ReadWriteOnce).
-    #[arg(long = "access-mode", value_name = "MODE", requires = "create_pvc")]
-    pub access_modes: Vec<String>,
+    #[arg(
+        long = "access-mode",
+        value_name = "MODE",
+        requires = "create_pvc",
+        value_parser = parse_access_mode
+    )]
+    pub access_modes: Vec<kopiur_api::common::PvcAccessMode>,
 
     // --- kopia restore options ---
     /// Delete files in the target that are not in the snapshot (exact mirror;
@@ -862,6 +867,20 @@ impl OriginFilter {
     pub fn label_value(self) -> &'static str {
         kopiur_api::Origin::from(self).label_value()
     }
+}
+
+/// clap value parser for `--access-mode`: only the four canonical Kubernetes
+/// access modes are accepted, so a typo fails AT THE CLI with the valid set in
+/// the message instead of surviving until the apiserver (or a provisioner)
+/// rejects it. `PvcAccessMode::Unknown` exists solely for decoding legacy
+/// stored data — it is never a valid input here.
+fn parse_access_mode(s: &str) -> Result<kopiur_api::common::PvcAccessMode, String> {
+    kopiur_api::common::PvcAccessMode::parse(s).ok_or_else(|| {
+        format!(
+            "{s:?} is not a Kubernetes access mode; use one of {}",
+            kopiur_api::common::PvcAccessMode::CANONICAL.join(", ")
+        )
+    })
 }
 
 /// `--repository-kind` values; mirrors `kopiur_api::common::RepositoryKind`.
