@@ -137,39 +137,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // is NOT terminal here — see `phase_is_terminal_at_guard`.)
     match restore.status.as_ref().and_then(|s| s.phase) {
         Some(phase) if phase_is_terminal_at_guard(phase, state) => {
-            // The kstatus conditions come from the controller's transition patch
-            // in `drive_direct_restore` — which the MOVER's own terminal `phase`
-            // stamp races past in the common case (its in-cluster PATCH carries
-            // `phase: Completed`/`Failed` + logTail/failure but no conditions;
-            // the Job-completion reconcile then already sees the terminal phase
-            // and lands HERE, never in the Job branch). Heal once: patch ONLY
-            // phase + observedGeneration + conditions (`restore_ready_status`
-            // carries nothing else, so the merge preserves the mover-written
-            // logTail/failure/progress and the pinned resolution). Self-gated by
-            // `kstatus_settled_for`, so a healed Restore never re-patches.
-            if !kstatus_settled_for(restore, phase) {
-                let status = if phase == RestorePhase::Completed {
-                    // The mover wrote `phase: Completed` + `status.resolved` in one
-                    // PATCH, so `resolved` is observed here — distinguish a real
-                    // restore from a deploy-or-restore that came up empty.
-                    restore_success_status(
-                        restore,
-                        restore.status.as_ref().and_then(|s| s.resolved.as_ref()),
-                    )
-                } else {
-                    restore_ready_status(
-                        restore,
-                        phase,
-                        "MoverJobFailed",
-                        "the restore mover reported a terminal failure; see \
-                         status.failure / status.logTail for the cause, fix it, and \
-                         create a NEW Restore — a Failed Restore is terminal and \
-                         never retries",
-                    )
-                };
-                io::patch_status(&api, &name, status).await?;
-            }
-            return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+            return steady_terminal_restore(restore, ctx, &api, &namespace, &name, phase).await;
         }
         _ => {}
     }
@@ -1159,6 +1127,130 @@ enum MoverOutcome {
 /// Idempotent: an existing Job is tracked to terminal, never re-applied. The caller
 /// owns the status/phase writes. `selection` is a concrete id (anchor-healed) or an
 /// in-Job selector the mover resolves.
+/// The steady pass for a Restore already in a terminal phase (the entry guard):
+/// heal the kstatus once, reap the finished run's work-spec ConfigMap, and
+/// settle into the slow heartbeat.
+///
+/// The kstatus conditions come from the controller's transition patch in
+/// `drive_direct_restore` — which the MOVER's own terminal `phase` stamp races
+/// past in the common case (its in-cluster PATCH carries `phase:
+/// Completed`/`Failed` + logTail/failure but no conditions; the Job-completion
+/// reconcile then already sees the terminal phase and lands HERE, never in the
+/// Job branch). Heal once: patch ONLY phase + observedGeneration + conditions
+/// (`restore_ready_status` carries nothing else, so the merge preserves the
+/// mover-written logTail/failure/progress and the pinned resolution).
+/// Self-gated by `kstatus_settled_for`, so a healed Restore never re-patches.
+async fn steady_terminal_restore(
+    restore: &Restore,
+    ctx: &Context,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    phase: RestorePhase,
+) -> Result<Action> {
+    if !kstatus_settled_for(restore, phase) {
+        let status = if phase == RestorePhase::Completed {
+            // The mover wrote `phase: Completed` + `status.resolved` in one
+            // PATCH, so `resolved` is observed here — distinguish a real
+            // restore from a deploy-or-restore that came up empty.
+            restore_success_status(
+                restore,
+                restore.status.as_ref().and_then(|s| s.resolved.as_ref()),
+            )
+        } else {
+            restore_ready_status(
+                restore,
+                phase,
+                "MoverJobFailed",
+                "the restore mover reported a terminal failure; see \
+                 status.failure / status.logTail for the cause, fix it, and \
+                 create a NEW Restore — a Failed Restore is terminal and \
+                 never retries",
+            )
+        };
+        io::patch_status(api, name, status).await?;
+    }
+    // The COMMON terminal path lands here, not in `run_restore_mover`'s
+    // terminal arms: the mover stamps the terminal phase before its pod exits,
+    // and this guard then short-circuits every later reconcile. Reap the
+    // work-spec ConfigMap once the direct-restore mover Job (named after the
+    // Restore) is observed terminal; the Job keeps the pod logs until its TTL.
+    // Gated on the run having finished within the reap lookback — beyond it
+    // the Job is certainly TTL-reaped and the GET would 404 on every heartbeat
+    // for as long as the Restore CR lives (the orphan sweep owns stragglers).
+    // A populator restore has no Job of this name (its `-populate` artifacts
+    // are `finalize_populator`'s) — a one-time absent-Job GET there.
+    let end_time = restore
+        .status
+        .as_ref()
+        .and_then(|s| s.timing.as_ref())
+        .and_then(|t| t.end_time.as_deref());
+    if crate::snapshot::finished_recently(end_time, chrono::Utc::now()) {
+        let job_api: Api<k8s_openapi::api::batch::v1::Job> =
+            Api::namespaced(ctx.client.clone(), namespace);
+        if crate::snapshot::work_spec_reapable(job_api.get_opt(name).await?.as_ref()) {
+            io::reap_work_spec_cm(&ctx.client, namespace, name).await;
+        }
+    }
+    Ok(Action::requeue(std::time::Duration::from_secs(600)))
+}
+
+/// Classify an EXISTING restore mover Job into a [`MoverOutcome`], reaping the
+/// work-spec ConfigMap at terminal (the Job stays until its TTL so pod logs
+/// remain reachable) and tearing down a wedged mover. Split from
+/// [`run_restore_mover`] so both stay under the complexity ratchet.
+async fn observe_restore_mover(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    job_name: &str,
+    job: &k8s_openapi::api::batch::v1::Job,
+) -> Result<MoverOutcome> {
+    Ok(match crate::snapshot::job_terminal_state(job) {
+        // Terminal either way: drop the work-spec ConfigMap now. Idempotent —
+        // the mover usually stamps the terminal phase before the Job goes
+        // terminal, in which case the entry guard short-circuits future
+        // reconciles and the periodic orphan sweep reaps the ConfigMap instead.
+        Some(true) => {
+            io::reap_work_spec_cm(&ctx.client, namespace, job_name).await;
+            MoverOutcome::Succeeded {
+                duration_secs: restore_job_duration_seconds(job),
+            }
+        }
+        Some(false) => {
+            io::reap_work_spec_cm(&ctx.client, namespace, job_name).await;
+            MoverOutcome::Failed
+        }
+        // A mover that can't START (impossible securityContext, bad image,
+        // unschedulable) never terminates, so backoffLimit never trips — fail fast
+        // past the pod-startup deadline instead of hanging to the 48h backstop.
+        None => {
+            let grace = kopiur_api::common::pod_startup_deadline_seconds(
+                restore.spec.failure_policy.as_ref(),
+            );
+            if let io::WedgedVerdict::Wedged { reason, message } =
+                io::wedged_pod_verdict(&ctx.client, namespace, job_name, grace).await?
+            {
+                // Reap the wedged Job (cascade) so the kubelet stops retrying,
+                // and its work-spec ConfigMap with it. BEST-EFFORT: an error here
+                // must not abort before `MoverOutcome::Wedged` reaches the caller —
+                // a partial teardown (Job gone, error surfaced) would otherwise
+                // leave the Restore un-Failed and the retry would spawn a fresh
+                // wedged mover, cycling instead of failing fast.
+                if let Err(e) = io::delete_mover_run(&ctx.client, namespace, job_name).await {
+                    tracing::warn!(restore = %job_name, error = %e,
+                        "wedged mover teardown failed (Job runs to its deadline; sweep reaps the ConfigMap)");
+                }
+                MoverOutcome::Wedged {
+                    message: crate::snapshot::wedged_pod_message(&reason, &message, grace),
+                }
+            } else {
+                MoverOutcome::Running { created: false }
+            }
+        }
+    })
+}
+
 async fn run_restore_mover(
     ctx: &Context,
     restore: &Restore,
@@ -1171,33 +1263,7 @@ async fn run_restore_mover(
     use k8s_openapi::api::batch::v1::Job;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     if let Some(job) = job_api.get_opt(job_name).await? {
-        return Ok(match crate::snapshot::job_terminal_state(&job) {
-            Some(true) => MoverOutcome::Succeeded {
-                duration_secs: restore_job_duration_seconds(&job),
-            },
-            Some(false) => MoverOutcome::Failed,
-            // A mover that can't START (impossible securityContext, bad image,
-            // unschedulable) never terminates, so backoffLimit never trips — fail fast
-            // past the pod-startup deadline instead of hanging to the 48h backstop.
-            None => {
-                let grace = kopiur_api::common::pod_startup_deadline_seconds(
-                    restore.spec.failure_policy.as_ref(),
-                );
-                if let io::WedgedVerdict::Wedged { reason, message } =
-                    io::wedged_pod_verdict(&ctx.client, namespace, job_name, grace).await?
-                {
-                    // Reap the wedged Job (cascade) so the kubelet stops retrying.
-                    let _ = job_api
-                        .delete(job_name, &kube::api::DeleteParams::background())
-                        .await;
-                    MoverOutcome::Wedged {
-                        message: crate::snapshot::wedged_pod_message(&reason, &message, grace),
-                    }
-                } else {
-                    MoverOutcome::Running { created: false }
-                }
-            }
-        });
+        return observe_restore_mover(ctx, restore, namespace, job_name, &job).await;
     }
 
     let target_path = "/restore".to_string();

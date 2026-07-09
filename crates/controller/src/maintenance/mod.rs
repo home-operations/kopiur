@@ -21,8 +21,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{DeleteParams, ListParams};
+use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
@@ -193,7 +192,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
             // sleep until the next slot.
             Some(true) => {
                 record_handled_slot(&api, &name, maint, mode, slot, now).await?;
-                delete_work_spec_cm(ctx, &namespace, &job_name).await;
+                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
                 Ok(Action::requeue(cap(next_wakeup(
                     maint,
                     now,
@@ -202,8 +201,9 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                 ))))
             }
             // Failed: surface the condition once (transition-guarded) and re-check.
-            // The failed Job lingers until its TTL, then a fresh reconcile
-            // re-spawns this slot as a bounded retry.
+            // The failed Job lingers until its TTL (pod logs stay reachable), then
+            // a fresh reconcile re-spawns this slot as a bounded retry. The
+            // work-spec ConfigMap is dropped now — the retry recreates it.
             Some(false) => {
                 patch_condition_if_changed(
                     &api,
@@ -214,6 +214,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                     "maintenance Job failed; see the Job/pod logs",
                 )
                 .await?;
+                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
             // Still running — but a mover that can't START (impossible securityContext, bad
@@ -237,7 +238,12 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                         &crate::snapshot::wedged_pod_message(&reason, &message, grace),
                     )
                     .await?;
-                    let _ = job_api.delete(&job_name, &DeleteParams::background()).await;
+                    // BEST-EFFORT: mirror the wedged teardown elsewhere — an error
+                    // must not turn the surfaced condition into a reconcile error.
+                    if let Err(e) = io::delete_mover_run(&ctx.client, &namespace, &job_name).await {
+                        tracing::warn!(maint = %name, error = %e,
+                            "wedged mover teardown failed (Job runs to its deadline; sweep reaps the ConfigMap)");
+                    }
                     return Ok(Action::requeue(REQUEUE_FAILED));
                 }
                 Ok(Action::requeue(REQUEUE_RUNNING))
@@ -361,7 +367,7 @@ async fn handle_manual_run(
                     },
                 )
                 .await?;
-                delete_work_spec_cm(ctx, namespace, &job_name).await;
+                io::reap_work_spec_cm(&ctx.client, namespace, &job_name).await;
                 Ok(None)
             }
             Some(false) => {
@@ -385,6 +391,7 @@ async fn handle_manual_run(
                     "manual maintenance Job failed; see the Job/pod logs",
                 )
                 .await?;
+                io::reap_work_spec_cm(&ctx.client, namespace, &job_name).await;
                 Ok(None)
             }
             None => Ok(Some(Action::requeue(REQUEUE_RUNNING))),
@@ -888,14 +895,6 @@ async fn has_active_maintenance_job(job_api: &Api<Job>, cr_name: &str) -> Result
         .list(&ListParams::default().labels(&selector))
         .await?;
     Ok(jobs.items.iter().any(|j| job_terminal_state(j).is_none()))
-}
-
-/// Best-effort delete of a per-slot work-spec ConfigMap once its Job is done.
-async fn delete_work_spec_cm(ctx: &Context, namespace: &str, name: &str) {
-    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-    if let Err(e) = api.delete(name, &DeleteParams::default()).await {
-        tracing::debug!(error = %e, configmap = %name, "work-spec ConfigMap cleanup failed (ignored)");
-    }
 }
 
 /// Patch the single `LeaseOwned` condition only when its status/reason actually

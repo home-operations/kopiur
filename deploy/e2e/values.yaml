@@ -81,6 +81,15 @@ extraVolumeMounts:
   - name: ro-repo
     mountPath: /ro-repo
 
+# Run the orphaned work-spec ConfigMap sweep on a fast cadence so crates/e2e
+# tests/leak_cleanup.rs can observe it in-test (production defaults: 6h
+# interval, 1h min-age). Root extraEnv = controller env (chart flatten, #203).
+extraEnv:
+  - name: KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS
+    value: "15"
+  - name: KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS
+    value: "30"
+
 # Exercise the probe passthrough: a retuned readiness probe (faster first check)
 # proves values-driven probes render and the pod still goes Ready.
 readinessProbe:

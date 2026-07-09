@@ -296,6 +296,29 @@ pub async fn wait_for_job(jobs: &Api<Job>, name: &str) -> Job {
     .unwrap_or_else(|_| panic!("mover Job {name} should be created"))
 }
 
+/// Wait for a mover run's work-spec `ConfigMap` and return it. The right sync
+/// point for asserting the controller→mover work-spec contract: the ConfigMap
+/// is applied BEFORE its same-named Job and deleted only after the Job is
+/// observed terminal (the ConfigMap-leak fix) — so, unlike syncing on the Job
+/// (which outlives the ConfigMap by its TTL), a poll from run creation observes
+/// it for at least the whole pod lifetime. A sub-second poll makes even an
+/// implausibly fast create→run→reap cycle (pod startup alone takes seconds)
+/// unable to slip between two samples.
+#[allow(dead_code)] // each test binary compiles `common` separately; not all use it
+pub async fn wait_for_work_spec_cm(
+    cms: &Api<k8s_openapi::api::core::v1::ConfigMap>,
+    name: &str,
+) -> k8s_openapi::api::core::v1::ConfigMap {
+    wait_until(
+        &format!("work-spec ConfigMap {name} created"),
+        default_timeout(),
+        std::time::Duration::from_millis(500),
+        || async { cms.get_opt(name).await },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("work-spec ConfigMap {name} should be created"))
+}
+
 /// The mover container's container-level `securityContext` from a Job's pod template.
 pub fn job_container_sc(job: &Job) -> Option<k8s_openapi::api::core::v1::SecurityContext> {
     job.spec

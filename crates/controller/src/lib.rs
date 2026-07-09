@@ -25,6 +25,7 @@ pub mod snapshot;
 pub mod snapshot_policy;
 pub mod snapshot_schedule;
 mod startup;
+pub mod sweep;
 pub mod verification;
 pub mod watch;
 pub mod webhook_tls;

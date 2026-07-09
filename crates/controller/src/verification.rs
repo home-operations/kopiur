@@ -354,10 +354,24 @@ pub async fn verify_step(
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped lastVerified; sleep until the next slot.
-            Some(true) => Ok(Some(
-                next_verify_wakeup(verification, &seed, Some(now), now, repo_tz).min(REQUEUE_CAP),
-            )),
-            Some(false) => Ok(Some(REQUEUE_FAILED)),
+            // Drop the per-slot work-spec ConfigMap now — it is owned by the
+            // long-lived SnapshotPolicy, so left alone one accumulates per slot,
+            // forever. The Job stays until its TTL: it is the slot-handled
+            // marker (deleting it early would re-fire the slot).
+            Some(true) => {
+                io::reap_work_spec_cm(&ctx.client, namespace, &job_name).await;
+                Ok(Some(
+                    next_verify_wakeup(verification, &seed, Some(now), now, repo_tz)
+                        .min(REQUEUE_CAP),
+                ))
+            }
+            // Failure: same CM reap (per-slot names mean failed slots accumulate
+            // too). The failed Job lingers to its TTL as the bounded-retry
+            // backoff; the retry re-spawn recreates the ConfigMap.
+            Some(false) => {
+                io::reap_work_spec_cm(&ctx.client, namespace, &job_name).await;
+                Ok(Some(REQUEUE_FAILED))
+            }
             None => Ok(Some(REQUEUE_RUNNING)),
         },
         None => {

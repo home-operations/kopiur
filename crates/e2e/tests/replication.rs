@@ -86,21 +86,32 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
     let selector = format!(
         "app.kubernetes.io/component=replication,kopiur.home-operations.com/replication={name}"
     );
-    let job_name = wait_until(
-        "a replication mover Job is created",
+    // The controller deletes a slot's work-spec ConfigMap once it observes the
+    // Job terminal (the ConfigMap-leak fix), so wait for a (Job, ConfigMap)
+    // PAIR: a pending/running slot always has both, and the every-minute cron
+    // keeps spawning fresh pairs.
+    let cm = wait_until(
+        "a replication mover Job with a live work-spec ConfigMap",
         default_timeout(),
         poll_interval(),
         || async {
-            let list = jobs.list(&ListParams::default().labels(&selector)).await?;
-            Ok(list.items.into_iter().find_map(|j| j.metadata.name))
+            for job in jobs
+                .list(&ListParams::default().labels(&selector))
+                .await?
+                .items
+            {
+                let Some(job_name) = job.metadata.name else {
+                    continue;
+                };
+                if let Some(cm) = cms.get_opt(&job_name).await? {
+                    return Ok(Some(cm));
+                }
+            }
+            Ok(None)
         },
     )
     .await
-    .expect("a replication mover Job should be created");
-    let cm = cms
-        .get(&job_name)
-        .await
-        .expect("replication work-spec ConfigMap");
+    .expect("a replication mover Job should be created with its work-spec ConfigMap");
     let spec_json = cm
         .data
         .as_ref()
@@ -155,6 +166,37 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
         count >= 1,
         "the destination repository must hold the mirrored snapshot, got {count}"
     );
+
+    // Leak guard (the "605 ConfigMaps" fix): a finished slot's work-spec
+    // ConfigMap is reaped once the controller observes its Job terminal — the
+    // per-slot names would otherwise accumulate one ConfigMap per slot on the
+    // long-lived RepositoryReplication CR, forever. The Job lingers to its TTL.
+    wait_until(
+        "a terminal replication Job with its work-spec ConfigMap reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            for job in jobs
+                .list(&ListParams::default().labels(&selector))
+                .await?
+                .items
+            {
+                let terminal = job
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.succeeded.unwrap_or(0) >= 1);
+                let Some(job_name) = job.metadata.name else {
+                    continue;
+                };
+                if terminal && cms.get_opt(&job_name).await?.is_none() {
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .expect("a finished replication slot's work-spec ConfigMap must be reaped (leak guard)");
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
 }

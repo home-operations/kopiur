@@ -67,6 +67,7 @@ pub struct Metrics {
     snapshots_completed: Counter<u64>,
     snapshot_deletion_failures: Counter<u64>,
     orphaned_snapshots: Counter<u64>,
+    work_spec_cms_swept: Counter<u64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
@@ -160,6 +161,13 @@ impl Metrics {
                 "Total snapshots orphaned (Orphan policy or skip-snapshot-cleanup annotation).",
             )
             .build();
+        let work_spec_cms_swept = m
+            .u64_counter("kopiur_work_spec_cms_swept")
+            .with_description(
+                "Total orphaned mover work-spec ConfigMaps deleted by the periodic sweep \
+                 (ConfigMaps whose mover Job was already TTL-reaped).",
+            )
+            .build();
         let schedule_backups_created = m
             .u64_counter("kopiur_schedule_snapshots_created")
             .with_description("Total Snapshot CRs created by a SnapshotSchedule.")
@@ -231,6 +239,7 @@ impl Metrics {
             snapshots_completed,
             snapshot_deletion_failures,
             orphaned_snapshots,
+            work_spec_cms_swept,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
@@ -582,6 +591,11 @@ impl Metrics {
     pub fn inc_orphaned_snapshot(&self, ns: &str) {
         self.orphaned_snapshots
             .add(1, &[KeyValue::new("namespace", ns.to_string())]);
+    }
+
+    /// Count `n` orphaned work-spec ConfigMaps deleted by one sweep pass.
+    pub fn inc_work_spec_cms_swept(&self, n: u64) {
+        self.work_spec_cms_swept.add(n, &[]);
     }
 
     /// Count a Snapshot CR created by a SnapshotSchedule.

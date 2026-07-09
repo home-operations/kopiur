@@ -143,6 +143,21 @@ pub const RESTORE_POPULATED_REASON: &str = "RestoreSucceeded";
 /// absent from the workload namespace — `False` carries the actionable message
 /// (which Secret, which namespace, why, and how to fix). ADR §4.12.
 pub const CREDENTIALS_AVAILABLE_CONDITION: &str = "CredentialsAvailable";
+/// `Snapshot` condition tracking kopia-side pin reconciliation (ADR-0005 §13(c)).
+/// `True`/`False` mirrors `status.pinned` once a SnapshotPin mover Job ran;
+/// `Unknown` with reason `PinJobRunning` while one is in flight. Named for the
+/// state (like `Ready`/`LeaseOwned`). Doubles as the durable "a pin mover was
+/// ever spawned" marker that gates the per-reconcile pin-Job lookup — never
+/// remove it once set.
+pub const PINNED_CONDITION: &str = "Pinned";
+/// `reason` for [`PINNED_CONDITION`] = `False`: the SnapshotPin mover Job failed.
+pub const PIN_JOB_FAILED_REASON: &str = "PinJobFailed";
+/// Annotation stamped on a `{name}-pin` mover Job recording the pin state it
+/// was spawned to APPLY (`"true"` = pin, `"false"` = unpin). The reconciler
+/// consumes a terminal pin Job by this direction — never by the currently
+/// desired `spec.pin` — so a stale Job can't satisfy the opposite toggle and a
+/// pin that completed after a mid-flight spec flip is still recorded.
+pub const PIN_TARGET_ANNOTATION: &str = "kopiur.home-operations.com/pin-target";
 /// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False`.
 pub const MISSING_CREDENTIALS_REASON: &str = "MissingCredentialsSecret";
 /// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False` when

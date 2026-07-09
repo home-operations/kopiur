@@ -171,6 +171,10 @@ same `logTail`/`failure` fields appear on a failed `Restore`.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
 
+/// note | The Job stays, the ConfigMap doesn't
+A finished run's mover **Job** (and its pod logs, as above) sticks around until its `ttlSecondsAfterFinished` (default 1h). The run's **work-spec ConfigMap** is deleted as soon as the run finishes — it only carried the instructions the controller handed the mover, which are derived from your CRs, so there is nothing in it to debug. If you don't see per-run ConfigMaps anymore: that's the fix for the leak where one accumulated per run, forever. See [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
+///
+
 ## Backup `Succeeded` but is **incomplete** (`filesFailed > 0`)
 
 By default an unreadable file is **fatal** — the backup fails loudly with `PermissionDenied` (above), so nothing is silent. But if you set an `errorHandling.ignoreFileErrors`/`ignoreDirErrors` policy, kopia **completes** the snapshot while *skipping* the files it couldn't read. Kopiur surfaces that so it isn't silent: the excluded count rides on `status.stats.filesFailed`, and the controller sets `SecurityContextCompatible=False` + a Warning Event.

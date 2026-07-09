@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::DeleteParams;
 use kube::runtime::controller::Action;
 use kube::{Api, Resource, ResourceExt};
 
@@ -639,15 +638,7 @@ async fn bootstrap_via_mover(
                     )
                 {
                     tracing::debug!(repo = %name, "recycling finished bootstrap Job for a catalog refresh");
-                    job_api
-                        .delete(&job_name, &DeleteParams::background())
-                        .await?;
-                    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-                    match cm_api.delete(&job_name, &DeleteParams::default()).await {
-                        Ok(_) => {}
-                        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-                        Err(e) => return Err(Error::Kube(e)),
-                    }
+                    io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
                 finalize_bootstrap(
@@ -1205,19 +1196,7 @@ async fn finalize_probe_failure(
 /// kube TTL controller may have reaped it first). Used to consume a probe Job
 /// exactly once.
 async fn delete_bootstrap_job(ctx: &Context, namespace: &str, job_name: &str) -> Result<()> {
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    match job_api.delete(job_name, &DeleteParams::background()).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-        Err(e) => return Err(Error::Kube(e)),
-    }
-    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-    match cm_api.delete(job_name, &DeleteParams::default()).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-        Err(e) => return Err(Error::Kube(e)),
-    }
-    Ok(())
+    io::delete_mover_run(&ctx.client, namespace, job_name).await
 }
 
 /// The steady-state requeue for a `Repository`, shortened to the health-probe

@@ -13,12 +13,11 @@ mod common;
 
 use common::{
     cr, ensure_repo, observed_snapshot_count, repository_json, snapshot_json, snapshot_policy_json,
-    wait_for_job, wait_phase,
+    wait_for_work_spec_cm, wait_phase,
 };
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 
-use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
@@ -168,10 +167,11 @@ async fn compression_and_upload_knobs_reach_the_mover_contract() {
         .await;
 
     // The work-spec ConfigMap (same name as the mover Job) carries the knobs.
-    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = wait_for_job(&jobs, "e2e-knobs").await;
+    // Sync on the ConfigMap itself, not the Job: the ConfigMap is applied
+    // BEFORE the Job and deleted only after the Job is observed terminal (the
+    // ConfigMap-leak fix), so this read can never race the reap.
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = cms.get("e2e-knobs").await.expect("work-spec ConfigMap");
+    let cm = wait_for_work_spec_cm(&cms, "e2e-knobs").await;
     let spec_json = cm
         .data
         .as_ref()
@@ -259,13 +259,8 @@ async fn snapshot_create_knobs_reach_the_mover_contract() {
     // The work-spec ConfigMap (same name as the mover Job) carries all three
     // knobs directly on `operation.snapshot` — NOT under `.policy` (the
     // `policy set` args), proving the recipe/invocation split holds end to end.
-    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = wait_for_job(&jobs, "e2e-create-knobs").await;
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = cms
-        .get("e2e-create-knobs")
-        .await
-        .expect("work-spec ConfigMap");
+    let cm = wait_for_work_spec_cm(&cms, "e2e-create-knobs").await;
     let spec_json = cm
         .data
         .as_ref()

@@ -134,12 +134,21 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped status; sleep until the next slot.
-            Some(true) => Ok(Action::requeue(cap(next_wakeup(
-                repl,
-                now,
-                Some(slot),
-                repo_tz,
-            )))),
+            // Drop the per-slot work-spec ConfigMap now — it is owned by the
+            // long-lived RepositoryReplication CR, so left alone one accumulates
+            // per slot, forever. The Job stays until its TTL: it is the
+            // slot-handled marker (deleting it early would re-fire the slot).
+            Some(true) => {
+                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
+                Ok(Action::requeue(cap(next_wakeup(
+                    repl,
+                    now,
+                    Some(slot),
+                    repo_tz,
+                ))))
+            }
+            // Failure: same CM reap. The failed Job lingers to its TTL as the
+            // bounded-retry backoff; the retry re-spawn recreates the ConfigMap.
             Some(false) => {
                 patch_ready_if_changed(
                     &api,
@@ -151,6 +160,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
                     Some("Failed"),
                 )
                 .await?;
+                io::reap_work_spec_cm(&ctx.client, &namespace, &job_name).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
             None => Ok(Action::requeue(REQUEUE_RUNNING)),

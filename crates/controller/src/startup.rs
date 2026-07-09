@@ -20,6 +20,7 @@ use crate::controllers::{scoped_api, spawn_all};
 use crate::http::serve_http;
 use crate::leader;
 use crate::metrics::Metrics;
+use crate::sweep;
 use crate::webhook_tls;
 
 /// Resolve the effective streaming-list setting against the live apiserver.
@@ -242,6 +243,18 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // resolve it here: on a server that predates WatchList (beta, on by default
     // from 1.32) we force paged lists regardless of config.
     let streaming_lists = effective_streaming_lists(&client, config.streaming_lists).await;
+
+    // Backstop GC for mover work-spec ConfigMaps whose Job is already gone
+    // (TTL-reaped before the reconciler observed it, or left behind by operator
+    // versions that never deleted them). Leader-only, like everything below the
+    // election gate — a single sweeping writer.
+    sweep::spawn_sweep(
+        client.clone(),
+        config.watch_scope.clone(),
+        metrics.clone(),
+        config.work_spec_sweep_interval_secs,
+        config.work_spec_sweep_min_age_secs,
+    );
 
     let controllers = spawn_all(
         client.clone(),

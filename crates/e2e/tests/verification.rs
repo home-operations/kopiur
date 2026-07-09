@@ -39,23 +39,31 @@ use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wai
 /// name as the Job — `io::apply_mover_objects`) rather than a name built here.
 async fn verify_work_spec_json(client: &kube::Client, selector: &str) -> serde_json::Value {
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let job = wait_until(
-        "verify mover Job created",
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    // The controller deletes a slot's work-spec ConfigMap once it observes the
+    // Job terminal (the ConfigMap-leak fix), so a finished slot's Job may
+    // linger (TTL) with no ConfigMap — wait for a (Job, ConfigMap) PAIR: a
+    // pending/running slot always has both, and the every-minute cron keeps
+    // spawning fresh pairs.
+    let cm = wait_until(
+        "verify mover Job with a live work-spec ConfigMap",
         default_timeout(),
         poll_interval(),
         || async {
             let lp = ListParams::default().labels(selector);
-            Ok(jobs.list(&lp).await?.items.into_iter().next())
+            for job in jobs.list(&lp).await?.items {
+                let Some(job_name) = job.metadata.name else {
+                    continue;
+                };
+                if let Some(cm) = cms.get_opt(&job_name).await? {
+                    return Ok(Some(cm));
+                }
+            }
+            Ok(None)
         },
     )
     .await
-    .expect("a verify Job should be spawned");
-    let job_name = job.metadata.name.expect("Job has a name");
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let cm = cms
-        .get(&job_name)
-        .await
-        .unwrap_or_else(|_| panic!("work-spec ConfigMap {job_name}"));
+    .expect("a verify Job should be spawned with its work-spec ConfigMap");
     let spec_json = cm
         .data
         .as_ref()
@@ -160,6 +168,39 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
         Some(1),
         "verification.quick.maxErrors must reach the mover contract; quick: {quick}"
     );
+
+    // Leak guard (the "605 ConfigMaps" fix): a finished slot's work-spec
+    // ConfigMap is reaped once the controller observes its Job terminal — the
+    // per-slot names would otherwise accumulate one ConfigMap per slot on the
+    // long-lived SnapshotPolicy, forever. The Job itself lingers to its TTL.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "a terminal verify Job with its work-spec ConfigMap reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let lp = ListParams::default().labels(
+                "app.kubernetes.io/component=verify,\
+                 kopiur.home-operations.com/verify=e2e-verify-policy",
+            );
+            for job in jobs.list(&lp).await?.items {
+                let terminal = job
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.succeeded.unwrap_or(0) >= 1);
+                let Some(job_name) = job.metadata.name else {
+                    continue;
+                };
+                if terminal && cms.get_opt(&job_name).await?.is_none() {
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .expect("a finished verify slot's work-spec ConfigMap must be reaped (leak guard)");
 }
 
 /// Deep verification (ADR-0005 §4): a `SnapshotPolicy.spec.verification.deep` drives

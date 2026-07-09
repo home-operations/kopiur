@@ -227,6 +227,21 @@ async fn workload_identity_s3_full_pipeline_without_static_keys() {
         )
         .await
         .expect("create Snapshot");
+    // Capture the work-spec ConfigMap BEFORE waiting for Succeeded: the
+    // controller deletes it as soon as it observes the mover Job terminal (the
+    // ConfigMap-leak fix), so reading it after the phase gate races the reap.
+    // The ConfigMap is applied before the Job, so polling from creation always
+    // observes it.
+    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let work_spec_cm = wait_until(
+        "work-spec ConfigMap e2e-wi-backup created",
+        default_timeout(),
+        poll_interval(),
+        || async { cms.get_opt("e2e-wi-backup").await },
+    )
+    .await
+    .expect("work-spec ConfigMap should be created");
     wait_phase(&backups, "e2e-wi-backup", "Succeeded")
         .await
         .expect("workload-identity Snapshot should reach Succeeded");
@@ -258,12 +273,6 @@ async fn workload_identity_s3_full_pipeline_without_static_keys() {
         vec![WI_SECRET.to_string()],
         "envFrom must carry ONLY the password Secret — no backend keys"
     );
-    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> =
-        Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let work_spec_cm = cms
-        .get("e2e-wi-backup")
-        .await
-        .expect("work-spec ConfigMap exists");
     let work_spec = work_spec_cm
         .data
         .as_ref()

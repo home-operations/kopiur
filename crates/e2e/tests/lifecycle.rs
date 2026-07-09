@@ -1194,6 +1194,26 @@ async fn wedged_mover_pod_fails_fast_instead_of_hanging() {
     .await
     .expect("the wedged Job must be deleted (cascade) so no orphaned pod survives");
 
+    // Leak guard (the "605 ConfigMaps" fix): the wedged teardown deletes the
+    // work-spec ConfigMap along with the Job — a bare Job delete used to
+    // orphan it until the Snapshot CR was deleted.
+    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "wedged mover's work-spec ConfigMap reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(cms
+                .get_opt("e2e-wedge-backup")
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the wedged run's work-spec ConfigMap must be deleted with its Job");
+
     // Cleanup.
     let _ = repos
         .delete("e2e-wedge-repo", &DeleteParams::default())
