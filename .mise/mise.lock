@@ -440,42 +440,44 @@ provenance = "github-attestations"
 version = "24.17.0"
 backend = "core:node"
 
-[tools.node.options]
-compile = "true"
-
 [tools.node."platforms.linux-arm64"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:faa0d59ba7fe7045c950ed09b190578fb8eee73e4358686d38fcc99ca58c1480"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-arm64.tar.gz"
 
 [tools.node."platforms.linux-arm64-musl"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:cc54f73a1a4108d9e325eb201d90b25eeab60edc92b2a13240b2877a74c596da"
+url = "https://unofficial-builds.nodejs.org/download/release/v24.17.0/node-v24.17.0-linux-arm64-musl.tar.gz"
 
 [tools.node."platforms.linux-x64"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f1265f"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz"
 
 [tools.node."platforms.linux-x64-musl"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:f884c958c0652f7cd0ea43fdc39dddd1a98456ea9b1adeca85964847e2e39fb0"
+url = "https://unofficial-builds.nodejs.org/download/release/v24.17.0/node-v24.17.0-linux-x64-musl.tar.gz"
 
 [tools.node."platforms.macos-arm64"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:4fc3266a3702eebc39cc37661cf4eeceeade307e242ab64e4d7ce7949197e11f"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-arm64.tar.gz"
 
 [tools.node."platforms.macos-x64"]
-checksum = "sha256:66a10e05fa7875ff1d7d669de405ea6ce8725f2352bd07550f520dea2f880825"
-url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0.tar.gz"
-install = "source"
+checksum = "sha256:80da552fe037290cb130e9dea590f5eeeb7aa450636f0c89ab41415511c1ec27"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-x64.tar.gz"
 
 [tools.node."platforms.windows-x64"]
 checksum = "sha256:f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda2528ab"
 url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-x64.zip"
+
+[[tools.node]]
+version = "24.17.0"
+backend = "core:node"
+
+[tools.node.options]
+compile = "true"
+
+[tools.node."platforms.linux-x64"]
+checksum = "sha256:e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f1265f"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz"
 
 [[tools.oxfmt]]
 version = "0.58.0"
