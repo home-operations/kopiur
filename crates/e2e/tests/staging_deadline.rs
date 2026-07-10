@@ -347,16 +347,47 @@ async fn recover_body(client: &kube::Client, prefix: &str) -> anyhow::Result<()>
         .await
         .context("mark VolumeSnapshot ready")?;
 
-    // Staging recovers: SourceStaged=True and the staged PVC exists. (The staged PVC
-    // can never bind — the VS has no real content — so the run pends at the mover;
-    // recovery of STAGING is the asserted success condition.)
-    wait_condition(&backups, prefix, "SourceStaged", "True")
-        .await
-        .context("staging must recover once the VolumeSnapshot is ready")?;
+    // Staging RECOVERS: the operator accepts the now-ready VS, drops the transient
+    // error, and advances PAST the VolumeSnapshot wait to provision the staged PVC.
+    // It cannot reach `SourceStaged=True` here: this synthetic VS has no backing
+    // VolumeSnapshotContent (the snapshot-controller is quiesced), so the CSI restore
+    // has nothing to copy and the staged PVC never binds — the #223 staged-PVC bind
+    // gate therefore holds `SourceStaged=False` with reason `WaitingForStagedPvcBind`.
+    // Reaching that reason IS the recovery signal for #198: pre-fix code terminally
+    // `Failed` the Snapshot on the transient error and never got past the VS wait.
+    // (A real snapshot binds and reaches `SourceStaged=True`; copy_methods.rs covers
+    // that path.)
+    wait_until(
+        "staging recovers past the transient VS error to the staged-PVC bind gate",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let advanced = status_json(&backups, prefix)
+                .await
+                .get("conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("SourceStaged"))
+                })
+                .is_some_and(|c| {
+                    c.get("status").and_then(|v| v.as_str()) == Some("False")
+                        && c.get("reason").and_then(|v| v.as_str())
+                            == Some("WaitingForStagedPvcBind")
+                });
+            Ok(advanced.then_some(()))
+        },
+    )
+    .await
+    .context("staging must recover past the transient VS error once the VS is ready")?;
+
+    // The recovery is real: the operator got past the VS wait and provisioned the
+    // staged PVC, and the transient error did NOT push the Snapshot terminal — it is
+    // still `Pending` (the whole point of #198).
     let staged = pvcs.get_opt(&format!("{prefix}-src")).await?;
     ensure!(
         staged.is_some(),
-        "the staged PVC must exist after staging recovered"
+        "the staged PVC must exist once staging recovered past the VS error"
     );
     let phase = status_json(&backups, prefix)
         .await
@@ -365,8 +396,9 @@ async fn recover_body(client: &kube::Client, prefix: &str) -> anyhow::Result<()>
         .unwrap_or_default()
         .to_string();
     ensure!(
-        phase != "Failed",
-        "the backup must not be Failed after staging recovered, got {phase:?}"
+        phase == "Pending",
+        "a recovered transient VS error must hold the Snapshot Pending (not Failed), \
+         got {phase:?}"
     );
     Ok(())
 }
