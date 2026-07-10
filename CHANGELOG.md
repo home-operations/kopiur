@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.7.1](https://github.com/home-operations/kopiur/compare/0.7.0...0.7.1) (2026-07-10)
+
+
+### Features
+
+* expose kopia CLI tuning flags across the CRDs (closes [#216](https://github.com/home-operations/kopiur/issues/216)) ([#221](https://github.com/home-operations/kopiur/issues/221)) ([6c83418](https://github.com/home-operations/kopiur/commit/6c83418db7a4498cafe5c14d32b9b7761cf0ff41))
+* staged-PVC storageClass/accessModes overrides + bind race fix (closes [#223](https://github.com/home-operations/kopiur/issues/223)) ([#228](https://github.com/home-operations/kopiur/issues/228)) ([416b68f](https://github.com/home-operations/kopiur/commit/416b68f55ea454b2646fb672a65854d0fd9d4d99))
+* **tests:** also update e2e ([9a6a685](https://github.com/home-operations/kopiur/commit/9a6a685710f45a5132946b89e502abec0a10269a))
+
+
+### Bug Fixes
+
+* reap mover work-spec ConfigMaps at Job-terminal + orphan sweep ([#225](https://github.com/home-operations/kopiur/issues/225)) ([01c30a0](https://github.com/home-operations/kopiur/commit/01c30a04811ad98a9594bd07cd9393b6192bcc29))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.7.0 manifest ([3baf990](https://github.com/home-operations/kopiur/commit/3baf9908862d77fb4af2a7a170133071e9172241))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.27 → 0.11.28) ([#217](https://github.com/home-operations/kopiur/issues/217)) ([1d7d8b1](https://github.com/home-operations/kopiur/commit/1d7d8b1aeb34fd164ee33d9372a40d23e25909af))
+* **mise:** Update tool helm (4.2.2 → 4.2.3) ([#227](https://github.com/home-operations/kopiur/issues/227)) ([b64f878](https://github.com/home-operations/kopiur/commit/b64f8788e8a885c9067590328a3dc011b79b7d6b))
+* **mise:** Update tool lefthook (2.1.9 → 2.1.10) ([#218](https://github.com/home-operations/kopiur/issues/218)) ([7e3a79a](https://github.com/home-operations/kopiur/commit/7e3a79ac87780e07ef6c9cdc38155347bb5d6fd6))
+
 ## [0.7.0](https://github.com/home-operations/kopiur/compare/0.6.0...0.7.0) (2026-07-07)
 
 
