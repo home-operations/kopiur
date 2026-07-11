@@ -20,10 +20,13 @@
 //!    Secret is absent, so the Snapshot stays `Pending` with `CredentialsAvailable=False`.
 //! 3. **Restore projection ON → Restore Completes.** A projection-on Snapshot seeds a
 //!    snapshot; a projection-on `Restore` then restores it into the creds-less
-//!    namespace, projecting its own `<restore>-creds-0` Secret.
+//!    namespace, projecting its own `<restore>-restore-creds-0` Secret.
 //! 4. **Maintenance projection ON → creds projected.** A projection-on `Maintenance`
-//!    for a shared `ClusterRepository` gets `<maint>-creds-0` projected (owned by
-//!    the Maintenance) so its mover can run `kopia maintenance`.
+//!    for a shared `ClusterRepository` gets `<maint>-maint-creds-0` projected (owned
+//!    by the Maintenance) so its mover can run `kopia maintenance`.
+//! 5. **Stable name across runs (#231 guard).** Two manual maintenance runs of ONE
+//!    Maintenance leave exactly ONE projected Secret, named for the CR — the per-run
+//!    naming of versions ≤ 0.7.1 minted a new copy per run, forever.
 //!
 //! Each projected Secret is asserted to be controller-owned by its consuming CR
 //! (the GC contract) — see `assert_projected_owned_by`.
@@ -31,7 +34,7 @@
 #![cfg(all(unix, feature = "e2e"))]
 
 use kube::Api;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
@@ -132,10 +135,17 @@ fn restore_json(
     })
 }
 
-/// A `Maintenance` due immediately whose `credentialProjection.enabled = project`
-/// decides whether the operator copies the repo's creds into this namespace for
-/// the maintenance mover.
-fn maintenance_json(ns: &str, name: &str, repo: &str, project: bool) -> serde_json::Value {
+/// A `Maintenance` whose `credentialProjection.enabled = project` decides whether
+/// the operator copies the repo's creds into this namespace for the maintenance
+/// mover. `quick_cron` schedules the quick tier — pass a far-future cron when only
+/// manual runs should drive movers (a deterministic run count).
+fn maintenance_json(
+    ns: &str,
+    name: &str,
+    repo: &str,
+    project: bool,
+    quick_cron: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
         "kind": "Maintenance",
@@ -143,7 +153,7 @@ fn maintenance_json(ns: &str, name: &str, repo: &str, project: bool) -> serde_js
         "spec": {
             "repository": { "kind": "ClusterRepository", "name": repo },
             "ownership": { "owner": "kopiur-e2e-proj", "takeoverPolicy": "Force" },
-            "schedule": { "quick": { "cron": "*/5 * * * *" }, "full": { "cron": "0 3 * * 0" } },
+            "schedule": { "quick": { "cron": quick_cron }, "full": { "cron": "0 3 * * 0" } },
             "credentialProjection": { "enabled": project }
         }
     })
@@ -151,10 +161,10 @@ fn maintenance_json(ns: &str, name: &str, repo: &str, project: bool) -> serde_js
 
 /// Wait for a kopiur-managed projected credential Secret in `ns` that is
 /// controller-owned by the consuming CR `owner_kind`/`owner_name` and carries the
-/// password key. Matched by **ownerReference**, not by name: a projected Secret is
-/// named after the per-run mover Job, which is the CR name for a Snapshot/Restore but
-/// `<cr>-<mode>-<slot>` for a Maintenance. The valid same-namespace controller
-/// ownerRef is the GC contract (Kubernetes reaps the copy with its owner).
+/// password key. Matched by **ownerReference**, not by name: the stable per-CR name
+/// varies by consumer kind (`<snapshot>-creds-N`, `<restore>-restore-creds-N`,
+/// `<maint>-maint-creds-N`). The valid same-namespace controller ownerRef is the GC
+/// contract (Kubernetes reaps the copy with its owner).
 async fn assert_projected_owned_by(
     client: &kube::Client,
     ns: &str,
@@ -579,7 +589,13 @@ async fn projection_enables_maintenance_in_a_namespace_without_creds() {
     maints
         .create(
             &PostParams::default(),
-            &cr(maintenance_json(PROJECTION_NS, maint, crepo, true)),
+            &cr(maintenance_json(
+                PROJECTION_NS,
+                maint,
+                crepo,
+                true,
+                "*/5 * * * *",
+            )),
         )
         .await
         .expect("create Maintenance with projection");
@@ -590,6 +606,137 @@ async fn projection_enables_maintenance_in_a_namespace_without_creds() {
     // on a missing Secret.
     assert_mover_rbac_minted(&client, PROJECTION_NS).await;
     assert_projected_owned_by(&client, PROJECTION_NS, "Maintenance", maint).await;
+
+    let _ = maints.delete(maint, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+}
+
+/// Request a manual maintenance run via the run-requested/run-mode annotations
+/// and wait until `status.manualRun` pins THIS request (`requestedAt` equality —
+/// the controller keys manual runs by the annotation value) with
+/// `phase: Succeeded`.
+async fn run_manual_maintenance(maints: &Api<Maintenance>, name: &str) {
+    let requested = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let patch = serde_json::json!({ "metadata": { "annotations": {
+        kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested,
+        kopiur_api::consts::RUN_MODE_ANNOTATION: "quick",
+    }}});
+    maints
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .expect("annotate Maintenance with a manual run request");
+    wait_until(
+        &format!("{name} manualRun {requested} Succeeded"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let status = status_json(maints, name).await;
+            let m = status.get("manualRun");
+            let done = m
+                .and_then(|m| m.get("requestedAt"))
+                .and_then(|v| v.as_str())
+                == Some(requested.as_str())
+                && m.and_then(|m| m.get("phase")).and_then(|v| v.as_str()) == Some("Succeeded");
+            Ok(done.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("manual maintenance run {requested} must succeed: {e}"));
+}
+
+/// **Stable projected-Secret name across runs (#231 regression guard).** Two manual
+/// maintenance runs of ONE projection-enabled `Maintenance` must leave exactly ONE
+/// projected Secret, named for the CR (`<maint>-maint-creds-0`) and carrying the
+/// stable-scope marker label. Operator versions ≤ 0.7.1 named the copy after each
+/// per-run mover Job, so this test observed TWO Secrets there — one per run,
+/// accumulating forever under the long-lived CR.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn maintenance_reuses_one_stable_projected_secret_across_runs() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio, Need::ProjectionNs])
+        .await
+        .expect("provision MinIO + projection namespace");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let maints: Api<Maintenance> = Api::namespaced(client.clone(), PROJECTION_NS);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), PROJECTION_NS);
+
+    let crepo = "e2e-proj-stable-crepo";
+    let maint = "e2e-proj-stable";
+
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(s3_cluster_repository_json(crepo, "kopiur-proj-stable")),
+        )
+        .await
+        .expect("create S3 ClusterRepository");
+    wait_phase(&crepos, crepo, "Ready")
+        .await
+        .expect("ClusterRepository should bootstrap to Ready");
+
+    // Far-future quick cron (Jan 1, 03:00): ONLY the manual runs below spawn
+    // movers, so the projected-Secret count is deterministic.
+    maints
+        .create(
+            &PostParams::default(),
+            &cr(maintenance_json(
+                PROJECTION_NS,
+                maint,
+                crepo,
+                true,
+                "0 3 1 1 *",
+            )),
+        )
+        .await
+        .expect("create Maintenance with projection and a far-future cron");
+
+    // Two sequential manual runs. Each projects/refreshes the credential copy.
+    run_manual_maintenance(&maints, maint).await;
+    run_manual_maintenance(&maints, maint).await;
+
+    // Exactly ONE projected Secret is controller-owned by this Maintenance —
+    // scoped by ownerRef, not namespace-wide (sibling scenarios share the
+    // namespace) — named for the CR and carrying the stable-scope marker.
+    let owned: Vec<Secret> = secrets
+        .list(&Default::default())
+        .await
+        .expect("list Secrets in the projection namespace")
+        .items
+        .into_iter()
+        .filter(|s| {
+            s.metadata.owner_references.as_ref().is_some_and(|os| {
+                os.iter().any(|o| {
+                    o.kind == "Maintenance" && o.name == maint && o.controller == Some(true)
+                })
+            })
+        })
+        .collect();
+    let names: Vec<_> = owned
+        .iter()
+        .map(|s| s.metadata.name.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![format!("{maint}-maint-creds-0")],
+        "two runs must converge on ONE stable projected Secret (pre-#231 versions \
+         left one per-run copy each)"
+    );
+    assert_eq!(
+        owned[0]
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kopiur.home-operations.com/creds-scope"))
+            .map(String::as_str),
+        Some("cr"),
+        "the stable copy must carry the creds-scope marker (what exempts it from \
+         the legacy sweep)"
+    );
 
     let _ = maints.delete(maint, &DeleteParams::default()).await;
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
