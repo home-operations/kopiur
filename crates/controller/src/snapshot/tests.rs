@@ -227,6 +227,33 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
     )
 }
 
+// --- delete_projection_enabled (cascade never projects, #231) ------------
+
+#[test]
+fn delete_projection_follows_the_recipe_in_the_snapshots_own_namespace() {
+    let mut policy = sample_policy();
+    policy.spec.credential_projection =
+        Some(kopiur_api::common::CredentialProjection { enabled: true });
+    assert!(delete_projection_enabled(false, Some(&policy)));
+    policy.spec.credential_projection = None;
+    assert!(!delete_projection_enabled(false, Some(&policy)));
+    assert!(
+        !delete_projection_enabled(false, None),
+        "gone recipe defaults off"
+    );
+}
+
+#[test]
+fn delete_projection_is_hard_off_for_the_cross_namespace_cascade() {
+    // Even a still-live recipe with the opt-in set must not project on the
+    // cascade path: the copy would be owned by the repository CR, which can be
+    // cluster-scoped — an invalid ownerRef on a namespaced Secret, never GC'd.
+    let mut policy = sample_policy();
+    policy.spec.credential_projection =
+        Some(kopiur_api::common::CredentialProjection { enabled: true });
+    assert!(!delete_projection_enabled(true, Some(&policy)));
+}
+
 // backend_to_repository_connect's exhaustive every-variant test moved with
 // the fn to `kopiur_mover::repo_meta`.
 
@@ -823,23 +850,6 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
         resolved.sources[0].source_path.as_deref(),
         Some(ws.identity.source_path.as_str())
     );
-}
-
-// --- capped_name (cross-namespace Job names stay valid DNS labels) -------
-
-#[test]
-fn capped_name_passes_short_names_through() {
-    assert_eq!(capped_name("app-nightly-delete"), "app-nightly-delete");
-}
-
-#[test]
-fn capped_name_caps_long_names_uniquely_and_deterministically() {
-    let long_a = format!("{}-snap-a-delete", "n".repeat(80));
-    let long_b = format!("{}-snap-b-delete", "n".repeat(80));
-    let a = capped_name(&long_a);
-    assert!(a.len() <= 63, "{} chars", a.len());
-    assert_eq!(a, capped_name(&long_a), "deterministic across reconciles");
-    assert_ne!(a, capped_name(&long_b), "distinct inputs stay distinct");
 }
 
 // --- effective_deletion_policy ------------------------------------------

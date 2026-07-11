@@ -174,6 +174,17 @@ pub const CREDENTIALS_PROJECTED_REASON: &str = "Projected";
 /// where it came from. Paired with the `app.kubernetes.io/managed-by=kopiur` +
 /// `app.kubernetes.io/component=credentials` labels.
 pub const PROJECTED_FROM_ANNOTATION: &str = "kopiur.home-operations.com/projected-from";
+/// Label marking a projected credential Secret as a **stable per-CR** copy
+/// (value [`CREDS_SCOPE_CR`]), i.e. named `{cr-prefix}-creds-{idx}` and
+/// refreshed in place on every run. Its ABSENCE on a Secret that carries
+/// [`PROJECTED_FROM_ANNOTATION`] identifies a legacy per-run copy (pre-#231
+/// operator versions named copies after per-slot mover Jobs, accumulating one
+/// per run forever) — exactly what the periodic sweep reaps.
+pub const CREDS_SCOPE_LABEL: &str = "kopiur.home-operations.com/creds-scope";
+/// The `app.kubernetes.io/component` value on projected credential Secrets.
+pub const CREDS_COMPONENT: &str = "credentials";
+/// The [`CREDS_SCOPE_LABEL`] value for stable per-CR projected copies.
+pub const CREDS_SCOPE_CR: &str = "cr";
 
 /// Helm value (chart `values.yaml`) that grants the operator `secrets` create/patch
 /// so credential projection (`spec.credentialProjection`) works. Surfaced verbatim in

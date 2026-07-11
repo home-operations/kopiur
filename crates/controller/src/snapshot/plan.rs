@@ -172,23 +172,7 @@ pub fn pinned_repository_ref(r: &RepositoryRef, config_ns: &str) -> RepositoryRe
     }
 }
 
-/// Cap a generated object name at the 63-character DNS-label limit while keeping
-/// it unique and deterministic: long names keep their leading 46 characters plus
-/// a stable FNV-1a hash of the full name. A cross-namespace cascade-delete Job
-/// embeds the source namespace in its name (two namespaces can each hold a
-/// `Snapshot` of the same name), which can exceed the limit.
-pub fn capped_name(full: &str) -> String {
-    if full.len() <= 63 {
-        return full.to_string();
-    }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in full.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let prefix: String = full.chars().take(46).collect();
-    format!("{}-{h:016x}", prefix.trim_end_matches('-'))
-}
+pub use crate::naming::capped_name;
 
 /// Build the `status.resolved` body frozen at run time (ADR §3.4): the
 /// normalized repository ref ([`pinned_repository_ref`]) plus the concrete

@@ -940,7 +940,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let creds = match io::resolve_mover_creds_for(
         &ctx.client,
         &namespace,
-        &name,
+        &io::CredsPrefix::snapshot_backup(&name),
         &owner,
         &repo,
         config
@@ -1652,6 +1652,23 @@ async fn resolve_repo_for_deletion(
     ))
 }
 
+/// The consumer projection opt-in for a SnapshotDelete mover. A cross-namespace
+/// cascade Job runs where the repository's canonical Secret lives, so it never
+/// needs projection — and honoring a (possibly still-live, mid-namespace-
+/// teardown) recipe's opt-in there would mint a copy owned by the repository
+/// CR, which can be cluster-scoped: an invalid ownerRef on a namespaced Secret
+/// is never GC'd, a permanent leak. Hardcoded off for the cascade; the
+/// same-namespace delete follows the recipe (absent recipe defaults to off).
+pub(crate) fn delete_projection_enabled(
+    cross_namespace: bool,
+    config: Option<&SnapshotPolicy>,
+) -> bool {
+    !cross_namespace
+        && config
+            .and_then(|c| c.spec.credential_projection.as_ref())
+            .is_some_and(|p| p.enabled)
+}
+
 /// Drive a SnapshotDelete mover Job for the deletion path. Creates the Job if
 /// absent; on terminal success removes the finalizer; on failure records a
 /// Deleting phase, bumps the failure metric, and requeues.
@@ -1743,20 +1760,14 @@ async fn delete_snapshot_via_job(
     // Resolve (and, when `spec.credentialProjection` is enabled, project) the mover's
     // credential Secret(s) into the Job's namespace before building the Job. Errors
     // propagate as MissingDependency (Transient) — this is the delete path, so we
-    // requeue rather than surface a CredentialsAvailable condition. The cascade
-    // placements need no projection by construction (the Job runs where the
-    // repository's canonical Secret lives), so a gone recipe defaulting the
-    // consumer opt-in to `false` is correct.
+    // requeue rather than surface a CredentialsAvailable condition.
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         job_ns,
-        &job_name,
+        &io::CredsPrefix::snapshot_delete(name),
         &owner,
         repo,
-        config
-            .as_ref()
-            .and_then(|c| c.spec.credential_projection.as_ref())
-            .is_some_and(|p| p.enabled),
+        delete_projection_enabled(cross_namespace, config.as_ref()),
         io::repo_kind_str(repo_ref.kind),
         &repo_ref.name,
     )
@@ -1930,7 +1941,7 @@ async fn reconcile_pin(
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         namespace,
-        &job_name,
+        &io::CredsPrefix::snapshot_pin(name),
         &owner,
         &repo,
         config

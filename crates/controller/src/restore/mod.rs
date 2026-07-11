@@ -1405,7 +1405,7 @@ async fn run_restore_mover(
     let creds = match io::resolve_mover_creds_for(
         &ctx.client,
         namespace,
-        name,
+        &io::CredsPrefix::restore(name),
         &owner,
         &repo,
         restore

@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod leader;
 pub mod maintenance;
 pub mod metrics;
+pub mod naming;
 pub mod repository;
 pub mod repository_replication;
 pub mod restore;
