@@ -138,10 +138,11 @@ pub const WEBHOOK_MUTATING_CONFIG_ENV: &str = "KOPIUR_WEBHOOK_MUTATING_CONFIG";
 /// chart's `webhook.tls.secretName` default.
 pub const DEFAULT_WEBHOOK_SECRET_NAME: &str = "kopiur-webhook-tls";
 
-/// Cadence (seconds) of the orphaned work-spec ConfigMap sweep
-/// ([`crate::sweep`]): reaps mover work-spec ConfigMaps whose Job is already
-/// gone (TTL-reaped before the reconciler could observe it, or left behind by
-/// operator versions that never deleted them). `0` disables the sweep.
+/// Cadence (seconds) of the orphaned-object sweep ([`crate::sweep`]): reaps
+/// mover work-spec ConfigMaps whose Job is already gone (TTL-reaped before the
+/// reconciler could observe it, or left behind by operator versions that never
+/// deleted them) AND legacy per-run projected credential Secrets left behind
+/// by pre-stable-naming versions (#231). `0` disables the sweep.
 /// Defaults to [`DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS`]. Reachable via the
 /// chart's `controller.extraEnv`.
 pub const WORK_SPEC_SWEEP_INTERVAL_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS";
@@ -151,9 +152,10 @@ pub const WORK_SPEC_SWEEP_INTERVAL_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_INTERVAL_
 /// the sweep is a backstop, so a slow cadence is ample.
 pub const DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
-/// Minimum age (seconds) a work-spec ConfigMap must reach before the sweep may
-/// reap it, closing the ConfigMap-applied-before-Job window (the ConfigMap and
-/// Job are applied in sequence) and any controller-crash-mid-spawn gap.
+/// Minimum age (seconds) a sweep victim (work-spec ConfigMap / legacy
+/// projected credential Secret) must reach before the sweep may reap it,
+/// closing the applied-before-Job window (the objects and the Job are applied
+/// in sequence) and any controller-crash-mid-spawn gap.
 /// Defaults to [`DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS`]; lower it only in
 /// tests. Reachable via the chart's `controller.extraEnv`.
 pub const WORK_SPEC_SWEEP_MIN_AGE_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS";

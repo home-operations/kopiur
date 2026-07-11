@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use common::{cr, wait_phase};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::Api;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 
@@ -616,4 +616,146 @@ async fn sweep_reaps_orphaned_work_spec_cm_but_not_a_live_runs() {
         .delete("e2e-sweep-live", &DeleteParams::background())
         .await;
     let _ = cms.delete("e2e-sweep-live", &DeleteParams::default()).await;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Legacy projected-Secret sweep (#231): a per-run projected credential copy
+//    with no Job is reaped; a stable-marked copy and a live run's copy survive.
+// ---------------------------------------------------------------------------
+
+/// The upgrade/backfill path for credential projection: versions ≤ 0.7.1 named
+/// projected copies after each mover run, leaking one Secret per run. The same
+/// periodic sweep (fast harness cadence, `KOPIUR_WORK_SPEC_SWEEP_*`) must reap
+/// exactly the marker-less, Job-less, aged copies — and nothing else. The
+/// harness enables `features.credentialProjection.enabled`, which now grants
+/// the `secrets` delete verb the sweep needs.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn sweep_reaps_legacy_projected_secret_but_not_stable_or_live_copies() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    let client = world.client().clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // The legacy shape a pre-#231 operator left behind: managed-by +
+    // component=credentials labels, projected-from annotation, NO scope marker,
+    // per-run name whose Job is long TTL-reaped.
+    let legacy_labels = serde_json::json!({
+        "app.kubernetes.io/managed-by": "kopiur",
+        "app.kubernetes.io/component": "credentials"
+    });
+    let projected_from =
+        serde_json::json!({ "kopiur.home-operations.com/projected-from": "kopiur-e2e/repo-pw" });
+    let orphan = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "e2e-sweep-legacy-q-1751831000-creds-0", "namespace": E2E_NAMESPACE,
+            "labels": legacy_labels, "annotations": projected_from
+        },
+        "stringData": { "KOPIA_PASSWORD": "stale-copy" }
+    });
+    let _ = secrets.create(&PostParams::default(), &cr(orphan)).await;
+
+    // Control 1: a STABLE copy (scope marker present) — the shape current
+    // versions refresh in place. Its age can't protect it (creationTimestamp
+    // never resets on re-apply); only the marker does. Must survive.
+    let mut stable_labels = legacy_labels.clone();
+    stable_labels["kopiur.home-operations.com/creds-scope"] = serde_json::json!("cr");
+    let stable = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "e2e-sweep-stable-maint-creds-0", "namespace": E2E_NAMESPACE,
+            "labels": stable_labels, "annotations": projected_from
+        },
+        "stringData": { "KOPIA_PASSWORD": "stable-copy" }
+    });
+    let _ = secrets.create(&PostParams::default(), &cr(stable)).await;
+
+    // Control 2: legacy shape whose copy a LIVE mover Job still loads via
+    // envFrom (the sweep's in-use guard reads the kopiur-labeled Jobs' pod
+    // templates — the Job must carry the label AND the envFrom reference,
+    // like every real mover Job does). Must survive.
+    let live = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "e2e-sweep-lively-creds-0", "namespace": E2E_NAMESPACE,
+            "labels": legacy_labels, "annotations": projected_from
+        },
+        "stringData": { "KOPIA_PASSWORD": "in-use-copy" }
+    });
+    let _ = secrets.create(&PostParams::default(), &cr(live)).await;
+    let live_job = serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": "e2e-sweep-lively", "namespace": E2E_NAMESPACE,
+            "labels": { "app.kubernetes.io/managed-by": "kopiur" }
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "sleep",
+                        "image": consts::BUSYBOX_IMAGE,
+                        "command": ["sh", "-c", "sleep 600"],
+                        "envFrom": [{ "secretRef": { "name": "e2e-sweep-lively-creds-0" } }]
+                    }]
+                }
+            }
+        }
+    });
+    let _ = jobs.create(&PostParams::default(), &cr(live_job)).await;
+
+    // The sweep reaps the orphan once it ages past the harness min-age (30s) —
+    // the wait must also absorb the sweep's fixed 60s first-pass delay after
+    // leader election plus the 15s cadence, all well inside default_timeout().
+    wait_until(
+        "legacy projected credential Secret swept",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(secrets
+                .get_opt("e2e-sweep-legacy-q-1751831000-creds-0")
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the sweep must delete an aged marker-less projected Secret with no Job");
+
+    // Both controls survived the pass that reaped the orphan (same age).
+    assert!(
+        secrets
+            .get_opt("e2e-sweep-stable-maint-creds-0")
+            .await
+            .expect("get stable control Secret")
+            .is_some(),
+        "the sweep deleted a STABLE (marker-labeled) projected Secret"
+    );
+    assert!(
+        secrets
+            .get_opt("e2e-sweep-lively-creds-0")
+            .await
+            .expect("get live control Secret")
+            .is_some(),
+        "the sweep deleted a projected Secret whose mover Job is still live"
+    );
+
+    // Cleanup.
+    let _ = jobs
+        .delete("e2e-sweep-lively", &DeleteParams::background())
+        .await;
+    let _ = secrets
+        .delete("e2e-sweep-lively-creds-0", &DeleteParams::default())
+        .await;
+    let _ = secrets
+        .delete("e2e-sweep-stable-maint-creds-0", &DeleteParams::default())
+        .await;
 }

@@ -40,6 +40,7 @@ use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
+use crate::naming::short_hash;
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
 
@@ -561,7 +562,7 @@ async fn spawn_maintenance_job(
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         namespace,
-        job_name,
+        &io::CredsPrefix::maintenance(cr_name),
         &owner,
         repo,
         maint
@@ -864,16 +865,6 @@ fn maintenance_job_name(cr: &str, mode: MaintenanceMode, slot: DateTime<Utc>) ->
         let trunc: String = cr.chars().take(keep).collect();
         format!("{trunc}-{hash}{suffix}")
     }
-}
-
-/// A short, stable (run-independent) 8-hex-char FNV-1a hash for name truncation.
-fn short_hash(s: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:08x}", (h & 0xffff_ffff))
 }
 
 /// Whether any non-terminal maintenance Job is owned by this `Maintenance` CR

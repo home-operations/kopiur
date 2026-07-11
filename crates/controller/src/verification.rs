@@ -41,6 +41,7 @@ use crate::io::{self, ResolvedRepository};
 use crate::jobs::{
     self, CacheVolume, DEEP_SCRATCH_PATH, JobLimits, MoverJobInputs, VolumeMountSpec,
 };
+use crate::naming::short_hash;
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
 
@@ -272,16 +273,6 @@ fn verify_job_name(policy: &str, tier: VerifyTierKind, slot: DateTime<Utc>) -> S
     }
 }
 
-/// A short, stable 8-hex-char FNV-1a hash for name truncation (matches maintenance).
-fn short_hash(s: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:08x}", (h & 0xffff_ffff))
-}
-
 /// The verification scheduling step, called by the `SnapshotPolicy` reconciler
 /// (after it has confirmed the policy is non-suspended and its Repository is Ready).
 /// Returns `Some(requeue)` when verification is configured (so the caller honors the
@@ -432,7 +423,7 @@ async fn spawn_verify_job(
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         namespace,
-        job_name,
+        &io::CredsPrefix::verification(policy_name),
         &owner,
         repo,
         config

@@ -711,7 +711,7 @@ async fn bootstrap_via_mover(
     let creds = io::resolve_mover_creds(
         &ctx.client,
         namespace,
-        &job_name,
+        &io::CredsPrefix::bootstrap(name),
         &owner,
         &refs,
         false, // consumer opt-in: never project on the bootstrap path

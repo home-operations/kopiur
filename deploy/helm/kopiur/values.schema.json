@@ -45,7 +45,7 @@
           "properties": {
             "enabled": {
               "default": false,
-              "description": "Grant the operator `secrets` create+patch so `spec.credentialProjection`\nworks: the operator copies a repository's credential Secret(s) into each mover\nJob's namespace (the chief win is a shared ClusterRepository whose Secret is\npinned to one namespace). SECURITY TRADE-OFF: `create` cannot be scoped to a\nSecret name, so the operator can write a Secret in any namespace it manages.",
+              "description": "Grant the operator `secrets` create+patch+delete so\n`spec.credentialProjection` works: the operator copies a repository's\ncredential Secret(s) into each mover Job's namespace (the chief win is a shared\nClusterRepository whose Secret is pinned to one namespace) and cleans its\ncopies up again (legacy-copy sweep, reap-on-shrink, reap-on-disable).\nSECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the\noperator can write a Secret in any namespace it manages.",
               "title": "enabled",
               "type": "boolean"
             }

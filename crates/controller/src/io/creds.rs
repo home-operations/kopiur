@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::Api;
 use kube::core::ObjectMeta;
+use kube::{Api, ResourceExt};
 
 use kopiur_api::common::RepositoryKind;
 
@@ -109,12 +109,70 @@ pub async fn ensure_creds_present(
     }
 }
 
-/// Deterministic name of the projected copy of the `idx`-th credential Secret for
-/// a mover Job named `job_name`. Per-Job and per-source so each copy is uniquely
-/// owned by (and garbage-collected with) its consuming CR, mirroring the per-Job
-/// work-spec ConfigMap. Distinct enough not to collide with a user-owned Secret.
-pub fn projected_creds_name(job_name: &str, idx: usize) -> String {
-    format!("{job_name}-creds-{idx}")
+/// Stable, per-CR prefix for projected credential Secret names
+/// (`{prefix}-creds-{idx}`).
+///
+/// Deliberately NOT constructible from an arbitrary string: every constructor
+/// takes only the consuming CR's name, so a per-run (slot-timestamped) mover
+/// Job name can never reach a Secret name again. Pre-#231 versions named
+/// copies after the Job, so every recurring run (Maintenance, verification)
+/// minted a NEW Secret owned by its long-lived CR with no delete path —
+/// unbounded accumulation of live credential copies, the sibling of the
+/// per-run work-spec ConfigMap leak (#224). With a stable name the force-SSA
+/// [`super::apply`] refreshes ONE object per (CR, source) in place, and the
+/// CR's ownerRef GC-reaps it. The kind slug keeps two CR kinds sharing a name
+/// (Snapshot `db` + Restore `db`) from fighting over one Secret; the residual
+/// user-crafted collision (a Snapshot literally named `db-restore`) is caught
+/// by the [`projected_ownership`] guard as an actionable error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredsPrefix(String);
+
+impl CredsPrefix {
+    /// Backup mover of a `Snapshot` — bare CR name, keeping the pre-#231
+    /// on-cluster Secret name (`{cr}-creds-{idx}`) on the common path.
+    pub fn snapshot_backup(cr: &str) -> Self {
+        Self(cr.to_string())
+    }
+    /// Restore mover of a `Restore` (its populate stage shares the copy).
+    pub fn restore(cr: &str) -> Self {
+        Self(format!("{cr}-restore"))
+    }
+    /// Pin/unpin mover of a `Snapshot`.
+    pub fn snapshot_pin(cr: &str) -> Self {
+        Self(format!("{cr}-pin"))
+    }
+    /// Deletion mover of a `Snapshot` (same-namespace placement only — the
+    /// cross-namespace cascade never projects, see `delete_snapshot_via_job`).
+    pub fn snapshot_delete(cr: &str) -> Self {
+        Self(format!("{cr}-delete"))
+    }
+    /// Maintenance mover of a `Maintenance` CR. Shared by cron quick/full and
+    /// manual runs: the per-CR single-flight gate means no concurrent writers,
+    /// and every mode resolves the same source Secrets.
+    pub fn maintenance(cr: &str) -> Self {
+        Self(format!("{cr}-maint"))
+    }
+    /// Verification mover of a `SnapshotPolicy` (both tiers; single-flight).
+    pub fn verification(policy: &str) -> Self {
+        Self(format!("{policy}-vfy"))
+    }
+    /// Replication mover of a `RepositoryReplication` (never projects today;
+    /// the slug exists so a future opt-in cannot collide — the cleanup GETs
+    /// under this prefix are guaranteed misses, an accepted per-run cost).
+    pub fn replication(cr: &str) -> Self {
+        Self(format!("{cr}-repl"))
+    }
+    /// Bootstrap mover of a `Repository` (never projects; same-namespace).
+    pub fn bootstrap(repo: &str) -> Self {
+        Self(format!("{repo}-bootstrap"))
+    }
+
+    /// The projected copy's Secret name for the `idx`-th credential source,
+    /// capped to a valid DNS label (long CR names truncate + hash over the
+    /// FULL name, so per-idx names stay distinct and deterministic).
+    pub fn secret_name(&self, idx: usize) -> String {
+        crate::naming::capped_name(&format!("{}-creds-{idx}", self.0))
+    }
 }
 
 /// Build a kopiur-managed copy of a source credential `Secret` for `job_ns`,
@@ -122,8 +180,10 @@ pub fn projected_creds_name(job_name: &str, idx: usize) -> String {
 /// owner and the copy are always in the same namespace, so the ownerRef is valid
 /// (cross-namespace ownerRefs are forbidden by Kubernetes). Pure (no IO) so the
 /// shape is unit-testable. Copies `data`/`stringData` verbatim and preserves the
-/// source `type`; records the source in [`PROJECTED_FROM_ANNOTATION`]. Not marked
-/// immutable — it is re-applied (refreshed from source) on every run.
+/// source `type`; records the source in [`PROJECTED_FROM_ANNOTATION`] and marks
+/// the copy stable-per-CR via [`crate::consts::CREDS_SCOPE_LABEL`] (its absence
+/// is how the sweep recognizes legacy per-run copies). Not marked immutable —
+/// it is re-applied (refreshed from source) on every run.
 pub fn build_projected_secret(
     name: &str,
     job_ns: &str,
@@ -134,12 +194,16 @@ pub fn build_projected_secret(
     let src_name = src.metadata.name.clone().unwrap_or_default();
     let labels = BTreeMap::from([
         (
-            "app.kubernetes.io/managed-by".to_string(),
-            "kopiur".to_string(),
+            crate::consts::MANAGED_BY_LABEL.to_string(),
+            crate::consts::MANAGED_BY_VALUE.to_string(),
         ),
         (
-            "app.kubernetes.io/component".to_string(),
-            "credentials".to_string(),
+            crate::consts::COMPONENT_LABEL.to_string(),
+            crate::consts::CREDS_COMPONENT.to_string(),
+        ),
+        (
+            crate::consts::CREDS_SCOPE_LABEL.to_string(),
+            crate::consts::CREDS_SCOPE_CR.to_string(),
         ),
     ]);
     let annotations = BTreeMap::from([(
@@ -159,6 +223,186 @@ pub fn build_projected_secret(
         string_data: src.string_data.clone(),
         type_: src.type_.clone().or_else(|| Some("Opaque".to_string())),
         immutable: None,
+    }
+}
+
+/// Who holds a would-be projection target name (the stable-name collision
+/// guard). Pure + exhaustive so the fail-closed decision is unit-tested.
+#[derive(Debug)]
+pub enum ProjectedOwnership<'a> {
+    /// No Secret of that name exists — free to apply.
+    Free,
+    /// Exists and its controller ownerRef uid matches the consuming CR — ours
+    /// to refresh.
+    OwnedBySelf,
+    /// Exists but is controlled by a different owner (`Some`) or carries no
+    /// controller ownerRef at all (`None`, e.g. a user-created Secret). Never
+    /// overwrite: force-SSA would silently flip the ownerRef and data.
+    OwnedByOther(Option<&'a OwnerReference>),
+}
+
+/// Classify an existing Secret at a projection target name against the
+/// consuming CR's uid. `None` (not found) is `Free` — a recreated same-name CR
+/// (new uid) must pass once GC reaped the old copy.
+pub fn projected_ownership<'a>(
+    existing: Option<&'a Secret>,
+    owner_uid: &str,
+) -> ProjectedOwnership<'a> {
+    let Some(secret) = existing else {
+        return ProjectedOwnership::Free;
+    };
+    let controller = secret
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|r| r.controller == Some(true));
+    match controller {
+        Some(r) if r.uid == owner_uid => ProjectedOwnership::OwnedBySelf,
+        other => ProjectedOwnership::OwnedByOther(other),
+    }
+}
+
+/// Actionable message when the stable projection name is already held by a
+/// different owner (two CRs whose names collide under the `-creds-` scheme,
+/// e.g. a Snapshot literally named `db-restore` next to a Restore `db`).
+/// The what/why/fix rule.
+fn projection_name_conflict_message(
+    proj_name: &str,
+    job_ns: &str,
+    existing: Option<&OwnerReference>,
+    ctx: &CredsContext,
+) -> String {
+    let holder = match existing {
+        Some(r) => format!("it is controlled by {} `{}`", r.kind, r.name),
+        None => "it carries no kopiur controller ownerReference, so it is \
+                 not managed by kopiur (likely user-created)"
+            .to_string(),
+    };
+    format!(
+        "cannot project credentials for {kind} `{name}`: the target Secret `{proj_name}` in \
+         namespace `{job_ns}` already exists and {holder}. Overwriting it would hand one \
+         consumer's runs another owner's (or the user's) Secret. Fix: rename one of the \
+         colliding resources, or delete the conflicting Secret if it is stale.",
+        kind = ctx.repo_kind,
+        name = ctx.repo_name,
+    )
+}
+
+/// Whether a Secret is a stable per-CR projected copy owned by `owner_uid` —
+/// the fail-closed gate for every resolve-path delete (index shrink, disabled
+/// projection). Requires BOTH the [`crate::consts::CREDS_SCOPE_LABEL`] marker
+/// (legacy per-run copies belong to the sweep, user Secrets to the user) AND a
+/// matching controller ownerRef. Pure so it is unit-tested.
+pub fn is_reapable_projected_copy(secret: &Secret, owner_uid: &str) -> bool {
+    let marked = secret.metadata.labels.as_ref().is_some_and(|l| {
+        l.get(crate::consts::CREDS_SCOPE_LABEL).map(String::as_str)
+            == Some(crate::consts::CREDS_SCOPE_CR)
+    });
+    marked
+        && matches!(
+            projected_ownership(Some(secret), owner_uid),
+            ProjectedOwnership::OwnedBySelf
+        )
+}
+
+/// Outcome of one best-effort reap of a projected copy (see [`reap_projected_copy`]).
+enum ReapSignal {
+    /// Deleted (or vanished/changed concurrently — treated as done).
+    Deleted,
+    /// No Secret of that name exists.
+    Absent,
+    /// Exists but is not ours to delete (no marker / different owner).
+    Kept,
+    /// The operator lacks the `secrets` delete verb (HTTP 403) — the chart's
+    /// projection grant predates the sweep. Stop trying; never fail the run.
+    Forbidden,
+}
+
+/// Delete of ONE stable projected copy, fail-closed: only a marker-labeled
+/// Secret controller-owned by `owner_uid` is deleted, via the sweep's shared
+/// precondition-pinned delete kernel (a concurrent re-apply bumps the RV and
+/// the delete 409s — the copy is spared and re-evaluated next run).
+/// 404/409/403 never propagate as errors.
+async fn reap_projected_copy(dst: &Api<Secret>, name: &str, owner_uid: &str) -> Result<ReapSignal> {
+    let Some(existing) = dst.get_opt(name).await? else {
+        return Ok(ReapSignal::Absent);
+    };
+    if !is_reapable_projected_copy(&existing, owner_uid) {
+        return Ok(ReapSignal::Kept);
+    }
+    use crate::sweep::DeleteOutcome;
+    match crate::sweep::delete_with_preconditions(
+        dst,
+        name,
+        existing.uid(),
+        existing.resource_version(),
+    )
+    .await?
+    {
+        DeleteOutcome::Deleted => Ok(ReapSignal::Deleted),
+        // Gone or changed since our GET: spared, re-evaluated next run.
+        DeleteOutcome::Spared => Ok(ReapSignal::Kept),
+        DeleteOutcome::Forbidden => Ok(ReapSignal::Forbidden),
+    }
+}
+
+/// [`reap_projected_copy`] made **infallible** for the cleanup paths: shared
+/// Deleted/Forbidden logging (the actionable 403 remediation text lives in
+/// exactly one place), and any other error is warned and swallowed — cleanup
+/// must never fail a run whose credentials already resolved. `what` names the
+/// copy's state for the log line (e.g. "stale", "leftover").
+async fn reap_quietly(
+    dst: &Api<Secret>,
+    name: &str,
+    owner_uid: &str,
+    job_ns: &str,
+    what: &str,
+) -> ReapSignal {
+    let signal = match reap_projected_copy(dst, name, owner_uid).await {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(secret = %name, namespace = %job_ns, what, error = %e,
+                "projected credentials copy cleanup failed (skipped; retried next run)");
+            return ReapSignal::Kept;
+        }
+    };
+    match signal {
+        ReapSignal::Deleted => {
+            tracing::info!(secret = %name, namespace = %job_ns, what,
+                "reaped projected credentials copy");
+        }
+        ReapSignal::Forbidden => {
+            tracing::warn!(secret = %name, namespace = %job_ns, what,
+                flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
+                "cannot reap projected credentials copy: the operator lacks the \
+                 `secrets` delete verb. Upgrade the Helm release so the credentialProjection \
+                 grant includes delete, or remove the Secret by hand");
+        }
+        ReapSignal::Absent | ReapSignal::Kept => {}
+    }
+    signal
+}
+
+/// Reap stale trailing projected copies after the source-Secret set shrank
+/// (e.g. a backend re-config folded the auth keys into the password Secret:
+/// 2 refs -> 1 leaves `{prefix}-creds-1` behind). Walks indices upward from
+/// `start_idx` until a name is absent, foreign, forbidden, or errored.
+/// Infallible by design — a failure here must never fail the run.
+async fn shrink_trailing_copies(
+    dst: &Api<Secret>,
+    prefix: &CredsPrefix,
+    start_idx: usize,
+    owner_uid: &str,
+    job_ns: &str,
+) {
+    for idx in start_idx.. {
+        let name = prefix.secret_name(idx);
+        match reap_quietly(dst, &name, owner_uid, job_ns, "stale (source set shrank)").await {
+            ReapSignal::Deleted => {}
+            ReapSignal::Absent | ReapSignal::Kept | ReapSignal::Forbidden => break,
+        }
     }
 }
 
@@ -224,6 +468,13 @@ pub struct MoverCreds {
 /// handling both the self-managed default and gated cross-namespace projection
 /// (ADR-0005 §8).
 ///
+/// `owner` MUST be a namespaced CR living in `job_ns`: the projected copy
+/// carries it as a controller ownerRef, and a cross-namespace (or
+/// cluster-scoped) owner on a namespaced Secret is invalid — never GC'd, a
+/// permanent credential leak. Every current caller passes the consuming CR
+/// resident in `job_ns` (the cascade delete path, whose owner is the
+/// repository CR, hardcodes projection off for exactly this reason).
+///
 /// `consumer_enabled` is the consumer opt-in (`credentialProjection.enabled` on the
 /// `SnapshotPolicy`/`Restore`); `owner_allowed` is the repository-owner allow
 /// (`ClusterRepository.credentialProjection.allowed`). Per-ref:
@@ -236,19 +487,26 @@ pub struct MoverCreds {
 ///   [`projection_decision`] — it requires BOTH `consumer_enabled` AND
 ///   `owner_allowed`, else it **fails closed** with an actionable
 ///   [`Error::MissingDependency`] naming the unmet gate. When permitted, read the
-///   source Secret and apply a per-Job copy (named [`projected_creds_name`], owned
-///   by `owner`) into `job_ns`. A missing source Secret / unresolvable source
-///   namespace yields an actionable error; a `403` on apply maps to the Helm RBAC
-///   toggle hint (degrade-not-crash — projection needs cluster-wide `secrets`
-///   create/patch, the third gate).
+///   source Secret and apply the **stable per-CR copy** (named
+///   [`CredsPrefix::secret_name`], owned by `owner`) into `job_ns`. A missing
+///   source Secret / unresolvable source namespace yields an actionable error; a
+///   `403` on apply maps to the Helm RBAC toggle hint (degrade-not-crash —
+///   projection needs cluster-wide `secrets` create/patch, the third gate).
 ///
-/// Re-reading the source and re-applying on every run keeps copies fresh, so there
-/// is no drift to reconcile and no source-watch to maintain.
+/// Re-reading the source and re-applying on every run keeps the copy fresh, so
+/// there is no drift to reconcile and no source-watch to maintain — and because
+/// the name is stable, every run converges on ONE Secret per (CR, source)
+/// instead of accumulating per-run copies (#231). Cleanup is uniform and
+/// best-effort (never fails the run): trailing indices beyond the current
+/// source set are always reaped first, and every ref this run does NOT project
+/// (same-namespace, projection disabled, unresolved source) reaps its own
+/// stable copy BEFORE verification — so a leftover plaintext copy never
+/// outlives the opt-in, the topology, or an in-progress migration.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_mover_creds(
     client: &kube::Client,
     job_ns: &str,
-    job_name: &str,
+    prefix: &CredsPrefix,
     owner: &OwnerReference,
     refs: &[CredsSecretRef],
     consumer_enabled: bool,
@@ -256,6 +514,10 @@ pub async fn resolve_mover_creds(
     ctx: &CredsContext<'_>,
 ) -> Result<MoverCreds> {
     let dst: Api<Secret> = Api::namespaced(client.clone(), job_ns);
+    // Trailing indices beyond the current source set are stale regardless of
+    // how each ref resolves below — reap them up front (best-effort), so even
+    // a run that errors on verification still converges.
+    shrink_trailing_copies(&dst, prefix, refs.len(), &owner.uid, job_ns).await;
     let mut names = Vec::with_capacity(refs.len());
     let mut projected = 0u64;
     for (idx, r) in refs.iter().enumerate() {
@@ -272,6 +534,14 @@ pub async fn resolve_mover_creds(
                         &r.name, ctx,
                     )));
                 }
+                reap_quietly(
+                    &dst,
+                    &prefix.secret_name(idx),
+                    &owner.uid,
+                    job_ns,
+                    "leftover (projection not in use)",
+                )
+                .await;
                 if dst.get_opt(&r.name).await?.is_none() {
                     return Err(Error::MissingDependency(missing_creds_message(
                         &r.name, job_ns, ctx,
@@ -285,6 +555,17 @@ pub async fn resolve_mover_creds(
         // nothing to copy across a trust boundary. Verify it is present — exactly the
         // self-managed path — and use its original name. No owner/consumer gate here.
         if src_ns == job_ns {
+            // A stable copy may linger from an earlier cross-namespace layout
+            // (the topology changed, not the opt-in) — reap it BEFORE the
+            // verify, so an incomplete migration still cleans up.
+            reap_quietly(
+                &dst,
+                &prefix.secret_name(idx),
+                &owner.uid,
+                job_ns,
+                "leftover (source is now same-namespace)",
+            )
+            .await;
             if dst.get_opt(&r.name).await?.is_none() {
                 return Err(Error::MissingDependency(missing_creds_message(
                     &r.name, job_ns, ctx,
@@ -298,6 +579,17 @@ pub async fn resolve_mover_creds(
         // themselves (e.g. a hand-copied ClusterRepository password). Verify it is
         // present in `job_ns` and use its name — never silently project without opt-in.
         if !consumer_enabled {
+            // Projection may have been enabled earlier: reap our leftover
+            // stable copy BEFORE the verify (an incomplete hand-migration must
+            // not leave the plaintext copy behind while this errors).
+            reap_quietly(
+                &dst,
+                &prefix.secret_name(idx),
+                &owner.uid,
+                job_ns,
+                "leftover (projection disabled)",
+            )
+            .await;
             if dst.get_opt(&r.name).await?.is_none() {
                 return Err(Error::MissingDependency(missing_creds_message(
                     &r.name, job_ns, ctx,
@@ -317,22 +609,69 @@ pub async fn resolve_mover_creds(
                 )));
             }
         }
-        // Permitted: project a per-Job copy owned by the consuming CR.
-        let src_api: Api<Secret> = Api::namespaced(client.clone(), src_ns);
-        let src = src_api.get_opt(&r.name).await?.ok_or_else(|| {
-            Error::MissingDependency(projection_source_missing_message(
-                &r.name, src_ns, job_ns, ctx,
-            ))
-        })?;
-        let proj_name = projected_creds_name(job_name, idx);
-        let secret = build_projected_secret(&proj_name, job_ns, owner.clone(), &src);
-        apply(&dst, &proj_name, &secret)
-            .await
-            .map_err(|e| map_projection_apply_error(e, &proj_name, job_ns))?;
-        names.push(proj_name);
+        // Permitted: project the stable per-CR copy owned by the consuming CR.
+        names
+            .push(project_one_ref(client, &dst, job_ns, prefix, idx, owner, r, src_ns, ctx).await?);
         projected += 1;
     }
     Ok(MoverCreds { names, projected })
+}
+
+/// Project ONE credential source Secret to its stable per-CR name in `job_ns`.
+///
+/// Guarded against stable-name collisions: the pre-apply GET fails closed when
+/// a different owner (or an unmanaged Secret) already holds the name — once a
+/// collision exists, every later run of BOTH parties errors actionably instead
+/// of force-SSA silently flipping the controller ownerRef back and forth. The
+/// post-apply check re-verifies the object our own apply returned; it cannot
+/// see a competing apply that lands after ours (the first-ever concurrent
+/// write between two colliding CRs is an accepted residual race — the very
+/// next run of the losing party trips the pre-apply guard), but it does catch
+/// same-manager anomalies where the server did not honor our ownerRef.
+#[allow(clippy::too_many_arguments)]
+async fn project_one_ref(
+    client: &kube::Client,
+    dst: &Api<Secret>,
+    job_ns: &str,
+    prefix: &CredsPrefix,
+    idx: usize,
+    owner: &OwnerReference,
+    r: &CredsSecretRef,
+    src_ns: &str,
+    ctx: &CredsContext<'_>,
+) -> Result<String> {
+    let proj_name = prefix.secret_name(idx);
+    let existing = dst.get_opt(&proj_name).await?;
+    match projected_ownership(existing.as_ref(), &owner.uid) {
+        // Absent, or already ours: safe to (re-)apply.
+        ProjectedOwnership::Free | ProjectedOwnership::OwnedBySelf => {}
+        ProjectedOwnership::OwnedByOther(holder) => {
+            return Err(Error::MissingDependency(projection_name_conflict_message(
+                &proj_name, job_ns, holder, ctx,
+            )));
+        }
+    }
+    let src_api: Api<Secret> = Api::namespaced(client.clone(), src_ns);
+    let src = src_api.get_opt(&r.name).await?.ok_or_else(|| {
+        Error::MissingDependency(projection_source_missing_message(
+            &r.name, src_ns, job_ns, ctx,
+        ))
+    })?;
+    let secret = build_projected_secret(&proj_name, job_ns, owner.clone(), &src);
+    let applied = apply(dst, &proj_name, &secret)
+        .await
+        .map_err(|e| map_projection_apply_error(e, &proj_name, job_ns))?;
+    match projected_ownership(Some(&applied), &owner.uid) {
+        ProjectedOwnership::OwnedBySelf => Ok(proj_name),
+        // Unreachable for `Some(&applied)`, but the holder-`None` message
+        // ("not managed by kopiur") is exactly right if it ever fires.
+        ProjectedOwnership::Free => Err(Error::MissingDependency(
+            projection_name_conflict_message(&proj_name, job_ns, None, ctx),
+        )),
+        ProjectedOwnership::OwnedByOther(holder) => Err(Error::MissingDependency(
+            projection_name_conflict_message(&proj_name, job_ns, holder, ctx),
+        )),
+    }
 }
 
 /// Resolve the mover Job's `envFrom` credential Secret names for a consumer run
@@ -340,7 +679,8 @@ pub async fn resolve_mover_creds(
 /// [`resolve_mover_creds`] that derives the credential references (with their
 /// source namespaces) and the [`CredsContext`] from the repository. `owner` is the
 /// consuming CR's owner reference, applied to any projected Secret so GC reaps it
-/// with that CR.
+/// with that CR; `prefix` is that CR's stable [`CredsPrefix`], which names the
+/// copy (one per CR + source, refreshed in place — never per run).
 ///
 /// `consumer_enabled` is the consumer opt-in (`spec.credentialProjection.enabled` on
 /// the `SnapshotPolicy`/`Restore`/`Maintenance`); the owner gate
@@ -354,7 +694,7 @@ pub async fn resolve_mover_creds(
 pub async fn resolve_mover_creds_for(
     client: &kube::Client,
     job_ns: &str,
-    job_name: &str,
+    prefix: &CredsPrefix,
     owner: &OwnerReference,
     repo: &ResolvedRepository,
     consumer_enabled: bool,
@@ -376,7 +716,7 @@ pub async fn resolve_mover_creds_for(
     resolve_mover_creds(
         client,
         job_ns,
-        job_name,
+        prefix,
         owner,
         &refs,
         consumer_enabled,
@@ -558,15 +898,161 @@ mod tests {
     }
 
     #[test]
-    fn projected_name_is_per_job_and_index() {
+    fn creds_prefix_names_are_stable_and_kind_distinct() {
+        // Stable: constructors take only the CR name — no slot, mode, or
+        // timestamp can reach the Secret name, so recurring runs converge on
+        // one object per (CR, idx) instead of accumulating (#231).
+        let all = [
+            CredsPrefix::snapshot_backup("app").secret_name(0),
+            CredsPrefix::restore("app").secret_name(0),
+            CredsPrefix::snapshot_pin("app").secret_name(0),
+            CredsPrefix::snapshot_delete("app").secret_name(0),
+            CredsPrefix::maintenance("app").secret_name(0),
+            CredsPrefix::verification("app").secret_name(0),
+            CredsPrefix::replication("app").secret_name(0),
+            CredsPrefix::bootstrap("app").secret_name(0),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "kind slugs must be pairwise distinct");
+            }
+        }
+        // The common backup path keeps its pre-fix on-cluster name.
         assert_eq!(
-            projected_creds_name("nightly-1700", 0),
-            "nightly-1700-creds-0"
+            CredsPrefix::snapshot_backup("app").secret_name(0),
+            "app-creds-0"
         );
         assert_eq!(
-            projected_creds_name("nightly-1700", 1),
-            "nightly-1700-creds-1"
+            CredsPrefix::maintenance("app").secret_name(0),
+            "app-maint-creds-0"
         );
+        assert_eq!(
+            CredsPrefix::verification("nightly").secret_name(1),
+            "nightly-vfy-creds-1"
+        );
+        assert_eq!(
+            CredsPrefix::restore("app").secret_name(0),
+            "app-restore-creds-0"
+        );
+    }
+
+    #[test]
+    fn creds_prefix_caps_long_names_deterministically() {
+        let long = "n".repeat(80);
+        let a = CredsPrefix::maintenance(&long).secret_name(0);
+        assert!(a.len() <= 63, "{} chars", a.len());
+        assert_eq!(a, CredsPrefix::maintenance(&long).secret_name(0));
+        assert_ne!(a, CredsPrefix::maintenance(&long).secret_name(1));
+    }
+
+    // --- projected_ownership: the stable-name collision guard ----------------
+
+    fn secret_owned_by(uid: &str) -> Secret {
+        let mut o = owner("other");
+        o.uid = uid.into();
+        Secret {
+            metadata: ObjectMeta {
+                name: Some("app-creds-0".into()),
+                owner_references: Some(vec![o]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ownership_free_when_absent() {
+        assert!(matches!(
+            projected_ownership(None, "uid-123"),
+            ProjectedOwnership::Free
+        ));
+    }
+
+    #[test]
+    fn ownership_self_when_controller_uid_matches() {
+        let s = secret_owned_by("uid-123");
+        assert!(matches!(
+            projected_ownership(Some(&s), "uid-123"),
+            ProjectedOwnership::OwnedBySelf
+        ));
+    }
+
+    #[test]
+    fn ownership_other_when_uid_differs_or_controller_ref_missing() {
+        let s = secret_owned_by("uid-999");
+        assert!(matches!(
+            projected_ownership(Some(&s), "uid-123"),
+            ProjectedOwnership::OwnedByOther(Some(_))
+        ));
+        // A same-named Secret with NO controller ownerRef (e.g. a user-created
+        // one) must also fail closed — never overwrite it.
+        let bare = Secret {
+            metadata: ObjectMeta {
+                name: Some("app-creds-0".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            projected_ownership(Some(&bare), "uid-123"),
+            ProjectedOwnership::OwnedByOther(None)
+        ));
+    }
+
+    #[test]
+    fn name_conflict_message_names_both_owners() {
+        let mut other = owner("db");
+        other.kind = "Restore".into();
+        let msg = projection_name_conflict_message("db-creds-0", "team-a", Some(&other), &ctx());
+        // what
+        assert!(msg.contains("`db-creds-0`"));
+        assert!(msg.contains("`team-a`"));
+        // why: who owns it now, and who wanted it
+        assert!(msg.contains("Restore `db`"));
+        assert!(msg.contains("ClusterRepository `shared`"));
+        // fix
+        assert!(msg.contains("rename"));
+
+        let unowned = projection_name_conflict_message("db-creds-0", "team-a", None, &ctx());
+        assert!(unowned.contains("not managed by kopiur"));
+        // Guard the message class against mangled string continuations (a
+        // missing `\` embeds the source indentation as literal spaces).
+        assert!(
+            !msg.contains("  "),
+            "message must not embed space runs: {msg}"
+        );
+        assert!(
+            !unowned.contains("  "),
+            "message must not embed space runs: {unowned}"
+        );
+    }
+
+    // --- is_reapable_projected_copy: shrink/disable cleanup fail-closed gate --
+
+    #[test]
+    fn reapable_requires_marker_label_and_owner_uid() {
+        let src = Secret {
+            metadata: ObjectMeta {
+                name: Some("repo-pw".into()),
+                namespace: Some("kopiur-system".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ours = build_projected_secret("app-maint-creds-1", "team-a", owner("app"), &src);
+        assert!(is_reapable_projected_copy(&ours, "uid-123"));
+        // Different owner uid: not ours to delete.
+        assert!(!is_reapable_projected_copy(&ours, "uid-999"));
+        // No marker label (a legacy per-run copy, or a user Secret): never
+        // reaped by the resolve path — the sweep owns the legacy case.
+        let mut legacy = ours.clone();
+        legacy
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(crate::consts::CREDS_SCOPE_LABEL);
+        assert!(!is_reapable_projected_copy(&legacy, "uid-123"));
     }
 
     #[test]
@@ -610,6 +1096,14 @@ mod tests {
                 .get("app.kubernetes.io/component")
                 .map(String::as_str),
             Some("credentials")
+        );
+        // The scope marker distinguishes stable per-CR copies from legacy
+        // per-run ones, which the periodic sweep reaps (#231).
+        assert_eq!(
+            labels
+                .get(crate::consts::CREDS_SCOPE_LABEL)
+                .map(String::as_str),
+            Some(crate::consts::CREDS_SCOPE_CR)
         );
         let ann = s.metadata.annotations.as_ref().unwrap();
         assert_eq!(

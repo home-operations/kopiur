@@ -201,8 +201,14 @@ pub fn wi_rolebinding_name(wi_sa: &str) -> String {
     }
 }
 
-/// Stable 8-hex-char content hash for name truncation (same idiom as the
-/// maintenance/verification job names).
+/// 8-hex-char content hash for name truncation (same idiom as the
+/// maintenance/verification job names, which use `crate::naming::short_hash`).
+///
+/// Deliberately NOT consolidated onto `crate::naming::short_hash` (FNV-1a):
+/// this one predates it and uses `DefaultHasher` (SipHash), whose output is
+/// not guaranteed stable across Rust releases. Switching algorithms would
+/// rename any existing over-budget `kopiur-mover-wi-*` RoleBinding on upgrade
+/// and orphan the old one. Tracked as a follow-up (needs a migration story).
 fn short_hash(s: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

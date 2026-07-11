@@ -68,6 +68,7 @@ pub struct Metrics {
     snapshot_deletion_failures: Counter<u64>,
     orphaned_snapshots: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
+    projected_secrets_swept: Counter<u64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
@@ -168,6 +169,13 @@ impl Metrics {
                  (ConfigMaps whose mover Job was already TTL-reaped).",
             )
             .build();
+        let projected_secrets_swept = m
+            .u64_counter("kopiur_projected_secrets_swept")
+            .with_description(
+                "Total legacy per-run projected credential Secrets deleted by the periodic \
+                 sweep (pre-stable-naming copies whose mover Job is gone).",
+            )
+            .build();
         let schedule_backups_created = m
             .u64_counter("kopiur_schedule_snapshots_created")
             .with_description("Total Snapshot CRs created by a SnapshotSchedule.")
@@ -240,6 +248,7 @@ impl Metrics {
             snapshot_deletion_failures,
             orphaned_snapshots,
             work_spec_cms_swept,
+            projected_secrets_swept,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
@@ -596,6 +605,12 @@ impl Metrics {
     /// Count `n` orphaned work-spec ConfigMaps deleted by one sweep pass.
     pub fn inc_work_spec_cms_swept(&self, n: u64) {
         self.work_spec_cms_swept.add(n, &[]);
+    }
+
+    /// Count `n` legacy per-run projected credential Secrets deleted by one
+    /// sweep pass.
+    pub fn inc_projected_secrets_swept(&self, n: u64) {
+        self.projected_secrets_swept.add(n, &[]);
     }
 
     /// Count a Snapshot CR created by a SnapshotSchedule.
@@ -969,6 +984,8 @@ mod tests {
         m.record_reconcile("Snapshot", 0.1);
         m.record_error("Snapshot", "transient");
         m.inc_orphaned_snapshot("ns");
+        m.inc_work_spec_cms_swept(1);
+        m.inc_projected_secrets_swept(1);
         m.set_snapshot_verified("ns", "db", 1_700_000_000);
         m.set_repository_maintenance_configured("Repository", "ns", "nas", false);
 
@@ -995,6 +1012,11 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("kopiur_orphaned_snapshots_total"), "{text}");
+        assert!(text.contains("kopiur_work_spec_cms_swept_total"), "{text}");
+        assert!(
+            text.contains("kopiur_projected_secrets_swept_total"),
+            "{text}"
+        );
         assert!(text.contains("kopiur_resource_phase"), "{text}");
         assert!(text.contains("kopiur_snapshot_size_bytes"), "{text}");
         assert!(
