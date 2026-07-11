@@ -238,11 +238,13 @@ serviceAccount:
 # See docs/feature-permissions.md for the full mapping and security trade-offs.
 features:
   credentialProjection:
-    # -- Grant the operator `secrets` create+patch so `spec.credentialProjection`
-    # works: the operator copies a repository's credential Secret(s) into each mover
-    # Job's namespace (the chief win is a shared ClusterRepository whose Secret is
-    # pinned to one namespace). SECURITY TRADE-OFF: `create` cannot be scoped to a
-    # Secret name, so the operator can write a Secret in any namespace it manages.
+    # -- Grant the operator `secrets` create+patch+delete so
+    # `spec.credentialProjection` works: the operator copies a repository's
+    # credential Secret(s) into each mover Job's namespace (the chief win is a shared
+    # ClusterRepository whose Secret is pinned to one namespace) and cleans its
+    # copies up again (legacy-copy sweep, reap-on-shrink, reap-on-disable).
+    # SECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the
+    # operator can write a Secret in any namespace it manages.
     enabled: false
   kopiaUi:
     # -- Grant the operator `secrets` create+patch+delete so `spec.server` (the

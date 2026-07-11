@@ -71,13 +71,17 @@ rules:
   {{- if .Values.features.credentialProjection.enabled }}
   # Credential projection (spec.credentialProjection): SSA-copy the repository Secret
   # into each mover Job namespace. `create` cannot be resourceName-scoped (the
-  # authorizer can't match a name at create time) and the projected name is per-Job,
-  # so the grant is necessarily unscoped — a broader blast radius, hence the toggle.
-  # No `delete`: projected copies carry an ownerRef and are reaped by GC.
+  # authorizer can't match a name at create time) and the projected name embeds the
+  # consuming CR's name, so the grant is necessarily unscoped — a broader blast
+  # radius, hence the toggle. ownerRef GC reaps the copy with its CR in the steady
+  # state; `delete` backs the same feature's cleanup paths: the leader-only sweep of
+  # legacy per-run copies left by pre-stable-naming versions, reap-on-shrink when a
+  # backend re-config drops a source Secret, and reap-on-disable when the consumer
+  # turns projection off.
   - apiGroups: [""]
     resources:
       - secrets
-    verbs: [create, patch]
+    verbs: [create, patch, delete]
   {{- end }}
   {{- if .Values.features.kopiaUi.enabled }}
   # kopia web-UI server (spec.server): create-once the generated-auth Secret, SSA the

@@ -203,7 +203,7 @@ tests:
   # --- per-feature secrets-write gating (least privilege) --------------------
   #
   # Secrets READ is always granted. Secrets WRITE is split per opt-in feature:
-  #   * features.credentialProjection.enabled → [create, patch]
+  #   * features.credentialProjection.enabled → [create, patch, delete]
   #   * features.kopiaUi.enabled              → [create, patch, delete]
   # Both default OFF, so the chart only grants what's enabled (services +
   # deployments stay full-verbs — those are presence-driven, not gated here).
@@ -248,7 +248,7 @@ tests:
             resources: [deployments]
             verbs: [get, list, watch, create, update, patch, delete]
 
-  - it: "features.credentialProjection adds [create, patch] but not delete (ClusterRole)"
+  - it: "features.credentialProjection adds [create, patch, delete] (ClusterRole)"
     set:
       installScope: cluster
       webhook.enabled: false
@@ -261,14 +261,13 @@ tests:
             apiGroups: [""]
             resources: [secrets]
             verbs: [get, list, watch]
+      # delete backs the feature's own cleanup (legacy-copy sweep,
+      # reap-on-shrink, reap-on-disable) — see role comments. count: 1 keeps
+      # the differential guarantee the old notContains gave: the OTHER
+      # feature's identically-verbed rule must NOT render off its flag.
       - contains:
           path: rules
-          content:
-            apiGroups: [""]
-            resources: [secrets]
-            verbs: [create, patch]
-      - notContains:
-          path: rules
+          count: 1
           content:
             apiGroups: [""]
             resources: [secrets]
@@ -287,8 +286,10 @@ tests:
             apiGroups: [""]
             resources: [secrets]
             verbs: [get, list, watch]
+      # count: 1 — the credentialProjection rule must NOT render off its flag.
       - contains:
           path: rules
+          count: 1
           content:
             apiGroups: [""]
             resources: [secrets]
@@ -308,14 +309,10 @@ tests:
             apiGroups: [""]
             resources: [secrets]
             verbs: [get, list, watch]
+      # Both gated rules now carry identical verbs — assert both render.
       - contains:
           path: rules
-          content:
-            apiGroups: [""]
-            resources: [secrets]
-            verbs: [create, patch]
-      - contains:
-          path: rules
+          count: 2
           content:
             apiGroups: [""]
             resources: [secrets]
@@ -360,14 +357,10 @@ tests:
       features.kopiaUi.enabled: true
     template: role.tpl
     asserts:
+      # Both gated rules now carry identical verbs — assert both render.
       - contains:
           path: rules
-          content:
-            apiGroups: [""]
-            resources: [secrets]
-            verbs: [create, patch]
-      - contains:
-          path: rules
+          count: 2
           content:
             apiGroups: [""]
             resources: [secrets]

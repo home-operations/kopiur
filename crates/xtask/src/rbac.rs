@@ -194,8 +194,10 @@ fn workload_rules() -> Vec<PolicyRule> {
         //      repository's Secret(s) into each mover Job's namespace via
         //      server-side apply (a PATCH). `create` cannot be resourceName-scoped
         //      (the authorizer can't match a name at create time) and the projected
-        //      name is per-Job, so this is necessarily unscoped. Needs create+patch;
-        //      NO delete — projected copies carry an ownerRef and are reaped by GC.
+        //      name embeds the consuming CR's name, so this is necessarily unscoped.
+        //      Needs create+patch+delete: ownerRef GC reaps the stable copy with its
+        //      CR, while `delete` backs the cleanup paths (the leader-only sweep of
+        //      legacy per-run copies, reap-on-shrink, reap-on-disable).
         //   2. kopia web-UI server (`spec.server`, `features.kopiaUi.enabled`):
         //      create-once the generated-auth Secret (Generate mode), SSA-patch the
         //      cross-namespace credentials mirror for ClusterRepository servers, and

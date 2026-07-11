@@ -74,12 +74,13 @@ rules:
     verbs: [get, list, watch]
   {{- if .Values.features.credentialProjection.enabled }}
   # Credential projection (spec.credentialProjection): SSA-copy the repository Secret
-  # into each mover Job namespace. create is unscopable (per-Job name); no delete
-  # (projected copies carry an ownerRef and are reaped by GC).
+  # into each mover Job namespace. create is unscopable (per-CR name); delete backs
+  # the feature's cleanup paths (legacy-copy sweep, reap-on-shrink, reap-on-disable —
+  # ownerRef GC covers the steady state).
   - apiGroups: [""]
     resources:
       - secrets
-    verbs: [create, patch]
+    verbs: [create, patch, delete]
   {{- end }}
   {{- if .Values.features.kopiaUi.enabled }}
   # kopia web-UI server (spec.server): create-once the generated-auth Secret, SSA the
