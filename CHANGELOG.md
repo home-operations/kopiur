@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.2](https://github.com/home-operations/kopiur/compare/0.7.1...0.7.2) (2026-07-11)
+
+
+### Bug Fixes
+
+* stable per-CR projected credential Secret names + legacy sweep ([#234](https://github.com/home-operations/kopiur/issues/234)) ([402945d](https://github.com/home-operations/kopiur/commit/402945dfd77e7b456c87eefa28e0c3ac48ea9b1e))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.7.1 manifest ([0d427d8](https://github.com/home-operations/kopiur/commit/0d427d8c6f769551e7538fac3d20ea08a16dac8f))
+
 ## [0.7.1](https://github.com/home-operations/kopiur/compare/0.7.0...0.7.1) (2026-07-10)
 
 
