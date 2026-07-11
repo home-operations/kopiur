@@ -103,14 +103,15 @@ A namespaced `Repository` has no such gate — its repo and Secret co-reside, so
 
 How the projected copies behave:
 
-- **Per run, owned by the consuming CR.** Each mover gets its own copy named `<run>-creds-N`, with an `ownerReference` to the `Snapshot`/`Restore`/`Maintenance` that created it. Deleting that CR garbage-collects the copy — no orphaned Secrets.
+- **One stable copy per consuming CR, owned by it.** The copy's name embeds the consumer, not the run: `<snapshot>-creds-N` for a backup, `<restore>-restore-creds-N`, `<maintenance>-maint-creds-N`, `<policy>-vfy-creds-N` for verification, `<snapshot>-pin-creds-N` / `<snapshot>-delete-creds-N` for the auxiliary movers. Every run of that CR refreshes the **same** Secret in place — recurring runs (a `Maintenance` cron, verification tiers) never accumulate copies. The copy carries an `ownerReference` to its CR, so deleting the CR garbage-collects it; when the consumer later disables projection, or a backend re-config drops a source Secret, the operator reaps its own leftover copies too.
 - **Always fresh.** The copy is re-read from source on every run, so rotating the source Secret takes effect on the next backup. There is no long-lived shadow copy to drift.
 - **A no-op when not needed.** For a namespaced `Repository` whose Secret already lives in the workload namespace, projection copies nothing — it just verifies the Secret is present, exactly like the self-managed path. It only copies for the genuine cross-namespace case.
-- **Labeled kopiur-managed.** Copies carry `app.kubernetes.io/managed-by=kopiur` and `app.kubernetes.io/component=credentials`, plus a `kopiur.home-operations.com/projected-from` annotation recording the source — don't edit them by hand.
+- **Labeled kopiur-managed.** Copies carry `app.kubernetes.io/managed-by=kopiur`, `app.kubernetes.io/component=credentials`, and `kopiur.home-operations.com/creds-scope=cr` (the stable-name marker), plus a `kopiur.home-operations.com/projected-from` annotation recording the source — don't edit them by hand.
+- **Legacy per-run copies are swept.** Operator versions up to 0.7.1 named copies after each mover run, so recurring consumers accumulated one Secret per run. The [legacy sweep](#the-legacy-object-sweep) below reaps those on upgraded clusters automatically.
 
-/// warning | Projection needs the operator's `secrets` create/patch RBAC
+/// warning | Projection needs the operator's `secrets` create/patch/delete RBAC
 
-To write Secrets into workload namespaces, the operator needs cluster-wide `secrets` `create`/`patch`. The Helm value `features.credentialProjection.enabled` (**off by default**) grants it. Projection is itself opt-in per-consumer, so the chart withholds this broader RBAC until you set `features.credentialProjection.enabled: true`. The trade-off: `create` cannot be scoped to a Secret name, so the operator can write a Secret in any namespace it manages. While it stays at the default `false`, `secrets` access is read-only — and a projection-enabled `SnapshotPolicy`/`Restore`/`Maintenance` surfaces an actionable `403` telling you to enable it. A projected copy in namespace `X` is readable by anything that can read Secrets in `X` — exactly as it would be if you placed it there yourself. See [Feature permissions](feature-permissions.md) for the full flag↔feature mapping.
+To write Secrets into workload namespaces (and clean its own copies up again), the operator needs cluster-wide `secrets` `create`/`patch`/`delete`. The Helm value `features.credentialProjection.enabled` (**off by default**) grants it. Projection is itself opt-in per-consumer, so the chart withholds this broader RBAC until you set `features.credentialProjection.enabled: true`. The trade-off: `create` cannot be scoped to a Secret name, so the operator can write a Secret in any namespace it manages. While it stays at the default `false`, `secrets` access is read-only — and a projection-enabled `SnapshotPolicy`/`Restore`/`Maintenance` surfaces an actionable `403` telling you to enable it. A projected copy in namespace `X` is readable by anything that can read Secrets in `X` — exactly as it would be if you placed it there yourself. See [Feature permissions](feature-permissions.md) for the full flag↔feature mapping.
 
 ///
 
@@ -315,18 +316,21 @@ The one exception is repository **bootstrap/probe** runs, which additionally cre
 Operator versions up to 0.7.0 mounted the work spec from a per-run ConfigMap. The Job self-reaped via its TTL, but ConfigMaps have no TTL mechanism and were owner-referenced to long-lived CRs (a `Snapshot` is the durable record of a backup; a `SnapshotPolicy` never goes away) — so one ConfigMap leaked per run, forever (issue #224: 605 in one reported cluster). Embedding the spec in the Job removes the second object, and with it the entire leak class.
 ///
 
-### The legacy-ConfigMap sweep
+### The legacy-object sweep
 
-Clusters upgraded from versions that created per-run work-spec ConfigMaps still hold the historical leftovers. A leader-only background sweep heals them: every 6 hours it lists Kopiur-managed ConfigMaps and deletes work-spec ones (data key `work-spec.json`) that have **no same-named Job** and are **older than 1 hour**. Bootstrap result ConfigMaps and anything a live legacy run still mounts are never touched. On upgrade, the backlog drains automatically — no `kubectl` cleanup needed.
+Clusters upgraded from older versions can hold two kinds of historical leftovers, and one leader-only background sweep heals both:
 
-Two environment variables tune it (set via the chart's controller `extraEnv`):
+- **Per-run work-spec ConfigMaps** (versions ≤ 0.7.0): work-spec ConfigMaps (data key `work-spec.json`) with **no same-named Job**, **older than 1 hour**, are deleted. Bootstrap result ConfigMaps and anything a live legacy run still mounts are never touched.
+- **Per-run projected credential Secrets** (versions ≤ 0.7.1): projected copies were named after each mover run (`<job>-creds-N`), so recurring consumers accumulated one live credential copy per run. The sweep deletes kopiur-managed, `projected-from`-annotated Secrets that lack the stable-name marker (`kopiur.home-operations.com/creds-scope`), are not loaded via `envFrom` by any live mover Job, and are older than the minimum age. Stable-named copies, the kopia web-UI credential mirrors, and user Secrets are excluded by construction. Deleting Secrets rides the same `features.credentialProjection.enabled` RBAC grant — if you used projection on an old version and later disabled the flag, the sweep logs an actionable warning instead of deleting.
+
+On upgrade, the backlog drains automatically — no `kubectl` cleanup needed. Two environment variables tune it (set via the chart's controller `extraEnv`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS` | `21600` (6h) | Sweep cadence; `0` disables the sweep entirely. |
-| `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` | `3600` (1h) | Minimum ConfigMap age before it may be reaped. |
+| `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` | `3600` (1h) | Minimum object age before it may be reaped. |
 
-Each pass increments the `kopiur_work_spec_cms_swept_total` counter on `/metrics`, so you can watch the backlog drain after an upgrade.
+Each pass increments the `kopiur_work_spec_cms_swept_total` and `kopiur_projected_secrets_swept_total` counters on `/metrics`, so you can watch the backlog drain after an upgrade.
 
 ## Troubleshooting
 

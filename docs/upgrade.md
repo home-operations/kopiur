@@ -30,6 +30,32 @@ If any tooling of yours read the per-run ConfigMaps, read the Job's
 `KOPIUR_WORK_SPEC` env instead. Details and tuning knobs:
 [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
 
+## After 0.7.1: projected credential Secrets stop accumulating (no action needed)
+
+Versions after 0.7.1 fix the sibling leak for **credential projection**
+(`spec.credentialProjection`): projected Secret copies were named after each
+mover run, so recurring consumers — a `Maintenance` cron, `SnapshotPolicy`
+verification — left one live copy of the repository credentials behind per run,
+owned by the long-lived CR and never deleted. Both halves of the fix are
+automatic:
+
+- Projected copies now use a **stable per-CR name** (e.g.
+  `<maintenance>-maint-creds-0`), refreshed in place on every run — one Secret
+  per consumer, garbage-collected with it. Copies are additionally reaped when
+  the consumer disables projection or a backend re-config drops a source
+  Secret.
+- The same periodic **legacy sweep** deletes the per-run copies accumulated by
+  earlier versions (marker-less, `projected-from`-annotated, not loaded by any
+  live mover Job, past the minimum age). Watch the backlog drain via the
+  `kopiur_projected_secrets_swept_total` counter.
+
+The chart's `features.credentialProjection.enabled` grant now includes the
+`secrets` **delete** verb to back this cleanup — `helm upgrade` applies it. If
+you used projection on an old version and later turned the flag **off**, the
+sweep cannot delete the leftovers; it logs a warning naming the flag
+(re-enable it once, or delete the legacy copies by hand). Details:
+[Movers → The legacy-object sweep](movers.md#the-legacy-object-sweep).
+
 ## Upgrading 0.5.x → 0.6.0 (one-time CRD migration)
 
 /// danger | 0.5.x → 0.6.0 is a breaking upgrade — read this first
