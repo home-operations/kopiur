@@ -437,24 +437,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // Repository's Maintenance lives in the repo's namespace. ADR §3.7.
             // §11: a ReadOnly repository runs no maintenance (it serves restores
             // only). Skip the projection so no managed Maintenance is created.
-            if repo.spec.mode.allows_writes() {
-                io::ensure_maintenance(
-                    ctx,
-                    &api,
-                    repo,
-                    &io::event_ref(repo),
-                    RepositoryKind::Repository,
-                    "Repository",
-                    &namespace,
-                    Some(&namespace),
-                    Some(&namespace),
-                    &name,
-                    repo.spec.maintenance.as_ref(),
-                    &conditions,
-                    repo.metadata.generation,
-                )
-                .await;
-            }
+            ensure_repo_maintenance(ctx, repo, &namespace, &name, &api, &conditions).await;
         }
         other => {
             // Object-store backends run connect/create/status/catalog in a
@@ -531,6 +514,55 @@ fn last_refresh_at(repo: &Repository) -> Option<&str> {
 /// from the controller in-process. A filesystem backend's repo volume is mounted
 /// read-write so the mover can create/connect the repository.
 #[allow(clippy::too_many_arguments)]
+/// The `Repository`'s currently-observed status conditions (empty when it has no status).
+fn repo_conditions(
+    repo: &Repository,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    repo.status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default()
+}
+
+/// Project this `Repository`'s `spec.maintenance` into its managed `Maintenance` CR and
+/// refresh the `MaintenanceConfigured` condition (ADR §3.7; §11: a ReadOnly repository
+/// serves restores only and runs no maintenance).
+///
+/// `conditions` is the set to build on — the freshly patched one on the bootstrap finalize
+/// path (a status patch replaces the whole array, so re-reading the cached object there
+/// would drop conditions written moments earlier), or the cached status elsewhere.
+///
+/// The cluster-repo twin (`cluster_repository::ensure_cluster_maintenance`) carries the
+/// full rationale for calling this on the steady-state pass as well (#231).
+async fn ensure_repo_maintenance(
+    ctx: &Context,
+    repo: &Repository,
+    namespace: &str,
+    name: &str,
+    api: &Api<Repository>,
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) {
+    if !repo.spec.mode.allows_writes() {
+        return;
+    }
+    io::ensure_maintenance(
+        ctx,
+        api,
+        repo,
+        &io::event_ref(repo),
+        RepositoryKind::Repository,
+        "Repository",
+        namespace,
+        Some(namespace),
+        Some(namespace),
+        name,
+        repo.spec.maintenance.as_ref(),
+        conditions,
+        repo.metadata.generation,
+    )
+    .await;
+}
+
 async fn bootstrap_via_mover(
     ctx: &Context,
     repo: &Repository,
@@ -667,6 +699,13 @@ async fn bootstrap_via_mover(
             chrono::Utc::now(),
         ))
     {
+        // The STEADY STATE of a Ready mover-bootstrapped repo (`bootstrap_create_due` is
+        // true for any non-Ready phase, so nothing pre-bootstrap reaches here). Re-evaluate
+        // maintenance coverage before parking — otherwise this repo's `MaintenanceConfigured`
+        // condition is only ever written at the tail of a bootstrap, and a value written
+        // during a bootstrap race freezes forever (#231). Cheap + idempotent; the status
+        // patch is skipped when nothing changed.
+        ensure_repo_maintenance(ctx, repo, namespace, name, api, &repo_conditions(repo)).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
 
@@ -1094,24 +1133,7 @@ async fn finalize_bootstrap(
     // cached object — otherwise this patch would drop the `Bootstrapped`
     // condition we set above (both writes replace the whole conditions array).
     // §11: a ReadOnly repository runs no maintenance — skip the projection.
-    if repo.spec.mode.allows_writes() {
-        io::ensure_maintenance(
-            ctx,
-            api,
-            repo,
-            &io::event_ref(repo),
-            RepositoryKind::Repository,
-            "Repository",
-            namespace,
-            Some(namespace),
-            Some(namespace),
-            name,
-            repo.spec.maintenance.as_ref(),
-            &conditions,
-            repo.metadata.generation,
-        )
-        .await;
-    }
+    ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
 
     // A probe consumes its Job exactly once: delete it so the steady state has no
     // lingering finished Job to re-read (no churn) and the next probe is a fresh

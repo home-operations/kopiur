@@ -96,9 +96,14 @@ You don't manage the files — just put the value under the right key; the secre
 
 ///
 
-/// note | ClusterRepository: Secret refs need a namespace
+/// note | ClusterRepository: where Secret refs resolve
 
-The per-backend pages use a namespaced `Repository`. For a cluster-scoped `ClusterRepository` the same backend stanzas apply, but **every** Secret reference must carry an explicit `namespace:` (webhook-enforced), and the credential Secret must also reach each workload namespace — either replicate it yourself or turn on [credential projection](../movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) (recommended for shared repos). A worked S3 example is on the [S3 page](s3.md#as-a-clusterrepository).
+The per-backend pages use a namespaced `Repository`. The same backend stanzas apply to a cluster-scoped `ClusterRepository`, with one wrinkle: it has no namespace of its own, so "absent = the referrer's namespace" has nothing to resolve to.
+
+- **When the operator itself reads the Secret** — to connect, to bootstrap, or to run the repository server — a Secret reference with no `namespace:` resolves to the **operator's namespace** (`KOPIUR_NAMESPACE`, which the Helm chart sets for you). Setting `namespace:` explicitly always wins. Keeping the repository Secret next to the operator and omitting `namespace:` is the simplest thing that works.
+- **When a workload mover reads it** — a `Snapshot`, `Restore` or `Maintenance` Job — the Secret must exist in **that workload's namespace**, because `envFrom` is namespace-local. Replicate it yourself, or turn on [credential projection](../movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) (recommended for shared repos), which needs an explicit `namespace:` on the reference so it knows what to copy.
+
+A worked S3 example is on the [S3 page](s3.md#as-a-clusterrepository).
 
 ///
 

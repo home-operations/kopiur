@@ -45,7 +45,12 @@ pub trait PhaseLabel: Copy + PartialEq + 'static {
 pub struct SecretKeyRef {
     /// Name of the `Secret`.
     pub name: String,
-    /// Namespace of the `Secret`; absent = same namespace as the referrer.
+    /// Namespace of the `Secret`; absent = same namespace as the referrer. A
+    /// `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT
+    /// reads the `Secret` (to connect, to bootstrap, or to run its repository server) an
+    /// absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload
+    /// mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace —
+    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// Which key inside the `Secret` to read.
@@ -59,7 +64,12 @@ pub struct SecretKeyRef {
 pub struct SecretRef {
     /// Name of the `Secret`.
     pub name: String,
-    /// Namespace of the `Secret`; absent = same namespace as the referrer.
+    /// Namespace of the `Secret`; absent = same namespace as the referrer. A
+    /// `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT
+    /// reads the `Secret` (to connect, to bootstrap, or to run its repository server) an
+    /// absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload
+    /// mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace —
+    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }

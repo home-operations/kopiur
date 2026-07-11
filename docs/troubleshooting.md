@@ -272,6 +272,8 @@ $ kubectl describe restore <name> -n <ns>
 | `Failed`, "no matching snapshot"        | The source resolved to nothing and `onMissingSnapshot: Fail`. | Verify the `snapshotRef`/identity; for deploy-or-restore use `fromPolicy` (which defaults to `Continue`).                                                         |
 | Stuck `Resolving`                       | Waiting for the source snapshot to appear (`waitTimeout`).    | Confirm the snapshot exists; raise `policy.waitTimeout` if a schedule is about to produce it.                                                                   |
 | PVC stuck `Pending` (populator)         | Volume-populator handshake not completing.                    | Need Kubernetes ≥ 1.24; install `volume-data-source-validator` to see the real event. See [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops). |
+| `prime-*` PVCs piling up, `Bound`, mounted by nothing | ≤ 0.7.x: a populator `Restore` re-created over an **already-bound** claim restored into a prime PVC that could never be adopted, and leaked it — one full copy of the data per re-created `Restore`. | Upgrade: Kopiur now completes that case as a no-op (`Ready=True reason=TargetAlreadyBound`) and reaps the orphans (`OrphanedPrimePvcReaped` event). List them with `kubectl get pvc -A -l kopiur.home-operations.com/op=restore-populate`; any whose claiming PVC is gone are collected with their `Restore`. |
+| Populator `Restore` says `TargetAlreadyBound` and restores nothing | Working as intended: its claiming PVC is already **Bound**, and a volume populator can only fill an **unbound** claim. | To really restore into it, delete the **PVC** (keep its `dataSourceRef`) and let it be re-created. Deleting the `Restore` just re-triggers the no-op. |
 | `identity` source rejected at admission | `source.identity` requires an explicit `spec.repository`.     | Add `spec.repository`.                                                                                                                                          |
 | Stuck `Pending`, `MoverPermitted=False` | The restore mover requests an elevated context (root / `privilegedMode`, container- or pod-level, possibly inherited). | Annotate the namespace (above), or drop the elevation from `spec.mover`. |
 | Restored files **owned by `65532`** / unreadable by the app | The mover wrote them as its own UID (no `mover.securityContext`). | Set `Restore.spec.mover.securityContext.runAsUser/Group` to the app's UID (or `inheritSecurityContextFrom`). |
@@ -318,6 +320,21 @@ $ kubectl describe maintenance <name> -n <ns>
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `WaitingForRepository`    | The repository isn't `Ready` yet — fix that first.                                                                             |
 | lease held elsewhere      | Another owner holds the maintenance lease (shared repo). Adjust `takeoverPolicy` only if you're sure no one else maintains it. |
+
+The repository's own `MaintenanceConfigured` condition says whether anything is maintaining it at all:
+
+| `MaintenanceConfigured` reason | Meaning                                                                                                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MaintenanceConfigured` (True) | A `Maintenance` covers the repo — either the operator-managed one, or one you authored yourself.                                                             |
+| `MaintenanceDisabled`          | You set `spec.maintenance.enabled: false` and nothing else references the repo. **Storage is never reclaimed.** A deliberate opt-out, so no warning is raised. |
+| `MaintenanceApplyFailed`       | Maintenance is **enabled**, but the operator could not apply its managed `Maintenance`. The message names the namespace and the error — usually missing RBAC, or a namespace that doesn't exist. It retries every reconcile. |
+| `MaintenanceNamespaceUnresolved` | A `ClusterRepository`'s managed `Maintenance` has nowhere to live: set `spec.maintenance.namespace`, or the operator's `KOPIUR_NAMESPACE`.                  |
+
+/// note | Upgrading from ≤ 0.7.x
+
+On object-store repositories this condition could get **stuck** at `MaintenanceDisabled` — even with maintenance enabled and the managed `Maintenance` present, owned, and running on schedule — because it was only ever evaluated at the tail of a bootstrap. It is now re-checked on every reconcile, so a stale value corrects itself shortly after upgrade, and a failed apply no longer masquerades as "you disabled maintenance".
+
+///
 
 If **every** run yields (`Ready=False`, reason `MaintenanceYielding`), kopia
 GC/compaction is not running at all — typically a repository whose kopia-side

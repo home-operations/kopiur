@@ -622,3 +622,196 @@ async fn clusterrepository_not_initialized_and_safe_create_guard() {
     let _ = crepos.delete(good, &DeleteParams::default()).await;
     let _ = crepos.delete(bad, &DeleteParams::default()).await;
 }
+
+/// #232: a `ClusterRepository` whose secret refs carry NO `namespace` must reconcile.
+///
+/// The CRD documents `namespace` as "absent = same namespace as the referrer", but a
+/// `ClusterRepository` is cluster-scoped and HAS no namespace — so the reconciler used to
+/// refuse the object outright ("encryption.passwordSecretRef.namespace is required"),
+/// contradicting its own schema and leaving users stuck. It now defaults to the operator's
+/// namespace (`KOPIUR_NAMESPACE`), the same rule `spec.maintenance.namespace` already used,
+/// and the namespace where a chart install's repository Secret conventionally lives.
+///
+/// This is the reporter's manifest, minus the namespaces: the e2e credential Secret already
+/// lives in the operator namespace, so the repo must reach `Ready` untouched. Pre-fix, the
+/// reconcile loops on a structural validation error and never bootstraps.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + MinIO"]
+async fn cluster_repository_defaults_secret_namespace_to_operator_namespace() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Minio]).await.expect("fixtures");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+
+    let name = "e2e-crepo-defaultns";
+    let _ = crepos.delete(name, &DeleteParams::default()).await;
+
+    // Note what is NOT here: no `namespace` on either secret ref. The operator's own
+    // namespace is where the harness put `kopia-s3-creds`.
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "metadata": { "name": name },
+                "spec": {
+                    "backend": { "s3": {
+                        "bucket": "kopiur-crepo-defaultns",
+                        "endpoint": "minio.kopiur-e2e.svc.cluster.local:9000",
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": { "name": "kopia-s3-creds" } }
+                    }},
+                    "encryption": {
+                        "passwordSecretRef": { "name": "kopia-s3-creds", "key": "KOPIA_PASSWORD" }
+                    },
+                    "create": { "enabled": true },
+                    "allowedNamespaces": { "all": true }
+                }
+            })),
+        )
+        .await
+        .expect("create namespace-less ClusterRepository");
+
+    wait_phase(&crepos, name, "Ready")
+        .await
+        .expect("a ClusterRepository with no secret-ref namespaces bootstraps against the operator namespace");
+
+    let status = status_json(&crepos, name).await;
+    assert!(
+        status
+            .get("uniqueId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|u| !u.is_empty()),
+        "the repository is really initialized (a pinned uniqueId), got {status}"
+    );
+
+    let _ = crepos.delete(name, &DeleteParams::default()).await;
+}
+
+/// #231: `MaintenanceConfigured` must be re-evaluated at STEADY STATE on the object-store
+/// path — and the managed `Maintenance` re-applied when it goes missing.
+///
+/// The reported failure: the condition stuck at `False/MaintenanceDisabled` for two days
+/// while the operator-managed `Maintenance` existed, was owned by the repo, held its lease,
+/// and ran on schedule. `ensure_maintenance` was only ever reached at the tail of a
+/// bootstrap, so a value written during a bootstrap race froze forever — the repo's own
+/// `.watches(Maintenance)` requeue landed on a reconcile that early-exits before the check.
+///
+/// The test reproduces the frozen state structurally: delete the finished bootstrap Job
+/// (what the TTL controller does anyway), so the only reconcile left is the steady-state
+/// one. Then delete the managed `Maintenance` and prove the operator notices and repairs
+/// it. Pre-fix, nothing would ever re-apply it and the condition would never be re-read.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + MinIO"]
+async fn s3_cluster_repository_maintenance_self_corrects_at_steady_state() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Minio]).await.expect("fixtures");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let maints: Api<Maintenance> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let name = "e2e-crepo-maintcond";
+    let _ = crepos.delete(name, &DeleteParams::default()).await;
+
+    // No `maintenance` block at all → default-on, exactly like the report.
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(s3_cluster_repository_json(
+                name,
+                "kopiur-crepo-maintcond",
+                "kopia-s3-creds",
+                true,
+            )),
+        )
+        .await
+        .expect("create ClusterRepository with default-on maintenance");
+
+    wait_phase(&crepos, name, "Ready")
+        .await
+        .expect("the ClusterRepository bootstraps");
+    wait_until(
+        "MaintenanceConfigured=True",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&crepos, name).await;
+            Ok(
+                (condition_status(&s, "MaintenanceConfigured").as_deref() == Some("True"))
+                    .then_some(()),
+            )
+        },
+    )
+    .await
+    .expect("a default-on repository reports its managed Maintenance as configured");
+
+    // Reach the frozen state: with the bootstrap Job gone (the TTL controller reaps it in
+    // the real world), every later reconcile takes the steady-state early-exit — the one
+    // that used to skip the maintenance check entirely.
+    let bootstrap_job = format!("{name}-bootstrap");
+    let _ = jobs
+        .delete(
+            &bootstrap_job,
+            &DeleteParams {
+                propagation_policy: Some(kube::api::PropagationPolicy::Background),
+                ..Default::default()
+            },
+        )
+        .await;
+    wait_until(
+        "the finished bootstrap Job is reaped",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(jobs.get_opt(&bootstrap_job).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the bootstrap Job is gone, so only steady-state reconciles remain");
+
+    // Now break maintenance out from under the repo.
+    maints
+        .delete(name, &DeleteParams::default())
+        .await
+        .expect("delete the operator-managed Maintenance");
+
+    // The steady-state reconcile must re-apply it and keep the condition truthful. This is
+    // impossible pre-fix: the Maintenance-watch requeue lands on the early-exit.
+    let restored = wait_until(
+        "the managed Maintenance is re-applied",
+        default_timeout(),
+        poll_interval(),
+        || async { maints.get_opt(name).await },
+    )
+    .await
+    .expect("the operator re-creates the managed Maintenance it owns");
+    assert!(
+        restored
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|o| o
+                .iter()
+                .any(|r| r.kind == "ClusterRepository" && r.name == name)),
+        "the re-applied Maintenance is owned by the repository, not orphaned"
+    );
+
+    let s = status_json(&crepos, name).await;
+    assert_eq!(
+        condition_status(&s, "MaintenanceConfigured").as_deref(),
+        Some("True"),
+        "the condition must track reality, not freeze at whatever the bootstrap wrote: {s}"
+    );
+    assert_ne!(
+        condition_reason(&s, "MaintenanceConfigured").as_deref(),
+        Some("MaintenanceDisabled"),
+        "maintenance was never disabled here — that reason is the #231 lie: {s}"
+    );
+
+    let _ = crepos.delete(name, &DeleteParams::default()).await;
+}

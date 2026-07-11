@@ -129,21 +129,48 @@ async fn assert_populator_binds_and_restores(
     seed: &str,
     prefix: &str,
 ) {
+    let populated = populate_claim(client, storage_class, repo, seed, prefix).await;
+    populated.cleanup(client).await;
+}
+
+/// The objects a [`populate_claim`] run left behind, so a caller can keep inspecting them
+/// (and clean up when done) instead of tearing them down immediately.
+struct PopulatedClaim {
+    restore: String,
+    claim: String,
+    reader: String,
+}
+
+impl PopulatedClaim {
+    async fn cleanup(&self, client: &kube::Client) {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let _ = pods.delete(&self.reader, &DeleteParams::default()).await;
+        let _ = pvcs.delete(&self.claim, &DeleteParams::default()).await;
+        let _ = restores
+            .delete(&self.restore, &DeleteParams::default())
+            .await;
+    }
+}
+
+/// Drive one populator handshake to completion and LEAVE the objects in place (the caller
+/// owns cleanup). Body of [`assert_populator_binds_and_restores`], split out so the #233
+/// regression test can keep the now-BOUND claim and then delete + re-create the `Restore`
+/// over it — the exact GitOps sequence that used to orphan a full-size prime PVC.
+async fn populate_claim(
+    client: &kube::Client,
+    storage_class: &str,
+    repo: &str,
+    seed: &str,
+    prefix: &str,
+) -> PopulatedClaim {
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let restore_name = format!("{prefix}-restore");
     restores
         .create(
             &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "kopiur.home-operations.com/v1alpha1",
-                "kind": "Restore",
-                "metadata": { "name": restore_name, "namespace": E2E_NAMESPACE },
-                "spec": {
-                    "repository": { "kind": "Repository", "name": repo },
-                    "source": { "snapshotRef": { "name": seed } },
-                    "target": { "populator": {} }
-                }
-            })),
+            &cr(populator_restore_json(&restore_name, repo, seed)),
         )
         .await
         .expect("create populator Restore");
@@ -202,11 +229,25 @@ async fn assert_populator_binds_and_restores(
         .await
         .expect("the populator Restore reaches Completed once the claim is bound");
 
-    let _ = pods.delete(&reader, &DeleteParams::default()).await;
-    let _ = pvcs.delete(&claim, &DeleteParams::default()).await;
-    let _ = restores
-        .delete(&restore_name, &DeleteParams::default())
-        .await;
+    PopulatedClaim {
+        restore: restore_name,
+        claim,
+        reader,
+    }
+}
+
+/// A populator `Restore` reading `seed` out of `repo` (`target.populator: {}`).
+fn populator_restore_json(name: &str, repo: &str, seed: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": repo },
+            "source": { "snapshotRef": { "name": seed } },
+            "target": { "populator": {} }
+        }
+    })
 }
 
 /// ADR-0005 §9 end-to-end (Immediate binding): a PVC whose `dataSourceRef` claims a
@@ -283,6 +324,175 @@ async fn restore_populator_wffc_binds_pvc_and_restores_data() {
         "e2e-pop3",
     )
     .await;
+}
+
+/// #233: re-creating a populator `Restore` whose claiming PVC is ALREADY bound must be a
+/// no-op — no prime PVC, no mover run — and must reap any orphaned prime left behind.
+///
+/// This is the GitOps sequence that bit the reporter at fleet scale: a `ClusterRepository`
+/// rebuild pruned and re-applied all 49 `Restore` CRs at once, while their target PVCs
+/// stayed Bound and their apps kept running. Each recreated `Restore` provisioned a
+/// `prime-<uid>` PVC and ran a FULL restore into it — a prime that can never be adopted (a
+/// CSI populator only hands volumes to UNBOUND claims), so it sat `Bound` forever: 120 GiB
+/// of orphaned copies, plus 49 pointless repository reads.
+///
+/// The test manufactures the orphan explicitly (a `prime-<consumer-uid>` PVC carrying the
+/// operator's populate label) so the reap path is exercised deterministically, then asserts
+/// the recreated `Restore` completes as `TargetAlreadyBound` having touched nothing.
+///
+/// Red on the pre-fix controller: a freshly re-created CR has no phase, so the old
+/// `Completed && bound` short-circuit doesn't fire, and it adopts the prime and runs a
+/// mover into it — failing both the "no populate Job" and "prime is gone" assertions.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install + CSI snapshot stack"]
+async fn recreated_populator_restore_over_bound_claim_is_noop_and_reaps_orphaned_prime() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+
+    ensure_seed(
+        &client,
+        "e2e-pop2-repo",
+        "e2e-pop2-policy",
+        "e2e-pop2-seed",
+        "populator2",
+    )
+    .await;
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // 1. A normal, successful populate: the claim ends up Bound with the restored data.
+    let populated = populate_claim(
+        &client,
+        CSI_STORAGE_CLASS,
+        "e2e-pop2-repo",
+        "e2e-pop2-seed",
+        "e2e-pop4",
+    )
+    .await;
+
+    let claim = pvcs
+        .get(&populated.claim)
+        .await
+        .expect("the claiming PVC exists");
+    let consumer_uid = claim.metadata.uid.clone().expect("claim uid");
+    let live_volume = claim
+        .spec
+        .as_ref()
+        .and_then(|s| s.volume_name.clone())
+        .expect("the claim is bound to a PV");
+
+    // 2. GitOps prunes the Restore. The claim stays Bound; the app keeps running.
+    restores
+        .delete(&populated.restore, &DeleteParams::default())
+        .await
+        .expect("delete the Restore");
+    wait_until(
+        "the pruned Restore is gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(restores
+                .get_opt(&populated.restore)
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the Restore is pruned");
+
+    // 3. Manufacture the ≤0.7.x orphan: a prime PVC keyed to the consumer's uid, carrying
+    //    the operator's populate label — exactly what the buggy path left Bound forever.
+    let orphan_prime = format!("prime-{consumer_uid}");
+    pvcs.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": orphan_prime,
+                "namespace": E2E_NAMESPACE,
+                "labels": { "kopiur.home-operations.com/op": "restore-populate" },
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": CSI_STORAGE_CLASS,
+                "resources": { "requests": { "storage": "1Gi" } },
+            }
+        })),
+    )
+    .await
+    .expect("create the orphaned prime PVC");
+
+    // 4. Flux re-applies the identical Restore over the still-bound claim.
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(populator_restore_json(
+                &populated.restore,
+                "e2e-pop2-repo",
+                "e2e-pop2-seed",
+            )),
+        )
+        .await
+        .expect("re-create the populator Restore");
+
+    // 5. It completes as a truthful no-op: phase AND conditions agree (the reported bug had
+    //    `phase: Completed` frozen against `Ready=False/PopulatingPrimePvc` for days).
+    wait_phase(&restores, &populated.restore, "Completed")
+        .await
+        .expect("the re-created Restore completes without populating anything");
+    let ready = wait_condition(&restores, &populated.restore, "Ready", "True")
+        .await
+        .expect("Ready=True: the no-op is a settled, healthy outcome");
+    assert_eq!(
+        ready.get("reason").and_then(|r| r.as_str()),
+        Some("TargetAlreadyBound"),
+        "the completion must say WHY nothing happened: {ready:#}"
+    );
+
+    // 6. The orphaned prime is reaped — the whole point of #233.
+    wait_until(
+        "the orphaned prime PVC is reaped",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pvcs.get_opt(&orphan_prime).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the prime PVC that can never be adopted is deleted, not left Bound forever");
+
+    // 7. No mover ran: a full restore into an unadoptable prime is exactly the wasted work
+    //    (49 pointless repository reads, at fleet scale) the fix eliminates.
+    let populate_job = format!("{}-populate", populated.restore);
+    assert!(
+        jobs.get_opt(&populate_job)
+            .await
+            .expect("list jobs")
+            .is_none(),
+        "no populate Job may be created for an already-bound claim ({populate_job} exists)"
+    );
+
+    // 8. The live volume was never touched.
+    let after = pvcs
+        .get(&populated.claim)
+        .await
+        .expect("claim still exists");
+    assert_eq!(
+        after.spec.as_ref().and_then(|s| s.volume_name.clone()),
+        Some(live_volume),
+        "the app's bound volume must be left exactly as it was"
+    );
+
+    populated.cleanup(&client).await;
 }
 
 /// The `Resolved` condition's reason on a Restore status, if present.

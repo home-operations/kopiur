@@ -85,7 +85,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.azure.auth.workloadIdentity` { #repository-spec-backend-azure-auth-workloadidentity }
 
@@ -112,7 +112,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.filesystem` { #repository-spec-backend-filesystem }
 
@@ -163,7 +163,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.gcs.auth.workloadIdentity` { #repository-spec-backend-gcs-auth-workloadidentity }
 
@@ -183,7 +183,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.rclone` { #repository-spec-backend-rclone }
 
@@ -198,7 +198,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.s3` { #repository-spec-backend-s3 }
 
@@ -223,7 +223,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.s3.auth.workloadIdentity` { #repository-spec-backend-s3-auth-workloadidentity }
 
@@ -267,7 +267,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.webDav` { #repository-spec-backend-webdav }
 
@@ -287,7 +287,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `spec.encryption` { #repository-spec-encryption }
 
@@ -301,7 +301,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
 | `key` | string | — | Which key inside the `Secret` to read. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `spec.bootstrap` { #repository-spec-bootstrap }
 
@@ -613,7 +613,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `status.storageStats` { #repository-status-storagestats }
 
@@ -706,7 +706,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.azure.auth.workloadIdentity` { #clusterrepository-spec-backend-azure-auth-workloadidentity }
 
@@ -733,7 +733,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.filesystem` { #clusterrepository-spec-backend-filesystem }
 
@@ -784,7 +784,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.gcs.auth.workloadIdentity` { #clusterrepository-spec-backend-gcs-auth-workloadidentity }
 
@@ -804,7 +804,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.rclone` { #clusterrepository-spec-backend-rclone }
 
@@ -819,7 +819,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.s3` { #clusterrepository-spec-backend-s3 }
 
@@ -844,7 +844,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.backend.s3.auth.workloadIdentity` { #clusterrepository-spec-backend-s3-auth-workloadidentity }
 
@@ -888,7 +888,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.backend.webDav` { #clusterrepository-spec-backend-webdav }
 
@@ -908,7 +908,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `spec.encryption` { #clusterrepository-spec-encryption }
 
@@ -922,7 +922,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
 | `key` | string | — | Which key inside the `Secret` to read. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `spec.bootstrap` { #clusterrepository-spec-bootstrap }
 
@@ -1249,7 +1249,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `status.storageStats` { #clusterrepository-status-storagestats }
 
@@ -2397,7 +2397,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.destination.azure.auth.workloadIdentity` { #repositoryreplication-spec-destination-azure-auth-workloadidentity }
 
@@ -2424,7 +2424,7 @@ Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.destination.filesystem` { #repositoryreplication-spec-destination-filesystem }
 
@@ -2475,7 +2475,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.destination.gcs.auth.workloadIdentity` { #repositoryreplication-spec-destination-gcs-auth-workloadidentity }
 
@@ -2495,7 +2495,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.destination.rclone` { #repositoryreplication-spec-destination-rclone }
 
@@ -2510,7 +2510,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.destination.s3` { #repositoryreplication-spec-destination-s3 }
 
@@ -2535,7 +2535,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ###### `spec.destination.s3.auth.workloadIdentity` { #repositoryreplication-spec-destination-s3-auth-workloadidentity }
 
@@ -2579,7 +2579,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 ##### `spec.destination.webDav` { #repositoryreplication-spec-destination-webdav }
 
@@ -2599,7 +2599,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the `Secret`. |
-| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`. |
 
 #### `spec.schedule` { #repositoryreplication-spec-schedule }
 

@@ -194,6 +194,12 @@ pub const BUCKETS: &[&str] = &[
     // Cluster-scoped safe-create guard: initialized once, then a wrong-password
     // ClusterRepository must NOT recreate over it.
     "kopiur-crepo-guard",
+    // #232: a ClusterRepository whose secret refs carry NO namespace — they must
+    // default to the operator's namespace instead of hard-erroring the reconcile.
+    "kopiur-crepo-defaultns",
+    // #231: MaintenanceConfigured must be re-evaluated at steady state (and the
+    // managed Maintenance re-applied), not frozen at whatever the bootstrap wrote.
+    "kopiur-crepo-maintcond",
     "kopiur-maint",
     "kopiur-xns-crepo",
     "kopiur-xns-repo",
