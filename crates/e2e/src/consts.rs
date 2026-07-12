@@ -203,13 +203,15 @@ pub const BUCKETS: &[&str] = &[
     "kopiur-maint",
     "kopiur-xns-crepo",
     "kopiur-xns-repo",
-    // Credential-projection scenarios: backup on/off, restore, maintenance, and
-    // the stable-name no-accumulation guard (#231).
+    // Credential-projection scenarios: backup on/off, restore, maintenance, the
+    // stable-name no-accumulation guard (#231), and the per-run copy-reclaim guard
+    // (#240).
     "kopiur-proj-crepo",
     "kopiur-proj-off",
     "kopiur-proj-restore",
     "kopiur-proj-maint",
     "kopiur-proj-stable",
+    "kopiur-leak-crepo",
     // Backed-via-rclone repository (rclone `s3` remote pointing at this MinIO).
     "kopiur-rclone",
     // Repository for the NFS-*source* scenario (the source is NFS; the repo is S3).

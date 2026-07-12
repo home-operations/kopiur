@@ -659,9 +659,16 @@ async fn sweep_reaps_legacy_projected_secret_but_not_stable_or_live_copies() {
     });
     let _ = secrets.create(&PostParams::default(), &cr(orphan)).await;
 
-    // Control 1: a STABLE copy (scope marker present) — the shape current
-    // versions refresh in place. Its age can't protect it (creationTimestamp
-    // never resets on re-apply); only the marker does. Must survive.
+    // Control 1: a marker-bearing copy with NO ownerRef — i.e. something wearing our
+    // labels that we did not write. Must survive.
+    //
+    // The marker alone is no longer what saves it. Before #240 the marker meant "never
+    // sweep", full stop; now it merely routes a copy to the terminal-creds kernel,
+    // which reaps stable copies once their owning Snapshot has finished. What spares
+    // THIS one is the fail-closed owner guard: no controller ownerRef to a Snapshot of
+    // our API group, so it is not ours to delete. (The reap of a genuine stable copy is
+    // exercised end-to-end in `credential_projection.rs`, against a real Snapshot
+    // rather than a hand-built fixture.)
     let mut stable_labels = legacy_labels.clone();
     stable_labels["kopiur.home-operations.com/creds-scope"] = serde_json::json!("cr");
     let stable = serde_json::json!({
@@ -737,7 +744,9 @@ async fn sweep_reaps_legacy_projected_secret_but_not_stable_or_live_copies() {
             .await
             .expect("get stable control Secret")
             .is_some(),
-        "the sweep deleted a STABLE (marker-labeled) projected Secret"
+        "the sweep deleted a marker-labeled Secret that carries no kopiur controller \
+         ownerRef — the owner guard is fail-closed: a copy we did not write is not ours \
+         to reap, however much it looks like one"
     );
     assert!(
         secrets

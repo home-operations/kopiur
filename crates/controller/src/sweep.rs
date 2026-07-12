@@ -50,15 +50,41 @@
 //!    projected copy (spares the kopia-UI credential mirrors and any user
 //!    Secret),
 //! 3. it does NOT carry the [`crate::consts::CREDS_SCOPE_LABEL`] marker — the
-//!    marker identifies stable-named copies, which are refreshed in place (a
-//!    stable copy's creationTimestamp never resets, so min-age alone could not
-//!    protect it; the marker + the delete's resourceVersion precondition do),
+//!    marker identifies stable-named copies, which belong to the third kernel
+//!    below,
 //! 4. its name parses as `{job}-creds-<digits>` (the per-run copy shape) and
 //!    no live kopiur-managed Job in its namespace still loads it via `envFrom`
 //!    — an exact in-use test read from the listed Jobs' pod templates, which
 //!    covers movers whose Job name differs from the copy's prefix (a populate
 //!    Restore's Job `{restore}-populate` loads `{restore}-creds-0`), and
-//! 5. it is older than `min_age_secs`.
+//! 5. it is older than `min_age_secs` (never below [`CREDS_MIN_AGE_FLOOR_SECS`]).
+//!
+//! # Stable copies of finished Snapshots (#240)
+//!
+//! A stable per-CR name bounds the copy count per CR — but a `Snapshot` is
+//! *itself* the per-run object, so `{snapshot}-creds-0` is still one live copy of
+//! the repository credentials per backup, owner-ref'd to a CR that outlives its
+//! mover Job by the entire retention window. #234 made the name stable and the
+//! leak survived it untouched: the fix is lifetime, not naming. A copy's real life
+//! is "while some mover Job can still load it via `envFrom`".
+//!
+//! [`terminal_creds_candidates`] is the steady-state reaper (the consuming CR's
+//! reconciler gets there first; this is the backstop, and what heals the backlog on
+//! upgrade). It is the exact complement of [`legacy_creds_candidates`] — that kernel
+//! owns the marker-LESS copies, this one the marker-BEARING copies, and a unit test
+//! pins that they partition. A stable copy is reapable only when it carries the
+//! marker AND the projected-from annotation AND a controller ownerRef to a
+//! `Snapshot` of our API group that we positively observed **terminal** AND no live
+//! Job loads it AND it is older than the floor.
+//!
+//! Keying on the owner's *phase* rather than on "no Job loads it" is deliberate
+//! twice over. It keeps the kernel off the copies of *long-lived* CRs (a
+//! `Maintenance` cron, a `SnapshotPolicy` verification tier), which idle between
+//! slots with no Job for hours or weeks — reaping those would churn and would leave
+//! the swept counter permanently non-zero, destroying the very signal that says this
+//! leak is shut. And it is safe for a run still in flight, whose creds are projected
+//! before its hooks and CSI staging, either of which may requeue for a long time
+//! before a Job exists at all.
 //!
 //! Deleting Secrets needs the `secrets` delete verb, which the chart grants
 //! under `features.credentialProjection.enabled`. A 403 (the flag was turned
@@ -69,19 +95,40 @@ use std::collections::HashSet;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::api::{DeleteParams, ListParams, Preconditions};
+use kube::core::PartialObjectMeta;
 use kube::{Api, Resource, ResourceExt};
 
+use kopiur_api::snapshot::{Snapshot, SnapshotPhase};
 use kopiur_mover::bootstrap::RESULT_CONFIGMAP_KEY;
 
 use crate::config;
 use crate::consts::{
-    COMPONENT_LABEL, CREDS_COMPONENT, CREDS_SCOPE_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    PROJECTED_FROM_ANNOTATION,
+    COMPONENT_LABEL, CREDS_COMPONENT, CREDS_SCOPE_CR, CREDS_SCOPE_LABEL, MANAGED_BY_LABEL,
+    MANAGED_BY_VALUE, PROJECTED_AT_ANNOTATION, PROJECTED_FROM_ANNOTATION,
 };
 use crate::controllers::scoped_api;
 use crate::error::Result;
 use crate::jobs::WORK_SPEC_FILE;
 use crate::metrics::Metrics;
+
+/// Metadata-only view of a credential Secret. Every guard in both creds kernels —
+/// and [`delete_with_preconditions`] itself — reads only `ObjectMeta`, so the sweep
+/// never needs a Secret's `.data`. Listing these instead of full `Secret`s keeps
+/// hundreds of base64 `KOPIA_PASSWORD` / `AWS_SECRET_ACCESS_KEY` blobs off the wire
+/// and out of the operator's heap on every pass, the same reason
+/// [`crate::controllers`] watches referents as `PartialObjectMeta`.
+type SecretMeta = PartialObjectMeta<Secret>;
+
+/// Floor (seconds) under which the creds kernels will not reap, regardless of the
+/// operator's configured sweep min-age.
+///
+/// `min_age_secs` is a **shared** knob whose documented subject is the work-spec
+/// ConfigMap, and it legally accepts `0`. An admin who zeroes it to drain
+/// ConfigMaps faster must not thereby hand the creds kernels a zero-width guard on
+/// the project→create-Job window, where a copy legitimately exists with no Job yet
+/// (creds resolve at the top of the Snapshot reconcile; hooks and CSI staging can
+/// sit between that and the Job).
+pub const CREDS_MIN_AGE_FLOOR_SECS: i64 = 15 * 60;
 
 /// Select the orphaned work-spec ConfigMaps out of `cms` (see the module doc
 /// for the guard set). `live_jobs` is the `(namespace, name)` set of every
@@ -135,14 +182,153 @@ pub fn legacy_creds_source_job(secret_name: &str) -> Option<&str> {
 /// [`job_env_from_secret_names`]) — the exact in-use test. `now_unix` is the
 /// injected decision clock, mirroring [`sweep_candidates`].
 pub fn legacy_creds_candidates<'a>(
-    secrets: &'a [Secret],
+    secrets: &'a [SecretMeta],
     live_creds_refs: &HashSet<(String, String)>,
     min_age_secs: i64,
     now_unix: i64,
-) -> Vec<&'a Secret> {
+) -> Vec<&'a SecretMeta> {
     secrets
         .iter()
         .filter(|s| is_legacy_creds_candidate(s, live_creds_refs, min_age_secs, now_unix))
+        .collect()
+}
+
+/// Select the **stable per-CR** projected credential copies whose owning `Snapshot`
+/// has finished — the steady-state creds reaper (#240).
+///
+/// This is the complement of [`legacy_creds_candidates`]: that kernel owns the
+/// marker-LESS pre-#231 copies, this one owns the marker-BEARING copies. The two
+/// partition the projected-creds population; neither ever selects the other's.
+///
+/// `terminal_snapshots` is the uid set of every `Snapshot` in a terminal phase.
+/// Owning that set — rather than testing "no live Job loads it", which would be
+/// simpler — is what keeps the kernel off the copies belonging to *long-lived* CRs
+/// (`Maintenance`, `SnapshotPolicy` verification). Those sit idle between cron slots
+/// with no live Job for hours, or weeks for a monthly verification tier; reaping
+/// them would churn (delete → next run re-projects → delete) and would leave the
+/// swept counter permanently non-zero, destroying the one signal that says this leak
+/// is closed. Their copies are already bounded 1:1 by #234 and are not a leak.
+///
+/// It is also fail-CLOSED on the owner: a copy is reaped only when its owner is a
+/// `Snapshot` we positively found *and* observed terminal. A partial or failed
+/// Snapshot list therefore reaps nothing, rather than mistaking every owner for
+/// "gone". Genuinely orphaned copies need no help from us — the ownerRef is valid
+/// and same-namespace, so Kubernetes GC reaps them when the owner dies.
+pub fn terminal_creds_candidates<'a>(
+    secrets: &'a [SecretMeta],
+    terminal_snapshots: &HashSet<String>,
+    live_creds_refs: &HashSet<(String, String)>,
+    min_age_secs: i64,
+    now_unix: i64,
+) -> Vec<&'a SecretMeta> {
+    secrets
+        .iter()
+        .filter(|s| {
+            is_terminal_creds_candidate(
+                s,
+                terminal_snapshots,
+                live_creds_refs,
+                min_age_secs,
+                now_unix,
+            )
+        })
+        .collect()
+}
+
+/// Whether ONE stable copy is reapable (see [`terminal_creds_candidates`]). Early
+/// returns keep each guard independently readable.
+fn is_terminal_creds_candidate(
+    s: &SecretMeta,
+    terminal_snapshots: &HashSet<String>,
+    live_creds_refs: &HashSet<(String, String)>,
+    min_age_secs: i64,
+    now_unix: i64,
+) -> bool {
+    let Some(labels) = s.metadata.labels.as_ref() else {
+        return false;
+    };
+    if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANAGED_BY_VALUE)
+        || labels.get(COMPONENT_LABEL).map(String::as_str) != Some(CREDS_COMPONENT)
+        // The marker is REQUIRED here — a marker-less copy is the legacy kernel's.
+        || labels.get(CREDS_SCOPE_LABEL).map(String::as_str) != Some(CREDS_SCOPE_CR)
+    {
+        return false;
+    }
+    // Positively a projected copy (spares the kopia-UI credential mirrors and any
+    // user Secret that happens to carry our labels).
+    if !s
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(PROJECTED_FROM_ANNOTATION))
+    {
+        return false;
+    }
+    // Controller-owned by a Snapshot of OUR api group that has finished. A copy
+    // owned by anything else (Maintenance, SnapshotPolicy, Restore) is not ours.
+    let owned_by_terminal_snapshot = s.metadata.owner_references.as_ref().is_some_and(|refs| {
+        refs.iter().any(|o| {
+            o.controller == Some(true)
+                && o.kind == "Snapshot"
+                && o.api_version
+                    .split_once('/')
+                    .is_some_and(|(group, _)| group == kopiur_api::GROUP)
+                && terminal_snapshots.contains(&o.uid)
+        })
+    });
+    if !owned_by_terminal_snapshot {
+        return false;
+    }
+    // The in-use test: any live kopiur Job still loading it via `envFrom`. The
+    // mover reads creds ONLY this way (never a volume mount), so this is exact.
+    let key = (s.namespace().unwrap_or_default(), s.name_any());
+    if live_creds_refs.contains(&key) {
+        return false;
+    }
+    creds_age_secs(s, now_unix) >= min_age_secs.max(CREDS_MIN_AGE_FLOOR_SECS)
+}
+
+/// How long ago the copy was last written, in seconds.
+///
+/// Prefers [`PROJECTED_AT_ANNOTATION`], which the projection re-stamps on every run.
+/// `creationTimestamp` cannot answer this: a stable copy is refreshed in place, so
+/// its creation time never resets and a Secret re-projected one second ago still
+/// looks a month old. Copies written before that annotation existed have none — they
+/// fall back to `creationTimestamp`, which for them is correct (a legacy copy was
+/// written exactly once) and, being genuinely ancient, keeps them eligible.
+fn creds_age_secs(s: &SecretMeta, now_unix: i64) -> i64 {
+    s.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(PROJECTED_AT_ANNOTATION))
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|t| now_unix - t.timestamp())
+        .or_else(|| {
+            s.metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| now_unix - t.0.as_second())
+        })
+        // Neither stamp (only possible for hand-built objects; the apiserver always
+        // stamps creationTimestamp) → treat as brand new, never eligible.
+        .unwrap_or(0)
+}
+
+/// The uids of every `Snapshot` that has finished — the owners whose projected
+/// credential copies are dead weight. A terminal `Snapshot` never mints another
+/// backup mover (the reconciler's one-shot discipline), so nothing will re-read its
+/// copy; the CR itself lives on for the whole retention window because it owns the
+/// kopia snapshot, which is precisely why ownerRef GC cannot bound the copy.
+fn terminal_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status.as_ref().and_then(|st| st.phase),
+                Some(SnapshotPhase::Succeeded) | Some(SnapshotPhase::Failed)
+            )
+        })
+        .filter_map(|s| s.uid())
         .collect()
 }
 
@@ -166,7 +352,7 @@ pub fn job_env_from_secret_names(job: &Job) -> Vec<String> {
 /// Whether ONE Secret passes every legacy-copy guard (module doc). Early
 /// returns keep each guard independently readable.
 fn is_legacy_creds_candidate(
-    s: &Secret,
+    s: &SecretMeta,
     live_creds_refs: &HashSet<(String, String)>,
     min_age_secs: i64,
     now_unix: i64,
@@ -196,13 +382,7 @@ fn is_legacy_creds_candidate(
     if live_creds_refs.contains(&(ns, name)) {
         return false;
     }
-    let age_secs = s
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .map(|t| now_unix - t.0.as_second())
-        .unwrap_or(0);
-    age_secs >= min_age_secs
+    creds_age_secs(s, now_unix) >= min_age_secs.max(CREDS_MIN_AGE_FLOOR_SECS)
 }
 
 /// What one guarded delete did (see [`delete_with_preconditions`]).
@@ -242,12 +422,19 @@ where
     }
 }
 
-/// What one sweep pass deleted, per victim kind.
+/// What one sweep pass deleted, per victim kind — plus the live population it saw.
 pub struct SweepOutcome {
     /// Orphaned mover work-spec ConfigMaps (#224).
     pub work_spec_cms: usize,
     /// Legacy per-run projected credential Secrets (#231).
     pub projected_secrets: usize,
+    /// Stable per-CR copies whose owning `Snapshot` had finished (#240).
+    pub terminal_creds_secrets: usize,
+    /// Projected credential Secrets alive at classification time, BEFORE this
+    /// pass's deletes. Backs the `kopiur_projected_secrets` gauge — the population
+    /// signal that was missing, and the reason this leak ran for weeks unseen: a
+    /// counter of projections rises identically whether or not anything leaks.
+    pub projected_secrets_live: usize,
 }
 
 /// One sweep pass: list the kopiur-managed ConfigMaps, projected credential
@@ -255,16 +442,22 @@ pub struct SweepOutcome {
 /// pure kernels, and delete them (per-item errors are logged and skipped —
 /// degrade, don't crash). Returns the counts deleted.
 ///
-/// Two guards close the classify→delete TOCTOU window for BOTH victim kinds:
+/// Three guards close the classify→delete TOCTOU window for every victim kind:
 /// - ConfigMaps and Secrets are listed BEFORE Jobs: a run spawned between the
 ///   lists shows up only in the Job list (keeping its objects), never the
 ///   reverse.
 /// - Each delete carries a `resourceVersion` PRECONDITION pinned to the exact
-///   object version the sweep classified. A run re-spawned during the delete
-///   loop server-side-applies the SAME-NAMED object (same UID, same old
-///   creationTimestamp — min-age can't help), but that write bumps the
-///   resourceVersion, so the delete fails 409 and the live run is spared;
-///   the next pass re-evaluates.
+///   object version the sweep classified. A run re-spawned during the delete loop
+///   server-side-applies the SAME-NAMED object (same UID, same old
+///   creationTimestamp — min-age can't help), and because the projection always
+///   re-stamps [`PROJECTED_AT_ANNOTATION`] that write is never a no-op, so it
+///   bumps the resourceVersion, the delete fails 409, and the live run is spared.
+///   (Without that stamp the re-apply would be byte-identical, the apiserver would
+///   skip the write, the resourceVersion would not move, and this precondition
+///   would silently pass — deleting a Secret a live Job is about to load.)
+/// - Snapshots are listed and only TERMINAL ones admit their copies, so a copy
+///   belonging to a run still in flight is never a candidate however long that run
+///   sits in hooks or CSI staging without a Job.
 pub async fn run_sweep(
     client: &kube::Client,
     scope: &config::WatchScope,
@@ -276,7 +469,8 @@ pub async fn run_sweep(
         .list(&ListParams::default().labels(&managed))
         .await?
         .items;
-    let secret_api: Api<Secret> = scoped_api(client, scope);
+    // Metadata-only: the sweep never needs a credential's plaintext (see `SecretMeta`).
+    let secret_api: Api<SecretMeta> = scoped_api(client, scope);
     let secrets = secret_api
         .list(
             &ListParams::default()
@@ -284,6 +478,8 @@ pub async fn run_sweep(
         )
         .await?
         .items;
+    let snapshot_api: Api<Snapshot> = scoped_api(client, scope);
+    let snapshots = snapshot_api.list(&ListParams::default()).await?.items;
     let job_api: Api<Job> = scoped_api(client, scope);
     let jobs = job_api
         .list(&ListParams::default().labels(&managed))
@@ -302,9 +498,11 @@ pub async fn run_sweep(
                 .map(move |name| (ns.clone(), name))
         })
         .collect();
+    let terminal = terminal_snapshot_uids(&snapshots);
     let now = chrono::Utc::now().timestamp();
 
     Ok(SweepOutcome {
+        projected_secrets_live: secrets.len(),
         work_spec_cms: delete_cm_victims(
             client,
             sweep_candidates(&cms, &live_set, min_age_secs, now),
@@ -313,6 +511,13 @@ pub async fn run_sweep(
         projected_secrets: delete_secret_victims(
             client,
             legacy_creds_candidates(&secrets, &live_creds_refs, min_age_secs, now),
+            "legacy per-run",
+        )
+        .await,
+        terminal_creds_secrets: delete_secret_victims(
+            client,
+            terminal_creds_candidates(&secrets, &terminal, &live_creds_refs, min_age_secs, now),
+            "finished-Snapshot",
         )
         .await,
     })
@@ -344,29 +549,38 @@ async fn delete_cm_victims(client: &kube::Client, victims: Vec<&ConfigMap>) -> u
     deleted
 }
 
-/// Delete the classified legacy projected-credentials Secrets; returns the
-/// count deleted. A 403 names the Helm flag whose grant carries the delete
-/// verb (degrade, don't crash).
-async fn delete_secret_victims(client: &kube::Client, victims: Vec<&Secret>) -> usize {
+/// Delete the classified projected-credentials Secrets; returns the count deleted.
+/// `kind` names the classification for the logs (both creds kernels feed this). A
+/// 403 names the Helm flag whose grant carries the delete verb (degrade, don't
+/// crash).
+async fn delete_secret_victims(
+    client: &kube::Client,
+    victims: Vec<&SecretMeta>,
+    kind: &str,
+) -> usize {
     let mut deleted = 0;
     for s in victims {
         let ns = s.namespace().unwrap_or_default();
         let name = s.name_any();
         let api: Api<Secret> = Api::namespaced(client.clone(), &ns);
         match delete_with_preconditions(&api, &name, s.uid(), s.resource_version()).await {
-            Ok(DeleteOutcome::Deleted) => deleted += 1,
+            Ok(DeleteOutcome::Deleted) => {
+                deleted += 1;
+                tracing::info!(secret = %name, namespace = %ns, kind,
+                    "reaped projected credentials Secret");
+            }
             Ok(DeleteOutcome::Spared) => {}
             Ok(DeleteOutcome::Forbidden) => {
-                tracing::warn!(secret = %name, namespace = %ns,
+                tracing::warn!(secret = %name, namespace = %ns, kind,
                     flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
-                    "legacy projected credentials Secret delete forbidden: the operator \
+                    "projected credentials Secret delete forbidden: the operator \
                      lacks the `secrets` delete verb (the credentialProjection flag was \
                      likely disabled after projection was used). Re-enable the flag or \
-                     delete the legacy copies by hand (skipped)");
+                     delete the copies by hand (skipped)");
             }
             Err(e) => {
-                tracing::warn!(secret = %name, namespace = %ns, error = %e,
-                    "legacy projected credentials Secret delete failed (skipped)");
+                tracing::warn!(secret = %name, namespace = %ns, kind, error = %e,
+                    "projected credentials Secret delete failed (skipped)");
             }
         }
     }
@@ -412,6 +626,23 @@ pub fn spawn_sweep(
                             "swept legacy per-run projected credential Secrets"
                         );
                     }
+                    if outcome.terminal_creds_secrets > 0 {
+                        metrics.inc_creds_secrets_reaped(
+                            "sweep",
+                            outcome.terminal_creds_secrets as u64,
+                        );
+                        tracing::info!(
+                            deleted = outcome.terminal_creds_secrets,
+                            "reaped projected credential Secrets of finished Snapshots"
+                        );
+                    }
+                    // The population gauge, not just the deltas: a rising gauge is
+                    // the regression alarm this leak had no way to trip.
+                    metrics.set_projected_secrets_live(
+                        outcome.projected_secrets_live.saturating_sub(
+                            outcome.projected_secrets + outcome.terminal_creds_secrets,
+                        ) as i64,
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "orphaned-object sweep failed; will retry next interval");
@@ -424,12 +655,13 @@ pub fn spawn_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
     use kube::core::ObjectMeta;
     use std::collections::BTreeMap;
 
     const NOW: i64 = 1_700_000_000;
     const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
 
     /// A kopiur-managed ConfigMap in `ns` created `age_secs` ago whose data
     /// holds exactly `keys`.
@@ -534,12 +766,12 @@ mod tests {
 
     use crate::consts::PROJECTED_FROM_ANNOTATION;
     use crate::consts::{COMPONENT_LABEL, CREDS_COMPONENT, CREDS_SCOPE_CR, CREDS_SCOPE_LABEL};
-    use k8s_openapi::api::core::v1::Secret;
 
     /// A fully legacy-shaped projected credential Secret in `ns` created
     /// `age_secs` ago: managed-by + component labels, projected-from
-    /// annotation, NO scope marker. Tests mutate it into the control shapes.
-    fn legacy_secret(ns: &str, name: &str, age_secs: i64) -> Secret {
+    /// annotation, NO scope marker, NO ownerRef. Tests mutate it into the control
+    /// shapes. Metadata-only, exactly as the sweep lists it.
+    fn legacy_secret(ns: &str, name: &str, age_secs: i64) -> SecretMeta {
         let labels = BTreeMap::from([
             (MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string()),
             (COMPONENT_LABEL.to_string(), CREDS_COMPONENT.to_string()),
@@ -548,7 +780,8 @@ mod tests {
             PROJECTED_FROM_ANNOTATION.to_string(),
             "kopiur-system/repo-pw".to_string(),
         )]);
-        Secret {
+        SecretMeta {
+            types: None,
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 namespace: Some(ns.to_string()),
@@ -559,12 +792,50 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            ..Default::default()
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    fn secret_names(picked: &[&Secret]) -> Vec<String> {
+    /// A stable per-CR copy: the legacy shape plus the scope marker and a
+    /// controller ownerRef to a `Snapshot` of our API group — i.e. what
+    /// `build_projected_secret` writes today. `age_secs` is applied to
+    /// `projected-at` (the re-stamped clock), not `creationTimestamp`, mirroring a
+    /// copy refreshed in place.
+    fn stable_secret(ns: &str, name: &str, owner_uid: &str, age_secs: i64) -> SecretMeta {
+        let mut s = legacy_secret(ns, name, 400 * DAY);
+        s.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(CREDS_SCOPE_LABEL.to_string(), CREDS_SCOPE_CR.to_string());
+        s.metadata.annotations.as_mut().unwrap().insert(
+            PROJECTED_AT_ANNOTATION.to_string(),
+            chrono::DateTime::from_timestamp(NOW - age_secs, 0)
+                .unwrap()
+                .to_rfc3339(),
+        );
+        s.metadata.owner_references =
+            Some(vec![owner_ref("Snapshot", owner_uid, kopiur_api::GROUP)]);
+        s
+    }
+
+    fn owner_ref(kind: &str, uid: &str, group: &str) -> OwnerReference {
+        OwnerReference {
+            api_version: format!("{group}/v1alpha1"),
+            kind: kind.to_string(),
+            name: "owner".to_string(),
+            uid: uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(false),
+        }
+    }
+
+    fn secret_names(picked: &[&SecretMeta]) -> Vec<String> {
         picked.iter().map(|s| s.name_any()).collect()
+    }
+
+    fn uids(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
 
     fn creds_refs(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
@@ -596,16 +867,186 @@ mod tests {
     }
 
     #[test]
-    fn marker_labeled_copy_is_never_selected() {
-        // The scope marker is what makes a STABLE-named copy off-limits: its
-        // creationTimestamp never resets on re-apply, so min-age is no shield.
-        let mut s = legacy_secret("media", "app-maint-creds-0", 2 * HOUR);
-        s.metadata
-            .labels
-            .as_mut()
-            .unwrap()
-            .insert(CREDS_SCOPE_LABEL.to_string(), CREDS_SCOPE_CR.to_string());
+    fn marker_labeled_copy_is_never_selected_by_the_legacy_kernel() {
+        // The scope marker routes a STABLE copy to the OTHER kernel — it does not
+        // mean "never reaped" (it did before #240). The legacy kernel must not touch
+        // one, because it has no way to tell a live consumer from a dead one: a
+        // stable copy's creationTimestamp never resets on re-apply, so min-age is no
+        // shield for it.
+        let s = stable_secret("media", "app-maint-creds-0", "uid-1", 2 * HOUR);
         assert!(legacy_creds_candidates(&[s], &HashSet::new(), HOUR, NOW).is_empty());
+    }
+
+    // --- stable copies of finished Snapshots (#240) ---------------------------
+
+    #[test]
+    fn stable_copy_of_a_finished_snapshot_is_reaped() {
+        let s = stable_secret("media", "app-20260712-creds-0", "uid-1", 2 * HOUR);
+        let picked = terminal_creds_candidates(
+            std::slice::from_ref(&s),
+            &uids(&["uid-1"]),
+            &HashSet::new(),
+            HOUR,
+            NOW,
+        );
+        assert_eq!(secret_names(&picked), vec!["app-20260712-creds-0"]);
+    }
+
+    #[test]
+    fn stable_copy_of_a_running_snapshot_is_spared() {
+        // The owner exists but has not finished: its mover Job may not even be born
+        // yet (creds resolve before hooks and CSI staging, either of which can requeue
+        // for a long time without a Job). Phase, not Job-absence, is the gate.
+        let s = stable_secret("media", "app-20260712-creds-0", "uid-1", 2 * HOUR);
+        assert!(
+            terminal_creds_candidates(&[s], &HashSet::new(), &HashSet::new(), HOUR, NOW).is_empty(),
+            "a copy whose owning Snapshot is not terminal must never be a candidate"
+        );
+    }
+
+    #[test]
+    fn copies_of_long_lived_owners_are_never_reaped_by_the_sweep() {
+        // THE churn guard. A Maintenance cron's or a SnapshotPolicy verification's
+        // copy sits idle between slots — hours, or weeks for a monthly tier — with no
+        // live Job. A kernel keyed on "no Job loads it" would delete it every pass and
+        // the next run would re-project it: endless churn, and a swept counter that
+        // never settles to zero, destroying the one signal that says this leak is shut.
+        // They are bounded 1:1 by #234 and are not a leak. Only Snapshot owners here.
+        for kind in ["Maintenance", "SnapshotPolicy", "Restore"] {
+            let mut s = stable_secret("media", "app-maint-creds-0", "uid-1", 30 * DAY);
+            s.metadata.owner_references = Some(vec![owner_ref(kind, "uid-1", kopiur_api::GROUP)]);
+            assert!(
+                terminal_creds_candidates(&[s], &uids(&["uid-1"]), &HashSet::new(), HOUR, NOW)
+                    .is_empty(),
+                "a {kind}-owned copy must never be swept"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_job_shields_a_finished_snapshots_copy() {
+        // The mover stamps `Succeeded` from inside the pod, before the pod exits and
+        // before the Job goes terminal — and with backoffLimit the Job can still
+        // schedule a replacement pod that re-reads this very Secret via envFrom.
+        // Terminal phase alone is NOT enough; the in-use test is the second gate.
+        let s = stable_secret("media", "app-creds-0", "uid-1", 2 * HOUR);
+        let live = creds_refs(&[("media", "app-creds-0")]);
+        assert!(
+            terminal_creds_candidates(
+                std::slice::from_ref(&s),
+                &uids(&["uid-1"]),
+                &live,
+                HOUR,
+                NOW
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_foreign_or_unowned_copy_is_never_reaped() {
+        let terminal = uids(&["uid-1"]);
+        // Owned by a Snapshot in someone else's API group (a same-named CRD).
+        let mut foreign = stable_secret("media", "app-creds-0", "uid-1", 2 * HOUR);
+        foreign.metadata.owner_references = Some(vec![owner_ref(
+            "Snapshot",
+            "uid-1",
+            "snapshot.storage.k8s.io",
+        )]);
+        assert!(
+            terminal_creds_candidates(&[foreign], &terminal, &HashSet::new(), HOUR, NOW).is_empty()
+        );
+        // No ownerRef at all (a user-crafted Secret wearing our labels).
+        let mut orphan = stable_secret("media", "app-creds-0", "uid-1", 2 * HOUR);
+        orphan.metadata.owner_references = None;
+        assert!(
+            terminal_creds_candidates(&[orphan], &terminal, &HashSet::new(), HOUR, NOW).is_empty()
+        );
+        // Not the controller ownerRef.
+        let mut not_controller = stable_secret("media", "app-creds-0", "uid-1", 2 * HOUR);
+        not_controller.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        assert!(
+            terminal_creds_candidates(&[not_controller], &terminal, &HashSet::new(), HOUR, NOW)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_freshly_reprojected_copy_is_young_however_old_the_object_is() {
+        // `stable_secret` pins creationTimestamp to 400 days ago — a copy that has
+        // been refreshed in place for over a year. What matters is when a run last
+        // WROTE it, which is what `projected-at` records; without it this Secret would
+        // look ancient and be reaped out from under the run that just re-projected it.
+        let just_written = stable_secret("media", "app-creds-0", "uid-1", 30);
+        assert!(
+            terminal_creds_candidates(
+                &[just_written],
+                &uids(&["uid-1"]),
+                &HashSet::new(),
+                HOUR,
+                NOW
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_creds_min_age_floor_survives_a_zeroed_knob() {
+        // `min_age_secs` is shared with the work-spec ConfigMap sweep and legally
+        // accepts 0. Zeroing it there must not strip the creds kernels' guard on the
+        // project→create-Job window.
+        let s = stable_secret("media", "app-creds-0", "uid-1", 60);
+        assert!(
+            terminal_creds_candidates(&[s], &uids(&["uid-1"]), &HashSet::new(), 0, NOW).is_empty()
+        );
+        let old = stable_secret(
+            "media",
+            "app-creds-0",
+            "uid-1",
+            CREDS_MIN_AGE_FLOOR_SECS + 1,
+        );
+        assert_eq!(
+            terminal_creds_candidates(&[old], &uids(&["uid-1"]), &HashSet::new(), 0, NOW).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_two_creds_kernels_partition_the_population() {
+        // Neither kernel may ever select the other's victim: every projected copy is
+        // legacy (marker-less) XOR stable (marker-bearing), and a copy that fell
+        // through both would leak forever while looking swept.
+        let legacy = legacy_secret("media", "app-q-1751831000-creds-0", 2 * HOUR);
+        let stable = stable_secret("media", "app-20260712-creds-0", "uid-1", 2 * HOUR);
+        let all = vec![legacy, stable];
+        let terminal = uids(&["uid-1"]);
+
+        let by_legacy = secret_names(&legacy_creds_candidates(&all, &HashSet::new(), HOUR, NOW));
+        let by_terminal = secret_names(&terminal_creds_candidates(
+            &all,
+            &terminal,
+            &HashSet::new(),
+            HOUR,
+            NOW,
+        ));
+        assert_eq!(by_legacy, vec!["app-q-1751831000-creds-0"]);
+        assert_eq!(by_terminal, vec!["app-20260712-creds-0"]);
+        assert!(by_legacy.iter().all(|n| !by_terminal.contains(n)));
+    }
+
+    #[test]
+    fn the_kopia_ui_credential_mirror_is_outside_the_sweeps_selector() {
+        // The sweep's in-use test reads JOBS only, so a non-Job consumer of a
+        // `component=credentials` Secret would be invisible to it. The one such
+        // consumer — the kopia web-UI Deployment — is safe purely because its mirrored
+        // Secret carries a DIFFERENT component value, i.e. it never even enters the
+        // list this sweep classifies. That is load-bearing and was untested.
+        assert_ne!(
+            CREDS_COMPONENT,
+            crate::consts::SERVER_COMPONENT_VALUE,
+            "the kopia-UI credential mirror must not share the projected-creds component \
+             label, or the sweep would classify a Secret a live Deployment mounts"
+        );
     }
 
     #[test]

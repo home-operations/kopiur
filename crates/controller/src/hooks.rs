@@ -287,8 +287,26 @@ async fn run_workload_exec(
     }
 }
 
-/// Materialize the hook's `JobSpec` as a one-shot Job owned by the Snapshot
-/// (GC'd with it), then wait for it to finish (bounded by the hook timeout).
+/// The user's hook `JobSpec`, with `ttlSecondsAfterFinished` defaulted so the
+/// finished Job self-reaps — as every other Job the operator builds already does
+/// (mover, maintenance, verification, replication). Pure, so the default is unit-tested.
+///
+/// The ownerRef is NOT a cleanup mechanism here: the owner is a `Snapshot`, a per-RUN
+/// CR retained for the whole GFS window because it owns the kopia snapshot via a
+/// finalizer. Left to ownerRef GC, a completed hook Job and its Pod would linger for
+/// months — one pair per hook, per backup, forever — which is the projected-credential
+/// leak (#240) in a different object. An explicit value is honored, so a user who
+/// wants the Job kept for post-mortem still can.
+fn hook_job_spec(hook: &RunJobHook) -> k8s_openapi::api::batch::v1::JobSpec {
+    let mut spec = hook.job_spec.clone();
+    spec.ttl_seconds_after_finished = spec
+        .ttl_seconds_after_finished
+        .or(Some(kopiur_api::common::DEFAULT_JOB_TTL_SECONDS as i32));
+    spec
+}
+
+/// Materialize the hook's `JobSpec` as a one-shot Job owned by the Snapshot, then
+/// wait for it to finish (bounded by the hook timeout).
 async fn run_job_hook(
     ctx: &Context,
     namespace: &str,
@@ -311,7 +329,7 @@ async fn run_job_hook(
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
-        spec: Some(hook.job_spec.clone()),
+        spec: Some(hook_job_spec(hook)),
         status: None,
     };
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
@@ -400,6 +418,43 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_job_hook_spec(ttl: Option<i32>) -> RunJobHook {
+        serde_json::from_value(serde_json::json!({
+            "jobSpec": {
+                "ttlSecondsAfterFinished": ttl,
+                "template": { "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{ "name": "hook", "image": "busybox" }],
+                }},
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_hook_job_always_gets_a_ttl_so_it_cannot_outlive_the_run() {
+        // The hook Job is owner-ref'd to the per-run Snapshot, which is retained for
+        // the whole GFS window (it owns the kopia snapshot via a finalizer). Without a
+        // TTL, ownerRef GC leaves the finished Job AND its Pod lying around for months
+        // — one pair per hook, per backup. This was the only Job the operator built
+        // without one (#240).
+        let spec = hook_job_spec(&run_job_hook_spec(None));
+        assert_eq!(
+            spec.ttl_seconds_after_finished,
+            Some(kopiur_api::common::DEFAULT_JOB_TTL_SECONDS as i32)
+        );
+        // An explicit value is the user's call — keeping the Job for post-mortem is a
+        // legitimate choice, and 0 (reap immediately) must not be read as "unset".
+        assert_eq!(
+            hook_job_spec(&run_job_hook_spec(Some(0))).ttl_seconds_after_finished,
+            Some(0)
+        );
+        assert_eq!(
+            hook_job_spec(&run_job_hook_spec(Some(86_400))).ttl_seconds_after_finished,
+            Some(86_400)
+        );
+    }
 
     fn pod(name: &str, phase: Option<&str>) -> Pod {
         serde_json::from_value(serde_json::json!({

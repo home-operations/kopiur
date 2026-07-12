@@ -13,9 +13,10 @@
 //!
 //! Scenarios, asserting real operator output:
 //!
-//! 1. **SnapshotPolicy projection ON → Snapshot succeeds where no creds Secret exists.**
-//!    The operator projects a kopiur-managed `<backup>-creds-0` Secret, owned by the
-//!    Snapshot; the mover runs and the Snapshot reaches `Succeeded` with a real snapshot.
+//! 1. **SnapshotPolicy projection ON → Snapshot succeeds where no creds Secret exists,
+//!    and the copy is reclaimed when the run ends.** The operator projects a
+//!    kopiur-managed `<backup>-creds-0` Secret, the mover runs to `Succeeded`, and the
+//!    copy is then deleted and the reap stamped on `status.cleanup.credsReapedAt`.
 //! 2. **SnapshotPolicy projection OFF → Snapshot blocks (guards the default).** The
 //!    Secret is absent, so the Snapshot stays `Pending` with `CredentialsAvailable=False`.
 //! 3. **Restore projection ON → Restore Completes.** A projection-on Snapshot seeds a
@@ -27,14 +28,20 @@
 //! 5. **Stable name across runs (#231 guard).** Two manual maintenance runs of ONE
 //!    Maintenance leave exactly ONE projected Secret, named for the CR — the per-run
 //!    naming of versions ≤ 0.7.1 minted a new copy per run, forever.
+//! 6. **Copies do not accumulate across runs (#240 guard).** Two backups from one
+//!    policy leave ZERO projected copies behind.
 //!
-//! Each projected Secret is asserted to be controller-owned by its consuming CR
-//! (the GC contract) — see `assert_projected_owned_by`.
+//! A projected copy holds live repository credentials, so its lifetime is the mover
+//! Job's, NOT the consuming CR's. Scenarios 1 and 6 are the ones that pin this: the
+//! ownerRef assertions (`assert_projected_owned_by`) prove the copy is correctly owned,
+//! which was true of every copy in a leaking cluster — a `Snapshot` is a per-run CR
+//! retained for the whole GFS window, so waiting for ownerRef GC meant waiting months.
+//! Assert the population, not the name.
 
 #![cfg(all(unix, feature = "e2e"))]
 
-use kube::Api;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::{Api, ResourceExt};
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
@@ -331,7 +338,10 @@ async fn projection_enables_backup_in_a_namespace_without_creds() {
     assert_mover_rbac_minted(&client, PROJECTION_NS).await;
 
     // 3. The operator projected the credential Secret into the namespace, owned by
-    //    the Snapshot and labeled kopiur-managed, with the password key copied.
+    //    the Snapshot and labeled kopiur-managed, with the password key copied. The
+    //    copy is transient — it exists only while the mover Job can still load it, and
+    //    step 5 asserts it is gone once the run ends — so this reads it while the run
+    //    is live (projection precedes Job creation; the Job then runs for seconds).
     let proj = wait_until(
         &format!("projected Secret {PROJECTION_NS}/{projected}"),
         default_timeout(),
@@ -367,16 +377,150 @@ async fn projection_enables_backup_in_a_namespace_without_creds() {
         .await
         .expect("Snapshot using projected credentials should reach Succeeded");
 
-    // GC is guaranteed by the controller-ownerReference asserted in step 3, not
-    // re-verified here: a Snapshot carries the `snapshot-cleanup` finalizer, so it
-    // lingers `Terminating` until that clears, and Kubernetes only reaps the owned
-    // Secret once the owner is actually removed from etcd. Racing that finalizer
-    // would make this test flaky for a guarantee that is Kubernetes' to keep, not
-    // ours — our contract is "set a valid controller ownerRef," which step 3 checks.
+    // 5. The copy is RECLAIMED now the run is over (#240). This is the assertion the
+    //    ownerRef check in step 3 cannot make, and its absence is exactly how the leak
+    //    shipped green: the ownerRef was always valid, and the copy was always owned —
+    //    by a Snapshot that is retained for the whole GFS window, so GC would not have
+    //    come for it for months. A projected copy holds live repository credentials;
+    //    its life is the mover Job's, not the CR's.
+    wait_until(
+        &format!("projected Secret {PROJECTION_NS}/{projected} to be reclaimed"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            secrets
+                .get_opt(&projected)
+                .await
+                .map(|s| if s.is_none() { Some(()) } else { None })
+        },
+    )
+    .await
+    .expect("the projected credential copy must be reclaimed once the run is terminal");
+
+    let done = backups.get(backup).await.expect("re-read Snapshot");
+    let reaped = done
+        .status
+        .as_ref()
+        .and_then(|s| s.cleanup.as_ref())
+        .and_then(|c| c.creds_reaped_at.as_ref());
+    assert!(
+        reaped.is_some(),
+        "the reap must be stamped on status.cleanup.credsReapedAt — the stamp is what \
+         makes every later steady-state reconcile of this terminal Snapshot free"
+    );
+
     backups
         .delete(backup, &DeleteParams::default())
         .await
         .expect("delete Snapshot");
+    let _ = configs.delete(cfg, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+}
+
+/// **The leak guard (#240).** Two backups from one policy, each into a creds-less
+/// namespace via projection. Afterwards the namespace must hold **zero** projected
+/// copies — the count is flat across runs, not one more per run.
+///
+/// This asserts the property that actually failed. The pre-existing projection test
+/// asserts that the copy exists and is correctly owned, and both were true for every
+/// one of the hundreds of copies a leaking cluster accumulated: the copy's NAME was
+/// stable per CR, but a `Snapshot` IS the per-run object, so one stable copy per CR
+/// was still one live credential copy per backup. Assert the population, not the name.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn projected_copies_do_not_accumulate_across_runs() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio, Need::ProjectionNs])
+        .await
+        .expect("provision MinIO + projection namespace");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), PROJECTION_NS);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), PROJECTION_NS);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), PROJECTION_NS);
+
+    let crepo = "e2e-leak-crepo";
+    let cfg = "e2e-leak-cfg";
+
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(s3_cluster_repository_json(crepo, "kopiur-leak-crepo")),
+        )
+        .await
+        .expect("create S3 ClusterRepository");
+    wait_phase(&crepos, crepo, "Ready")
+        .await
+        .expect("ClusterRepository should bootstrap to Ready");
+    configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json(PROJECTION_NS, cfg, crepo, true)),
+        )
+        .await
+        .expect("create SnapshotPolicy with projection");
+
+    // Two runs, exactly as a SnapshotSchedule would mint them: a fresh per-run CR each
+    // time. Under the bug this leaves two live credential copies behind, and a third
+    // run would leave three.
+    for run in ["e2e-leak-run-1", "e2e-leak-run-2"] {
+        backups
+            .create(
+                &PostParams::default(),
+                &cr(backup_json(PROJECTION_NS, run, cfg)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create Snapshot {run}: {e}"));
+        wait_phase(&backups, run, "Succeeded")
+            .await
+            .unwrap_or_else(|e| panic!("Snapshot {run} should reach Succeeded: {e}"));
+    }
+
+    // Both runs are terminal, so every copy they projected is dead weight.
+    //
+    // Counted over THIS test's runs rather than every projected copy in the namespace:
+    // a `Maintenance`/verification copy is one-per-CR and is deliberately kept between
+    // its cron slots, so a namespace-wide "zero copies" assertion would silently depend
+    // on which other scenarios in this file ran first. The property that must hold is
+    // the per-RUN one — N backups leave zero copies behind, for any N.
+    let survivors = wait_until(
+        "the runs' projected credential copies to be reclaimed",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let lp = kube::api::ListParams::default().labels(
+                "app.kubernetes.io/managed-by=kopiur,app.kubernetes.io/component=credentials",
+            );
+            secrets.list(&lp).await.map(|list| {
+                let names: Vec<String> = list
+                    .items
+                    .iter()
+                    .map(|s| s.name_any())
+                    .filter(|n| n.starts_with("e2e-leak-run-"))
+                    .collect();
+                names.is_empty().then_some(names)
+            })
+        },
+    )
+    .await;
+
+    assert!(
+        survivors.is_ok(),
+        "a backup's projected credential copy must not survive its run — after both \
+         Snapshots reached Succeeded the namespace still holds their copies. That is the \
+         leak: one live copy of the repository password per backup, per namespace, kept \
+         for the whole GFS retention window because the copy is owned by a per-run CR."
+    );
+
+    let _ = backups
+        .delete("e2e-leak-run-1", &DeleteParams::default())
+        .await;
+    let _ = backups
+        .delete("e2e-leak-run-2", &DeleteParams::default())
+        .await;
     let _ = configs.delete(cfg, &DeleteParams::default()).await;
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
 }

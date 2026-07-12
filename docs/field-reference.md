@@ -1676,6 +1676,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `cleanup` | [object](#snapshot-status-cleanup) | — | Post-run cleanup bookkeeping, so each cleanup runs at most once per Snapshot. |
 | `conditions` | [][object](#snapshot-status-conditions) | — | Standard Kubernetes conditions (e.g. `SourcesQuiesced`, `SnapshotCreated`). |
 | `failure` | [object](#snapshot-status-failure) | — | Structured terminal-failure detail (kopia error class, stderr tail, retry hint). |
 | `hooks` | [object](#snapshot-status-hooks) | — | Hook-execution bookkeeping so each hook list runs exactly once per Snapshot. |
@@ -1691,6 +1692,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `staged` | [object](#snapshot-status-staged) | — | The CSI staging objects the run created for `copyMethod: Snapshot`/`Clone`. |
 | `stats` | [object](#snapshot-status-stats) | — | Byte/file counts parsed from kopia's JSON output. |
 | `timing` | [object](#snapshot-status-timing) | — | Start/end/duration of the snapshot run. |
+
+#### `status.cleanup` { #snapshot-status-cleanup }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `credsReapedAt` | string | — | When the run's projected credential Secrets were reclaimed (RFC 3339); absent until the reap has run. A projected copy is only needed while a mover Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which long outlives that Job — so without an explicit reap it would sit in the workload namespace holding live repository credentials until the CR is pruned (#240). |
 
 #### `status.conditions[]` { #snapshot-status-conditions }
 

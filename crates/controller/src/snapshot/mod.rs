@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::api::DeleteParams;
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType};
@@ -220,6 +220,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             }
+            // The credential copies die with the mover Job, not with this CR (#240).
+            // Self-gated by its stamp, so this costs nothing once it has run; if the
+            // Job is not terminal yet, the owned-Job watch and the steady-state
+            // requeue below both bring us back.
+            reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await?;
             // §13(c): spec.pin stays live after the mover Job is gone.
             return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
         }
@@ -299,6 +304,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
                 io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+            }
+            // The credential copies die with the mover Job, not with this CR (#240).
+            // Unlike the Succeeded arm this one has no steady-state timer, so keep a
+            // slow requeue alive until the reap settles rather than leaning on the
+            // periodic sweep — which an operator may legitimately have disabled. Once
+            // stamped, we go back to `await_change()` and stop polling entirely.
+            if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await? {
+                return Ok(Action::requeue(Duration::from_secs(600)));
             }
             return Ok(Action::await_change());
         }
@@ -2550,6 +2563,83 @@ fn staged_teardown_ready(job: Option<&Job>) -> bool {
         None => true,
         Some(j) => job_terminal_state(j).is_some(),
     }
+}
+
+/// Whether this Snapshot's projected credential copies have already been reclaimed.
+fn creds_reaped(backup: &Snapshot) -> bool {
+    backup
+        .status
+        .as_ref()
+        .and_then(|s| s.cleanup.as_ref())
+        .and_then(|c| c.creds_reaped_at.as_ref())
+        .is_some()
+}
+
+/// Reclaim the run's projected credential copies now that no mover Job can read
+/// them, and stamp `status.cleanup.credsReapedAt`. Returns whether the reap is
+/// settled — `false` asks the caller to come back (the Job is not terminal yet, or a
+/// copy could not be removed).
+///
+/// A projected copy is only needed while a mover Job can load it via `envFrom` —
+/// minutes. But it is owner-ref'd to this `Snapshot`, which owns the kopia snapshot
+/// via a finalizer and so lives for the entire retention window. Without an explicit
+/// reap, ownerRef GC leaves a live copy of the repository password and backend keys
+/// sitting in the workload namespace for months (#240).
+///
+/// **The Job gate is load-bearing.** The mover PATCHes its terminal phase from *inside
+/// the pod*, before that pod exits and before the Job controller marks the Job
+/// terminal; with the default `backoffLimit` the Job can still schedule a replacement
+/// pod that re-reads these very Secrets. Reaping under an Active Job would strand it in
+/// `CreateContainerConfigError`. This is the same hazard, and the same gate, as the
+/// staged-source teardown (#103).
+///
+/// **The stamp is load-bearing too.** A terminal Snapshot is re-reconciled every 10
+/// minutes for its whole retention window, so an ungated probe would re-issue these
+/// GETs per Snapshot, forever, only to rediscover there is nothing to do —
+/// `pin_job_may_exist` exists in this file for exactly that reason. Stamped once, this
+/// is a no-op thereafter (the `run_post_hooks_once` pattern).
+async fn reap_backup_creds_once(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+) -> Result<bool> {
+    if creds_reaped(backup) {
+        return Ok(true);
+    }
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    if !staged_teardown_ready(job_api.get_opt(name).await?.as_ref()) {
+        return Ok(false);
+    }
+    let owner_uid = backup.uid().unwrap_or_default();
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let outcome = io::reap_projection(
+        &secrets,
+        &io::CredsPrefix::snapshot_backup(name),
+        &owner_uid,
+        namespace,
+        "run finished",
+    )
+    .await;
+    if !outcome.settled {
+        return Ok(false);
+    }
+    if outcome.deleted > 0 {
+        ctx.metrics
+            .inc_creds_secrets_reaped("terminal", outcome.deleted as u64);
+    }
+    // Stamped even when nothing was projected (the common same-namespace case): the
+    // stamp records that cleanup RAN, which is what makes every later reconcile free.
+    io::patch_status(
+        api,
+        name,
+        serde_json::json!({
+            "cleanup": { "credsReapedAt": chrono::Utc::now().to_rfc3339() }
+        }),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// What the running-Job staged-PVC bind watchdog observed.
