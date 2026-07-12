@@ -69,6 +69,8 @@ pub struct Metrics {
     orphaned_snapshots: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
     projected_secrets_swept: Counter<u64>,
+    creds_secrets_reaped: Counter<u64>,
+    projected_secrets_live: Gauge<i64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
@@ -176,6 +178,24 @@ impl Metrics {
                  sweep (pre-stable-naming copies whose mover Job is gone).",
             )
             .build();
+        let creds_secrets_reaped = m
+            .u64_counter("kopiur_creds_secrets_reaped")
+            .with_description(
+                "Total projected credential Secrets reaped once no mover Job could still \
+                 load them, by mechanism: `by=terminal` is the consuming CR's reconciler \
+                 (the fast path), `by=sweep` is the periodic backstop. Do NOT sum them — a \
+                 steady non-zero `by=sweep` rate means the reconciler's reap is not firing.",
+            )
+            .build();
+        let projected_secrets_live = m
+            .i64_gauge("kopiur_projected_secrets_live")
+            .with_description(
+                "Projected credential Secrets currently alive, observed each sweep pass. \
+                 The population, not a delta: a counter of projections rises identically \
+                 whether or not copies are ever reclaimed, which is why the per-run leak \
+                 (#237) ran unseen. Alert on deriv() > 0 over a day.",
+            )
+            .build();
         let schedule_backups_created = m
             .u64_counter("kopiur_schedule_snapshots_created")
             .with_description("Total Snapshot CRs created by a SnapshotSchedule.")
@@ -249,6 +269,8 @@ impl Metrics {
             orphaned_snapshots,
             work_spec_cms_swept,
             projected_secrets_swept,
+            creds_secrets_reaped,
+            projected_secrets_live,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
@@ -611,6 +633,21 @@ impl Metrics {
     /// sweep pass.
     pub fn inc_projected_secrets_swept(&self, n: u64) {
         self.projected_secrets_swept.add(n, &[]);
+    }
+
+    /// Count `n` projected credential Secrets reaped once no mover Job could still
+    /// load them. `by` is the mechanism — `terminal` (the consuming CR's reconciler)
+    /// or `sweep` (the periodic backstop) — and the two are deliberately NOT summed:
+    /// in steady state the reconciler should get there first, so a persistent
+    /// `by=sweep` rate is the signal that its reap has stopped firing.
+    pub fn inc_creds_secrets_reaped(&self, by: &'static str, n: u64) {
+        self.creds_secrets_reaped
+            .add(n, &[opentelemetry::KeyValue::new("by", by)]);
+    }
+
+    /// Record the projected credential Secrets alive after a sweep pass.
+    pub fn set_projected_secrets_live(&self, n: i64) {
+        self.projected_secrets_live.record(n, &[]);
     }
 
     /// Count a Snapshot CR created by a SnapshotSchedule.
