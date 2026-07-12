@@ -18,8 +18,9 @@ use kopiur_api::maintenance::{
 };
 
 use crate::consts::{
-    CHECK_MAINTENANCE_ACTION, MAINTENANCE_CONFIGURED_CONDITION, MAINTENANCE_CONFIGURED_REASON,
-    MAINTENANCE_DISABLED_REASON, MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
+    CHECK_MAINTENANCE_ACTION, MAINTENANCE_APPLY_FAILED_REASON, MAINTENANCE_CONFIGURED_CONDITION,
+    MAINTENANCE_CONFIGURED_REASON, MAINTENANCE_DISABLED_REASON,
+    MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
 };
 use crate::context::Context;
 
@@ -69,6 +70,95 @@ pub enum MaintenanceAction {
     Leave,
     /// Wanted, but the (cluster-repo) placement namespace is unresolved.
     Unresolved,
+}
+
+/// What [`ensure_maintenance`] actually OBSERVED this pass, as a closed set — the input to
+/// the `MaintenanceConfigured` condition. Separate from [`MaintenanceAction`] (what the
+/// operator decided to DO) because the two disagree exactly where #231 bit: the operator
+/// intends to `Manage`, its apply fails, and the repo ends up not covered — which the old
+/// boolean `covered` flag lumped in with a deliberate opt-out and reported as
+/// "maintenance is disabled (spec.maintenance.enabled: false)", a claim that was simply
+/// false. Every not-covered state now says why it is not covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceCoverage {
+    /// Wanted, but the (cluster-repo) placement namespace is unresolved.
+    Unresolved,
+    /// An externally-authored `Maintenance` references the repo.
+    CoveredByForeign,
+    /// The operator's own managed `Maintenance` is applied and covers the repo.
+    CoveredByManaged,
+    /// A deliberate opt-out: `spec.maintenance.enabled: false` and nothing else covers it.
+    DisabledBySpec,
+    /// Maintenance is ENABLED, nothing covers the repository, and the operator could not
+    /// apply its managed `Maintenance`.
+    ///
+    /// The apply error is deliberately NOT carried into the condition message: this runs on
+    /// every reconcile, and the hot-loop guard that suppresses an unchanged condition is a
+    /// byte comparison — an error string that varies between attempts (a `Conflict` naming a
+    /// resourceVersion, an API detail that moves) would defeat it and spin status writes and
+    /// Events at full speed. The verbatim error goes to the operator log instead, where it
+    /// costs nothing to vary.
+    ApplyFailed {
+        /// Namespace the managed `Maintenance` was to be applied in.
+        namespace: String,
+    },
+}
+
+/// The `MaintenanceConfigured` condition for an observed [`MaintenanceCoverage`]:
+/// `(status, reason, message, warn)`. Pure + exhaustive, so every coverage state — and in
+/// particular every NOT-covered state — carries a reason and a message that are true of it
+/// (#231). `warn` marks the states that also deserve a Warning Event.
+pub fn maintenance_condition(
+    coverage: &MaintenanceCoverage,
+    metric_kind: &str,
+    name: &str,
+) -> (bool, &'static str, String, bool) {
+    match coverage {
+        MaintenanceCoverage::Unresolved => (
+            false,
+            MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
+            format!(
+                "managed Maintenance for {metric_kind} {name} cannot be placed: set \
+                 spec.maintenance.namespace, or the operator's KOPIUR_NAMESPACE, so the \
+                 namespaced Maintenance CR has a home"
+            ),
+            true,
+        ),
+        MaintenanceCoverage::CoveredByForeign => (
+            true,
+            MAINTENANCE_CONFIGURED_REASON,
+            format!("an externally-authored Maintenance references {metric_kind} {name}"),
+            false,
+        ),
+        MaintenanceCoverage::CoveredByManaged => (
+            true,
+            MAINTENANCE_CONFIGURED_REASON,
+            format!("the operator manages a Maintenance for {metric_kind} {name}"),
+            false,
+        ),
+        MaintenanceCoverage::DisabledBySpec => (
+            false,
+            MAINTENANCE_DISABLED_REASON,
+            format!(
+                "maintenance is disabled for {metric_kind} {name} (spec.maintenance.enabled: \
+                 false) and no Maintenance references it; kopia storage will not be reclaimed"
+            ),
+            false,
+        ),
+        MaintenanceCoverage::ApplyFailed { namespace } => (
+            false,
+            MAINTENANCE_APPLY_FAILED_REASON,
+            format!(
+                "maintenance is ENABLED for {metric_kind} {name}, but the operator could not \
+                 apply its managed Maintenance in namespace {namespace}, and nothing else \
+                 covers this repository; kopia storage will not be reclaimed until this \
+                 succeeds. It is retried on every reconcile — if it persists, check that the \
+                 namespace exists and that the operator has RBAC to write Maintenance there; \
+                 the apply error itself is in the operator log"
+            ),
+            true,
+        ),
+    }
 }
 
 /// Pure decision for the managed `Maintenance` (the design matrix in the plan):
@@ -192,6 +282,17 @@ pub fn build_managed_maintenance(
 ///   deliberate opt-out).
 /// - `ClusterRepository` whose managed Maintenance has no resolvable placement
 ///   namespace → condition `False` + Warning (`MaintenanceNamespaceUnresolved`).
+/// - enabled, but the managed `Maintenance` **could not be applied** (a failed SSA, or an
+///   un-buildable owner ref) → condition `False` + Warning (`MaintenanceApplyFailed`),
+///   naming the namespace and the error. This state used to be reported as
+///   `MaintenanceDisabled` — "you set spec.maintenance.enabled: false", which was simply
+///   untrue and pointed the operator at the wrong knob (#231).
+///
+/// Every not-covered state says WHY it is not covered, and the condition is re-evaluated on
+/// every reconcile (including the steady-state object-store pass), so a wrong value written
+/// during a bootstrap race self-corrects instead of freezing (#231). The Warning Event is
+/// published only when the condition actually changes — the condition is the durable
+/// signal, the Event marks the transition.
 ///
 /// Degrade-not-crash: if the shared informer store has not synced yet, the whole
 /// step is skipped (the `.watches` trigger + periodic requeue re-run it warm), so
@@ -233,11 +334,10 @@ pub async fn ensure_maintenance<K>(
         match_namespace,
     );
 
-    let mut covered = foreign;
-    let mut unresolved = false;
-
-    // Exhaustive match on the pure decision so every state is handled (ADR §5.5).
-    match maintenance_action(
+    // Exhaustive match on the pure decision so every state is handled (ADR §5.5), and the
+    // OBSERVED outcome — including "we tried to manage it and could not" — is carried out
+    // as a closed [`MaintenanceCoverage`] rather than collapsed into a boolean.
+    let coverage = match maintenance_action(
         enabled,
         foreign,
         managed.is_some(),
@@ -250,14 +350,31 @@ pub async fn ensure_maintenance<K>(
                     let desired = build_managed_maintenance(kind, name, ns, &spec, owner);
                     let mapi: Api<Maintenance> = Api::namespaced(ctx.client.clone(), ns);
                     match apply(&mapi, name, &desired).await {
-                        Ok(_) => covered = true,
+                        Ok(_) => MaintenanceCoverage::CoveredByManaged,
+                        // An apply that fails while the managed `Maintenance` ALREADY exists
+                        // has not un-covered the repo: the CR is right there, owned, holding
+                        // its lease, running on schedule. Since this now runs on every
+                        // reconcile, treating a transient apiserver blip as "maintenance is
+                        // not configured" would flap the condition (and its gauge, and a
+                        // Warning) on every hiccup. Only report the failure when nothing
+                        // covers the repo — the state a user actually has to fix.
+                        Err(e) if managed.is_some() => {
+                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to re-apply the managed Maintenance; the existing one still covers this repository");
+                            MaintenanceCoverage::CoveredByManaged
+                        }
                         Err(e) => {
-                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to apply managed Maintenance")
+                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to apply managed Maintenance");
+                            MaintenanceCoverage::ApplyFailed {
+                                namespace: ns.to_string(),
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, repo = %name, "cannot build owner reference for managed Maintenance")
+                    tracing::warn!(error = %e, repo = %name, "cannot build owner reference for managed Maintenance");
+                    MaintenanceCoverage::ApplyFailed {
+                        namespace: ns.to_string(),
+                    }
                 }
             }
         }
@@ -277,44 +394,27 @@ pub async fn ensure_maintenance<K>(
                     tracing::warn!(error = %e, repo = %name, "failed to delete managed Maintenance");
                 }
             }
+            coverage_without_managed(foreign)
         }
-        MaintenanceAction::Unresolved => unresolved = true,
-        MaintenanceAction::Leave => {}
-    }
+        MaintenanceAction::Unresolved => MaintenanceCoverage::Unresolved,
+        MaintenanceAction::Leave => coverage_without_managed(foreign),
+    };
 
+    let covered = matches!(
+        coverage,
+        MaintenanceCoverage::CoveredByForeign | MaintenanceCoverage::CoveredByManaged
+    );
     ctx.metrics
         .set_repository_maintenance_configured(metric_kind, metric_namespace, name, covered);
 
-    let (status, reason, message, warn) = if unresolved {
-        (
-            false,
-            MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
-            format!(
-                "managed Maintenance for {metric_kind} {name} cannot be placed: set \
-                 spec.maintenance.namespace, or the operator's KOPIUR_NAMESPACE, so the namespaced \
-                 Maintenance CR has a home"
-            ),
-            true,
-        )
-    } else if covered {
-        let msg = if foreign {
-            format!("an externally-authored Maintenance references {metric_kind} {name}")
-        } else {
-            format!("the operator manages a Maintenance for {metric_kind} {name}")
-        };
-        (true, MAINTENANCE_CONFIGURED_REASON, msg, false)
-    } else {
-        (
-            false,
-            MAINTENANCE_DISABLED_REASON,
-            format!(
-                "maintenance is disabled for {metric_kind} {name} (spec.maintenance.enabled: \
-                 false) and no Maintenance references it; kopia storage will not be reclaimed"
-            ),
-            false,
-        )
-    };
+    let (status, reason, message, warn) = maintenance_condition(&coverage, metric_kind, name);
 
+    // Publish the Warning while the problem PERSISTS, not just when the condition flips.
+    // Kubernetes aggregates repeats of an identical Event (bumping its count and
+    // lastTimestamp rather than minting new objects), so re-publishing keeps the signal
+    // alive for `kubectl describe` and Event-driven alerting; gating it on a condition
+    // change instead would emit exactly one Event ever and then go silent forever once it
+    // aged out of the Event TTL — while kopia storage quietly never got reclaimed.
     if warn
         && let Err(e) = ctx
             .recorder
@@ -343,11 +443,26 @@ pub async fn ensure_maintenance<K>(
     );
     // Skip the write when the upsert changed nothing: this runs on EVERY repo
     // reconcile, and an identical re-write would bump `resourceVersion` and
-    // re-trigger the repo controller through its own watch (hot-loop).
+    // re-trigger the repo controller through its own watch (hot-loop). Every `message`
+    // above is a pure function of (coverage, kind, name), so a steady state produces a
+    // byte-identical condition and this guard always fires.
     if conditions.as_slice() == existing_conditions {
         return;
     }
     if let Err(e) = patch_status(api, name, serde_json::json!({ "conditions": conditions })).await {
         tracing::warn!(error = %e, repo = %name, "failed to patch MaintenanceConfigured condition");
+    }
+}
+
+/// Coverage when the operator is NOT managing a `Maintenance` of its own (the `Unmanage` /
+/// `Leave` arms). A foreign `Maintenance` still covers the repo; otherwise the only way to
+/// reach these arms is `enabled == false` (`maintenance_action` routes an enabled,
+/// un-covered repo to `Manage`/`Unresolved`), so "disabled by spec" is provably true here
+/// rather than a catch-all guess (#231).
+fn coverage_without_managed(foreign: bool) -> MaintenanceCoverage {
+    if foreign {
+        MaintenanceCoverage::CoveredByForeign
+    } else {
+        MaintenanceCoverage::DisabledBySpec
     }
 }

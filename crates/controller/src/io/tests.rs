@@ -871,6 +871,91 @@ fn maintenance_action_covers_the_matrix() {
     assert_eq!(maintenance_action(false, true, false, true), Leave);
 }
 
+/// #231: every NOT-covered state must say why it is not covered. The old code branded all
+/// of them `MaintenanceDisabled` with a message asserting `spec.maintenance.enabled: false`
+/// and "no Maintenance references it" — both false when an apply had merely failed, which
+/// pointed operators at entirely the wrong knob.
+#[test]
+fn maintenance_condition_covers_every_coverage_state() {
+    use crate::consts::{
+        MAINTENANCE_APPLY_FAILED_REASON, MAINTENANCE_CONFIGURED_REASON,
+        MAINTENANCE_DISABLED_REASON, MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
+    };
+
+    // Covered, by either party → True, no warning.
+    let (status, reason, msg, warn) = maintenance_condition(
+        &MaintenanceCoverage::CoveredByManaged,
+        "ClusterRepository",
+        "expanse",
+    );
+    assert!(status);
+    assert_eq!(reason, MAINTENANCE_CONFIGURED_REASON);
+    assert!(!warn);
+    assert!(msg.contains("the operator manages a Maintenance"), "{msg}");
+
+    let (status, reason, msg, warn) = maintenance_condition(
+        &MaintenanceCoverage::CoveredByForeign,
+        "Repository",
+        "vault",
+    );
+    assert!(status);
+    assert_eq!(reason, MAINTENANCE_CONFIGURED_REASON);
+    assert!(!warn);
+    assert!(msg.contains("externally-authored"), "{msg}");
+
+    // A deliberate opt-out keeps its message — which is now provably true, since
+    // `maintenance_action` only reaches this state with `enabled == false`.
+    let (status, reason, msg, warn) =
+        maintenance_condition(&MaintenanceCoverage::DisabledBySpec, "Repository", "vault");
+    assert!(!status);
+    assert_eq!(reason, MAINTENANCE_DISABLED_REASON);
+    assert!(!warn, "a deliberate opt-out must not warn");
+    assert!(msg.contains("spec.maintenance.enabled: false"), "{msg}");
+
+    // THE #231 STATE: enabled, nothing covers the repo, and the apply failed. It must NOT
+    // read as "disabled", and it must name the namespace so the operator can act.
+    let (status, reason, msg, warn) = maintenance_condition(
+        &MaintenanceCoverage::ApplyFailed {
+            namespace: "kopiur-system".into(),
+        },
+        "ClusterRepository",
+        "expanse",
+    );
+    assert!(!status);
+    assert_eq!(reason, MAINTENANCE_APPLY_FAILED_REASON);
+    assert!(warn, "a failed apply is a real problem: warn");
+    assert!(msg.contains("ENABLED"), "{msg}");
+    assert!(msg.contains("kopiur-system"), "{msg}");
+    assert!(msg.contains("RBAC"), "{msg}");
+    assert!(
+        !msg.contains("spec.maintenance.enabled: false"),
+        "must never claim the user disabled maintenance: {msg}"
+    );
+    // The message is a pure function of (coverage, kind, name) — no interpolated apply
+    // error. `ensure_maintenance` now runs on EVERY reconcile and suppresses an unchanged
+    // condition by BYTE COMPARISON, so an error string that varies between attempts (a
+    // Conflict naming a resourceVersion) would defeat that guard and spin status writes +
+    // Events at full speed. The verbatim error belongs in the log, not the condition.
+    let (_, _, again, _) = maintenance_condition(
+        &MaintenanceCoverage::ApplyFailed {
+            namespace: "kopiur-system".into(),
+        },
+        "ClusterRepository",
+        "expanse",
+    );
+    assert_eq!(msg, again, "the condition message must be byte-stable");
+
+    // Unplaceable cluster-repo Maintenance keeps its own distinct reason.
+    let (status, reason, _, warn) = maintenance_condition(
+        &MaintenanceCoverage::Unresolved,
+        "ClusterRepository",
+        "expanse",
+    );
+    assert!(!status);
+    assert_eq!(reason, MAINTENANCE_NAMESPACE_UNRESOLVED_REASON);
+    assert!(warn);
+}
+
 fn maint_referencing(
     name: &str,
     ns: &str,

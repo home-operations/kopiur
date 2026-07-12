@@ -96,9 +96,30 @@ You don't manage the files — just put the value under the right key; the secre
 
 ///
 
-/// note | ClusterRepository: Secret refs need a namespace
+/// note | ClusterRepository: where Secret refs resolve
 
-The per-backend pages use a namespaced `Repository`. For a cluster-scoped `ClusterRepository` the same backend stanzas apply, but **every** Secret reference must carry an explicit `namespace:` (webhook-enforced), and the credential Secret must also reach each workload namespace — either replicate it yourself or turn on [credential projection](../movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) (recommended for shared repos). A worked S3 example is on the [S3 page](s3.md#as-a-clusterrepository).
+The per-backend pages use a namespaced `Repository`. The same backend stanzas apply to a cluster-scoped `ClusterRepository`, with one wrinkle: it has no namespace of its own, so "absent = the referrer's namespace" has nothing to resolve to.
+
+- **When the operator itself reads the Secret** — to connect, to bootstrap, or to run the repository server — a Secret reference with no `namespace:` resolves to the **operator's namespace** (`KOPIUR_NAMESPACE`, which the Helm chart sets for you). Setting `namespace:` explicitly always wins. This is what makes a `ClusterRepository` with no namespaces on its refs reach `Ready` at all.
+- **When a workload mover reads it** — a `Snapshot`, `Restore` or `Maintenance` Job — the Secret must exist in **that workload's namespace**, because `envFrom` is namespace-local. Either replicate it there yourself, or turn on [credential projection](../movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) (recommended for shared repos) and let Kopiur copy it in.
+
+/// warning | Set `namespace:` explicitly if anything other than the operator reads the Secret
+
+The operator-namespace default above applies **only** to the repository's own connect / bootstrap / server. The mover side does **not** default it: credential projection needs an explicit `namespace:` on the reference to know what to copy, and without projection a mover looks for a same-named Secret in its own namespace. So a `ClusterRepository` with no `namespace:` on its refs will reach `Ready` and then fail its `Snapshot`/`Restore` Jobs with a `MissingDependency` naming the Secret.
+
+**If you run backups (i.e. almost always), pin the namespace:**
+
+```yaml
+encryption:
+  passwordSecretRef:
+    name: kopiur-repository-secret
+    namespace: kopiur-system # where the Secret actually lives
+    key: KOPIA_PASSWORD
+```
+
+///
+
+A worked S3 example is on the [S3 page](s3.md#as-a-clusterrepository).
 
 ///
 

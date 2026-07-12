@@ -134,6 +134,16 @@ Contrast a **direct** target (`pvc` / `pvcRef`): that restore _is_ one-shot. Onc
 
 ///
 
+/// note | Re-creating a populator `Restore` over a **bound** PVC does nothing (by design)
+
+The claim is what drives a populate, not the `Restore`. A volume populator can only hand a volume to an **unbound** claim, so if you delete and re-create the `Restore` (a GitOps prune and re-apply, a repository rebuild that cascades) while its claiming PVC is still **Bound** and the app is happily running on it, there is nothing to populate. Kopiur completes it as a no-op: `Completed` with `Ready=True reason=TargetAlreadyBound`, no prime PVC, no mover run, and your live volume untouched.
+
+To actually restore into that claim, delete the **PVC** (keeping its `dataSourceRef`) and let it be re-created — see the reusability note above.
+
+**Upgrading from ≤ 0.7.x?** That case used to run a full restore into a `prime-<uid>` PVC that could never be adopted, and then leak it: a Bound PVC holding a complete second copy of your data, one per re-created `Restore`. On upgrade, Kopiur reaps those automatically (watch for an `OrphanedPrimePvcReaped` event) for every orphan whose claiming PVC still exists. Any left over from a claim that has since been deleted are garbage-collected when their `Restore` is. To find them: `kubectl get pvc -A -l kopiur.home-operations.com/op=restore-populate`.
+
+///
+
 ## How to write — `options` and `policy`
 
 ```yaml

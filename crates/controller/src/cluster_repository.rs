@@ -75,6 +75,90 @@ fn cluster_maintenance_placement(ctx: &Context, repo: &ClusterRepository) -> Opt
         .or_else(|| ctx.operator_namespace.clone())
 }
 
+/// Project this `ClusterRepository`'s `spec.maintenance` into its managed `Maintenance` CR
+/// and refresh the `MaintenanceConfigured` condition (ADR §3.7; §11: ReadOnly cluster repos
+/// run no maintenance).
+///
+/// `conditions` is the condition set to build on — the FRESHLY patched set on the bootstrap
+/// finalize path (so this patch doesn't drop the `Bootstrapped` condition written moments
+/// earlier), or the cached status elsewhere.
+///
+/// Called on every reconcile that gets far enough to know the repo's state, including the
+/// steady-state pass of an already-`Ready` object-store repo. That last one is #231: the
+/// condition used to be written only at the tail of a bootstrap, so a value written during
+/// a bootstrap race (the informer store had not yet seen the just-applied Maintenance, or
+/// the apply transiently failed) froze — reading `MaintenanceDisabled` for days while the
+/// managed `Maintenance` sat right there, owned and running.
+async fn ensure_cluster_maintenance(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    name: &str,
+    api: &Api<ClusterRepository>,
+    conditions: &[Condition],
+) {
+    if !repo.spec.mode.allows_writes() {
+        return;
+    }
+    let placement = cluster_maintenance_placement(ctx, repo);
+    io::ensure_maintenance(
+        ctx,
+        api,
+        repo,
+        &io::event_ref(repo),
+        RepositoryKind::ClusterRepository,
+        "ClusterRepository",
+        "",
+        None,
+        placement.as_deref(),
+        name,
+        repo.spec.maintenance.as_ref(),
+        conditions,
+        repo.metadata.generation,
+    )
+    .await;
+}
+
+/// The `ClusterRepository`'s currently-observed status conditions (empty when no status).
+fn cluster_conditions(repo: &ClusterRepository) -> Vec<Condition> {
+    repo.status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default()
+}
+
+/// Which namespace a cluster-scoped repository reads its credential `Secret` from (and
+/// therefore runs its bootstrap `Job` in): the reference's explicit `namespace` if set,
+/// else the operator's own namespace (`KOPIUR_NAMESPACE`).
+///
+/// A `ClusterRepository` has no namespace of its own, so "absent = the referrer's
+/// namespace" cannot mean anything for it. Rather than refuse the object (#232: the
+/// reconcile hard-errored `passwordSecretRef.namespace is required`, contradicting the
+/// field's own documentation), default to the operator namespace — the same rule
+/// [`cluster_maintenance_placement`] already applies to `spec.maintenance.namespace`, and
+/// the namespace where a chart install's repository Secret conventionally lives.
+///
+/// Only an off-chart install with no `KOPIUR_NAMESPACE` has neither, and that is a real
+/// misconfiguration: refuse it with both fixes rather than guess a namespace. Pure.
+fn cluster_secret_namespace(
+    explicit: Option<&str>,
+    operator_namespace: Option<&str>,
+) -> Result<String> {
+    explicit
+        .or(operator_namespace)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Error::Validation(
+                "ClusterRepository encryption.passwordSecretRef.namespace is not set and the \
+                 operator's own namespace is unknown (KOPIUR_NAMESPACE is unset), so there is no \
+                 namespace to read the repository's credential Secret from — a cluster-scoped \
+                 ClusterRepository has none of its own to fall back on. Set \
+                 encryption.passwordSecretRef.namespace to the Secret's namespace, or set \
+                 KOPIUR_NAMESPACE on the controller (the Helm chart does this automatically)."
+                    .into(),
+            )
+        })
+}
+
 /// Reconcile a `ClusterRepository`.
 #[tracing::instrument(skip(repo, ctx), fields(kind = "ClusterRepository", name = %repo.name_any()))]
 pub async fn reconcile(repo: Arc<ClusterRepository>, ctx: Arc<Context>) -> Result<Action> {
@@ -169,15 +253,39 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
     // below — whose branches return early — so it is applied/migrated/torn down on
     // every reconcile. Children live in `spec.server.namespace` (cluster-scoped
     // owners can't own them); cleanup is via the finalizer + back-reference labels.
-    reconcile_cluster_server(ctx, repo, &name, &api).await?;
+    //
+    // Degrade, don't crash: the web UI is auxiliary — backups and restores do not depend on
+    // it — so a problem here must NOT abort the reconcile before the backend match below,
+    // which is what actually bootstraps the repository. It used to `?`, so a server whose
+    // credentials Secret is not where we expect (e.g. an absent `passwordSecretRef.namespace`
+    // now resolving to the operator namespace rather than the server's) would take the whole
+    // repository down with it. Surface it as a Warning and carry on.
+    if let Err(e) = reconcile_cluster_server(ctx, repo, &name, &api).await {
+        tracing::warn!(error = %e, repo = %name, "failed to reconcile the kopia repository server; the repository itself is unaffected");
+        io::publish_warning_event(
+            ctx,
+            repo,
+            "RepositoryServerDegraded",
+            "CheckRepositoryServer",
+            &format!(
+                "the kopia repository server (spec.server) could not be reconciled: {e}. The \
+                 repository itself is unaffected — backups and restores continue. If its \
+                 credentials Secret lives in the server's namespace, pin it explicitly with \
+                 encryption.passwordSecretRef.namespace (a ClusterRepository otherwise reads it \
+                 from the operator's namespace)."
+            ),
+        )
+        .await;
+    }
     // Once a server is no longer configured (and any teardown above has run), the
     // cleanup finalizer is no longer needed.
     if !server_enabled {
         io::remove_finalizer(&api, repo, SERVER_CLEANUP_FINALIZER).await?;
     }
 
-    // Same connect/create/status lifecycle as Repository. Cluster-scoped secret
-    // refs MUST carry an explicit namespace (webhook-enforced).
+    // Same connect/create/status lifecycle as Repository. A cluster-scoped secret ref has
+    // no referrer namespace to inherit, so an absent one resolves to the operator's
+    // namespace (`cluster_secret_namespace`).
     match &repo.spec.backend {
         // A PVC/NFS-backed filesystem repo is NOT reachable from the controller
         // in-process (the controller pod can't mount the repo volume), so — exactly
@@ -199,11 +307,10 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // rationale: a credential fix does not bump `generation`, so the gate must
             // also key on the Secret revision).
             let creds = io::repo_credentials(&repo.spec.encryption);
-            let secret_ns = creds.namespace.clone().ok_or_else(|| {
-                Error::Validation(
-                    "ClusterRepository encryption.passwordSecretRef.namespace is required".into(),
-                )
-            })?;
+            let secret_ns = cluster_secret_namespace(
+                creds.namespace.as_deref(),
+                ctx.operator_namespace.as_deref(),
+            )?;
             let (password, cred_version) =
                 io::read_repo_credential(&ctx.client, &secret_ns, &creds).await?;
 
@@ -364,31 +471,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // Cluster-scoped, so the metric namespace label is empty and
             // ref-matching ignores namespace. The (namespaced) Maintenance lands in
             // spec.maintenance.namespace, else the operator's own namespace.
-            let conditions = repo
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
-            // §11: ReadOnly cluster repos run no maintenance.
-            if repo.spec.mode.allows_writes() {
-                let placement = cluster_maintenance_placement(ctx, repo);
-                io::ensure_maintenance(
-                    ctx,
-                    &api,
-                    repo,
-                    &io::event_ref(repo),
-                    RepositoryKind::ClusterRepository,
-                    "ClusterRepository",
-                    "",
-                    None,
-                    placement.as_deref(),
-                    &name,
-                    repo.spec.maintenance.as_ref(),
-                    &conditions,
-                    repo.metadata.generation,
-                )
-                .await;
-            }
+            ensure_cluster_maintenance(ctx, repo, &name, &api, &cluster_conditions(repo)).await;
         }
         other => {
             // Object-store backends bootstrap via a short-lived mover Job (ADR
@@ -509,12 +592,18 @@ async fn reconcile_cluster_server(
         (CLUSTER_REPOSITORY_UID_LABEL.to_string(), uid),
     ]);
 
-    // Cluster-scoped credentials Secret carries an explicit namespace; fall back to
-    // the server namespace if somehow unset.
+    // Which namespace the server MIRRORS the credentials Secret from. Same rule the
+    // repository itself uses (`cluster_secret_namespace`): the reference's explicit
+    // namespace, else the operator's — so "absent" means ONE thing on a ClusterRepository.
+    // Were this to keep defaulting to the server namespace while the repository defaulted
+    // to the operator's, a user who followed the documented default (Secret in the operator
+    // namespace) would bootstrap fine and then get a server pod wedged on a Secret that
+    // isn't in its namespace. The server namespace remains the last resort.
     let creds = io::repo_credentials(&repo.spec.encryption);
     let creds_src_namespace = creds
         .namespace
         .clone()
+        .or_else(|| ctx.operator_namespace.clone())
         .or_else(|| desired_ns.clone())
         .unwrap_or_default();
 
@@ -597,14 +686,13 @@ async fn bootstrap_cluster_via_mover(
     api: &Api<ClusterRepository>,
     backend: &Backend,
 ) -> Result<Action> {
-    // The Job + its result ConfigMap live in the credentials Secret's namespace
-    // (cluster-scoped refs must carry an explicit namespace — webhook-enforced).
+    // The Job + its result ConfigMap live in the credentials Secret's namespace: the
+    // reference's explicit namespace, else the operator's own (`cluster_secret_namespace`).
     let creds = io::repo_credentials(&repo.spec.encryption);
-    let job_ns = creds.namespace.clone().ok_or_else(|| {
-        Error::Validation(
-            "ClusterRepository encryption.passwordSecretRef.namespace is required".into(),
-        )
-    })?;
+    let job_ns = cluster_secret_namespace(
+        creds.namespace.as_deref(),
+        ctx.operator_namespace.as_deref(),
+    )?;
     let job_name = format!("{name}-bootstrap");
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &job_ns);
 
@@ -723,6 +811,25 @@ async fn bootstrap_cluster_via_mover(
             chrono::Utc::now(),
         ))
     {
+        // This is the STEADY STATE of a Ready object-store repo (`bootstrap_create_due` is
+        // true for any non-Ready phase, so nothing that has yet to bootstrap gets here).
+        // Re-evaluate maintenance coverage before parking: it is the only pass a repo whose
+        // bootstrap Job has been TTL-reaped ever makes, and #231 is exactly what happens
+        // when the condition is never re-evaluated — a `MaintenanceDisabled` written during
+        // a bootstrap race froze for days while the managed `Maintenance` ran happily. Cheap
+        // and idempotent: a synchronous informer read, a deterministic server-side apply,
+        // and a status patch that is skipped when nothing changed. It also gives the
+        // Maintenance watch (`controllers.rs`) a reconcile that actually re-classifies, so
+        // deleting the managed CR now re-applies it instead of being silently ignored.
+        //
+        // Build on a FRESH read of the conditions, not the watch-cached object: a Maintenance
+        // event can requeue us moments after the bootstrap finalize patched `Bootstrapped` /
+        // `BackendReachable`, while the informer store still holds the pre-patch copy — and
+        // the condition write below replaces the whole array, so a stale copy would silently
+        // resurrect it and drop those conditions.
+        let fresh = api.get_opt(name).await?;
+        let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+        ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
         )));
@@ -742,7 +849,34 @@ async fn bootstrap_cluster_via_mover(
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
     );
-    let creds_secrets = io::plain_creds(io::mover_creds_secrets(backend, &repo.spec.encryption));
+    // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
+    // namespace it will actually run in. Without this the Job launches against a Secret
+    // that isn't there, its pod wedges in `CreateContainerConfigError` until the bootstrap
+    // deadline, and the failure surfaces as a generic "mover pod crashed or never
+    // scheduled" — naming neither the Secret nor the namespace. That matters more now that
+    // `job_ns` can be DEFAULTED (#232): if the Secret lives somewhere else, say so.
+    let creds_names = io::mover_creds_secrets(backend, &repo.spec.encryption);
+    io::ensure_creds_present(
+        &ctx.client,
+        &job_ns,
+        &io::CredsContext {
+            secret_names: &creds_names,
+            repo_kind: "ClusterRepository",
+            repo_name: name,
+            // The namespace the REFERENCE names, not the Job's. Passing the Job's namespace
+            // would make it tautologically equal and silence the cross-namespace branch of
+            // `missing_creds_message` — the branch that exists precisely to say "your
+            // ClusterRepository keeps that Secret in X, but the Job runs in Y".
+            repo_secret_namespace: repo
+                .spec
+                .encryption
+                .password_secret_ref
+                .namespace
+                .as_deref(),
+        },
+    )
+    .await?;
+    let creds_secrets = io::plain_creds(creds_names);
     let owner = io::owner_ref_for(repo, "ClusterRepository")?;
     // The bootstrap Job runs in the credentials Secret's namespace (`job_ns`).
     // Resolve its run identity there: the user's workload-identity SA
@@ -1084,26 +1218,7 @@ async fn finalize_cluster_bootstrap(
     // Ensure the managed Maintenance for this ClusterRepository (§3.7). Build on
     // the conditions we just patched (including `Bootstrapped`), not the stale
     // cached object, so this patch doesn't drop the `Bootstrapped` set above.
-    // §11: ReadOnly cluster repos run no maintenance.
-    if repo.spec.mode.allows_writes() {
-        let placement = cluster_maintenance_placement(ctx, repo);
-        io::ensure_maintenance(
-            ctx,
-            api,
-            repo,
-            &io::event_ref(repo),
-            RepositoryKind::ClusterRepository,
-            "ClusterRepository",
-            "",
-            None,
-            placement.as_deref(),
-            name,
-            repo.spec.maintenance.as_ref(),
-            &conditions,
-            repo.metadata.generation,
-        )
-        .await;
-    }
+    ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
 
     // A probe consumes its Job exactly once (no lingering finished Job → no churn;
     // the next probe is a fresh connect). Requeue on the probe cadence.
@@ -1282,5 +1397,39 @@ mod tests {
     #[test]
     fn disallowed_and_no_fallback_yields_none() {
         assert_eq!(placement_namespace("evil", false, None), None);
+    }
+
+    // #232: a ClusterRepository is cluster-scoped, so "absent = the referrer's namespace"
+    // has nothing to resolve to. It used to hard-error `passwordSecretRef.namespace is
+    // required` on every reconcile, contradicting the field's own documentation; it now
+    // defaults to the operator's namespace, exactly like spec.maintenance.namespace.
+
+    #[test]
+    fn explicit_secret_namespace_wins_over_the_operator_namespace() {
+        assert_eq!(
+            cluster_secret_namespace(Some("vault"), Some("kopiur-system")).unwrap(),
+            "vault"
+        );
+    }
+
+    #[test]
+    fn absent_secret_namespace_defaults_to_the_operator_namespace() {
+        assert_eq!(
+            cluster_secret_namespace(None, Some("kopiur-system")).unwrap(),
+            "kopiur-system"
+        );
+    }
+
+    #[test]
+    fn absent_secret_namespace_without_an_operator_namespace_is_an_actionable_error() {
+        let err = cluster_secret_namespace(None, None).expect_err("must not guess a namespace");
+        let msg = err.to_string();
+        // Both fixes, so an off-chart install knows either lever will do.
+        assert!(
+            msg.contains("encryption.passwordSecretRef.namespace"),
+            "{msg}"
+        );
+        assert!(msg.contains("KOPIUR_NAMESPACE"), "{msg}");
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
     }
 }

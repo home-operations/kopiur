@@ -101,6 +101,12 @@ pub const MAINTENANCE_DISABLED_REASON: &str = "MaintenanceDisabled";
 /// cannot be placed: neither `spec.maintenance.namespace` nor the operator
 /// namespace (`KOPIUR_NAMESPACE`) is set. A real misconfiguration, so it warns.
 pub const MAINTENANCE_NAMESPACE_UNRESOLVED_REASON: &str = "MaintenanceNamespaceUnresolved";
+/// Event + condition reason when maintenance is ENABLED but the operator could not apply
+/// its managed `Maintenance` (a failed server-side apply, or an un-buildable owner ref).
+/// Distinct from [`MAINTENANCE_DISABLED_REASON`], which is a deliberate opt-out: reporting
+/// a transient apply failure as "you disabled maintenance" pointed operators at entirely
+/// the wrong knob (#231). Warns, and is retried on every reconcile.
+pub const MAINTENANCE_APPLY_FAILED_REASON: &str = "MaintenanceApplyFailed";
 
 /// Status condition `type` recording the outcome of an object-store repository
 /// bootstrap Job (connect/create). `True` once the repository is reachable;
@@ -138,6 +144,27 @@ pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
 pub const OP_RESTORE_POPULATE: &str = "restore-populate";
 /// `Restore` Ready reason once a populator restored its snapshot and rebound the volume.
 pub const RESTORE_POPULATED_REASON: &str = "RestoreSucceeded";
+/// `Restore` Failed reason (and Warning Event) when the claiming PVC was bound out from
+/// under a populate that was still RUNNING — a provisioner handed it a volume without
+/// honoring its `dataSourceRef`, so the restore can never be delivered. Distinct from
+/// [`RESTORE_TARGET_ALREADY_BOUND_REASON`]: that one is a benign no-op over a claim that was
+/// already carrying its data; this one means the app is about to start on the WRONG volume.
+pub const POPULATE_HIJACKED_REASON: &str = "PopulateHijacked";
+/// `Restore` Ready reason while a populator that had completed as an already-bound no-op
+/// re-resolves its source, because its claiming PVC was re-created (and is unbound again,
+/// so it genuinely wants populating). Also re-anchors the `waitTimeout` window.
+pub const RESTORE_CLAIM_RECREATED_REASON: &str = "ClaimRecreated";
+/// `Restore` Ready reason when a populator's claiming PVC is ALREADY bound, so there is
+/// nothing to populate: a CSI volume-populator can only hand a volume to an unbound claim.
+/// A truthful terminal no-op — no prime PVC, no mover run (#233).
+pub const RESTORE_TARGET_ALREADY_BOUND_REASON: &str = "TargetAlreadyBound";
+/// Warning Event reason when the populator reaps leftover populate artifacts (a prime PVC
+/// and/or its mover Job) that can never be handed over because the claiming PVC is already
+/// bound. Pre-0.8 these leaked, each holding a full copy of the restored data (#233).
+pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
+/// `action` for the already-bound no-op / orphan-reap Events: to actually restore into the
+/// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
+pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
 
 /// `Snapshot`/`Restore` condition surfaced when the mover Job's credential Secret is
 /// absent from the workload namespace — `False` carries the actionable message

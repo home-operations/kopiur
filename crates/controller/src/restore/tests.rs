@@ -182,6 +182,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
             Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
             Some(Completed),
             AwaitingClaim,
+            false,
         ),
         Some(Resolution::Empty)
     );
@@ -195,6 +196,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
             )),
             Some(Pending),
             DirectTarget,
+            false,
         ),
         Some(Resolution::Snapshot("k7".into()))
     );
@@ -205,6 +207,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
             Some(&resolved_with(None, Some("k7"))),
             Some(Pending),
             DirectTarget,
+            false,
         ),
         Some(Resolution::Snapshot("k7".into()))
     );
@@ -213,16 +216,74 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
     // resolved populator ALWAYS pins before Completed, so this unambiguously means
     // the decision was "empty" — back-fill Empty, do NOT re-resolve.
     assert_eq!(
-        pinned_decision(None, Some(Completed), AwaitingClaim),
+        pinned_decision(None, Some(Completed), AwaitingClaim, false),
         Some(Resolution::Empty)
     );
     // The same shape on a DIRECT target is not a stuck populator (its `Completed`
     // is terminal at the guard, so it never reaches here): require fresh resolution.
-    assert_eq!(pinned_decision(None, Some(Completed), DirectTarget), None);
+    assert_eq!(
+        pinned_decision(None, Some(Completed), DirectTarget, false),
+        None
+    );
 
     // A fresh, un-pinned restore must resolve.
-    assert_eq!(pinned_decision(None, Some(Pending), AwaitingClaim), None);
-    assert_eq!(pinned_decision(None, None, DirectTarget), None);
+    assert_eq!(
+        pinned_decision(None, Some(Pending), AwaitingClaim, false),
+        None
+    );
+    assert_eq!(pinned_decision(None, None, DirectTarget, false), None);
+}
+
+/// #233: the OTHER way a populator reaches `Completed` unpinned is an already-bound
+/// no-op on a DEFERRED source — the mover (which pins a deferred source) never ran.
+/// Back-filling `Empty` there would durably pin `NoSnapshot`, so a later, legitimate
+/// re-creation of the claiming PVC would provision an EMPTY volume instead of restoring
+/// the snapshot. The `noop_already_bound` flag must suppress exactly that back-fill —
+/// and nothing else.
+#[test]
+fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
+    use PopulatorState::AwaitingClaim;
+    use RestorePhase::Completed;
+
+    // The no-op'd populator: do NOT infer "empty", leave it unresolved so a recreated
+    // claim re-resolves and restores for real.
+    assert_eq!(
+        pinned_decision(None, Some(Completed), AwaitingClaim, true),
+        None
+    );
+    // The legacy stuck populator (same shape, but NOT an already-bound no-op) still
+    // back-fills — that heal must survive this fix.
+    assert_eq!(
+        pinned_decision(None, Some(Completed), AwaitingClaim, false),
+        Some(Resolution::Empty)
+    );
+    // A genuine deploy-or-restore PINNED `NoSnapshot`, so it reads its pin either way:
+    // the flag never overrides a real pin.
+    for noop in [true, false] {
+        assert_eq!(
+            pinned_decision(
+                Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
+                Some(Completed),
+                AwaitingClaim,
+                noop,
+            ),
+            Some(Resolution::Empty)
+        );
+        // …and a pinned snapshot id is likewise honored, so a recreated claim restores
+        // the SAME snapshot (ADR §4.6: pinned once, never re-resolved).
+        assert_eq!(
+            pinned_decision(
+                Some(&resolved_with(
+                    Some(ResolutionOutcome::Snapshot),
+                    Some("k9")
+                )),
+                Some(Completed),
+                AwaitingClaim,
+                noop,
+            ),
+            Some(Resolution::Snapshot("k9".into()))
+        );
+    }
 }
 
 // --- kstatus Ready conditions (ADR-0005 §2) -----------------------------
@@ -407,6 +468,236 @@ fn pvc_is_bound_reads_volume_name_or_phase() {
     assert!(!pvc_is_bound(&pvc(serde_json::json!({
         "metadata": { "name": "p" }, "spec": {}, "status": { "phase": "Pending" },
     }))));
+}
+
+// --- #233: the populator handshake verdict --------------------------------
+// The bug: a `Restore` re-created (GitOps prune + re-apply) over a claim that is
+// ALREADY bound used to provision a prime PVC and run a full restore into it, then
+// park forever — the prime could never be adopted (a CSI populator only hands volumes
+// to UNBOUND claims), so it sat `Bound` holding a complete copy of the data. Every
+// binding ordering is decided here, exhaustively, in one pure place.
+
+#[test]
+fn populator_handshake_covers_every_binding_ordering() {
+    let unbound = pvc(serde_json::json!({ "metadata": { "name": "c" }, "spec": {} }));
+    let bound_ours = pvc(serde_json::json!({
+        "metadata": { "name": "c" }, "spec": { "volumeName": "pv-ours" },
+    }));
+    let bound_foreign = pvc(serde_json::json!({
+        "metadata": { "name": "c" }, "spec": { "volumeName": "pv-theirs" },
+    }));
+    // Bound only through `status.phase` — `spec.volumeName` not observed yet.
+    let bound_by_phase = pvc(serde_json::json!({
+        "metadata": { "name": "c" }, "spec": {}, "status": { "phase": "Bound" },
+    }));
+
+    // No rebind of ours + unbound claim → the normal populate path (also the WFFC
+    // shape before a pod schedules the claim).
+    assert_eq!(
+        populator_handshake(&unbound, None),
+        PopulatorHandshake::Populate
+    );
+
+    // THE #233 CASE: no rebind of ours + an already-bound claim → nothing to populate.
+    assert_eq!(
+        populator_handshake(&bound_foreign, None),
+        PopulatorHandshake::NothingToPopulate
+    );
+    // …including a claim that only reads bound through its phase.
+    assert_eq!(
+        populator_handshake(&bound_by_phase, None),
+        PopulatorHandshake::NothingToPopulate
+    );
+
+    // Mid-handover: our rebind is issued but the claim has not bound yet. This is the
+    // guard that must NOT misfire — reaping here would kill a healthy restore.
+    assert_eq!(
+        populator_handshake(&unbound, Some("pv-ours")),
+        PopulatorHandshake::AwaitingBind
+    );
+    // Bound-by-phase-only WITH our rebind outstanding is still mid-handover, NOT a lost
+    // rebind: `spec.volumeName` is the only field that says WHICH volume won the claim.
+    assert_eq!(
+        populator_handshake(&bound_by_phase, Some("pv-ours")),
+        PopulatorHandshake::AwaitingBind
+    );
+
+    // The handover landed → finalize (restore the PV's reclaim policy, GC the prime).
+    assert_eq!(
+        populator_handshake(&bound_ours, Some("pv-ours")),
+        PopulatorHandshake::FinalizeRebound {
+            pv: "pv-ours".into()
+        }
+    );
+
+    // Our rebind was issued but a DIFFERENT PV won the claim: the handover is lost and
+    // can never complete. Reap — and keep our PV, which holds the restored data.
+    assert_eq!(
+        populator_handshake(&bound_foreign, Some("pv-ours")),
+        PopulatorHandshake::LostRebind {
+            pv: "pv-ours".into()
+        }
+    );
+}
+
+/// A populator Restore that is `Completed` with `Ready=True/<reason>`, parsed the
+/// cluster's way (JSON → typed).
+fn completed_populator_with_ready_reason(reason: &str) -> Restore {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "snapshotRef": { "name": "b" } },
+            "target": { "populator": {} }
+        },
+        "status": {
+            "phase": "Completed",
+            "conditions": [{
+                "type": "Ready", "status": "True", "reason": reason, "message": "m",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"
+            }]
+        }
+    }))
+    .expect("valid Restore")
+}
+
+/// The `Ready` reason is what tells the three `Completed` populator states apart, so it
+/// gates both the re-resolution skip and the `pinned_decision` back-fill.
+#[test]
+fn completed_as_target_already_bound_reads_ready_reason() {
+    assert!(completed_as_target_already_bound(
+        &completed_populator_with_ready_reason(crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON)
+    ));
+    // A real restore, and the legacy stuck-populator state, must NOT be mistaken for it —
+    // the first would have its success message clobbered, the second would never heal.
+    assert!(!completed_as_target_already_bound(
+        &completed_populator_with_ready_reason(crate::consts::RESTORE_POPULATED_REASON)
+    ));
+    assert!(!completed_as_target_already_bound(
+        &completed_populator_with_ready_reason("PopulatingPrimePvc")
+    ));
+    // No status at all (a fresh CR) is not a no-op completion either.
+    assert!(!completed_as_target_already_bound(&restore_with_condition(
+        "Resolved", "True"
+    )));
+}
+
+/// The no-op and reap messages are what a human reads when 49 prime PVCs vanish, so the
+/// what/why/fix text is asserted like any other behavior.
+#[test]
+fn target_already_bound_messages_say_what_why_fix() {
+    let msg = target_already_bound_message("plex-config", Some("pvc-abc"));
+    assert!(msg.contains("`plex-config`"), "{msg}");
+    assert!(msg.contains("already bound"), "{msg}");
+    assert!(msg.contains("PersistentVolume `pvc-abc`"), "{msg}");
+    // The fix: re-create the CLAIM (deleting the Restore just re-triggers this no-op).
+    assert!(msg.contains("delete the PVC"), "{msg}");
+    // Never claim a restore ran.
+    assert!(msg.contains("no restore ran"), "{msg}");
+    // A claim bound without an observed volumeName still reads sensibly.
+    assert!(
+        target_already_bound_message("plex-config", None).contains("a PersistentVolume"),
+        "unnamed volume must not render as an empty backtick pair"
+    );
+
+    let note =
+        reaped_populate_artifacts_note(&["prime PVC `prime-9f2`".to_string()], "plex-config", None);
+    assert!(note.contains("prime PVC `prime-9f2`"), "{note}");
+    assert!(note.contains("plex-config"), "{note}");
+    // A lost rebind must say the volume was KEPT — the data is in there.
+    let kept = reaped_populate_artifacts_note(
+        &["populate Job `plex-populate`".to_string()],
+        "plex-config",
+        Some("pv-xyz"),
+    );
+    assert!(kept.contains("pv-xyz"), "{kept}");
+    assert!(kept.contains("Retain"), "{kept}");
+    assert!(kept.contains("KEPT"), "{kept}");
+}
+
+/// A LOST rebind is not an already-bound no-op: a prime WAS provisioned, a restore DID run,
+/// and a full-size volume is now `Retain`ed. Telling the operator "nothing was provisioned,
+/// no restore ran" there would hide storage they have just become responsible for.
+#[test]
+fn lost_rebind_message_never_claims_nothing_ran() {
+    let msg = lost_rebind_message("plex-config", "pv-ours");
+    assert!(msg.contains("`plex-config`"), "{msg}");
+    assert!(msg.contains("pv-ours"), "{msg}");
+    assert!(msg.contains("Retain"), "{msg}");
+    assert!(
+        !msg.contains("no restore ran"),
+        "a lost rebind DID run a restore: {msg}"
+    );
+    assert!(
+        msg.contains("restored data is NOT in the claim"),
+        "must say where the data actually is: {msg}"
+    );
+}
+
+/// A claim bound out from under a RUNNING populate is a hijacked handover, not a success:
+/// the app is about to start on someone else's (probably empty) volume, so reporting
+/// `Ready=True` would tell `kubectl wait`/Flux a restore landed when it did not.
+#[test]
+fn populate_hijacked_message_points_at_the_provisioner() {
+    let msg = populate_hijacked_message("plex-config", Some("pv-empty"));
+    assert!(msg.contains("`plex-config`"), "{msg}");
+    assert!(msg.contains("pv-empty"), "{msg}");
+    assert!(msg.contains("AnyVolumeDataSource"), "{msg}");
+    assert!(msg.contains("terminal"), "{msg}");
+    assert!(
+        populate_hijacked_message("plex-config", None).contains("another PersistentVolume"),
+        "an unnamed volume must not render as an empty backtick pair"
+    );
+}
+
+/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
+/// claim must measure its `waitTimeout` from the re-open, not from its own creation —
+/// otherwise the window is already spent, and a `fromPolicy` source (which defaults to
+/// `Continue`) skips the wait and provisions an EMPTY volume the instant the snapshot
+/// happens not to be there yet.
+#[test]
+fn wait_window_re_anchors_when_a_recreated_claim_reopens_resolution() {
+    let with_ready = |reason: &str, at: &str| -> Restore {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "source": { "fromPolicy": { "name": "cfg" } },
+                "target": { "populator": {} }
+            },
+            "status": { "conditions": [{
+                "type": "Ready", "status": "False", "reason": reason, "message": "m",
+                "lastTransitionTime": at
+            }] }
+        }))
+        .expect("valid Restore")
+    };
+
+    // 2026-01-01T00:00:00Z == 1767225600. The Restore itself was created long before.
+    let created = 1_000_000_000;
+    let reopened = with_ready("ClaimRecreated", "2026-01-01T00:00:00Z");
+    assert_eq!(wait_window_anchor(&reopened, created), 1_767_225_600);
+
+    // Any other Ready reason leaves the window anchored at creation.
+    let normal = with_ready("PopulatingPrimePvc", "2026-01-01T00:00:00Z");
+    assert_eq!(wait_window_anchor(&normal, created), created);
+
+    // A re-open that somehow predates creation never SHORTENS the window.
+    let stale = with_ready("ClaimRecreated", "2001-09-09T01:46:40Z");
+    assert_eq!(wait_window_anchor(&stale, created), created);
+
+    // Net effect: the user's 5m window is fully available again from the re-open.
+    assert_eq!(
+        wait_remaining_secs(
+            wait_window_anchor(&reopened, created),
+            Some("5m"),
+            1_767_225_660,
+        ),
+        Some(240),
+        "the configured waitTimeout must actually apply to the re-created claim"
+    );
 }
 
 // --- restore_flags (M2 flag sweep controller-glue guard) ---
