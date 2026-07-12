@@ -3,7 +3,7 @@
 //! (created PVC / existing PVC / populator), with optional wait + log stream.
 
 use chrono::{DateTime, Utc};
-use kopiur_api::common::{FailurePolicy, ObjectRef, RepositoryRef};
+use kopiur_api::common::{CredentialProjection, FailurePolicy, ObjectRef, RepositoryRef};
 use kopiur_api::restore::{
     FromPolicy, IdentitySource, PvcTemplate, RestoreOptions, RestorePolicy, RestoreSpec,
 };
@@ -153,7 +153,9 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
             target,
             options,
             policy,
-            credential_projection: None,
+            credential_projection: args
+                .credential_projection
+                .then_some(CredentialProjection { enabled: true }),
             mover: None,
             failure_policy,
         },
@@ -603,6 +605,19 @@ mod tests {
         for key in ["options", "policy", "failurePolicy", "repository", "mover"] {
             assert!(spec.get(key).is_none(), "{key} should be absent");
         }
+    }
+
+    #[test]
+    fn credential_projection_flag_lands_in_the_spec() {
+        let args = parse(&[
+            "--from-snapshot",
+            "snap1",
+            "--to-pvc",
+            "data",
+            "--credential-projection",
+        ]);
+        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        assert_eq!(wire["spec"]["credentialProjection"]["enabled"], true);
     }
 
     #[test]
