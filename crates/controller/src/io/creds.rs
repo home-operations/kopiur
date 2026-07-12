@@ -342,6 +342,11 @@ enum ReapSignal {
     Absent,
     /// Exists but is not ours to delete (no marker / different owner).
     Kept,
+    /// The API call failed. Distinct from [`Self::Kept`]: nothing is owed on a copy
+    /// that was never ours, but a copy we could not *reach* may still be there, and a
+    /// caller that treats the two alike would record the reap as settled and never
+    /// look again.
+    Errored,
     /// The operator lacks the `secrets` delete verb (HTTP 403) — the chart's
     /// projection grant predates the sweep. Stop trying; never fail the run.
     Forbidden,
@@ -392,7 +397,7 @@ async fn reap_quietly(
         Err(e) => {
             tracing::warn!(secret = %name, namespace = %job_ns, what, error = %e,
                 "projected credentials copy cleanup failed (skipped; retried next run)");
-            return ReapSignal::Kept;
+            return ReapSignal::Errored;
         }
     };
     match signal {
@@ -407,7 +412,7 @@ async fn reap_quietly(
                  `secrets` delete verb. Upgrade the Helm release so the credentialProjection \
                  grant includes delete, or remove the Secret by hand");
         }
-        ReapSignal::Absent | ReapSignal::Kept => {}
+        ReapSignal::Absent | ReapSignal::Kept | ReapSignal::Errored => {}
     }
     signal
 }
@@ -428,9 +433,63 @@ async fn shrink_trailing_copies(
         let name = prefix.secret_name(idx);
         match reap_quietly(dst, &name, owner_uid, job_ns, "stale (source set shrank)").await {
             ReapSignal::Deleted => {}
-            ReapSignal::Absent | ReapSignal::Kept | ReapSignal::Forbidden => break,
+            ReapSignal::Absent | ReapSignal::Kept | ReapSignal::Errored | ReapSignal::Forbidden => {
+                break;
+            }
         }
     }
+}
+
+/// The most projected copies one consumer can ever have — [`mover_creds_secret_refs`]
+/// yields the encryption-password Secret plus, only when it is differently named, the
+/// backend's auth Secret.
+const MAX_CREDS_IDX: usize = 1;
+
+/// Reap EVERY projected copy of `prefix` — the whole-projection reap a consumer runs
+/// once its mover Job can no longer read them.
+///
+/// Returns whether the reap is **settled**: nothing of ours is left, so the caller may
+/// durably record it and stop looking. `false` means a copy we could not remove may
+/// still be out there (a 403, or an API error), so the caller must not stamp it done.
+/// Infallible either way — cleanup must never fail a run that already succeeded.
+///
+/// Unlike [`shrink_trailing_copies`], which walks *past* the live set, this visits
+/// every index unconditionally rather than stopping at the first gap. `-creds-0` being
+/// absent says nothing about `-creds-1`: an earlier reap could have been interrupted
+/// between them, and stopping early would strand a live credential copy in a way that
+/// looks exactly like a clean reap.
+pub(crate) async fn reap_projection(
+    dst: &Api<Secret>,
+    prefix: &CredsPrefix,
+    owner_uid: &str,
+    job_ns: &str,
+    what: &str,
+) -> ReapOutcome {
+    let mut out = ReapOutcome {
+        deleted: 0,
+        settled: true,
+    };
+    for idx in 0..=MAX_CREDS_IDX {
+        match reap_quietly(dst, &prefix.secret_name(idx), owner_uid, job_ns, what).await {
+            ReapSignal::Deleted => out.deleted += 1,
+            // Never ours to begin with: nothing owed on this index.
+            ReapSignal::Absent | ReapSignal::Kept => {}
+            // A copy may survive that we did not remove. Don't let the caller stamp
+            // the reap as done — the 403 is actionable (the log names the Helm flag),
+            // and the periodic sweep is the backstop for the transient case.
+            ReapSignal::Forbidden | ReapSignal::Errored => out.settled = false,
+        }
+    }
+    out
+}
+
+/// What one whole-projection reap did (see [`reap_projection`]).
+pub(crate) struct ReapOutcome {
+    /// Copies actually deleted by this call.
+    pub deleted: usize,
+    /// Nothing of ours is left: the caller may durably record the reap and stop
+    /// looking. `false` ⇒ a copy we could not remove may still exist.
+    pub settled: bool,
 }
 
 /// The decision for projecting a repository credential Secret across namespaces

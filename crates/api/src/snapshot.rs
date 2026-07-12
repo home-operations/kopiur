@@ -175,6 +175,32 @@ pub struct SnapshotStatus {
     /// so a later failing episode gets a fresh budget rather than a stale anchor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_since: Option<String>,
+    /// Post-run cleanup bookkeeping, so each cleanup runs at most once per Snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupStatus>,
+}
+
+/// One-shot markers for the cleanups a terminal `Snapshot` performs, mirroring
+/// [`HookExecutionStatus`]: the stamp IS the idempotence, so a stamped Snapshot's
+/// steady-state reconcile is a no-op forever.
+///
+/// This is not just tidiness. A terminal `Snapshot` is re-reconciled every 10
+/// minutes for the whole retention window (the steady-state requeue), and it is
+/// retained as long as the kopia snapshot it owns — months. An ungated cleanup
+/// probe would therefore re-issue its GETs against the apiserver, per Snapshot,
+/// forever, to re-discover that there is nothing left to clean. `pin_job_may_exist`
+/// exists in the same reconciler for exactly this reason.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupStatus {
+    /// When the run's projected credential Secrets were reclaimed (RFC 3339);
+    /// absent until the reap has run. A projected copy is only needed while a mover
+    /// Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which
+    /// long outlives that Job — so without an explicit reap it would sit in the
+    /// workload namespace holding live repository credentials until the CR is pruned
+    /// (#237).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creds_reaped_at: Option<String>,
 }
 
 /// The CSI staging objects a backup created so kopia reads a point-in-time copy of the source PVC.
