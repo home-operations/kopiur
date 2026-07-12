@@ -68,9 +68,12 @@ Every `spec.options`/`spec.policy` knob has a flag: `--enable-file-deletion`
 (exact-mirror restore; default is additive), `--ignore-permission-errors
 true|false`, `--write-files-atomically true|false`, `--on-missing-snapshot
 fail|continue`, `--wait-timeout 5m`, plus `--backoff-limit` /
-`--active-deadline-seconds` for the mover Job. `--wait`, `--logs`, and
-`--timeout` behave exactly as in `snapshot now` (Completed → exit 0 with a
-summary; Failed → exit 1 with the failure block).
+`--active-deadline-seconds` for the mover Job. `--credential-projection` copies
+the repository's credential Secret into the restore's namespace (needs the
+owning `ClusterRepository`'s `credentialProjection.allowed` gate; see
+[Movers → credential projection](../movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos)).
+`--wait`, `--logs`, and `--timeout` behave exactly as in `snapshot now`
+(Completed → exit 0 with a summary; Failed → exit 1 with the failure block).
 
 /// warning | Restores fail closed
 With an explicit source (`--from-snapshot`/`--identity`), a missing snapshot

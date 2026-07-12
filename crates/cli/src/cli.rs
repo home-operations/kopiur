@@ -540,6 +540,14 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "BOOL")]
     pub skip_existing: Option<bool>,
 
+    // --- credential projection ---
+    /// Project the repository's credential Secret(s) into this restore's mover
+    /// Job namespace. Requires the owning ClusterRepository's
+    /// `credentialProjection.allowed` gate (namespaced Repositories have no
+    /// gate). Off by default.
+    #[arg(long)]
+    pub credential_projection: bool,
+
     // --- missing-snapshot policy ---
     /// What to do when no snapshot matches (operator default: fail, except
     /// continue for --from-policy).
