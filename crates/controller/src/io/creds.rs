@@ -114,22 +114,33 @@ pub async fn ensure_creds_present(
 ///
 /// Deliberately NOT constructible from an arbitrary string: every constructor
 /// takes only the consuming CR's name, so a per-run (slot-timestamped) mover
-/// Job name can never reach a Secret name again. Pre-#231 versions named
-/// copies after the Job, so every recurring run (Maintenance, verification)
-/// minted a NEW Secret owned by its long-lived CR with no delete path —
-/// unbounded accumulation of live credential copies, the sibling of the
-/// per-run work-spec ConfigMap leak (#224). With a stable name the force-SSA
-/// [`super::apply`] refreshes ONE object per (CR, source) in place, and the
-/// CR's ownerRef GC-reaps it. The kind slug keeps two CR kinds sharing a name
-/// (Snapshot `db` + Restore `db`) from fighting over one Secret; the residual
-/// user-crafted collision (a Snapshot literally named `db-restore`) is caught
-/// by the [`projected_ownership`] guard as an actionable error.
+/// Job name can never reach a Secret name again. Pre-#231 versions named copies
+/// after the Job, so every recurring run of a *long-lived* CR (Maintenance,
+/// verification) minted a NEW Secret with no delete path — unbounded
+/// accumulation of live credential copies, the sibling of the per-run work-spec
+/// ConfigMap leak (#224). With a stable name the force-SSA [`super::apply`]
+/// refreshes ONE object per (CR, source) in place. The kind slug keeps two CR
+/// kinds sharing a name (Snapshot `db` + Restore `db`) from fighting over one
+/// Secret; the residual user-crafted collision (a Snapshot literally named
+/// `db-restore`) is caught by the [`projected_ownership`] guard as an actionable
+/// error.
+///
+/// **A stable name bounds the copy count per CR — NOT per run.** [`Self::snapshot_backup`]
+/// keys on a `Snapshot`, which is *itself* the per-run object, so "one copy per CR"
+/// is still one copy per backup: the same leak, entering through the front door
+/// (#237). Do not read the ownerRef as the lifetime. A copy lives only while some
+/// mover Job can still load it via `envFrom`; past that it is reaped at the
+/// consuming CR's terminal arm, with [`crate::sweep`] as the backstop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredsPrefix(String);
 
 impl CredsPrefix {
     /// Backup mover of a `Snapshot` — bare CR name, keeping the pre-#231
     /// on-cluster Secret name (`{cr}-creds-{idx}`) on the common path.
+    ///
+    /// The `Snapshot` is per-run, so unlike every other constructor here this one
+    /// yields a per-run Secret name. #234 renamed nothing on this path and the leak
+    /// survived it; the fix is lifetime, not naming (see the type's docs).
     pub fn snapshot_backup(cr: &str) -> Self {
         Self(cr.to_string())
     }
@@ -176,19 +187,29 @@ impl CredsPrefix {
 }
 
 /// Build a kopiur-managed copy of a source credential `Secret` for `job_ns`,
-/// owned by the consuming CR (`owner`) so native GC reaps it with that CR — the
-/// owner and the copy are always in the same namespace, so the ownerRef is valid
-/// (cross-namespace ownerRefs are forbidden by Kubernetes). Pure (no IO) so the
-/// shape is unit-testable. Copies `data`/`stringData` verbatim and preserves the
-/// source `type`; records the source in [`PROJECTED_FROM_ANNOTATION`] and marks
-/// the copy stable-per-CR via [`crate::consts::CREDS_SCOPE_LABEL`] (its absence
-/// is how the sweep recognizes legacy per-run copies). Not marked immutable —
-/// it is re-applied (refreshed from source) on every run.
+/// owned by the consuming CR (`owner`) — the owner and the copy are always in the
+/// same namespace, so the ownerRef is valid (cross-namespace ownerRefs are
+/// forbidden by Kubernetes, and would never GC). Pure (no IO) so the shape is
+/// unit-testable; `now` is the injected clock. Copies `data`/`stringData`
+/// verbatim and preserves the source `type`; records the source in
+/// [`PROJECTED_FROM_ANNOTATION`] and marks the copy stable-per-CR via
+/// [`crate::consts::CREDS_SCOPE_LABEL`] (its absence is how the sweep recognizes
+/// legacy per-run copies). Not marked immutable — it is re-applied (refreshed
+/// from source) on every run.
+///
+/// The ownerRef alone does NOT bound the copy's life: a `Snapshot` is a *per-run*
+/// CR that outlives its mover Job by the whole retention window, so a copy owned
+/// by one sits in the workload namespace holding live repository credentials long
+/// after anything could read it. The copy's real lifetime is "while a mover Job can
+/// still load it via `envFrom`" — enforced by the terminal-arm reap and the sweep,
+/// with [`crate::consts::PROJECTED_AT_ANNOTATION`] as the freshness clock and the
+/// guarantee that a re-projection is a real write (see that const's docs).
 pub fn build_projected_secret(
     name: &str,
     job_ns: &str,
     owner: OwnerReference,
     src: &Secret,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Secret {
     let src_ns = src.metadata.namespace.clone().unwrap_or_default();
     let src_name = src.metadata.name.clone().unwrap_or_default();
@@ -206,10 +227,16 @@ pub fn build_projected_secret(
             crate::consts::CREDS_SCOPE_CR.to_string(),
         ),
     ]);
-    let annotations = BTreeMap::from([(
-        PROJECTED_FROM_ANNOTATION.to_string(),
-        format!("{src_ns}/{src_name}"),
-    )]);
+    let annotations = BTreeMap::from([
+        (
+            PROJECTED_FROM_ANNOTATION.to_string(),
+            format!("{src_ns}/{src_name}"),
+        ),
+        (
+            crate::consts::PROJECTED_AT_ANNOTATION.to_string(),
+            now.to_rfc3339(),
+        ),
+    ]);
     Secret {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -657,7 +684,8 @@ async fn project_one_ref(
             &r.name, src_ns, job_ns, ctx,
         ))
     })?;
-    let secret = build_projected_secret(&proj_name, job_ns, owner.clone(), &src);
+    let secret =
+        build_projected_secret(&proj_name, job_ns, owner.clone(), &src, chrono::Utc::now());
     let applied = apply(dst, &proj_name, &secret)
         .await
         .map_err(|e| map_projection_apply_error(e, &proj_name, job_ns))?;
@@ -1039,7 +1067,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let ours = build_projected_secret("app-maint-creds-1", "team-a", owner("app"), &src);
+        let ours = build_projected_secret(
+            "app-maint-creds-1",
+            "team-a",
+            owner("app"),
+            &src,
+            chrono::Utc::now(),
+        );
         assert!(is_reapable_projected_copy(&ours, "uid-123"));
         // Different owner uid: not ours to delete.
         assert!(!is_reapable_projected_copy(&ours, "uid-999"));
@@ -1070,7 +1104,13 @@ mod tests {
             k8s_openapi::ByteString(b"hunter2".to_vec()),
         )]));
 
-        let s = build_projected_secret("job-creds-0", "team-a", owner("job"), &src);
+        let s = build_projected_secret(
+            "job-creds-0",
+            "team-a",
+            owner("job"),
+            &src,
+            chrono::Utc::now(),
+        );
 
         assert_eq!(s.metadata.name.as_deref(), Some("job-creds-0"));
         assert_eq!(s.metadata.namespace.as_deref(), Some("team-a"));
@@ -1110,6 +1150,40 @@ mod tests {
             ann.get(PROJECTED_FROM_ANNOTATION).map(String::as_str),
             Some("kopiur-system/repo-pw")
         );
+        assert!(ann.contains_key(crate::consts::PROJECTED_AT_ANNOTATION));
+    }
+
+    /// The sweep pins every delete to the `resourceVersion` it classified, so a
+    /// run that re-projects between the sweep's LIST and its DELETE must bump that
+    /// `resourceVersion` or the sweep will delete a Secret a live Job is about to
+    /// load. A force-SSA of a byte-identical object is a no-op at the apiserver —
+    /// no write, no RV bump — and everything else here is a pure function of
+    /// (name, ns, owner, source). `projected-at` is the ONLY moving part, so this
+    /// inequality is what makes that precondition real. Do not "optimize" it away.
+    #[test]
+    fn reprojection_differs_so_the_apply_is_a_real_write() {
+        let src = Secret {
+            metadata: ObjectMeta {
+                name: Some("repo-pw".into()),
+                namespace: Some("kopiur-system".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t0 = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = chrono::DateTime::from_timestamp(1_700_003_600, 0).unwrap();
+
+        let first = build_projected_secret("app-creds-0", "team-a", owner("app"), &src, t0);
+        let second = build_projected_secret("app-creds-0", "team-a", owner("app"), &src, t1);
+
+        assert_ne!(
+            first.metadata.annotations, second.metadata.annotations,
+            "a re-projection must produce a different object, or the SSA no-ops \
+             and the sweep's resourceVersion precondition cannot fire"
+        );
+        // Everything a consumer reads is still identical — only the clock moved.
+        assert_eq!(first.data, second.data);
+        assert_eq!(first.metadata.labels, second.metadata.labels);
     }
 
     #[test]

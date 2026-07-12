@@ -185,6 +185,23 @@ pub const CREDS_SCOPE_LABEL: &str = "kopiur.home-operations.com/creds-scope";
 pub const CREDS_COMPONENT: &str = "credentials";
 /// The [`CREDS_SCOPE_LABEL`] value for stable per-CR projected copies.
 pub const CREDS_SCOPE_CR: &str = "cr";
+/// Annotation stamped with the RFC 3339 instant of the projection that wrote a
+/// credential copy. It has two jobs, and both are load-bearing for the sweep:
+///
+/// 1. **It makes the re-projection a real write.** A stable copy is refreshed in
+///    place by a force server-side apply, and an SSA that yields a byte-identical
+///    object is a no-op at the apiserver — no write, and crucially *no
+///    `resourceVersion` bump*. Every sweep delete is pinned to the
+///    `resourceVersion` the sweep classified, so without a moving field a run that
+///    re-projects between the sweep's LIST and its DELETE would NOT invalidate the
+///    precondition, and the sweep would delete a Secret a live Job is about to read
+///    (`CreateContainerConfigError`). A fresh timestamp per projection guarantees
+///    the RV moves, so that delete 409s and the copy is spared.
+/// 2. **It is the copy's real age.** `creationTimestamp` never resets on an object
+///    refreshed in place, so it cannot answer "has any run touched this lately?".
+///    This can. Absent (every copy written before this annotation existed), callers
+///    fall back to `creationTimestamp`.
+pub const PROJECTED_AT_ANNOTATION: &str = "kopiur.home-operations.com/projected-at";
 
 /// Helm value (chart `values.yaml`) that grants the operator `secrets` create/patch
 /// so credential projection (`spec.credentialProjection`) works. Surfaced verbatim in
