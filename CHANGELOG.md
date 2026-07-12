@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.3](https://github.com/home-operations/kopiur/compare/0.7.2...0.7.3) (2026-07-12)
+
+
+### Features
+
+* add credential_projection to the cli ([#239](https://github.com/home-operations/kopiur/issues/239)) ([ffd551f](https://github.com/home-operations/kopiur/commit/ffd551f8da2349c3144abee68267f8ad685174c8))
+
+
+### Bug Fixes
+
+* bound projected credential Secrets to the mover Job, not the Snapshot CR ([#241](https://github.com/home-operations/kopiur/issues/241)) ([c035c2a](https://github.com/home-operations/kopiur/commit/c035c2a98885e3efcb920544c6e15893ae3d368d))
+* populator no-op over bound PVCs, ClusterRepository secret namespace, stuck MaintenanceConfigured ([#236](https://github.com/home-operations/kopiur/issues/236)) ([b05c698](https://github.com/home-operations/kopiur/commit/b05c698dba8d2e876912bd2ac4d076a62e0e1ad2))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.7.2 manifest ([fd69b91](https://github.com/home-operations/kopiur/commit/fd69b91bec770477961d17de973ef9638d3943c0))
+
 ## [0.7.2](https://github.com/home-operations/kopiur/compare/0.7.1...0.7.2) (2026-07-11)
 
 
