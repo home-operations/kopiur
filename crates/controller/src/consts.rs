@@ -144,6 +144,16 @@ pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
 pub const OP_RESTORE_POPULATE: &str = "restore-populate";
 /// `Restore` Ready reason once a populator restored its snapshot and rebound the volume.
 pub const RESTORE_POPULATED_REASON: &str = "RestoreSucceeded";
+/// `Restore` Failed reason (and Warning Event) when the claiming PVC was bound out from
+/// under a populate that was still RUNNING — a provisioner handed it a volume without
+/// honoring its `dataSourceRef`, so the restore can never be delivered. Distinct from
+/// [`RESTORE_TARGET_ALREADY_BOUND_REASON`]: that one is a benign no-op over a claim that was
+/// already carrying its data; this one means the app is about to start on the WRONG volume.
+pub const POPULATE_HIJACKED_REASON: &str = "PopulateHijacked";
+/// `Restore` Ready reason while a populator that had completed as an already-bound no-op
+/// re-resolves its source, because its claiming PVC was re-created (and is unbound again,
+/// so it genuinely wants populating). Also re-anchors the `waitTimeout` window.
+pub const RESTORE_CLAIM_RECREATED_REASON: &str = "ClaimRecreated";
 /// `Restore` Ready reason when a populator's claiming PVC is ALREADY bound, so there is
 /// nothing to populate: a CSI volume-populator can only hand a volume to an unbound claim.
 /// A truthful terminal no-op — no prime PVC, no mover run (#233).

@@ -89,12 +89,18 @@ pub enum MaintenanceCoverage {
     CoveredByManaged,
     /// A deliberate opt-out: `spec.maintenance.enabled: false` and nothing else covers it.
     DisabledBySpec,
-    /// Maintenance is ENABLED, but the operator could not apply its managed `Maintenance`.
+    /// Maintenance is ENABLED, nothing covers the repository, and the operator could not
+    /// apply its managed `Maintenance`.
+    ///
+    /// The apply error is deliberately NOT carried into the condition message: this runs on
+    /// every reconcile, and the hot-loop guard that suppresses an unchanged condition is a
+    /// byte comparison — an error string that varies between attempts (a `Conflict` naming a
+    /// resourceVersion, an API detail that moves) would defeat it and spin status writes and
+    /// Events at full speed. The verbatim error goes to the operator log instead, where it
+    /// costs nothing to vary.
     ApplyFailed {
         /// Namespace the managed `Maintenance` was to be applied in.
         namespace: String,
-        /// The apply (or owner-ref) error, verbatim, so the condition is actionable.
-        error: String,
     },
 }
 
@@ -139,15 +145,16 @@ pub fn maintenance_condition(
             ),
             false,
         ),
-        MaintenanceCoverage::ApplyFailed { namespace, error } => (
+        MaintenanceCoverage::ApplyFailed { namespace } => (
             false,
             MAINTENANCE_APPLY_FAILED_REASON,
             format!(
                 "maintenance is ENABLED for {metric_kind} {name}, but the operator could not \
-                 apply its managed Maintenance in namespace {namespace}: {error}; kopia storage \
-                 will not be reclaimed until this succeeds. It is retried on every reconcile — \
-                 if it persists, check that the namespace exists and that the operator has RBAC \
-                 to write Maintenance there"
+                 apply its managed Maintenance in namespace {namespace}, and nothing else \
+                 covers this repository; kopia storage will not be reclaimed until this \
+                 succeeds. It is retried on every reconcile — if it persists, check that the \
+                 namespace exists and that the operator has RBAC to write Maintenance there; \
+                 the apply error itself is in the operator log"
             ),
             true,
         ),
@@ -344,11 +351,21 @@ pub async fn ensure_maintenance<K>(
                     let mapi: Api<Maintenance> = Api::namespaced(ctx.client.clone(), ns);
                     match apply(&mapi, name, &desired).await {
                         Ok(_) => MaintenanceCoverage::CoveredByManaged,
+                        // An apply that fails while the managed `Maintenance` ALREADY exists
+                        // has not un-covered the repo: the CR is right there, owned, holding
+                        // its lease, running on schedule. Since this now runs on every
+                        // reconcile, treating a transient apiserver blip as "maintenance is
+                        // not configured" would flap the condition (and its gauge, and a
+                        // Warning) on every hiccup. Only report the failure when nothing
+                        // covers the repo — the state a user actually has to fix.
+                        Err(e) if managed.is_some() => {
+                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to re-apply the managed Maintenance; the existing one still covers this repository");
+                            MaintenanceCoverage::CoveredByManaged
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to apply managed Maintenance");
                             MaintenanceCoverage::ApplyFailed {
                                 namespace: ns.to_string(),
-                                error: e.to_string(),
                             }
                         }
                     }
@@ -357,7 +374,6 @@ pub async fn ensure_maintenance<K>(
                     tracing::warn!(error = %e, repo = %name, "cannot build owner reference for managed Maintenance");
                     MaintenanceCoverage::ApplyFailed {
                         namespace: ns.to_string(),
-                        error: e.to_string(),
                     }
                 }
             }
@@ -393,24 +409,12 @@ pub async fn ensure_maintenance<K>(
 
     let (status, reason, message, warn) = maintenance_condition(&coverage, metric_kind, name);
 
-    let conditions = upsert_condition(
-        existing_conditions,
-        MAINTENANCE_CONFIGURED_CONDITION,
-        status,
-        reason,
-        &message,
-        observed_generation,
-    );
-    // Skip the write when the upsert changed nothing: this runs on EVERY repo
-    // reconcile, and an identical re-write would bump `resourceVersion` and
-    // re-trigger the repo controller through its own watch (hot-loop).
-    if conditions.as_slice() == existing_conditions {
-        return;
-    }
-    // Warn only alongside a real condition transition. This runs on every reconcile now
-    // (including the steady-state object-store pass that #231 added), so an unconditional
-    // publish would mint the same Warning every reconcile interval for as long as the
-    // problem lasts — the condition is the durable signal; the Event marks the change.
+    // Publish the Warning while the problem PERSISTS, not just when the condition flips.
+    // Kubernetes aggregates repeats of an identical Event (bumping its count and
+    // lastTimestamp rather than minting new objects), so re-publishing keeps the signal
+    // alive for `kubectl describe` and Event-driven alerting; gating it on a condition
+    // change instead would emit exactly one Event ever and then go silent forever once it
+    // aged out of the Event TTL — while kopia storage quietly never got reclaimed.
     if warn
         && let Err(e) = ctx
             .recorder
@@ -427,6 +431,23 @@ pub async fn ensure_maintenance<K>(
             .await
     {
         tracing::warn!(error = %e, repo = %name, "failed to publish {reason} event");
+    }
+
+    let conditions = upsert_condition(
+        existing_conditions,
+        MAINTENANCE_CONFIGURED_CONDITION,
+        status,
+        reason,
+        &message,
+        observed_generation,
+    );
+    // Skip the write when the upsert changed nothing: this runs on EVERY repo
+    // reconcile, and an identical re-write would bump `resourceVersion` and
+    // re-trigger the repo controller through its own watch (hot-loop). Every `message`
+    // above is a pure function of (coverage, kind, name), so a steady state produces a
+    // byte-identical condition and this guard always fires.
+    if conditions.as_slice() == existing_conditions {
+        return;
     }
     if let Err(e) = patch_status(api, name, serde_json::json!({ "conditions": conditions })).await {
         tracing::warn!(error = %e, repo = %name, "failed to patch MaintenanceConfigured condition");

@@ -50,7 +50,9 @@ pub struct SecretKeyRef {
     /// reads the `Secret` (to connect, to bootstrap, or to run its repository server) an
     /// absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload
     /// mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace —
-    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`.
+    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which
+    /// needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything
+    /// other than the operator itself reads the `Secret`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// Which key inside the `Secret` to read.
@@ -69,7 +71,9 @@ pub struct SecretRef {
     /// reads the `Secret` (to connect, to bootstrap, or to run its repository server) an
     /// absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload
     /// mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace —
-    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`.
+    /// `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which
+    /// needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything
+    /// other than the operator itself reads the `Secret`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }

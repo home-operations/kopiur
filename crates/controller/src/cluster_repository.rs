@@ -253,7 +253,30 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
     // below — whose branches return early — so it is applied/migrated/torn down on
     // every reconcile. Children live in `spec.server.namespace` (cluster-scoped
     // owners can't own them); cleanup is via the finalizer + back-reference labels.
-    reconcile_cluster_server(ctx, repo, &name, &api).await?;
+    //
+    // Degrade, don't crash: the web UI is auxiliary — backups and restores do not depend on
+    // it — so a problem here must NOT abort the reconcile before the backend match below,
+    // which is what actually bootstraps the repository. It used to `?`, so a server whose
+    // credentials Secret is not where we expect (e.g. an absent `passwordSecretRef.namespace`
+    // now resolving to the operator namespace rather than the server's) would take the whole
+    // repository down with it. Surface it as a Warning and carry on.
+    if let Err(e) = reconcile_cluster_server(ctx, repo, &name, &api).await {
+        tracing::warn!(error = %e, repo = %name, "failed to reconcile the kopia repository server; the repository itself is unaffected");
+        io::publish_warning_event(
+            ctx,
+            repo,
+            "RepositoryServerDegraded",
+            "CheckRepositoryServer",
+            &format!(
+                "the kopia repository server (spec.server) could not be reconciled: {e}. The \
+                 repository itself is unaffected — backups and restores continue. If its \
+                 credentials Secret lives in the server's namespace, pin it explicitly with \
+                 encryption.passwordSecretRef.namespace (a ClusterRepository otherwise reads it \
+                 from the operator's namespace)."
+            ),
+        )
+        .await;
+    }
     // Once a server is no longer configured (and any teardown above has run), the
     // cleanup finalizer is no longer needed.
     if !server_enabled {
@@ -798,7 +821,15 @@ async fn bootstrap_cluster_via_mover(
         // and a status patch that is skipped when nothing changed. It also gives the
         // Maintenance watch (`controllers.rs`) a reconcile that actually re-classifies, so
         // deleting the managed CR now re-applies it instead of being silently ignored.
-        ensure_cluster_maintenance(ctx, repo, name, api, &cluster_conditions(repo)).await;
+        //
+        // Build on a FRESH read of the conditions, not the watch-cached object: a Maintenance
+        // event can requeue us moments after the bootstrap finalize patched `Bootstrapped` /
+        // `BackendReachable`, while the informer store still holds the pre-patch copy — and
+        // the condition write below replaces the whole array, so a stale copy would silently
+        // resurrect it and drop those conditions.
+        let fresh = api.get_opt(name).await?;
+        let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+        ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
         )));
@@ -832,7 +863,16 @@ async fn bootstrap_cluster_via_mover(
             secret_names: &creds_names,
             repo_kind: "ClusterRepository",
             repo_name: name,
-            repo_secret_namespace: Some(&job_ns),
+            // The namespace the REFERENCE names, not the Job's. Passing the Job's namespace
+            // would make it tautologically equal and silence the cross-namespace branch of
+            // `missing_creds_message` — the branch that exists precisely to say "your
+            // ClusterRepository keeps that Secret in X, but the Job runs in Y".
+            repo_secret_namespace: repo
+                .spec
+                .encryption
+                .password_secret_ref
+                .namespace
+                .as_deref(),
         },
     )
     .await?;

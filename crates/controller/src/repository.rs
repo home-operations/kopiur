@@ -507,13 +507,6 @@ fn last_refresh_at(repo: &Repository) -> Option<&str> {
         .and_then(|c| c.last_refresh_at.as_deref())
 }
 
-/// Drive the mover-Job bootstrap state machine: launch the Job, then on each
-/// reconcile reflect its progress (`Initializing` → `Ready`/`Failed`), reading the
-/// result the mover wrote into the work-spec ConfigMap. Used for object stores AND
-/// for volume-backed filesystem repos (PVC / inline NFS) — neither is reachable
-/// from the controller in-process. A filesystem backend's repo volume is mounted
-/// read-write so the mover can create/connect the repository.
-#[allow(clippy::too_many_arguments)]
 /// The `Repository`'s currently-observed status conditions (empty when it has no status).
 fn repo_conditions(
     repo: &Repository,
@@ -563,6 +556,13 @@ async fn ensure_repo_maintenance(
     .await;
 }
 
+/// Drive the mover-Job bootstrap state machine: launch the Job, then on each
+/// reconcile reflect its progress (`Initializing` → `Ready`/`Failed`), reading the
+/// result the mover wrote into the work-spec ConfigMap. Used for object stores AND
+/// for volume-backed filesystem repos (PVC / inline NFS) — neither is reachable
+/// from the controller in-process. A filesystem backend's repo volume is mounted
+/// read-write so the mover can create/connect the repository.
+#[allow(clippy::too_many_arguments)]
 async fn bootstrap_via_mover(
     ctx: &Context,
     repo: &Repository,
@@ -705,7 +705,15 @@ async fn bootstrap_via_mover(
         // condition is only ever written at the tail of a bootstrap, and a value written
         // during a bootstrap race freezes forever (#231). Cheap + idempotent; the status
         // patch is skipped when nothing changed.
-        ensure_repo_maintenance(ctx, repo, namespace, name, api, &repo_conditions(repo)).await;
+        //
+        // Build on a FRESH read of the conditions, not the watch-cached object: a Maintenance
+        // event can requeue us moments after the bootstrap finalize patched `Bootstrapped` /
+        // `BackendReachable`, while the informer store still holds the pre-patch copy — and
+        // the condition write below replaces the whole array, so a stale copy would silently
+        // resurrect it and drop those conditions.
+        let fresh = api.get_opt(name).await?;
+        let conditions = fresh.as_ref().map(repo_conditions).unwrap_or_default();
+        ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
 

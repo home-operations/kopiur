@@ -616,6 +616,90 @@ fn target_already_bound_messages_say_what_why_fix() {
     assert!(kept.contains("KEPT"), "{kept}");
 }
 
+/// A LOST rebind is not an already-bound no-op: a prime WAS provisioned, a restore DID run,
+/// and a full-size volume is now `Retain`ed. Telling the operator "nothing was provisioned,
+/// no restore ran" there would hide storage they have just become responsible for.
+#[test]
+fn lost_rebind_message_never_claims_nothing_ran() {
+    let msg = lost_rebind_message("plex-config", "pv-ours");
+    assert!(msg.contains("`plex-config`"), "{msg}");
+    assert!(msg.contains("pv-ours"), "{msg}");
+    assert!(msg.contains("Retain"), "{msg}");
+    assert!(
+        !msg.contains("no restore ran"),
+        "a lost rebind DID run a restore: {msg}"
+    );
+    assert!(
+        msg.contains("restored data is NOT in the claim"),
+        "must say where the data actually is: {msg}"
+    );
+}
+
+/// A claim bound out from under a RUNNING populate is a hijacked handover, not a success:
+/// the app is about to start on someone else's (probably empty) volume, so reporting
+/// `Ready=True` would tell `kubectl wait`/Flux a restore landed when it did not.
+#[test]
+fn populate_hijacked_message_points_at_the_provisioner() {
+    let msg = populate_hijacked_message("plex-config", Some("pv-empty"));
+    assert!(msg.contains("`plex-config`"), "{msg}");
+    assert!(msg.contains("pv-empty"), "{msg}");
+    assert!(msg.contains("AnyVolumeDataSource"), "{msg}");
+    assert!(msg.contains("terminal"), "{msg}");
+    assert!(
+        populate_hijacked_message("plex-config", None).contains("another PersistentVolume"),
+        "an unnamed volume must not render as an empty backtick pair"
+    );
+}
+
+/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
+/// claim must measure its `waitTimeout` from the re-open, not from its own creation —
+/// otherwise the window is already spent, and a `fromPolicy` source (which defaults to
+/// `Continue`) skips the wait and provisions an EMPTY volume the instant the snapshot
+/// happens not to be there yet.
+#[test]
+fn wait_window_re_anchors_when_a_recreated_claim_reopens_resolution() {
+    let with_ready = |reason: &str, at: &str| -> Restore {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "source": { "fromPolicy": { "name": "cfg" } },
+                "target": { "populator": {} }
+            },
+            "status": { "conditions": [{
+                "type": "Ready", "status": "False", "reason": reason, "message": "m",
+                "lastTransitionTime": at
+            }] }
+        }))
+        .expect("valid Restore")
+    };
+
+    // 2026-01-01T00:00:00Z == 1767225600. The Restore itself was created long before.
+    let created = 1_000_000_000;
+    let reopened = with_ready("ClaimRecreated", "2026-01-01T00:00:00Z");
+    assert_eq!(wait_window_anchor(&reopened, created), 1_767_225_600);
+
+    // Any other Ready reason leaves the window anchored at creation.
+    let normal = with_ready("PopulatingPrimePvc", "2026-01-01T00:00:00Z");
+    assert_eq!(wait_window_anchor(&normal, created), created);
+
+    // A re-open that somehow predates creation never SHORTENS the window.
+    let stale = with_ready("ClaimRecreated", "2001-09-09T01:46:40Z");
+    assert_eq!(wait_window_anchor(&stale, created), created);
+
+    // Net effect: the user's 5m window is fully available again from the re-open.
+    assert_eq!(
+        wait_remaining_secs(
+            wait_window_anchor(&reopened, created),
+            Some("5m"),
+            1_767_225_660,
+        ),
+        Some(240),
+        "the configured waitTimeout must actually apply to the re-created claim"
+    );
+}
+
 // --- restore_flags (M2 flag sweep controller-glue guard) ---
 
 #[test]

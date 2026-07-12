@@ -209,6 +209,45 @@ pub(super) fn target_already_bound_message(
     )
 }
 
+/// What / why / fix when our rebind was issued but a DIFFERENT volume won the claim
+/// ([`PopulatorHandshake::LostRebind`]). Distinct from [`target_already_bound_message`]
+/// because here a prime PVC WAS provisioned and a restore DID run — saying otherwise would
+/// hide a full-size `Retain`ed volume the admin now owns. Pure.
+pub(super) fn lost_rebind_message(consumer_name: &str, kept_pv: &str) -> String {
+    format!(
+        "populator: the claiming PVC `{consumer_name}` bound to a DIFFERENT volume than the one \
+         this restore prepared for it, so the handover was lost and can never complete — a \
+         volume-populator only fills an UNBOUND claim, and something else (a provisioner that \
+         ignores dataSourceRef, or an earlier bind) got there first. The restored data is NOT \
+         in the claim: it is on PersistentVolume `{kept_pv}`, which was kept (forced \
+         reclaimPolicy: Retain) rather than reclaimed. Recover it from there, or delete the \
+         claiming PVC and let it be re-created so the restore can run again — and delete \
+         `{kept_pv}` once you no longer need it."
+    )
+}
+
+/// What / why / fix when the claiming PVC was bound out from under a restore that was still
+/// RUNNING: some provisioner handed the claim a volume without honoring its `dataSourceRef`,
+/// so the populate can never be delivered. Reported as a FAILURE — the app is about to start
+/// on that other volume, and calling this a success would tell `kubectl wait` / Flux that a
+/// restore landed when it did not. Pure.
+pub(super) fn populate_hijacked_message(consumer_name: &str, bound_volume: Option<&str>) -> String {
+    let volume = match bound_volume {
+        Some(v) => format!("PersistentVolume `{v}`"),
+        None => "another PersistentVolume".to_string(),
+    };
+    format!(
+        "populator: the claiming PVC `{consumer_name}` was bound to {volume} while this restore \
+         was still writing its prime volume, so the restored data can never reach the claim — \
+         the app will come up on whatever that volume holds (an empty one, if a provisioner \
+         bound it without honoring the dataSourceRef). This cluster cannot complete a \
+         volume-populator handshake for that claim: check that the StorageClass's provisioner \
+         supports populators (AnyVolumeDataSource + a populator-aware external-provisioner). \
+         The in-flight restore was cancelled and its prime PVC left in place for inspection; a \
+         Failed Restore is terminal, so fix the provisioner and create a NEW Restore."
+    )
+}
+
 /// What / why / fix for reaping populate artifacts that can never be handed over (#233).
 /// `artifacts` are pre-described (e.g. ``["prime PVC `prime-abc`"]``) so the note names only
 /// what actually existed; `kept_pv` is the PV holding restored data that a lost rebind left
@@ -335,6 +374,31 @@ pub(super) fn existing_conditions(restore: &Restore) -> Vec<Condition> {
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
 }
+/// Where the `waitTimeout` window is anchored: the Restore's creation, or — when a
+/// populator RE-OPENED resolution because its claiming PVC was re-created — that moment
+/// instead (the `Ready` condition's transition into
+/// [`crate::consts::RESTORE_CLAIM_RECREATED_REASON`]).
+///
+/// Without the re-anchor, a populator that no-op'd months ago and is now asked to populate a
+/// freshly re-created claim would measure its wait window from a creation timestamp long
+/// past: `wait_remaining_secs` returns `None` on the very first pass, and a `fromPolicy`
+/// source (which defaults to `onMissingSnapshot: Continue`) would skip the wait entirely and
+/// provision an EMPTY volume the instant the snapshot happens not to be there yet — exactly
+/// what the user configured `waitTimeout` to prevent. Pure.
+pub(super) fn wait_window_anchor(restore: &Restore, created_epoch: i64) -> i64 {
+    use crate::consts::{READY_CONDITION, RESTORE_CLAIM_RECREATED_REASON};
+    restore
+        .status
+        .as_ref()
+        .and_then(|s| {
+            s.conditions
+                .iter()
+                .find(|c| c.type_ == READY_CONDITION && c.reason == RESTORE_CLAIM_RECREATED_REASON)
+                .map(|c| c.last_transition_time.0.as_second())
+        })
+        .map_or(created_epoch, |reopened| created_epoch.max(reopened))
+}
+
 /// Seconds left in the `waitTimeout` window that started at the Restore's
 /// creation, or `None` when no (parseable) window is configured or it has
 /// elapsed. Pure, clock-free — unit-tested without a cluster.

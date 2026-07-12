@@ -31,7 +31,7 @@ use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    ORPHANED_PRIME_REAPED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    ORPHANED_PRIME_REAPED_REASON, POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     RECREATE_CLAIM_TO_RESTORE_ACTION, RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
     RESTORE_TARGET_ALREADY_BOUND_REASON, SECURITY_CONTEXT_COMPATIBLE_REASON,
 };
@@ -265,12 +265,17 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 // up — `onMissingSnapshot` applies only once the window closes
                 // (ADR §4.6 G7).
                 let now = chrono::Utc::now().timestamp();
-                let created = restore
-                    .metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| t.0.as_second())
-                    .unwrap_or(now);
+                // Anchored at creation — or, for a populator whose claim was re-created
+                // after an already-bound no-op, at that re-open (`wait_window_anchor`).
+                let created = wait_window_anchor(
+                    restore,
+                    restore
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0.as_second())
+                        .unwrap_or(now),
+                );
                 let wait_timeout = restore
                     .spec
                     .policy
@@ -351,21 +356,6 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         }),
     };
 
-    // Pin the deploy-or-restore "no snapshot" decision exactly once. This durably records
-    // the choice (so a snapshot that appears later can never silently restore over the
-    // provisioned volume) AND back-fills the pre-fix stuck-populator state that
-    // `pinned_decision` inferred from a `Completed`+unpinned Restore. Idempotent: re-pinning
-    // an already-`NoSnapshot` resolution is a server-side no-op. A bare `{resolved}` merge
-    // patch leaves phase/conditions to the target driver below (the `Resolved` domain
-    // condition is stamped at the driver's empty completion).
-    if decision == Some(Resolution::Empty)
-        && resolved.and_then(|r| r.resolution) != Some(ResolutionOutcome::NoSnapshot)
-    {
-        let mut pin = serde_json::json!({ "pinnedAt": chrono::Utc::now().to_rfc3339() });
-        pin["resolution"] = serde_json::to_value(ResolutionOutcome::NoSnapshot)?;
-        io::patch_status(&api, &name, serde_json::json!({ "resolved": pin })).await?;
-    }
-
     // Dispatch the decision to the target driver. Exhaustive over `Resolution` so a new
     // variant must be handled in both drivers before it compiles.
     match state {
@@ -383,6 +373,10 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                     ));
                 }
             };
+            // A direct restore always acts on its decision, so pin an empty outcome here.
+            if selection.is_none() {
+                pin_no_snapshot(&api, restore, &name).await?;
+            }
             drive_direct_restore(ctx, restore, &api, &namespace, &name, selection.as_ref()).await
         }
         PopulatorState::AwaitingClaim => {
@@ -399,6 +393,31 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             drive_populator_restore(ctx, restore, &api, &namespace, &name, &work).await
         }
     }
+}
+
+/// Durably pin the deploy-or-restore "no snapshot" decision, so a snapshot that appears
+/// LATER can never silently restore over the volume we are about to provision empty
+/// (ADR §4.6). Idempotent: an already-`NoSnapshot` resolution is left alone.
+///
+/// Pinned at the point of USE, not at resolution. A populator that turns out to have
+/// nothing to populate (its claiming PVC is already bound — #233) must never record "this
+/// restore decided to come up empty", because that pin outlives the no-op: the user then
+/// follows the documented fix, re-creates the claim to get a real restore, and
+/// `pinned_decision` hands back `Empty` from the pin — provisioning an EMPTY volume and
+/// silently never restoring their data. Only a pass that actually provisions may pin.
+async fn pin_no_snapshot(api: &Api<Restore>, restore: &Restore, name: &str) -> Result<()> {
+    if restore
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved.as_ref())
+        .and_then(|r| r.resolution)
+        == Some(ResolutionOutcome::NoSnapshot)
+    {
+        return Ok(());
+    }
+    let mut pin = serde_json::json!({ "pinnedAt": chrono::Utc::now().to_rfc3339() });
+    pin["resolution"] = serde_json::to_value(ResolutionOutcome::NoSnapshot)?;
+    io::patch_status(api, name, serde_json::json!({ "resolved": pin })).await
 }
 
 /// Park a populator `Restore` in `AwaitingClaim=True` / `Pending` with `reason`+`msg`
@@ -485,6 +504,22 @@ async fn drive_populator_restore(
     let prime_name = format!("prime-{consumer_uid}");
     let populate_job = format!("{name}-populate");
 
+    // Steady-state exit for a Restore that has already settled over a BOUND claim (a
+    // finished restore, or an already-bound no-op) and has no prime left to reap: nothing
+    // observable can change until the claim itself is re-created, which re-enqueues us with
+    // an UNBOUND claim and so cannot be missed. This keeps the per-heartbeat cost at one
+    // namespaced GET instead of the unfiltered, cluster-wide PersistentVolume LIST below —
+    // which, at the fleet scale this bug was reported from (one populator Restore per app),
+    // is pure read amplification against a handshake that is over. Gated on the prime being
+    // gone, so a reap whose best-effort delete did not land is still retried.
+    let settled_over_bound_claim = restore.status.as_ref().and_then(|s| s.phase)
+        == Some(RestorePhase::Completed)
+        && kstatus_settled_for(restore, RestorePhase::Completed)
+        && pvc_is_bound(&consumer);
+    if settled_over_bound_claim && pvc_api.get_opt(&prime_name).await?.is_none() {
+        return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+    }
+
     // The PV our populator earmarked for this consumer: claimRef → THIS consumer (name +
     // uid) AND our rebind annotation. `Some` proves the prime→consumer rebind was already
     // issued, so we never recreate the prime past that point.
@@ -547,7 +582,14 @@ async fn drive_populator_restore(
         // Unbound claim, no rebind outstanding: populate it.
         PopulatorHandshake::Populate => match work {
             PopulatorWork::Restore(sel) => Some(sel),
-            PopulatorWork::EmptyVolume => None,
+            PopulatorWork::EmptyVolume => {
+                // We are about to provision the empty volume, so NOW the deploy-or-restore
+                // decision is real and must be pinned (a later snapshot must never restore
+                // over it). Pinning any earlier would also pin a no-op that provisioned
+                // nothing — see `pin_no_snapshot`.
+                pin_no_snapshot(api, restore, name).await?;
+                None
+            }
             // The claim is unbound but we deliberately skipped resolution this pass (this
             // Restore had completed as an already-bound no-op and the claim has since been
             // re-created). Re-open resolution rather than treating "no selection" as
@@ -601,6 +643,7 @@ async fn drive_populator_restore(
             &populate_job,
             &prime_name,
             selection,
+            true, // the populate Job name is re-used across every claim this Restore populates
         )
         .await?
         {
@@ -711,14 +754,6 @@ async fn finalize_populator_success(
     prime_name: &str,
     pv_name: &str,
 ) -> Result<Action> {
-    finalize_populator(
-        ctx,
-        namespace,
-        populate_job,
-        prime_name,
-        PrimePvAction::RestoreOriginalPolicy(pv_name),
-    )
-    .await?;
     // Re-read `status.resolved` fresh: for a deferred restore the mover pins it in its own
     // terminal PATCH, which the cached `restore` (watch cache) may not yet reflect when a
     // PVC/PV bind event triggers this finalize reconcile — the direct path guards the same
@@ -758,7 +793,23 @@ async fn finalize_populator_success(
             msg,
         )
     };
+    // Write the outcome BEFORE tearing the artifacts down. `finalize_populator` strips the
+    // rebind annotation — the only evidence that the bound PV came from US — so a crash (or
+    // a transient API error) between the strip and this patch would leave a restore that
+    // genuinely ran looking, forever, like a claim we never touched: the next pass would see
+    // no annotation plus a bound claim, read it as `NothingToPopulate`, and relabel it
+    // `TargetAlreadyBound` ("no restore ran"), telling the user to delete the very PVC
+    // holding their freshly restored data. Patching first makes the reverse order harmless:
+    // the annotation still identifies our PV, so a crash simply replays this finalize.
     io::patch_status(api, name, status).await?;
+    finalize_populator(
+        ctx,
+        namespace,
+        populate_job,
+        prime_name,
+        PrimePvAction::RestoreOriginalPolicy(pv_name),
+    )
+    .await?;
     Ok(Action::requeue(std::time::Duration::from_secs(600)))
 }
 
@@ -802,28 +853,51 @@ async fn complete_populator_already_bound(
     // (and re-publishing the Event) on every heartbeat while it sits Terminating on a
     // finalizer would be pure churn.
     let live = |meta: &kube::core::ObjectMeta| meta.deletion_timestamp.is_none();
-    let mut artifacts = Vec::new();
-    if pvc_api
+    let prime_live = pvc_api
         .get_opt(prime_name)
         .await?
-        .is_some_and(|p| live(&p.metadata))
-    {
-        artifacts.push(format!("prime PVC `{prime_name}`"));
-    }
-    if job_api
+        .is_some_and(|p| live(&p.metadata));
+    let job = job_api
         .get_opt(populate_job)
         .await?
-        .is_some_and(|j| live(&j.metadata))
+        .filter(|j| live(&j.metadata));
+    let consumer_name = consumer.name_any();
+    let bound_volume = consumer
+        .spec
+        .as_ref()
+        .and_then(|s| s.volume_name.as_deref())
+        .filter(|v| !v.is_empty());
+
+    // A populate still RUNNING when the claim binds elsewhere is not a benign "nothing to
+    // populate" — it is a handover hijacked mid-flight (see [`fail_populate_hijacked`]).
+    if let Some(job) = job.as_ref()
+        && crate::snapshot::job_terminal_state(job).is_none()
     {
-        artifacts.push(format!("populate Job `{populate_job}`"));
+        return fail_populate_hijacked(
+            ctx,
+            restore,
+            api,
+            namespace,
+            name,
+            populate_job,
+            &consumer_name,
+            bound_volume,
+        )
+        .await;
     }
 
     let kept_pv = match pv {
         PrimePvAction::ForceRetain(p) => Some(p),
         PrimePvAction::RestoreOriginalPolicy(_) | PrimePvAction::Leave => None,
     };
+    let mut artifacts = Vec::new();
+    if prime_live {
+        artifacts.push(format!("prime PVC `{prime_name}`"));
+    }
+    if job.is_some() {
+        artifacts.push(format!("populate Job `{populate_job}`"));
+    }
     if !artifacts.is_empty() || kept_pv.is_some() {
-        let consumer_name = consumer.name_any();
         finalize_populator(ctx, namespace, populate_job, prime_name, pv).await?;
         let note = reaped_populate_artifacts_note(&artifacts, &consumer_name, kept_pv);
         tracing::warn!(%namespace, restore = %name, consumer = %consumer_name, "{note}");
@@ -840,12 +914,13 @@ async fn complete_populator_already_bound(
     let settled = restore.status.as_ref().and_then(|s| s.phase) == Some(RestorePhase::Completed)
         && kstatus_settled_for(restore, RestorePhase::Completed);
     if !settled {
-        let bound_volume = consumer
-            .spec
-            .as_ref()
-            .and_then(|s| s.volume_name.as_deref())
-            .filter(|v| !v.is_empty());
-        let msg = target_already_bound_message(&consumer.name_any(), bound_volume);
+        // A lost rebind gets its OWN message: a prime was provisioned, a restore DID run,
+        // and a full-size volume is now retained — saying "nothing was provisioned, no
+        // restore ran" there would hide storage the admin has just become responsible for.
+        let msg = match kept_pv {
+            Some(pv) => lost_rebind_message(&consumer_name, pv),
+            None => target_already_bound_message(&consumer_name, bound_volume),
+        };
         io::patch_status(
             api,
             name,
@@ -853,6 +928,55 @@ async fn complete_populator_already_bound(
                 restore,
                 RestorePhase::Completed,
                 RESTORE_TARGET_ALREADY_BOUND_REASON,
+                &msg,
+            ),
+        )
+        .await?;
+    }
+    Ok(Action::requeue(std::time::Duration::from_secs(600)))
+}
+
+/// The claiming PVC was bound out from under a populate that was STILL RUNNING: some
+/// provisioner handed it a volume without honoring its `dataSourceRef`, so the restore we
+/// are writing can never be delivered to it.
+///
+/// This is NOT the already-bound no-op (#233) even though it looks like one from the API:
+/// there the claim was bound long before, by an earlier successful restore, and the app is
+/// running on its own data. Here the app is about to come up on somebody else's — probably
+/// empty — volume, so completing `Ready=True` would tell `kubectl wait`, Flux and Argo that
+/// a restore landed when it did not. Fail honestly, cancel the doomed run, and LEAVE the
+/// prime PVC in place: it holds the data we were mid-way through writing, and a `Failed`
+/// populator is terminal at the reconcile guard, so nothing reaps it behind the user's back.
+#[allow(clippy::too_many_arguments)]
+async fn fail_populate_hijacked(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    populate_job: &str,
+    consumer_name: &str,
+    bound_volume: Option<&str>,
+) -> Result<Action> {
+    let msg = populate_hijacked_message(consumer_name, bound_volume);
+    tracing::warn!(%namespace, restore = %name, consumer = %consumer_name, "{msg}");
+    io::delete_mover_run(&ctx.client, namespace, populate_job).await?;
+    io::publish_warning_event(
+        ctx,
+        restore,
+        POPULATE_HIJACKED_REASON,
+        RECREATE_CLAIM_TO_RESTORE_ACTION,
+        &msg,
+    )
+    .await;
+    if restore.status.as_ref().and_then(|s| s.phase) != Some(RestorePhase::Failed) {
+        io::patch_status(
+            api,
+            name,
+            restore_ready_status(
+                restore,
+                RestorePhase::Failed,
+                POPULATE_HIJACKED_REASON,
                 &msg,
             ),
         )
@@ -884,7 +1008,12 @@ async fn reopen_populator_resolution(
     io::patch_status(
         api,
         name,
-        restore_ready_status(restore, RestorePhase::Resolving, "ClaimRecreated", &msg),
+        restore_ready_status(
+            restore,
+            RestorePhase::Resolving,
+            crate::consts::RESTORE_CLAIM_RECREATED_REASON,
+            &msg,
+        ),
     )
     .await?;
     Ok(Action::requeue(std::time::Duration::from_secs(5)))
@@ -1324,7 +1453,18 @@ async fn drive_direct_restore(
 
     // The Job is named after the Restore and writes into the explicit target PVC;
     // the helper creates/tracks it, the phase writes stay here.
-    match run_restore_mover(ctx, restore, api, namespace, name, &target_pvc, selection).await? {
+    match run_restore_mover(
+        ctx,
+        restore,
+        api,
+        namespace,
+        name,
+        &target_pvc,
+        selection,
+        false, // a direct restore is one-shot: its Job name is never re-used
+    )
+    .await?
+    {
         MoverOutcome::Succeeded { duration_secs } => {
             if let Some(secs) = duration_secs {
                 ctx.metrics.set_restore_duration(namespace, name, secs);
@@ -1515,6 +1655,7 @@ async fn observe_restore_mover(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_restore_mover(
     ctx: &Context,
     restore: &Restore,
@@ -1523,15 +1664,22 @@ async fn run_restore_mover(
     job_name: &str,
     target_pvc: &str,
     selection: &RestoreSelection,
+    reusable_job_name: bool,
 ) -> Result<MoverOutcome> {
     use k8s_openapi::api::batch::v1::Job;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     if let Some(job) = job_api.get_opt(job_name).await? {
-        // A Job that is being DELETED is not this run's outcome. The populate Job name is
-        // stable (`<restore>-populate`), so a reaped-then-immediately-re-populated claim
-        // could otherwise read the outgoing Job's terminal `Succeeded` as its own and rebind
-        // a still-empty prime. Wait for the delete to land, then create a fresh Job.
-        if job.metadata.deletion_timestamp.is_some() {
+        // A Job being DELETED is not THIS run's outcome — but only where the Job name is
+        // re-used across runs, i.e. the populator (`<restore>-populate`, one name for every
+        // claim the reusable Restore ever populates). There, a reaped-then-immediately-
+        // re-populated claim could read the outgoing Job's terminal `Succeeded` as its own
+        // and rebind a still-empty prime. Wait for the delete to land, then create a fresh Job.
+        //
+        // A DIRECT restore is one-shot, so its Job name is never re-used: a terminating Job
+        // there IS this run's Job (typically TTL-reaped after succeeding), and ignoring its
+        // terminal state would drop the outcome and re-run a full restore over a target PVC
+        // the workload may already be writing to.
+        if reusable_job_name && job.metadata.deletion_timestamp.is_some() {
             return Ok(MoverOutcome::Running { created: false });
         }
         return observe_restore_mover(ctx, restore, namespace, job_name, &job).await;

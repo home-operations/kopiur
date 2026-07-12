@@ -912,12 +912,11 @@ fn maintenance_condition_covers_every_coverage_state() {
     assert!(!warn, "a deliberate opt-out must not warn");
     assert!(msg.contains("spec.maintenance.enabled: false"), "{msg}");
 
-    // THE #231 STATE: enabled, but the apply failed. It must NOT read as "disabled", and it
-    // must name the namespace and the underlying error so the operator can act.
+    // THE #231 STATE: enabled, nothing covers the repo, and the apply failed. It must NOT
+    // read as "disabled", and it must name the namespace so the operator can act.
     let (status, reason, msg, warn) = maintenance_condition(
         &MaintenanceCoverage::ApplyFailed {
             namespace: "kopiur-system".into(),
-            error: "maintenances.kopiur.home-operations.com is forbidden".into(),
         },
         "ClusterRepository",
         "expanse",
@@ -927,12 +926,24 @@ fn maintenance_condition_covers_every_coverage_state() {
     assert!(warn, "a failed apply is a real problem: warn");
     assert!(msg.contains("ENABLED"), "{msg}");
     assert!(msg.contains("kopiur-system"), "{msg}");
-    assert!(msg.contains("is forbidden"), "{msg}");
     assert!(msg.contains("RBAC"), "{msg}");
     assert!(
         !msg.contains("spec.maintenance.enabled: false"),
         "must never claim the user disabled maintenance: {msg}"
     );
+    // The message is a pure function of (coverage, kind, name) — no interpolated apply
+    // error. `ensure_maintenance` now runs on EVERY reconcile and suppresses an unchanged
+    // condition by BYTE COMPARISON, so an error string that varies between attempts (a
+    // Conflict naming a resourceVersion) would defeat that guard and spin status writes +
+    // Events at full speed. The verbatim error belongs in the log, not the condition.
+    let (_, _, again, _) = maintenance_condition(
+        &MaintenanceCoverage::ApplyFailed {
+            namespace: "kopiur-system".into(),
+        },
+        "ClusterRepository",
+        "expanse",
+    );
+    assert_eq!(msg, again, "the condition message must be byte-stable");
 
     // Unplaceable cluster-repo Maintenance keeps its own distinct reason.
     let (status, reason, _, warn) = maintenance_condition(
