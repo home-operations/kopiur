@@ -27,7 +27,7 @@ will eventually use.
 
 | CRD field you set… | …needs this Helm flag | Grants the operator `secrets` |
 | --- | --- | --- |
-| `spec.credentialProjection` on a `SnapshotPolicy` / `Restore` / `Maintenance` | `features.credentialProjection.enabled` | `create`, `patch` |
+| `spec.credentialProjection` on a `SnapshotPolicy` / `Restore` / `Maintenance` | `features.credentialProjection.enabled` | `create`, `patch`, `delete` |
 | `spec.server` on a `Repository` / `ClusterRepository` (the kopia web-UI) | `features.kopiaUi.enabled` | `create`, `patch`, `delete` |
 
 Both default to `false`. With both off, the operator's `secrets` access is
@@ -39,8 +39,13 @@ read-only — exactly what a vanilla backup deployment needs.
   copies a repository's credential `Secret` into each mover Job's namespace, so a
   shared `ClusterRepository` whose `Secret` lives in one place "just works" across
   many workload namespaces. The operator therefore needs to **create** and
-  **patch** `Secret`s in those namespaces. (No `delete`: each projected copy
-  carries an `ownerReference` and is garbage-collected with the consuming CR.)
+  **patch** `Secret`s in those namespaces — and to **delete** them, because a copy
+  lives only as long as a mover Job can still read it. Kopiur reclaims each copy
+  once the run that needed it has finished, rather than leaving live repository
+  credentials lying around in your app namespaces. The `ownerReference` on the copy
+  is a backstop for the case where the whole CR is removed; it is not the cleanup
+  mechanism (a `Snapshot` is retained for your entire retention window, so waiting
+  for GC would mean waiting months).
 - **kopia web-UI server** ([Web UI](server.md)) creates a generated-auth `Secret`
   for the UI login (`auth: generate`), and for a `ClusterRepository` also mirrors
   the repository's credentials into the server's namespace (because the

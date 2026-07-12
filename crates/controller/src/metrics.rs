@@ -71,6 +71,7 @@ pub struct Metrics {
     projected_secrets_swept: Counter<u64>,
     creds_secrets_reaped: Counter<u64>,
     projected_secrets_live: Gauge<i64>,
+    snapshots_live: Gauge<i64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
@@ -193,7 +194,15 @@ impl Metrics {
                 "Projected credential Secrets currently alive, observed each sweep pass. \
                  The population, not a delta: a counter of projections rises identically \
                  whether or not copies are ever reclaimed, which is why the per-run leak \
-                 (#237) ran unseen. Alert on deriv() > 0 over a day.",
+                 (#240) ran unseen. Alert on deriv() > 0 over a day.",
+            )
+            .build();
+        let snapshots_live = m
+            .i64_gauge("kopiur_snapshots_live")
+            .with_description(
+                "Snapshot CRs currently alive per SnapshotPolicy. Bounded by GFS retention \
+                 when `spec.retention` is set; a policy WITHOUT it never prunes (a \
+                 deliberate safe default) and this is the only thing that will tell you so.",
             )
             .build();
         let schedule_backups_created = m
@@ -271,6 +280,7 @@ impl Metrics {
             projected_secrets_swept,
             creds_secrets_reaped,
             projected_secrets_live,
+            snapshots_live,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
@@ -648,6 +658,11 @@ impl Metrics {
     /// Record the projected credential Secrets alive after a sweep pass.
     pub fn set_projected_secrets_live(&self, n: i64) {
         self.projected_secrets_live.record(n, &[]);
+    }
+
+    /// Record the `Snapshot` CRs alive for one SnapshotPolicy.
+    pub fn set_snapshots_live(&self, ns: &str, name: &str, n: i64) {
+        self.snapshots_live.record(n, &ns_name(ns, name));
     }
 
     /// Count a Snapshot CR created by a SnapshotSchedule.

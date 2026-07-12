@@ -198,7 +198,7 @@ pub struct CleanupStatus {
     /// Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which
     /// long outlives that Job — so without an explicit reap it would sit in the
     /// workload namespace holding live repository credentials until the CR is pruned
-    /// (#237).
+    /// (#240).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creds_reaped_at: Option<String>,
 }

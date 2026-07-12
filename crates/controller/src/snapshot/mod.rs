@@ -220,7 +220,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             }
-            // The credential copies die with the mover Job, not with this CR (#237).
+            // The credential copies die with the mover Job, not with this CR (#240).
             // Self-gated by its stamp, so this costs nothing once it has run; if the
             // Job is not terminal yet, the owned-Job watch and the steady-state
             // requeue below both bring us back.
@@ -305,7 +305,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
             }
-            // The credential copies die with the mover Job, not with this CR (#237).
+            // The credential copies die with the mover Job, not with this CR (#240).
             // Unlike the Succeeded arm this one has no steady-state timer, so keep a
             // slow requeue alive until the reap settles rather than leaning on the
             // periodic sweep — which an operator may legitimately have disabled. Once
@@ -2584,7 +2584,7 @@ fn creds_reaped(backup: &Snapshot) -> bool {
 /// minutes. But it is owner-ref'd to this `Snapshot`, which owns the kopia snapshot
 /// via a finalizer and so lives for the entire retention window. Without an explicit
 /// reap, ownerRef GC leaves a live copy of the repository password and backend keys
-/// sitting in the workload namespace for months (#237).
+/// sitting in the workload namespace for months (#240).
 ///
 /// **The Job gate is load-bearing.** The mover PATCHes its terminal phase from *inside
 /// the pod*, before that pod exits and before the Job controller marks the Job

@@ -128,7 +128,7 @@ pub async fn ensure_creds_present(
 /// **A stable name bounds the copy count per CR — NOT per run.** [`Self::snapshot_backup`]
 /// keys on a `Snapshot`, which is *itself* the per-run object, so "one copy per CR"
 /// is still one copy per backup: the same leak, entering through the front door
-/// (#237). Do not read the ownerRef as the lifetime. A copy lives only while some
+/// (#240). Do not read the ownerRef as the lifetime. A copy lives only while some
 /// mover Job can still load it via `envFrom`; past that it is reaped at the
 /// consuming CR's terminal arm, with [`crate::sweep`] as the backstop.
 #[derive(Debug, Clone, PartialEq, Eq)]

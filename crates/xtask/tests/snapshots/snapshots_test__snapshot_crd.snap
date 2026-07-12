@@ -118,7 +118,7 @@ spec:
                       Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which
                       long outlives that Job — so without an explicit reap it would sit in the
                       workload namespace holding live repository credentials until the CR is pruned
-                      (#237).
+                      (#240).
                     nullable: true
                     type: string
                 type: object

@@ -237,18 +237,25 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // below (captured before `last_successful` is consumed by the status patch).
     let has_successful_snapshot = last_successful.is_some();
 
-    // 2. Enforce GFS retention: list this config's Snapshots, decide which to
-    //    delete, and delete each (the Snapshot finalizer governs the snapshot).
+    // 2. Observe this policy's Snapshots, then enforce GFS retention over them (the
+    //    Snapshot finalizer governs the kopia snapshot itself).
+    //
+    //    The LIST and the gauges are UNCONDITIONAL; only the prune is gated on
+    //    `spec.retention`. `retention: None` deliberately means "never prune" (see
+    //    `validate::snapshot`) — but it used to also skip these metrics, so a policy
+    //    whose `Snapshot` CRs grow without bound did so entirely invisibly, and its
+    //    consecutive-failure alert never armed either. The population is the signal;
+    //    emit it whatever the retention config says.
+    let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
+    let backups = backup_api.list(&lp).await?.items;
+    // Surface the consecutive-failure streak for alerting (ADR §4.13).
+    ctx.metrics
+        .set_backup_consecutive_failures(&namespace, &name, consecutive_failures(&backups));
+    ctx.metrics
+        .set_snapshots_live(&namespace, &name, backups.len() as i64);
+
     if let Some(retention) = config.spec.retention.as_ref() {
-        let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
-        let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
-        let backups = backup_api.list(&lp).await?.items;
-        // Surface the consecutive-failure streak for alerting (ADR §4.13).
-        ctx.metrics.set_backup_consecutive_failures(
-            &namespace,
-            &name,
-            consecutive_failures(&backups),
-        );
         let to_delete = backups_to_delete(&backups, retention);
         let dp = DeleteParams::default();
         for cr_name in &to_delete {

@@ -59,7 +59,7 @@
 //!    Restore's Job `{restore}-populate` loads `{restore}-creds-0`), and
 //! 5. it is older than `min_age_secs` (never below [`CREDS_MIN_AGE_FLOOR_SECS`]).
 //!
-//! # Stable copies of finished Snapshots (#237)
+//! # Stable copies of finished Snapshots (#240)
 //!
 //! A stable per-CR name bounds the copy count per CR — but a `Snapshot` is
 //! *itself* the per-run object, so `{snapshot}-creds-0` is still one live copy of
@@ -194,7 +194,7 @@ pub fn legacy_creds_candidates<'a>(
 }
 
 /// Select the **stable per-CR** projected credential copies whose owning `Snapshot`
-/// has finished — the steady-state creds reaper (#237).
+/// has finished — the steady-state creds reaper (#240).
 ///
 /// This is the complement of [`legacy_creds_candidates`]: that kernel owns the
 /// marker-LESS pre-#231 copies, this one owns the marker-BEARING copies. The two
@@ -428,7 +428,7 @@ pub struct SweepOutcome {
     pub work_spec_cms: usize,
     /// Legacy per-run projected credential Secrets (#231).
     pub projected_secrets: usize,
-    /// Stable per-CR copies whose owning `Snapshot` had finished (#237).
+    /// Stable per-CR copies whose owning `Snapshot` had finished (#240).
     pub terminal_creds_secrets: usize,
     /// Projected credential Secrets alive at classification time, BEFORE this
     /// pass's deletes. Backs the `kopiur_projected_secrets` gauge — the population
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn marker_labeled_copy_is_never_selected_by_the_legacy_kernel() {
         // The scope marker routes a STABLE copy to the OTHER kernel — it does not
-        // mean "never reaped" (it did before #237). The legacy kernel must not touch
+        // mean "never reaped" (it did before #240). The legacy kernel must not touch
         // one, because it has no way to tell a live consumer from a dead one: a
         // stable copy's creationTimestamp never resets on re-apply, so min-age is no
         // shield for it.
@@ -877,7 +877,7 @@ mod tests {
         assert!(legacy_creds_candidates(&[s], &HashSet::new(), HOUR, NOW).is_empty());
     }
 
-    // --- stable copies of finished Snapshots (#237) ---------------------------
+    // --- stable copies of finished Snapshots (#240) ---------------------------
 
     #[test]
     fn stable_copy_of_a_finished_snapshot_is_reaped() {

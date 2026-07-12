@@ -103,11 +103,17 @@ A namespaced `Repository` has no such gate — its repo and Secret co-reside, so
 
 How the projected copies behave:
 
-- **One stable copy per consuming CR, owned by it.** The copy's name embeds the consumer, not the run: `<snapshot>-creds-N` for a backup, `<restore>-restore-creds-N`, `<maintenance>-maint-creds-N`, `<policy>-vfy-creds-N` for verification, `<snapshot>-pin-creds-N` / `<snapshot>-delete-creds-N` for the auxiliary movers. Every run of that CR refreshes the **same** Secret in place — recurring runs (a `Maintenance` cron, verification tiers) never accumulate copies. The copy carries an `ownerReference` to its CR, so deleting the CR garbage-collects it; when the consumer later disables projection, or a backend re-config drops a source Secret, the operator reaps its own leftover copies too.
+- **A copy lives only as long as a mover Job can read it.** Once the run that needed it has finished, kopiur deletes the copy — it does not leave live repository credentials sitting in your app namespaces. The copy does carry an `ownerReference` to its consuming CR, but treat that as a backstop, not the cleanup: a `Snapshot` is retained for your whole retention window (it owns the kopia snapshot), so waiting for garbage collection would mean waiting months. Copies are reclaimed when a run ends, when a consumer disables projection, and when a backend re-config drops a source Secret; a [periodic sweep](#the-object-sweep) catches anything the reconciler missed.
+- **One stable copy per consuming CR.** The copy's name embeds the consumer, not the run: `<snapshot>-creds-N` for a backup, `<restore>-restore-creds-N`, `<maintenance>-maint-creds-N`, `<policy>-vfy-creds-N` for verification, `<snapshot>-pin-creds-N` / `<snapshot>-delete-creds-N` for the auxiliary movers. Every run of that CR refreshes the **same** Secret in place, so recurring consumers (a `Maintenance` cron, verification tiers) never accumulate copies.
 - **Always fresh.** The copy is re-read from source on every run, so rotating the source Secret takes effect on the next backup. There is no long-lived shadow copy to drift.
 - **A no-op when not needed.** For a namespaced `Repository` whose Secret already lives in the workload namespace, projection copies nothing — it just verifies the Secret is present, exactly like the self-managed path. It only copies for the genuine cross-namespace case.
-- **Labeled kopiur-managed.** Copies carry `app.kubernetes.io/managed-by=kopiur`, `app.kubernetes.io/component=credentials`, and `kopiur.home-operations.com/creds-scope=cr` (the stable-name marker), plus a `kopiur.home-operations.com/projected-from` annotation recording the source — don't edit them by hand.
-- **Legacy per-run copies are swept.** Operator versions up to 0.7.1 named copies after each mover run, so recurring consumers accumulated one Secret per run. The [legacy sweep](#the-legacy-object-sweep) below reaps those on upgraded clusters automatically.
+- **Labeled kopiur-managed.** Copies carry `app.kubernetes.io/managed-by=kopiur`, `app.kubernetes.io/component=credentials`, and `kopiur.home-operations.com/creds-scope=cr` (the stable-name marker), plus `kopiur.home-operations.com/projected-from` (the source) and `kopiur.home-operations.com/projected-at` (when the last run wrote it) annotations — don't edit them by hand.
+
+/// tip | Watch `kopiur_projected_secrets_live`
+
+This gauge is the number of projected copies alive right now. In a healthy cluster it hovers around the number of runs in flight and returns to roughly zero between them. If it climbs day over day, copies are not being reclaimed — that is the shape of the bug fixed in 0.7.3, and `deriv(kopiur_projected_secrets_live[24h]) > 0` is the alert for it coming back.
+
+///
 
 /// warning | Projection needs the operator's `secrets` create/patch/delete RBAC
 
@@ -316,21 +322,26 @@ The one exception is repository **bootstrap/probe** runs, which additionally cre
 Operator versions up to 0.7.0 mounted the work spec from a per-run ConfigMap. The Job self-reaped via its TTL, but ConfigMaps have no TTL mechanism and were owner-referenced to long-lived CRs (a `Snapshot` is the durable record of a backup; a `SnapshotPolicy` never goes away) — so one ConfigMap leaked per run, forever (issue #224: 605 in one reported cluster). Embedding the spec in the Job removes the second object, and with it the entire leak class.
 ///
 
-### The legacy-object sweep
+### The object sweep
 
-Clusters upgraded from older versions can hold two kinds of historical leftovers, and one leader-only background sweep heals both:
+One leader-only background sweep reclaims objects a run no longer needs. It is a **steady-state safety net**, not just an upgrade tool: the reconcilers reclaim their own objects as each run ends, and the sweep catches whatever they missed — a controller that crashed mid-cleanup, a `Snapshot` deleted while the operator was down, an RBAC grant that was briefly absent.
 
-- **Per-run work-spec ConfigMaps** (versions ≤ 0.7.0): work-spec ConfigMaps (data key `work-spec.json`) with **no same-named Job**, **older than 1 hour**, are deleted. Bootstrap result ConfigMaps and anything a live legacy run still mounts are never touched.
-- **Per-run projected credential Secrets** (versions ≤ 0.7.1): projected copies were named after each mover run (`<job>-creds-N`), so recurring consumers accumulated one live credential copy per run. The sweep deletes kopiur-managed, `projected-from`-annotated Secrets that lack the stable-name marker (`kopiur.home-operations.com/creds-scope`), are not loaded via `envFrom` by any live mover Job, and are older than the minimum age. Stable-named copies, the kopia web-UI credential mirrors, and user Secrets are excluded by construction. Deleting Secrets rides the same `features.credentialProjection.enabled` RBAC grant — if you used projection on an old version and later disabled the flag, the sweep logs an actionable warning instead of deleting.
+It handles three things:
 
-On upgrade, the backlog drains automatically — no `kubectl` cleanup needed. Two environment variables tune it (set via the chart's controller `extraEnv`):
+- **Projected credential copies of finished runs.** A copy is only needed while its mover Job can load it via `envFrom`. Once the owning `Snapshot` has reached `Succeeded`/`Failed` and no live Job still references the copy, it is deleted. The copies of long-lived consumers (a `Maintenance` cron, a verification tier) are **not** touched between their runs — those are already one-per-CR and are refreshed in place.
+- **Per-run projected credential Secrets** (versions ≤ 0.7.1): older versions named copies after each mover *run* (`<job>-creds-N`), so recurring consumers accumulated one live credential copy per run. Kopiur-managed, `projected-from`-annotated Secrets that lack the stable-name marker, are loaded by no live mover Job, and are past the minimum age are deleted. The kopia web-UI credential mirrors and user Secrets are excluded by construction.
+- **Per-run work-spec ConfigMaps** (versions ≤ 0.7.0): work-spec ConfigMaps (data key `work-spec.json`) with **no same-named Job**, past the minimum age, are deleted. Bootstrap result ConfigMaps and anything a live legacy run still mounts are never touched.
+
+Deleting Secrets rides the `features.credentialProjection.enabled` RBAC grant. If you used projection and later disabled the flag, the sweep logs an actionable warning naming it instead of deleting.
+
+Backlogs drain automatically on upgrade — no `kubectl` cleanup needed. Two environment variables tune it (set via the chart's controller `extraEnv`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `KOPIUR_WORK_SPEC_SWEEP_INTERVAL_SECS` | `21600` (6h) | Sweep cadence; `0` disables the sweep entirely. |
-| `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` | `3600` (1h) | Minimum object age before it may be reaped. |
+| `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` | `3600` (1h) | Minimum object age before it may be reaped. Credential copies additionally have a hard 15-minute floor, so setting this to `0` cannot expose the window in which a copy exists but its Job does not yet. |
 
-Each pass increments the `kopiur_work_spec_cms_swept_total` and `kopiur_projected_secrets_swept_total` counters on `/metrics`, so you can watch the backlog drain after an upgrade.
+Each pass increments `kopiur_work_spec_cms_swept_total`, `kopiur_projected_secrets_swept_total`, and `kopiur_creds_secrets_reaped_total{by="sweep"}` on `/metrics`. That last one is worth an alert: in steady state the reconciler should reclaim a copy long before the sweep sees it, so a **sustained** `by="sweep"` rate means the reconciler's own cleanup has stopped firing. (Don't sum it with `by="terminal"` — the split is the whole point.)
 
 ## Troubleshooting
 

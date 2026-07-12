@@ -1697,7 +1697,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `credsReapedAt` | string | — | When the run's projected credential Secrets were reclaimed (RFC 3339); absent until the reap has run. A projected copy is only needed while a mover Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which long outlives that Job — so without an explicit reap it would sit in the workload namespace holding live repository credentials until the CR is pruned (#237). |
+| `credsReapedAt` | string | — | When the run's projected credential Secrets were reclaimed (RFC 3339); absent until the reap has run. A projected copy is only needed while a mover Job can still load it via `envFrom`, but it is owner-ref'd to this CR, which long outlives that Job — so without an explicit reap it would sit in the workload namespace holding live repository credentials until the CR is pruned (#240). |
 
 #### `status.conditions[]` { #snapshot-status-conditions }
 

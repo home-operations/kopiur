@@ -30,31 +30,51 @@ If any tooling of yours read the per-run ConfigMaps, read the Job's
 `KOPIUR_WORK_SPEC` env instead. Details and tuning knobs:
 [Movers → Run artifacts & cleanup](movers.md#run-artifacts--cleanup).
 
-## After 0.7.1: projected credential Secrets stop accumulating (no action needed)
+## After 0.7.1: recurring consumers stop accumulating credential copies (no action needed)
 
-Versions after 0.7.1 fix the sibling leak for **credential projection**
+Versions after 0.7.1 fix one half of the credential-projection leak
 (`spec.credentialProjection`): projected Secret copies were named after each
-mover run, so recurring consumers — a `Maintenance` cron, `SnapshotPolicy`
+mover **run**, so recurring consumers — a `Maintenance` cron, `SnapshotPolicy`
 verification — left one live copy of the repository credentials behind per run,
-owned by the long-lived CR and never deleted. Both halves of the fix are
-automatic:
+owned by the long-lived CR and never deleted. Copies now use a **stable per-CR
+name** (e.g. `<maintenance>-maint-creds-0`), refreshed in place on every run, and
+a periodic sweep deletes the per-run copies earlier versions accumulated.
 
-- Projected copies now use a **stable per-CR name** (e.g.
-  `<maintenance>-maint-creds-0`), refreshed in place on every run — one Secret
-  per consumer, garbage-collected with it. Copies are additionally reaped when
-  the consumer disables projection or a backend re-config drops a source
-  Secret.
-- The same periodic **legacy sweep** deletes the per-run copies accumulated by
-  earlier versions (marker-less, `projected-from`-annotated, not loaded by any
-  live mover Job, past the minimum age). Watch the backlog drain via the
-  `kopiur_projected_secrets_swept_total` counter.
+The chart's `features.credentialProjection.enabled` grant gained the `secrets`
+**delete** verb to back this cleanup — `helm upgrade` applies it. If you used
+projection on an old version and later turned the flag **off**, the sweep cannot
+delete the leftovers; it logs a warning naming the flag (re-enable it once, or
+delete the copies by hand).
 
-The chart's `features.credentialProjection.enabled` grant now includes the
-`secrets` **delete** verb to back this cleanup — `helm upgrade` applies it. If
-you used projection on an old version and later turned the flag **off**, the
-sweep cannot delete the leftovers; it logs a warning naming the flag
-(re-enable it once, or delete the legacy copies by hand). Details:
-[Movers → The legacy-object sweep](movers.md#the-legacy-object-sweep).
+## After 0.7.2: **backups** stop accumulating credential copies (no action needed)
+
+The 0.7.2 fix above did not cover the highest-frequency consumer, and you may
+have watched your Secret count keep climbing. The stable name is
+`<snapshot>-creds-0` — and a `Snapshot` **is** the per-run object, so "one copy
+per CR" was still one live copy of your repository password and backend keys per
+backup, per namespace, retained for the entire GFS window because the `Snapshot`
+CR owns the kopia snapshot via a finalizer. A stable name bounds copies per CR;
+it cannot bound them per run. The lifetime was the bug, not the name.
+
+Versions after 0.7.2 reclaim a copy when the run that needed it finishes. Both
+halves are automatic and need no `kubectl`:
+
+- Each `Snapshot` reclaims its own copies at its terminal phase, once its mover
+  Job can no longer schedule a pod that would read them.
+- The periodic sweep reclaims the copies of any already-finished `Snapshot`,
+  which is what drains the backlog. Most of it goes within ten minutes of the
+  rollout (terminal Snapshots re-reconcile on that cadence); the rest goes on the
+  next sweep pass.
+
+Watch it land on `/metrics`: **`kopiur_projected_secrets_live`** is the live
+count of projected copies. It should fall to roughly the number of runs in flight
+and then stay flat across your backup window instead of stepping up once per run.
+`deriv(kopiur_projected_secrets_live[24h]) > 0` is the alert if this ever
+regresses. Details: [Movers → The object sweep](movers.md#the-object-sweep).
+
+`runJob` hooks also now get a default `ttlSecondsAfterFinished` (1h) when your
+`jobSpec` omits one, so a completed hook Job and its Pod no longer linger for the
+whole retention window. Set the field explicitly to keep them longer.
 
 ## Upgrading 0.5.x → 0.6.0 (one-time CRD migration)
 

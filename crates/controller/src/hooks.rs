@@ -295,7 +295,7 @@ async fn run_workload_exec(
 /// CR retained for the whole GFS window because it owns the kopia snapshot via a
 /// finalizer. Left to ownerRef GC, a completed hook Job and its Pod would linger for
 /// months — one pair per hook, per backup, forever — which is the projected-credential
-/// leak (#237) in a different object. An explicit value is honored, so a user who
+/// leak (#240) in a different object. An explicit value is honored, so a user who
 /// wants the Job kept for post-mortem still can.
 fn hook_job_spec(hook: &RunJobHook) -> k8s_openapi::api::batch::v1::JobSpec {
     let mut spec = hook.job_spec.clone();
@@ -438,7 +438,7 @@ mod tests {
         // the whole GFS window (it owns the kopia snapshot via a finalizer). Without a
         // TTL, ownerRef GC leaves the finished Job AND its Pod lying around for months
         // — one pair per hook, per backup. This was the only Job the operator built
-        // without one (#237).
+        // without one (#240).
         let spec = hook_job_spec(&run_job_hook_spec(None));
         assert_eq!(
             spec.ttl_seconds_after_finished,
