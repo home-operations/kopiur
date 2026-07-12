@@ -97,14 +97,19 @@ spec:
           body: '{"event": "postgres-data backed up"}'
           timeout: 30s
           continueOnFailure: true
-      # The third form, runJob, materializes a full one-shot Job (owned by the
-      # Snapshot, GC'd with it) — use it when the work needs its own image or
-      # volumes rather than an exec into the app:
+      # The third form, runJob, materializes a full one-shot Job — use it when the
+      # work needs its own image or volumes rather than an exec into the app. The
+      # finished Job self-reaps an hour later; set ttlSecondsAfterFinished yourself
+      # to keep it around longer for a post-mortem, or to drop it sooner. (Don't
+      # rely on the ownerRef to clean it up: the owning Snapshot is retained for
+      # the whole retention window, so an untimed Job would outlive its run by
+      # months.)
       #
       # - runJob:
       #     timeout: 5m
       #     jobSpec:
       #       backoffLimit: 0
+      #       ttlSecondsAfterFinished: 3600
       #       template:
       #         spec:
       #           restartPolicy: Never
