@@ -595,12 +595,14 @@ pub struct PlacementPass {
     /// Kopia ids of listing entries whose host decided [`PlacementDecision::ForeignIgnored`] —
     /// fed to [`plan_catalog`] exactly like `produced_ids`.
     pub foreign_ignored_ids: BTreeSet<String>,
-    /// ALL entries this scan's listing classified as another cluster's OR treated the
-    /// same way (a disallowed bare host once cluster identity is on) — regardless of
-    /// whether `foreignSnapshots` ultimately dropped or materialized them. The
-    /// `status.catalog.foreignSnapshotCount` / `kopiur_repo_foreign_snapshots` value
-    /// (plus any count the mover's prefilter already dropped before this pass ever
-    /// saw them — the caller adds that in, never double-counted).
+    /// Entries this scan counted as foreign: every foreign-SUFFIXED entry, plus
+    /// bare-disallowed hosts only when they decided [`PlacementDecision::ForeignIgnored`]
+    /// (under `Fallback`, a bare-disallowed host materializes into the fallback and is
+    /// NOT counted — see the `ForeignSnapshots` doc in `common/cache.rs`, which states
+    /// the same rule). Feeds `status.catalog.foreignSnapshotCount` /
+    /// `kopiur_repo_foreign_snapshots` (plus any count the mover's prefilter already
+    /// dropped before this pass ever saw them — the caller adds that in, never
+    /// double-counted).
     pub foreign_count: i64,
     /// Bounded top-N (by count desc) foreign-suffix breakdown for the scan's info
     /// log — NEVER surfaced in status (cardinality is foreign-writer-controlled).
