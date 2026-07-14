@@ -34,15 +34,28 @@ Every user-facing page must let a reader who has never seen Kopiur succeed at
    reverse-engineer the CRD to find the knobs.
 
 When in doubt, over-explain the "why", and prefer a worked example over a prose
-description. Use Material **admonitions** (`!!! note` / `!!! tip` / `!!! warning`,
-with an optional `"title"`) for the gotchas — alpha API, webhook-enforced
-constraints, version prerequisites. The admonition body is indented 4 spaces:
+description. Use Material **admonitions** for the gotchas — alpha API,
+webhook-enforced constraints, version prerequisites. This repo uses the pymdownx
+**blocks** form (`/// note | Title` … `///`), NOT the classic `!!! note` form:
+the classic `admonition` extension is not even registered (`mkdocs.yml` wires up
+`pymdownx.blocks.admonition`), because the pre-commit `oxfmt` pass strips the
+4-space body indentation `!!!` requires and silently breaks every such block. The
+blocks body stays at **column 0** and the block is closed with a `///` line:
 
 ```markdown
-!!! warning "Lose the password, lose the backups"
+/// warning | Lose the password, lose the backups
+
 The `KOPIA_PASSWORD` encrypts the repository. If you lose it, the backups are
 unrecoverable — kopia cannot decrypt without it.
+
+///
 ```
+
+Keep a blank line before the closing `///` (so oxfmt doesn't fold it into a
+preceding list item). The title is bare text after `| ` — not quoted. Registered
+types are the canonical Material set: `note`, `abstract`, `info`, `tip`,
+`success`, `question`, `warning`, `failure`, `danger`, `bug`, `example`, `quote`
+— `important` is **not** one; use `warning` for a webhook-enforced constraint.
 
 ## Examples are the backbone (simple → complex)
 
@@ -110,7 +123,7 @@ Triggers that REQUIRE a docs/examples update:
 | A Helm value or install scope (`deploy/helm`) | `docs/install.md` |
 | RBAC / SA / mover behavior | `docs/movers.md` |
 | Maintenance defaults or projection | `docs/maintenance.md` |
-| A webhook-enforced constraint | the affected page (state it as a `!!! warning` admonition) + the example that would otherwise violate it |
+| A webhook-enforced constraint | the affected page (state it as a `/// warning` admonition) + the example that would otherwise violate it |
 | A reconciler UX change (status, print columns, phases) | wherever that surface is described |
 
 Field shapes shown in docs/examples must be the real ones — the manifests are
@@ -137,8 +150,10 @@ manifest that wouldn't survive admission is wrong even if the site builds.
 - Adding `deploy/examples/NN.yaml` but forgetting the table row or the section
   (or vice-versa) → orphaned file or dead reference.
 - New page not added to the `nav:` in `mkdocs.yml` → builds unlinked.
-- Forgetting to indent an admonition body 4 spaces → the text renders outside the
-  box as plain paragraphs (it does not error — eyeball the rendered page).
+- Writing an admonition in the classic `!!! note` form (4-space-indented body)
+  instead of the `/// note | Title` … `///` blocks form → the title renders as
+  literal text and the indented body becomes a code block (it does not error —
+  eyeball the rendered page or grep the built HTML for `class="admonition`).
 - Documenting the field list without the mental model or the "which values do I
   actually change" guidance → technically complete, practically useless.
 - Shipping a behavior change with "docs later" → the docs now lie. Same PR.

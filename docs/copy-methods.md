@@ -26,14 +26,20 @@ Do you have (or can you install) the CSI snapshot stack for this source?
 - **Set `copyMethod: Direct` explicitly** if you don't have (or don't want to maintain) the CSI snapshot stack, or the source is a static/non-CSI volume (hostPath, some NFS setups) — it works on any storage, no CSI required.
 - **Use `Clone`** only if your driver does cloning but not snapshots (uncommon).
 
-!!! note "`Snapshot` is the default"
-    `copyMethod` defaults to `Snapshot` because it is **crash-consistent**: kopia reads a frozen point-in-time capture instead of a live, possibly-mid-write PVC — the difference matters most for databases and other stateful apps. It requires the CSI snapshot stack (external-snapshotter + a `VolumeSnapshotClass` for your source's driver). If your cluster doesn't have it, or the source is a static/non-CSI volume, set `copyMethod: Direct` explicitly. When the stack/class is missing and `copyMethod` was left at its default, the backup fails with a clear condition telling you exactly what to install or which field to set — it never silently falls back to a live read.
+/// note | `Snapshot` is the default
 
-!!! warning "Upgrading? Two hazards when `copyMethod` is left implicit"
-    `copyMethod` began defaulting to `Snapshot` as of this release (previously `Direct`). Check any `SnapshotPolicy` that never sets `copyMethod` explicitly:
+`copyMethod` defaults to `Snapshot` because it is **crash-consistent**: kopia reads a frozen point-in-time capture instead of a live, possibly-mid-write PVC — the difference matters most for databases and other stateful apps. It requires the CSI snapshot stack (external-snapshotter + a `VolumeSnapshotClass` for your source's driver). If your cluster doesn't have it, or the source is a static/non-CSI volume, set `copyMethod: Direct` explicitly. When the stack/class is missing and `copyMethod` was left at its default, the backup fails with a clear condition telling you exactly what to install or which field to set — it never silently falls back to a live read.
 
-    1. **No CSI snapshot stack for that source?** It now fails instead of silently reading the live PVC — pin `copyMethod: Direct` on that policy.
-    2. **Server-side re-defaulting**: a server-defaulted field has no field owner under server-side apply. Re-applying an *existing* manifest that omits `copyMethod` can silently flip a stored `Direct` value to `Snapshot` once the CRD is upgraded — pin `copyMethod` explicitly on every `SnapshotPolicy` you manage, especially ones reconciled by GitOps. This also applies to manifests previously produced by `kopiur-migrate`: translations run before this release omit `copyMethod` when the source VolSync object had none set, so they're exposed to this hazard too — re-run the migration (now emits an explicit value) or add `copyMethod: Direct` by hand before re-applying.
+///
+
+/// warning | Upgrading? Two hazards when `copyMethod` is left implicit
+
+`copyMethod` began defaulting to `Snapshot` as of this release (previously `Direct`). Check any `SnapshotPolicy` that never sets `copyMethod` explicitly:
+
+1. **No CSI snapshot stack for that source?** It now fails instead of silently reading the live PVC — pin `copyMethod: Direct` on that policy.
+2. **Server-side re-defaulting**: a server-defaulted field has no field owner under server-side apply. Re-applying an *existing* manifest that omits `copyMethod` can silently flip a stored `Direct` value to `Snapshot` once the CRD is upgraded — pin `copyMethod` explicitly on every `SnapshotPolicy` you manage, especially ones reconciled by GitOps. This also applies to manifests previously produced by `kopiur-migrate`: translations run before this release omit `copyMethod` when the source VolSync object had none set, so they're exposed to this hazard too — re-run the migration (now emits an explicit value) or add `copyMethod: Direct` by hand before re-applying.
+
+///
 
 ---
 
@@ -148,8 +154,11 @@ spec:
 
 Only this deadline fails staging. If it expires the backup goes `Failed` with reason `VolumeSnapshotFailed` (the snapshot was still reporting an error), `StagingTimedOut` (no error — the driver/snapshot-controller is stuck), or `StagedPvcBindTimeout` (the snapshot was fine but the staged PVC never bound — the restore/clone is still provisioning or can't provision), and the message names this field. A `Failed` backup is terminal; the next scheduled run (or a new `Snapshot`) retries — and Kopiur reaps whatever staging objects the failed run already created.
 
-!!! note "A `VolumeSnapshot` error during the wait is NOT a failure"
-    The snapshot-controller routinely reports **transient** errors on a perfectly healthy `VolumeSnapshot` — most commonly a benign `409 Conflict` (`"the object has been modified; please apply your changes to the latest version and try again"`) while it adds finalizers, which its own retry clears a moment later. Kopiur surfaces such errors on the `SourceStaged` condition for visibility but keeps waiting; it declares `VolumeSnapshotFailed` only if the snapshot is still not `readyToUse` when the staging deadline passes.
+/// note | A `VolumeSnapshot` error during the wait is NOT a failure
+
+The snapshot-controller routinely reports **transient** errors on a perfectly healthy `VolumeSnapshot` — most commonly a benign `409 Conflict` (`"the object has been modified; please apply your changes to the latest version and try again"`) while it adds finalizers, which its own retry clears a moment later. Kopiur surfaces such errors on the `SourceStaged` condition for visibility but keeps waiting; it declares `VolumeSnapshotFailed` only if the snapshot is still not `readyToUse` when the staging deadline passes.
+
+///
 
 ```yaml
 --8<-- "deploy/examples/21-copy-method-snapshot.yaml"
@@ -167,8 +176,11 @@ Use it when your CSI driver supports cloning (`CLONE_VOLUME`) but not snapshots.
 --8<-- "deploy/examples/22-copy-method-clone.yaml"
 ```
 
-!!! warning "Clone requires driver support"
-    If your driver can't clone the volume, the staged PVC stays `Pending` and the backup fails with `StagedPvcBindTimeout` once the [staging deadline](#how-long-staging-may-wait-specstagingtimeout) passes. If you see that, check the staged PVC's events (`kubectl describe pvc <snapshot-name>-src`) and use `Snapshot` or `Direct` instead.
+/// warning | Clone requires driver support
+
+If your driver can't clone the volume, the staged PVC stays `Pending` and the backup fails with `StagedPvcBindTimeout` once the [staging deadline](#how-long-staging-may-wait-specstagingtimeout) passes. If you see that, check the staged PVC's events (`kubectl describe pvc <snapshot-name>-src`) and use `Snapshot` or `Direct` instead.
+
+///
 
 ---
 
@@ -196,8 +208,11 @@ On CephFS, restoring a VolumeSnapshot into a staged PVC is a **full subvolume cl
 --8<-- "deploy/examples/30-cephfs-shallow-snapshot.yaml"
 ```
 
-!!! note "Same driver, shallow-capable versions, delete order"
-    The shallow class must use the **same provisioner** as your source's class (kopiur enforces this). CephFS shallow volumes need ceph-csi ≥ 3.7 and are read-only by design — request them `ReadOnlyMany`. ceph-csi reference-tracks the backing snapshot, and Kopiur always deletes the staged PVC **before** the VolumeSnapshot, so the cleanup order is safe for shallow mounts.
+/// note | Same driver, shallow-capable versions, delete order
+
+The shallow class must use the **same provisioner** as your source's class (kopiur enforces this). CephFS shallow volumes need ceph-csi ≥ 3.7 and are read-only by design — request them `ReadOnlyMany`. ceph-csi reference-tracks the backing snapshot, and Kopiur always deletes the staged PVC **before** the VolumeSnapshot, so the cleanup order is safe for shallow mounts.
+
+///
 
 ---
 

@@ -89,10 +89,13 @@ sources) takes one consistent group snapshot across all PVCs; `None` opts into
 independent per-PVC snapshots. `None` must be set **explicitly** — there is no
 silent per-PVC fallback, because that would produce inconsistent backups.
 
-!!! note "Single-PVC today"
-    Group snapshotting is not yet fully wired; multi-PVC group consistency is a
-    work in progress. For the current single-PVC behavior this field has no
-    observable effect.
+/// note | Single-PVC today
+
+Group snapshotting is not yet fully wired; multi-PVC group consistency is a
+work in progress. For the current single-PVC behavior this field has no
+observable effect.
+
+///
 
 ### `retention`
 

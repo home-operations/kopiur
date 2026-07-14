@@ -181,19 +181,25 @@ identity:
 
 (For a shared `ClusterRepository`, the repo can supply identity _CEL expressions_ so tenants get distinct identities automatically — see [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel). An explicit `identity` here always wins.)
 
-!!! warning "Identity strings must round-trip through kopia"
-    `username` and `hostname` form the `username@hostname:path` string kopia parses on the **first** `@` and **first** `:` — with no escaping. The webhook therefore rejects a `username`/`hostname` that is empty or contains `@`, `:`, whitespace, or a control character (a `sourcePathOverride` may contain spaces and `:`, but not control characters and not be empty). This is shape-only — dots, dashes, slashes, and unicode letters are all fine. Normal Kubernetes names and namespaces always pass; the rule only catches values that could never have worked.
+/// warning | Identity strings must round-trip through kopia
 
-!!! warning "Changing a policy's identity after it has snapshots orphans the old history"
-    A snapshot's identity is its address in the repository. If you edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, new snapshots land under the new address and the old ones are orphaned: GFS retention treats them as a separate source and never prunes them, and the new identity restarts retention from zero. To stop silent data loss the webhook **rejects** such an edit. If the re-identification is intentional, acknowledge it with the annotation:
+`username` and `hostname` form the `username@hostname:path` string kopia parses on the **first** `@` and **first** `:` — with no escaping. The webhook therefore rejects a `username`/`hostname` that is empty or contains `@`, `:`, whitespace, or a control character (a `sourcePathOverride` may contain spaces and `:`, but not control characters and not be empty). This is shape-only — dots, dashes, slashes, and unicode letters are all fine. Normal Kubernetes names and namespaces always pass; the rule only catches values that could never have worked.
 
-    ```yaml
-    metadata:
-      annotations:
-        kopiur.home-operations.com/allow-identity-change: "intentional"  # any non-empty value
-    ```
+///
 
-    Fixing the identity *before* the first successful snapshot is unrestricted (there is no history to orphan).
+/// warning | Changing a policy's identity after it has snapshots orphans the old history
+
+A snapshot's identity is its address in the repository. If you edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, new snapshots land under the new address and the old ones are orphaned: GFS retention treats them as a separate source and never prunes them, and the new identity restarts retention from zero. To stop silent data loss the webhook **rejects** such an edit. If the re-identification is intentional, acknowledge it with the annotation:
+
+```yaml
+metadata:
+  annotations:
+    kopiur.home-operations.com/allow-identity-change: "intentional"  # any non-empty value
+```
+
+Fixing the identity *before* the first successful snapshot is unrestricted (there is no history to orphan).
+
+///
 
 ### compression, files & extraArgs — kopia tuning and ignores
 
@@ -252,22 +258,28 @@ Per-entry rationale:
   you happen to name `.snapshot`, at any depth, is also excluded — if you have
   one, set `ignoreRules` explicitly (your list replaces the default wholesale).
 
-!!! warning "An explicit `ignoreRules` REPLACES the default — it does not merge"
-    Setting `files.ignoreRules` to any list, including a single-entry list,
-    **replaces** the default 5-entry set wholesale; it is not appended to it. If
-    you set `ignoreRules: ["*.tmp"]` you get `*.tmp` excluded and NOTHING else —
-    `/lost+found` and the rest of the default set are no longer excluded. Re-add
-    any default entries you still want alongside your own globs. Setting
-    `ignoreRules: []` explicitly opts out of ignoring anything at all (a full
-    snapshot of everything, including the OS junk above).
+/// warning | An explicit `ignoreRules` REPLACES the default — it does not merge
 
-!!! tip "Carrying `ignoreRules: [\"/lost+found\"]` in every SnapshotPolicy today?"
-    If your manifests (or a kustomize component applied to every app) paste in
-    `ignoreRules: ["/lost+found"]` by hand, you can delete that block — the
-    default now covers it, plus four more entries. Keeping it explicit pins you
-    to exactly that one-entry list (see the replace-semantics warning above), so
-    only keep it if you deliberately want `/lost+found` excluded and nothing
-    else from the default set.
+Setting `files.ignoreRules` to any list, including a single-entry list,
+**replaces** the default 5-entry set wholesale; it is not appended to it. If
+you set `ignoreRules: ["*.tmp"]` you get `*.tmp` excluded and NOTHING else —
+`/lost+found` and the rest of the default set are no longer excluded. Re-add
+any default entries you still want alongside your own globs. Setting
+`ignoreRules: []` explicitly opts out of ignoring anything at all (a full
+snapshot of everything, including the OS junk above).
+
+///
+
+/// tip | Carrying `ignoreRules: ["/lost+found"]` in every SnapshotPolicy today?
+
+If your manifests (or a kustomize component applied to every app) paste in
+`ignoreRules: ["/lost+found"]` by hand, you can delete that block — the
+default now covers it, plus four more entries. Keeping it explicit pins you
+to exactly that one-entry list (see the replace-semantics warning above), so
+only keep it if you deliberately want `/lost+found` excluded and nothing
+else from the default set.
+
+///
 
 **Recommended extras** — desktop/editor junk that is deliberately **not**
 defaulted (copy this list into your own `ignoreRules` alongside anything else
@@ -363,14 +375,17 @@ volume.
 
 ///
 
-!!! warning "Upgrading from the old flat `quick: { cron, jitter }` shape"
-    `verification.quick` used to be a bare `{ cron, jitter, timezone }` (GitHub #174). An
-    already-persisted `SnapshotPolicy` in that old shape keeps decoding fine, but with
-    its quick tier treated as **disabled** (no schedule to run) until you migrate it.
-    Re-applying that old shape as a **new** write is rejected at admission with a
-    message pointing at the move: nest the same fields under `quick.schedule`, e.g.
-    `quick: { cron: "0 4 * * *", jitter: 30m }` becomes
-    `quick: { schedule: { cron: "0 4 * * *", jitter: 30m } }`.
+/// warning | Upgrading from the old flat `quick: { cron, jitter }` shape
+
+`verification.quick` used to be a bare `{ cron, jitter, timezone }` (GitHub #174). An
+already-persisted `SnapshotPolicy` in that old shape keeps decoding fine, but with
+its quick tier treated as **disabled** (no schedule to run) until you migrate it.
+Re-applying that old shape as a **new** write is rejected at admission with a
+message pointing at the move: nest the same fields under `quick.schedule`, e.g.
+`quick: { cron: "0 4 * * *", jitter: 30m }` becomes
+`quick: { schedule: { cron: "0 4 * * *", jitter: 30m } }`.
+
+///
 
 Deep verify restores into a throwaway scratch volume, then discards it. `capacity` and `storageClassName` size and place that volume: **set `capacity`** and the operator provisions a fresh generic-ephemeral PVC (auto-deleted with the Job) of that size — size it to comfortably hold the restored snapshot; **omit `capacity`** and scratch falls back to a node-ephemeral `emptyDir` (zero-config, but bounded by node disk — fine for small snapshots). `storageClassName` only applies when `capacity` is set — a class with no capacity is a no-op (an `emptyDir` has no StorageClass), which the operator surfaces as a `ScratchStorageClassIgnored` condition + Warning Event on the `SnapshotPolicy`.
 
@@ -407,8 +422,11 @@ spawn a verify Job that failed hard against an empty repository (GitHub #168).
 
 It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 
-!!! tip "A timezone for the verify crons"
-    Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
+/// tip | A timezone for the verify crons
+
+Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
+
+///
 
 ### suspend — pause a recipe
 
@@ -608,17 +626,20 @@ is described in the table below.
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
 
-!!! tip "The cron timezone can be inherited from the repository"
-    Leave `schedule.timezone` unset and the schedule evaluates its cron in the
-    target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once)
-    (else UTC) — set the zone once on the repository instead of on every schedule.
-    The resolved zone is recorded in `status.nextSchedule.timezone`; if you later
-    change the repository default, the schedule re-reconciles (a referent watch)
-    and **recomputes its pinned slot** in the new zone rather than waiting for the
-    stale slot to fire. A `policySelector` schedule whose matched policies'
-    repositories disagree on the zone can't be resolved unambiguously — it falls
-    back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
-    set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
+/// tip | The cron timezone can be inherited from the repository
+
+Leave `schedule.timezone` unset and the schedule evaluates its cron in the
+target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once)
+(else UTC) — set the zone once on the repository instead of on every schedule.
+The resolved zone is recorded in `status.nextSchedule.timezone`; if you later
+change the repository default, the schedule re-reconciles (a referent watch)
+and **recomputes its pinned slot** in the new zone rather than waiting for the
+stale slot to fire. A `policySelector` schedule whose matched policies'
+repositories disagree on the zone can't be resolved unambiguously — it falls
+back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
+set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
+
+///
 
 ### `policyRef` or `policySelector` — one recipe or many
 

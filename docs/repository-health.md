@@ -64,16 +64,19 @@ When a backup mover Job fails, the `Snapshot` stamps a rate-limited
 once (loop-guarded on `status.lastReverifyAt`) and flips to `Failed` if the backend is
 gone — at which point the gate suppresses all further Jobs.
 
-!!! warning "Known limitation: a one-Job detection window"
-    For object-store / volume-backed repositories, the gate reads `status.phase`. By
-    default (`periodicRefresh` off) the phase isn't re-probed on a timer, so an outage
-    that begins between backups is detected when the **next** backup fails: that failure
-    fires the reactive re-probe, the phase flips to `Failed` within ~60s, and the gate
-    then suppresses every subsequent Job — **one** doomed Job per outage instead of one
-    per schedule tick, not zero. Bare-path filesystem repos don't have this window (they
-    re-probe every reconcile). To get proactive timed detection for object stores, enable
-    the [backend health probe](#backend-health-probe-opt-in) below (or
-    `catalog.periodicRefresh`, at the cost of re-running the bootstrap Job on that cadence).
+/// warning | Known limitation: a one-Job detection window
+
+For object-store / volume-backed repositories, the gate reads `status.phase`. By
+default (`periodicRefresh` off) the phase isn't re-probed on a timer, so an outage
+that begins between backups is detected when the **next** backup fails: that failure
+fires the reactive re-probe, the phase flips to `Failed` within ~60s, and the gate
+then suppresses every subsequent Job — **one** doomed Job per outage instead of one
+per schedule tick, not zero. Bare-path filesystem repos don't have this window (they
+re-probe every reconcile). To get proactive timed detection for object stores, enable
+the [backend health probe](#backend-health-probe-opt-in) below (or
+`catalog.periodicRefresh`, at the cost of re-running the bootstrap Job on that cadence).
+
+///
 
 ## Backend health probe (opt-in)
 
@@ -106,24 +109,30 @@ Two failures are reported distinctly, because they demand different responses:
 | `RepositoryVanished` | backend **reachable**, kopia repository **absent** (format blob gone) | Verify the backend is *truly* empty before any re-create (see warning below) |
 | `BackendUnreachable` | backend unreachable, mount/path missing, or auth/lock failed | Fix the backend / credentials / volume; **not** a wipe |
 
-!!! warning "kopiur never auto-recreates a repository it once trusted"
-    A wiped repository and a transient outage look alike, and silently creating a
-    fresh empty repository over a real one destroys restorability. So
-    `create.enabled` governs the **first** bootstrap only — once a repository has
-    been `Ready` (it carries a pinned `status.uniqueId`), kopiur will **never**
-    recreate it, even on a `RepositoryVanished` alert. Re-creating is always a
-    deliberate human action. And a `RepositoryVanished` alert means the *format
-    blob* is gone — **data blobs may still remain** and be recoverable, so verify
-    the backend is genuinely empty (and that no other Repository points at the same
-    backend) before you act.
+/// warning | kopiur never auto-recreates a repository it once trusted
 
-!!! tip "Tuning"
-    - `interval` — how often to re-connect (Go-style duration; min `30s`, default
-      `30m`). Each probe runs a short connect, so leave it long for metered stores.
-    - `failureThreshold` — consecutive failing probes required before the alert
-      fires (default `3`). Debounces a single transient blip (an S3
-      list-after-delete race, a NAS reboot) from paging on-call. Any success resets
-      the counter and clears the condition.
+A wiped repository and a transient outage look alike, and silently creating a
+fresh empty repository over a real one destroys restorability. So
+`create.enabled` governs the **first** bootstrap only — once a repository has
+been `Ready` (it carries a pinned `status.uniqueId`), kopiur will **never**
+recreate it, even on a `RepositoryVanished` alert. Re-creating is always a
+deliberate human action. And a `RepositoryVanished` alert means the *format
+blob* is gone — **data blobs may still remain** and be recoverable, so verify
+the backend is genuinely empty (and that no other Repository points at the same
+backend) before you act.
+
+///
+
+/// tip | Tuning
+
+- `interval` — how often to re-connect (Go-style duration; min `30s`, default
+  `30m`). Each probe runs a short connect, so leave it long for metered stores.
+- `failureThreshold` — consecutive failing probes required before the alert
+  fires (default `3`). Debounces a single transient blip (an S3
+  list-after-delete race, a NAS reboot) from paging on-call. Any success resets
+  the counter and clears the condition.
+
+///
 
 ## Backup preflight (opt-in)
 
@@ -172,23 +181,29 @@ Each check is a CEL **bool** expression over two variables:
 | `maintenance.hasRun` | bool | the repo's `Maintenance` has a recorded successful run (scheduled **or** manual run-now) |
 | `maintenance.lastSuccessAgeSeconds` | int | seconds since the most recent successful maintenance of any mode |
 
-!!! warning "Unknown values — always pair with the `*Known`/`hasRun` companion bool"
-    An unobserved age/count/size is `i64::MAX`. For a **freshness** check
-    (`maintenance.lastSuccessAgeSeconds < 604800`) that fails *closed* — the unknown value
-    is "infinitely old", so the check blocks, which is what you want. But for a
-    **count/size** check the same sentinel fails *open*: `repository.snapshotCount > 0`
-    is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always
-    guard with the boolean companion so the unknown case fails closed:
+/// warning | Unknown values — always pair with the `*Known`/`hasRun` companion bool
 
-    - `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`
-    - `repository.snapshotCountKnown && repository.snapshotCount > 0`
-    - `repository.sizeBytesKnown && repository.sizeBytes < 1000000000000`
+An unobserved age/count/size is `i64::MAX`. For a **freshness** check
+(`maintenance.lastSuccessAgeSeconds < 604800`) that fails *closed* — the unknown value
+is "infinitely old", so the check blocks, which is what you want. But for a
+**count/size** check the same sentinel fails *open*: `repository.snapshotCount > 0`
+is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always
+guard with the boolean companion so the unknown case fails closed:
 
-!!! tip "Validation & the AND rule"
-    Each `expr` is compiled and trial-evaluated **at admission** (`kubectl apply`), so a
-    typo or non-bool expression is rejected up front, not at the first backup. Check
-    `name`s must be unique. All checks must pass; the first failing one names itself in
-    the Snapshot's `Ready` condition message (`kubectl describe snapshot`).
+- `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`
+- `repository.snapshotCountKnown && repository.snapshotCount > 0`
+- `repository.sizeBytesKnown && repository.sizeBytes < 1000000000000`
+
+///
+
+/// tip | Validation & the AND rule
+
+Each `expr` is compiled and trial-evaluated **at admission** (`kubectl apply`), so a
+typo or non-bool expression is rejected up front, not at the first backup. Check
+`name`s must be unique. All checks must pass; the first failing one names itself in
+the Snapshot's `Ready` condition message (`kubectl describe snapshot`).
+
+///
 
 ### Bounding failed Snapshots
 

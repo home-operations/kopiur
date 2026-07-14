@@ -8,12 +8,15 @@ per-namespace identity expressions (`identityDefaults`). For the terse
 type/default table see the [field reference](../../field-reference.md); for
 how-to guidance see [Repositories](../../repositories.md).
 
-!!! important "Every Secret reference needs an explicit namespace"
-    A `ClusterRepository` is cluster-scoped, so it has no namespace of its own to
-    resolve references against. Every Secret/config reference — in `backend`,
-    `encryption`, `server`, anywhere — **must carry an explicit `namespace`**. The
-    type system cannot express this, so it is webhook-enforced: a reference without
-    a namespace is rejected on apply.
+/// warning | Every Secret reference needs an explicit namespace
+
+A `ClusterRepository` is cluster-scoped, so it has no namespace of its own to
+resolve references against. Every Secret/config reference — in `backend`,
+`encryption`, `server`, anywhere — **must carry an explicit `namespace`**. The
+type system cannot express this, so it is webhook-enforced: a reference without
+a namespace is rejected on apply.
+
+///
 
 ## `spec`
 
