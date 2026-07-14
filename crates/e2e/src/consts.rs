@@ -252,6 +252,16 @@ pub const BUCKETS: &[&str] = &[
     // MinIO user, so a passing replication proves the destination creds are used.
     S3_REPL_SRC_BUCKET,
     S3_REPL_DST_BUCKET,
+    // Multi-cluster shared-repository scenarios (M7a, crates/e2e/tests/multi_cluster.rs):
+    // one isolated bucket per scenario so identity/catalog/lease state from one
+    // scenario can never leak into another's counts/assertions.
+    "kopiur-mc-a",
+    "kopiur-mc-b",
+    "kopiur-mc-c",
+    "kopiur-mc-d1",
+    "kopiur-mc-d2",
+    "kopiur-mc-e",
+    "kopiur-mc-f",
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see

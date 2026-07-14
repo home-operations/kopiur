@@ -27,7 +27,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 use k8s_openapi::api::core::v1::Secret;
 
 use kopiur_api::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION;
-use kopiur_api::{Repository, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Repository, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
 
 /// Names the chart renders for release "kopiur" (the e2e release).
@@ -299,6 +299,144 @@ async fn identity_shape_and_fork_guard_are_enforced_at_admission() {
         .expect("an acknowledged re-identification must be ADMITTED");
 
     let _ = policies.delete(name, &DeleteParams::default()).await;
+}
+
+/// A cluster-scoped, filesystem-backed `ClusterRepository` (admission validates
+/// spec shape only — the backend need not actually be reachable for these
+/// admission-only assertions, mirroring `valid_repository`/`self_managed_webhook_tls_
+/// bootstraps_and_gates_admission`'s own posture above).
+fn cluster_repository_json(name: &str) -> ClusterRepository {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "ClusterRepository",
+        "metadata": { "name": name },
+        "spec": {
+            "backend": { "filesystem": { "path": "/repo", "volume": { "pvc": { "name": "kopiur-e2e-repo" } } } },
+            "encryption": {
+                "passwordSecretRef": { "name": "kopia-creds", "namespace": E2E_NAMESPACE, "key": "KOPIA_PASSWORD" }
+            },
+            "create": { "enabled": false },
+            "allowedNamespaces": { "all": true }
+        }
+    }))
+    .expect("ClusterRepository JSON deserializes")
+}
+
+/// A `SnapshotPolicy` referencing `crepo` by `ClusterRepository`, suspended so
+/// the reconciler doesn't churn it while we drive admission directly (mirrors
+/// `identity_backup_config` above).
+fn cluster_repo_backup_config(name: &str, crepo: &str) -> SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "ClusterRepository", "name": crepo },
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "retention": { "keepLatest": 5 },
+            "suspend": true
+        }
+    }))
+    .expect("SnapshotPolicy JSON deserializes")
+}
+
+/// The repository-edit identity guard (M2/M5), exercised for a
+/// `ClusterRepository` at the REAL admission webhook (unit tests already cover
+/// the pure decision — `detect_repository_identity_change` — and the thin IO
+/// caller — `check_repository_identity_change`'s cluster-wide LIST; this
+/// proves the API server actually delivers `oldObject` on UPDATE the same way
+/// `identity_shape_and_fork_guard_are_enforced_at_admission` proves it for the
+/// per-policy fork guard).
+///
+/// A `SnapshotPolicy` with one successful snapshot references the
+/// `ClusterRepository`; adding `identityDefaults.cluster` (unset → `east`) would
+/// silently re-identify it on its very next backup (ADR-0004 §5: the default
+/// hostname becomes `<namespace>.<cluster>` instead of bare `<namespace>`) with
+/// no per-policy edit to acknowledge it — denied unless the repository carries
+/// `kopiur.home-operations.com/allow-identity-change`.
+#[tokio::test]
+#[ignore = "requires a kind cluster with the operator installed (mise //crates/e2e:test)"]
+async fn setting_cluster_on_repo_with_history_requires_acknowledgment() {
+    let Some(world) = World::connect().await else {
+        return; // no cluster: graceful no-op
+    };
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let crepo = "webhook-crepo-history";
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+    crepos
+        .create(&PostParams::default(), &cluster_repository_json(crepo))
+        .await
+        .expect("create ClusterRepository (admission-shape only)");
+
+    let policy = "webhook-crepo-history-policy";
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    policies
+        .create(
+            &PostParams::default(),
+            &cluster_repo_backup_config(policy, crepo),
+        )
+        .await
+        .expect("a valid policy referencing the ClusterRepository is admitted");
+
+    // Simulate history: one successful snapshot (no identity override — the
+    // policy consults the repository's defaults, so it IS affected by an edit).
+    let status = serde_json::json!({
+        "status": { "lastSuccessfulSnapshot": "2026-01-01T00:00:00Z" }
+    });
+    policies
+        .patch_status(policy, &PatchParams::default(), &Patch::Merge(&status))
+        .await
+        .expect("status patch (simulated history) applies");
+    let got = policies.get_status(policy).await.expect("get status");
+    assert!(
+        got.status
+            .as_ref()
+            .and_then(|s| s.last_successful_snapshot.as_ref())
+            .is_some(),
+        "simulated history must be pinned before the UPDATE test"
+    );
+
+    // Adding identityDefaults.cluster (None -> Some) with a consumer that has
+    // history and no acknowledgment -> DENIED, naming the policy.
+    let change = serde_json::json!({ "spec": { "identityDefaults": { "cluster": "east" } } });
+    let err = crepos
+        .patch(crepo, &PatchParams::default(), &Patch::Merge(&change))
+        .await
+        .expect_err(
+            "adding identityDefaults.cluster on a repo with consumer history must be DENIED",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
+        "rejection should come from the admission webhook, got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("{E2E_NAMESPACE}/{policy}")),
+        "the deny message must name the affected policy, got: {msg}"
+    );
+
+    // The SAME change WITH the acknowledgment annotation -> ADMITTED.
+    let acked = serde_json::json!({
+        "metadata": { "annotations": { ALLOW_IDENTITY_CHANGE_ANNOTATION: "intentional" } },
+        "spec": { "identityDefaults": { "cluster": "east" } }
+    });
+    crepos
+        .patch(crepo, &PatchParams::default(), &Patch::Merge(&acked))
+        .await
+        .expect("an acknowledged identityDefaults change must be ADMITTED");
+    // The ack path also attaches an admission WARNING naming the same policy
+    // (`check_repository_identity_change`'s `outcome.consumers`, rendered via
+    // `describe_identity_change_consumers`) — but kube-rs's `Api::patch` only
+    // returns the persisted object, not the HTTP response's `Warning:` headers,
+    // so that half of the behavior has no client-observable surface here; it is
+    // asserted at the unit tier instead (`identity_repo_edit.rs`'s tests and
+    // `handlers.rs`'s warning-attachment call site).
+
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
 }
 
 /// True when every webhook in the ValidatingWebhookConfiguration carries a

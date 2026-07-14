@@ -584,6 +584,11 @@ pub enum SeedStep<'a> {
         /// Data dir under `/data` to snapshot.
         dir: &'a str,
     },
+    /// `kopia maintenance set --owner me` under the identity of the most recent
+    /// create/connect step — claims kopia's maintenance ownership for that
+    /// identity, simulating a peer cluster's (or legacy-format) stamped owner
+    /// (M7a multi-cluster shared-repository scenarios: `tests/multi_cluster.rs`).
+    ClaimMaintenance,
 }
 
 /// A one-shot Pod (`restartPolicy: Never`) that drives RAW kopia against the
@@ -685,6 +690,14 @@ pub fn foreign_kopia_pod(ns: &str, name: &str, steps: &[SeedStep<'_>]) -> Pod {
                 "image": consts::MOVER_IMAGE,
                 "imagePullPolicy": "Never",
                 "command": [consts::KOPIA_BIN, "snapshot", "create", &format!("/data/{dir}")],
+                "env": kopia_env.clone(),
+                "volumeMounts": kopia_mounts.clone(),
+            }),
+            SeedStep::ClaimMaintenance => json!({
+                "name": format!("step-{i}-claim-maint"),
+                "image": consts::MOVER_IMAGE,
+                "imagePullPolicy": "Never",
+                "command": [consts::KOPIA_BIN, "maintenance", "set", "--owner", "me"],
                 "env": kopia_env.clone(),
                 "volumeMounts": kopia_mounts.clone(),
             }),
