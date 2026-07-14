@@ -113,6 +113,8 @@ fn restore_roundtrip() {
             anchor: SnapshotAnchor {
                 source_path: "/pvc/db".into(),
                 start_time: Some("2026-06-19T05:54:19Z".into()),
+                username: None,
+                hostname: None,
             },
             ignore_permission_errors: Some(true),
             write_files_atomically: Some(false),
@@ -936,6 +938,8 @@ fn snapshot_pin_roundtrip_and_wire_shape() {
             anchor: SnapshotAnchor {
                 source_path: "/pvc/db".into(),
                 start_time: Some("2026-06-19T05:54:19Z".into()),
+                username: None,
+                hostname: None,
             },
         }),
         identity: sample_identity(),
@@ -962,6 +966,57 @@ fn snapshot_pin_roundtrip_and_wire_shape() {
     let legacy = r#"{"snapshotId":"k123","pin":false}"#;
     let parsed: SnapshotPinOp = serde_json::from_str(legacy).unwrap();
     assert!(parsed.anchor.is_empty());
+}
+
+// --- M0a: SnapshotAnchor identity fields (cross-identity delete/verify hazard) ---
+
+#[test]
+fn snapshot_anchor_without_identity_fields_still_deserializes() {
+    // Work-spec JSON stamped before this fix carries no username/hostname —
+    // must still decode, with the matchers then falling back to path-only.
+    let legacy = serde_json::json!({
+        "sourcePath": "/pvc/db",
+        "startTime": "2026-06-19T05:54:19Z",
+    });
+    let anchor: SnapshotAnchor = serde_json::from_value(legacy).expect("legacy anchor decodes");
+    assert_eq!(anchor.source_path, "/pvc/db");
+    assert!(anchor.username.is_none());
+    assert!(anchor.hostname.is_none());
+    assert_eq!(anchor.identity_filter(), None);
+    // `is_empty()` is unaffected by the new fields — it still only reflects
+    // whether there's a path/time to anchor on at all.
+    assert!(!anchor.is_empty());
+}
+
+#[test]
+fn snapshot_anchor_identity_fields_roundtrip() {
+    let anchor = SnapshotAnchor {
+        source_path: "/pvc/db".into(),
+        start_time: Some("2026-06-19T05:54:19Z".into()),
+        username: Some("app".into()),
+        hostname: Some("cluster-a".into()),
+    };
+    let v = serde_json::to_value(&anchor).unwrap();
+    assert_eq!(v["sourcePath"], "/pvc/db");
+    assert_eq!(v["username"], "app");
+    assert_eq!(v["hostname"], "cluster-a");
+    let back: SnapshotAnchor = serde_json::from_value(v).unwrap();
+    assert_eq!(back, anchor);
+    assert_eq!(anchor.identity_filter(), Some(("app", "cluster-a")));
+}
+
+#[test]
+fn snapshot_anchor_identity_filter_requires_both_halves() {
+    // A half-populated anchor (shouldn't happen from a real producer, but the
+    // helper must not silently treat one known half as a match) yields no
+    // filter — same as a fully-legacy anchor, so matching stays path-only.
+    let half = SnapshotAnchor {
+        source_path: "/pvc/db".into(),
+        start_time: None,
+        username: Some("app".into()),
+        hostname: None,
+    };
+    assert_eq!(half.identity_filter(), None);
 }
 
 // --- §4 verify op ---

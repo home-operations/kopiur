@@ -586,6 +586,69 @@ fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
     assert!(build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "x").is_err());
 }
 
+// --- matches_snapshot_identity: the resolve_succeeded_snapshot predicate ---
+// (M0a: same path alone must never cross-match a different source's snapshot)
+
+fn list_entry(
+    id: &str,
+    path: &str,
+    user_name: &str,
+    host: &str,
+) -> kopiur_kopia::SnapshotListEntry {
+    let now = chrono::Utc::now();
+    kopiur_kopia::SnapshotListEntry {
+        id: id.to_string(),
+        source: kopiur_kopia::SnapshotSource {
+            host: host.into(),
+            user_name: user_name.into(),
+            path: path.to_string(),
+        },
+        description: String::new(),
+        start_time: now,
+        end_time: now,
+        stats: Default::default(),
+        root_entry: None,
+        retention_reason: vec![],
+    }
+}
+
+fn identity_of(
+    username: &str,
+    hostname: &str,
+    source_path: &str,
+) -> kopiur_mover::workspec::ResolvedIdentity {
+    kopiur_mover::workspec::ResolvedIdentity {
+        username: username.into(),
+        hostname: hostname.into(),
+        source_path: source_path.into(),
+    }
+}
+
+#[test]
+fn matches_snapshot_identity_excludes_same_path_different_identity() {
+    // The exact hazard this predicate exists to close: two sources (e.g.
+    // different namespaces, or different clusters sharing a repository)
+    // wrote to the SAME path. Path alone must not match.
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("theirs", "/pvc/data", "someone-else", "cluster-b");
+    assert!(!matches_snapshot_identity(&entry, &identity));
+}
+
+#[test]
+fn matches_snapshot_identity_accepts_same_path_same_identity() {
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("mine", "/pvc/data", "app", "cluster-a");
+    assert!(matches_snapshot_identity(&entry, &identity));
+}
+
+#[test]
+fn matches_snapshot_identity_excludes_different_path_same_identity() {
+    // Identity alone isn't sufficient either — path still has to match.
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("elsewhere", "/pvc/other", "app", "cluster-a");
+    assert!(!matches_snapshot_identity(&entry, &identity));
+}
+
 // --- plan_deletion: exhaustive over every DeletionPolicy ----------------
 
 #[test]

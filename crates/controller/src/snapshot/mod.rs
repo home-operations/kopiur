@@ -2328,15 +2328,17 @@ async fn resolve_succeeded_snapshot(
                     kopiur_kopia::CacheTuning::default(),
                 )
                 .await?;
-            // Match the snapshot by its source path (the path we snapshotted),
-            // newest first. The pod's recorded user/host differ from our
-            // resolved identity (a documented mover-identity follow-up), so we
-            // key on the source path which IS authoritative.
+            // Match the snapshot by identity, newest first: source path is
+            // necessary but NOT sufficient once two sources share it (the same
+            // PVC subpath repeats across namespaces, and, in a shared
+            // repository, across clusters) — the recorded username/hostname
+            // must match too, or this could resolve to a DIFFERENT source's
+            // snapshot.
             let mut list = client.snapshot_list(None).await?;
             list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
             let matched = list
                 .into_iter()
-                .find(|e| e.source.path == identity.source_path);
+                .find(|e| matches_snapshot_identity(e, &identity));
             Ok(matched.map(|e| {
                 let id = e.id.clone();
                 let body = serde_json::json!({

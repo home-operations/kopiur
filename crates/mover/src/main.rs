@@ -35,7 +35,7 @@ use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
 use kopiur_mover::env::{RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
-use kopiur_mover::resolve::match_current_manifest;
+use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
     StatusReporter, StatusUpdate, lease_blocked_body, maintenance_failed_body,
@@ -766,7 +766,13 @@ async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Optio
         return None;
     }
     let list = client.snapshot_list(None).await.ok()?;
-    match_current_manifest(&list, &anchor.source_path, anchor.start_instant()).map(|e| e.id.clone())
+    match_current_manifest(
+        &list,
+        &anchor.source_path,
+        anchor.start_instant(),
+        anchor.identity_filter(),
+    )
+    .map(|e| e.id.clone())
 }
 
 /// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
@@ -802,7 +808,7 @@ async fn resolve_pinned_info(
         op.anchor.source_path.clone()
     };
     let list = client.snapshot_list(None).await.ok()?;
-    let entry = match_current_manifest(&list, &source_path, start)?;
+    let entry = match_current_manifest(&list, &source_path, start, op.anchor.identity_filter())?;
     Some(SnapshotInfo {
         kopia_snapshot_id: entry.id.clone(),
         identity: ResolvedIdentity {
@@ -1438,18 +1444,28 @@ async fn run_verify_flow(
     Ok(())
 }
 
-/// The newest snapshot for this run's identity, by source path (the kopia catalog
-/// records the path authoritatively; the pod's user/host differ). The full manifest
-/// entry is returned so callers can read both its id (deep-verify restore target) and
-/// its `stats` (quick-verify predicate environment).
+/// The newest snapshot for this run's identity: source path AND
+/// username/hostname must all match, not path alone — the same path repeats
+/// across namespaces (and, in a shared repository, across clusters), so a
+/// path-only pick could quick/deep-verify or restore-heal a DIFFERENT
+/// source's data. Reuses [`kopiur_mover::resolve::matches_source`], the same
+/// identity-aware predicate the delete/pin self-heal matchers use. The full
+/// manifest entry is returned so callers can read both its id (deep-verify
+/// restore target) and its `stats` (quick-verify predicate environment).
 async fn resolve_latest_snapshot(
     client: &KopiaClient,
     spec: &MoverWorkSpec,
 ) -> Result<Option<kopiur_kopia::SnapshotListEntry>, KopiaError> {
     let mut list = client.snapshot_list(None).await?;
     list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
-    let path = &spec.identity.source_path;
-    Ok(list.into_iter().find(|e| e.source.path == *path))
+    let identity = &spec.identity;
+    Ok(list.into_iter().find(|e| {
+        matches_source(
+            e,
+            &identity.source_path,
+            Some((&identity.username, &identity.hostname)),
+        )
+    }))
 }
 
 /// Best-effort recursive file count under `dir` for the deep-verify result

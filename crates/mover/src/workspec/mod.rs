@@ -296,6 +296,14 @@ impl CreateOptionsSpec {
 /// stale id at delete/restore time. All fields are optional so older work specs
 /// (and Snapshots with no recorded identity/timing) still round-trip and fall
 /// back to the previous behavior.
+///
+/// `source_path` alone is NOT globally unique: the same PVC subpath repeats
+/// across namespaces, and — in a shared repository — across clusters, so a
+/// path-only match can select (and, in the delete path, DELETE) a different
+/// identity's snapshot. `username`/`hostname` close that hole: when both are
+/// present the matchers additionally require them to match; when they are
+/// absent (anchors captured before this fix) matching falls back to the
+/// previous path-only behavior exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotAnchor {
@@ -307,6 +315,15 @@ pub struct SnapshotAnchor {
     /// several snapshots share `source_path`. Absent on older work specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
+    /// The recorded kopia `username`, when known — required (with `hostname`)
+    /// to disambiguate a match by identity, not path alone. Absent on anchors
+    /// captured before this fix; matchers then fall back to path-only
+    /// behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The recorded kopia `hostname`, when known. See `username`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 impl SnapshotAnchor {
@@ -322,6 +339,13 @@ impl SnapshotAnchor {
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&chrono::Utc))
+    }
+
+    /// The `(username, hostname)` identity filter for
+    /// [`crate::resolve::match_current_manifest`], or `None` when either half
+    /// is missing (older anchors) — in which case matching stays path-only.
+    pub fn identity_filter(&self) -> Option<(&str, &str)> {
+        self.username.as_deref().zip(self.hostname.as_deref())
     }
 }
 
