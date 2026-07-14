@@ -81,6 +81,7 @@ pub struct Metrics {
     repo_size_bytes: Gauge<i64>,
     repo_snapshot_count: Gauge<i64>,
     repo_discovered_backups: Gauge<i64>,
+    repo_foreign_snapshots: Gauge<i64>,
     repo_maintenance_configured: Gauge<i64>,
 
     // Restore + maintenance.
@@ -249,6 +250,13 @@ impl Metrics {
             .i64_gauge("kopiur_repo_discovered_snapshots")
             .with_description("Number of backups discovered in the repository catalog.")
             .build();
+        let repo_foreign_snapshots = m
+            .i64_gauge("kopiur_repo_foreign_snapshots")
+            .with_description(
+                "Snapshots in the repository catalog classified as another cluster's \
+                 (multi-cluster shared repository; identityDefaults.cluster).",
+            )
+            .build();
         let repo_maintenance_configured = m
             .i64_gauge("kopiur_repository_maintenance_configured")
             .with_description(
@@ -288,6 +296,7 @@ impl Metrics {
             repo_size_bytes,
             repo_snapshot_count,
             repo_discovered_backups,
+            repo_foreign_snapshots,
             repo_maintenance_configured,
             restore_duration_seconds,
             maintenance_reclaimed_bytes,
@@ -707,13 +716,15 @@ impl Metrics {
         self.repo_size_bytes.record(bytes, &ns_name(ns, name));
     }
 
-    /// Set the repository snapshot-count and discovered-backup gauges.
+    /// Set the repository snapshot-count, discovered-backup, and foreign-snapshot
+    /// gauges (`foreign`: multi-cluster shared repo, `status.catalog.foreignSnapshotCount`).
     pub fn set_repo_catalog(
         &self,
         ns: &str,
         name: &str,
         snapshot_count: Option<i64>,
         discovered: Option<i64>,
+        foreign: Option<i64>,
     ) {
         let labels = ns_name(ns, name);
         if let Some(v) = snapshot_count {
@@ -721,6 +732,9 @@ impl Metrics {
         }
         if let Some(v) = discovered {
             self.repo_discovered_backups.record(v, &labels);
+        }
+        if let Some(v) = foreign {
+            self.repo_foreign_snapshots.record(v, &labels);
         }
     }
 
@@ -1077,6 +1091,50 @@ mod tests {
         );
         assert!(
             text.contains("kopiur_repository_maintenance_configured"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn repo_catalog_sets_snapshot_discovered_and_foreign_gauges() {
+        let m = Metrics::new();
+        m.set_repo_catalog("apps", "nas", Some(42), Some(7), Some(3));
+        let text = String::from_utf8(m.gather()).unwrap();
+        let find = |metric: &str| -> String {
+            text.lines()
+                .find(|l| l.starts_with(&format!("{metric}{{")) && l.contains("name=\"nas\""))
+                .unwrap_or_else(|| panic!("missing {metric}: {text}"))
+                .to_string()
+        };
+        assert!(
+            find("kopiur_repo_snapshot_count")
+                .trim_end()
+                .ends_with(" 42")
+        );
+        assert!(
+            find("kopiur_repo_discovered_snapshots")
+                .trim_end()
+                .ends_with(" 7")
+        );
+        assert!(
+            find("kopiur_repo_foreign_snapshots")
+                .trim_end()
+                .ends_with(" 3")
+        );
+    }
+
+    #[test]
+    fn repo_catalog_omits_the_foreign_gauge_series_when_unset() {
+        // A `None` foreign count (e.g. a repository predating this metric, or one
+        // with no cluster identity) must not fabricate a 0-valued series.
+        let m = Metrics::new();
+        m.set_repo_catalog("apps", "nas", Some(1), Some(0), None);
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("kopiur_repo_foreign_snapshots{")
+                    && l.contains("name=\"nas\"")),
             "{text}"
         );
     }

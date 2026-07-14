@@ -93,9 +93,13 @@ async fn record_repository_status_metrics(repo: &Repository, ctx: &Context, ok: 
             .catalog
             .as_ref()
             .and_then(|c| c.discovered_backup_count);
-        if snapshots.is_some() || discovered.is_some() {
+        let foreign = status
+            .catalog
+            .as_ref()
+            .and_then(|c| c.foreign_snapshot_count);
+        if snapshots.is_some() || discovered.is_some() || foreign.is_some() {
             ctx.metrics
-                .set_repo_catalog(&ns, &name, snapshots, discovered);
+                .set_repo_catalog(&ns, &name, snapshots, discovered, foreign);
         }
     }
 }
@@ -424,7 +428,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 let listing = client.snapshot_list(None).await?;
                 let total = listing.len() as i64;
                 run_catalog_scan(
-                    ctx, repo, &namespace, &name, &repo_uid, &listing, total, false,
+                    ctx, repo, &namespace, &name, &repo_uid, &listing, total, false, 0,
                 )
                 .await?;
             }
@@ -913,6 +917,9 @@ fn bootstrap_work_spec(
                     name,
                 ),
             )),
+            // M5: RepositorySpec has no `identityDefaults` field yet, so a namespaced
+            // Repository has no cluster identity to prefilter foreign entries against.
+            catalog_foreign_prefilter_cluster: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1132,6 +1139,7 @@ async fn finalize_bootstrap(
             &result.snapshots,
             result.snapshot_count,
             result.snapshots_truncated,
+            result.foreign_suffix_dropped,
         )
         .await?;
     }
@@ -1277,6 +1285,10 @@ fn bootstrap_condition(
 /// everything else. `total_snapshot_count` is the authoritative repository-wide
 /// count (may exceed `listing.len()` when the Job capped the returned entries —
 /// `listing_truncated`, see `BootstrapResult::snapshots_truncated`).
+/// `foreign_prefilter_dropped` is the count the mover's foreign-suffix prefilter
+/// already dropped before this scan ever saw `listing` (always `0` here today: a
+/// namespaced `Repository` has no `identityDefaults.cluster` yet — M5 — so the
+/// prefilter can never be armed for it; threaded through for that future milestone).
 #[allow(clippy::too_many_arguments)]
 async fn run_catalog_scan(
     ctx: &Context,
@@ -1287,6 +1299,7 @@ async fn run_catalog_scan(
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
     listing_truncated: bool,
+    foreign_prefilter_dropped: i64,
 ) -> Result<()> {
     let owner_ref = io::owner_ref_for(repo, "Repository")?;
     let outcome = catalog::scan(
@@ -1298,11 +1311,16 @@ async fn run_catalog_scan(
         owner_ref,
         repo_uid,
         catalog::Placement::Namespace(namespace),
+        // M5: RepositorySpec has no `identityDefaults` field yet, so a namespaced
+        // Repository has no cluster identity to classify hostnames against —
+        // `classify_hostname` is total-Bare, matching the pre-M4 behavior exactly.
+        None,
         repo.spec.catalog.as_ref(),
         listing,
         listing_truncated,
     )
     .await?;
+    let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     // Logical bytes under management is recorded directly from kopia's data, both as
     // the metric gauge and as `storageStats.totalSizeBytes` (the integer form of the
@@ -1319,6 +1337,7 @@ async fn run_catalog_scan(
             "catalog": {
                 "discoveredBackupCount": outcome.discovered,
                 "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
+                "foreignSnapshotCount": foreign_total,
             },
             "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),

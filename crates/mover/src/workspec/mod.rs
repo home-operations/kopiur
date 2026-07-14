@@ -568,6 +568,18 @@ pub struct BootstrapRepositoryOp {
     /// hash,ecc}` (ADR-0005 §13(a)); they're immutable post-create (§7).
     #[serde(default, skip_serializing_if = "CreateOptionsSpec::is_empty")]
     pub create_options: CreateOptionsSpec,
+    /// This cluster's `identityDefaults.cluster` (multi-cluster shared repo),
+    /// carried ONLY when the controller determined cluster identity is on AND the
+    /// effective `catalog.foreignSnapshots` policy is `Ignore` — never under
+    /// `Fallback` (those entries must still come back so the controller can
+    /// materialize them into `catalog.fallbackNamespace`). When set, the mover
+    /// drops listing entries whose hostname classifies
+    /// [`kopiur_api::HostClass::ForeignCluster`] against it BEFORE
+    /// [`crate::bootstrap::MAX_RETURNED_SNAPSHOTS`] is applied (see
+    /// [`crate::bootstrap::apply_foreign_prefilter`]); absent on old work specs
+    /// (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_foreign_prefilter_cluster: Option<String>,
 }
 
 impl BootstrapRepositoryOp {

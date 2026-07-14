@@ -286,6 +286,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             scan_catalog: true,
             create_options: Default::default(),
             maintenance_owner: Some("kopiur@kopiur-ns-repo".into()),
+            catalog_foreign_prefilter_cluster: Some("east".into()),
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -312,6 +313,10 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
     // Externally tagged: { "bootstrapRepository": { "autoCreate": true, ... } }.
     assert_eq!(v["operation"]["bootstrapRepository"]["autoCreate"], true);
     assert_eq!(v["operation"]["bootstrapRepository"]["scanCatalog"], true);
+    assert_eq!(
+        v["operation"]["bootstrapRepository"]["catalogForeignPrefilterCluster"],
+        "east"
+    );
     // S3 disable-tls flows on the wire (camelCase, omitted when false).
     assert_eq!(v["repository"]["s3"]["disableTls"], true);
     assert!(
@@ -319,6 +324,18 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             .get("disableTlsVerification")
             .is_none()
     );
+}
+
+#[test]
+fn bootstrap_repository_old_wire_json_without_the_prefilter_field_still_decodes() {
+    // Pre-M4 work-spec ConfigMaps never carried this key at all — a controller
+    // upgraded ahead of a mover (or vice versa) must not wedge.
+    let old = r#"{"autoCreate":true,"scanCatalog":true}"#;
+    let parsed: BootstrapRepositoryOp = serde_json::from_str(old).unwrap();
+    assert!(parsed.auto_create);
+    assert!(parsed.scan_catalog);
+    assert!(parsed.maintenance_owner.is_none());
+    assert!(parsed.catalog_foreign_prefilter_cluster.is_none());
 }
 
 #[test]

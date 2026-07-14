@@ -4,10 +4,14 @@
 //! catalog scan), plus the cluster-scoped placement rule for discovered
 //! `Snapshot` CRs (ADR §2.3): a discovered snapshot is materialized in the
 //! namespace named by its identity hostname **if** that namespace exists and is
-//! in `allowedNamespaces`; otherwise it falls back to `catalog.fallbackNamespace`.
+//! in `allowedNamespaces`; otherwise it falls back to `catalog.fallbackNamespace`
+//! — extended (M4, multi-cluster shared repo) to classify each hostname
+//! `Bare`/`OwnCluster`/`ForeignCluster` first (`identityDefaults.cluster`) and
+//! drop/collect another cluster's snapshots per `catalog.foreignSnapshots`.
 //!
-//! [`placement_namespace`] encodes that rule purely and is unit-tested; the
-//! existence check and `Snapshot` creation are the thin IO parts.
+//! [`crate::catalog::decide_cluster_placement`] encodes that rule purely and is
+//! unit-tested; the existence check and `Snapshot` creation are the thin IO parts
+//! ([`crate::catalog::scan`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,7 +24,7 @@ use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, RepositoryKind};
+use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{ClusterRepository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -44,23 +48,6 @@ use crate::server::{
     server_object_name, server_status_json,
 };
 use crate::snapshot::backend_to_repository_connect;
-
-/// Where to materialize a discovered `Snapshot` under a `ClusterRepository`
-/// (ADR §2.3). `identity_namespace` is the namespace named by the snapshot's
-/// identity hostname; `namespace_allowed` is whether it exists and is in the
-/// tenancy gate. Falls back to `fallback` when not allowed; returns `None` if
-/// neither is available (caller skips materialization with a warning).
-pub fn placement_namespace<'a>(
-    identity_namespace: &'a str,
-    namespace_allowed: bool,
-    fallback: Option<&'a str>,
-) -> Option<&'a str> {
-    if namespace_allowed {
-        Some(identity_namespace)
-    } else {
-        fallback
-    }
-}
 
 /// Resolve where a `ClusterRepository`'s managed (namespaced) `Maintenance` CR
 /// should live (ADR §3.7): `spec.maintenance.namespace` if set, else the
@@ -193,9 +180,13 @@ async fn record_cluster_repository_status_metrics(
             .catalog
             .as_ref()
             .and_then(|c| c.discovered_backup_count);
-        if snapshots.is_some() || discovered.is_some() {
+        let foreign = status
+            .catalog
+            .as_ref()
+            .and_then(|c| c.foreign_snapshot_count);
+        if snapshots.is_some() || discovered.is_some() || foreign.is_some() {
             ctx.metrics
-                .set_repo_catalog("", &name, snapshots, discovered);
+                .set_repo_catalog("", &name, snapshots, discovered, foreign);
         }
     }
 }
@@ -451,8 +442,8 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // filesystem repo re-lists in-process. Each discovered snapshot is
             // placed in the namespace named by its identity hostname when that
             // namespace exists and passes the tenancy gate, else
-            // `catalog.fallbackNamespace`, else it is skipped with a Warning
-            // Event ([`placement_namespace`] + `crate::catalog`).
+            // `catalog.fallbackNamespace`, else it is skipped with a Warning Event
+            // (`crate::catalog::decide_cluster_placement` + `crate::catalog::scan`).
             let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
             if catalog::scan_due(
                 repo.metadata.generation,
@@ -464,7 +455,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             ) {
                 let listing = client.snapshot_list(None).await?;
                 let total = listing.len() as i64;
-                run_cluster_catalog_scan(ctx, repo, &name, &listing, total, false).await?;
+                run_cluster_catalog_scan(ctx, repo, &name, &listing, total, false, 0).await?;
             }
 
             // Ensure the managed Maintenance for this ClusterRepository (ADR §3.7).
@@ -495,11 +486,31 @@ fn cluster_last_refresh_at(repo: &ClusterRepository) -> Option<&str> {
         .and_then(|c| c.last_refresh_at.as_deref())
 }
 
+/// The `DiscoveredSnapshotUnplaced` Warning event body: names the offending
+/// hostnames and both fixes — the pre-M4 fixes (create/allow the namespace, or set
+/// a fallback) AND the shared-repo posture (cluster identity + `Ignore`) so a
+/// repository intentionally shared across clusters points at the fix that's
+/// actually expected there, not just the single-cluster remedies. Pure.
+fn unplaced_warning_message(hosts: &[&str]) -> String {
+    format!(
+        "discovered snapshots were not materialized: identity hostname(s) [{}] name no \
+         existing namespace in spec.allowedNamespaces. Why: a ClusterRepository places each \
+         discovered Snapshot in the namespace its identity hostname names. Fix: create/allow \
+         those namespaces, or set spec.catalog.fallbackNamespace to collect foreign \
+         snapshots in one namespace; if this repository is shared across clusters, set \
+         identityDefaults.cluster and catalog.foreignSnapshots: Ignore so another cluster's \
+         snapshots are counted (status.catalog.foreignSnapshotCount) rather than surfaced \
+         as unplaced",
+        hosts.join(", ")
+    )
+}
+
 /// Run the shared catalog scan ([`crate::catalog::scan`]) for a
 /// `ClusterRepository` and reflect the outcome: each discovered snapshot lands in
 /// the namespace named by its identity hostname when allowed, else
 /// `catalog.fallbackNamespace`; snapshots with neither are surfaced via a Warning
 /// Event naming the fix (never silently dropped).
+#[allow(clippy::too_many_arguments)]
 async fn run_cluster_catalog_scan(
     ctx: &Context,
     repo: &ClusterRepository,
@@ -507,11 +518,21 @@ async fn run_cluster_catalog_scan(
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
     listing_truncated: bool,
+    // Entries the mover's foreign-suffix prefilter already dropped before this
+    // scan ever saw its `listing` (0 for the in-process bare-filesystem path,
+    // which never prefilters). Added to `outcome.foreign` — never double-counted,
+    // since a mover-dropped entry never reaches this scan's listing at all.
+    foreign_prefilter_dropped: i64,
 ) -> Result<()> {
     let repo_uid = repo
         .uid()
         .ok_or_else(|| Error::Invariant("ClusterRepository has no uid".into()))?;
     let owner_ref = io::owner_ref_for(repo, "ClusterRepository")?;
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
     let fallback = repo
         .spec
         .catalog
@@ -526,22 +547,17 @@ async fn run_cluster_catalog_scan(
             allowed: &repo.spec.allowed_namespaces,
             fallback,
         },
+        cluster,
         repo.spec.catalog.as_ref(),
         listing,
         listing_truncated,
     )
     .await?;
+    let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     if !outcome.unplaced_hosts.is_empty() {
         let hosts: Vec<&str> = outcome.unplaced_hosts.iter().map(String::as_str).collect();
-        let msg = format!(
-            "discovered snapshots were not materialized: identity hostname(s) [{}] name no \
-             existing namespace in spec.allowedNamespaces. Why: a ClusterRepository places each \
-             discovered Snapshot in the namespace its identity hostname names. Fix: create/allow \
-             those namespaces, or set spec.catalog.fallbackNamespace to collect foreign \
-             snapshots in one namespace",
-            hosts.join(", ")
-        );
+        let msg = unplaced_warning_message(&hosts);
         tracing::warn!(repo = %name, hosts = ?hosts, "discovered snapshots skipped: no placement namespace");
         io::publish_warning_event(ctx, repo, "DiscoveredSnapshotUnplaced", "CatalogScan", &msg)
             .await;
@@ -560,6 +576,7 @@ async fn run_cluster_catalog_scan(
             "catalog": {
                 "discoveredBackupCount": outcome.discovered,
                 "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
+                "foreignSnapshotCount": foreign_total,
             },
             "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),
@@ -675,10 +692,11 @@ async fn handle_cluster_deletion(
 /// Drive the mover-Job bootstrap for a `ClusterRepository` whose backend the
 /// controller cannot reach in-process — object stores AND volume-backed (PVC / inline
 /// NFS) filesystem repos (the Job mounts the repo volume). Mirrors the namespaced
-/// [`crate::repository::reconcile`] path, minus discovered-Snapshot materialization:
-/// cross-namespace catalog placement for a ClusterRepository is a separate concern
-/// (see [`placement_namespace`]), so `scanCatalog` is off and the bootstrap reports
-/// identity + snapshot count only.
+/// [`crate::repository::reconcile`] path; the Job also returns the snapshot listing
+/// (`scanCatalog: true`) so [`finalize_cluster_bootstrap`] can run the shared,
+/// identity-aware catalog scan (`crate::catalog`) — the cross-namespace/foreign
+/// placement itself is decided there
+/// ([`crate::catalog::decide_cluster_placement`]), not in this function.
 async fn bootstrap_cluster_via_mover(
     ctx: &Context,
     repo: &ClusterRepository,
@@ -841,6 +859,12 @@ async fn bootstrap_cluster_via_mover(
         kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
         repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
     );
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
+    let foreign = CatalogBounds::effective_foreign_snapshots(repo.spec.catalog.as_ref());
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -848,6 +872,8 @@ async fn bootstrap_cluster_via_mover(
         create_enabled,
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
+        cluster,
+        foreign,
     );
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
@@ -984,6 +1010,14 @@ async fn bootstrap_cluster_via_mover(
 }
 
 /// Build the bootstrap work spec for a `ClusterRepository` object store.
+///
+/// `cluster`/`foreign` (`identityDefaults.cluster` / the effective
+/// `catalog.foreignSnapshots`) drive `catalog_foreign_prefilter_cluster`: the mover
+/// pre-filters `ForeignCluster`-classified entries BEFORE its own materialization
+/// cap only when cluster identity is actually on AND the effective policy is
+/// `Ignore` — under `Fallback` those entries must still come back so the controller
+/// can materialize them into `catalog.fallbackNamespace`.
+#[allow(clippy::too_many_arguments)]
 fn cluster_bootstrap_work_spec(
     backend: &Backend,
     name: &str,
@@ -991,7 +1025,12 @@ fn cluster_bootstrap_work_spec(
     auto_create: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    cluster: Option<&str>,
+    foreign: ForeignSnapshots,
 ) -> MoverWorkSpec {
+    let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
+    let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
+        .then(|| cluster.unwrap_or_default().to_string());
     MoverWorkSpec {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
@@ -1009,6 +1048,7 @@ fn cluster_bootstrap_work_spec(
                     name,
                 ),
             )),
+            catalog_foreign_prefilter_cluster: prefilter_cluster,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1211,6 +1251,7 @@ async fn finalize_cluster_bootstrap(
             &result.snapshots,
             result.snapshot_count,
             result.snapshots_truncated,
+            result.foreign_suffix_dropped,
         )
         .await?;
     }
@@ -1378,26 +1419,11 @@ pub fn error_policy(obj: Arc<ClusterRepository>, err: &Error, ctx: Arc<Context>)
 mod tests {
     use super::*;
 
-    #[test]
-    fn allowed_namespace_is_used_directly() {
-        assert_eq!(
-            placement_namespace("billing", true, Some("kopia-system")),
-            Some("billing")
-        );
-    }
-
-    #[test]
-    fn disallowed_namespace_falls_back() {
-        assert_eq!(
-            placement_namespace("evil", false, Some("kopia-system")),
-            Some("kopia-system")
-        );
-    }
-
-    #[test]
-    fn disallowed_and_no_fallback_yields_none() {
-        assert_eq!(placement_namespace("evil", false, None), None);
-    }
+    // Placement decision tests (`allowed_namespace_is_used_directly`,
+    // `disallowed_namespace_falls_back`, `disallowed_and_no_fallback_yields_none`)
+    // migrated to `catalog.rs`'s decision-table tests over
+    // `catalog::decide_cluster_placement` (M4: the pre-M4 `placement_namespace` this
+    // module defined is now folded into that shared, identity-aware decision fn).
 
     // #232: a ClusterRepository is cluster-scoped, so "absent = the referrer's namespace"
     // has nothing to resolve to. It used to hard-error `passwordSecretRef.namespace is
@@ -1431,5 +1457,17 @@ mod tests {
         );
         assert!(msg.contains("KOPIUR_NAMESPACE"), "{msg}");
         assert!(matches!(err, Error::Validation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn unplaced_warning_names_the_shared_repo_fix_alongside_the_original_ones() {
+        let msg = unplaced_warning_message(&["ghost", "old-host"]);
+        assert!(msg.contains("ghost"), "{msg}");
+        assert!(msg.contains("old-host"), "{msg}");
+        // Original (pre-M4) fixes are preserved.
+        assert!(msg.contains("spec.catalog.fallbackNamespace"), "{msg}");
+        // M4: the shared-repository posture is now named too.
+        assert!(msg.contains("identityDefaults.cluster"), "{msg}");
+        assert!(msg.contains("catalog.foreignSnapshots: Ignore"), "{msg}");
     }
 }

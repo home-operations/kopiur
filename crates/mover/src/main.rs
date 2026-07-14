@@ -1047,28 +1047,33 @@ async fn run_bootstrap(
         Err(e) => return BootstrapResult::failed(&e),
     };
 
-    // Always list to report an authoritative snapshot count; return the entries
-    // for materialization only when scanning is requested.
+    // Always list to report an authoritative snapshot count (unaffected by either
+    // the foreign-suffix prefilter or the cap below); return the entries for
+    // materialization only when scanning is requested.
     let listing = match client.snapshot_list(None).await {
         Ok(l) => l,
         Err(e) => return BootstrapResult::failed(&e),
     };
     let snapshot_count = listing.len() as i64;
-    let (snapshots, truncated) = if op.scan_catalog {
-        let truncated = listing.len() > MAX_RETURNED_SNAPSHOTS;
-        let mut s = listing;
-        if truncated {
-            s.truncate(MAX_RETURNED_SNAPSHOTS);
-        }
-        (s, truncated)
+    let (snapshots, truncated, foreign_suffix_dropped) = if op.scan_catalog {
+        kopiur_mover::bootstrap::prepare_catalog_entries(
+            listing,
+            op.catalog_foreign_prefilter_cluster.as_deref(),
+        )
     } else {
-        (Vec::new(), false)
+        (Vec::new(), false, 0)
     };
     if truncated {
         warn!(
             snapshot_count,
             returned = MAX_RETURNED_SNAPSHOTS,
             "more snapshots than the materialization cap; only the newest were returned"
+        );
+    }
+    if foreign_suffix_dropped > 0 {
+        info!(
+            dropped = foreign_suffix_dropped,
+            "dropped foreign-cluster snapshot entries before the materialization cap"
         );
     }
 
@@ -1093,6 +1098,7 @@ async fn run_bootstrap(
         snapshot_count,
         snapshots,
         truncated,
+        foreign_suffix_dropped,
         index_blob_count,
     )
 }
