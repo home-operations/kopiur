@@ -33,7 +33,7 @@ kubectl = "1.36.2"
 shellcheck = "0.11.0"
 kind = "0.32.0"
 kopia = "v0.23.1"
-"aqua:EmbarkStudios/cargo-deny" = "0.19.9"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "aqua:taiki-e/cargo-llvm-cov" = "0.8.7"
 # Docs site toolchain. The docs are an MkDocs Material site (see `mise run docs`);
 # the MkDocs + Material + pymdown-extensions versions are pinned in pyproject.toml
