@@ -2194,6 +2194,271 @@ catalog:
     );
 }
 
+// --- catalog.foreignSnapshots × identityDefaults.cluster ---
+
+#[test]
+fn foreign_snapshots_fallback_requires_fallback_namespace() {
+    // (b) Fallback with no fallbackNamespace ⇒ rejected.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Fallback" }));
+    let errs = validate_catalog_bounds(&c, true);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("catalog.foreignSnapshots")
+                && e.to_string().contains("fallbackNamespace")),
+        "{errs:?}"
+    );
+
+    // Fallback + fallbackNamespace set ⇒ accepted by validate_catalog_bounds
+    // (the cluster-identity coupling is a separate rule, tested below).
+    let c = catalog(serde_json::json!({
+        "foreignSnapshots": "Fallback",
+        "fallbackNamespace": "backups",
+    }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+
+    // Ignore never needs a fallbackNamespace.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Ignore" }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_fallback_is_cluster_repository_only() {
+    // (c) Fallback on a namespaced Repository (cluster_scoped: false) is
+    // rejected, mirroring the fallbackNamespace-is-ClusterRepository-only
+    // message (its-own-namespace wording).
+    let c = catalog(serde_json::json!({
+        "foreignSnapshots": "Fallback",
+        "fallbackNamespace": "backups",
+    }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+
+    let errs = validate_catalog_bounds(&c, false);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .find(|m| m.contains("catalog.foreignSnapshots"))
+        .unwrap_or_else(|| panic!("expected a foreignSnapshots error: {errs:?}"));
+    assert!(msg.contains("its own namespace"), "{msg}");
+    assert!(msg.contains("Ignore or omit"), "{msg}");
+
+    // Ignore is fine on a namespaced Repository.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Ignore" }));
+    assert!(validate_catalog_bounds(&c, false).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_unknown_variant_is_rejected() {
+    let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
+    assert!(
+        serde_json::from_value::<crate::common::CatalogBounds>(value).is_err(),
+        "an unknown foreignSnapshots variant must be rejected"
+    );
+}
+
+#[test]
+fn foreign_snapshots_requires_a_cluster_identity_on_both_kinds() {
+    // (a) foreignSnapshots set + no cluster identity ⇒ rejected on BOTH kinds,
+    // with a kind-neutral message (never claims a field doesn't exist).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        None,
+    );
+    assert_eq!(errs.len(), 1);
+    assert!(matches!(
+        errs[0],
+        ValidationError::ForeignSnapshotsRequiresCluster
+    ));
+    let msg = errs[0].to_string();
+    assert!(
+        msg.contains("requires a cluster identity (`identityDefaults.cluster`)"),
+        "{msg}"
+    );
+
+    // Empty-string cluster behaves like unset (matches classify_hostname's own rule).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        Some(""),
+    );
+    assert_eq!(errs.len(), 1);
+
+    // A real cluster identity clears rule (a) (and there's no fallbackNamespace, so (d) is inert).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        Some("east"),
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+
+    // No catalog at all ⇒ nothing to validate.
+    assert!(validate_foreign_snapshots_cluster_coupling(None, None).is_empty());
+    assert!(validate_foreign_snapshots_cluster_coupling(None, Some("east")).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_choice_required_when_cluster_and_fallback_namespace_both_set() {
+    // (d) cluster + fallbackNamespace set but foreignSnapshots ABSENT ⇒ rejected.
+    let c = catalog(serde_json::json!({ "fallbackNamespace": "backups" }));
+    let errs = validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east"));
+    assert_eq!(errs.len(), 1);
+    assert!(matches!(
+        errs[0],
+        ValidationError::ForeignSnapshotsChoiceRequired
+    ));
+
+    // Explicit Ignore accepted.
+    let c = catalog(serde_json::json!({
+        "fallbackNamespace": "backups",
+        "foreignSnapshots": "Ignore",
+    }));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+
+    // Explicit Fallback accepted.
+    let c = catalog(serde_json::json!({
+        "fallbackNamespace": "backups",
+        "foreignSnapshots": "Fallback",
+    }));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+
+    // No fallbackNamespace ⇒ rule (d) does not apply even with a cluster identity.
+    let c = catalog(serde_json::json!({}));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+}
+
+#[test]
+fn repository_validators_route_foreign_snapshots_cluster_coupling() {
+    // The aggregate validators must actually call
+    // validate_foreign_snapshots_cluster_coupling, or the webhook silently
+    // admits what the docs forbid.
+
+    // A namespaced Repository has no identityDefaults at all — any
+    // foreignSnapshots is rejected via the generic, kind-neutral message.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // A ClusterRepository with no identityDefaults.cluster: same rejection.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // With identityDefaults.cluster set, foreignSnapshots is legal.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // Cluster + fallbackNamespace set but foreignSnapshots absent ⇒ (d) fires
+    // through the aggregate validator too.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+identityDefaults:
+  cluster: east
+catalog:
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsChoiceRequired)),
+        "{errs:?}"
+    );
+
+    // Fallback on a namespaced Repository: rejected both by rule (a) (no
+    // cluster identity at all) AND rule (c) (Fallback is ClusterRepository-only).
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+catalog:
+  foreignSnapshots: Fallback
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("its own namespace")),
+        "{errs:?}"
+    );
+}
+
 // --- scheduleDefaults.timezone (GitHub #174 item 3) ---
 
 #[test]

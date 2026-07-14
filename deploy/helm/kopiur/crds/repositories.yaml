@@ -545,6 +545,19 @@ spec:
                     description: Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
                     nullable: true
                     type: string
+                  foreignSnapshots:
+                    description: |-
+                      How catalog discovery treats snapshots written by ANOTHER cluster — an
+                      identity hostname carrying a different `.<cluster>` suffix, or a bare
+                      hostname naming no allowed namespace here (see `classify_hostname`).
+                      Meaningful only when `identityDefaults.cluster` is set: without a cluster
+                      identity there is no notion of "foreign" and the legacy
+                      hostname-names-a-namespace placement applies (validators enforce this).
+                    enum:
+                    - Ignore
+                    - Fallback
+                    nullable: true
+                    type: string
                   periodicRefresh:
                     description: |-
                       Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
@@ -2464,6 +2477,15 @@ spec:
                 properties:
                   discoveredBackupCount:
                     description: How many `Snapshot` CRs were materialized from the catalog scan.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  foreignSnapshotCount:
+                    description: |-
+                      Snapshots in the last complete listing classified as another cluster's
+                      (see `catalog.foreignSnapshots`); never materialized under `Ignore`.
+                      As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it
+                      current.
                     format: int64
                     nullable: true
                     type: integer

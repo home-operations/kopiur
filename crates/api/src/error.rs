@@ -462,6 +462,37 @@ pub enum ValidationError {
         /// The `spec.maintenance.namespace` value set on the namespaced `Repository`.
         namespace: String,
     },
+
+    /// `catalog.foreignSnapshots` is set, but there is no cluster identity to
+    /// classify a snapshot's origin against — `Ignore`/`Fallback` decide what
+    /// to do with a snapshot [`crate::identity::classify_hostname`] classifies
+    /// as another cluster's, and that classification is undecidable without
+    /// `identityDefaults.cluster`. Fires on a `ClusterRepository` whose
+    /// `identityDefaults.cluster` is unset, and — kind-neutral wording — on a
+    /// namespaced `Repository`, which has no `identityDefaults` field at all
+    /// today (M5): the message never claims the field doesn't exist, since a
+    /// later milestone may add it.
+    #[error(
+        "catalog.foreignSnapshots is set, but classifying a snapshot as \"foreign\" requires a \
+         cluster identity (`identityDefaults.cluster`); without one there is nothing to compare \
+         it against. Fix: set identityDefaults.cluster, or remove catalog.foreignSnapshots"
+    )]
+    ForeignSnapshotsRequiresCluster,
+
+    /// A `ClusterRepository` sets both `identityDefaults.cluster` and
+    /// `catalog.fallbackNamespace` but leaves `catalog.foreignSnapshots`
+    /// unset. Both being set at once is a strong signal the fallback
+    /// collector is actually relied upon, so adopting a cluster identity must
+    /// never silently switch it off by defaulting to `Ignore` — the choice is
+    /// forced explicit instead.
+    #[error(
+        "catalog.foreignSnapshots must be set explicitly: both identityDefaults.cluster and \
+         catalog.fallbackNamespace are set, so adopting a cluster identity must not silently \
+         change what the fallback collector does. `Ignore` stops materializing foreign \
+         snapshots (existing rows in fallbackNamespace age out under catalog.retain); \
+         `Fallback` keeps collecting them there. Set one explicitly"
+    )]
+    ForeignSnapshotsChoiceRequired,
 }
 
 /// Render the consumer list for [`ValidationError::RepositoryIdentityWouldFork`]:

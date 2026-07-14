@@ -392,4 +392,84 @@ identityDefaults:
             "absent identityDefaults.cluster must be elided"
         );
     }
+
+    #[test]
+    fn catalog_foreign_snapshots_round_trips_on_cluster_repository() {
+        use crate::common::ForeignSnapshots;
+
+        let yaml = r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }
+allowedNamespaces: { all: true }
+identityDefaults:
+  cluster: east
+catalog:
+  fallbackNamespace: kopia-system
+  foreignSnapshots: Fallback
+"#;
+        let spec: ClusterRepositorySpec = from_yaml(yaml);
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.foreign_snapshots),
+            Some(ForeignSnapshots::Fallback)
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["catalog"]["foreignSnapshots"], "Fallback");
+        let reparsed: ClusterRepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        let yaml_ignore = r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }
+allowedNamespaces: { all: true }
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Ignore
+"#;
+        let spec: ClusterRepositorySpec = from_yaml(yaml_ignore);
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.foreign_snapshots),
+            Some(ForeignSnapshots::Ignore)
+        );
+
+        // Absent stays None and is elided.
+        let bare: ClusterRepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+             allowedNamespaces: { all: true }\n\
+             catalog: {}\n",
+        );
+        assert!(bare.catalog.as_ref().unwrap().foreign_snapshots.is_none());
+        assert!(
+            serde_json::to_value(&bare).unwrap()["catalog"]
+                .get("foreignSnapshots")
+                .is_none(),
+            "absent catalog.foreignSnapshots must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_foreign_snapshots_unknown_variant_is_rejected() {
+        let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
+        assert!(serde_json::from_value::<crate::common::CatalogBounds>(value).is_err());
+    }
+
+    #[test]
+    fn catalog_foreign_snapshots_schema_carries_no_default() {
+        // Per the conventions doc (§4a): the effective default (`Ignore`) is
+        // context-dependent (coupled to identityDefaults.cluster), so no
+        // schemars `default` is emitted — the field must stay `—` in the
+        // generated field reference, not silently materialize `Ignore` for
+        // every repository regardless of whether it has a cluster identity.
+        let crd = ClusterRepository::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let prop = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["catalog"]["properties"]["foreignSnapshots"];
+        assert!(
+            prop.get("default").is_none(),
+            "catalog.foreignSnapshots must NOT carry a schema default: {prop}"
+        );
+        // Sanity: the property itself is present, with the expected enum values.
+        assert_eq!(prop["enum"].as_array().map(|a| a.len()), Some(2), "{prop}");
+    }
 }

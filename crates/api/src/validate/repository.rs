@@ -370,6 +370,12 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, false));
     }
+    // RepositorySpec has no identityDefaults field (M5), so there is never a
+    // cluster identity here — any foreignSnapshots always rejects via rule (a).
+    errs.extend(validate_foreign_snapshots_cluster_coupling(
+        spec.catalog.as_ref(),
+        None,
+    ));
     if let Some(md) = &spec.mover_defaults
         && let Some(res) = &md.resources
         && let Err(e) = validate_resources(res, "Repository moverDefaults")
@@ -513,6 +519,59 @@ pub fn validate_catalog_bounds(
                      the field (or move the repository to a ClusterRepository)"
                 .to_string(),
         });
+    }
+    // `foreignSnapshots: Fallback` needs somewhere to land, and only a
+    // ClusterRepository can place discovered Snapshots outside their own
+    // namespace — mirrors the fallbackNamespace rule directly above.
+    if matches!(
+        catalog.foreign_snapshots,
+        Some(crate::common::ForeignSnapshots::Fallback)
+    ) {
+        if catalog.fallback_namespace.is_none() {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: "catalog.foreignSnapshots".to_string(),
+                reason: "Fallback requires catalog.fallbackNamespace to be set (there is \
+                         nowhere to materialize a foreign snapshot otherwise); set \
+                         fallbackNamespace, or use Ignore"
+                    .to_string(),
+            });
+        }
+        if !cluster_scoped {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: "catalog.foreignSnapshots".to_string(),
+                reason: "Fallback is only meaningful on a ClusterRepository; a namespaced \
+                         Repository already materializes into its own namespace; use Ignore or \
+                         omit"
+                    .to_string(),
+            });
+        }
+    }
+    errs
+}
+
+/// The `identityDefaults.cluster` × `catalog.foreignSnapshots` cross-field
+/// rules (multi-cluster shared-repo): classifying a snapshot as another
+/// cluster's is undecidable without a cluster identity (a), and adopting one
+/// must never silently switch off an already-configured fallback collector
+/// (d). Shared by both repository kinds — `cluster` is the resolved
+/// `identityDefaults.cluster` value; a namespaced `Repository` always passes
+/// `None` here (it has no `identityDefaults` field at all today, M5), which
+/// makes rule (d) a no-op for that kind (it requires a cluster to fire) while
+/// rule (a) still rejects any `foreignSnapshots` set there.
+pub fn validate_foreign_snapshots_cluster_coupling(
+    catalog: Option<&crate::common::CatalogBounds>,
+    cluster: Option<&str>,
+) -> Vec<ValidationError> {
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    let mut errs = Vec::new();
+    let has_cluster = cluster.is_some_and(|c| !c.is_empty());
+    if catalog.foreign_snapshots.is_some() && !has_cluster {
+        errs.push(ValidationError::ForeignSnapshotsRequiresCluster);
+    }
+    if has_cluster && catalog.fallback_namespace.is_some() && catalog.foreign_snapshots.is_none() {
+        errs.push(ValidationError::ForeignSnapshotsChoiceRequired);
     }
     errs
 }
@@ -702,6 +761,12 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, true));
     }
+    errs.extend(validate_foreign_snapshots_cluster_coupling(
+        spec.catalog.as_ref(),
+        spec.identity_defaults
+            .as_ref()
+            .and_then(|id| id.cluster.as_deref()),
+    ));
     if let Some(md) = &spec.mover_defaults
         && let Some(res) = &md.resources
         && let Err(e) = validate_resources(res, "ClusterRepository moverDefaults")

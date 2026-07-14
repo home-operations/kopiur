@@ -322,6 +322,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
+| `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster — an identity hostname carrying a different `.&lt;cluster&gt;` suffix, or a bare hostname naming no allowed namespace here (see `classify_hostname`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
 | `refreshInterval` | string | `1h` | How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum `30s`, default `1h`). Inert unless `periodicRefresh` is enabled. |
 | `retain` | [object](#repository-spec-catalog-retain) | — | How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint). |
@@ -576,6 +577,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
+| `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
 
 #### `status.conditions[]` { #repository-status-conditions }
@@ -943,6 +945,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
+| `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster — an identity hostname carrying a different `.&lt;cluster&gt;` suffix, or a bare hostname naming no allowed namespace here (see `classify_hostname`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
 | `refreshInterval` | string | `1h` | How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum `30s`, default `1h`). Inert unless `periodicRefresh` is enabled. |
 | `retain` | [object](#clusterrepository-spec-catalog-retain) | — | How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint). |
@@ -1213,6 +1216,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
+| `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
 
 #### `status.conditions[]` { #clusterrepository-status-conditions }

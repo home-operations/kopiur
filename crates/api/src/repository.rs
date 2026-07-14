@@ -378,6 +378,12 @@ pub struct CatalogStatus {
     /// RFC 3339 timestamp of the last catalog refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh_at: Option<String>,
+    /// Snapshots in the last complete listing classified as another cluster's
+    /// (see `catalog.foreignSnapshots`); never materialized under `Ignore`.
+    /// As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it
+    /// current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_snapshot_count: Option<i64>,
 }
 
 #[cfg(test)]
@@ -563,6 +569,29 @@ health:
     }
 
     #[test]
+    fn catalog_status_foreign_snapshot_count_roundtrips() {
+        let status: CatalogStatus = from_yaml(
+            "discoveredBackupCount: 42\nlastRefreshAt: 2026-06-01T00:00:00Z\nforeignSnapshotCount: 7\n",
+        );
+        assert_eq!(status.foreign_snapshot_count, Some(7));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["foreignSnapshotCount"], 7);
+        let back: CatalogStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+
+        // Absent stays None and is elided (no stored-object churn).
+        let bare: CatalogStatus = from_yaml("{}\n");
+        assert!(bare.foreign_snapshot_count.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("foreignSnapshotCount")
+                .is_none(),
+            "absent foreignSnapshotCount must be elided"
+        );
+    }
+
+    #[test]
     fn repository_crd_exposes_index_blobs_print_column() {
         let crd = Repository::crd();
         let json = serde_json::to_value(&crd).unwrap();
@@ -730,6 +759,49 @@ health:
                 .get("scheduleDefaults")
                 .is_none(),
             "absent scheduleDefaults must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_foreign_snapshots_round_trips_on_repository() {
+        use crate::common::ForeignSnapshots;
+
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             catalog:\n  foreignSnapshots: Fallback\n",
+        );
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.foreign_snapshots),
+            Some(ForeignSnapshots::Fallback)
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["catalog"]["foreignSnapshots"], "Fallback");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             catalog:\n  foreignSnapshots: Ignore\n",
+        );
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.foreign_snapshots),
+            Some(ForeignSnapshots::Ignore)
+        );
+
+        // Absent stays None and is elided.
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             catalog: {}\n",
+        );
+        assert!(bare.catalog.as_ref().unwrap().foreign_snapshots.is_none());
+        assert!(
+            serde_json::to_value(&bare).unwrap()["catalog"]
+                .get("foreignSnapshots")
+                .is_none(),
+            "absent catalog.foreignSnapshots must be elided"
         );
     }
 }

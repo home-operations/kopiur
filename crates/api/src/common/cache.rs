@@ -101,6 +101,24 @@ impl ScratchDefaults {
     }
 }
 
+/// How catalog discovery treats snapshots written by ANOTHER cluster — an
+/// identity hostname carrying a different `.<cluster>` suffix, or a bare
+/// hostname naming no allowed namespace here (see `classify_hostname`).
+/// Meaningful only when `identityDefaults.cluster` is set: without a cluster
+/// identity there is no notion of "foreign" and the legacy
+/// hostname-names-a-namespace placement applies (validators enforce this).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum ForeignSnapshots {
+    /// Skip foreign snapshots: no discovered `Snapshot` CR is materialized;
+    /// they are counted in `status.catalog.foreignSnapshotCount` and the
+    /// `kopiur_repo_foreign_snapshots` gauge, never silently invisible.
+    #[default]
+    Ignore,
+    /// Materialize foreign snapshots into `catalog.fallbackNamespace`
+    /// (ClusterRepository only; requires `fallbackNamespace`).
+    Fallback,
+}
+
 /// Bounds on materialization of `origin: discovered` `Snapshot` CRs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -124,6 +142,13 @@ pub struct CatalogBounds {
     /// Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_namespace: Option<String>,
+    /// How to treat discovered snapshots written by another cluster. Requires
+    /// `identityDefaults.cluster`. Absent resolves to `Ignore`. When BOTH
+    /// `cluster` and `fallbackNamespace` are set this field is REQUIRED
+    /// (explicit), so adopting a cluster identity can never silently switch a
+    /// configured fallback collector off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_snapshots: Option<ForeignSnapshots>,
 }
 
 impl CatalogBounds {
@@ -143,6 +168,17 @@ impl CatalogBounds {
             .and_then(|c| c.refresh_interval.as_deref())
             .and_then(crate::duration::parse_go_duration)
             .unwrap_or(crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL)
+    }
+
+    /// The effective foreign-snapshot policy: `catalog.foreignSnapshots` when
+    /// set, else [`ForeignSnapshots::Ignore`] (absent `catalog`, or the field
+    /// unset). Only meaningful alongside a cluster identity
+    /// (`identityDefaults.cluster`) — the validators enforce that coupling, so
+    /// this resolver never has to guess at one.
+    pub fn effective_foreign_snapshots(catalog: Option<&Self>) -> ForeignSnapshots {
+        catalog
+            .and_then(|c| c.foreign_snapshots)
+            .unwrap_or_default()
     }
 }
 
@@ -186,6 +222,56 @@ mod tests {
         assert_eq!(
             CatalogBounds::effective_refresh_interval(None),
             crate::consts::DEFAULT_CATALOG_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn foreign_snapshots_serializes_to_bare_pascal_case_strings() {
+        // Same wire encoding as TakeoverPolicy/NamespaceDeletePolicy — bare
+        // PascalCase unit-variant strings, not a `{ "ignore": {} }` externally
+        // tagged shape (this is a closed enum with no payload).
+        assert_eq!(
+            serde_json::to_value(ForeignSnapshots::Ignore).unwrap(),
+            "Ignore"
+        );
+        assert_eq!(
+            serde_json::to_value(ForeignSnapshots::Fallback).unwrap(),
+            "Fallback"
+        );
+        assert_eq!(ForeignSnapshots::default(), ForeignSnapshots::Ignore);
+        assert_eq!(
+            serde_json::from_value::<ForeignSnapshots>(serde_json::json!("Ignore")).unwrap(),
+            ForeignSnapshots::Ignore
+        );
+        assert_eq!(
+            serde_json::from_value::<ForeignSnapshots>(serde_json::json!("Fallback")).unwrap(),
+            ForeignSnapshots::Fallback
+        );
+        // Unknown variant rejected.
+        assert!(serde_json::from_value::<ForeignSnapshots>(serde_json::json!("Delete")).is_err());
+    }
+
+    #[test]
+    fn effective_foreign_snapshots_defaults_to_ignore() {
+        // Absent catalog.
+        assert_eq!(
+            CatalogBounds::effective_foreign_snapshots(None),
+            ForeignSnapshots::Ignore
+        );
+        // Catalog present but the field unset.
+        let bare = CatalogBounds::default();
+        assert_eq!(
+            CatalogBounds::effective_foreign_snapshots(Some(&bare)),
+            ForeignSnapshots::Ignore
+        );
+        // Explicit value resolves verbatim.
+        let explicit = CatalogBounds {
+            foreign_snapshots: Some(ForeignSnapshots::Fallback),
+            ..Default::default()
+        };
+        assert_eq!(
+            CatalogBounds::effective_foreign_snapshots(Some(&explicit)),
+            ForeignSnapshots::Fallback
         );
     }
 }
