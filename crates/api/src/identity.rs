@@ -12,12 +12,13 @@
 //! - `hostname` ← namespace
 //! - `sourcePath` ← `/pvc/<pvcName>`
 //!
-//! ## ClusterRepository identity expressions (CEL)
+//! ## Repository/ClusterRepository identity expressions (CEL)
 //!
-//! A [`crate::cluster_repository::IdentityDefaults`] supplies
-//! `hostnameExpr`/`usernameExpr`, **CEL** expressions ([`cel`]) evaluated at
-//! admission (ADR-0004 §5). A consumer's explicit [`Identity`] override **always
-//! wins** over the expression.
+//! A [`crate::common::IdentityDefaults`] (`Repository.spec.identityDefaults` or
+//! `ClusterRepository.spec.identityDefaults`) supplies `hostnameExpr`/
+//! `usernameExpr`, **CEL** expressions ([`cel`]) evaluated at admission
+//! (ADR-0004 §5). A consumer's explicit [`Identity`] override **always wins**
+//! over the expression.
 //!
 //! ### CEL environment
 //!
@@ -35,7 +36,7 @@
 //!
 //! ### Multi-cluster hostname default
 //!
-//! When a `ClusterRepository`'s [`IdentityDefaults::cluster`] is set, the default
+//! When a repository's [`IdentityDefaults::cluster`] is set, the default
 //! (no override, no `hostnameExpr`) kopia identity hostname becomes
 //! `<namespace>.<cluster>` instead of bare `<namespace>`, so N clusters sharing one
 //! repository never collide on a same-named namespace. [`classify_hostname`]
@@ -46,8 +47,7 @@ use std::collections::BTreeMap;
 
 use cel::{Context, Program, Value};
 
-use crate::cluster_repository::IdentityDefaults;
-use crate::common::{Identity, ResolvedIdentity};
+use crate::common::{Identity, IdentityDefaults, ResolvedIdentity};
 use crate::error::{ValidationError, ValidationResult};
 
 /// Maximum CEL expression length accepted at admission (the cost-budget surrogate;
@@ -67,8 +67,8 @@ pub struct IdentityInputs<'a> {
     pub namespace: &'a str,
     /// Explicit overrides from `SnapshotPolicy.spec.identity`, if any.
     pub overrides: Option<&'a Identity>,
-    /// `ClusterRepository.spec.identityDefaults` (CEL `*Expr`), if the consumer
-    /// targets one.
+    /// The referenced repository's `spec.identityDefaults` (CEL `*Expr`) —
+    /// `Repository` or `ClusterRepository`, whichever the consumer targets.
     pub defaults: Option<&'a IdentityDefaults>,
     /// The consumer's `metadata.labels`, exposed to CEL as `labels`.
     pub labels: Option<&'a BTreeMap<String, String>>,
@@ -108,8 +108,8 @@ fn compile_expr(expr: &str) -> ValidationResult<Program> {
 /// `policyName`, `labels`, `annotations`, `cluster`. `cluster` is **always**
 /// declared (so an expression referencing it never hits an undeclared-variable
 /// error), taking `inputs.defaults.and_then(|d| d.cluster.as_deref())` or `""`
-/// when the consumer's `ClusterRepository` has no `identityDefaults.cluster` set
-/// (bare single-cluster deployments never see a `cluster` variable value).
+/// when the consumer's repository has no `identityDefaults.cluster` set (bare
+/// single-cluster deployments never see a `cluster` variable value).
 fn identity_context<'a>(inputs: &IdentityInputs<'_>) -> Context<'a> {
     let mut ctx = Context::default();
     // `add_variable` only errors if a value cannot serialize; these are
@@ -155,12 +155,13 @@ fn render_expr(expr: &str, inputs: &IdentityInputs<'_>) -> ValidationResult<Stri
     eval_expr(expr, &program, inputs)
 }
 
-/// Validate a `ClusterRepository.identityDefaults` CEL expression at admission
-/// (ADR-0004 §5): it must compile, and — because CEL reports an out-of-scope
-/// variable only at *evaluation* time — it must also evaluate against a
-/// representative context without referencing an undeclared variable. A non-string
-/// result is rejected. Missing *map keys* (e.g. `labels['env']` when the trial data
-/// lacks `env`) are tolerated: they are data-dependent, not a structural error.
+/// Validate a `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+/// at admission (ADR-0004 §5): it must compile, and — because CEL reports an
+/// out-of-scope variable only at *evaluation* time — it must also evaluate
+/// against a representative context without referencing an undeclared variable.
+/// A non-string result is rejected. Missing *map keys* (e.g. `labels['env']`
+/// when the trial data lacks `env`) are tolerated: they are data-dependent, not
+/// a structural error.
 pub fn validate_identity_expr(expr: &str) -> ValidationResult {
     let program = compile_expr(expr)?;
     // Representative trial context: non-empty maps so `'k' in labels`-style guards
@@ -168,7 +169,7 @@ pub fn validate_identity_expr(expr: &str) -> ValidationResult {
     // (rather than the "unset" empty string [`identity_context`] would otherwise
     // supply) so an expression referencing it — e.g. `namespace + '.' + cluster` —
     // trial-evaluates the same way regardless of whether *this particular*
-    // `ClusterRepository` happens to set `identityDefaults.cluster`.
+    // repository happens to set `identityDefaults.cluster`.
     let labels = BTreeMap::from([("app".to_string(), "trial".to_string())]);
     let annotations = BTreeMap::from([("note".to_string(), "trial".to_string())]);
     let trial_defaults = IdentityDefaults {
@@ -207,8 +208,9 @@ pub fn validate_identity_expr(expr: &str) -> ValidationResult {
     }
 }
 
-/// Resolve a [`ResolvedIdentity`] from defaults, an optional `ClusterRepository`
-/// identity expression set, and explicit consumer overrides (ADR §4.2 / ADR-0004 §5).
+/// Resolve a [`ResolvedIdentity`] from defaults, an optional `Repository`/
+/// `ClusterRepository` identity expression set, and explicit consumer overrides
+/// (ADR §4.2 / ADR-0004 §5).
 ///
 /// Precedence per component: **explicit override, then expression, then default**.
 /// For `hostname` specifically, the default step itself has two tiers: with

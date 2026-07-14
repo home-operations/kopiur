@@ -195,8 +195,9 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
 
     // 1. Resolve identity (per-source PVC + overrides + the repository's CEL
     //    identityDefaults) and pin status.resolved. Resolving the repository first
-    //    means a ClusterRepository's `identityDefaults` (ADR-0004 §5) are applied and
-    //    the pinned identity is correct from the start (never re-rendered, ADR §4.2).
+    //    means the referenced repository's `identityDefaults` (ADR-0004 §5) are
+    //    applied and the pinned identity is correct from the start (never
+    //    re-rendered, ADR §4.2).
     let repo = io::resolve_repository_ref(&ctx.client, &config.spec.repository, &namespace).await?;
     let resolved = resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
     io::patch_status_if_changed(

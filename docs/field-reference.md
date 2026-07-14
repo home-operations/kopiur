@@ -33,6 +33,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `catalog` | [object](#repository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
 | `create` | [object](#repository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `health` | [object](#repository-spec-health) | — | Repository health thresholds (tunes the index-blob-count warning). |
+| `identityDefaults` | [object](#repository-spec-identitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. Set `cluster` when this repository's backend is shared across clusters (e.g. one bucket backed up from more than one Kubernetes cluster) — the default kopia identity hostname then becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of bare `&lt;namespace&gt;`, so same-named namespaces on different clusters never collide. Same semantics as `ClusterRepository`'s field of the same name (ADR-0004 §5); a consumer's explicit `spec.identity` still wins over anything here. |
 | `maintenance` | [object](#repository-spec-maintenance) | — | Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR. |
 | `mode` | enum: ReadWrite \| ReadOnly | `ReadWrite` | Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only). |
 | `moverDefaults` | [object](#repository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
@@ -365,6 +366,14 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `enabled` | boolean | — | Turn the probe on. Off by default — existing repositories keep their current behavior until a user opts in. |
 | `failureThreshold` | integer | `3` | How many *consecutive* failing probes to require before raising the loud condition + event (default `3`). Debounces a single transient blip from alarming or nudging a destructive manual recreate. Any success resets it. |
 | `interval` | string | `30m` | How often to re-probe the backend (Go-style duration like `30m` or `1h`; minimum `30s`, default `30m`). Inert unless `enabled`. |
+
+#### `spec.identityDefaults` { #repository-spec-identitydefaults }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cluster` | string | — | This cluster's identity suffix for repositories shared across clusters (an RFC 1123 label, at most 32 characters; dots are rejected — the first `.` in a hostname is the namespace/cluster delimiter). When set, the default kopia identity hostname becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of `&lt;namespace&gt;`, so two clusters backing up same-named namespaces write distinct identities (and one cluster's retention prune can no longer touch the other's snapshots). Also exposed to `hostnameExpr`/ `usernameExpr` as the CEL variable `cluster`. |
+| `hostnameExpr` | string | — | CEL expression for the kopia identity hostname (e.g. `"namespace"`). |
+| `usernameExpr` | string | — | CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`). |
 
 #### `spec.maintenance` { #repository-spec-maintenance }
 

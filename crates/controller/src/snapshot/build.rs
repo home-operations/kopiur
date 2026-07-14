@@ -213,8 +213,9 @@ fn hook_plan_for(config: &SnapshotPolicy) -> kopiur_mover::workspec::HookPlanSum
 /// Resolve identity from a `SnapshotPolicy` (overrides + the repository's CEL
 /// `identityDefaults`) into the mover wire identity. Reuses
 /// `api::identity::resolve_identity` (the tested kernel). `defaults` is the
-/// `ClusterRepository`'s `identityDefaults` (ADR-0004 §5), `None` for a namespaced
-/// `Repository`.
+/// referenced repository's `identityDefaults` (ADR-0004 §5) — `Repository` or
+/// `ClusterRepository`, whichever `config.spec.repository` targets; `None` when
+/// it has none set.
 pub(super) fn resolve_identity_for(
     config: &SnapshotPolicy,
     namespace: &str,

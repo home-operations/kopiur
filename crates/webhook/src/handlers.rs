@@ -609,6 +609,8 @@ async fn handle_cluster_repository(
         let outcome = crate::identity_repo_edit::check_repository_identity_change(
             client,
             &self_key,
+            // ClusterRepository consumers may live in any namespace: list cluster-wide.
+            None,
             old.identity_defaults.as_ref(),
             spec.identity_defaults.as_ref(),
             obj.metadata.annotations.as_ref(),
@@ -633,19 +635,10 @@ async fn handle_cluster_repository(
 
 // --- Repository -------------------------------------------------------------
 
-// M5: `RepositorySpec` has no `identityDefaults` field yet — only
-// `ClusterRepositorySpec` does (added M1). Once M5 adds
-// `RepositorySpec.identity_defaults`, wire
-// `identity_repo_edit::check_repository_identity_change` into this UPDATE path
-// exactly as `handle_cluster_repository` does above (decode `old_spec` once,
-// run the guard, attach the acknowledged-warning), and replace the placeholder
-// test `repository_identity_defaults_guard_is_deferred_to_m5` in this module's
-// tests with the same identityDefaults-change coverage the ClusterRepository
-// tests have. `client` is unused here until then.
 async fn handle_repository(
     req: &AdmissionRequest<DynamicObject>,
     resp: AdmissionResponse,
-    _client: Option<&Client>,
+    client: Option<&Client>,
 ) -> AdmissionResult {
     let obj = raw_object(req)?;
     let spec: RepositorySpec =
@@ -654,21 +647,69 @@ async fn handle_repository(
             source,
         })?;
 
+    // Decode the old spec once (UPDATE only) — reused by both the create-time
+    // immutability check and the identityDefaults edit guard below.
+    let old_spec = (req.operation == Operation::Update)
+        .then(|| decode_old_spec::<RepositorySpec>(req))
+        .flatten();
+
     let mut errs = api::validate::validate_repository(&spec);
     // Create-time immutability (ADR-0005 §7), UPDATE-only: `create.*` algorithms only;
     // the password Secret reference is mutable (a rename with identical content passes).
-    if req.operation == Operation::Update
-        && let Some(old) = decode_old_spec::<RepositorySpec>(req)
-    {
-        errs.extend(api::validate::validate_repository_immutability(&old, &spec));
+    if let Some(old) = &old_spec {
+        errs.extend(api::validate::validate_repository_immutability(old, &spec));
     }
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
-    Ok(with_warnings(
-        resp,
-        api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref()),
-    ))
+
+    let mut warnings =
+        api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref());
+
+    // identityDefaults edit guard (silent re-identification): same rule as
+    // `handle_cluster_repository` above, scoped to this Repository's own
+    // namespace — a namespaced Repository is normally consumed only from its
+    // own namespace, and scoping the consumer LIST there (rather than
+    // cluster-wide) also works under a namespaced Role install (see
+    // `identity_repo_edit::affected_consumers`'s doc for the accepted
+    // cross-namespace-reference gap this best-effort guard leaves open).
+    if let Some(old) = &old_spec {
+        let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
+        let namespace = obj
+            .metadata
+            .namespace
+            .as_deref()
+            .or(req.namespace.as_deref())
+            .unwrap_or_default();
+        let self_key = crate::identity_collision::repo_key(
+            &RepositoryRef {
+                kind: RepositoryKind::Repository,
+                name: name.to_string(),
+                namespace: None,
+            },
+            namespace,
+        );
+        let outcome = crate::identity_repo_edit::check_repository_identity_change(
+            client,
+            &self_key,
+            Some(namespace),
+            old.identity_defaults.as_ref(),
+            spec.identity_defaults.as_ref(),
+            obj.metadata.annotations.as_ref(),
+        )
+        .await;
+        if let Some(err) = outcome.error {
+            return Err(AdmissionError::Invalid(vec![err]));
+        }
+        if !outcome.consumers.is_empty() {
+            warnings.push(format!(
+                "identityDefaults change acknowledged: this re-identifies {}",
+                api::error::describe_identity_change_consumers(&outcome.consumers)
+            ));
+        }
+    }
+
+    Ok(with_warnings(resp, warnings))
 }
 
 // --- shared tenancy adapter -------------------------------------------------
@@ -989,12 +1030,62 @@ mod tests {
         })
     }
 
-    /// A cluster-wide `SnapshotPolicyList` LIST response with a single consumer
-    /// referencing `repo_name` (as a `ClusterRepository`), with or without
-    /// snapshot history, and no `spec.identity` override.
+    fn repository_spec(cluster: &str) -> Value {
+        json!({
+            "backend": { "filesystem": { "path": "/r" } },
+            "encryption": { "passwordSecretRef": { "name": "s" } },
+            "identityDefaults": { "cluster": cluster }
+        })
+    }
+
+    /// Build an UPDATE `AdmissionRequest` for a namespaced `Repository`, with the
+    /// new object (spec + annotations) and the `oldObject` spec. Mirrors
+    /// `update_cluster_repository_request`; used by the identityDefaults-edit-guard
+    /// tests below.
+    fn update_repository_request(
+        namespace: &str,
+        name: &str,
+        new_spec: Value,
+        new_annotations: Value,
+        old_spec: Value,
+    ) -> AdmissionRequest<DynamicObject> {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "test-uid",
+                "kind": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "kind": "Repository" },
+                "resource": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "resource": "repositories" },
+                "name": name,
+                "namespace": namespace,
+                "operation": "UPDATE",
+                "userInfo": { "username": "tester" },
+                "object": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "Repository",
+                    "metadata": { "name": name, "namespace": namespace, "annotations": new_annotations },
+                    "spec": new_spec,
+                },
+                "oldObject": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "Repository",
+                    "metadata": { "name": name, "namespace": namespace },
+                    "spec": old_spec,
+                }
+            }
+        });
+        let review: kube::core::admission::AdmissionReview<DynamicObject> =
+            serde_json::from_value(review).unwrap();
+        review.try_into().unwrap()
+    }
+
+    /// A `SnapshotPolicyList` LIST response with a single consumer referencing
+    /// `repo_name` (as `repo_kind`: `"ClusterRepository"` or `"Repository"`), with
+    /// or without snapshot history, and no `spec.identity` override.
     fn consumer_policy_list(
         namespace: &str,
         name: &str,
+        repo_kind: &str,
         repo_name: &str,
         has_history: bool,
     ) -> Value {
@@ -1006,7 +1097,7 @@ mod tests {
             "items": [{
                 "metadata": { "name": name, "namespace": namespace },
                 "spec": {
-                    "repository": { "kind": "ClusterRepository", "name": repo_name },
+                    "repository": { "kind": repo_kind, "name": repo_name },
                     "sources": [ { "pvc": { "name": "data" } } ]
                 },
                 "status": status
@@ -1019,7 +1110,13 @@ mod tests {
         // A consumer with existing history references THIS ClusterRepository and
         // doesn't pin identity — editing identityDefaults would silently re-identify
         // it on its next backup.
-        let client = mock_list_client(consumer_policy_list("billing", "pg", "shared", true));
+        let client = mock_list_client(consumer_policy_list(
+            "billing",
+            "pg",
+            "ClusterRepository",
+            "shared",
+            true,
+        ));
         let req = update_cluster_repository_request(
             "shared",
             cluster_repository_spec("west"),
@@ -1037,7 +1134,13 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_repository_identity_defaults_change_acked_allowed_with_warning() {
-        let client = mock_list_client(consumer_policy_list("billing", "pg", "shared", true));
+        let client = mock_list_client(consumer_policy_list(
+            "billing",
+            "pg",
+            "ClusterRepository",
+            "shared",
+            true,
+        ));
         let req = update_cluster_repository_request(
             "shared",
             cluster_repository_spec("west"),
@@ -1094,15 +1197,101 @@ mod tests {
         );
     }
 
+    // --- Repository identityDefaults edit guard (M5) --------------------------
+
     #[tokio::test]
-    #[ignore = "M5: RepositorySpec has no identityDefaults yet; once it does, wire \
-                identity_repo_edit::check_repository_identity_change into handle_repository \
-                (see handle_cluster_repository) and replace this placeholder with the same \
-                identityDefaults-change coverage as the ClusterRepository tests above"]
-    async fn repository_identity_defaults_guard_is_deferred_to_m5() {
-        unimplemented!(
-            "wire the identityDefaults edit guard into handle_repository once M5 adds \
-             RepositorySpec.identity_defaults"
+    async fn repository_identity_defaults_change_with_history_denied() {
+        // A consumer with existing history references THIS Repository (same
+        // namespace, the guard's LIST scope) and doesn't pin identity — editing
+        // identityDefaults would silently re-identify it on its next backup.
+        let client = mock_list_client(consumer_policy_list(
+            "billing",
+            "pg",
+            "Repository",
+            "nas",
+            true,
+        ));
+        let req = update_repository_request(
+            "billing",
+            "nas",
+            repository_spec("west"),
+            json!({}),
+            repository_spec("east"),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(!resp.allowed, "must deny: {:?}", resp.result.message);
+        assert!(
+            resp.result.message.contains("billing/pg"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_identity_defaults_change_acked_allowed_with_warning() {
+        let client = mock_list_client(consumer_policy_list(
+            "billing",
+            "pg",
+            "Repository",
+            "nas",
+            true,
+        ));
+        let req = update_repository_request(
+            "billing",
+            "nas",
+            repository_spec("west"),
+            json!({ "kopiur.home-operations.com/allow-identity-change": "intentional" }),
+            repository_spec("east"),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(
+            resp.allowed,
+            "acknowledged change must be allowed: {:?}",
+            resp.result.message
+        );
+        let warnings = resp.warnings.unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| w.contains("billing/pg")),
+            "expected a warning naming the re-identified consumer: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_no_identity_defaults_change_is_allowed_without_warning() {
+        // No client at all: the guard must short-circuit before ever asking for one.
+        let req = update_repository_request(
+            "billing",
+            "nas",
+            repository_spec("east"),
+            json!({}),
+            repository_spec("east"),
+        );
+        let resp = dispatch(&req, None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+        assert!(
+            resp.warnings.is_none(),
+            "unchanged identityDefaults must not warn: {:?}",
+            resp.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_identity_defaults_change_without_client_degrades_to_allow() {
+        // A real change, but no client to list consumers with — fail open (same
+        // posture as the fork/collision guards): a repository apply must not wedge
+        // on a webhook that can't reach the API server for a best-effort check.
+        let req = update_repository_request(
+            "billing",
+            "nas",
+            repository_spec("west"),
+            json!({}),
+            repository_spec("east"),
+        );
+        let resp = dispatch(&req, None).await;
+        assert!(
+            resp.allowed,
+            "no client => degrade to allow: {:?}",
+            resp.result.message
         );
     }
 }

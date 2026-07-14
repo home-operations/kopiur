@@ -7,8 +7,9 @@
 
 use crate::backend::Backend;
 use crate::common::{
-    CatalogBounds, CreateBehavior, Encryption, MoverDefaults, NamespaceDeletePolicy,
-    RepositoryMode, ScheduleDefaults, default_namespace_delete_policy, default_repository_mode,
+    CatalogBounds, CreateBehavior, Encryption, IdentityDefaults, MoverDefaults,
+    NamespaceDeletePolicy, RepositoryMode, ScheduleDefaults, default_namespace_delete_policy,
+    default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::repository::{
@@ -143,28 +144,6 @@ impl AllowedNamespaces {
             AllowedNamespaces::All(_) => "All",
         }
     }
-}
-
-/// CEL expressions evaluated at admission to derive consumer identity when a `SnapshotPolicy` doesn't override.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityDefaults {
-    /// This cluster's identity suffix for repositories shared across clusters
-    /// (an RFC 1123 label, at most 32 characters; dots are rejected — the first
-    /// `.` in a hostname is the namespace/cluster delimiter). When set, the
-    /// default kopia identity hostname becomes `<namespace>.<cluster>` instead
-    /// of `<namespace>`, so two clusters backing up same-named namespaces write
-    /// distinct identities (and one cluster's retention prune can no longer
-    /// touch the other's snapshots). Also exposed to `hostnameExpr`/
-    /// `usernameExpr` as the CEL variable `cluster`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cluster: Option<String>,
-    /// CEL expression for the kopia identity hostname (e.g. `"namespace"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname_expr: Option<String>,
-    /// CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username_expr: Option<String>,
 }
 
 /// Observed state of a `ClusterRepository`; mirrors `RepositoryStatus` plus `allowedNamespaceCount`.

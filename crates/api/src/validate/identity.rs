@@ -1,4 +1,4 @@
-use crate::cluster_repository::IdentityDefaults;
+use crate::common::IdentityDefaults;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot_policy::{SnapshotPolicySpec, Source};
 use std::collections::BTreeMap;
@@ -118,13 +118,13 @@ pub fn validate_identity_component(field: &str, value: &str) -> ValidationResult
     }
 }
 
-/// Maximum length of `ClusterRepository.identityDefaults.cluster`. A cluster
-/// identity is a short, human-chosen suffix appended onto a namespace name — not
-/// free text — so this is generous headroom well under DNS's 253-byte label
-/// ceiling, not a real constraint in practice.
+/// Maximum length of `Repository`/`ClusterRepository` `identityDefaults.cluster`.
+/// A cluster identity is a short, human-chosen suffix appended onto a namespace
+/// name — not free text — so this is generous headroom well under DNS's 253-byte
+/// label ceiling, not a real constraint in practice.
 pub const CLUSTER_NAME_MAX_LEN: usize = 32;
 
-/// Validate `ClusterRepository.identityDefaults.cluster`: an RFC 1123 label
+/// Validate a `Repository`/`ClusterRepository` `identityDefaults.cluster`: an RFC 1123 label
 /// (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), 1..=[`CLUSTER_NAME_MAX_LEN`] characters,
 /// with dots called out explicitly as forbidden even though a well-formed RFC
 /// 1123 label never contains one anyway — the message needs to explain *why* to
@@ -299,7 +299,7 @@ pub fn detect_source_path_fork(
 /// consumer `SnapshotPolicy`s, read the ack annotation) and calls this.
 ///
 /// ```
-/// use kopiur_api::cluster_repository::IdentityDefaults;
+/// use kopiur_api::common::IdentityDefaults;
 /// use kopiur_api::validate::detect_repository_identity_change;
 ///
 /// let old = IdentityDefaults { cluster: Some("east".into()), ..Default::default() };

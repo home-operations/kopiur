@@ -89,6 +89,7 @@ fn sample_repository(name: &str) -> Repository {
             mover_defaults: None,
             schedule_defaults: None,
             catalog: None,
+            identity_defaults: None,
             maintenance: None,
             on_namespace_delete: Default::default(),
             mode: Default::default(),

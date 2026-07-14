@@ -15,8 +15,9 @@
 //! - The api-crate [`api::validate::detect_identity_collision`] is the pure
 //!   decision over a candidate pair + a list of existing pairs.
 //! - [`check_identity_collision`] is the **thin IO caller**: it lists every
-//!   `SnapshotPolicy` cluster-wide, fetches each referenced `ClusterRepository`'s
-//!   `identityDefaults` (cached), resolves identities, and calls the pure decision.
+//!   `SnapshotPolicy` cluster-wide, fetches each referenced repository's (`Repository`
+//!   or `ClusterRepository`) `identityDefaults` (cached), resolves identities, and
+//!   calls the pure decision.
 //!   It **fails open on IO errors** (a transient list/get failure must not wedge
 //!   unrelated applies) — the collision guard is a best-effort admission check, not
 //!   a security boundary, and the controller would still pin distinct status.
@@ -25,10 +26,9 @@ use std::collections::BTreeMap;
 
 use kopiur_api as api;
 
-use api::cluster_repository::IdentityDefaults;
-use api::common::{RepositoryKind, RepositoryRef};
+use api::common::{IdentityDefaults, RepositoryKind, RepositoryRef};
 use api::validate::ExistingIdentity;
-use api::{ClusterRepository, IdentityInputs, SnapshotPolicy, SnapshotPolicySpec};
+use api::{ClusterRepository, IdentityInputs, Repository, SnapshotPolicy, SnapshotPolicySpec};
 use kube::{Api, Client, ResourceExt};
 
 /// A normalized, comparable repository key for a consumer's [`RepositoryRef`]
@@ -51,8 +51,9 @@ pub fn repo_key(repo: &RepositoryRef, owner_namespace: &str) -> String {
 
 /// Resolve a `SnapshotPolicy`'s kopia identity string (`username@hostname[:path]`),
 /// reusing the api-crate kernel ([`api::resolve_identity`] + [`api::identity_string`]).
-/// `defaults` is the referenced `ClusterRepository`'s `identityDefaults` (CEL `*Expr`),
-/// `None` for a namespaced `Repository`. Returns `None` if an expression fails to
+/// `defaults` is the referenced repository's `identityDefaults` (CEL `*Expr`) —
+/// `Repository` or `ClusterRepository`, whichever the policy targets; `None` if it
+/// has none set (or the lookup failed). Returns `None` if an expression fails to
 /// resolve (the per-field validators already reject those; here we just skip the
 /// collision check for an unresolvable identity rather than panic).
 pub fn resolve_policy_identity(
@@ -95,38 +96,51 @@ pub fn policy_identity_string(
         .map(|r| api::identity_string(&r))
 }
 
-/// Look up the `identityDefaults` of the `ClusterRepository` a policy references, if
-/// any (`None` for a namespaced `Repository` or when the lookup fails). Cached by
-/// repo name so listing N policies that share a ClusterRepository does one get.
-/// Fetch the `identityDefaults` of the `ClusterRepository` a single policy
+/// Look up the `identityDefaults` of the `Repository`/`ClusterRepository` a policy
+/// references, if any (`None` when the lookup fails). Cached by [`repo_key`] (kind +
+/// effective namespace + name) so listing N policies that share a repository does
+/// one get — a plain repo-name key would collide across namespaces for a namespaced
+/// `Repository`. Fetch the `identityDefaults` of the repository a single policy
 /// references (no cache — for callers resolving one policy, e.g. the fork guard).
 pub(crate) async fn cluster_repo_defaults_for(
     client: &Client,
     repo: &RepositoryRef,
+    owner_namespace: &str,
 ) -> Option<IdentityDefaults> {
     let mut cache = BTreeMap::new();
-    cluster_repo_defaults(client, repo, &mut cache).await
+    cluster_repo_defaults(client, repo, owner_namespace, &mut cache).await
 }
 
 async fn cluster_repo_defaults(
     client: &Client,
     repo: &RepositoryRef,
+    owner_namespace: &str,
     cache: &mut BTreeMap<String, Option<IdentityDefaults>>,
 ) -> Option<IdentityDefaults> {
-    if repo.kind != RepositoryKind::ClusterRepository {
-        return None;
-    }
-    if let Some(cached) = cache.get(&repo.name) {
+    let key = repo_key(repo, owner_namespace);
+    if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    let api: Api<ClusterRepository> = Api::all(client.clone());
-    let defaults = api
-        .get_opt(&repo.name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|c| c.spec.identity_defaults);
-    cache.insert(repo.name.clone(), defaults.clone());
+    let defaults = match repo.kind {
+        RepositoryKind::ClusterRepository => {
+            let api: Api<ClusterRepository> = Api::all(client.clone());
+            api.get_opt(&repo.name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.spec.identity_defaults)
+        }
+        RepositoryKind::Repository => {
+            let ns = repo.namespace.as_deref().unwrap_or(owner_namespace);
+            let api: Api<Repository> = Api::namespaced(client.clone(), ns);
+            api.get_opt(&repo.name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.spec.identity_defaults)
+        }
+    };
+    cache.insert(key, defaults.clone());
     defaults
 }
 
@@ -142,7 +156,7 @@ async fn policy_pair(
     annotations: Option<&BTreeMap<String, String>>,
     cache: &mut BTreeMap<String, Option<IdentityDefaults>>,
 ) -> Option<(String, String)> {
-    let defaults = cluster_repo_defaults(client, &spec.repository, cache).await;
+    let defaults = cluster_repo_defaults(client, &spec.repository, namespace, cache).await;
     let identity = policy_identity_string(
         name,
         namespace,
@@ -169,8 +183,8 @@ pub struct Collision {
 /// [`Collision`] when found, else `None`.
 ///
 /// Thin IO: lists every `SnapshotPolicy` cluster-wide, resolves each one's
-/// `(identity, repo_key)` pair (using the exact ClusterRepository identity defaults),
-/// and calls the pure [`api::validate::detect_identity_collision`]. Self (same
+/// `(identity, repo_key)` pair (using the exact referenced repository's identity
+/// defaults), and calls the pure [`api::validate::detect_identity_collision`]. Self (same
 /// `namespace/name`) is skipped. **Fails open** if the client is absent or the list
 /// fails — a transient IO error must not wedge applies, and this is a best-effort
 /// guard (the controller still pins distinct status).
@@ -239,6 +253,7 @@ mod tests {
     use super::*;
     use api::common::{Identity, RepositoryRef};
     use api::snapshot_policy::{PvcSource, Source};
+    use serde_json::{Value, json};
 
     fn spec_with(repo: RepositoryRef, identity: Option<Identity>, pvc: &str) -> SnapshotPolicySpec {
         SnapshotPolicySpec {
@@ -328,5 +343,52 @@ mod tests {
         );
         let id = policy_identity_string("pg", "billing", &spec, None, None, None).unwrap();
         assert_eq!(id, "custom@host:/pvc/data");
+    }
+
+    /// A `Client` whose every request returns the same canned JSON body — a
+    /// hermetic, no-cluster stand-in for `Api::get_opt`, mirroring
+    /// `handlers::tests::mock_list_client`.
+    fn mock_get_client(body: Value) -> Client {
+        let svc = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+            let body = body.clone();
+            async move {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    #[tokio::test]
+    async fn cluster_repo_defaults_for_resolves_a_namespaced_repository() {
+        // M5: `RepositorySpec` now carries `identityDefaults` too, so the lookup
+        // must do a NAMESPACED get (not `Api::all`, which only makes sense for the
+        // cluster-scoped kind) for `kind: Repository`.
+        let body = json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Repository",
+            "metadata": { "name": "nas", "namespace": "billing" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/r" } },
+                "encryption": { "passwordSecretRef": { "name": "s" } },
+                "identityDefaults": { "cluster": "east" },
+            }
+        });
+        let client = mock_get_client(body);
+        let repo_ref = RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: None,
+        };
+        // No explicit ref namespace: falls back to the policy's own (owner) namespace.
+        let defaults = cluster_repo_defaults_for(&client, &repo_ref, "billing").await;
+        assert_eq!(
+            defaults.expect("identityDefaults").cluster.as_deref(),
+            Some("east")
+        );
     }
 }

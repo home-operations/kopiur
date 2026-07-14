@@ -1140,6 +1140,7 @@ fn repository_inline_retention_hook_passes_today() {
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: None,
         on_namespace_delete: Default::default(),
@@ -1430,6 +1431,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: m,
         on_namespace_delete: Default::default(),
@@ -1540,7 +1542,7 @@ fn cluster_repository_rejects_all_false() {
 #[test]
 fn cluster_repository_rejects_bad_identity_expr() {
     use crate::backend::{Backend, FilesystemBackend};
-    use crate::cluster_repository::IdentityDefaults;
+    use crate::common::IdentityDefaults;
     use crate::common::{Encryption, SecretKeyRef};
     let spec = ClusterRepositorySpec {
         backend: Backend::Filesystem(FilesystemBackend {
@@ -1615,6 +1617,7 @@ fn repo_spec_create(
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: None,
         on_namespace_delete: Default::default(),
@@ -2335,7 +2338,7 @@ fn repository_validators_route_foreign_snapshots_cluster_coupling() {
     // validate_foreign_snapshots_cluster_coupling, or the webhook silently
     // admits what the docs forbid.
 
-    // A namespaced Repository has no identityDefaults at all — any
+    // A namespaced Repository with no identityDefaults set — any
     // foreignSnapshots is rejected via the generic, kind-neutral message.
     let repo: RepositorySpec = crate::testutil::from_yaml(
         r#"
@@ -2352,6 +2355,30 @@ catalog:
     let errs = validate_repository(&repo);
     assert!(
         errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // M5: a namespaced Repository WITH identityDefaults.cluster set — Ignore is
+    // now legal, exactly like a ClusterRepository with a cluster identity.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        !errs
+            .iter()
             .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
         "{errs:?}"
     );
@@ -2456,6 +2483,37 @@ catalog:
         errs.iter()
             .any(|e| e.to_string().contains("its own namespace")),
         "{errs:?}"
+    );
+
+    // M5: Fallback on a namespaced Repository WITH a cluster identity set — rule
+    // (a) no longer fires (there IS a cluster identity now), but rule (c)
+    // (Fallback is ClusterRepository-only) still rejects it. Unchanged by M5.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Fallback
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "rule (a) must not fire once a cluster identity is set: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("its own namespace")),
+        "rule (c) must still reject Fallback on a namespaced Repository: {errs:?}"
     );
 }
 
@@ -3429,7 +3487,7 @@ fn cluster_name_rejects_dot_with_delimiter_message() {
 #[test]
 fn cluster_repository_rejects_bad_cluster_name() {
     use crate::backend::{Backend, FilesystemBackend};
-    use crate::cluster_repository::IdentityDefaults;
+    use crate::common::IdentityDefaults;
     use crate::common::{Encryption, SecretKeyRef};
     let spec = ClusterRepositorySpec {
         backend: Backend::Filesystem(FilesystemBackend {
@@ -3466,6 +3524,49 @@ fn cluster_repository_rejects_bad_cluster_name() {
     assert!(
         errs.iter()
             .any(|e| matches!(e, ValidationError::ClusterNameInvalid { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn repository_rejects_bad_cluster_name() {
+    // M5: `RepositorySpec.identityDefaults.cluster` is validated exactly like
+    // `ClusterRepositorySpec`'s field of the same name.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: East
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterNameInvalid { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn repository_rejects_bad_identity_expr() {
+    // M5: `RepositorySpec.identityDefaults.{hostnameExpr,usernameExpr}` are
+    // validated exactly like `ClusterRepositorySpec`'s fields of the same name.
+    // `namspace` is an out-of-scope typo → rejected at admission (ADR-0004 §5),
+    // mirroring `cluster_repository_rejects_bad_identity_expr`.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        "backend: { filesystem: { path: /repo } }\n\
+         encryption: { passwordSecretRef: { name: creds } }\n\
+         identityDefaults:\n  hostnameExpr: namspace\n",
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::IdentityExprEval { .. })),
         "{errs:?}"
     );
 }
@@ -3528,7 +3629,7 @@ fn source_path_fork_matches_by_pvc_name() {
 
 #[test]
 fn repository_identity_change_decision_table() {
-    use crate::cluster_repository::IdentityDefaults;
+    use crate::common::IdentityDefaults;
 
     let east = IdentityDefaults {
         cluster: Some("east".into()),

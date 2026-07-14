@@ -149,10 +149,10 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression (`hostnameExpr` /
-    /// `usernameExpr`) failed to **compile** (a syntax error, or it exceeds the
-    /// length budget). Surfaced at admission so a bad expression never reaches
-    /// status (ADR-0004 §5).
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// (`hostnameExpr` / `usernameExpr`) failed to **compile** (a syntax error, or
+    /// it exceeds the length budget). Surfaced at admission so a bad expression
+    /// never reaches status (ADR-0004 §5).
     #[error("identity CEL expression {expr:?} failed to compile: {reason} (check the CEL syntax)")]
     IdentityExprCompile {
         /// The offending CEL expression.
@@ -161,10 +161,10 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression referenced a variable
-    /// outside its environment (e.g. a typo), or otherwise failed to evaluate at
-    /// admission (ADR-0004 §5). The environment is `namespace`, `policyName`,
-    /// `labels`, `annotations`, `cluster`.
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// referenced a variable outside its environment (e.g. a typo), or otherwise
+    /// failed to evaluate at admission (ADR-0004 §5). The environment is
+    /// `namespace`, `policyName`, `labels`, `annotations`, `cluster`.
     #[error(
         "identity CEL expression {expr:?} failed to evaluate: {reason} \
          (available variables: namespace, policyName, labels, annotations, cluster)"
@@ -176,9 +176,9 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression evaluated to a
-    /// non-string value. `hostnameExpr`/`usernameExpr` must return a string
-    /// (ADR-0004 §5).
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// evaluated to a non-string value. `hostnameExpr`/`usernameExpr` must return
+    /// a string (ADR-0004 §5).
     #[error(
         "identity CEL expression {expr:?} must return a string, got {got} \
          (hostnameExpr/usernameExpr must evaluate to a string)"
@@ -294,8 +294,8 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// `ClusterRepository.identityDefaults.cluster` is not a valid RFC 1123 label,
-    /// or contains a `.`. `cluster` is appended onto the namespace as
+    /// A `Repository`/`ClusterRepository` `identityDefaults.cluster` is not a
+    /// valid RFC 1123 label, or contains a `.`. `cluster` is appended onto the namespace as
     /// `<namespace>.<cluster>` for the default hostname, and
     /// [`crate::identity::classify_hostname`] splits that hostname back apart at
     /// the FIRST `.` — a `cluster` value with an embedded dot would just shift
@@ -467,11 +467,9 @@ pub enum ValidationError {
     /// classify a snapshot's origin against — `Ignore`/`Fallback` decide what
     /// to do with a snapshot [`crate::identity::classify_hostname`] classifies
     /// as another cluster's, and that classification is undecidable without
-    /// `identityDefaults.cluster`. Fires on a `ClusterRepository` whose
-    /// `identityDefaults.cluster` is unset, and — kind-neutral wording — on a
-    /// namespaced `Repository`, which has no `identityDefaults` field at all
-    /// today (M5): the message never claims the field doesn't exist, since a
-    /// later milestone may add it.
+    /// `identityDefaults.cluster`. Fires on either repository kind (`Repository`
+    /// or `ClusterRepository`) whose `identityDefaults.cluster` is unset —
+    /// kind-neutral wording, since the rule is identical either way.
     #[error(
         "catalog.foreignSnapshots is set, but classifying a snapshot as \"foreign\" requires a \
          cluster identity (`identityDefaults.cluster`); without one there is nothing to compare \

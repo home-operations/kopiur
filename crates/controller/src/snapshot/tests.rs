@@ -489,6 +489,35 @@ fn build_backup_run_maps_pvc_source_to_pvc_mount() {
 }
 
 #[test]
+fn build_backup_run_renders_ns_dot_cluster_hostname_for_a_namespaced_repo_with_cluster_identity() {
+    // M5: a namespaced Repository's `identityDefaults.cluster` now flows through
+    // `io::ResolvedRepository` (previously always `None`) with ZERO further glue
+    // changes — `resolve_identity_for`/`build_backup_run` were already kind-agnostic.
+    use kopiur_api::common::IdentityDefaults;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut repo = resolved_s3_repo();
+    repo.identity_defaults = Some(IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: None,
+        username_expr: None,
+    });
+    let cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "pg-data".into(),
+            }),
+            pvc_selector: None,
+            nfs: None,
+            source_path_override: None,
+            source_path_strategy: None,
+        },
+    );
+    let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "billing", "pg").unwrap();
+    assert_eq!(ws.identity.hostname, "billing.east");
+}
+
+#[test]
 fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() {
     // M4 flag sweep (issue #216 category sweep): `failFast`/`limitMb` (the
     // recipe's `SnapshotPolicy.spec.{errorHandling,upload}`) and `description`

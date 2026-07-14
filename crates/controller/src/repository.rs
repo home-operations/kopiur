@@ -22,7 +22,7 @@ use kube::runtime::controller::Action;
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, RepositoryKind};
+use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{Repository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -730,6 +730,12 @@ async fn bootstrap_via_mover(
         kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
         repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
     );
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
+    let foreign = CatalogBounds::effective_foreign_snapshots(repo.spec.catalog.as_ref());
     let work_spec = bootstrap_work_spec(
         backend,
         name,
@@ -738,6 +744,8 @@ async fn bootstrap_via_mover(
         true,
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
+        cluster,
+        foreign,
     );
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
@@ -889,6 +897,16 @@ async fn bootstrap_via_mover(
 /// sentinel (bootstrap connects/creates the repo, it does not snapshot under any
 /// identity). `scan_catalog` drives whether the mover returns the snapshot list
 /// for discovered-Snapshot materialization.
+///
+/// `cluster`/`foreign` (`identityDefaults.cluster` / the effective
+/// `catalog.foreignSnapshots`) drive `catalog_foreign_prefilter_cluster`, mirroring
+/// `cluster_repository::cluster_bootstrap_work_spec`: the mover pre-filters
+/// `ForeignCluster`-classified entries BEFORE its own materialization cap only when
+/// cluster identity is actually on AND the effective policy is `Ignore` — under
+/// `Fallback` those entries must still come back so `run_catalog_scan`'s placement
+/// pass can count them (a namespaced Repository has no `fallbackNamespace`, so
+/// `decide_namespace_placement` always resolves a `Fallback`-classified foreign
+/// entry to `ForeignIgnored` too, but the count still needs the entry present).
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_work_spec(
     backend: &Backend,
@@ -898,7 +916,12 @@ fn bootstrap_work_spec(
     scan_catalog: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    cluster: Option<&str>,
+    foreign: ForeignSnapshots,
 ) -> MoverWorkSpec {
+    let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
+    let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
+        .then(|| cluster.unwrap_or_default().to_string());
     MoverWorkSpec {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
@@ -917,9 +940,7 @@ fn bootstrap_work_spec(
                     name,
                 ),
             )),
-            // M5: RepositorySpec has no `identityDefaults` field yet, so a namespaced
-            // Repository has no cluster identity to prefilter foreign entries against.
-            catalog_foreign_prefilter_cluster: None,
+            catalog_foreign_prefilter_cluster: prefilter_cluster,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1286,9 +1307,9 @@ fn bootstrap_condition(
 /// count (may exceed `listing.len()` when the Job capped the returned entries —
 /// `listing_truncated`, see `BootstrapResult::snapshots_truncated`).
 /// `foreign_prefilter_dropped` is the count the mover's foreign-suffix prefilter
-/// already dropped before this scan ever saw `listing` (always `0` here today: a
-/// namespaced `Repository` has no `identityDefaults.cluster` yet — M5 — so the
-/// prefilter can never be armed for it; threaded through for that future milestone).
+/// already dropped before this scan ever saw `listing` (`0` when the repository has
+/// no cluster identity, or `catalog.foreignSnapshots` isn't `Ignore` — the prefilter
+/// is armed only then, see `bootstrap_work_spec`).
 #[allow(clippy::too_many_arguments)]
 async fn run_catalog_scan(
     ctx: &Context,
@@ -1302,6 +1323,11 @@ async fn run_catalog_scan(
     foreign_prefilter_dropped: i64,
 ) -> Result<()> {
     let owner_ref = io::owner_ref_for(repo, "Repository")?;
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
     let outcome = catalog::scan(
         ctx,
         catalog::ScanOwner::Repository {
@@ -1311,10 +1337,7 @@ async fn run_catalog_scan(
         owner_ref,
         repo_uid,
         catalog::Placement::Namespace(namespace),
-        // M5: RepositorySpec has no `identityDefaults` field yet, so a namespaced
-        // Repository has no cluster identity to classify hostnames against —
-        // `classify_hostname` is total-Bare, matching the pre-M4 behavior exactly.
-        None,
+        cluster,
         repo.spec.catalog.as_ref(),
         listing,
         listing_truncated,
@@ -1400,5 +1423,40 @@ mod tests {
         ];
         assert_eq!(logical_bytes_under_management(&listing), 190);
         assert_eq!(logical_bytes_under_management(&[]), 0);
+    }
+
+    #[test]
+    fn bootstrap_work_spec_arms_the_prefilter_only_under_cluster_mode_and_ignore() {
+        // M5: mirrors `cluster_repository`'s identical rule — the mover's
+        // foreign-suffix prefilter is armed only when there IS a cluster identity
+        // AND the effective policy is `Ignore` (never under `Fallback`, which needs
+        // the entries back so the scan can count them).
+        use kopiur_api::backend::FilesystemBackend;
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
+            let spec = bootstrap_work_spec(
+                &backend, "nas", "billing", true, true, None, None, cluster, foreign,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+
+        // No cluster identity: never armed, regardless of the foreign policy.
+        assert_eq!(prefilter(None, ForeignSnapshots::Ignore), None);
+        assert_eq!(prefilter(None, ForeignSnapshots::Fallback), None);
+        // Cluster identity + Fallback: must not prefilter.
+        assert_eq!(prefilter(Some("east"), ForeignSnapshots::Fallback), None);
+        // Cluster identity + Ignore: armed with the cluster suffix.
+        assert_eq!(
+            prefilter(Some("east"), ForeignSnapshots::Ignore),
+            Some("east".to_string())
+        );
+        // Empty-string cluster behaves like unset (matches classify_hostname's rule).
+        assert_eq!(prefilter(Some(""), ForeignSnapshots::Ignore), None);
     }
 }

@@ -5,10 +5,9 @@ use kube::api::{Patch, PatchParams};
 use kube::runtime::reflector::Store;
 
 use kopiur_api::backend::Backend;
-use kopiur_api::cluster_repository::IdentityDefaults;
 use kopiur_api::common::{
-    Encryption, MoverDefaults, NamespaceDeletePolicy, PhaseLabel, RepositoryKind, RepositoryMode,
-    RepositoryRef, ScheduleDefaults,
+    Encryption, IdentityDefaults, MoverDefaults, NamespaceDeletePolicy, PhaseLabel, RepositoryKind,
+    RepositoryMode, RepositoryRef, ScheduleDefaults,
 };
 use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
 use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
@@ -62,9 +61,10 @@ pub struct ResolvedRepository {
     /// (security context, pod security context, resources, cache, node placement,
     /// Job TTL), merged field-wise under each run's `mover` (ADR-0004 §1/§2).
     pub mover_defaults: Option<MoverDefaults>,
-    /// The `ClusterRepository`'s `identityDefaults` (CEL `*Expr`), applied when a
-    /// consumer doesn't override its identity (ADR-0004 §5). `None` for a namespaced
-    /// `Repository` (which has no identity defaults).
+    /// The repository's `identityDefaults` (CEL `*Expr`), applied when a
+    /// consumer doesn't override its identity (ADR-0004 §5; M5 gave the
+    /// namespaced `Repository` the same field the cluster-scoped kind has had
+    /// since M1).
     pub identity_defaults: Option<IdentityDefaults>,
     /// The repository's `scheduleDefaults` (e.g. `timezone`), inherited at
     /// reconcile time by consumers that don't set their own equivalent field —
@@ -181,8 +181,7 @@ pub async fn resolve_repository_ref(
                 backend: repo.spec.backend,
                 encryption: repo.spec.encryption,
                 mover_defaults: repo.spec.mover_defaults,
-                // A namespaced Repository has no identity defaults.
-                identity_defaults: None,
+                identity_defaults: repo.spec.identity_defaults,
                 schedule_defaults: repo.spec.schedule_defaults,
                 on_namespace_delete: repo.spec.on_namespace_delete,
                 // A namespaced Repository has no owner-side projection gate: its

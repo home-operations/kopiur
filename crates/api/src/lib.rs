@@ -33,14 +33,14 @@ pub mod validate;
 pub use backend::{Backend, NfsVolume, PvcVolume, RepoVolume};
 pub use cluster_repository::{
     AllowedNamespaces, ClusterRepoCredentialProjection, ClusterRepository, ClusterRepositorySpec,
-    ClusterRepositoryStatus, IdentityDefaults,
+    ClusterRepositoryStatus,
 };
 pub use common::{
-    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, InheritSecurityContextFrom,
-    MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel, PodSelector, PolicyRef,
-    PvcConsumerInherit, ResolvedMover, SourceColocation, SourceColocationMode,
-    effective_run_as_user, hardened_security_context, merge_pod_security_context, merge_resources,
-    merge_security_context, resolve_mover,
+    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, IdentityDefaults,
+    InheritSecurityContextFrom, MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel,
+    PodSelector, PolicyRef, PvcConsumerInherit, ResolvedMover, SourceColocation,
+    SourceColocationMode, effective_run_as_user, hardened_security_context,
+    merge_pod_security_context, merge_resources, merge_security_context, resolve_mover,
 };
 pub use maintenance::{
     LeaseAction, Maintenance, MaintenanceSchedule, MaintenanceSpec, MaintenanceStatus,

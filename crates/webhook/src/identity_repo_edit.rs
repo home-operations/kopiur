@@ -80,8 +80,23 @@ fn is_affected(
 /// fully pinned (see [`is_affected`]). Fails open (empty vec, with a
 /// `tracing::warn!`) when the list call fails — a transient IO error must not
 /// wedge a repository apply, and this is a best-effort guard.
-async fn affected_consumers(client: &Client, self_key: &str) -> Vec<String> {
-    let api: Api<SnapshotPolicy> = Api::all(client.clone());
+///
+/// `list_namespace` scopes the `SnapshotPolicy` LIST: `None` lists cluster-wide
+/// (a `ClusterRepository`'s consumers may live in any namespace), `Some(ns)`
+/// lists only `ns` (a namespaced `Repository` can only ever be consumed from
+/// its own namespace via a bare, same-namespace `RepositoryRef` — a
+/// cross-namespace `ref.namespace` reference is a rarer case this best-effort
+/// guard accepts missing, in exchange for working under a namespaced Role
+/// install, where a cluster-wide LIST of `SnapshotPolicy` is a permanent 403).
+async fn affected_consumers(
+    client: &Client,
+    self_key: &str,
+    list_namespace: Option<&str>,
+) -> Vec<String> {
+    let api: Api<SnapshotPolicy> = match list_namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
     let policies = match api.list(&Default::default()).await {
         Ok(list) => list,
         Err(error) => {
@@ -131,7 +146,9 @@ pub struct IdentityChangeOutcome {
 /// normalized key (build it with [`crate::identity_collision::repo_key`], e.g.
 /// `"ClusterRepository/shared"` or `"Repository/billing/nas"`) so it compares
 /// against each candidate policy's own resolved key the same way the collision
-/// guard does.
+/// guard does. `list_namespace` scopes the consumer LIST (see
+/// [`affected_consumers`]): `None` for a `ClusterRepository` (cluster-wide),
+/// `Some(repo_namespace)` for a namespaced `Repository`.
 ///
 /// Only does the LIST when `old_defaults != new_defaults` (a no-op edit never
 /// needs to ask). Degrades to allow (empty consumers, no error, `tracing::warn!`)
@@ -140,8 +157,9 @@ pub struct IdentityChangeOutcome {
 pub async fn check_repository_identity_change(
     client: Option<&Client>,
     self_key: &str,
-    old_defaults: Option<&api::cluster_repository::IdentityDefaults>,
-    new_defaults: Option<&api::cluster_repository::IdentityDefaults>,
+    list_namespace: Option<&str>,
+    old_defaults: Option<&api::common::IdentityDefaults>,
+    new_defaults: Option<&api::common::IdentityDefaults>,
     new_annotations: Option<&BTreeMap<String, String>>,
 ) -> IdentityChangeOutcome {
     if old_defaults == new_defaults {
@@ -154,7 +172,7 @@ pub async fn check_repository_identity_change(
         );
         return IdentityChangeOutcome::default();
     };
-    let consumers = affected_consumers(client, self_key).await;
+    let consumers = affected_consumers(client, self_key, list_namespace).await;
     let acked = acknowledged(new_annotations);
     let error = api::validate::detect_repository_identity_change(
         old_defaults,
@@ -238,15 +256,21 @@ mod tests {
     #[tokio::test]
     async fn no_change_short_circuits_without_a_client() {
         // old == new (both None) → must not even ask for a client.
-        let outcome =
-            check_repository_identity_change(None, "ClusterRepository/shared", None, None, None)
-                .await;
+        let outcome = check_repository_identity_change(
+            None,
+            "ClusterRepository/shared",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(outcome, IdentityChangeOutcome::default());
     }
 
     #[tokio::test]
     async fn no_client_degrades_to_allow_on_a_real_change() {
-        use api::cluster_repository::IdentityDefaults;
+        use api::common::IdentityDefaults;
         let old = IdentityDefaults {
             cluster: Some("east".into()),
             ..Default::default()
@@ -258,11 +282,50 @@ mod tests {
         let outcome = check_repository_identity_change(
             None,
             "ClusterRepository/shared",
+            None,
             Some(&old),
             Some(&new),
             None,
         )
         .await;
         assert_eq!(outcome, IdentityChangeOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn affected_consumers_scopes_the_list_to_the_given_namespace() {
+        // M5: a namespaced Repository's consumer LIST must be scoped to the
+        // repository's own namespace (works under a namespaced Role install,
+        // where a cluster-wide LIST 403s); a ClusterRepository's stays cluster-wide.
+        use std::sync::{Arc, Mutex};
+        let captured_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let captured = captured_path.clone();
+        let svc = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let captured = captured.clone();
+            async move {
+                *captured.lock().unwrap() = req.uri().path().to_string();
+                let body = serde_json::json!({ "items": [] });
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let client = Client::new(svc, "test-ns");
+
+        let _ = affected_consumers(&client, "Repository/billing/nas", Some("billing")).await;
+        let path = captured_path.lock().unwrap().clone();
+        assert!(
+            path.contains("/namespaces/billing/"),
+            "expected a namespaced LIST scoped to `billing`, got {path:?}"
+        );
+
+        let _ = affected_consumers(&client, "ClusterRepository/shared", None).await;
+        let path = captured_path.lock().unwrap().clone();
+        assert!(
+            !path.contains("/namespaces/"),
+            "expected a cluster-wide LIST, got {path:?}"
+        );
     }
 }

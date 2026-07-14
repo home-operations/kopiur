@@ -705,6 +705,39 @@ spec:
                         type: string
                     type: object
                 type: object
+              identityDefaults:
+                description: |-
+                  Identity defaults (CEL `*Expr`) applied when consumers don't override.
+                  Set `cluster` when this repository's backend is shared across clusters
+                  (e.g. one bucket backed up from more than one Kubernetes cluster) — the
+                  default kopia identity hostname then becomes `<namespace>.<cluster>`
+                  instead of bare `<namespace>`, so same-named namespaces on different
+                  clusters never collide. Same semantics as `ClusterRepository`'s field of
+                  the same name (ADR-0004 §5); a consumer's explicit `spec.identity` still
+                  wins over anything here.
+                nullable: true
+                properties:
+                  cluster:
+                    description: |-
+                      This cluster's identity suffix for repositories shared across clusters
+                      (an RFC 1123 label, at most 32 characters; dots are rejected — the first
+                      `.` in a hostname is the namespace/cluster delimiter). When set, the
+                      default kopia identity hostname becomes `<namespace>.<cluster>` instead
+                      of `<namespace>`, so two clusters backing up same-named namespaces write
+                      distinct identities (and one cluster's retention prune can no longer
+                      touch the other's snapshots). Also exposed to `hostnameExpr`/
+                      `usernameExpr` as the CEL variable `cluster`.
+                    nullable: true
+                    type: string
+                  hostnameExpr:
+                    description: CEL expression for the kopia identity hostname (e.g. `"namespace"`).
+                    nullable: true
+                    type: string
+                  usernameExpr:
+                    description: CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`).
+                    nullable: true
+                    type: string
+                type: object
               maintenance:
                 description: Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR.
                 nullable: true

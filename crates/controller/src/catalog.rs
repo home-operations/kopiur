@@ -558,10 +558,7 @@ pub fn decide_cluster_placement(
 /// backstop) must never fall through to materializing a foreign entry into the repo's
 /// own namespace by accident.
 ///
-/// Unreachable in M4: `identityDefaults.cluster` doesn't exist on `RepositorySpec` yet
-/// (M5), so the `cluster` passed to `classify_hostname` for a namespaced `Repository`
-/// is always `None` and every hostname classifies `Bare` — kept exhaustive for when M5
-/// adds it. Exhaustive match, no `_ =>`.
+/// Exhaustive match, no `_ =>`.
 pub fn decide_namespace_placement(class: HostClass<'_>, namespace: &str) -> PlacementDecision {
     match class {
         HostClass::Bare { .. } | HostClass::OwnCluster { .. } => {
@@ -727,9 +724,8 @@ pub struct ScanOutcome {
 /// the bootstrap Job's result for everything else) and patches its own status from
 /// the returned outcome.
 ///
-/// `cluster` is the consuming repository's `identityDefaults.cluster` (a
-/// `ClusterRepository`; always `None` for a namespaced `Repository` — M5, it has no
-/// `identityDefaults` field yet).
+/// `cluster` is the consuming repository's `identityDefaults.cluster` (`Repository`
+/// or `ClusterRepository`; `None` when the repository has no cluster identity set).
 #[allow(clippy::too_many_arguments)]
 pub async fn scan(
     ctx: &Context,
@@ -1797,10 +1793,11 @@ mod tests {
 
     #[test]
     fn namespaced_placement_is_byte_identical_to_today_when_cluster_is_none() {
-        // M4: RepositorySpec has no identityDefaults yet (M5), so `cluster` is always
-        // None here — classify_hostname is total-Bare regardless of hostname shape
-        // (even one that LOOKS like <namespace>.<cluster>), so a namespaced Repository
-        // always materializes into its own namespace exactly as before this change.
+        // A namespaced Repository with no identityDefaults.cluster set (the
+        // overwhelming common case): `cluster` is None, so classify_hostname is
+        // total-Bare regardless of hostname shape (even one that LOOKS like
+        // <namespace>.<cluster>) — the repository always materializes into its own
+        // namespace exactly as before M5 gave Repository an identityDefaults field.
         for host in ["billing", "billing.east", "ns.", ".east", ""] {
             let class = classify_hostname(host, None);
             assert_eq!(
@@ -1813,9 +1810,11 @@ mod tests {
 
     #[test]
     fn namespaced_placement_ignores_foreign_cluster_defensively() {
-        // Unreachable while RepositorySpec has no identityDefaults (M5); kept
-        // exhaustive for forward-compat. Never materialize a foreign entry into the
-        // repo's own namespace, even if a Fallback policy value somehow reached here.
+        // Defensive backstop kept exhaustive for `HostClass::ForeignCluster`: never
+        // materialize a foreign entry into the repo's own namespace, even if a
+        // Fallback policy value somehow reached here (the validator rejects
+        // Fallback on a namespaced Repository — see rule (c) — so this never fires
+        // in practice, but the match stays total).
         let class = classify_hostname("billing.west", Some("east"));
         assert_eq!(
             decide_namespace_placement(class, "prod"),
@@ -1901,6 +1900,46 @@ mod tests {
             pass.decisions.get("billing.west"),
             Some(&PlacementDecision::ForeignIgnored)
         );
+    }
+
+    #[test]
+    fn namespaced_placement_pass_with_cluster_identity_places_own_and_bare_ignores_foreign() {
+        // M5: a namespaced Repository with identityDefaults.cluster set gets the
+        // SAME cluster-aware placement pass a ClusterRepository does — own-cluster
+        // and bare hostnames still land in the repo's own namespace; a
+        // foreign-cluster hostname is ignored (never materialized) but still
+        // counted (status.catalog.foreignSnapshotCount).
+        let listing = vec![
+            entry("own1", ("u", "prod.east", "/p"), t(5)), // OwnCluster
+            entry("bare1", ("u", "legacy", "/p"), t(5)),   // Bare (pre-cluster-identity hostname)
+            entry("foreign1", ("u", "prod.west", "/p"), t(5)), // ForeignCluster
+        ];
+        let placement = Placement::Namespace("prod");
+        let pass = plan_placements(
+            &listing,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            pass.decisions.get("prod.east"),
+            Some(&PlacementDecision::Place("prod".to_string())),
+            "OwnCluster host must place into the repo's own namespace"
+        );
+        assert_eq!(
+            pass.decisions.get("legacy"),
+            Some(&PlacementDecision::Place("prod".to_string())),
+            "Bare host must place into the repo's own namespace"
+        );
+        assert_eq!(
+            pass.decisions.get("prod.west"),
+            Some(&PlacementDecision::ForeignIgnored),
+            "ForeignCluster host must be ignored, never materialized"
+        );
+        assert_eq!(pass.foreign_ignored_ids, ["foreign1".to_string()].into());
+        assert_eq!(pass.foreign_count, 1, "the foreign entry is still counted");
+        assert_eq!(pass.foreign_suffix_counts.get("west"), Some(&1));
     }
 
     // --- plan_catalog: foreign_ignored_ids interaction ---

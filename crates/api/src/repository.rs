@@ -2,8 +2,9 @@
 
 use crate::backend::Backend;
 use crate::common::{
-    CatalogBounds, CreateBehavior, Encryption, FailurePolicy, MoverDefaults, NamespaceDeletePolicy,
-    RepositoryMode, ScheduleDefaults, default_namespace_delete_policy, default_repository_mode,
+    CatalogBounds, CreateBehavior, Encryption, FailurePolicy, IdentityDefaults, MoverDefaults,
+    NamespaceDeletePolicy, RepositoryMode, ScheduleDefaults, default_namespace_delete_policy,
+    default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::server::{ServerSpec, ServerStatus};
@@ -70,6 +71,16 @@ pub struct RepositorySpec {
     /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogBounds>,
+    /// Identity defaults (CEL `*Expr`) applied when consumers don't override.
+    /// Set `cluster` when this repository's backend is shared across clusters
+    /// (e.g. one bucket backed up from more than one Kubernetes cluster) — the
+    /// default kopia identity hostname then becomes `<namespace>.<cluster>`
+    /// instead of bare `<namespace>`, so same-named namespaces on different
+    /// clusters never collide. Same semantics as `ClusterRepository`'s field of
+    /// the same name (ADR-0004 §5); a consumer's explicit `spec.identity` still
+    /// wins over anything here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_defaults: Option<IdentityDefaults>,
     /// Optional kopia web-UI server, exposed via a `Service` in this namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerSpec>,
@@ -759,6 +770,42 @@ health:
                 .get("scheduleDefaults")
                 .is_none(),
             "absent scheduleDefaults must be elided"
+        );
+    }
+
+    #[test]
+    fn identity_defaults_cluster_round_trips_on_repository() {
+        // M5: `RepositorySpec.identityDefaults` mirrors `ClusterRepositorySpec`'s
+        // field of the same name — same shape, same round-trip behavior (see
+        // `cluster_repository::tests::identity_defaults_cluster_round_trips`).
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             identityDefaults:\n  cluster: east\n  hostnameExpr: namespace\n",
+        );
+        let id = spec.identity_defaults.as_ref().expect("identityDefaults");
+        assert_eq!(id.cluster.as_deref(), Some("east"));
+        assert_eq!(id.hostname_expr.as_deref(), Some("namespace"));
+        assert!(id.username_expr.is_none());
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["identityDefaults"]["cluster"], "east");
+        assert_eq!(json["identityDefaults"]["hostnameExpr"], "namespace");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent identityDefaults stays None and is elided (no stored-object churn).
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n",
+        );
+        assert!(bare.identity_defaults.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("identityDefaults")
+                .is_none(),
+            "absent identityDefaults must be elided"
         );
     }
 

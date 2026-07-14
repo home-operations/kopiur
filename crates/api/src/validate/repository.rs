@@ -331,7 +331,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
+/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -370,11 +370,34 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, false));
     }
-    // RepositorySpec has no identityDefaults field (M5), so there is never a
-    // cluster identity here — any foreignSnapshots always rejects via rule (a).
+    // Identity CEL expressions must compile + trial-evaluate to a string at admission
+    // (ADR-0004 §5), so a typo / out-of-scope variable is rejected on `kubectl apply`.
+    // Mirrors `validate_cluster_repository`'s identical block.
+    if let Some(id) = &spec.identity_defaults {
+        if let Some(expr) = &id.hostname_expr
+            && let Err(e) = crate::identity::validate_identity_expr(expr)
+        {
+            errs.push(e);
+        }
+        if let Some(expr) = &id.username_expr
+            && let Err(e) = crate::identity::validate_identity_expr(expr)
+        {
+            errs.push(e);
+        }
+        // `cluster` becomes part of the default hostname (`<namespace>.<cluster>`)
+        // and `classify_hostname` splits on the first `.`, so it must be a clean
+        // RFC 1123 label with no dot of its own (M1/M5).
+        if let Some(cluster) = &id.cluster
+            && let Err(e) = validate_cluster_name(cluster)
+        {
+            errs.push(e);
+        }
+    }
     errs.extend(validate_foreign_snapshots_cluster_coupling(
         spec.catalog.as_ref(),
-        None,
+        spec.identity_defaults
+            .as_ref()
+            .and_then(|id| id.cluster.as_deref()),
     ));
     if let Some(md) = &spec.mover_defaults
         && let Some(res) = &md.resources
@@ -554,9 +577,9 @@ pub fn validate_catalog_bounds(
 /// cluster's is undecidable without a cluster identity (a), and adopting one
 /// must never silently switch off an already-configured fallback collector
 /// (d). Shared by both repository kinds — `cluster` is the resolved
-/// `identityDefaults.cluster` value; a namespaced `Repository` always passes
-/// `None` here (it has no `identityDefaults` field at all today, M5), which
-/// makes rule (d) a no-op for that kind (it requires a cluster to fire) while
+/// `identityDefaults.cluster` value, `None` when the repository has no cluster
+/// identity set (or, on a namespaced `Repository`, no `identityDefaults` set at
+/// all). Without a cluster, rule (d) is a no-op (it requires one to fire) while
 /// rule (a) still rejects any `foreignSnapshots` set there.
 pub fn validate_foreign_snapshots_cluster_coupling(
     catalog: Option<&crate::common::CatalogBounds>,
