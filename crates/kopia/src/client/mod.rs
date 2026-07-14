@@ -588,6 +588,26 @@ pub struct PolicyArgs {
     pub max_parallel_snapshots: Option<u32>,
     /// `--max-parallel-file-reads` upload parallelism. ADR-0005 §13(f).
     pub max_parallel_file_reads: Option<u32>,
+    /// `--keep-latest`: most-recent-N backups to keep per source.
+    ///
+    /// This field (and its five siblings below) exists ONLY so the mover can
+    /// pin kopia's own create-time retention to effectively-infinite at the
+    /// identity scope — see `kopiur_mover::workspec::KOPIA_KEEP_MAX`'s doc
+    /// comment for the full hazard. There is deliberately no CRD/workspec
+    /// surface that lets a user set these: kopia-side retention stays
+    /// forbidden (`crates/api/src/error.rs`'s `InlineRetentionForbidden`),
+    /// and `PolicyArgsSpec::to_kopia` never populates them.
+    pub keep_latest: Option<i64>,
+    /// `--keep-hourly`. See [`Self::keep_latest`].
+    pub keep_hourly: Option<i64>,
+    /// `--keep-daily`. See [`Self::keep_latest`].
+    pub keep_daily: Option<i64>,
+    /// `--keep-weekly`. See [`Self::keep_latest`].
+    pub keep_weekly: Option<i64>,
+    /// `--keep-monthly`. See [`Self::keep_latest`].
+    pub keep_monthly: Option<i64>,
+    /// `--keep-annual`. See [`Self::keep_latest`].
+    pub keep_annual: Option<i64>,
     /// Verbatim extra `policy set` flags (the CRD escape hatch).
     pub extra_args: Vec<String>,
 }
@@ -789,10 +809,22 @@ impl KopiaClientBuilder {
 
     /// Finalize.
     pub fn build(self) -> KopiaClient {
+        let mut common_args = self.common_args;
+        // kopia's hidden default-on `--auto-maintenance` opportunistically runs
+        // a maintenance pass as a side effect of other commands (`snapshot
+        // create`/`delete`/`expire`, and — verified against the pinned kopia
+        // 0.23.1 binary — even a bare `policy set`) whenever the connected
+        // client identity equals the repository's designated maintenance
+        // owner. Only the Maintenance CR's own `maintenance run` may trigger
+        // maintenance (that explicit subcommand is unaffected by this flag —
+        // also verified against the pinned binary), so every `KopiaClient`
+        // carries `--no-auto-maintenance` on every invocation, unconditionally,
+        // rather than relying on each call site to remember it.
+        common_args.push("--no-auto-maintenance".into());
         KopiaClient {
             binary: self.binary.unwrap_or_else(|| PathBuf::from("kopia")),
             common_env: self.common_env,
-            common_args: self.common_args,
+            common_args,
             default_timeout: self.default_timeout,
         }
     }
@@ -847,6 +879,13 @@ impl KopiaClient {
     /// that the cache/log/config dirs were injected).
     pub fn common_env(&self) -> &BTreeMap<String, String> {
         &self.common_env
+    }
+
+    /// The global args appended after the subcommand on every invocation
+    /// (useful for tests asserting e.g. `--no-auto-maintenance` is always
+    /// present).
+    pub fn common_args(&self) -> &[String] {
+        &self.common_args
     }
 
     /// Run kopia with the given subcommand args, returning raw output. Applies
@@ -1788,6 +1827,30 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
     }
     if let Some(n) = policy.max_parallel_file_reads {
         args.push("--max-parallel-file-reads".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_latest {
+        args.push("--keep-latest".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_hourly {
+        args.push("--keep-hourly".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_daily {
+        args.push("--keep-daily".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_weekly {
+        args.push("--keep-weekly".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_monthly {
+        args.push("--keep-monthly".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = policy.keep_annual {
+        args.push("--keep-annual".into());
         args.push(n.to_string());
     }
     args.extend(policy.extra_args.iter().cloned());

@@ -163,6 +163,10 @@ Set only the buckets you care about; omit the rest. There is deliberately **no**
 If you set `retention:` but leave every bucket unset or `0`, GFS would prune **every** snapshot the moment it runs — silent data loss. The admission webhook rejects that (*"keeps no snapshots … set at least one bucket"*). To disable pruning entirely, **omit `retention` altogether** (absent = don't prune); an empty-but-present block is the trap, so it's blocked.
 ///
 
+/// note | GFS is the only pruning mechanism — kopia's own retention is pinned off
+kopia's `snapshot create` normally applies its own retention after every backup, and with nothing configured it falls back to kopia's defaults (`keepLatest: 10`, etc.) — values a wide `retention:` window above would blow right past, deleting backups behind Kopiur's back. Kopiur pins kopia's own retention to effectively-infinite on every identity it manages, so `retention:` above is the only thing that ever deletes a backup.
+///
+
 ### Identity — what kopia records (`username@hostname:path`)
 
 kopia stores every snapshot under an identity. Kopiur resolves it **once at admission** and pins it to status; it is never re-rendered. The defaults:

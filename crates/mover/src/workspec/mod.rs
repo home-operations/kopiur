@@ -187,7 +187,11 @@ impl PolicyArgsSpec {
 
     /// Convert to the kopia client's [`PolicyArgs`](kopiur_kopia::PolicyArgs).
     /// `splitter` is never set here — the object splitter is a repository property
-    /// (ADR-0004 §4b removed the per-policy splitter).
+    /// (ADR-0004 §4b removed the per-policy splitter). The six `keep_*`
+    /// (create-time retention) fields are likewise never set here: `PolicyArgsSpec`
+    /// is the wire work-spec, and Kopiur's `KOPIA_KEEP_MAX` pin is deliberately NOT
+    /// user-configurable — the mover applies it directly at the identity scope
+    /// (`crates/mover/src/main.rs`), so it never rides this struct.
     pub fn to_kopia(&self) -> kopiur_kopia::PolicyArgs {
         kopiur_kopia::PolicyArgs {
             compression: self.compression.clone(),
@@ -201,6 +205,7 @@ impl PolicyArgsSpec {
             max_parallel_snapshots: self.max_parallel_snapshots,
             max_parallel_file_reads: self.max_parallel_file_reads,
             extra_args: self.extra_args.clone(),
+            ..Default::default()
         }
     }
 
@@ -666,6 +671,37 @@ pub struct SnapshotPinOp {
 /// (ADR-0005 §13(c)). A stable name so add/remove target the same pin and so the
 /// pin is recognizable in `kopia snapshot list` output.
 pub const KOPIUR_PIN_NAME: &str = "kopiur-retain";
+
+/// The value the mover pins every one of kopia's six retention `--keep-*`
+/// fields to, at the identity scope, before the first `snapshot create` on
+/// that identity (M0b, confirmed data-loss bug).
+///
+/// kopia's `snapshot create` unconditionally applies the *source's* retention
+/// policy after every create — even under `--override-source`
+/// (`policy.ApplyRetentionPolicy(ctx, rep, sourceInfo, true)`,
+/// `cli/command_snapshot_create.go`) — and with no policy set, kopia's OWN
+/// defaults apply (keep-latest 10, hourly 48, daily 7, weekly 4, monthly 24,
+/// annual 3; `snapshot/policy/retention_policy.go`). `snapshot/policy/expire.go`
+/// then deletes any manifest with no retention reason and no pin. So any
+/// `SnapshotPolicy.spec.retention` window wider than kopia's defaults (e.g.
+/// `keepDaily: 30`) has kopia silently deleting manifests that Succeeded
+/// `Snapshot` CRs still reference — surfacing only at restore.
+///
+/// Kopiur's design is that CR-driven GFS (`SnapshotPolicy.spec.retention`,
+/// enforced by pruning `Snapshot` CRs) is the SOLE deleter. Pinning every
+/// `--keep-*` field to this value at the identity scope (the path scope
+/// inherits it when unset there) makes kopia's own create-time retention
+/// effectively a no-op, restoring that invariant. This is NOT
+/// user-configurable — kopia-side retention stays forbidden
+/// (`crates/api/src/error.rs`'s `InlineRetentionForbidden`) — so it is
+/// hardcoded here rather than exposed on `PolicyArgsSpec`/any CRD.
+///
+/// The value itself is kopia's largest safely round-tripping retention count:
+/// its policy fields are a Go `int` (`policy.OptionalInt`), and `i32::MAX` is
+/// the conventional "no effective limit" sentinel for a flag of this shape —
+/// comfortably larger than any real backup history, while avoiding the
+/// overflow risk of reaching for an unbounded value on a numeric CLI flag.
+pub const KOPIA_KEEP_MAX: i64 = i32::MAX as i64; // 2_147_483_647
 
 /// Which verification tier to run (ADR-0005 §4). Externally-tagged on the wire so
 /// it round-trips as `{ "quick": {} }` / `{ "deep": {...} }` and a new tier cannot

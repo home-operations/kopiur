@@ -488,3 +488,88 @@ async fn snapshot_create_accepts_m4_flag_sweep_and_records_the_description() {
         .expect("created snapshot present in list");
     assert_eq!(entry.description, "m4 flag sweep smoke test");
 }
+
+/// M0b (confirmed data-loss bug): real-kopia proof that pinning the six
+/// `--keep-*` fields to a very large value at the IDENTITY scope, before the
+/// first `snapshot create`, neutralizes kopia's own create-time retention.
+///
+/// kopia's `snapshot create` unconditionally applies the *source's* retention
+/// policy after every create — even under `--override-source`
+/// (`policy.ApplyRetentionPolicy`, kopia's `cli/command_snapshot_create.go`) —
+/// and with no policy set, kopia's OWN defaults apply (`keep-latest: 10`
+/// among them; `snapshot/policy/retention_policy.go`). Twelve creates under
+/// one identity would, on kopia's defaults, prune the two oldest manifests
+/// the moment the 11th/12th is created (manually verified against this exact
+/// pinned kopia 0.23.1 binary while writing this test: 12 creates with no
+/// policy override left only 10 manifests; with this policy applied first,
+/// all 12 survived). Those pruned manifests are exactly what a Kopiur
+/// `Snapshot` CR — whose GFS window may be wider than kopia's defaults — would
+/// still reference, so this is Kopiur's permanent regression guard that the
+/// mover's mandatory identity-scope pin (`kopiur_mover::workspec::KOPIA_KEEP_MAX`)
+/// actually works against real kopia, not just that the argv shape looks right.
+/// Kept fast: one 1-byte file, twelve creates.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn identity_scope_keep_max_pin_survives_twelve_creates() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"x").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+
+    // Mirrors the mover's mandatory identity-scope pin exactly (same six
+    // flags, same value) — see `identity_retention_policy` in
+    // `crates/mover/src/main.rs` and `KOPIA_KEEP_MAX`'s doc comment.
+    const KOPIA_KEEP_MAX: i64 = 2_147_483_647;
+    let identity_scope = "retentionuser@retentionhost";
+    client
+        .policy_set(
+            identity_scope,
+            &PolicyArgs {
+                keep_latest: Some(KOPIA_KEEP_MAX),
+                keep_hourly: Some(KOPIA_KEEP_MAX),
+                keep_daily: Some(KOPIA_KEEP_MAX),
+                keep_weekly: Some(KOPIA_KEEP_MAX),
+                keep_monthly: Some(KOPIA_KEEP_MAX),
+                keep_annual: Some(KOPIA_KEEP_MAX),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("identity-scope keep-* policy set");
+
+    let override_source = format!("{identity_scope}:/data");
+    for n in 0..12 {
+        client
+            .snapshot_create(
+                source_dir.path().to_str().unwrap(),
+                &BTreeMap::new(),
+                Some(&override_source),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("snapshot create #{n} should succeed: {e}"));
+    }
+
+    let list = client
+        .snapshot_list(None)
+        .await
+        .expect("snapshot list after twelve creates");
+    assert_eq!(
+        list.len(),
+        12,
+        "all 12 manifests must survive with the identity-scope keep-* pin applied; \
+         without it kopia's own default keep-latest=10 would have pruned 2, got {list:?}"
+    );
+}

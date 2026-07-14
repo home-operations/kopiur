@@ -43,9 +43,9 @@ use kopiur_mover::status::{
     verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
-    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
-    Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor,
-    SnapshotPinOp, VerifyOp, VerifyTier,
+    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
+    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
+    SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier,
 };
 
 fn main() -> std::process::ExitCode {
@@ -374,31 +374,42 @@ async fn run_operation(
             // all key on this identity.
             let id = &spec.identity;
             let override_source = format!("{}@{}:{}", id.username, id.hostname, id.source_path);
+            let identity_scope = format!("{}@{}", id.username, id.hostname);
             // Apply the resolved kopia `policy set` knobs (compression / never-compress
             // / ignore rules / ignore-cache-dirs / backup-side error handling / upload
             // parallelism / extraArgs) against this snapshot's source identity BEFORE
             // creating the snapshot, so SnapshotPolicy.spec.{compression,files,
             // errorHandling,upload,extraArgs} actually reach kopia (ADR-0005 §13(b)/§13(f),
-            // ADR-0004 §4b). Skipped when nothing is configured.
+            // ADR-0004 §4b). The path-scoped `policy set` is skipped when nothing is
+            // configured, but the identity-scoped one below ALWAYS runs — it also
+            // carries the mandatory `KOPIA_KEEP_MAX` retention pin (see its doc
+            // comment): kopia's `snapshot create` unconditionally applies the
+            // source's OWN retention policy after every create, so an unset
+            // identity policy would otherwise fall back to kopia's defaults
+            // (keep-latest 10, …), silently deleting manifests a Kopiur `Snapshot`
+            // CR still references.
+            let mut user_identity_policy = None;
             if !op.policy.is_empty() {
                 // kopia rejects `--max-parallel-snapshots` on a path-scoped
                 // policy ("only global, username@hostname or @hostname"), so
-                // that one knob is applied in a second `policy set` at the
-                // identity scope (the policy_knobs e2e regression).
-                let (path_policy, identity_policy) =
+                // that one knob is folded into the identity-scope policy_set
+                // below instead of the path-scoped one (the policy_knobs e2e
+                // regression).
+                let (path_policy, split_identity_policy) =
                     kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
                 client
                     .policy_set(&override_source, &path_policy)
                     .await
                     .map_err(kopia(KopiaOp::PolicySet))?;
-                if let Some(p) = identity_policy {
-                    let identity_scope = format!("{}@{}", id.username, id.hostname);
-                    client
-                        .policy_set(&identity_scope, &p)
-                        .await
-                        .map_err(kopia(KopiaOp::PolicySet))?;
-                }
+                user_identity_policy = split_identity_policy;
             }
+            client
+                .policy_set(
+                    &identity_scope,
+                    &identity_retention_policy(user_identity_policy),
+                )
+                .await
+                .map_err(kopia(KopiaOp::PolicySet))?;
             let result = client
                 .snapshot_create_with(
                     &op.source_path,
@@ -872,6 +883,28 @@ async fn run_bootstrap_flow(
             class: KopiaErrorClass::from_label(class),
             message: message.to_string(),
         })
+    }
+}
+
+/// Build the identity-scope `policy set` args applied before every `snapshot
+/// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
+/// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
+/// (the one knob `split_policy_scopes` moves to the identity scope —
+/// currently only `max_parallel_snapshots`) folded in on top when the
+/// operator configured it. Pulled out of `run_operation` so the mandatory
+/// pin is unit-testable without spawning kopia.
+fn identity_retention_policy(
+    user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
+) -> kopiur_kopia::PolicyArgs {
+    kopiur_kopia::PolicyArgs {
+        keep_latest: Some(KOPIA_KEEP_MAX),
+        keep_hourly: Some(KOPIA_KEEP_MAX),
+        keep_daily: Some(KOPIA_KEEP_MAX),
+        keep_weekly: Some(KOPIA_KEEP_MAX),
+        keep_monthly: Some(KOPIA_KEEP_MAX),
+        keep_annual: Some(KOPIA_KEEP_MAX),
+        max_parallel_snapshots: user_identity_policy.and_then(|p| p.max_parallel_snapshots),
+        ..Default::default()
     }
 }
 
@@ -1836,6 +1869,35 @@ mod tests {
             maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), ""),
             Some("kopiur@kopiur-prod"),
         );
+    }
+
+    // --- M0b: identity-scope retention pin (KOPIA_KEEP_MAX) is mandatory ---
+
+    #[test]
+    fn identity_retention_policy_always_pins_keep_max_with_no_user_policy() {
+        let p = identity_retention_policy(None);
+        assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_hourly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_daily, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_weekly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_monthly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.max_parallel_snapshots, None);
+    }
+
+    #[test]
+    fn identity_retention_policy_folds_in_user_max_parallel_snapshots() {
+        // The one user knob kopia allows only at identity/global scope
+        // (`split_policy_scopes`) rides alongside the mandatory pin, not
+        // instead of it.
+        let user = kopiur_kopia::PolicyArgs {
+            max_parallel_snapshots: Some(3),
+            ..Default::default()
+        };
+        let p = identity_retention_policy(Some(user));
+        assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.max_parallel_snapshots, Some(3));
     }
 
     // --- `kopiur-mover ready` probe mode: the pure marker decision ---

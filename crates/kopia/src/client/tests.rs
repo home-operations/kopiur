@@ -120,6 +120,30 @@ fn builder_defaults_binary() {
     assert_eq!(c.binary(), &PathBuf::from("kopia"));
 }
 
+#[test]
+fn builder_always_disables_auto_maintenance() {
+    // kopia's hidden default-on `--auto-maintenance` opportunistically runs a
+    // maintenance pass as a side effect of ops like `snapshot create`/`delete`/
+    // `expire` — and, verified against the pinned kopia 0.23.1 binary, even a
+    // bare `policy set` — whenever the connected identity is the repository's
+    // designated maintenance owner. Only the Maintenance CR's explicit
+    // `maintenance run` may trigger maintenance, so every `KopiaClient` must
+    // carry `--no-auto-maintenance` regardless of what the caller configured.
+    let c = KopiaClient::builder().build();
+    assert!(
+        c.common_args().iter().any(|a| a == "--no-auto-maintenance"),
+        "{:?}",
+        c.common_args()
+    );
+
+    // A caller's own common args survive alongside it.
+    let c = KopiaClient::builder()
+        .common_arg("--some-other-flag")
+        .build();
+    assert!(c.common_args().iter().any(|a| a == "--some-other-flag"));
+    assert!(c.common_args().iter().any(|a| a == "--no-auto-maintenance"));
+}
+
 // --- backend_args: one assertion per backend variant. A new ConnectSpec
 // variant must be added here (and to kind_str) or these tests fail to cover
 // it, preserving the "every backend is wired" guarantee. ---
@@ -902,6 +926,50 @@ fn connect_args_appends_readonly_only_for_readonly_connects() {
         "{tuned:?}"
     );
     assert!(tuned.iter().any(|a| a == "--content-cache-size-mb"));
+}
+
+#[test]
+fn policy_set_args_builds_keep_flags() {
+    // M0b: the six create-time retention `--keep-*` fields, pinned to
+    // kopia's largest safely round-tripping value at the identity scope
+    // (mover's `KOPIA_KEEP_MAX`). Space-separated valued flags (verified
+    // against the pinned kopia 0.23.1: `--keep-latest 2147483647` is
+    // accepted; unlike the `--flag=value` grammar of the tri-state knobs
+    // below, these are plain `--flag N` like `--max-parallel-snapshots`).
+    let policy = PolicyArgs {
+        keep_latest: Some(2_147_483_647),
+        keep_hourly: Some(2_147_483_647),
+        keep_daily: Some(2_147_483_647),
+        keep_weekly: Some(2_147_483_647),
+        keep_monthly: Some(2_147_483_647),
+        keep_annual: Some(2_147_483_647),
+        ..Default::default()
+    };
+    assert_eq!(
+        policy_set_args("user@host", &policy),
+        vec![
+            "policy",
+            "set",
+            "user@host",
+            "--keep-latest",
+            "2147483647",
+            "--keep-hourly",
+            "2147483647",
+            "--keep-daily",
+            "2147483647",
+            "--keep-weekly",
+            "2147483647",
+            "--keep-monthly",
+            "2147483647",
+            "--keep-annual",
+            "2147483647",
+        ]
+    );
+    // Unset (the common case for a path-scoped policy) emits nothing.
+    assert_eq!(
+        policy_set_args("--global", &PolicyArgs::default()),
+        vec!["policy", "set", "--global"]
+    );
 }
 
 #[test]

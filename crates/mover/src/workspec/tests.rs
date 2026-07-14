@@ -782,6 +782,16 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     assert_eq!(args.max_parallel_snapshots, Some(4));
     // No per-policy splitter (ADR-0004 §4b).
     assert_eq!(args.splitter, None);
+    // M0b: the create-time retention `keep_*` pin is NOT user-configurable and
+    // never rides `PolicyArgsSpec` — `to_kopia()` must never populate it, even
+    // when every other knob is set (the mover applies the pin directly,
+    // separately, at the identity scope).
+    assert_eq!(args.keep_latest, None);
+    assert_eq!(args.keep_hourly, None);
+    assert_eq!(args.keep_daily, None);
+    assert_eq!(args.keep_weekly, None);
+    assert_eq!(args.keep_monthly, None);
+    assert_eq!(args.keep_annual, None);
 }
 
 /// A `SnapshotPolicySpec` with every optional policy surface left `None`/empty
