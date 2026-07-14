@@ -312,16 +312,19 @@ pub enum ValidationError {
 
     /// An UPDATE to a `SnapshotPolicy` would change its resolved kopia identity
     /// (`username@hostname`, or a source's path) while the policy already has snapshot
-    /// history. New snapshots would land under the new kopia source, orphaning the old
-    /// history — GFS retention treats them as separate sources and never prunes the
-    /// old set (a storage leak), and the new identity restarts retention from zero.
-    /// Rejected unless the change is acknowledged with the
+    /// history. New snapshots would land under the new kopia source: Kopiur's own GFS
+    /// retention pools ALL of a policy's `Snapshot` CRs regardless of identity, so the
+    /// old and new lineages don't get independent retention — they compete for the same
+    /// `keepLatest`/`keepDaily`/etc. buckets in one merged timeline, and restore/verify/
+    /// `fromPolicy` resolve only the new identity (the old lineage stays reachable via
+    /// `Restore.source.identity`). Rejected unless the change is acknowledged with the
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
         "this edit changes the policy's resolved kopia identity from {old:?} to {new:?}, but the \
-         policy already has snapshot history; new snapshots would orphan the old history (kopia \
-         treats them as a separate source and GFS retention never prunes the old set). To \
+         policy already has snapshot history; new snapshots would land under a new kopia source \
+         while the old lineage's Snapshot CRs keep competing in the same GFS retention timeline \
+         (not independent retention), and restore/verify resolve only the new identity. To \
          intentionally re-identify, set annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
@@ -340,15 +343,18 @@ pub enum ValidationError {
     /// `spec.identity` is), so this edit changes what each affected policy
     /// resolves to on its very next backup with **no per-policy edit** to
     /// acknowledge it. Exactly like [`Self::IdentityWouldFork`], new snapshots
-    /// would land under a new kopia source while the old history orphans (GFS
-    /// retention treats it as a separate source and never prunes the old set) —
-    /// but here it happens fleet-wide in one apply. Rejected unless the
-    /// repository carries the `kopiur.home-operations.com/allow-identity-change`
-    /// annotation ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
+    /// would land under a new kopia lineage while the old lineage's `Snapshot`
+    /// CRs keep competing with it in the same merged GFS retention timeline
+    /// (Kopiur pools a policy's CRs regardless of identity, so nothing is
+    /// independently retained) — but here it happens fleet-wide in one apply.
+    /// Rejected unless the repository carries the
+    /// `kopiur.home-operations.com/allow-identity-change` annotation
+    /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
         "this edit changes identityDefaults, which would re-identify {} — new snapshots would \
-         fork to a new kopia lineage while the old history stays under the old identity (GFS \
-         retention never prunes across the split). To intentionally re-identify, set annotation \
+         fork to a new kopia lineage while the old and new lineages keep competing in the same \
+         GFS retention timeline (not independent retention), and restore/verify resolve only the \
+         new identity. To intentionally re-identify, set annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value, e.g. \
          \"intentional\") on this repository; or pin an explicit spec.identity (both username \
          AND hostname) on the affected policies first",

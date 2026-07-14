@@ -4,14 +4,15 @@
 //! `hostnameExpr`, `usernameExpr`) is a CEL recipe every consumer `SnapshotPolicy`
 //! that doesn't override identity resolves against — and, like the rest of
 //! identity resolution, it is re-rendered from the LIVE repository on every
-//! reconcile/backup, not evaluated once and pinned (only an explicit
-//! per-policy `spec.identity.{username,hostname}` override is a fixed input;
-//! the repository's *defaults* are not). So editing `identityDefaults` on a
+//! reconcile/backup, not evaluated once and pinned — what's pinned instead is
+//! a directly-specified value (guarded per-policy by the fork guard) rather
+//! than a repository-derived default. So editing `identityDefaults` on a
 //! repository with consumers that already have snapshot
 //! history silently re-identifies all of them on their very next backup, with
 //! **no per-policy edit** to acknowledge it: new snapshots land under a new kopia
-//! source while the old history orphans (GFS retention treats it as a separate
-//! source and never prunes the old set). This closes that hole, mirroring
+//! lineage while the old lineage's `Snapshot` CRs keep competing with it in the
+//! same GFS retention timeline (Kopiur pools a policy's CRs regardless of
+//! identity — nothing is independently retained). This closes that hole, mirroring
 //! [`crate::identity_fork`]'s per-policy guard but fleet-wide.
 //!
 //! ## Pure core + thin IO (mirrors [`crate::identity_fork`] / [`crate::identity_collision`])

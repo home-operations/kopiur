@@ -925,7 +925,9 @@ mod tests {
         let resp = dispatch(&req, None).await;
         assert!(!resp.allowed, "path re-identification must be rejected");
         assert!(
-            resp.result.message.contains("orphan the old history"),
+            resp.result
+                .message
+                .contains("competing in the same GFS retention timeline"),
             "{:?}",
             resp.result.message
         );
