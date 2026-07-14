@@ -4,11 +4,12 @@
 //! `SnapshotPolicy` is *edited* so its resolved identity changes — renamed, a
 //! namespace/label change feeding an `identityDefaults` CEL expression, a hand-edited
 //! `spec.identity`, or a per-source `sourcePathOverride` change — new snapshots land
-//! under the **new** kopia source while the old history orphans: GFS retention treats
-//! them as separate sources and never prunes the old set (a storage leak), and the new
-//! identity restarts retention from zero. That is silent data-loss, so the webhook
-//! **rejects** such an edit unless the operator acknowledges it with the
-//! [`ALLOW_IDENTITY_CHANGE_ANNOTATION`].
+//! under the **new** kopia source while the old history stays under the old one:
+//! restore/verify/`fromPolicy` resolve the new identity (old history is reachable only
+//! via `Restore.spec.source.identity`), and old- and new-lineage `Snapshot` CRs keep
+//! competing in the policy's one GFS retention timeline. That is a silent
+//! re-identification, so the webhook **rejects** such an edit unless the operator
+//! acknowledges it with the [`ALLOW_IDENTITY_CHANGE_ANNOTATION`].
 //!
 //! ## Pure core + thin IO (mirrors [`crate::identity_collision`])
 //!

@@ -74,8 +74,10 @@ pub const RUN_MODE_ANNOTATION: &str = "kopiur.home-operations.com/run-mode";
 ///
 /// Without it, the webhook **rejects** the edit when it would re-identify
 /// (a) policy/(consumer policies) with existing snapshot history, because new
-/// snapshots land under a new kopia source and the old history is orphaned (GFS
-/// retention treats them as separate sources and never prunes the old set). Any
+/// snapshots land under a new kopia source: restore/verify/`fromPolicy` resolve
+/// the new identity (old history is reachable only via
+/// `Restore.spec.source.identity`), while old- and new-lineage `Snapshot` CRs
+/// keep competing in the policy's one GFS retention timeline. Any
 /// **non-empty** value acknowledges the re-identification for that admission
 /// (presence-only, mirroring [`SKIP_SNAPSHOT_CLEANUP_ANNOTATION`]; a specific
 /// value isn't required because an edit can change more than one identity

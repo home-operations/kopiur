@@ -191,11 +191,11 @@ identity:
 
 ///
 
-/// warning | Changing identity after there's history orphans it — two guards, one per surface
+/// warning | Changing identity after there's history forks the lineage — two guards, one per surface
 
 A snapshot's identity is its address in the repository, and because it's **re-resolved live** (above) rather than frozen at admission, either surface that feeds it can silently re-identify a policy — so both are guarded independently, at admission:
 
-- **Per-policy.** Edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, and new snapshots would land under the new address while the old ones orphan: Kopiur's own GFS retention pools **all** of a policy's `Snapshot` CRs into one timeline regardless of identity, so old- and new-lineage snapshots compete for the same `keepLatest`/`keepDaily`/etc. buckets instead of getting independent retention — and restore/verify/`fromPolicy` now resolve the new identity, so the old lineage is only reachable via `Restore.source.identity`. The webhook **rejects** such an edit.
+- **Per-policy.** Edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, and new snapshots would land under the new address while the old lineage stays behind: Kopiur's own GFS retention pools **all** of a policy's `Snapshot` CRs into one timeline regardless of identity, so old- and new-lineage snapshots compete for the same `keepLatest`/`keepDaily`/etc. buckets instead of getting independent retention — and restore/verify/`fromPolicy` now resolve the new identity, so the old lineage is only reachable via `Restore.source.identity`. The webhook **rejects** such an edit.
 - **Per-repository.** Edit a `Repository`/`ClusterRepository`'s `identityDefaults` (`cluster`, `hostnameExpr`, `usernameExpr`), and every consumer `SnapshotPolicy` that resolves through those defaults re-identifies **fleet-wide**, on each one's very next backup — with no per-policy edit of its own to acknowledge it. The webhook rejects this too. See [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel) for the full guard behavior (it lists every affected consumer, cluster-wide, in the rejection message).
 
 Both are acknowledged with the same annotation, set on the object you're editing (the `SnapshotPolicy` for the first case, the `Repository`/`ClusterRepository` for the second):
@@ -206,7 +206,7 @@ metadata:
     kopiur.home-operations.com/allow-identity-change: "intentional"  # any non-empty value
 ```
 
-Fixing the identity *before* the first successful snapshot (or, for a repository, before any consumer has history) is unrestricted — there is nothing to orphan yet.
+Fixing the identity *before* the first successful snapshot (or, for a repository, before any consumer has history) is unrestricted — there is nothing to re-identify yet.
 
 ///
 
