@@ -1231,11 +1231,14 @@ mod tests {
 
     #[tokio::test]
     async fn repository_identity_defaults_change_catches_cross_namespace_consumer() {
-        // The consumer LIST is cluster-wide (this fix): a policy in a
-        // DIFFERENT namespace than the edited Repository, referencing it via
-        // an explicit `RepositoryRef.namespace` (a documented, supported
-        // pattern — see `api::common::RepositoryRef`), must still be caught,
-        // not silently missed.
+        // The consumer LIST is cluster-wide: a policy in a DIFFERENT namespace
+        // than the edited Repository, referencing it via an explicit
+        // `RepositoryRef.namespace` (a documented, supported pattern — see
+        // `api::common::RepositoryRef`), must still be caught, not silently
+        // missed. This test exercises that end-to-end through `dispatch`; the
+        // actual scope guard — proving the underlying LIST request itself
+        // never gets namespace-scoped — is the URI-asserting
+        // `identity_repo_edit::affected_consumers_lists_cluster_wide`.
         let list_body = json!({
             "items": [{
                 "metadata": { "name": "pg", "namespace": "consumer-ns" },

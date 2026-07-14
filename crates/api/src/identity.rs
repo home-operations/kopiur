@@ -3,9 +3,17 @@
 //! Kopia records every snapshot under `username@hostname:sourcePath`. Kopiur makes
 //! that identity an explicit, overridable part of the API rather than an accident
 //! of `metadata.name`/`metadata.namespace` (ADR §2.2 principle 9). This module is
-//! the single place the defaulting + templating rules live; the webhook calls it at
-//! admission and pins the result into `status.resolved.identity`, which is **never
-//! re-rendered** afterwards (ADR §4.2).
+//! the single place the defaulting + templating rules live. The webhook calls it
+//! at admission (so a bad expression/component is rejected on `kubectl apply`) and
+//! the controller calls it again on every reconcile, resolving from the LIVE
+//! `SnapshotPolicy.spec.identity` and the LIVE referenced repository's
+//! `identityDefaults` — **not** a value pinned once and frozen. `status.resolved.identity`
+//! mirrors the most recent resolution for observability; it is not the source of
+//! truth a later run reads back. What actually keeps an already-snapshotted policy
+//! stable is the fork guard (`ValidationError::IdentityWouldFork`/
+//! `RepositoryIdentityWouldFork`): an edit that would change the resolved identity
+//! on a policy (or repository) with existing history is rejected at admission
+//! unless acknowledged with the `allow-identity-change` annotation.
 //!
 //! ## Defaults (ADR §4.2)
 //! - `username` ← `SnapshotPolicy.metadata.name`
@@ -16,9 +24,13 @@
 //!
 //! A [`crate::common::IdentityDefaults`] (`Repository.spec.identityDefaults` or
 //! `ClusterRepository.spec.identityDefaults`) supplies `hostnameExpr`/
-//! `usernameExpr`, **CEL** expressions ([`cel`]) evaluated at admission
-//! (ADR-0004 §5). A consumer's explicit [`Identity`] override **always wins**
-//! over the expression.
+//! `usernameExpr`, **CEL** expressions ([`cel`]) validated (compiled + trial-evaluated
+//! via [`validate_identity_expr`]) at admission, then actually rendered against the
+//! LIVE consumer + LIVE repository on every reconcile (ADR-0004 §5) — so editing
+//! `identityDefaults` re-renders every consumer that resolves through it on its
+//! next backup (guarded by [`ValidationError::RepositoryIdentityWouldFork`], see
+//! the module intro above). A consumer's explicit [`Identity`] override **always
+//! wins** over the expression.
 //!
 //! ### CEL environment
 //!
@@ -67,8 +79,11 @@ pub struct IdentityInputs<'a> {
     pub namespace: &'a str,
     /// Explicit overrides from `SnapshotPolicy.spec.identity`, if any.
     pub overrides: Option<&'a Identity>,
-    /// The referenced repository's `spec.identityDefaults` (CEL `*Expr`) —
-    /// `Repository` or `ClusterRepository`, whichever the consumer targets.
+    /// The referenced repository's `spec.identityDefaults` — `Repository` or
+    /// `ClusterRepository`, whichever the consumer targets. Carries the CEL
+    /// `*Expr` pair (`hostnameExpr`/`usernameExpr`) AND `cluster`, the
+    /// multi-cluster hostname-default suffix (see [`IdentityDefaults::cluster`]
+    /// and the module's "Multi-cluster hostname default" section).
     pub defaults: Option<&'a IdentityDefaults>,
     /// The consumer's `metadata.labels`, exposed to CEL as `labels`.
     pub labels: Option<&'a BTreeMap<String, String>>,

@@ -38,6 +38,7 @@ snapshot means matching that identity. See [How Kopia works](../concepts/how-kop
 | 06  | [Backup verification / restore drills](verification-drills.md)     | Prove backups are restorable on a schedule, and alert when one isn't. | Advanced   |
 | 07  | [Point-in-time rollback](point-in-time-rollback.md)                | Roll a volume back to a specific known-good moment (`asOf`/`offset`).  | Simple     |
 | 08  | [Clone an app into another namespace](clone-app-to-namespace.md)   | Copy prod data into staging/preview to reproduce a bug or seed an env.| Advanced   |
+| 09  | [Share one repository across clusters](shared-repository-multi-cluster.md) | Several clusters back up to (or restore from) the SAME repository at once, safely. | Advanced   |
 
 /// warning | Alpha
 

@@ -49,12 +49,20 @@ spec:
       - payments
       - identity
       - media
-  # CEL expressions evaluated at admission, pinned to status. The
-  # CEL environment is `namespace`, `policyName`, `labels`, `annotations` (the
-  # consuming SnapshotPolicy's metadata). Each *Expr returns a string.
+  # CEL expressions, validated at admission, then rendered against the LIVE
+  # consumer on every reconcile. The CEL environment is `namespace`,
+  # `policyName`, `labels`, `annotations`, `cluster` (the consuming
+  # SnapshotPolicy's metadata + this repo's `cluster` below). Each *Expr
+  # returns a string.
   identityDefaults:
     hostnameExpr: "namespace"
     usernameExpr: "namespace + '-' + policyName"
+    # Uncomment to share THIS repository across multiple clusters (an RFC 1123
+    # label, <=32 chars, no dots): flips the no-hostnameExpr default hostname to
+    # <namespace>.<cluster>, feeds the `cluster` CEL variable above, and
+    # cluster-qualifies the managed Maintenance lease so clusters never fight
+    # over it. See docs/scenarios/shared-repository-multi-cluster.md.
+    # cluster: east
   # Maintenance is default-managed here too. Because Maintenance is namespaced
   # but a ClusterRepository is not, `namespace` selects where the managed
   # Maintenance CR lands; it defaults to the operator's own namespace

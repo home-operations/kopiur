@@ -382,9 +382,9 @@ Phases: `Pending` → `Initializing` → **`Ready`** (healthy). `Degraded` means
 
 ## ClusterRepository: a shared repository
 
-A `ClusterRepository` is the same backend/encryption surface, made cluster-scoped and shared. A platform team defines it once; tenant namespaces reference it by name (`repository: { kind: ClusterRepository, name: … }`) without seeing the backend or credentials. Two extra fields make sharing safe:
+A `ClusterRepository` is the same backend/encryption surface, made cluster-scoped and shared. A platform team defines it once; tenant namespaces reference it by name (`repository: { kind: ClusterRepository, name: … }`) without seeing the backend or credentials. One extra field makes cross-namespace sharing safe (`allowedNamespaces`, below) — `identityDefaults` isn't actually ClusterRepository-exclusive: a namespaced `Repository` has it too (it's documented here because a shared repo is where you reach for it most), for the same reason — many `SnapshotPolicy`s, or more than one cluster ([`cluster`](#identitydefaultscluster--sharing-one-repository-across-clusters) below), writing to one repository.
 
-### `allowedNamespaces` — who may use it
+### `allowedNamespaces` — who may use it (ClusterRepository only)
 
 A tenancy gate, enforced on every consumer CR (externally tagged — exactly one form):
 
@@ -397,7 +397,7 @@ spec:
 
 ### `identityDefaults` — per-tenant identity (CEL)
 
-kopia records every snapshot under `username@hostname:path`. For a shared repo you usually want each tenant's snapshots distinguishable. `identityDefaults` are **CEL expressions** (`*Expr`, the kromgo `valueExpr`/`colorExpr` convention), evaluated at admission and pinned to status; a consumer's explicit `spec.identity` always wins.
+kopia records every snapshot under `username@hostname:path`. For a shared repo you usually want each tenant's snapshots distinguishable. `identityDefaults` are **CEL expressions** (`*Expr`, the kromgo `valueExpr`/`colorExpr` convention): syntax, return type, and variable scope are **validated at admission** (`kubectl apply` rejects a bad expression immediately), but the expression is actually **rendered against the live consumer on every reconcile** — it is not evaluated once and pinned. A consumer's explicit `spec.identity` always wins.
 
 ```yaml
 spec:
@@ -416,6 +416,7 @@ The CEL **environment** is the consuming `SnapshotPolicy`'s metadata:
 | `policyName` | string | the SnapshotPolicy's name |
 | `labels` | map | `metadata.labels` |
 | `annotations` | map | `metadata.annotations` |
+| `cluster` | string | `identityDefaults.cluster` (below), or `""` when unset |
 
 Each `*Expr` must return a **string**. Conditionals and map access come for free:
 
@@ -427,7 +428,29 @@ identityDefaults:
 
 /// note | How `*Expr` evaluation is bounded
 
-Each `*Expr` is a CEL expression returning a **string**. CEL is sandboxed (no I/O, no arbitrary code) and the expression is **validated at admission** — a syntax error, a wrong return type, or a reference to a variable outside the documented environment (`namespace`/`policyName`/`labels`/`annotations`) is rejected on `kubectl apply`, not discovered at backup time. Evaluation is bounded by CEL's cost budget, and each expression is capped at ~1 KiB.
+Each `*Expr` is a CEL expression returning a **string**. CEL is sandboxed (no I/O, no arbitrary code) and the expression is **validated at admission** — a syntax error, a wrong return type, or a reference to a variable outside the documented environment (`namespace`/`policyName`/`labels`/`annotations`/`cluster`) is rejected on `kubectl apply`, not discovered at backup time. Evaluation is bounded by CEL's cost budget, and each expression is capped at ~1 KiB.
+
+///
+
+### `identityDefaults.cluster` — sharing one repository across clusters
+
+`cluster` is a distinct knob from the two CEL expressions above: an RFC 1123 label, **at most 32 characters**, with **no dots** (a dot is the delimiter `identityDefaults.cluster` reserves to split a hostname back into its namespace and cluster parts on the read path, so an embedded dot is rejected outright at admission rather than risked). Set it once per cluster that shares this repository:
+
+```yaml
+spec:
+    identityDefaults:
+        cluster: east # this cluster's identity suffix
+```
+
+Setting it changes three things:
+
+1. **The default hostname.** With no `hostnameExpr` and no consumer override, the default kopia identity hostname becomes `<namespace>.<cluster>` instead of bare `<namespace>` — so two clusters backing up same-named namespaces (`billing` in `east` and `billing` in `west`) write distinct identities and never collide or cross-prune each other's snapshots. See [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath).
+2. **The CEL variable `cluster`.** Available to `hostnameExpr`/`usernameExpr` above (e.g. `hostnameExpr: "namespace + '.' + cluster"` — equivalent to the default, spelled out explicitly, or a starting point for a custom scheme).
+3. **Foreign-snapshot classification and the maintenance lease.** Once set, the catalog scan can tell "written by this cluster" from "written by another cluster sharing this repository" (`catalog.foreignSnapshots`, [above](#the-catalog--discovered-snapshots)), and the operator-managed `Maintenance`'s lease becomes cluster-qualified so two clusters never fight over who runs maintenance. See [Maintenance → Ownership and shared repositories](maintenance.md#ownership-and-shared-repositories).
+
+/// warning | Setting or changing `cluster` on a repository with consumer history is an identity change
+
+If any consumer `SnapshotPolicy` already has snapshot history, setting `identityDefaults.cluster` for the first time — or changing it — silently re-identifies every consumer that resolves the default hostname (no `hostnameExpr`, no per-policy `identity` override): new snapshots land under `<namespace>.<cluster>` while the old history stays under bare `<namespace>`, and GFS retention never prunes across that split. The webhook **rejects** this edit fleet-wide, exactly like any other `identityDefaults` change (see [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath)) — acknowledge it with the `allow-identity-change` annotation once you've read the consequences. For turning on multi-cluster sharing on a repository that's already in use, follow [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md), which walks the safe order of operations end to end.
 
 ///
 
@@ -464,7 +487,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `create.enabled`                                       | Whether to initialize a new repository.           |
 | `backend.s3.tls.disableTls`                            | Plain-HTTP endpoints (in-cluster MinIO/RustFS).   |
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
-| `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`).       |
+| `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`) and, for a repository shared across clusters, `cluster`. |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
 | `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|

@@ -599,9 +599,14 @@ spec:
                     type: string
                   foreignSnapshots:
                     description: |-
-                      How catalog discovery treats snapshots written by ANOTHER cluster — an
-                      identity hostname carrying a different `.<cluster>` suffix, or a bare
-                      hostname naming no allowed namespace here (see `classify_hostname`).
+                      How catalog discovery treats snapshots written by ANOTHER cluster.
+                      `status.catalog.foreignSnapshotCount` counts an identity hostname carrying
+                      a different `.<cluster>` suffix ALWAYS, under either value below, plus —
+                      under `Ignore` only — a bare hostname naming no allowed namespace here.
+                      Under `Fallback`, that same disallowed bare host is NOT counted foreign:
+                      it materializes into `catalog.fallbackNamespace` exactly like a disallowed
+                      `OwnCluster` host would, so it is placed rather than dropped-and-counted
+                      (see `classify_hostname`/`decide_cluster_placement`).
                       Meaningful only when `identityDefaults.cluster` is set: without a cluster
                       identity there is no notion of "foreign" and the legacy
                       hostname-names-a-namespace placement applies (validators enforce this).

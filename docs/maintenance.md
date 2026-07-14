@@ -142,7 +142,8 @@ With no maintenance, the repository never garbage-collects, so storage grows wit
 
 kopia tracks a single **maintenance owner** per repository. When several clusters (or operators) share one repository, only one should run maintenance at a time. `spec.ownership` encodes who that is and what to do on conflict:
 
-- `owner` — a stable identity string for this `Maintenance`.
+- `owner` — a stable identity string for this `Maintenance` (the operator derives it for a managed `Maintenance`; see the lease format below).
+- `ownerAliases` — previous lease strings still recognized as **self** (the lease-format migration path, below).
 - `takeoverPolicy` — a closed enum:
 
 | Policy                      | Behavior when another owner holds the lease                    |
@@ -153,13 +154,44 @@ kopia tracks a single **maintenance owner** per repository. When several cluster
 
 The lease is read inside the maintenance Job (which is the only place with repository access for object stores). If the policy declines to take over, the run is a successful no-op that records why on the resource's conditions.
 
+### The lease string and kopia's recorded owner
+
+Every default-managed `Maintenance` derives its lease string (`spec.ownership.owner`) from the repository it covers. The format depends on whether the repository has [`identityDefaults.cluster`](repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters) set — a repository shared across clusters needs a **distinct lease per cluster**, or every cluster would derive the identical lease and fight over it:
+
+| Repository kind     | Cluster identity | Lease string (`spec.ownership.owner`)  | kopia's recorded owner (`user@hostname`)      |
+| -------------------- | ----------------- | --------------------------------------- | ----------------------------------------------- |
+| `Repository`         | unset              | `kopiur/<namespace>/<name>`             | `kopiur@kopiur-<namespace>-<name>`             |
+| `Repository`         | `east`             | `kopiur/east/<namespace>/<name>`        | `kopiur@kopiur.east.<namespace>.<name>`        |
+| `ClusterRepository`  | unset              | `kopiur/clusterrepository/<name>`       | `kopiur@kopiur-clusterrepository-<name>`       |
+| `ClusterRepository`  | `east`             | `kopiur/east/clusterrepository/<name>`  | `kopiur@kopiur.east.clusterrepository.<name>`  |
+
+/// note | Why the cluster-qualified owner is dot-joined, not dash-joined
+
+A single-cluster lease sanitizes to one dash-joined DNS label (`kopiur-media-nas`), unchanged from before multi-cluster support. A cluster-qualified lease is instead dot-joined **per segment** (`kopiur.east.media.nas`). This dot-join only ever applies to a lease the operator itself generated — its first path segment is the literal, reserved `kopiur` — so a hand-authored `spec.ownership.owner` you write yourself always falls back to the single dash-joined form; its derivation can never change across an upgrade merely because it happens to also split into four segments.
+
+///
+
+### `ownerAliases` — carrying ownership across a lease-format change
+
+`spec.ownership.ownerAliases` lists previous lease strings kopiur should still recognize as **itself**. This is the migration path for turning `identityDefaults.cluster` on for the first time on a repository that already has a managed `Maintenance`: the operator automatically records the pre-cluster lease as an alias on every managed `Maintenance` for a cluster-identified repository, so a run recognizes kopia's already-recorded owner as its own and **claims and re-stamps** it to the new cluster-qualified format, instead of yielding to what would otherwise look like a foreign owner. You don't set this by hand for a managed `Maintenance` — only a standalone one needs it authored explicitly if you hand-roll the same migration.
+
+## Sharing one repository's maintenance across clusters: pick ONE owner
+
+kopia has no cross-host lock beyond this lease, so when several clusters' `Repository`/`ClusterRepository` objects all point at the **same physical repository**, each cluster's independently-managed `Maintenance` tries to claim the same lease. The default (`takeoverPolicy: Never`) makes that safe — every cluster but the current holder yields — but it isn't the recommended steady state once you know which cluster should own it:
+
+- **Pick the one cluster** that runs maintenance for the shared repository (kopia doesn't care which).
+- On every **other** cluster, set `spec.maintenance.enabled: false` on that repository — the operator stops creating/reconciling a `Maintenance` there at all, instead of one that exists only to yield forever.
+- **Remove `takeoverPolicy: Force` from every cluster except the owner.** `Force` unconditionally seizes the lease on its next run; leave it set on more than one cluster and they fight over it every reconcile, each re-seizing it from the other. Set `Force` only on the one cluster you intend to own it, and only long enough to claim the lease once — then revert it to `Never`.
+
+Yielding is the **safety net**, not the recommended posture: a non-owner cluster left with maintenance enabled just yields loudly (`Ready=False`, reason `MaintenanceYielding`) rather than fighting for the lease or touching data — but the loud yielding (and a mover Job that runs for nothing every cron slot) is exactly why the explicit `enabled: false` posture above is preferred once you know the owner. See [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) for the full walkthrough, with this step placed in the correct order relative to the identity flip.
+
 ### Self-healing a stale owner
 
-kopia stamps a maintenance owner when a repository is **created**. kopiur stamps its own stable, lease-derived owner (e.g. `kopiur@kopiur-clusterrepository-nas`) so that every maintenance Job — each from a fresh, throwaway pod — recognizes itself as the owner and runs.
+kopia stamps a maintenance owner when a repository is **created**. kopiur stamps its own stable, lease-derived owner (the table above) so that every maintenance Job — each from a fresh, throwaway pod — recognizes itself as the owner and runs. On every bootstrap (initial connect and each catalog refresh), if the recorded owner doesn't match, kopiur may re-stamp it (`kopia maintenance set --owner` is not owner-gated) — how readily depends on whether the repository has a cluster identity:
 
-A repository created by an **older** kopiur (or by another tool) can instead carry kopia's auto-assigned **ephemeral** pod identity as the owner (e.g. `nonroot@nas-bootstrap-5trlr`). With the default `takeoverPolicy: Never`, every maintenance run then sees a "foreign" owner and yields **forever** — full maintenance never compacts, and index blobs pile up (see below).
-
-kopiur now **self-heals this automatically**: on every bootstrap (initial connect and each catalog refresh), if the recorded owner doesn't match the stable lease owner, the operator re-stamps it (`kopia maintenance set --owner` is not owner-gated). No manual intervention is needed. `takeoverPolicy: Force` remains available as an immediate, one-time override if you'd rather not wait for the next bootstrap cycle.
+- **No `identityDefaults.cluster` (single-cluster repository).** Self-healing is unchanged from before multi-cluster support: any stale owner is re-stamped unconditionally. Safe, because at most one cluster's operator ever bootstraps this repository — a stale owner can only be kopia's own ephemeral create-time identity (e.g. `nonroot@nas-bootstrap-5trlr`) or an older-format stamp from this same operator, never another cluster's.
+- **`identityDefaults.cluster` set (shared repository).** Self-heal restamps **only** an owner that is empty, already the desired owner, or matches a recognized [`ownerAliases`](#owneraliases--carrying-ownership-across-a-lease-format-change) entry — i.e. only this cluster's own current or legacy formats. A **foreign cluster's owner is always honored** and left completely alone: with the unconditional rule, every cluster sharing the repository would see the OTHER's owner as "stale" and re-claim it on its own next bootstrap, ping-ponging the lease back and forth forever.
+- The tradeoff: an **ancient owner** this operator has never recognized before — a workstation `kopia` CLI, or any owner string that isn't this cluster's current lease or a registered alias — is left alone rather than auto-clobbered, even though it may genuinely be stale. Move it with a **one-time** `spec.ownership.takeoverPolicy: Force` (or `kopia maintenance set --owner` by hand); once claimed, this operator's own lease-derived owner is recognized on every subsequent run, so no further manual steps are needed. Revert `Force` to `Never` right after — see the "pick ONE owner" section above for why leaving it set is unsafe on a shared repository.
 
 ## Index-blob health
 
@@ -293,3 +325,5 @@ $ kubectl get jobs -n billing -l app.kubernetes.io/component=maintenance
 
 - [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml) — a standalone `Maintenance`.
 - [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml) — inline `spec.maintenance`.
+- [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) — the full multi-cluster walkthrough, including the maintenance-ownership steps above in their correct order.
+- [Troubleshooting → Maintenance isn't running](troubleshooting.md#maintenance-isnt-running) — `LeaseHeldByOther` on a shared repository: expected vs. stale.

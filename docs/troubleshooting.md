@@ -346,6 +346,20 @@ the operator claims the lease, then revert to `Never`.
 additionally records slots that were handled by *yielding*). See the
 [Maintenance guide](maintenance.md) for ownership and the schedule model.
 
+### `LeaseHeldByOther` on a repository shared across clusters — expected, or stale?
+
+On a repository with [`identityDefaults.cluster`](repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters)
+set, `LeaseOwned=False, reason=LeaseHeldByOther` on every cluster **except one**
+is the expected steady state, not a symptom — see
+[Maintenance → pick ONE owner](maintenance.md#sharing-one-repositorys-maintenance-across-clusters-pick-one-owner).
+Tell expected apart from genuinely stale by reading `status.ownership.owner` —
+the holder this run yielded to:
+
+| `status.ownership.owner` names… | Meaning | Fix |
+| --- | --- | --- |
+| Another cluster's lease-derived owner (`kopiur@kopiur.<cluster>.<namespace-or-clusterrepository>.<name>`) | Expected — that cluster owns maintenance for this repository and this one is correctly yielding. | Nothing broken. Prefer `spec.maintenance.enabled: false` on this (non-owner) cluster's repository to silence the recurring yield instead of leaving it noisy every cron slot. |
+| An owner that matches no cluster's current lease format (an ephemeral bootstrap identity, a workstation `kopia` CLI, or a pre-multi-cluster stamp the [self-heal](maintenance.md#self-healing-a-stale-owner) doesn't recognize) | Genuinely stale. | Set `spec.ownership.takeoverPolicy: Force` **once**, on the ONE cluster meant to own it, then revert to `Never`. Never leave `Force` set on more than one cluster sharing the repository — they'll fight over the lease every reconcile. |
+
 ## kopia web UI ([`spec.server`](server.md)) won't come up or can't be reached
 
 The server is a `Deployment` + `Service` named `<repo>-kopia-ui`, created once the

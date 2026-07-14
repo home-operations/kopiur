@@ -806,7 +806,12 @@ async fn pin_start_anchor(
 /// After a pin/unpin, re-resolve the snapshot's CURRENT manifest id (kopia
 /// rewrote it) into a `SnapshotInfo` for `status.snapshot`. Matches on the
 /// snapshot's stable source path (anchor, else the resolved identity) plus the
-/// pre-pin start-time anchor. `None` when unresolvable or ambiguous.
+/// pre-pin start-time anchor, narrowed by `op.anchor.identity_filter()`
+/// (`username`/`hostname`) when the anchor carries one — required so a shared
+/// repository never cross-matches another namespace's or cluster's snapshot
+/// that happens to share the exact same source path (see
+/// `kopiur_mover::resolve::match_current_manifest`). `None` when unresolvable
+/// or ambiguous.
 async fn resolve_pinned_info(
     client: &KopiaClient,
     op: &SnapshotPinOp,

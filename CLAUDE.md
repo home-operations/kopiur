@@ -69,8 +69,13 @@ add controller-runtime dependencies to `crates/api`.
 3. **Sub-objects, not leaf fields**, for every credential/policy/identity/schedule
    surface, so future fields slot in without API breakage.
 4. **Optionals**: `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-   Status always pins `resolved.*` values (identity resolved at admission, never
-   re-rendered).
+   Status always pins `resolved.*` values, but for identity that pin is a
+   mirror, not a freeze: kopia identity re-resolves from the LIVE spec +
+   LIVE repository `identityDefaults` on every reconcile (`status.resolved.identity`
+   reflects the latest resolution). What actually keeps an already-snapshotted
+   policy/repository from silently re-identifying is the admission-time fork
+   guard (`IdentityWouldFork`/`RepositoryIdentityWouldFork`), acknowledged via
+   the `allow-identity-change` annotation — not a one-time pin.
 5. **Tests parse YAML the cluster's way**: YAML → `serde_json::Value` → typed
    (see `crates/api/src/lib.rs::testutil::from_yaml`). Never `serde_yaml::from_str`
    directly into a typed value — serde_yaml 0.9 mis-encodes externally-tagged enums.

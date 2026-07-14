@@ -169,10 +169,10 @@ kopia's `snapshot create` normally applies its own retention after every backup,
 
 ### Identity — what kopia records (`username@hostname:path`)
 
-kopia stores every snapshot under an identity. Kopiur resolves it **once at admission** and pins it to status; it is never re-rendered. The defaults:
+kopia stores every snapshot under an identity. Kopiur **re-resolves it from the live spec on every run** — the live `SnapshotPolicy.spec.identity` plus the live referenced repository's `identityDefaults` — not once at admission and frozen. `status.resolved.identity` mirrors the most recent resolution rather than being the source of truth a later run reads back. The defaults:
 
 - `username` ← the `SnapshotPolicy` name
-- `hostname` ← the namespace
+- `hostname` ← the namespace — or `<namespace>.<cluster>` when the repository has [`identityDefaults.cluster`](repositories.md#identitydefaults--per-tenant-identity-cel) set (a repository shared across clusters)
 - `sourcePath` ← `/pvc/<pvcName>` for a PVC source, or the export `path` for an `nfs` source
 
 Override either part when you need stable identities across renames or clusters:
@@ -183,7 +183,7 @@ identity:
     hostname: billing
 ```
 
-(For a shared `ClusterRepository`, the repo can supply identity _CEL expressions_ so tenants get distinct identities automatically — see [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel). An explicit `identity` here always wins.)
+(For a shared `ClusterRepository`, the repo can supply identity _CEL expressions_ — and, for multi-cluster, a `cluster` suffix — so tenants get distinct identities automatically — see [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel). An explicit `identity` here always wins.)
 
 /// warning | Identity strings must round-trip through kopia
 
@@ -191,9 +191,14 @@ identity:
 
 ///
 
-/// warning | Changing a policy's identity after it has snapshots orphans the old history
+/// warning | Changing identity after there's history orphans it — two guards, one per surface
 
-A snapshot's identity is its address in the repository. If you edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, new snapshots land under the new address and the old ones are orphaned: GFS retention treats them as a separate source and never prunes them, and the new identity restarts retention from zero. To stop silent data loss the webhook **rejects** such an edit. If the re-identification is intentional, acknowledge it with the annotation:
+A snapshot's identity is its address in the repository, and because it's **re-resolved live** (above) rather than frozen at admission, either surface that feeds it can silently re-identify a policy — so both are guarded independently, at admission:
+
+- **Per-policy.** Edit `identity` (or a source's `sourcePathOverride`) on a `SnapshotPolicy` that has **already produced snapshots**, and new snapshots would land under the new address while the old ones orphan: GFS retention treats them as a separate source and never prunes them, and the new identity restarts retention from zero. The webhook **rejects** such an edit.
+- **Per-repository.** Edit a `Repository`/`ClusterRepository`'s `identityDefaults` (`cluster`, `hostnameExpr`, `usernameExpr`), and every consumer `SnapshotPolicy` that resolves through those defaults re-identifies **fleet-wide**, on each one's very next backup — with no per-policy edit of its own to acknowledge it. The webhook rejects this too. See [Repositories → identityDefaults](repositories.md#identitydefaults--per-tenant-identity-cel) for the full guard behavior (it lists every affected consumer, cluster-wide, in the rejection message).
+
+Both are acknowledged with the same annotation, set on the object you're editing (the `SnapshotPolicy` for the first case, the `Repository`/`ClusterRepository` for the second):
 
 ```yaml
 metadata:
@@ -201,7 +206,7 @@ metadata:
     kopiur.home-operations.com/allow-identity-change: "intentional"  # any non-empty value
 ```
 
-Fixing the identity *before* the first successful snapshot is unrestricted (there is no history to orphan).
+Fixing the identity *before* the first successful snapshot (or, for a repository, before any consumer has history) is unrestricted — there is nothing to orphan yet.
 
 ///
 
