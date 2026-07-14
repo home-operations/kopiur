@@ -938,6 +938,63 @@ fn bootstrap_maintenance_owner_plan_with_cluster_is_own_formats_only_with_legacy
     assert_eq!(aliases, vec!["kopiur@kopiur-apps-nas".to_string()]);
 }
 
+/// M6 regression (fix round 1): the in-process create path must stamp the
+/// desired owner UNCONDITIONALLY — never defer to `maintenance_restamp_target`
+/// with a hardcoded `created: false`, which under `OwnFormatsOnly` (whenever
+/// `cluster` is set) would refuse to restamp a freshly-created repo's
+/// kopia-assigned ephemeral owner forever. The create-vs-connect distinction
+/// is the entire point of this test, exercised across both the cluster-qualified
+/// and legacy owner shapes.
+#[test]
+fn in_process_create_owner_target_covers_the_create_vs_connect_matrix() {
+    // created=true stamps the cluster-qualified owner unconditionally.
+    let (desired, _, _) = bootstrap_maintenance_owner_plan(
+        RepositoryKind::Repository,
+        "apps",
+        "nas",
+        Some("east"),
+        false,
+    );
+    assert_eq!(
+        in_process_create_owner_target(true, desired.as_deref()),
+        Some("kopiur@kopiur.east.apps.nas")
+    );
+
+    // created=true stamps the legacy owner unconditionally when cluster is unset.
+    let (desired, _, _) =
+        bootstrap_maintenance_owner_plan(RepositoryKind::Repository, "apps", "nas", None, false);
+    assert_eq!(
+        in_process_create_owner_target(true, desired.as_deref()),
+        Some("kopiur@kopiur-apps-nas")
+    );
+
+    // created=false (connect-to-existing) always defers to the self-heal path,
+    // regardless of cluster.
+    for cluster in [None, Some("east")] {
+        let (desired, _, _) = bootstrap_maintenance_owner_plan(
+            RepositoryKind::Repository,
+            "apps",
+            "nas",
+            cluster,
+            false,
+        );
+        assert_eq!(
+            in_process_create_owner_target(false, desired.as_deref()),
+            None,
+            "cluster={cluster:?}"
+        );
+    }
+
+    // Suppressed (desired=None) never stamps, regardless of created.
+    for created in [true, false] {
+        assert_eq!(
+            in_process_create_owner_target(created, None),
+            None,
+            "created={created}"
+        );
+    }
+}
+
 #[test]
 fn maintenance_action_covers_the_matrix() {
     use MaintenanceAction::*;

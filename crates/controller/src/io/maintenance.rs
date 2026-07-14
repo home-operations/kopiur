@@ -303,6 +303,37 @@ pub fn bootstrap_maintenance_owner_plan(
     }
 }
 
+/// The maintenance owner an in-process (bare-path filesystem) `Repository`
+/// reconcile should stamp UNCONDITIONALLY on the pass that just CREATED the
+/// repository — mirrors the mover's create-path stamp
+/// (`crates/mover/src/main.rs`) exactly: kopia auto-assigns the controller
+/// pod's ephemeral identity as owner on `repository create`, and nothing
+/// recognizes that owner yet, so there is no staleness check to apply. This is
+/// distinct from — and takes priority over — the connect-to-existing
+/// self-heal, which must instead go through [`maintenance_restamp_target`]
+/// against the repository's already-recorded owner so it never clobbers a
+/// legitimate foreign one.
+///
+/// Returns `None` on a connect-to-existing pass (`created: false`) so the
+/// caller falls through to the self-heal path, and also returns `None`
+/// whenever `desired` is `None` — stamping is suppressed altogether
+/// (ReadOnly / `spec.maintenance.enabled: false` / foreign-covered) —
+/// regardless of `created`.
+///
+/// Fixes an M6 regression: the in-process create path used to hardcode
+/// `created: false` into `maintenance_restamp_target` even right after its own
+/// create, so a freshly-created bare-path `Repository` with
+/// `identityDefaults.cluster` set recorded the ephemeral pod identity as
+/// owner, and `RestampPolicy::OwnFormatsOnly` (required once `cluster` is set)
+/// refused to ever restamp it (the recorded owner is neither empty nor a
+/// recognized alias) — the managed `Maintenance`'s `takeoverPolicy: Never`
+/// then yielded forever. Pre-M6 self-healed this unconditionally; hand-authored
+/// owners are a separate concern (see [`bootstrap_maintenance_owner_plan`]'s
+/// `suppress` gate).
+pub fn in_process_create_owner_target(created: bool, desired: Option<&str>) -> Option<&str> {
+    if created { desired } else { None }
+}
+
 /// Build the operator-managed `Maintenance` CR projected from a repository's
 /// `spec.maintenance` (ADR §3.7). Pure — the reconciler server-side-applies the
 /// result. Naming is 1:1 with the repository (at most one `Maintenance` per

@@ -272,8 +272,9 @@ const CLUSTER_HOSTNAME_MAX: usize = 253;
 /// lease STRING, never the CR it came from, so the rule must be derivable from
 /// the string alone):
 ///
-/// * **Exactly 4 `/`-separated segments** — [`managed_lease`]'s two
-///   cluster-qualified formats (`kopiur/{cluster}/{namespace}/{name}`,
+/// * **Exactly 4 `/`-separated segments, AND the first is literally `"kopiur"`**
+///   — [`managed_lease`]'s two cluster-qualified formats
+///   (`kopiur/{cluster}/{namespace}/{name}`,
 ///   `kopiur/{cluster}/clusterrepository/{name}`) — sanitize each segment
 ///   INDEPENDENTLY (the same character rule, but with no per-segment cap and
 ///   without ever crossing a segment boundary) and join with `.`. Every
@@ -290,11 +291,25 @@ const CLUSTER_HOSTNAME_MAX: usize = 253;
 ///   [`CLUSTER_HOSTNAME_MAX`] (253, the identity-hostname byte cap enforced by
 ///   [`crate::validate::validate_identity_component`]), which cluster (≤32) +
 ///   two Kubernetes names + `"kopiur"` cannot reach in practice.
-/// * **Any other shape** (the legacy 3-segment formats, or a hand-authored
-///   `Ownership.owner`/alias) — the ORIGINAL whole-string sanitizer: collapse
-///   the entire lease through the same character rule and cap at
-///   [`LEGACY_HOSTNAME_MAX`] (63, a DNS label). Byte-identical to every
-///   pre-M6 lease this function has ever produced.
+///
+///   The `"kopiur"`-first-segment check matters because [`managed_lease`] is
+///   NOT the only source of lease strings: `Ownership.owner` is a free-form
+///   field a user can hand-author, and a hand-authored value that HAPPENS to
+///   have 4 `/`-separated segments (e.g. `a/b/c/d`) is not one of our
+///   generated formats at all. Gating the dot-join on the reserved `"kopiur"`
+///   prefix — which [`managed_lease`] always emits and a user has no reason to
+///   — guarantees a hand-authored owner's derivation can never change across
+///   an operator upgrade merely because it happens to split into 4 segments;
+///   it always falls to the legacy whole-string sanitizer below, exactly as it
+///   did pre-M6. Without this gate, such an owner would silently switch from
+///   its `a-b-c-d` identity to `a.b.c.d`, and with `takeoverPolicy: Never` the
+///   repository's maintenance would then yield forever.
+/// * **Any other shape** (the legacy 3-segment formats, a 4-segment lease NOT
+///   `"kopiur"`-prefixed, or any other hand-authored `Ownership.owner`/alias)
+///   — the ORIGINAL whole-string sanitizer: collapse the entire lease through
+///   the same character rule and cap at [`LEGACY_HOSTNAME_MAX`] (63, a DNS
+///   label). Byte-identical to every pre-M6 lease this function has ever
+///   produced.
 ///
 /// ```
 /// use kopiur_api::maintenance::kopia_lease_identity;
@@ -305,10 +320,17 @@ const CLUSTER_HOSTNAME_MAX: usize = 253;
 ///     ("kopiur".to_string(), "kopiur-media-nas".to_string())
 /// );
 ///
-/// // Cluster-qualified (4-segment): dot-joined, segment-preserving.
+/// // Cluster-qualified (4-segment, "kopiur"-prefixed): dot-joined, segment-preserving.
 /// assert_eq!(
 ///     kopia_lease_identity("kopiur/east/media/nas"),
 ///     ("kopiur".to_string(), "kopiur.east.media.nas".to_string())
+/// );
+///
+/// // A hand-authored 4-segment owner that is NOT "kopiur"-prefixed: legacy
+/// // sanitization, byte-identical to pre-M6 — never dot-joined.
+/// assert_eq!(
+///     kopia_lease_identity("a/b/c/d"),
+///     ("kopiur".to_string(), "a-b-c-d".to_string())
 /// );
 ///
 /// // Injective: a '-' inside a segment can no longer masquerade as a boundary.
@@ -320,7 +342,7 @@ const CLUSTER_HOSTNAME_MAX: usize = 253;
 pub fn kopia_lease_identity(lease: &str) -> (String, String) {
     let segments: Vec<&str> = lease.split('/').collect();
     let host = match segments.as_slice() {
-        [a, b, c, d] => {
+        [a, b, c, d] if *a == "kopiur" => {
             let joined = [a, b, c, d]
                 .iter()
                 .map(|s| sanitize_lease_fragment(s))
@@ -900,6 +922,26 @@ failurePolicy:
         let (_, host) = kopia_lease_identity(&format!("kopiur/{}/x", "n".repeat(100)));
         assert!(host.len() <= 63, "{host}");
         assert!(!host.ends_with('-'), "{host}");
+    }
+
+    /// Hardening (fix round 1): a hand-authored `Ownership.owner` that HAPPENS
+    /// to be 4 `/`-separated segments must NOT be mistaken for one of
+    /// `managed_lease`'s generated cluster-qualified formats — those are always
+    /// `"kopiur"`-first-segment. Without this gate, an owner like `a/b/c/d`
+    /// would silently change derivation from the legacy `a-b-c-d` to the
+    /// dot-joined `a.b.c.d` across an operator upgrade, and with
+    /// `takeoverPolicy: Never` maintenance would then yield forever.
+    #[test]
+    fn four_segment_non_kopiur_lease_is_legacy_byte_identical_to_pre_m6() {
+        assert_eq!(
+            kopia_lease_identity("a/b/c/d"),
+            ("kopiur".to_string(), "a-b-c-d".to_string())
+        );
+        // Still legacy even when the segments individually look plausible.
+        assert_eq!(
+            kopia_lease_identity("east/media/nas/extra"),
+            ("kopiur".to_string(), "east-media-nas-extra".to_string())
+        );
     }
 
     #[test]

@@ -209,6 +209,11 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // Idempotent connect; create on first use when enabled AND the
             // failure does not indicate an existing repo (auth/locked) — the same
             // safe gate the bootstrap mover applies (never recreate over data).
+            // `created` tracks whether THIS reconcile is the one that created the
+            // repo (mirrors the mover's own `created` flag, `crates/mover/src/
+            // main.rs`) — the maintenance-owner stamp below needs the real
+            // distinction, not a hardcoded assumption.
+            let mut created = false;
             if let Err(e) = client
                 .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                 .await
@@ -243,6 +248,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                             .await
                         {
                             Ok(_) => {
+                                created = true;
                                 client
                                     .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
                                     .await
@@ -308,17 +314,23 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // Status: phase/uniqueId/backend/resolvedCredentialVersion.
             let status = client.repository_status().await?;
 
-            // Self-heal the maintenance owner on this in-process (bare-path
+            // Stamp/self-heal the maintenance owner on this in-process (bare-path
             // filesystem) path, mirroring the mover's bootstrap stamp/self-heal
-            // (the SAME shared `maintenance_restamp_target` decision — M6: a
-            // bare-path Repository with `identityDefaults.cluster` set would
-            // otherwise ping-pong the recorded owner against its own managed
-            // Maintenance on every reconcile). kopia records the controller
-            // pod's ephemeral identity as owner on create, and an older
-            // operator may have left a stale one — either way the managed
-            // Maintenance's `takeoverPolicy: Never` would yield forever.
-            // Re-stamp the stable lease owner (`maintenance set --owner` is
-            // NOT owner-gated) so maintenance recognizes itself.
+            // exactly (`crates/mover/src/main.rs`) — including the create-vs-connect
+            // split: a repository THIS reconcile just created stamps the desired
+            // owner unconditionally (kopia recorded the controller pod's ephemeral
+            // identity as owner, and nothing recognizes it yet, so there is no
+            // staleness check to apply); a connect-to-existing repository instead
+            // goes through the shared `maintenance_restamp_target` decision against
+            // its recorded owner. M6 regression fixed here: this used to hardcode
+            // `created: false` into `maintenance_restamp_target` even right after an
+            // in-process create, so a freshly-created bare-path Repository with
+            // `identityDefaults.cluster` set recorded the ephemeral pod identity as
+            // owner and `RestampPolicy::OwnFormatsOnly` (required once `cluster` is
+            // set) refused to ever restamp it (not empty, not a recognized alias) —
+            // the managed Maintenance's `takeoverPolicy: Never` then yielded
+            // forever. `maintenance set --owner` is NOT owner-gated, so re-stamping
+            // is always safe once we decide to do it.
             //
             // Gated (via `bootstrap_maintenance_owner_plan` returning `None`)
             // exactly like the mover work specs: never for a ReadOnly repo (a
@@ -350,13 +362,24 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     cluster,
                     suppress,
                 );
-                if let Some(desired) = desired.as_deref() {
+                if let Some(owner) = io::in_process_create_owner_target(created, desired.as_deref())
+                {
+                    // Unconditional stamp on a repository THIS reconcile created —
+                    // see the block comment above.
+                    match client.maintenance_set_owner(owner).await {
+                        Ok(()) => {
+                            tracing::info!(%owner, "stamped maintenance owner on created filesystem repository")
+                        }
+                        Err(e) => {
+                            tracing::warn!(%owner, class = %e.class(), "could not stamp maintenance owner on created repository; maintenance may need takeoverPolicy=Force once")
+                        }
+                    }
+                } else if let Some(desired) = desired.as_deref() {
                     match client.maintenance_info().await {
                         Ok(info) => {
-                            // `created: false` — this is always a connect-to-existing
-                            // pass (the create path above just ran in the same
-                            // reconcile at most once, and restamping right after our
-                            // own create is a harmless no-op decision either way).
+                            // `created` is `false` here (the `if` above already
+                            // handled the create case) — a genuine connect-to-existing
+                            // self-heal pass.
                             if let Some(owner) = kopiur_mover::workspec::maintenance_restamp_target(
                                 false,
                                 Some(desired),
