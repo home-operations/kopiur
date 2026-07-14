@@ -307,8 +307,8 @@ impl CreateOptionsSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotAnchor {
-    /// The snapshotted source path — the authoritative match key (the
-    /// mover-recorded user/host can differ from the resolved identity).
+    /// The snapshotted source path — necessary but not sufficient to match
+    /// once two sources share a path; see `username`/`hostname`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_path: String,
     /// RFC3339 start time recorded for this snapshot — the disambiguator when
