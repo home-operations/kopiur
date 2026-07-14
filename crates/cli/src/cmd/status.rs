@@ -57,6 +57,15 @@ pub struct RepoRow {
     pub suspended: bool,
     /// Whether a Maintenance covers it (`MaintenanceConfigured` condition).
     pub maintenance: String,
+    /// `spec.identityDefaults.cluster` — this cluster's identity suffix when
+    /// the repository is shared across clusters; absent when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// `status.catalog.foreignSnapshotCount` — snapshots the last catalog scan
+    /// classified as another cluster's; absent when never scanned or the
+    /// repository has no `cluster` identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreign_snapshots: Option<i64>,
     /// The `Ready` condition message when the repo is NOT Ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -254,6 +263,8 @@ fn repo_row(
     mode: String,
     suspended: bool,
     conditions: &[Condition],
+    cluster: Option<String>,
+    foreign_snapshots: Option<i64>,
 ) -> RepoRow {
     let phase = phase.unwrap_or_else(|| EMPTY_CELL.into());
     let maintenance = condition(conditions, MAINTENANCE_CONFIGURED_CONDITION)
@@ -280,6 +291,8 @@ fn repo_row(
         mode,
         suspended,
         maintenance,
+        cluster,
+        foreign_snapshots,
         problem,
     }
 }
@@ -344,6 +357,13 @@ async fn gather(
             format!("{:?}", repo.spec.mode),
             repo.spec.suspend,
             status.map(|s| s.conditions.as_slice()).unwrap_or_default(),
+            repo.spec
+                .identity_defaults
+                .as_ref()
+                .and_then(|d| d.cluster.clone()),
+            status
+                .and_then(|s| s.catalog.as_ref())
+                .and_then(|c| c.foreign_snapshot_count),
         ));
     }
     {
@@ -381,6 +401,13 @@ async fn gather(
                 format!("{:?}", repo.spec.mode),
                 repo.spec.suspend,
                 status.map(|s| s.conditions.as_slice()).unwrap_or_default(),
+                repo.spec
+                    .identity_defaults
+                    .as_ref()
+                    .and_then(|d| d.cluster.clone()),
+                status
+                    .and_then(|s| s.catalog.as_ref())
+                    .and_then(|c| c.foreign_snapshot_count),
             ));
         }
     }
@@ -545,6 +572,8 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
             "MODE",
             "SUSPENDED",
             "MAINTENANCE",
+            "CLUSTER",
+            "FOREIGN",
         ]);
         for r in &report.repositories {
             t.push(vec![
@@ -556,6 +585,10 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
                 r.mode.clone(),
                 r.suspended.to_string(),
                 r.maintenance.clone(),
+                r.cluster.clone().unwrap_or_else(|| EMPTY_CELL.into()),
+                r.foreign_snapshots
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| EMPTY_CELL.into()),
             ]);
         }
         out.push_str(&t.render());
@@ -700,6 +733,8 @@ mod tests {
                     mode: "ReadWrite".into(),
                     suspended: false,
                     maintenance: "configured".into(),
+                    cluster: None,
+                    foreign_snapshots: None,
                     problem: None,
                 },
                 RepoRow {
@@ -711,6 +746,8 @@ mod tests {
                     mode: "ReadWrite".into(),
                     suspended: false,
                     maintenance: "-".into(),
+                    cluster: Some("east".into()),
+                    foreign_snapshots: Some(3),
                     problem: Some("credentials rejected; fix the Secret".into()),
                 },
             ],
@@ -749,6 +786,16 @@ mod tests {
         let text = render(&sample(), now());
         assert!(text.contains("REPOSITORIES"), "{text}");
         assert!(text.contains("Repository         nas"), "{text}");
+        // Multi-cluster columns: unset shows the empty-cell dash, set shows the
+        // cluster name and foreign-snapshot count.
+        assert!(text.contains("CLUSTER"), "{text}");
+        assert!(text.contains("FOREIGN"), "{text}");
+        assert!(
+            text.lines().any(|l| l.starts_with("ClusterRepository")
+                && l.contains("east")
+                && l.contains('3')),
+            "{text}"
+        );
         // A non-Ready repo carries its Ready-condition message inline.
         assert!(
             text.contains("! ClusterRepository/offsite: credentials rejected"),
@@ -833,5 +880,10 @@ mod tests {
             v["repositories"][1]["problem"],
             "credentials rejected; fix the Secret"
         );
+        assert_eq!(v["repositories"][1]["cluster"], "east");
+        assert_eq!(v["repositories"][1]["foreignSnapshots"], 3);
+        // Unset multi-cluster fields are elided, not `null`.
+        assert!(v["repositories"][0].get("cluster").is_none());
+        assert!(v["repositories"][0].get("foreignSnapshots").is_none());
     }
 }
