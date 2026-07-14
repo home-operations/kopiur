@@ -480,7 +480,7 @@ checksum = "sha256:e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f12
 url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz"
 
 [[tools.oxfmt]]
-version = "0.58.0"
+version = "0.59.0"
 backend = "npm:oxfmt"
 
 [[tools.rust]]
