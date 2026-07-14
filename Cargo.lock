@@ -1867,6 +1867,7 @@ dependencies = [
  "axum-server",
  "base64",
  "clap",
+ "http",
  "http-body-util",
  "json-patch",
  "k8s-openapi",

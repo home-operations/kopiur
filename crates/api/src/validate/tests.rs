@@ -3259,6 +3259,80 @@ fn source_path_fork_matches_by_pvc_name() {
     assert!(detect_source_path_fork(&mk(None), &mk(None), true, false).is_none());
 }
 
+// --- repository identityDefaults edit guard ---
+
+#[test]
+fn repository_identity_change_decision_table() {
+    use crate::cluster_repository::IdentityDefaults;
+
+    let east = IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: None,
+        username_expr: None,
+    };
+    let west = IdentityDefaults {
+        cluster: Some("west".into()),
+        hostname_expr: None,
+        username_expr: None,
+    };
+    let consumers = vec!["billing/pg".to_string()];
+
+    // No change ⇒ None, regardless of consumers/ack.
+    assert!(
+        detect_repository_identity_change(Some(&east), Some(&east), false, &consumers).is_none()
+    );
+    assert!(detect_repository_identity_change(None, None, false, &consumers).is_none());
+
+    // Change + no consumers with history ⇒ None (nothing to orphan).
+    assert!(detect_repository_identity_change(Some(&east), Some(&west), false, &[]).is_none());
+
+    // Change + consumers + not acked ⇒ Some, naming the consumer.
+    let err = detect_repository_identity_change(Some(&east), Some(&west), false, &consumers);
+    assert!(
+        matches!(&err, Some(ValidationError::RepositoryIdentityWouldFork { consumers: c }) if c == &consumers),
+        "{err:?}"
+    );
+
+    // Acked ⇒ None even with consumers.
+    assert!(
+        detect_repository_identity_change(Some(&east), Some(&west), true, &consumers).is_none()
+    );
+
+    // Going from `None` (no identityDefaults at all) to `Some` is a change too.
+    assert!(detect_repository_identity_change(None, Some(&west), false, &consumers).is_some());
+
+    // Each of cluster/hostnameExpr/usernameExpr individually triggers.
+    let base = IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: Some("namespace".into()),
+        username_expr: Some("'svc'".into()),
+    };
+    let cluster_changed = IdentityDefaults {
+        cluster: Some("west".into()),
+        ..base.clone()
+    };
+    let hostname_changed = IdentityDefaults {
+        hostname_expr: Some("namespace + '.' + cluster".into()),
+        ..base.clone()
+    };
+    let username_changed = IdentityDefaults {
+        username_expr: Some("'other'".into()),
+        ..base.clone()
+    };
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&cluster_changed), false, &consumers)
+            .is_some()
+    );
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&hostname_changed), false, &consumers)
+            .is_some()
+    );
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&username_changed), false, &consumers)
+            .is_some()
+    );
+}
+
 // --- validate_access_modes (shared: staging + restore target) ---
 
 #[test]

@@ -332,6 +332,36 @@ pub enum ValidationError {
         new: String,
     },
 
+    /// An UPDATE to a `Repository`/`ClusterRepository`'s `identityDefaults`
+    /// (`cluster`, `hostnameExpr`, or `usernameExpr`) would silently re-identify
+    /// every consumer `SnapshotPolicy` that resolves through those defaults —
+    /// identity is re-resolved from the LIVE repository on every reconcile/backup
+    /// (nothing about a *repository's* defaults is pinned the way a policy's own
+    /// `spec.identity` is), so this edit changes what each affected policy
+    /// resolves to on its very next backup with **no per-policy edit** to
+    /// acknowledge it. Exactly like [`Self::IdentityWouldFork`], new snapshots
+    /// would land under a new kopia source while the old history orphans (GFS
+    /// retention treats it as a separate source and never prunes the old set) —
+    /// but here it happens fleet-wide in one apply. Rejected unless the
+    /// repository carries the `kopiur.home-operations.com/allow-identity-change`
+    /// annotation ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
+    #[error(
+        "this edit changes identityDefaults, which would re-identify {} — new snapshots would \
+         fork to a new kopia lineage while the old history stays under the old identity (GFS \
+         retention never prunes across the split). To intentionally re-identify, set annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value, e.g. \
+         \"intentional\") on this repository; or pin an explicit spec.identity (both username \
+         AND hostname) on the affected policies first",
+        describe_identity_change_consumers(consumers)
+    )]
+    RepositoryIdentityWouldFork {
+        /// `namespace/name` of every consumer `SnapshotPolicy` with existing
+        /// snapshot history that this edit would re-identify (the message
+        /// truncates the rendered list to 5 names; this field carries all of
+        /// them).
+        consumers: Vec<String>,
+    },
+
     /// A verification `successExpr` (ADR-0005 §4/§15) failed to **compile** (a
     /// syntax error, or it exceeds the length budget). Surfaced at admission.
     #[error("successExpr {expr:?} failed to compile: {reason} (check the CEL syntax)")]
@@ -433,6 +463,42 @@ pub enum ValidationError {
         namespace: String,
     },
 }
+
+/// Render the consumer list for [`ValidationError::RepositoryIdentityWouldFork`]:
+/// the count, then up to [`CONSUMER_LIST_SHOWN`] `namespace/name`s, then
+/// `"and N more"` for the rest. Also reused verbatim by the webhook to build the
+/// admission WARNING when the same change is acknowledged, so the deny message
+/// and the warning always name the same policies the same way.
+///
+/// ```
+/// use kopiur_api::error::describe_identity_change_consumers;
+///
+/// assert_eq!(
+///     describe_identity_change_consumers(&["billing/pg".to_string()]),
+///     "1 SnapshotPolicy consumer(s) with existing snapshot history (billing/pg)",
+/// );
+/// let many: Vec<String> = (0..7).map(|i| format!("ns/pg-{i}")).collect();
+/// let rendered = describe_identity_change_consumers(&many);
+/// assert!(rendered.starts_with("7 SnapshotPolicy consumer(s)"));
+/// assert!(rendered.ends_with("and 2 more)"), "{rendered}");
+/// ```
+pub fn describe_identity_change_consumers(consumers: &[String]) -> String {
+    let total = consumers.len();
+    let mut names = consumers
+        .iter()
+        .take(CONSUMER_LIST_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > CONSUMER_LIST_SHOWN {
+        names.push_str(&format!(", and {} more", total - CONSUMER_LIST_SHOWN));
+    }
+    format!("{total} SnapshotPolicy consumer(s) with existing snapshot history ({names})")
+}
+
+/// How many consumer names [`describe_identity_change_consumers`] spells out
+/// before collapsing the rest into `"and N more"`.
+const CONSUMER_LIST_SHOWN: usize = 5;
 
 /// Result alias for validators. Defaults to `()` for the common "pass/fail with no
 /// value" case.

@@ -1,3 +1,4 @@
+use crate::cluster_repository::IdentityDefaults;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot_policy::{SnapshotPolicySpec, Source};
 use std::collections::BTreeMap;
@@ -282,4 +283,48 @@ pub fn detect_source_path_fork(
         }
     }
     None
+}
+
+// --- Repository identityDefaults edit guard (fleet-wide silent re-identification) ---
+
+/// Pure decision for the repository `identityDefaults`-edit guard. An edit to a
+/// `Repository`/`ClusterRepository`'s `identityDefaults` (`cluster`,
+/// `hostnameExpr`, or `usernameExpr`) changes what every consumer
+/// `SnapshotPolicy` relying on those defaults resolves to — silently, with no
+/// per-policy edit to acknowledge it (unlike [`detect_identity_fork`], which
+/// guards a policy's own edit). Returns
+/// `Some(`[`ValidationError::RepositoryIdentityWouldFork`]`)` iff
+/// `identityDefaults` actually changed, at least one consumer has snapshot
+/// history, and the change is not acknowledged. The webhook does the IO (list
+/// consumer `SnapshotPolicy`s, read the ack annotation) and calls this.
+///
+/// ```
+/// use kopiur_api::cluster_repository::IdentityDefaults;
+/// use kopiur_api::validate::detect_repository_identity_change;
+///
+/// let old = IdentityDefaults { cluster: Some("east".into()), ..Default::default() };
+/// let new = IdentityDefaults { cluster: Some("west".into()), ..Default::default() };
+/// let consumers = ["billing/pg".to_string()];
+///
+/// // Change + a consumer with history + no ack → rejected, naming the consumer.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), false, &consumers).is_some());
+/// // No consumers with history → nothing to orphan → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), false, &[]).is_none());
+/// // Acknowledged → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), true, &consumers).is_none());
+/// // No actual change → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&old), false, &consumers).is_none());
+/// ```
+pub fn detect_repository_identity_change(
+    old: Option<&IdentityDefaults>,
+    new: Option<&IdentityDefaults>,
+    acknowledged: bool,
+    consumers_with_history: &[String],
+) -> Option<ValidationError> {
+    if acknowledged || consumers_with_history.is_empty() || old == new {
+        return None;
+    }
+    Some(ValidationError::RepositoryIdentityWouldFork {
+        consumers: consumers_with_history.to_vec(),
+    })
 }
