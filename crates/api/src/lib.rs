@@ -75,7 +75,10 @@ pub use snapshot_schedule::{
 // Shared logic re-exports.
 pub use duration::{parse_go_duration, resolve_timeout};
 pub use error::{ValidationError, ValidationResult};
-pub use identity::{IdentityInputs, identity_string, resolve_identity, validate_identity_expr};
+pub use identity::{
+    HostClass, IdentityInputs, classify_hostname, identity_string, resolve_identity,
+    validate_identity_expr,
+};
 pub use jitter::{offset as jitter_offset, substitute_h};
 pub use preflight::{
     PreflightCheck, PreflightInputs, PreflightSpec, eval_preflight_expr, validate_preflight_expr,

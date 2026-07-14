@@ -117,6 +117,68 @@ pub fn validate_identity_component(field: &str, value: &str) -> ValidationResult
     }
 }
 
+/// Maximum length of `ClusterRepository.identityDefaults.cluster`. A cluster
+/// identity is a short, human-chosen suffix appended onto a namespace name — not
+/// free text — so this is generous headroom well under DNS's 253-byte label
+/// ceiling, not a real constraint in practice.
+pub const CLUSTER_NAME_MAX_LEN: usize = 32;
+
+/// Validate `ClusterRepository.identityDefaults.cluster`: an RFC 1123 label
+/// (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), 1..=[`CLUSTER_NAME_MAX_LEN`] characters,
+/// with dots called out explicitly as forbidden even though a well-formed RFC
+/// 1123 label never contains one anyway — the message needs to explain *why* to
+/// whoever hits it: `cluster` is concatenated onto a namespace as
+/// `<namespace>.<cluster>` for the default hostname (see
+/// [`crate::identity::resolve_identity`]), and [`crate::identity::classify_hostname`]
+/// splits that hostname back apart at the FIRST `.`, so a dot anywhere in
+/// `cluster` would make that split ambiguous.
+pub fn validate_cluster_name(value: &str) -> ValidationResult {
+    if value.is_empty() {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    if value.len() > CLUSTER_NAME_MAX_LEN {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: format!(
+                "is {} characters; the maximum is {CLUSTER_NAME_MAX_LEN}",
+                value.len()
+            ),
+        });
+    }
+    if value.contains('.') {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must not contain '.' — the first '.' in a hostname is the \
+                     namespace/cluster delimiter"
+                .to_string(),
+        });
+    }
+    let is_rfc1123_label = value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !is_rfc1123_label {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must be a lowercase RFC 1123 label: lowercase alphanumeric \
+                     characters or '-', starting and ending with an alphanumeric \
+                     character"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate a kopia identity `sourcePath` (the part after the first `:`). Lenient:
 /// spaces and `:` are allowed (only the first `:` is kopia's delimiter, and the rest
 /// is the path verbatim), but the path must be non-empty and free of newlines / ASCII

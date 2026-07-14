@@ -149,6 +149,16 @@ impl AllowedNamespaces {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityDefaults {
+    /// This cluster's identity suffix for repositories shared across clusters
+    /// (an RFC 1123 label, at most 32 characters; dots are rejected — the first
+    /// `.` in a hostname is the namespace/cluster delimiter). When set, the
+    /// default kopia identity hostname becomes `<namespace>.<cluster>` instead
+    /// of `<namespace>`, so two clusters backing up same-named namespaces write
+    /// distinct identities (and one cluster's retention prune can no longer
+    /// touch the other's snapshots). Also exposed to `hostnameExpr`/
+    /// `usernameExpr` as the CEL variable `cluster`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
     /// CEL expression for the kopia identity hostname (e.g. `"namespace"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_expr: Option<String>,
@@ -338,6 +348,48 @@ scheduleDefaults:
                 .get("scheduleDefaults")
                 .is_none(),
             "absent scheduleDefaults must be elided"
+        );
+    }
+
+    #[test]
+    fn identity_defaults_cluster_round_trips() {
+        // `identityDefaults.cluster` is the multi-cluster shared-repo identity
+        // suffix (M1): present, it round-trips through serde like any other field.
+        let yaml = r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }
+allowedNamespaces: { all: true }
+identityDefaults:
+  cluster: east
+"#;
+        let spec: ClusterRepositorySpec = from_yaml(yaml);
+        let id = spec.identity_defaults.as_ref().expect("identityDefaults");
+        assert_eq!(id.cluster.as_deref(), Some("east"));
+        assert!(id.hostname_expr.is_none());
+        assert!(id.username_expr.is_none());
+
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["identityDefaults"]["cluster"], "east");
+        let reparsed: ClusterRepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent `cluster` stays None and is elided (no stored-object churn) —
+        // exercised independently of the existing `identityDefaults` back-compat
+        // fixture in `cluster_repository_roundtrip_matches_adr_shape`, which is
+        // left untouched.
+        let bare: ClusterRepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+             allowedNamespaces: { all: true }\n\
+             identityDefaults:\n  hostnameExpr: namespace\n",
+        );
+        let id = bare.identity_defaults.as_ref().expect("identityDefaults");
+        assert!(id.cluster.is_none());
+        assert!(
+            serde_json::to_value(&bare).unwrap()["identityDefaults"]
+                .get("cluster")
+                .is_none(),
+            "absent identityDefaults.cluster must be elided"
         );
     }
 }

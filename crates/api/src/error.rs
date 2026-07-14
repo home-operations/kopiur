@@ -164,10 +164,10 @@ pub enum ValidationError {
     /// A `ClusterRepository.identityDefaults` CEL expression referenced a variable
     /// outside its environment (e.g. a typo), or otherwise failed to evaluate at
     /// admission (ADR-0004 §5). The environment is `namespace`, `policyName`,
-    /// `labels`, `annotations`.
+    /// `labels`, `annotations`, `cluster`.
     #[error(
         "identity CEL expression {expr:?} failed to evaluate: {reason} \
-         (available variables: namespace, policyName, labels, annotations)"
+         (available variables: namespace, policyName, labels, annotations, cluster)"
     )]
     IdentityExprEval {
         /// The offending CEL expression.
@@ -291,6 +291,22 @@ pub enum ValidationError {
         /// The rejected value.
         value: String,
         /// What's wrong and how to fix it.
+        reason: String,
+    },
+
+    /// `ClusterRepository.identityDefaults.cluster` is not a valid RFC 1123 label,
+    /// or contains a `.`. `cluster` is appended onto the namespace as
+    /// `<namespace>.<cluster>` for the default hostname, and
+    /// [`crate::identity::classify_hostname`] splits that hostname back apart at
+    /// the FIRST `.` — a `cluster` value with an embedded dot would just shift
+    /// which suffix classifies as "own cluster" rather than error, so the value is
+    /// rejected outright at admission instead of letting classification silently
+    /// disagree with intent.
+    #[error("identityDefaults.cluster {value:?} is not a valid cluster identity suffix: {reason}")]
+    ClusterNameInvalid {
+        /// The rejected cluster name.
+        value: String,
+        /// What's wrong and how to fix it (e.g. the RFC 1123 shape, or the dot-as-delimiter rule).
         reason: String,
     },
 

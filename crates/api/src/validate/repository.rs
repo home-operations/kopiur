@@ -690,6 +690,14 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         {
             errs.push(e);
         }
+        // `cluster` becomes part of the default hostname (`<namespace>.<cluster>`)
+        // and `classify_hostname` splits on the first `.`, so it must be a clean
+        // RFC 1123 label with no dot of its own (M1).
+        if let Some(cluster) = &id.cluster
+            && let Err(e) = validate_cluster_name(cluster)
+        {
+            errs.push(e);
+        }
     }
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, true));

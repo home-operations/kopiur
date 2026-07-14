@@ -1563,6 +1563,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         allowed_namespaces: AllowedNamespaces::All(true),
         // `namspace` is an out-of-scope typo → rejected at admission (ADR-0004 §5).
         identity_defaults: Some(IdentityDefaults {
+            cluster: None,
             hostname_expr: Some("namspace".into()),
             username_expr: None,
         }),
@@ -3092,6 +3093,116 @@ fn source_path_is_lenient_but_rejects_empty_and_control() {
     // Empty-when-set and control chars are not.
     assert!(validate_source_path("f", "").is_err());
     assert!(validate_source_path("f", "/data\nx").is_err());
+}
+
+// --- validate_cluster_name (identityDefaults.cluster, M1) ---
+
+#[test]
+fn cluster_name_accepts_valid_labels() {
+    for v in [
+        "east",
+        "east-prod",
+        "a",
+        "a1",
+        &"a".repeat(CLUSTER_NAME_MAX_LEN),
+    ] {
+        assert!(validate_cluster_name(v).is_ok(), "{v:?} should be accepted");
+    }
+    assert_eq!(CLUSTER_NAME_MAX_LEN, 32, "table below assumes this bound");
+}
+
+#[test]
+fn cluster_name_rejects_over_length() {
+    let too_long = "a".repeat(CLUSTER_NAME_MAX_LEN + 1);
+    let err = validate_cluster_name(&too_long).unwrap_err();
+    assert!(
+        matches!(err, ValidationError::ClusterNameInvalid { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn cluster_name_rejects_empty() {
+    let err = validate_cluster_name("").unwrap_err();
+    assert!(matches!(err, ValidationError::ClusterNameInvalid { .. }));
+}
+
+#[test]
+fn cluster_name_rejects_uppercase() {
+    let err = validate_cluster_name("East").unwrap_err();
+    assert!(matches!(err, ValidationError::ClusterNameInvalid { .. }));
+}
+
+#[test]
+fn cluster_name_rejects_leading_and_trailing_dash() {
+    for v in ["-east", "east-"] {
+        let err = validate_cluster_name(v).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::ClusterNameInvalid { .. }),
+            "{v:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn cluster_name_rejects_dot_with_delimiter_message() {
+    // The "no dots" message must explain the FIRST-dot-is-the-delimiter rule,
+    // since that's what makes a dotted cluster name dangerous (classify_hostname
+    // would silently disagree with intent rather than error).
+    let err = validate_cluster_name("ea.st").unwrap_err();
+    match &err {
+        ValidationError::ClusterNameInvalid { reason, .. } => {
+            assert!(
+                reason.contains("delimiter"),
+                "message should explain the namespace/cluster delimiter rule: {reason}"
+            );
+        }
+        other => panic!("expected ClusterNameInvalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn cluster_repository_rejects_bad_cluster_name() {
+    use crate::backend::{Backend, FilesystemBackend};
+    use crate::cluster_repository::IdentityDefaults;
+    use crate::common::{Encryption, SecretKeyRef};
+    let spec = ClusterRepositorySpec {
+        backend: Backend::Filesystem(FilesystemBackend {
+            path: "/r".into(),
+            volume: None,
+        }),
+        encryption: Encryption {
+            password_secret_ref: SecretKeyRef {
+                name: "s".into(),
+                namespace: Some("kopia-system".into()),
+                key: None,
+            },
+        },
+        create: None,
+        bootstrap: None,
+        mover_defaults: None,
+        schedule_defaults: None,
+        catalog: None,
+        server: None,
+        allowed_namespaces: AllowedNamespaces::All(true),
+        identity_defaults: Some(IdentityDefaults {
+            cluster: Some("East".into()), // uppercase — invalid RFC 1123 label
+            hostname_expr: None,
+            username_expr: None,
+        }),
+        maintenance: None,
+        on_namespace_delete: Default::default(),
+        mode: Default::default(),
+        suspend: false,
+        health: None,
+        credential_projection: None,
+    };
+    let errs = validate_cluster_repository(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterNameInvalid { .. })),
+        "{errs:?}"
+    );
 }
 
 #[test]

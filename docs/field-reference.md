@@ -996,6 +996,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `cluster` | string | — | This cluster's identity suffix for repositories shared across clusters (an RFC 1123 label, at most 32 characters; dots are rejected — the first `.` in a hostname is the namespace/cluster delimiter). When set, the default kopia identity hostname becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of `&lt;namespace&gt;`, so two clusters backing up same-named namespaces write distinct identities (and one cluster's retention prune can no longer touch the other's snapshots). Also exposed to `hostnameExpr`/ `usernameExpr` as the CEL variable `cluster`. |
 | `hostnameExpr` | string | — | CEL expression for the kopia identity hostname (e.g. `"namespace"`). |
 | `usernameExpr` | string | — | CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`). |
 
