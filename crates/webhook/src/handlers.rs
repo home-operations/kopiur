@@ -609,8 +609,6 @@ async fn handle_cluster_repository(
         let outcome = crate::identity_repo_edit::check_repository_identity_change(
             client,
             &self_key,
-            // ClusterRepository consumers may live in any namespace: list cluster-wide.
-            None,
             old.identity_defaults.as_ref(),
             spec.identity_defaults.as_ref(),
             obj.metadata.annotations.as_ref(),
@@ -667,12 +665,17 @@ async fn handle_repository(
         api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref());
 
     // identityDefaults edit guard (silent re-identification): same rule as
-    // `handle_cluster_repository` above, scoped to this Repository's own
-    // namespace — a namespaced Repository is normally consumed only from its
-    // own namespace, and scoping the consumer LIST there (rather than
-    // cluster-wide) also works under a namespaced Role install (see
-    // `identity_repo_edit::affected_consumers`'s doc for the accepted
-    // cross-namespace-reference gap this best-effort guard leaves open).
+    // `handle_cluster_repository` above. The consumer SnapshotPolicy LIST is
+    // cluster-wide, not scoped to this Repository's own namespace —
+    // `RepositoryRef.namespace` is a documented, supported cross-namespace
+    // reference (see `api::common::RepositoryRef`), so a namespaced
+    // Repository's consumers are NOT confined to its own namespace. This
+    // mirrors the pre-existing collision guard
+    // (`identity_collision::check_identity_collision` uses `Api::all`
+    // unconditionally). Degrades to allow (fail-open) when there is no client
+    // or the LIST fails — including a 403 under a namespaced Role install —
+    // same posture as the fork/collision guards (see
+    // `identity_repo_edit::affected_consumers`'s doc).
     if let Some(old) = &old_spec {
         let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
         let namespace = obj
@@ -692,7 +695,6 @@ async fn handle_repository(
         let outcome = crate::identity_repo_edit::check_repository_identity_change(
             client,
             &self_key,
-            Some(namespace),
             old.identity_defaults.as_ref(),
             spec.identity_defaults.as_ref(),
             obj.metadata.annotations.as_ref(),
@@ -1202,8 +1204,8 @@ mod tests {
     #[tokio::test]
     async fn repository_identity_defaults_change_with_history_denied() {
         // A consumer with existing history references THIS Repository (same
-        // namespace, the guard's LIST scope) and doesn't pin identity — editing
-        // identityDefaults would silently re-identify it on its next backup.
+        // namespace) and doesn't pin identity — editing identityDefaults would
+        // silently re-identify it on its next backup.
         let client = mock_list_client(consumer_policy_list(
             "billing",
             "pg",
@@ -1222,6 +1224,44 @@ mod tests {
         assert!(!resp.allowed, "must deny: {:?}", resp.result.message);
         assert!(
             resp.result.message.contains("billing/pg"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_identity_defaults_change_catches_cross_namespace_consumer() {
+        // The consumer LIST is cluster-wide (this fix): a policy in a
+        // DIFFERENT namespace than the edited Repository, referencing it via
+        // an explicit `RepositoryRef.namespace` (a documented, supported
+        // pattern — see `api::common::RepositoryRef`), must still be caught,
+        // not silently missed.
+        let list_body = json!({
+            "items": [{
+                "metadata": { "name": "pg", "namespace": "consumer-ns" },
+                "spec": {
+                    "repository": {
+                        "kind": "Repository",
+                        "name": "shared",
+                        "namespace": "repo-ns",
+                    },
+                    "sources": [ { "pvc": { "name": "data" } } ]
+                },
+                "status": { "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z" }
+            }]
+        });
+        let client = mock_list_client(list_body);
+        let req = update_repository_request(
+            "repo-ns",
+            "shared",
+            repository_spec("west"),
+            json!({}),
+            repository_spec("east"),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(!resp.allowed, "must deny: {:?}", resp.result.message);
+        assert!(
+            resp.result.message.contains("consumer-ns/pg"),
             "{:?}",
             resp.result.message
         );
