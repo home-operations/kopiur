@@ -468,6 +468,21 @@ fn manual_job_name(cr: &str, mode: kopiur_api::ManualRunMode, requested: DateTim
     }
 }
 
+/// The mover `MaintenanceOp` for one run of `maint`: the lease parameters the
+/// mover's lease decision needs, verbatim from `spec.ownership` — including
+/// `ownerAliases` (M6), without which a Maintenance migrated to a
+/// cluster-qualified lease would see kopia's still-recorded legacy owner as
+/// foreign and yield forever instead of claiming + re-stamping it. Pure so the
+/// threading is unit-testable.
+fn maintenance_op(maint: &Maintenance, mode: MaintenanceMode) -> MaintenanceOp {
+    MaintenanceOp {
+        mode,
+        owner: maint.spec.ownership.owner.clone(),
+        owner_aliases: maint.spec.ownership.owner_aliases.clone(),
+        takeover_policy: maint.spec.ownership.takeover_policy,
+    }
+}
+
 /// Build + apply the per-slot work-spec ConfigMap and mover Job.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_maintenance_job(
@@ -489,11 +504,7 @@ async fn spawn_maintenance_job(
     let cache = crate::cache::cache_tuning(effective_cache.as_ref());
     let work_spec = MoverWorkSpec {
         version: 1,
-        operation: Operation::Maintenance(MaintenanceOp {
-            mode,
-            owner: maint.spec.ownership.owner.clone(),
-            takeover_policy: maint.spec.ownership.takeover_policy,
-        }),
+        operation: Operation::Maintenance(maintenance_op(maint, mode)),
         // Maintenance does not snapshot, so the identity is a stable sentinel
         // (like bootstrap's) — it is not a kopia snapshot source.
         identity: ResolvedIdentity {

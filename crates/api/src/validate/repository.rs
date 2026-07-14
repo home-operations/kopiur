@@ -707,6 +707,20 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     if let Err(e) = validate_repository_ref(&spec.repository) {
         errs.push(e);
     }
+    // `ownership.ownerAliases` become kopia identity components once run
+    // through `kopia_lease_identity` (M6), so each alias gets the identity
+    // shape rule — the same validator the resolved hostname/username go
+    // through. `owner` itself is deliberately NOT tightened here: it predates
+    // this rule, stored CRs may carry arbitrary strings the lease sanitizer
+    // already handles, and the controller re-validates defensively on every
+    // reconcile — a new rejection would hard-stop a working Maintenance.
+    // Aliases are new with this rule, so no stored object can regress.
+    for (i, alias) in spec.ownership.owner_aliases.iter().enumerate() {
+        if let Err(e) = validate_identity_component(&format!("ownership.ownerAliases[{i}]"), alias)
+        {
+            errs.push(e);
+        }
+    }
     if let Err(e) = validate_cron(&spec.schedule.quick.cron) {
         errs.push(e);
     }

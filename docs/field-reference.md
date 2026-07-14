@@ -2214,6 +2214,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `owner` | string | **required** | Stable lease holder identity (e.g. `kopia-operator/nas-primary`). |
+| `ownerAliases` | []string | — | Previous lease strings still recognized as SELF (a migration path): when kopia's currently-recorded maintenance owner matches the owner derived from one of these aliases, a run treats the lease as its own — it claims it and re-stamps `owner`, upgrading the recorded owner to the current format. The operator populates this when a repository's managed Maintenance moves to a cluster-qualified lease (identityDefaults.cluster), so the transition never yields the lease to what merely looks like a foreign owner. |
 | `takeoverPolicy` | enum: Never \| PromptCondition \| Force | `Never` | What to do when the lease is already held by a different `owner`. |
 
 #### `spec.repository` { #maintenance-spec-repository }

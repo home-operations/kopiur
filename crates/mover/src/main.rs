@@ -45,7 +45,7 @@ use kopiur_mover::status::{
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier,
+    SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier, maintenance_restamp_target,
 };
 
 fn main() -> std::process::ExitCode {
@@ -908,30 +908,23 @@ fn identity_retention_policy(
     }
 }
 
-/// Decide whether the bootstrap mover should re-stamp the stable maintenance
-/// owner on a *connect-to-existing* repository. Returns `Some(owner)` to stamp,
-/// or `None` to leave the recorded owner alone.
-///
-/// The self-heal fires only when ALL hold:
-///   * `!created` — on a repo we just CREATED the owner was already stamped
-///     unconditionally, so re-reading/re-stamping would be redundant work.
-///   * a stable owner is configured (`desired.is_some()`).
-///   * kopia's currently-recorded `current` owner differs from `desired` — i.e.
-///     it's the ephemeral bootstrap-pod identity (or any foreign value), the
-///     exact state that makes `takeoverPolicy: Never` maintenance yield forever.
-///
-/// Pulled out of `run_bootstrap` so the gate is unit-testable without spawning
-/// kopia. The string we return is `kopia_owner_for_lease(managed_lease(..))` —
-/// exactly the `my_owner` the maintenance mover compares against, so after a
-/// re-stamp `held_by_other` is false and `maintenance run` proceeds.
-fn maintenance_restamp_target<'a>(
-    created: bool,
-    desired: Option<&'a str>,
-    current: &str,
-) -> Option<&'a str> {
-    match desired {
-        Some(owner) if !created && current != owner => Some(owner),
-        _ => None,
+/// Connect for bootstrap, honoring [`BootstrapRepositoryOp::read_only`]
+/// (M6): a `mode: ReadOnly` repository's bootstrap connects with `--readonly`
+/// (`repository_connect_readonly`) instead of the normal read-write connect —
+/// bootstrap is a connect/scan probe, and a read-write connect from a
+/// ReadOnly consumer repo was exactly what let it clobber the primary's
+/// maintenance owner. Every other mover flow (restore, delete, snapshot)
+/// stays on the plain read-write connect regardless.
+async fn bootstrap_connect(
+    client: &KopiaClient,
+    spec: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+    read_only: bool,
+) -> std::result::Result<(), KopiaError> {
+    if read_only {
+        client.repository_connect_readonly(spec, cache).await
+    } else {
+        client.repository_connect(spec, cache).await
     }
 }
 
@@ -948,7 +941,7 @@ async fn run_bootstrap(
     // it connects with kopia's default cache budgets.
     let cache = kopiur_kopia::CacheTuning::default();
     let mut created = false;
-    if let Err(e) = client.repository_connect(&connect_spec, cache).await {
+    if let Err(e) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
         if !should_attempt_create(op.auto_create, e.class()) {
             // We will NOT create. Two distinct decline reasons → two distinct,
             // accurate messages:
@@ -984,7 +977,7 @@ async fn run_bootstrap(
         {
             return BootstrapResult::failed(&ce);
         }
-        if let Err(ce) = client.repository_connect(&connect_spec, cache).await {
+        if let Err(ce) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
             return BootstrapResult::failed(&ce);
         }
         created = true;
@@ -1019,8 +1012,13 @@ async fn run_bootstrap(
     if !created && let Some(desired) = op.maintenance_owner.as_deref() {
         match client.maintenance_info().await {
             Ok(info) => {
-                if let Some(owner) = maintenance_restamp_target(created, Some(desired), &info.owner)
-                {
+                if let Some(owner) = maintenance_restamp_target(
+                    created,
+                    Some(desired),
+                    op.restamp_policy,
+                    &op.maintenance_owner_aliases,
+                    &info.owner,
+                ) {
                     match client.maintenance_set_owner(owner).await {
                         Ok(()) => info!(
                             %owner,
@@ -1218,12 +1216,27 @@ async fn run_maintenance_flow(
             });
         }
     };
-    // Held by another when kopia's recorded owner is neither empty nor OUR
-    // stable identity. Comparing against `op.owner` (the logical lease string,
-    // never a kopia user@hostname) was the bug that made every run on a
+    // Held by another when kopia's recorded owner is neither empty, OUR stable
+    // identity, nor one of our recognized owner-format aliases (the M6
+    // migration path — a repo whose managed Maintenance moved to a new lease
+    // format still recognizes what it used to stamp as itself). Comparing
+    // against `op.owner` (the logical lease string, never a kopia
+    // user@hostname) directly was the bug that made every run on a
     // mover-bootstrapped repo yield forever.
-    let my_owner = kopiur_api::maintenance::kopia_owner_for_lease(&op.owner);
-    let held_by_other = !info.owner.is_empty() && info.owner != my_owner;
+    let held_by_other =
+        kopiur_api::maintenance::lease_held_by_other(&info.owner, &op.owner, &op.owner_aliases);
+    // Shared remediation appended to both blocked outcomes below: this mover
+    // cannot tell a hand-authored Maintenance from an operator-managed one
+    // (that distinction lives on the CR's ownerReferences, which the work spec
+    // doesn't carry), so it is worded neutrally — conditioned on "for
+    // operator-managed maintenance" rather than asserted outright. Hand-authored
+    // Maintenance CRs are always honored regardless of any Repository's
+    // `spec.maintenance`, so telling every reader to flip `enabled: false` would
+    // be actively wrong advice for those.
+    const REMEDIATION: &str = "for operator-managed maintenance: if another cluster is the \
+         designated maintenance runner, set spec.maintenance.enabled: false on this \
+         repository's non-owner clusters; to move ownership here instead, set \
+         ownership.takeoverPolicy: Force once";
     match lease_action(op.takeover_policy, held_by_other) {
         LeaseAction::Yield => {
             patch_maintenance_status(
@@ -1232,7 +1245,7 @@ async fn run_maintenance_flow(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_HELD_BY_OTHER_REASON,
                     &format!(
-                        "maintenance lease held by {}; takeoverPolicy=Never",
+                        "maintenance lease held by {}; takeoverPolicy=Never ({REMEDIATION})",
                         info.owner
                     ),
                 ),
@@ -1247,10 +1260,7 @@ async fn run_maintenance_flow(
                 &lease_blocked_body(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_TAKEOVER_PROMPT_REASON,
-                    &format!(
-                        "lease held by {}; set takeoverPolicy=Force to claim",
-                        info.owner
-                    ),
+                    &format!("lease held by {}; {REMEDIATION}", info.owner),
                 ),
             )
             .await;
@@ -1819,63 +1829,6 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- maintenance-owner self-heal gate (connect-to-existing re-stamp) ---
-
-    #[test]
-    fn restamp_fires_on_existing_repo_with_foreign_owner() {
-        // The bug case: connect-to-existing (`created == false`), a stable owner
-        // is configured, and kopia recorded a foreign (ephemeral) owner. The
-        // self-heal must re-stamp the stable owner so `takeoverPolicy: Never`
-        // maintenance stops yielding forever.
-        assert_eq!(
-            maintenance_restamp_target(
-                false,
-                Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
-                "nonroot@rustfs-kopiur-bootstrap-5trlr",
-            ),
-            Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
-        );
-    }
-
-    #[test]
-    fn restamp_skipped_when_owner_already_stable() {
-        // Idempotent: the recorded owner already equals the stable value, so
-        // there is nothing to heal and we avoid a needless `maintenance set`.
-        assert_eq!(
-            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), "kopiur@kopiur-prod"),
-            None,
-        );
-    }
-
-    #[test]
-    fn restamp_skipped_on_create_path() {
-        // On CREATE the owner is stamped unconditionally elsewhere; the connect
-        // self-heal must not also fire (even if `current` looks foreign).
-        assert_eq!(
-            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), "ephemeral@pod-xyz"),
-            None,
-        );
-    }
-
-    #[test]
-    fn restamp_skipped_without_configured_owner() {
-        // No stable owner configured (e.g. maintenance disabled) → never stamp.
-        assert_eq!(
-            maintenance_restamp_target(false, None, "ephemeral@pod-xyz"),
-            None
-        );
-    }
-
-    #[test]
-    fn restamp_heals_empty_recorded_owner() {
-        // An empty recorded owner is still foreign relative to the stable value,
-        // so we stamp it (kopia would otherwise leave it unowned).
-        assert_eq!(
-            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), ""),
-            Some("kopiur@kopiur-prod"),
-        );
-    }
 
     // --- M0b: identity-scope retention pin (KOPIA_KEEP_MAX) is mandatory ---
 

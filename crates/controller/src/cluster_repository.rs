@@ -87,6 +87,11 @@ async fn ensure_cluster_maintenance(
         return;
     }
     let placement = cluster_maintenance_placement(ctx, repo);
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
     io::ensure_maintenance(
         ctx,
         api,
@@ -99,6 +104,7 @@ async fn ensure_cluster_maintenance(
         placement.as_deref(),
         name,
         repo.spec.maintenance.as_ref(),
+        cluster,
         conditions,
         repo.metadata.generation,
     )
@@ -865,6 +871,20 @@ async fn bootstrap_cluster_via_mover(
         .as_ref()
         .and_then(|d| d.cluster.as_deref());
     let foreign = CatalogBounds::effective_foreign_snapshots(repo.spec.catalog.as_ref());
+    // M6: bootstrap must not stamp/restamp a maintenance owner at all for a
+    // ReadOnly repo (the clobber-the-primary's-owner bug this fixes), a
+    // deliberate `spec.maintenance.enabled: false` opt-out, or a repository an
+    // externally-authored Maintenance already covers (its own ownership.owner
+    // has no relation to ours) — see `io::bootstrap_maintenance_owner_plan`.
+    let read_only = !repo.spec.mode.allows_writes();
+    let maintenance_enabled = repo.spec.maintenance.as_ref().is_none_or(|m| m.enabled);
+    let foreign_maintenance = io::maintenance_covered_by_foreign(
+        ctx,
+        RepositoryKind::ClusterRepository,
+        "ClusterRepository",
+        name,
+        None,
+    );
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -874,6 +894,9 @@ async fn bootstrap_cluster_via_mover(
         repo.spec.mover_defaults.as_ref(),
         cluster,
         foreign,
+        read_only,
+        maintenance_enabled,
+        foreign_maintenance,
     );
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
@@ -1017,6 +1040,15 @@ async fn bootstrap_cluster_via_mover(
 /// cap only when cluster identity is actually on AND the effective policy is
 /// `Ignore` — under `Fallback` those entries must still come back so the controller
 /// can materialize them into `catalog.fallbackNamespace`.
+///
+/// `read_only`/`maintenance_enabled`/`foreign_maintenance` (M6) drive the
+/// maintenance-owner plan via [`io::bootstrap_maintenance_owner_plan`]: the
+/// mover restamps a stale owner on EVERY connect-to-existing, not just create
+/// (see `maintenance_restamp_target`), so `maintenance_owner: None` is the only
+/// way to mean "never stamp/restamp at all" — used for a ReadOnly repo (fixes
+/// the consumer-clobbers-the-primary's-owner bug), a deliberate
+/// `spec.maintenance.enabled: false`, or a repository an externally-authored
+/// Maintenance already covers.
 #[allow(clippy::too_many_arguments)]
 fn cluster_bootstrap_work_spec(
     backend: &Backend,
@@ -1027,10 +1059,22 @@ fn cluster_bootstrap_work_spec(
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
+    read_only: bool,
+    maintenance_enabled: bool,
+    foreign_maintenance: bool,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
         .then(|| cluster.unwrap_or_default().to_string());
+    let cluster_ref = cluster.filter(|c| !c.is_empty());
+    let (maintenance_owner, restamp_policy, maintenance_owner_aliases) =
+        io::bootstrap_maintenance_owner_plan(
+            RepositoryKind::ClusterRepository,
+            job_ns,
+            name,
+            cluster_ref,
+            read_only || !maintenance_enabled || foreign_maintenance,
+        );
     MoverWorkSpec {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
@@ -1040,15 +1084,14 @@ fn cluster_bootstrap_work_spec(
             // see `crate::catalog`).
             scan_catalog: true,
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
-            // Stamped on CREATE only (see the Repository sibling).
-            maintenance_owner: Some(kopiur_api::maintenance::kopia_owner_for_lease(
-                &kopiur_api::maintenance::managed_lease(
-                    kopiur_api::common::RepositoryKind::ClusterRepository,
-                    job_ns,
-                    name,
-                ),
-            )),
+            // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
+            // every connect-to-existing when stale (`maintenance_restamp_target`);
+            // `None` means neither ever happens — see the doc above.
+            maintenance_owner,
             catalog_foreign_prefilter_cluster: prefilter_cluster,
+            restamp_policy,
+            maintenance_owner_aliases,
+            read_only,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1469,5 +1512,68 @@ mod tests {
         // M4: the shared-repository posture is now named too.
         assert!(msg.contains("identityDefaults.cluster"), "{msg}");
         assert!(msg.contains("catalog.foreignSnapshots: Ignore"), "{msg}");
+    }
+
+    /// M6: the ClusterRepository bootstrap work spec's maintenance-owner gating,
+    /// mirroring the namespaced Repository's matrix (whose test carries the full
+    /// combinations) — here the kind-specific lease formats are the point.
+    #[test]
+    fn cluster_bootstrap_work_spec_maintenance_owner_gating() {
+        use kopiur_api::backend::FilesystemBackend;
+        use kopiur_mover::workspec::RestampPolicy;
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |read_only: bool, enabled: bool, foreign_m: bool, cluster: Option<&str>| {
+            let spec = cluster_bootstrap_work_spec(
+                &backend,
+                "shared",
+                "kopia-system",
+                true,
+                None,
+                None,
+                cluster,
+                ForeignSnapshots::Fallback,
+                read_only,
+                enabled,
+                foreign_m,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+
+        // Default: the legacy ClusterRepository lease's owner, AnyStale, no aliases.
+        let op = build(false, true, false, None);
+        assert_eq!(
+            op.maintenance_owner.as_deref(),
+            Some("kopiur@kopiur-clusterrepository-shared")
+        );
+        assert_eq!(op.restamp_policy, RestampPolicy::AnyStale);
+        assert!(op.maintenance_owner_aliases.is_empty());
+        assert!(!op.read_only);
+
+        // Cluster set: cluster-qualified owner + OwnFormatsOnly + legacy alias.
+        let op = build(false, true, false, Some("east"));
+        assert_eq!(
+            op.maintenance_owner.as_deref(),
+            Some("kopiur@kopiur.east.clusterrepository.shared")
+        );
+        assert_eq!(op.restamp_policy, RestampPolicy::OwnFormatsOnly);
+        assert_eq!(
+            op.maintenance_owner_aliases,
+            vec!["kopiur@kopiur-clusterrepository-shared".to_string()]
+        );
+
+        // ReadOnly consumer: no stamp + --readonly connect (the clobber fix).
+        let op = build(true, true, false, Some("east"));
+        assert_eq!(op.maintenance_owner, None);
+        assert!(op.read_only);
+
+        // Disabled / foreign-covered: no stamp, normal connect.
+        assert_eq!(build(false, false, false, None).maintenance_owner, None);
+        assert_eq!(build(false, true, true, None).maintenance_owner, None);
     }
 }

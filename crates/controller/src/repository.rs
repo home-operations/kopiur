@@ -310,36 +310,73 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
 
             // Self-heal the maintenance owner on this in-process (bare-path
             // filesystem) path, mirroring the mover's bootstrap stamp/self-heal
-            // (`maintenance_restamp_target`). kopia records the controller pod's
-            // ephemeral identity as owner on create, and an older operator may
-            // have left a stale one — either way the managed Maintenance's
-            // `takeoverPolicy: Never` would yield forever. Re-stamp the stable
-            // lease owner (`maintenance set --owner` is NOT owner-gated) so
-            // maintenance recognizes itself. Only when writes are allowed (a
-            // ReadOnly repo runs no maintenance). Best-effort — never fail the
-            // reconcile over it.
-            if repo.spec.mode.allows_writes() {
-                let owner = kopiur_api::maintenance::kopia_owner_for_lease(
-                    &kopiur_api::maintenance::managed_lease(
-                        RepositoryKind::Repository,
-                        &namespace,
-                        &name,
-                    ),
+            // (the SAME shared `maintenance_restamp_target` decision — M6: a
+            // bare-path Repository with `identityDefaults.cluster` set would
+            // otherwise ping-pong the recorded owner against its own managed
+            // Maintenance on every reconcile). kopia records the controller
+            // pod's ephemeral identity as owner on create, and an older
+            // operator may have left a stale one — either way the managed
+            // Maintenance's `takeoverPolicy: Never` would yield forever.
+            // Re-stamp the stable lease owner (`maintenance set --owner` is
+            // NOT owner-gated) so maintenance recognizes itself.
+            //
+            // Gated (via `bootstrap_maintenance_owner_plan` returning `None`)
+            // exactly like the mover work specs: never for a ReadOnly repo (a
+            // consumer must not clobber the primary's owner), a deliberate
+            // `spec.maintenance.enabled: false`, or a repository an
+            // externally-authored Maintenance already covers. Best-effort —
+            // never fail the reconcile over it.
+            {
+                let cluster = repo
+                    .spec
+                    .identity_defaults
+                    .as_ref()
+                    .and_then(|d| d.cluster.as_deref())
+                    .filter(|c| !c.is_empty());
+                let maintenance_enabled = repo.spec.maintenance.as_ref().is_none_or(|m| m.enabled);
+                let foreign_maintenance = io::maintenance_covered_by_foreign(
+                    ctx,
+                    RepositoryKind::Repository,
+                    "Repository",
+                    &name,
+                    Some(&namespace),
                 );
-                match client.maintenance_info().await {
-                    Ok(info) if info.owner != owner => {
-                        match client.maintenance_set_owner(&owner).await {
-                            Ok(()) => {
-                                tracing::info!(%owner, stale = %info.owner, "re-stamped maintenance owner on filesystem repository")
-                            }
-                            Err(e) => {
-                                tracing::warn!(%owner, class = %e.class(), "could not re-stamp maintenance owner; maintenance may need takeoverPolicy=Force once")
+                let suppress =
+                    !repo.spec.mode.allows_writes() || !maintenance_enabled || foreign_maintenance;
+                let (desired, policy, aliases) = io::bootstrap_maintenance_owner_plan(
+                    RepositoryKind::Repository,
+                    &namespace,
+                    &name,
+                    cluster,
+                    suppress,
+                );
+                if let Some(desired) = desired.as_deref() {
+                    match client.maintenance_info().await {
+                        Ok(info) => {
+                            // `created: false` — this is always a connect-to-existing
+                            // pass (the create path above just ran in the same
+                            // reconcile at most once, and restamping right after our
+                            // own create is a harmless no-op decision either way).
+                            if let Some(owner) = kopiur_mover::workspec::maintenance_restamp_target(
+                                false,
+                                Some(desired),
+                                policy,
+                                &aliases,
+                                &info.owner,
+                            ) {
+                                match client.maintenance_set_owner(owner).await {
+                                    Ok(()) => {
+                                        tracing::info!(%owner, stale = %info.owner, "re-stamped maintenance owner on filesystem repository")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%owner, class = %e.class(), "could not re-stamp maintenance owner; maintenance may need takeoverPolicy=Force once")
+                                    }
+                                }
                             }
                         }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(class = %e.class(), "could not read maintenance owner to self-heal; continuing")
+                        Err(e) => {
+                            tracing::warn!(class = %e.class(), "could not read maintenance owner to self-heal; continuing")
+                        }
                     }
                 }
             }
@@ -542,6 +579,11 @@ async fn ensure_repo_maintenance(
     if !repo.spec.mode.allows_writes() {
         return;
     }
+    let cluster = repo
+        .spec
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
     io::ensure_maintenance(
         ctx,
         api,
@@ -554,6 +596,7 @@ async fn ensure_repo_maintenance(
         Some(namespace),
         name,
         repo.spec.maintenance.as_ref(),
+        cluster,
         conditions,
         repo.metadata.generation,
     )
@@ -736,6 +779,20 @@ async fn bootstrap_via_mover(
         .as_ref()
         .and_then(|d| d.cluster.as_deref());
     let foreign = CatalogBounds::effective_foreign_snapshots(repo.spec.catalog.as_ref());
+    // M6: bootstrap must not stamp/restamp a maintenance owner at all for a
+    // ReadOnly repo (the clobber-the-primary's-owner bug this fixes), a
+    // deliberate `spec.maintenance.enabled: false` opt-out, or a repository an
+    // externally-authored Maintenance already covers (its own ownership.owner
+    // has no relation to ours) — see `io::bootstrap_maintenance_owner_plan`.
+    let read_only = !repo.spec.mode.allows_writes();
+    let maintenance_enabled = repo.spec.maintenance.as_ref().is_none_or(|m| m.enabled);
+    let foreign_maintenance = io::maintenance_covered_by_foreign(
+        ctx,
+        RepositoryKind::Repository,
+        "Repository",
+        name,
+        Some(namespace),
+    );
     let work_spec = bootstrap_work_spec(
         backend,
         name,
@@ -746,6 +803,9 @@ async fn bootstrap_via_mover(
         repo.spec.mover_defaults.as_ref(),
         cluster,
         foreign,
+        read_only,
+        maintenance_enabled,
+        foreign_maintenance,
     );
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
@@ -907,6 +967,15 @@ async fn bootstrap_via_mover(
 /// pass can count them (a namespaced Repository has no `fallbackNamespace`, so
 /// `decide_namespace_placement` always resolves a `Fallback`-classified foreign
 /// entry to `ForeignIgnored` too, but the count still needs the entry present).
+///
+/// `read_only`/`maintenance_enabled`/`foreign_maintenance` (M6) drive the
+/// maintenance-owner plan via [`io::bootstrap_maintenance_owner_plan`]: the
+/// mover restamps a stale owner on EVERY connect-to-existing, not just create
+/// (see `maintenance_restamp_target`), so `maintenance_owner: None` is the only
+/// way to mean "never stamp/restamp at all" — used for a ReadOnly repo (fixes
+/// the consumer-clobbers-the-primary's-owner bug), a deliberate
+/// `spec.maintenance.enabled: false`, or a repository an externally-authored
+/// Maintenance already covers.
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_work_spec(
     backend: &Backend,
@@ -918,10 +987,22 @@ fn bootstrap_work_spec(
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
+    read_only: bool,
+    maintenance_enabled: bool,
+    foreign_maintenance: bool,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
         .then(|| cluster.unwrap_or_default().to_string());
+    let cluster_ref = cluster.filter(|c| !c.is_empty());
+    let (maintenance_owner, restamp_policy, maintenance_owner_aliases) =
+        io::bootstrap_maintenance_owner_plan(
+            RepositoryKind::Repository,
+            namespace,
+            name,
+            cluster_ref,
+            read_only || !maintenance_enabled || foreign_maintenance,
+        );
     MoverWorkSpec {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
@@ -930,17 +1011,14 @@ fn bootstrap_work_spec(
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
             // when the bootstrap creates the repo (ADR-0005 §13(a)).
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
-            // Stamped on CREATE only: the stable owner the managed Maintenance's
-            // movers compare against and claim (never the creating pod's
-            // ephemeral identity).
-            maintenance_owner: Some(kopiur_api::maintenance::kopia_owner_for_lease(
-                &kopiur_api::maintenance::managed_lease(
-                    kopiur_api::common::RepositoryKind::Repository,
-                    namespace,
-                    name,
-                ),
-            )),
+            // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
+            // every connect-to-existing when stale (`maintenance_restamp_target`);
+            // `None` means neither ever happens — see the doc above.
+            maintenance_owner,
             catalog_foreign_prefilter_cluster: prefilter_cluster,
+            restamp_policy,
+            maintenance_owner_aliases,
+            read_only,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1438,7 +1516,8 @@ mod tests {
         });
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
-                &backend, "nas", "billing", true, true, None, None, cluster, foreign,
+                &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
+                false,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -1458,5 +1537,86 @@ mod tests {
         );
         // Empty-string cluster behaves like unset (matches classify_hostname's rule).
         assert_eq!(prefilter(Some(""), ForeignSnapshots::Ignore), None);
+    }
+
+    /// M6: the bootstrap work spec's maintenance-owner gating matrix. Column
+    /// legend: (read_only, maintenance_enabled, foreign_maintenance, cluster).
+    #[test]
+    fn bootstrap_work_spec_maintenance_owner_gating_matrix() {
+        use kopiur_api::backend::FilesystemBackend;
+        use kopiur_mover::workspec::RestampPolicy;
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |read_only: bool, enabled: bool, foreign_m: bool, cluster: Option<&str>| {
+            let spec = bootstrap_work_spec(
+                &backend,
+                "nas",
+                "billing",
+                true,
+                true,
+                None,
+                None,
+                cluster,
+                ForeignSnapshots::Fallback,
+                read_only,
+                enabled,
+                foreign_m,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+
+        // Default (writable, enabled, no foreign, no cluster): stamp exactly
+        // as before M6 — AnyStale, the legacy lease's owner, no aliases,
+        // read-write connect.
+        let op = build(false, true, false, None);
+        assert_eq!(
+            op.maintenance_owner.as_deref(),
+            Some("kopiur@kopiur-billing-nas")
+        );
+        assert_eq!(op.restamp_policy, RestampPolicy::AnyStale);
+        assert!(op.maintenance_owner_aliases.is_empty());
+        assert!(!op.read_only);
+
+        // Cluster set: cluster-qualified owner, OwnFormatsOnly, legacy alias.
+        let op = build(false, true, false, Some("east"));
+        assert_eq!(
+            op.maintenance_owner.as_deref(),
+            Some("kopiur@kopiur.east.billing.nas")
+        );
+        assert_eq!(op.restamp_policy, RestampPolicy::OwnFormatsOnly);
+        assert_eq!(
+            op.maintenance_owner_aliases,
+            vec!["kopiur@kopiur-billing-nas".to_string()]
+        );
+        assert!(!op.read_only);
+
+        // ReadOnly: NO owner stamp at all (the consumer-clobbers-owner fix)
+        // AND a --readonly connect, with or without cluster.
+        for cluster in [None, Some("east")] {
+            let op = build(true, true, false, cluster);
+            assert_eq!(op.maintenance_owner, None, "cluster={cluster:?}");
+            assert!(op.read_only, "cluster={cluster:?}");
+            assert!(
+                op.maintenance_owner_aliases.is_empty(),
+                "cluster={cluster:?}"
+            );
+        }
+
+        // Maintenance disabled: no stamp, but still a read-write connect
+        // (the repo itself is writable; only owner-stamping is opted out).
+        let op = build(false, false, false, Some("east"));
+        assert_eq!(op.maintenance_owner, None);
+        assert!(!op.read_only);
+
+        // Foreign (externally-authored) Maintenance covers the repo: its
+        // ownership.owner has no relation to ours — never stamp.
+        let op = build(false, true, true, None);
+        assert_eq!(op.maintenance_owner, None);
+        assert!(!op.read_only);
     }
 }

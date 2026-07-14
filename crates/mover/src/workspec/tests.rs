@@ -287,6 +287,9 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             create_options: Default::default(),
             maintenance_owner: Some("kopiur@kopiur-ns-repo".into()),
             catalog_foreign_prefilter_cluster: Some("east".into()),
+            restamp_policy: RestampPolicy::OwnFormatsOnly,
+            maintenance_owner_aliases: vec!["kopiur@kopiur-ns-repo-legacy".into()],
+            read_only: true,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -317,6 +320,15 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
         v["operation"]["bootstrapRepository"]["catalogForeignPrefilterCluster"],
         "east"
     );
+    assert_eq!(
+        v["operation"]["bootstrapRepository"]["restampPolicy"],
+        "ownFormatsOnly"
+    );
+    assert_eq!(
+        v["operation"]["bootstrapRepository"]["maintenanceOwnerAliases"][0],
+        "kopiur@kopiur-ns-repo-legacy"
+    );
+    assert_eq!(v["operation"]["bootstrapRepository"]["readOnly"], true);
     // S3 disable-tls flows on the wire (camelCase, omitted when false).
     assert_eq!(v["repository"]["s3"]["disableTls"], true);
     assert!(
@@ -336,6 +348,37 @@ fn bootstrap_repository_old_wire_json_without_the_prefilter_field_still_decodes(
     assert!(parsed.scan_catalog);
     assert!(parsed.maintenance_owner.is_none());
     assert!(parsed.catalog_foreign_prefilter_cluster.is_none());
+    // M6 compat: pre-M6 work specs never carried these keys either — they must
+    // decode to the pre-M6 behavior (AnyStale, no aliases, read-write connect).
+    assert_eq!(parsed.restamp_policy, RestampPolicy::AnyStale);
+    assert!(parsed.maintenance_owner_aliases.is_empty());
+    assert!(!parsed.read_only);
+}
+
+#[test]
+fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
+    // New→old direction: when the M6 fields are at their defaults, they must
+    // not appear on the wire at all, so an OLD mover (that has never heard of
+    // them) still parses the JSON a NEW controller writes.
+    let op = BootstrapRepositoryOp {
+        auto_create: true,
+        scan_catalog: true,
+        create_options: Default::default(),
+        maintenance_owner: None,
+        catalog_foreign_prefilter_cluster: None,
+        restamp_policy: RestampPolicy::AnyStale,
+        maintenance_owner_aliases: Vec::new(),
+        read_only: false,
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    assert!(v.get("maintenanceOwnerAliases").is_none());
+    assert!(v.get("readOnly").is_none());
+    // restampPolicy has no `skip_serializing_if` (it's not carried as absent
+    // vs. present the way an Option/Vec is) — it always serializes, but at its
+    // default value, which an old mover that has never heard of the key
+    // would simply never read (it decodes what it recognizes and ignores the
+    // rest), so this is still forward/backward compatible in practice.
+    assert_eq!(v["restampPolicy"], "anyStale");
 }
 
 #[test]
@@ -345,6 +388,7 @@ fn maintenance_roundtrip_and_wire_shape() {
         operation: Operation::Maintenance(MaintenanceOp {
             mode: kopiur_kopia::MaintenanceMode::Full,
             owner: "kopiur/prod/nas-primary".into(),
+            owner_aliases: vec!["kopiur/prod-legacy/nas-primary".into()],
             takeover_policy: kopiur_api::TakeoverPolicy::Force,
         }),
         identity: ResolvedIdentity {
@@ -379,7 +423,21 @@ fn maintenance_roundtrip_and_wire_shape() {
         v["operation"]["maintenance"]["owner"],
         "kopiur/prod/nas-primary"
     );
+    assert_eq!(
+        v["operation"]["maintenance"]["ownerAliases"][0],
+        "kopiur/prod-legacy/nas-primary"
+    );
     assert_eq!(v["operation"]["maintenance"]["takeoverPolicy"], "Force");
+}
+
+#[test]
+fn maintenance_op_old_wire_json_without_owner_aliases_still_decodes() {
+    // Pre-M6 work-spec ConfigMaps never carried `ownerAliases` at all.
+    let old = r#"{"mode":"quick","owner":"kopiur/prod/nas-primary"}"#;
+    let parsed: MaintenanceOp = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.owner, "kopiur/prod/nas-primary");
+    assert!(parsed.owner_aliases.is_empty());
+    assert_eq!(parsed.takeover_policy, kopiur_api::TakeoverPolicy::Never);
 }
 
 #[test]
@@ -1327,5 +1385,150 @@ fn replicate_op_old_wire_decodes_with_sync_fields_defaulted() {
             delete_extra: true,
             ..Default::default()
         }
+    );
+}
+
+// --- M6: maintenance-owner restamp policy (connect-to-existing self-heal) --
+
+#[test]
+fn restamp_target_skips_the_create_path_regardless_of_policy() {
+    // On CREATE the owner is stamped unconditionally elsewhere; the connect
+    // self-heal must never also fire, under either policy.
+    for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
+        assert_eq!(
+            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), policy, &[], "anything"),
+            None,
+            "{policy:?}"
+        );
+    }
+}
+
+#[test]
+fn restamp_target_skips_without_a_configured_owner() {
+    // No stable owner configured (e.g. maintenance disabled) → never stamp,
+    // under either policy.
+    for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
+        assert_eq!(
+            maintenance_restamp_target(false, None, policy, &[], "ephemeral@pod-xyz"),
+            None,
+            "{policy:?}"
+        );
+    }
+}
+
+/// The `{AnyStale, OwnFormatsOnly} x {empty, ==desired, alias, foreign,
+/// ephemeral}` decision table (M6). `foreign x OwnFormatsOnly -> None` is the
+/// anti-ping-pong regression: two clusters cluster-qualifying the SAME
+/// underlying repository must never see each other's owner as "stale" and
+/// re-claim it on every bootstrap connect.
+#[test]
+fn restamp_target_decision_table() {
+    let desired = "kopiur@kopiur-east-media-nas";
+    let alias_owner = "kopiur@kopiur-media-nas"; // the pre-cluster lease's owner
+    let aliases = vec![alias_owner.to_string()];
+    let foreign = "someone-else@their-host";
+    let ephemeral = "nonroot@rustfs-kopiur-bootstrap-5trlr"; // kopia's auto-assigned pod identity
+
+    // current == desired: never restamp, either policy (nothing to heal).
+    for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
+        assert_eq!(
+            maintenance_restamp_target(false, Some(desired), policy, &aliases, desired),
+            None,
+            "==desired x {policy:?}"
+        );
+    }
+
+    // current empty (never-run repo): both policies heal it.
+    assert_eq!(
+        maintenance_restamp_target(false, Some(desired), RestampPolicy::AnyStale, &aliases, ""),
+        Some(desired),
+        "empty x AnyStale"
+    );
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &aliases,
+            ""
+        ),
+        Some(desired),
+        "empty x OwnFormatsOnly"
+    );
+
+    // current is a recognized alias (the migration path): both policies heal it.
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::AnyStale,
+            &aliases,
+            alias_owner
+        ),
+        Some(desired),
+        "alias x AnyStale"
+    );
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &aliases,
+            alias_owner
+        ),
+        Some(desired),
+        "alias x OwnFormatsOnly"
+    );
+
+    // current is a genuinely foreign owner: AnyStale still clobbers it
+    // (single-cluster behavior, unchanged); OwnFormatsOnly refuses — THE
+    // anti-ping-pong regression test.
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::AnyStale,
+            &aliases,
+            foreign
+        ),
+        Some(desired),
+        "foreign x AnyStale"
+    );
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &aliases,
+            foreign
+        ),
+        None,
+        "foreign x OwnFormatsOnly (anti-ping-pong)"
+    );
+
+    // current is an ancient/ephemeral owner this operator never recognized:
+    // same shape as "foreign" — AnyStale clobbers, OwnFormatsOnly refuses (a
+    // one-time takeoverPolicy: Force is required to move it under this policy).
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::AnyStale,
+            &aliases,
+            ephemeral
+        ),
+        Some(desired),
+        "ephemeral x AnyStale"
+    );
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &aliases,
+            ephemeral
+        ),
+        None,
+        "ephemeral x OwnFormatsOnly"
     );
 }

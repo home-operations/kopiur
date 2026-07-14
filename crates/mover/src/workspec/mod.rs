@@ -580,6 +580,29 @@ pub struct BootstrapRepositoryOp {
     /// (serde default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_foreign_prefilter_cluster: Option<String>,
+    /// How aggressively the connect-to-existing self-heal (see
+    /// [`maintenance_restamp_target`]) may re-stamp a stale maintenance owner.
+    /// Defaults to [`RestampPolicy::AnyStale`] (the pre-M6 behavior) so old
+    /// work-spec JSON decodes unchanged.
+    #[serde(default)]
+    pub restamp_policy: RestampPolicy,
+    /// Pre-derived kopia OWNER strings (`kopia_owner_for_lease(alias_lease)`,
+    /// not raw lease strings) for this repository's recognized legacy leases
+    /// (M6 migration path — see
+    /// [`kopiur_api::maintenance::Ownership::owner_aliases`]). Consulted by
+    /// [`maintenance_restamp_target`] under [`RestampPolicy::OwnFormatsOnly`].
+    /// Absent on old work specs (serde default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintenance_owner_aliases: Vec<String>,
+    /// Connect with `--readonly` (`kopia repository connect --readonly`)
+    /// instead of the normal read-write connect. Set ONLY for the bootstrap of
+    /// a `mode: ReadOnly` repository (M6): bootstrap is a connect/scan probe,
+    /// and read-write-connecting a consumer repo is exactly what let it clobber
+    /// the primary's maintenance owner (the bug this field fixes). Never set
+    /// for restore/delete movers, which legitimately write pins. Absent on old
+    /// work specs (serde default ⇒ `false`, the pre-M6 behavior).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl BootstrapRepositoryOp {
@@ -587,6 +610,76 @@ impl BootstrapRepositoryOp {
     /// create-time format knobs carried here.
     pub fn create_options(&self) -> kopiur_kopia::CreateOptions {
         self.create_options.to_kopia()
+    }
+}
+
+/// How aggressively the bootstrap mover's connect-to-existing self-heal (see
+/// [`maintenance_restamp_target`]) may re-stamp a stale kopia maintenance
+/// owner. Closed enum — a new policy cannot compile until every caller
+/// accounts for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestampPolicy {
+    /// Re-stamp whenever the recorded owner differs from the desired one — the
+    /// pre-M6 behavior. Safe for a repository with no cluster dimension: at
+    /// most one cluster's operator ever bootstraps it, so any stale owner is
+    /// either the ephemeral pod identity kopia auto-assigned on create, or an
+    /// older-format stamp from THIS SAME operator — never another cluster's.
+    #[default]
+    AnyStale,
+    /// Re-stamp ONLY when the recorded owner is empty, already the desired
+    /// owner, or matches one of [`BootstrapRepositoryOp::maintenance_owner_aliases`]
+    /// — i.e. never clobber a foreign or unrecognized owner. Required once a
+    /// repository has a cluster dimension (`identityDefaults.cluster` set): with
+    /// `AnyStale`, every cluster restamping on every connect would each see the
+    /// OTHER'S owner as "stale" and re-claim it — an infinite ping-pong on a
+    /// shared repo. The tradeoff: an ancient/ephemeral owner this operator has
+    /// never seen before is left alone rather than auto-clobbered, needing a
+    /// one-time `ownership.takeoverPolicy: Force` — auto-clobber is exactly the
+    /// behavior that is unsafe once more than one cluster can reach this repo.
+    OwnFormatsOnly,
+}
+
+/// Decide whether the bootstrap mover should re-stamp the stable maintenance
+/// owner on a *connect-to-existing* repository. Returns `Some(owner)` to stamp,
+/// or `None` to leave the recorded owner alone.
+///
+/// `created` is `true` only for a repository this bootstrap run just CREATED —
+/// its owner was already stamped unconditionally at create time, so this
+/// self-heal never fires there (see the mover's create-path stamp).
+///
+/// Exhaustive over [`RestampPolicy`]:
+/// * [`RestampPolicy::AnyStale`] — restamp whenever `current != desired`
+///   (unconditional on a connect-to-existing; the pre-M6 rule).
+/// * [`RestampPolicy::OwnFormatsOnly`] — the same staleness check, AND ONLY
+///   when `current` is empty, or recognized as one of `aliases` (never a
+///   foreign or unrecognized owner — including an ancient ephemeral one, which
+///   needs a one-time `takeoverPolicy: Force` to move under this policy; see
+///   the variant's doc for why auto-clobber is unsafe here).
+///
+/// Pulled out so the gate is unit-testable without spawning kopia, and shared
+/// (via [`kopiur_mover::workspec`]) with the controller's in-process
+/// (bare-path filesystem) restamp, which needs the identical decision.
+pub fn maintenance_restamp_target<'a>(
+    created: bool,
+    desired: Option<&'a str>,
+    policy: RestampPolicy,
+    aliases: &[String],
+    current: &str,
+) -> Option<&'a str> {
+    let owner = desired?;
+    if created || current == owner {
+        return None;
+    }
+    match policy {
+        RestampPolicy::AnyStale => Some(owner),
+        RestampPolicy::OwnFormatsOnly => {
+            if current.is_empty() || aliases.iter().any(|a| a == current) {
+                Some(owner)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -650,6 +743,12 @@ pub struct MaintenanceOp {
     /// This `Maintenance`'s configured lease holder identity
     /// (`spec.ownership.owner`); compared against the repo's current holder.
     pub owner: String,
+    /// Previous lease strings still recognized as SELF
+    /// (`spec.ownership.ownerAliases`, M6 migration path) — see
+    /// [`kopiur_api::maintenance::lease_held_by_other`]. Absent on old work
+    /// specs (serde default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_aliases: Vec<String>,
     /// What to do if the lease is held by a *different* owner. ADR §3.7.
     #[serde(default)]
     pub takeover_policy: kopiur_api::TakeoverPolicy,

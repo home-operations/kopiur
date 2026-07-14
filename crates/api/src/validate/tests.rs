@@ -3890,3 +3890,49 @@ fn restore_pvc_target_rejects_unknown_and_rwop_combo_access_modes() {
     });
     assert!(validate_restore(&spec).is_ok());
 }
+
+/// M6: each `ownership.ownerAliases` entry gets the kopia identity shape rule
+/// (it becomes an identity hostname via `kopia_lease_identity`); `owner`
+/// itself is deliberately NOT tightened (stored pre-M6 CRs may carry strings
+/// the lease sanitizer already handles — a new rejection would hard-stop a
+/// working Maintenance on its next defensive re-validation).
+#[test]
+fn maintenance_owner_aliases_are_shape_validated_but_owner_is_not_tightened() {
+    use crate::maintenance::{MaintenanceSpec, Ownership};
+
+    let spec = |owner: &str, aliases: Vec<String>| MaintenanceSpec {
+        repository: repo_ref(RepositoryKind::Repository, None),
+        schedule: crate::maintenance::default_maintenance_schedule(),
+        ownership: Ownership {
+            owner: owner.into(),
+            owner_aliases: aliases,
+            takeover_policy: Default::default(),
+        },
+        mover: None,
+        failure_policy: None,
+        credential_projection: None,
+    };
+
+    // Well-formed aliases (lease strings) pass.
+    assert!(
+        validate_maintenance(&spec(
+            "kopiur/east/prod/nas",
+            vec!["kopiur/prod/nas".into()]
+        ))
+        .is_empty()
+    );
+
+    // An alias with an identity delimiter is rejected, naming the entry.
+    let errs = validate_maintenance(&spec(
+        "kopiur/east/prod/nas",
+        vec!["kopiur/prod/nas".into(), "bad@alias".into()],
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let msg = errs[0].to_string();
+    assert!(msg.contains("ownerAliases[1]"), "{msg}");
+    assert!(msg.contains('@'), "{msg}");
+
+    // A legacy hand-authored owner with an '@' is still accepted (no stored-CR
+    // regression) — the lease sanitizer collapses it safely at run time.
+    assert!(validate_maintenance(&spec("admin@legacy-host", Vec::new())).is_empty());
+}
