@@ -54,6 +54,16 @@ pub use plan::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Steady-state requeue for a **terminal** `Snapshot` (Succeeded/Failed/Discovered
+/// and the settled pin/reap tails). These re-reconciles are pure no-ops — every
+/// cleanup transition is one-shot-stamped — so the interval is a straight
+/// reconcile-QPS lever with no behavior change (issue #249). At 600s a fleet of
+/// ~5k terminal CRs pinned ~8 no-op reconciles/second forever; 45 min cuts that by
+/// ~4.5×. Kept under an hour so a stuck-but-terminal CR still self-checks a couple
+/// of times per hour. Active work (pin spawn, staging, Job polling) keeps its own
+/// short requeues — only the terminal steady state is slowed here.
+const TERMINAL_SNAPSHOT_STEADY_REQUEUE: Duration = Duration::from_secs(45 * 60);
 /// Reconcile a `Snapshot`.
 ///
 /// IO is intentionally thin here: the decision logic ([`plan_deletion`],
@@ -112,7 +122,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             status["origin"] = serde_json::json!("discovered");
             io::patch_status(&api, &name, status).await?;
         }
-        return Ok(Action::requeue(Duration::from_secs(600)));
+        return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
     }
 
     // Ensure the snapshot-cleanup finalizer before doing any work that creates a
@@ -311,7 +321,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // periodic sweep — which an operator may legitimately have disabled. Once
             // stamped, we go back to `await_change()` and stop polling entirely.
             if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await? {
-                return Ok(Action::requeue(Duration::from_secs(600)));
+                return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
             }
             return Ok(Action::await_change());
         }
@@ -1915,7 +1925,7 @@ async fn reconcile_pin(
 ) -> Result<Action> {
     let desired = backup.spec.pin;
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
-    let steady = Action::requeue(Duration::from_secs(600));
+    let steady = Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE);
     let action = pin_decision(desired, observed);
     let job_name = format!("{name}-pin");
 
@@ -2144,7 +2154,7 @@ fn pin_job_still_wanted(target: Option<bool>, action: PinAction) -> bool {
 /// action is still pending (the spawn path runs next pass), steady otherwise.
 fn post_pin_consume_action(action: PinAction) -> Action {
     match action {
-        PinAction::NoOp => Action::requeue(Duration::from_secs(600)),
+        PinAction::NoOp => Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE),
         PinAction::Pin | PinAction::Unpin => Action::requeue(Duration::from_secs(5)),
     }
 }

@@ -2,6 +2,18 @@ use super::*;
 use crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION;
 use kopiur_api::common::NamespaceDeletePolicy;
 
+#[test]
+fn terminal_steady_requeue_is_bounded_reconcile_qps_relief() {
+    // Issue #249: terminal Snapshots re-reconcile on this interval for their whole
+    // retention window, so it must stay well above the old 600s (QPS relief) but
+    // under an hour (a terminal CR still self-checks a couple of times per hour).
+    let secs = TERMINAL_SNAPSHOT_STEADY_REQUEUE.as_secs();
+    assert!(
+        (30 * 60..=60 * 60).contains(&secs),
+        "terminal requeue {secs}s must be 30–60 min (was 600s before #249)"
+    );
+}
+
 fn ann(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
