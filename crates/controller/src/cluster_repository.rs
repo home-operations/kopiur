@@ -374,10 +374,25 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 if let Err(e) = outcome {
                     let class = e.class();
                     let retryable = class.is_retryable();
+                    let phase_enum = if retryable {
+                        RepositoryPhase::Degraded
+                    } else {
+                        RepositoryPhase::Failed
+                    };
                     let phase = if retryable { "Degraded" } else { "Failed" };
                     // Stable, volatile-free condition message; full stderr → Event.
                     let conditions =
                         cluster_bootstrap_condition(repo, false, class.as_str(), class.summary());
+                    // kstatus conditions so Flux sees a retryable connect as
+                    // Reconciling and a terminal one as Stalled, never a frozen
+                    // Ready/Suspended (issue #245).
+                    let conditions = io::set_ready(
+                        &conditions,
+                        repo.metadata.generation,
+                        io::ready_outcome_for_phase(phase_enum),
+                        class.as_str(),
+                        class.summary(),
+                    );
                     let current = serde_json::to_value(&repo.status).ok();
                     let wrote = io::patch_status_if_changed(
                         &api,
@@ -413,6 +428,22 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             }
             let status = client.repository_status().await?;
             let allowed_count = allowed_namespace_count(&repo.spec.allowed_namespaces);
+            // kstatus Ready/Reconciling/Stalled for the healthy bare-path repo
+            // (issue #245), layered on any existing conditions so the merge-patch
+            // replace keeps them. A resume through this in-process path must clear
+            // the suspend branch's stale entries just like the mover path does.
+            let existing = repo
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let conditions = io::set_ready(
+                &existing,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(RepositoryPhase::Ready),
+                "Connected",
+                "connected to the existing repository",
+            );
             let mut status_patch = serde_json::json!({
                 "phase": "Ready",
                 "backend": "Filesystem",
@@ -420,6 +451,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 "allowedNamespaceCount": allowed_count,
                 "observedGeneration": repo.metadata.generation,
                 "resolvedCredentialVersion": cred_version,
+                "conditions": conditions,
             });
             // Record a `Snapshot`'s reverify nudge as honored. This in-process arm
             // re-probes on every reconcile (the connect above) and the annotation patch
@@ -1154,6 +1186,15 @@ async fn finalize_cluster_bootstrap(
             let reason = failure.reason();
             let conditions =
                 cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+            // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
+            // should fail its health check fast, not hang until timeout.
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(RepositoryPhase::Failed),
+                reason,
+                &failure.condition_message(),
+            );
             // Guard the write so the Event + warn log fire only on the real transition,
             // not on every 120 s re-read (the message is stable → a true no-op once
             // written, so no reconcile hot-loop and no Event spam).
@@ -1233,6 +1274,23 @@ async fn finalize_cluster_bootstrap(
             pinned_unique_id = Some(pinned.to_string());
         }
     }
+    // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
+    // healthy repository (issue #245), layered onto the conditions built above so
+    // the merge-patch replace of `conditions` still carries Bootstrapped and
+    // IndexBlobHealth. A resume reaches this path and MUST overwrite the stale
+    // `Suspended`-reasoned Ready/Reconciling entries left by the suspend branch —
+    // otherwise Flux `wait: true` hangs on a repository that is actually Ready.
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(RepositoryPhase::Ready),
+        "Bootstrapped",
+        if result.created {
+            "created a new repository"
+        } else {
+            "connected to the existing repository"
+        },
+    );
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
     // re-write of identical status would bump `resourceVersion` and re-trigger
@@ -1349,6 +1407,18 @@ async fn finalize_cluster_probe_failure(
         &now,
         repo.metadata.generation,
     );
+    // The repository stays kstatus-Ready during a probe failure (backups continue
+    // by design); the probe detail rides the `BackendReachable` condition folded
+    // into `upd.conditions`. Layer Ready on top so its observedGeneration stays
+    // current and a resumed-then-probe-flapping repo never shows a stale
+    // `Suspended` Ready reason (issue #245).
+    let conditions = io::set_ready(
+        &upd.conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(RepositoryPhase::Ready),
+        "Bootstrapped",
+        "repository connected; a health probe is failing (see BackendReachable), backups continue",
+    );
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
         api,
@@ -1357,7 +1427,7 @@ async fn finalize_cluster_probe_failure(
         serde_json::json!({
             "phase": "Ready",
             "health": upd.health,
-            "conditions": upd.conditions,
+            "conditions": conditions,
         }),
     )
     .await?;

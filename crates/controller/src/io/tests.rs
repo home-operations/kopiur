@@ -464,6 +464,29 @@ fn set_ready_emits_ready_reconciling_stalled_per_outcome() {
 }
 
 #[test]
+fn ready_outcome_for_phase_maps_every_phase() {
+    // Issue #245: the phase→kstatus mapping used at every repository status write.
+    use kopiur_api::RepositoryPhase;
+    assert_eq!(
+        ready_outcome_for_phase(RepositoryPhase::Ready),
+        ReadyOutcome::Ready
+    );
+    assert_eq!(
+        ready_outcome_for_phase(RepositoryPhase::Failed),
+        ReadyOutcome::Stalled
+    );
+    // Reachable-but-unsettled and retryable-failure phases are Reconciling, never
+    // a premature Ready and never a hard Stalled.
+    for p in [
+        RepositoryPhase::Pending,
+        RepositoryPhase::Initializing,
+        RepositoryPhase::Degraded,
+    ] {
+        assert_eq!(ready_outcome_for_phase(p), ReadyOutcome::Reconciling);
+    }
+}
+
+#[test]
 fn set_ready_preserves_transition_time_when_unchanged_and_flips_on_change() {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     // Seed Ready=True with a fixed transition time.

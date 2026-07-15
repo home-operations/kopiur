@@ -265,12 +265,27 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     // a retryable backend blip is `Degraded` and keeps retrying on
                     // the 30 s transient cadence.
                     let phase = if retryable { "Degraded" } else { "Failed" };
+                    let phase_enum = if retryable {
+                        RepositoryPhase::Degraded
+                    } else {
+                        RepositoryPhase::Failed
+                    };
                     // Stable, volatile-free condition message — the full stderr (with
                     // its per-attempt temp filename) goes to the Event only, so the
                     // persisted status is byte-identical across repeated failures and
                     // the guarded write below becomes a true no-op.
                     let conditions =
                         bootstrap_condition(repo, false, class.as_str(), class.summary());
+                    // kstatus conditions so Flux sees a retryable connect as
+                    // Reconciling and a terminal one as Stalled, never a frozen
+                    // Ready/Suspended (issue #245).
+                    let conditions = io::set_ready(
+                        &conditions,
+                        repo.metadata.generation,
+                        io::ready_outcome_for_phase(phase_enum),
+                        class.as_str(),
+                        class.summary(),
+                    );
                     let current = serde_json::to_value(&repo.status).ok();
                     let wrote = io::patch_status_if_changed(
                         &api,
@@ -462,6 +477,18 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             {
                 status_patch["lastReverifyAt"] = serde_json::Value::String(token.to_string());
             }
+            // Always publish the kstatus Ready conditions for the healthy bare-path
+            // repo (issue #245), layered on any conditions built above — even when
+            // no index-blob count was read, so a resume clears the suspend branch's
+            // stale Ready/Reconciling/Suspended entries and Flux `wait: true` passes.
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(RepositoryPhase::Ready),
+                "Connected",
+                "connected to the existing repository",
+            );
+            status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
             let current = serde_json::to_value(&repo.status).ok();
             io::patch_status_if_changed(&api, &name, current.as_ref(), status_patch).await?;
             if let Some(w) = index_blob_event {
@@ -1127,6 +1154,15 @@ async fn finalize_bootstrap(
             }
             let reason = failure.reason();
             let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+            // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
+            // should fail its health check fast, not hang until timeout.
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(RepositoryPhase::Failed),
+                reason,
+                &failure.condition_message(),
+            );
             // Guard the write so a re-confirmed failure fires the Event + warn log only
             // on the real transition, not on every 120 s re-read (the message is stable,
             // so this becomes a true no-op once written — no reconcile hot-loop).
@@ -1215,6 +1251,23 @@ async fn finalize_bootstrap(
             status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
         }
     }
+    // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
+    // healthy repository (issue #245), layered onto the conditions built above so
+    // the merge-patch replace of `conditions` still carries Bootstrapped and
+    // IndexBlobHealth. A resume reaches this path and MUST overwrite the stale
+    // `Suspended`-reasoned entries left by the suspend branch, else Flux
+    // `wait: true` hangs on a repository that is actually Ready.
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(RepositoryPhase::Ready),
+        "Bootstrapped",
+        if result.created {
+            "created a new repository"
+        } else {
+            "connected to the existing repository"
+        },
+    );
     status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
     // Guarded write: this path re-runs on EVERY reconcile while the finished
     // bootstrap Job exists, so the steady-state pass must be a true no-op — a
@@ -1324,6 +1377,17 @@ async fn finalize_probe_failure(
     );
     // Phase stays `Ready` (set explicitly so a stray `Initializing`/`Degraded` from
     // an earlier path self-heals); the alert lives entirely in the condition.
+    // Layer the kstatus Ready on top (issue #245) so its observedGeneration stays
+    // current and a resumed-then-probe-flapping repo never shows a stale
+    // `Suspended` Ready reason; the probe detail rides the `BackendReachable`
+    // condition already folded into `upd.conditions`.
+    let conditions = io::set_ready(
+        &upd.conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(RepositoryPhase::Ready),
+        "Bootstrapped",
+        "repository connected; a health probe is failing (see BackendReachable), backups continue",
+    );
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
         api,
@@ -1332,7 +1396,7 @@ async fn finalize_probe_failure(
         serde_json::json!({
             "phase": "Ready",
             "health": upd.health,
-            "conditions": upd.conditions,
+            "conditions": conditions,
         }),
     )
     .await?;
