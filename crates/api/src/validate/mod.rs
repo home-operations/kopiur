@@ -461,5 +461,26 @@ pub(crate) fn forbid_pvc_consumer(
     Ok(())
 }
 
+/// Reject `inheritSecurityContextFrom` **entirely**, for a kind whose reconciler never resolves
+/// it. Stronger than [`forbid_pvc_consumer`]: that rejects one variant on a kind that *does*
+/// honor the other, this rejects the whole field on a kind that honors none of it.
+///
+/// Accepting a field and then ignoring it is the failure mode this repo exists to design out —
+/// the manifest says the mover runs as the workload, the mover runs as something else, and
+/// nothing says otherwise. If a kind cannot honor it, admission must say so.
+pub(crate) fn forbid_inherit(
+    mover: &MoverSpec,
+    field_prefix: &str,
+    reason: &str,
+) -> ValidationResult {
+    if mover.inherit_security_context_from.is_some() {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field_prefix}.mover.inheritSecurityContextFrom"),
+            reason: reason.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

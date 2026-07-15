@@ -619,10 +619,25 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
     if let Err(e) = validate_backend(&spec.destination) {
         errs.push(e);
     }
-    if let Some(m) = &spec.mover
-        && let Err(e) = validate_mover(m, "RepositoryReplication mover")
-    {
-        errs.push(e);
+    if let Some(m) = &spec.mover {
+        if let Err(e) = validate_mover(m, "RepositoryReplication mover") {
+            errs.push(e);
+        }
+        // A replication mover copies blobs repo→repo and never touches a workload's files, so
+        // `repository_replication.rs` never resolves inheritance — it passes the explicit
+        // contexts straight to `resolve_mover`. The field was therefore ACCEPTED and silently
+        // dropped: the manifest claimed the mover ran as the workload, and it did not. Reject
+        // it instead of ignoring it.
+        if let Err(e) = super::forbid_inherit(
+            m,
+            "RepositoryReplication spec",
+            "is not honored by a replication mover, which copies repository blobs and never \
+             reads a workload's files — there is no workload whose identity it could take. \
+             Remove it; set mover.securityContext explicitly if the destination backend needs \
+             a particular UID/GID (e.g. a filesystem repository on an NFS export).",
+        ) {
+            errs.push(e);
+        }
     }
     if let Some(sync) = &spec.sync {
         if let Some(p) = sync.parallel

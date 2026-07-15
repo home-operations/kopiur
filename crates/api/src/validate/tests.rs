@@ -4091,3 +4091,187 @@ fn example_18_merged_policy_is_valid() {
     // And the pair the docs teach must actually be accepted.
     validate_mover(mover, "SnapshotPolicy mover").expect("inherit + explicit must be accepted");
 }
+
+/// `RepositoryReplication.spec.mover.inheritSecurityContextFrom` used to be accepted at
+/// admission and then silently dropped at reconcile: `repository_replication.rs` passes the
+/// explicit contexts straight to `resolve_mover` and never resolves inheritance. The manifest
+/// said the mover ran as the workload; it ran as something else, and nothing said otherwise.
+///
+/// A replication mover copies blobs repo→repo and never reads a workload's files, so there is
+/// no workload identity to take. Reject it rather than ignore it.
+#[test]
+fn replication_mover_rejects_inherit_instead_of_silently_dropping_it() {
+    use crate::common::{InheritSecurityContextFrom, MoverSpec, PodSelector, PvcConsumerInherit};
+    use k8s_openapi::api::core::v1::SecurityContext;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+
+    let with_inherit = |i: InheritSecurityContextFrom| MoverSpec {
+        inherit_security_context_from: Some(i),
+        ..Default::default()
+    };
+
+    // Both variants are equally unhonorable here.
+    for inherit in [
+        InheritSecurityContextFrom::PvcConsumer(PvcConsumerInherit::default()),
+        InheritSecurityContextFrom::WorkloadSelector(PodSelector {
+            pod_selector: LabelSelector::default(),
+            container: None,
+        }),
+    ] {
+        let err = super::forbid_inherit(
+            &with_inherit(inherit),
+            "RepositoryReplication spec",
+            "is not honored by a replication mover",
+        )
+        .expect_err("inherit on a replication mover must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inheritSecurityContextFrom"),
+            "the message must name the offending field, got: {msg}"
+        );
+    }
+
+    // An explicit context — the actual remedy — is still fine.
+    let explicit = MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(3001),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(super::forbid_inherit(&explicit, "RepositoryReplication spec", "x").is_ok());
+    assert!(validate_mover(&explicit, "RepositoryReplication mover").is_ok());
+}
+
+/// The same rejection, through the REAL entry point users hit. `validate_repository_replication`
+/// is called by both the webhook (`handlers.rs`) and the controller
+/// (`repository_replication.rs`), so this covers webhook-disabled installs too.
+#[test]
+fn replication_validator_surfaces_the_inherit_rejection() {
+    use crate::backend::{Backend, S3Backend};
+    use crate::common::{InheritSecurityContextFrom, MoverSpec, PvcConsumerInherit};
+
+    let mut spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        Backend::S3(S3Backend {
+            bucket: "mirror".into(),
+            prefix: None,
+            endpoint: None,
+            region: None,
+            auth: None,
+            tls: None,
+        }),
+        "0 5 * * *",
+    );
+    // Sanity: this spec is otherwise valid, so any error below is the one under test.
+    assert!(validate_repository_replication(&spec).is_empty());
+
+    spec.mover = Some(MoverSpec {
+        inherit_security_context_from: Some(InheritSecurityContextFrom::PvcConsumer(
+            PvcConsumerInherit::default(),
+        )),
+        ..Default::default()
+    });
+    let errs = validate_repository_replication(&spec);
+    let named = errs.iter().any(|e| {
+        matches!(e, ValidationError::InvalidFieldValue { field, .. }
+            if field == "RepositoryReplication spec.mover.inheritSecurityContextFrom")
+    });
+    assert!(
+        named,
+        "expected the inherit field to be rejected, got: {errs:?}"
+    );
+    // The message must say WHY and WHAT TO DO, not just "invalid".
+    let msg = errs
+        .iter()
+        .find(|e| {
+            matches!(e, ValidationError::InvalidFieldValue { field, .. }
+            if field.ends_with("inheritSecurityContextFrom"))
+        })
+        .map(|e| e.to_string())
+        .unwrap();
+    assert!(
+        msg.contains("never reads a workload's files") && msg.contains("mover.securityContext"),
+        "the message must explain the why and name the remedy, got: {msg}"
+    );
+}
+
+/// The e2e `replication_with_inherit` fixture (crates/e2e/tests/webhook.rs) must be rejected
+/// for EXACTLY ONE reason: the inherit field. A fixture that is invalid some other way would
+/// still be DENIED at admission, and the e2e test would pass while proving nothing.
+#[test]
+fn e2e_replication_inherit_fixture_is_rejected_only_for_inherit() {
+    let v: serde_json::Value = crate::testutil::from_yaml(
+        r#"
+sourceRef: { kind: Repository, name: any }
+destination: { s3: { bucket: mirror, region: us-east-1 } }
+schedule: { cron: "0 5 * * *" }
+mover:
+  inheritSecurityContextFrom:
+    pvcConsumer: {}
+"#,
+    );
+    let spec: crate::repository_replication::RepositoryReplicationSpec =
+        serde_json::from_value(v).expect("the e2e fixture shape deserializes");
+    let errs = validate_repository_replication(&spec);
+    assert_eq!(
+        errs.len(),
+        1,
+        "the fixture must be otherwise valid so the e2e denial is attributable, got: {errs:?}"
+    );
+    assert!(matches!(
+        &errs[0],
+        ValidationError::InvalidFieldValue { field, .. }
+            if field == "RepositoryReplication spec.mover.inheritSecurityContextFrom"
+    ));
+}
+
+/// The `mover` shapes the new e2e scenarios build (crates/e2e/tests/security_context_compat.rs)
+/// must deserialize into the typed spec. The e2e harness's `cr()` helper panics at *runtime* on
+/// a bad shape, so a typo there fails inside a kind cluster minutes later, if at all — and a
+/// silently-dropped optional key (no `deny_unknown_fields`) would not fail at all. Pin them here.
+#[test]
+fn e2e_inherit_scenario_mover_shapes_deserialize() {
+    use crate::common::{InheritSecurityContextFrom, MoverSpec};
+
+    // Scenario (c)/(d)/(e): pvcConsumer, alone and with an explicit override.
+    let cases: &[(&str, &str)] = &[
+        (
+            "pvcConsumer alone",
+            r#"{ "inheritSecurityContextFrom": { "pvcConsumer": {} } }"#,
+        ),
+        (
+            "pvcConsumer + explicit override",
+            r#"{ "inheritSecurityContextFrom": { "pvcConsumer": {} },
+                 "securityContext": { "runAsUser": 1000 } }"#,
+        ),
+    ];
+    for (what, json) in cases {
+        let mover: MoverSpec = serde_json::from_str(json).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            matches!(
+                mover.inherit_security_context_from,
+                Some(InheritSecurityContextFrom::PvcConsumer(_))
+            ),
+            "{what}: pvcConsumer must survive deserialization, not be dropped as unknown"
+        );
+        validate_mover(&mover, "SnapshotPolicy mover")
+            .unwrap_or_else(|e| panic!("{what}: must be accepted, got {e}"));
+    }
+
+    // The override case must actually carry the explicit UID (the thing the e2e asserts wins).
+    let mover: MoverSpec = serde_json::from_str(cases[1].1).unwrap();
+    assert_eq!(
+        mover.security_context.and_then(|s| s.run_as_user),
+        Some(1000)
+    );
+
+    // Scenario (c)'s UID-less workload container context.
+    let sc: k8s_openapi::api::core::v1::SecurityContext =
+        serde_json::from_str(r#"{ "allowPrivilegeEscalation": false }"#).unwrap();
+    assert_eq!(
+        crate::common::effective_run_as_user(Some(&sc), None),
+        None,
+        "the e2e's UID-less workload must genuinely pin no UID, or scenario (c) proves nothing"
+    );
+}
