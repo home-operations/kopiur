@@ -26,7 +26,9 @@ use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::{PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz};
+use kopiur_api::common::{
+    DeletionPolicy, PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz,
+};
 use kopiur_api::snapshot::SnapshotSpec;
 use kopiur_api::{
     ConcurrencyPolicy, ScheduleSpec, Snapshot, SnapshotPolicy, SnapshotSchedule, jitter, validate,
@@ -748,6 +750,59 @@ async fn policy_repo_timezone_default(
     Ok(repo.schedule_defaults.and_then(|d| d.timezone))
 }
 
+/// Build the `SnapshotSpec` for a scheduled backup of `policy_ref`. Pure so the
+/// `defaultDeletionPolicy` inheritance (issue #238) is unit-tested without a
+/// cluster.
+///
+/// `default_deletion_policy` is the referenced `SnapshotPolicy`'s
+/// `spec.defaultDeletionPolicy`. Threading it here — rather than always emitting
+/// `deletion_policy: None` — is what makes the recipe-wide default actually reach
+/// the produced `Snapshot`: the mutating admission webhook only fills in its
+/// origin-aware `Delete` default when this field is `None`, so a never-resolved
+/// policy default silently became `Delete` regardless of what the recipe asked
+/// for. `None` here preserves that safe origin-aware default exactly.
+fn scheduled_backup_spec(
+    policy_ref: &PolicyRef,
+    default_deletion_policy: Option<DeletionPolicy>,
+) -> SnapshotSpec {
+    SnapshotSpec {
+        policy_ref: Some(policy_ref.clone()),
+        tags: None,
+        failure_policy: None,
+        deletion_policy: default_deletion_policy,
+        pin: false,
+        // Scheduled backups never carry a templated description (out of
+        // scope for M4 — description is per-invocation only).
+        description: None,
+    }
+}
+
+/// GET the target policy and return its `spec.defaultDeletionPolicy` (issue #238).
+/// Honors a cross-namespace `policyRef.namespace` exactly like
+/// [`policy_repo_timezone_default`]. Degrades to `None` on any GET failure or a
+/// missing policy: a transient apiserver blip must never block a due backup, and
+/// `None` falls through to the webhook's origin-aware `Delete` default just as
+/// before — the next fire re-resolves.
+async fn policy_default_deletion_policy(
+    ctx: &Context,
+    policy_ref: &PolicyRef,
+    schedule_ns: &str,
+) -> Option<DeletionPolicy> {
+    let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
+    let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), policy_ns);
+    match api.get_opt(&policy_ref.name).await {
+        Ok(Some(p)) => p.spec.default_deletion_policy,
+        Ok(None) => {
+            tracing::debug!(policy = %policy_ref.name, "policy not found while resolving defaultDeletionPolicy; using origin-aware default");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(policy = %policy_ref.name, error = %e, "resolving policy defaultDeletionPolicy failed; using origin-aware default");
+            None
+        }
+    }
+}
+
 /// Create a scheduled Snapshot CR for `policy_ref` (owner-ref to the schedule,
 /// origin=scheduled). Server-side applied so re-firing the same slot converges
 /// instead of erroring. `backup_name` is the per-policy slot-stamped name.
@@ -773,18 +828,12 @@ async fn create_scheduled_backup(
         policy_ref.name.clone(),
     );
 
+    // Inherit the recipe's defaultDeletionPolicy so the produced Snapshot carries
+    // it BEFORE admission (else the webhook stamps its origin default) — #238.
+    let default_deletion_policy = policy_default_deletion_policy(ctx, policy_ref, namespace).await;
     let mut backup = Snapshot::new(
         backup_name,
-        SnapshotSpec {
-            policy_ref: Some(policy_ref.clone()),
-            tags: None,
-            failure_policy: None,
-            deletion_policy: None,
-            pin: false,
-            // Scheduled backups never carry a templated description (out of
-            // scope for M4 — description is per-invocation only).
-            description: None,
-        },
+        scheduled_backup_spec(policy_ref, default_deletion_policy),
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
 
@@ -792,7 +841,7 @@ async fn create_scheduled_backup(
     io::apply(&api, backup_name, &backup).await?;
     ctx.metrics
         .inc_schedule_backup_created(namespace, &schedule.name_any());
-    tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, policy = %policy_ref.name, "created scheduled Snapshot");
+    tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, policy = %policy_ref.name, deletion_policy = ?default_deletion_policy, "created scheduled Snapshot");
     Ok(())
 }
 
@@ -849,6 +898,31 @@ mod tests {
             concurrency_policy: policy,
             starting_deadline_seconds: deadline,
         }
+    }
+
+    #[test]
+    fn scheduled_backup_spec_inherits_default_deletion_policy() {
+        // Issue #238: the recipe's defaultDeletionPolicy must be stamped onto the
+        // produced Snapshot, so a policy asking for Retain isn't silently
+        // overridden to Delete by the webhook's origin-aware default.
+        let pref = PolicyRef {
+            name: "test-pvc".into(),
+            namespace: None,
+        };
+        let retain = scheduled_backup_spec(&pref, Some(DeletionPolicy::Retain));
+        assert_eq!(retain.deletion_policy, Some(DeletionPolicy::Retain));
+        assert_eq!(
+            retain.policy_ref.as_ref().map(|r| r.name.as_str()),
+            Some("test-pvc")
+        );
+
+        let orphan = scheduled_backup_spec(&pref, Some(DeletionPolicy::Orphan));
+        assert_eq!(orphan.deletion_policy, Some(DeletionPolicy::Orphan));
+
+        // An unset recipe default leaves the field None, so the webhook's
+        // safe origin-aware Delete default still applies (no behavior change).
+        let unset = scheduled_backup_spec(&pref, None);
+        assert_eq!(unset.deletion_policy, None);
     }
 
     #[test]
