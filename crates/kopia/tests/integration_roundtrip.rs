@@ -227,15 +227,19 @@ async fn verbs_roundtrip() {
     // category sweep) tuning knobs `--file-parallelism`/`--file-queue-length`
     // against the real kopia binary — the permanent regression guard that kopia
     // actually accepts these flag forms, not just that the argv shape looks right.
+    // `--sources <identity>` (issue #250) is exercised here too: the pinned kopia
+    // binary must both PARSE the flag and MATCH the snapshot recorded under this
+    // identity (verify exits 0 — it found the source and its blobs are intact).
     client
         .snapshot_verify(&VerifyOptions {
+            sources: vec![identity.to_string()],
             verify_files_percent: Some(100),
             file_parallelism: Some(2),
             file_queue_length: Some(100),
             ..Default::default()
         })
         .await
-        .expect("verify with file-parallelism/file-queue-length");
+        .expect("verify with --sources scope + file-parallelism/file-queue-length");
 
     // Restore honoring options (atomic writes, ignore permission errors).
     client

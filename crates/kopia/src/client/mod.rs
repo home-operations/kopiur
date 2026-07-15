@@ -460,6 +460,15 @@ impl ConnectSpec {
 /// when `None`/empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyOptions {
+    /// `--sources`: restrict verification to these kopia sources
+    /// (`username@hostname:path`). Empty (the default) verifies EVERY snapshot
+    /// in the repository — kopia's own default. For a per-`SnapshotPolicy`
+    /// verify against a shared repository that is both wrong (it re-verifies
+    /// every other policy's data under a different identity) and expensive
+    /// (`verifyFilesPercent` then samples the WHOLE repository, not just this
+    /// policy's snapshots — issue #250), so the controller always scopes a
+    /// quick verify to the policy's resolved identity.
+    pub sources: Vec<String>,
     /// `--verify-files-percent`: randomly fully-read this percentage of files.
     pub verify_files_percent: Option<u8>,
     /// `--max-errors`: stop after this many errors (0 = never stop early).
@@ -1724,6 +1733,10 @@ fn snapshot_create_args(
 /// Build the args for `kopia snapshot verify` plus options. Pure.
 fn verify_args(opts: &VerifyOptions) -> Vec<String> {
     let mut args = vec!["snapshot".into(), "verify".into()];
+    for src in &opts.sources {
+        args.push("--sources".into());
+        args.push(src.clone());
+    }
     if let Some(pct) = opts.verify_files_percent {
         args.push("--verify-files-percent".into());
         args.push(pct.to_string());

@@ -351,6 +351,7 @@ async fn snapshot_verify_passes_flags() {
     let client = client_for(&s);
     client
         .snapshot_verify(&VerifyOptions {
+            sources: vec![],
             verify_files_percent: Some(5),
             max_errors: Some(0),
             parallel: None,
@@ -374,6 +375,7 @@ async fn snapshot_verify_passes_parallelism_flags() {
     let client = client_for(&s);
     client
         .snapshot_verify(&VerifyOptions {
+            sources: vec![],
             verify_files_percent: None,
             max_errors: Some(1),
             parallel: Some(2),
@@ -382,6 +384,28 @@ async fn snapshot_verify_passes_parallelism_flags() {
         })
         .await
         .expect("verify parallelism flags must pass through");
+}
+
+#[tokio::test]
+async fn snapshot_verify_scopes_to_sources() {
+    // Issue #250: a per-policy quick verify must be scoped to the policy's
+    // resolved identity via `--sources user@host:/path`, so it verifies only
+    // that policy's snapshots — not every identity sharing the repository.
+    let s = argv_gate_shim(
+        "snapshot verify --sources app-config@app:/pvc/app-config --verify-files-percent 100",
+    );
+    let client = client_for(&s);
+    client
+        .snapshot_verify(&VerifyOptions {
+            sources: vec!["app-config@app:/pvc/app-config".into()],
+            verify_files_percent: Some(100),
+            max_errors: None,
+            parallel: None,
+            file_parallelism: None,
+            file_queue_length: None,
+        })
+        .await
+        .expect("verify --sources scope must pass through");
 }
 
 #[tokio::test]

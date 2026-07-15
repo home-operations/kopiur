@@ -656,8 +656,11 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
 /// repository's backend (ADR-0005 §13(d)). Replicating a repository to *itself* is a
 /// no-op (or a loop), so the webhook rejects it. Pure so the decision is unit-tested;
 /// the webhook resolves the source backend (it has a client) and calls this. A
-/// "same" destination is detected structurally: same backend kind AND the same
-/// identifying target (bucket+prefix / path / container / host+path / url / remote).
+/// "same" destination is detected structurally by [`backend_target_key`]: same
+/// backend kind AND the same identifying target — which for S3 includes the
+/// endpoint and region (not just bucket+prefix), for Azure the storage account,
+/// and for a filesystem the backing volume, so two distinct providers that share
+/// a bucket/container/path name are NOT mistaken for the same repository (#248).
 ///
 /// ```
 /// use kopiur_api::backend::{Backend, FilesystemBackend, S3Backend};
@@ -672,6 +675,10 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
 /// // Different backend kinds always differ.
 /// let s3 = Backend::S3(S3Backend { bucket: "b".into(), prefix: None, endpoint: None, region: None, auth: None, tls: None });
 /// assert!(replication_destination_differs(&fs_a, &s3));
+/// // Same bucket name at two DIFFERENT S3 endpoints → distinct targets (#248).
+/// let s3_nas = Backend::S3(S3Backend { bucket: "kopiur".into(), prefix: None, endpoint: Some("nas.example:3000".into()), region: None, auth: None, tls: None });
+/// let s3_e2 = Backend::S3(S3Backend { bucket: "kopiur".into(), prefix: None, endpoint: Some("t3u7.fra3.idrivee2-58.com".into()), region: Some("eu-central-2".into()), auth: None, tls: None });
+/// assert!(replication_destination_differs(&s3_nas, &s3_e2));
 /// ```
 pub fn replication_destination_differs(
     source: &crate::backend::Backend,
@@ -684,19 +691,66 @@ pub fn replication_destination_differs(
 /// [`replication_destination_differs`] to decide whether two backends point at the
 /// same storage. Exhaustive over [`crate::backend::Backend`] so a new backend cannot
 /// compile until its key is defined.
+///
+/// Each arm must fold in EVERY field that distinguishes the storage *target*
+/// (never credentials) — dropping one makes two genuinely-distinct destinations
+/// collide onto the same key, so [`replication_destination_differs`] wrongly
+/// reports a self-replication and the webhook rejects a valid `RepositoryReplication`
+/// (issue #248): two different S3 providers sharing the bucket name `kopiur`
+/// resolved to the same `s3:kopiur/` key when only `bucket`+`prefix` were keyed.
+/// Fields are labelled (`endpoint=…;region=…`) so distinct tuples can't concatenate
+/// into an identical string. Auth/TLS are deliberately excluded: the same bucket
+/// reached with different credentials is still the same storage.
 fn backend_target_key(backend: &crate::backend::Backend) -> String {
-    use crate::backend::Backend;
+    use crate::backend::{Backend, RepoVolume};
     let kind = backend.kind_str();
     let target = match backend {
-        Backend::Filesystem(f) => f.path.clone(),
-        Backend::S3(s) => format!("{}/{}", s.bucket, s.prefix.clone().unwrap_or_default()),
-        Backend::Azure(a) => format!("{}/{}", a.container, a.prefix.clone().unwrap_or_default()),
-        Backend::Gcs(g) => format!("{}/{}", g.bucket, g.prefix.clone().unwrap_or_default()),
-        Backend::B2(b) => format!("{}/{}", b.bucket, b.prefix.clone().unwrap_or_default()),
-        Backend::Sftp(s) => format!("{}:{}", s.host, s.path),
-        Backend::WebDav(w) => w.url.clone(),
-        Backend::Rclone(r) => r.remote_path.clone(),
-        Backend::Gdrive(g) => g.folder_id.clone(),
+        Backend::Filesystem(f) => {
+            // `path` is a mount path INSIDE the mover pod and is commonly the
+            // same default (`/repo`) across repositories, so the backing volume
+            // (a distinct PVC or NFS export) is what actually distinguishes two
+            // filesystem targets.
+            let vol = match &f.volume {
+                None => "none".to_string(),
+                Some(RepoVolume::Pvc(p)) => format!("pvc={}", p.name),
+                Some(RepoVolume::Nfs(n)) => format!("nfs={}:{}", n.server, n.path),
+            };
+            format!("path={};volume={vol}", f.path)
+        }
+        Backend::S3(s) => format!(
+            "endpoint={};region={};bucket={};prefix={}",
+            s.endpoint.clone().unwrap_or_default(),
+            s.region.clone().unwrap_or_default(),
+            s.bucket,
+            s.prefix.clone().unwrap_or_default(),
+        ),
+        Backend::Azure(a) => format!(
+            "account={};container={};prefix={}",
+            a.storage_account.clone().unwrap_or_default(),
+            a.container,
+            a.prefix.clone().unwrap_or_default(),
+        ),
+        // GCS/B2 bucket names are globally unique (no endpoint/account to key),
+        // so bucket+prefix is the complete target identity.
+        Backend::Gcs(g) => format!(
+            "bucket={};prefix={}",
+            g.bucket,
+            g.prefix.clone().unwrap_or_default()
+        ),
+        Backend::B2(b) => format!(
+            "bucket={};prefix={}",
+            b.bucket,
+            b.prefix.clone().unwrap_or_default()
+        ),
+        Backend::Sftp(s) => format!(
+            "host={};port={};path={}",
+            s.host,
+            s.port.map(|p| p.to_string()).unwrap_or_default(),
+            s.path,
+        ),
+        Backend::WebDav(w) => format!("url={}", w.url),
+        Backend::Rclone(r) => format!("remotePath={}", r.remote_path),
+        Backend::Gdrive(g) => format!("folderId={}", g.folder_id),
     };
     format!("{kind}:{target}")
 }

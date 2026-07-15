@@ -589,6 +589,32 @@ impl Metrics {
                 })
                 .build();
         }
+        // Per-policy backup HEALTH (issue #196): 1 when a policy's latest terminal
+        // backup succeeded, 0 when it failed. `count(... == 1)` answers "how many of
+        // my N policies are currently healthy" — a per-policy STATE the durable
+        // `kopiur_snapshots_completed_total` run-counter cannot, since summing it over
+        // a window counts every run (23 policies × N runs), not the 23 the user
+        // expects for a healthy fleet. Store-backed, so a deleted policy's series
+        // disappears on the next collection with no explicit cleanup.
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshotpolicy_last_backup_success")
+                .with_description(
+                    "1 if a policy's most recent terminal backup succeeded, 0 if it failed, \
+                     per (namespace, policy). Absent for a policy with no terminal backup yet.",
+                )
+                .with_callback(move |o| {
+                    for h in policy_backup_health(&snapshots.state()) {
+                        let attrs = [
+                            KeyValue::new("namespace", h.namespace.clone()),
+                            KeyValue::new("policy", h.policy.clone()),
+                        ];
+                        o.observe(i64::from(h.healthy), &attrs);
+                    }
+                })
+                .build();
+        }
     }
 
     // ---- backup business metrics -------------------------------------------
@@ -920,6 +946,73 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
             .or_insert(candidate);
     }
     let mut out: Vec<PolicyLatest> = best.into_values().collect();
+    out.sort_by(|a, b| {
+        (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
+    });
+    out
+}
+
+/// Whether a policy's most recent *completed* backup succeeded (issue #196).
+#[derive(Debug, Clone, PartialEq)]
+struct PolicyHealth {
+    namespace: String,
+    policy: String,
+    /// `true` when the latest terminal (Succeeded/Failed) Snapshot for this policy
+    /// is Succeeded.
+    healthy: bool,
+}
+
+/// Reduce a Snapshot set to, per (namespace, policy), whether that policy's LATEST
+/// terminal backup succeeded — the signal behind `kopiur_snapshotpolicy_last_backup_success`.
+///
+/// This answers "of my N policies, how many currently have a healthy last backup"
+/// (issue #196) — the question the durable `kopiur_snapshots_completed_total`
+/// counter can't, because summing it over a window counts every *run*, not the
+/// per-policy *state* (23 policies × N runs ≫ 23). "Latest" is by
+/// `metadata.creationTimestamp` (always present, monotonic with attempt order), so
+/// a policy whose newest attempt FAILED reports `0` even though an older run
+/// succeeded. Only terminal (`Succeeded`/`Failed`) Snapshots carrying a `policyRef`
+/// participate — an in-flight `Running`/`Pending` run never flips the state, and
+/// `Discovered` snapshots (no `policyRef`) are excluded. A policy with no terminal
+/// backup yet is simply absent (genuinely "unknown", not healthy or failed). Pure so
+/// the reduction is unit-tested off-cluster; output sorted for deterministic tests.
+fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
+    use std::collections::HashMap;
+    // (ns, policy) -> (creation_unix of the winning terminal snapshot, healthy).
+    let mut best: HashMap<(String, String), (i64, bool)> = HashMap::new();
+    for s in snapshots {
+        let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
+            continue;
+        };
+        let healthy = match s.status.as_ref().and_then(|st| st.phase) {
+            Some(SnapshotPhase::Succeeded) => true,
+            Some(SnapshotPhase::Failed) => false,
+            // Non-terminal / Discovered / Deleting never define "last backup".
+            _ => continue,
+        };
+        let created = s
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.as_second())
+            .unwrap_or(0);
+        let namespace = s.namespace().unwrap_or_default();
+        best.entry((namespace, policy))
+            .and_modify(|cur| {
+                if created >= cur.0 {
+                    *cur = (created, healthy);
+                }
+            })
+            .or_insert((created, healthy));
+    }
+    let mut out: Vec<PolicyHealth> = best
+        .into_iter()
+        .map(|((namespace, policy), (_, healthy))| PolicyHealth {
+            namespace,
+            policy,
+            healthy,
+        })
+        .collect();
     out.sort_by(|a, b| {
         (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
     });
@@ -1309,6 +1402,106 @@ mod tests {
             val("kopiur_policy_last_backup_success_timestamp_seconds"),
             END_UNIX.to_string()
         );
+    }
+
+    /// Build a terminal Snapshot with an explicit creationTimestamp (issue #196
+    /// orders "last backup" by creation, since a Failed run may carry no endTime).
+    fn snap_created(name: &str, policy: &str, phase: &str, created: &str) -> Snapshot {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Snapshot",
+            "metadata": { "name": name, "namespace": "apps", "creationTimestamp": created },
+            "spec": { "policyRef": { "name": policy } },
+            "status": { "phase": phase },
+        }))
+        .expect("valid Snapshot")
+    }
+
+    #[test]
+    fn policy_backup_health_reflects_latest_terminal_attempt() {
+        // A discovered Snapshot (no policyRef) is excluded even though it's newest.
+        let discovered: Snapshot = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Snapshot",
+            "metadata": { "name": "disc", "namespace": "apps", "creationTimestamp": "2026-06-01T00:00:00Z" },
+            "spec": {},
+            "status": { "phase": "Discovered" },
+        }))
+        .expect("valid");
+        let snaps: Vec<Arc<Snapshot>> = vec![
+            // policy "a": older Succeeded, newer Failed → the last attempt failed → 0.
+            snap_created("a-1", "a", "Succeeded", "2026-05-01T00:00:00Z"),
+            snap_created("a-2", "a", "Failed", "2026-05-02T00:00:00Z"),
+            // policy "b": older Failed, newer Succeeded → recovered → 1.
+            snap_created("b-1", "b", "Failed", "2026-05-01T00:00:00Z"),
+            snap_created("b-2", "b", "Succeeded", "2026-05-02T00:00:00Z"),
+            // policy "c": only Succeeded → 1.
+            snap_created("c-1", "c", "Succeeded", "2026-05-01T00:00:00Z"),
+            // policy "d": only a Running (non-terminal) run → absent (unknown).
+            snap_created("d-1", "d", "Running", "2026-05-01T00:00:00Z"),
+        ]
+        .into_iter()
+        .chain(std::iter::once(discovered))
+        .map(Arc::new)
+        .collect();
+
+        let health = policy_backup_health(&snaps);
+        assert_eq!(
+            health,
+            vec![
+                PolicyHealth {
+                    namespace: "apps".into(),
+                    policy: "a".into(),
+                    healthy: false
+                },
+                PolicyHealth {
+                    namespace: "apps".into(),
+                    policy: "b".into(),
+                    healthy: true
+                },
+                PolicyHealth {
+                    namespace: "apps".into(),
+                    policy: "c".into(),
+                    healthy: true
+                },
+            ]
+        );
+        // The user's question: "how many of my policies are OK?" — a count of states,
+        // NOT a run count (which would grow with every scheduled fire).
+        assert_eq!(health.iter().filter(|h| h.healthy).count(), 2);
+    }
+
+    #[test]
+    fn policy_backup_health_gauge_exports_zero_and_one_per_policy() {
+        let m = Metrics::new();
+        let snaps = make_store(vec![
+            snap_created("ok-1", "ok", "Succeeded", "2026-05-01T00:00:00Z"),
+            snap_created("bad-1", "bad", "Failed", "2026-05-01T00:00:00Z"),
+        ]);
+        let (_, repos, crepos, restores) = empty_stores();
+        let text = gather_with(
+            &m,
+            ResourceStores {
+                snapshots: snaps.0,
+                repositories: repos.0,
+                cluster_repositories: crepos.0,
+                restores: restores.0,
+            },
+        );
+        let line = |policy: &str| -> String {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("kopiur_snapshotpolicy_last_backup_success{")
+                        && l.contains(&format!("policy=\"{policy}\""))
+                })
+                .unwrap_or_else(|| panic!("missing series for {policy}: {text}"))
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(line("ok"), "1");
+        assert_eq!(line("bad"), "0");
     }
 
     /// A discovered Snapshot (no policyRef) gets no `policy` label and never feeds

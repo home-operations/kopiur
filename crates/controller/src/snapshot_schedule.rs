@@ -26,7 +26,9 @@ use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::{PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz};
+use kopiur_api::common::{
+    DeletionPolicy, PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz,
+};
 use kopiur_api::snapshot::SnapshotSpec;
 use kopiur_api::{
     ConcurrencyPolicy, ScheduleSpec, Snapshot, SnapshotPolicy, SnapshotSchedule, jitter, validate,
@@ -748,6 +750,60 @@ async fn policy_repo_timezone_default(
     Ok(repo.schedule_defaults.and_then(|d| d.timezone))
 }
 
+/// Build the `SnapshotSpec` for a scheduled backup of `policy_ref`. Pure so the
+/// `defaultDeletionPolicy` inheritance (issue #238) is unit-tested without a
+/// cluster.
+///
+/// `default_deletion_policy` is the referenced `SnapshotPolicy`'s
+/// `spec.defaultDeletionPolicy`. Threading it here — rather than always emitting
+/// `deletion_policy: None` — is what makes the recipe-wide default actually reach
+/// the produced `Snapshot`: the mutating admission webhook only fills in its
+/// origin-aware `Delete` default when this field is `None`, so a never-resolved
+/// policy default silently became `Delete` regardless of what the recipe asked
+/// for. `None` here preserves that safe origin-aware default exactly.
+fn scheduled_backup_spec(
+    policy_ref: &PolicyRef,
+    default_deletion_policy: Option<DeletionPolicy>,
+) -> SnapshotSpec {
+    SnapshotSpec {
+        policy_ref: Some(policy_ref.clone()),
+        tags: None,
+        failure_policy: None,
+        deletion_policy: default_deletion_policy,
+        pin: false,
+        // Scheduled backups never carry a templated description (out of
+        // scope for M4 — description is per-invocation only).
+        description: None,
+    }
+}
+
+/// GET the target policy and return its `spec.defaultDeletionPolicy` (issue #238).
+/// Honors a cross-namespace `policyRef.namespace` exactly like
+/// [`policy_repo_timezone_default`], and — like it — returns an **error** rather
+/// than a value on a read failure or a missing policy, so the caller skips/retries
+/// the fire instead of firing with a wrong default.
+///
+/// This must NOT degrade to `None` on a transient GET failure: `None` reaches the
+/// mutating webhook, which stamps the origin default `Delete`, so an apiserver blip
+/// against a policy whose `defaultDeletionPolicy` is `Retain`/`Orphan` would
+/// silently downgrade the produced snapshot's retention to destructive `Delete`.
+/// Deferring the fire (it re-fires idempotently on the next reconcile) is strictly
+/// safer than persisting the wrong retention semantics. A genuine `None` here means
+/// the policy exists but sets no default — then the webhook `Delete` default is
+/// correct — never "we couldn't read it."
+async fn policy_default_deletion_policy(
+    client: &kube::Client,
+    policy_ref: &PolicyRef,
+    schedule_ns: &str,
+) -> Result<Option<DeletionPolicy>> {
+    let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
+    let api: Api<SnapshotPolicy> = Api::namespaced(client.clone(), policy_ns);
+    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
+        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+    })?;
+    Ok(policy.spec.default_deletion_policy)
+}
+
 /// Create a scheduled Snapshot CR for `policy_ref` (owner-ref to the schedule,
 /// origin=scheduled). Server-side applied so re-firing the same slot converges
 /// instead of erroring. `backup_name` is the per-policy slot-stamped name.
@@ -773,18 +829,15 @@ async fn create_scheduled_backup(
         policy_ref.name.clone(),
     );
 
+    // Inherit the recipe's defaultDeletionPolicy so the produced Snapshot carries
+    // it BEFORE admission (else the webhook stamps its origin default) — #238. A
+    // read failure/missing policy propagates so the fire is skipped and retried,
+    // never firing with a wrong (destructive) default (mirrors target resolution).
+    let default_deletion_policy =
+        policy_default_deletion_policy(&ctx.client, policy_ref, namespace).await?;
     let mut backup = Snapshot::new(
         backup_name,
-        SnapshotSpec {
-            policy_ref: Some(policy_ref.clone()),
-            tags: None,
-            failure_policy: None,
-            deletion_policy: None,
-            pin: false,
-            // Scheduled backups never carry a templated description (out of
-            // scope for M4 — description is per-invocation only).
-            description: None,
-        },
+        scheduled_backup_spec(policy_ref, default_deletion_policy),
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
 
@@ -792,7 +845,7 @@ async fn create_scheduled_backup(
     io::apply(&api, backup_name, &backup).await?;
     ctx.metrics
         .inc_schedule_backup_created(namespace, &schedule.name_any());
-    tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, policy = %policy_ref.name, "created scheduled Snapshot");
+    tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, policy = %policy_ref.name, deletion_policy = ?default_deletion_policy, "created scheduled Snapshot");
     Ok(())
 }
 
@@ -848,6 +901,98 @@ mod tests {
             suspend,
             concurrency_policy: policy,
             starting_deadline_seconds: deadline,
+        }
+    }
+
+    #[test]
+    fn scheduled_backup_spec_inherits_default_deletion_policy() {
+        // Issue #238: the recipe's defaultDeletionPolicy must be stamped onto the
+        // produced Snapshot, so a policy asking for Retain isn't silently
+        // overridden to Delete by the webhook's origin-aware default.
+        let pref = PolicyRef {
+            name: "test-pvc".into(),
+            namespace: None,
+        };
+        let retain = scheduled_backup_spec(&pref, Some(DeletionPolicy::Retain));
+        assert_eq!(retain.deletion_policy, Some(DeletionPolicy::Retain));
+        assert_eq!(
+            retain.policy_ref.as_ref().map(|r| r.name.as_str()),
+            Some("test-pvc")
+        );
+
+        let orphan = scheduled_backup_spec(&pref, Some(DeletionPolicy::Orphan));
+        assert_eq!(orphan.deletion_policy, Some(DeletionPolicy::Orphan));
+
+        // An unset recipe default leaves the field None, so the webhook's
+        // safe origin-aware Delete default still applies (no behavior change).
+        let unset = scheduled_backup_spec(&pref, None);
+        assert_eq!(unset.deletion_policy, None);
+    }
+
+    /// The policy read must FAIL the fire rather than degrade to a destructive
+    /// default (#238 review): a `None` from a failed read reaches the webhook,
+    /// which stamps `Delete` over the recipe's `Retain`/`Orphan` intent.
+    mod policy_read_propagates_errors {
+        use super::*;
+        use http::{Request, Response, StatusCode};
+        use kube::Client;
+        use kube::client::Body;
+
+        fn mock_client(status: StatusCode, body: serde_json::Value) -> Client {
+            let body = Arc::new(body);
+            let svc = tower::service_fn(move |_req: Request<Body>| {
+                let body = body.clone();
+                async move {
+                    let resp = Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&*body).unwrap()))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            Client::new(svc, "default")
+        }
+
+        fn status_body(code: u16, reason: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": reason, "code": code,
+            })
+        }
+
+        fn pref() -> PolicyRef {
+            PolicyRef {
+                name: "test-pvc".into(),
+                namespace: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn transient_read_failure_errors_instead_of_defaulting() {
+            // A 5xx must propagate so the fire is skipped/retried — never fire with
+            // a wrong (Delete) default over a Retain/Orphan intent.
+            let client = mock_client(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                status_body(500, "InternalError"),
+            );
+            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            assert!(
+                r.is_err(),
+                "a failing policy read must propagate, got {r:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_policy_is_missing_dependency() {
+            // A genuinely-absent policy is an error too (mirrors the timezone
+            // resolver) — the fire has nothing to inherit from, so skip/retry.
+            let client = mock_client(StatusCode::NOT_FOUND, status_body(404, "NotFound"));
+            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            assert!(
+                matches!(r, Err(Error::MissingDependency(_))),
+                "a missing policy must be MissingDependency, got {r:?}"
+            );
         }
     }
 

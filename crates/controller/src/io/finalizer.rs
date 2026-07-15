@@ -258,3 +258,27 @@ pub fn set_ready(
         generation,
     )
 }
+
+/// Map a [`RepositoryPhase`](kopiur_api::RepositoryPhase) to its kstatus
+/// [`ReadyOutcome`] (issue #245). `Repository`/`ClusterRepository` must call
+/// [`set_ready`] with this on EVERY terminal status write — not just the suspend
+/// branch — or the standard `Ready`/`Reconciling`/`Stalled` conditions freeze at
+/// whatever generation last wrote them (e.g. a `Suspended` reason that survives a
+/// resume), which hangs Flux `wait: true` health checks.
+///
+/// - `Ready` → `Ready` (the repository is connected and healthy).
+/// - `Degraded`/`Initializing`/`Pending` → `Reconciling` (reachable-but-not-yet-
+///   settled, or a retryable failure the operator keeps retrying): `Ready=False`
+///   with `Reconciling=True`, so a health check waits rather than passing prematurely.
+/// - `Failed` → `Stalled` (a terminal connect/create failure): `Ready=False` with
+///   `Stalled=True`, so a health check fails fast instead of hanging until timeout.
+pub fn ready_outcome_for_phase(phase: kopiur_api::RepositoryPhase) -> ReadyOutcome {
+    use kopiur_api::RepositoryPhase;
+    match phase {
+        RepositoryPhase::Ready => ReadyOutcome::Ready,
+        RepositoryPhase::Pending | RepositoryPhase::Initializing | RepositoryPhase::Degraded => {
+            ReadyOutcome::Reconciling
+        }
+        RepositoryPhase::Failed => ReadyOutcome::Stalled,
+    }
+}

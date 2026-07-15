@@ -2055,7 +2055,7 @@ fn replication_destination_differs_decision() {
         tls: None,
     });
     assert!(replication_destination_differs(&fs_a, &s3));
-    // Same S3 bucket+prefix → same target.
+    // Same S3 bucket+prefix (and same endpoint/region) → same target.
     let s3b = Backend::S3(S3Backend {
         bucket: "b".into(),
         prefix: None,
@@ -2065,6 +2065,89 @@ fn replication_destination_differs_decision() {
         tls: None,
     });
     assert!(!replication_destination_differs(&s3, &s3b));
+}
+
+#[test]
+fn replication_destination_differs_by_s3_endpoint_and_region() {
+    // Issue #248: two DISTINCT S3 providers that happen to share a bucket name
+    // (`kopiur`, no prefix) must be treated as different targets — keying on
+    // bucket+prefix alone wrongly collapsed them to one and rejected the
+    // replication as a self-replication.
+    use crate::backend::{Backend, S3Backend};
+    let s3 = |endpoint: Option<&str>, region: Option<&str>| {
+        Backend::S3(S3Backend {
+            bucket: "kopiur".into(),
+            prefix: None,
+            endpoint: endpoint.map(Into::into),
+            region: region.map(Into::into),
+            auth: None,
+            tls: None,
+        })
+    };
+    let nas = s3(Some("nas.example:3000"), None);
+    let e2 = s3(Some("t3u7.fra3.idrivee2-58.com"), Some("eu-central-2"));
+    // Different endpoints → distinct targets (the exact reported case).
+    assert!(replication_destination_differs(&nas, &e2));
+    // Same bucket, differ only by region → still distinct targets.
+    let aws_us = s3(None, Some("us-east-1"));
+    let aws_eu = s3(None, Some("eu-west-1"));
+    assert!(replication_destination_differs(&aws_us, &aws_eu));
+    // Fully identical endpoint+region+bucket+prefix → same target (a real
+    // self-replication is still correctly rejected).
+    assert!(!replication_destination_differs(
+        &nas,
+        &s3(Some("nas.example:3000"), None)
+    ));
+}
+
+#[test]
+fn replication_destination_differs_by_azure_account_and_fs_volume() {
+    // Same class of bug as #248 on the other backends that carry an
+    // above-the-container/path discriminator.
+    use crate::backend::{
+        AzureBackend, Backend, FilesystemBackend, NfsVolume, PvcVolume, RepoVolume,
+    };
+    let azure = |account: Option<&str>| {
+        Backend::Azure(AzureBackend {
+            container: "kopiur".into(),
+            prefix: None,
+            storage_account: account.map(Into::into),
+            auth: None,
+        })
+    };
+    // Same container name under two different storage accounts → distinct.
+    assert!(replication_destination_differs(
+        &azure(Some("acctprod")),
+        &azure(Some("acctdr")),
+    ));
+
+    // Filesystem: the same in-pod mount path (`/repo`, the common default)
+    // backed by two different volumes → distinct targets.
+    let fs = |vol: Option<RepoVolume>| {
+        Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: vol,
+        })
+    };
+    let pvc_a = fs(Some(RepoVolume::Pvc(PvcVolume {
+        name: "repo-a".into(),
+    })));
+    let pvc_b = fs(Some(RepoVolume::Pvc(PvcVolume {
+        name: "repo-b".into(),
+    })));
+    assert!(replication_destination_differs(&pvc_a, &pvc_b));
+    let nfs = fs(Some(RepoVolume::Nfs(NfsVolume {
+        server: "nas.lan".into(),
+        path: "/export/kopia".into(),
+    })));
+    assert!(replication_destination_differs(&pvc_a, &nfs));
+    // Same path + same PVC → same target.
+    assert!(!replication_destination_differs(
+        &pvc_a,
+        &fs(Some(RepoVolume::Pvc(PvcVolume {
+            name: "repo-a".into()
+        }))),
+    ));
 }
 
 // --- validate_catalog_bounds ---

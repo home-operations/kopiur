@@ -8,6 +8,14 @@ fn sample_identity() -> ResolvedIdentity {
     }
 }
 
+#[test]
+fn resolved_identity_source_spec_is_user_host_path() {
+    // The `username@hostname:path` form is what a snapshot is recorded under and
+    // what `snapshot verify --sources` matches against (issue #250), so it must
+    // reassemble the three components in exactly that shape.
+    assert_eq!(sample_identity().source_spec(), "mydb@prod:/pvc/mydb");
+}
+
 fn sample_target() -> TargetRef {
     TargetRef {
         api_version: "kopiur.home-operations.com/v1alpha1".into(),

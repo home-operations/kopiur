@@ -39,8 +39,8 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Backups OK",
-      "description": "Backups (Snapshot runs) that completed successfully within the selected dashboard time range.",
+      "title": "Policies Healthy",
+      "description": "SnapshotPolicies whose most recent backup succeeded (last-backup state, not a run count) — for a healthy fleet this equals your number of policies. Uses kopiur_snapshotpolicy_last_backup_success.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "fieldConfig": {
@@ -56,7 +56,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(kopiur_snapshots_completed_total{result=\"succeeded\", namespace=~\"$namespace\"}[$__range])) or vector(0)",
+          "expr": "count(kopiur_snapshotpolicy_last_backup_success{namespace=~\"$namespace\"} == 1) or vector(0)",
           "refId": "A"
         }
       ]

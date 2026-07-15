@@ -1106,6 +1106,28 @@ async fn run_bootstrap(
     )
 }
 
+/// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning
+/// if trailing discovered entries had to be trimmed. The count cap
+/// (`MAX_RETURNED_SNAPSHOTS`) is not a size cap, so a large catalog could otherwise
+/// produce a result the apiserver rejects — wedging the repository at
+/// `Bootstrapped: False` forever. The trimming decision itself is the pure,
+/// unit-tested [`kopiur_mover::bootstrap::enforce_result_size_budget`].
+fn size_guarded_result(result: &BootstrapResult) -> BootstrapResult {
+    let guarded = kopiur_mover::bootstrap::enforce_result_size_budget(
+        result.clone(),
+        kopiur_mover::bootstrap::RESULT_SIZE_BUDGET_BYTES,
+    );
+    if guarded.snapshots.len() < result.snapshots.len() {
+        warn!(
+            kept = guarded.snapshots.len(),
+            total = result.snapshots.len(),
+            "bootstrap result exceeded the ConfigMap size budget; trimmed trailing \
+             discovered entries so the write fits (the repository still bootstraps)"
+        );
+    }
+    guarded
+}
+
 /// Persist a [`BootstrapResult`] into the work-spec ConfigMap (best-effort). The
 /// controller reads it from key [`RESULT_CONFIGMAP_KEY`].
 async fn write_bootstrap_result(
@@ -1121,9 +1143,20 @@ async fn write_bootstrap_result(
         }
     };
     let ns = &spec.target_ref.namespace;
-    match write_result_configmap(cm_name, ns, result).await {
+    let guarded = size_guarded_result(result);
+    match write_result_configmap(cm_name, ns, &guarded).await {
         Ok(()) => info!(configmap = %cm_name, "wrote bootstrap result"),
-        Err(e) => warn!(error = %e, configmap = %cm_name, "failed to write bootstrap result"),
+        // Loud (issue #237): a rejected write leaves the controller unable to read
+        // the result, so the Repository stays `Bootstrapped: False` and all backup
+        // work is gated. The size guard above should prevent the 1 MiB case, so a
+        // failure here points at RBAC or another apiserver rejection worth surfacing.
+        Err(e) => error!(
+            error = %e,
+            configmap = %cm_name,
+            entries = guarded.snapshots.len(),
+            "failed to write bootstrap result; the repository will stay Bootstrapped: \
+             False until this is resolved (check the ConfigMap's size and the mover's RBAC)"
+        ),
     }
 }
 
@@ -1350,7 +1383,16 @@ async fn run_verify_flow(
     // failure is terminal; a clean run yields the stats the predicate inspects.
     let (stats, restored, snapshot_id) = match &op.tier {
         VerifyTier::Quick(q) => {
-            if let Err(e) = client.snapshot_verify(&q.to_kopia()).await {
+            // Scope the verify to THIS policy's resolved identity. Without
+            // `--sources`, `kopia snapshot verify` verifies every snapshot in
+            // the repository, so on a shared ClusterRepository a per-policy
+            // quick verify would re-verify every other identity's data and
+            // `verifyFilesPercent` would sample the whole repository — issue
+            // #250. The identity is the same `username@hostname:path` kopia
+            // recorded the snapshot under.
+            let mut opts = q.to_kopia();
+            opts.sources = vec![spec.identity.source_spec()];
+            if let Err(e) = client.snapshot_verify(&opts).await {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
                 error!(class = %e.class(), "snapshot verify failed");
                 return Err(MoverError::Kopia {

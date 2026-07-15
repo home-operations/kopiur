@@ -77,7 +77,61 @@ pub fn prepare_catalog_entries(
     if truncated {
         listing.truncate(MAX_RETURNED_SNAPSHOTS);
     }
+    // Slim each returned entry to only the fields the controller materializes.
+    // The prefilter above needed `source.host`; nothing downstream needs the
+    // heavy `rootEntry`/`retentionReason`/`description`, so drop them here — this
+    // is what actually bounds the result ConfigMap size (see [`slim_catalog_entry`]).
+    let listing = listing.into_iter().map(slim_catalog_entry).collect();
     (listing, truncated, dropped)
+}
+
+/// Strip the fields the controller never reads from a materialization entry,
+/// keeping only what `catalog::materialize_discovered` consumes (`id`, `source`,
+/// `startTime`, `endTime`, and `stats.totalSize`). Pure.
+///
+/// This is what actually bounds the result `ConfigMap` under etcd's ~1 MiB object
+/// limit (issue #237): [`MAX_RETURNED_SNAPSHOTS`] caps the *count*, but a full
+/// [`SnapshotListEntry`] serializes to ~2 KB — its `rootEntry.summ` carries an
+/// **unbounded** per-file `errors` list, plus a `retentionReason` array and a
+/// free-form `description` — so ~500 real-world entries already blow past 1 MiB and
+/// wedge the repository at `Bootstrapped: False`. Slimmed, each entry is a few
+/// hundred bytes, so the 1000-entry cap is genuinely size-safe.
+fn slim_catalog_entry(mut e: SnapshotListEntry) -> SnapshotListEntry {
+    e.description = String::new();
+    e.root_entry = None;
+    e.retention_reason = Vec::new();
+    e
+}
+
+/// Conservative byte budget for the serialized `result.json` value the mover
+/// writes into the bootstrap `ConfigMap`. The apiserver rejects a ConfigMap whose
+/// TOTAL size exceeds ~1 MiB (etcd's object limit); `result.json` is the only data
+/// key (the work-spec rides the Job env since PR #225), so this leaves ample room
+/// for the object's metadata/envelope. See [`enforce_result_size_budget`].
+pub const RESULT_SIZE_BUDGET_BYTES: usize = 900 * 1024;
+
+/// Backstop for the ConfigMap 1 MiB limit (issue #237): if the serialized `result`
+/// would still exceed `budget_bytes` (e.g. pathologically long identity paths, or a
+/// future field growth that [`slim_catalog_entry`] no longer covers), drop trailing
+/// `snapshots` entries — already newest-first from the cap — until it fits, flagging
+/// [`BootstrapResult::snapshots_truncated`] so the controller logs that not all were
+/// materialized. The authoritative `snapshot_count` is left untouched. Pure and
+/// deterministic; returns the (possibly trimmed) result.
+pub fn enforce_result_size_budget(
+    mut result: BootstrapResult,
+    budget_bytes: usize,
+) -> BootstrapResult {
+    let serialized_len =
+        |r: &BootstrapResult| serde_json::to_string(r).map(|s| s.len()).unwrap_or(0);
+    // Drop trailing entries in shrinking chunks until it fits (or none remain).
+    // Re-measuring per round converges quickly since entries are near-uniform size.
+    while !result.snapshots.is_empty() && serialized_len(&result) > budget_bytes {
+        let len = result.snapshots.len();
+        let drop = (len / 8).max(1);
+        result.snapshots.truncate(len.saturating_sub(drop));
+        result.snapshots_truncated = true;
+    }
+    result
 }
 
 /// Sentinel [`FailureBlock::kopia_error_class`] the mover writes when connect found
@@ -459,5 +513,150 @@ mod tests {
         let (kept, dropped) = apply_foreign_prefilter(listing, Some("east"));
         assert_eq!(kept.len(), 1);
         assert_eq!(dropped, 0);
+    }
+
+    // --- issue #237: ConfigMap size (slim entries + size guard) ---
+
+    /// A realistic full-size list entry: a populated `rootEntry.summ` with an
+    /// unbounded per-file `errors` list, a `retentionReason` array, and a
+    /// `description` — the bloat that pushed real repositories past the 1 MiB
+    /// ConfigMap limit at ~500 entries.
+    fn fat_entry(id: &str) -> SnapshotListEntry {
+        let now = chrono::Utc::now();
+        let errors: Vec<kopiur_kopia::EntryError> = (0..20)
+            .map(|i| kopiur_kopia::EntryError {
+                path: format!("var/lib/app/data/subdir-{i}/some-long-filename-{i}.dat"),
+                error: format!("error reading {i}: permission denied (os error 13)"),
+            })
+            .collect();
+        SnapshotListEntry {
+            id: id.into(),
+            source: kopiur_kopia::SnapshotSource {
+                user_name: "app-config".into(),
+                host: "some-namespace".into(),
+                path: "/pvc/app-config".into(),
+            },
+            description: "a fairly wordy free-form snapshot description that nobody reads".into(),
+            start_time: now - chrono::Duration::seconds(60),
+            end_time: now,
+            stats: kopiur_kopia::SnapshotStats {
+                total_size: 4096,
+                ..Default::default()
+            },
+            root_entry: Some(kopiur_kopia::RootEntry {
+                name: "app-config".into(),
+                entry_type: "d".into(),
+                obj: "kdeadbeefdeadbeefdeadbeef".into(),
+                summary: Some(kopiur_kopia::DirSummary {
+                    size: 4096,
+                    files: 12,
+                    symlinks: 0,
+                    dirs: 3,
+                    max_time: None,
+                    num_failed: 20,
+                    errors,
+                }),
+            }),
+            retention_reason: vec!["latest-1".into(), "daily-1".into(), "weekly-1".into()],
+        }
+    }
+
+    #[test]
+    fn slim_catalog_entry_drops_heavy_fields_keeps_consumed_ones() {
+        let slim = slim_catalog_entry(fat_entry("k1"));
+        // Dropped (never read by the controller).
+        assert!(slim.root_entry.is_none());
+        assert!(slim.retention_reason.is_empty());
+        assert!(slim.description.is_empty());
+        // Preserved (materialize_discovered reads exactly these).
+        assert_eq!(slim.id, "k1");
+        assert_eq!(
+            slim.source.identity(),
+            "app-config@some-namespace:/pvc/app-config"
+        );
+        assert_eq!(slim.stats.total_size, 4096);
+    }
+
+    #[test]
+    fn prepare_catalog_entries_returns_slimmed_entries() {
+        let listing = vec![fat_entry("a"), fat_entry("b")];
+        let (kept, truncated, _) = prepare_catalog_entries(listing, None);
+        assert!(!truncated);
+        assert!(
+            kept.iter()
+                .all(|e| e.root_entry.is_none() && e.retention_reason.is_empty()),
+            "returned entries must be slimmed"
+        );
+    }
+
+    #[test]
+    fn full_catalog_of_fat_entries_fits_under_the_configmap_limit_once_slimmed() {
+        const K8S_CONFIGMAP_LIMIT: usize = 1_048_576;
+        let raw: Vec<SnapshotListEntry> = (0..MAX_RETURNED_SNAPSHOTS)
+            .map(|i| fat_entry(&format!("k{i}")))
+            .collect();
+
+        // Without slimming, a full cap's worth of real entries blows past 1 MiB —
+        // this is the bug: the count cap is not a size cap.
+        let unslimmed = BootstrapResult::ready(
+            false,
+            Some("u".into()),
+            raw.len() as i64,
+            raw.clone(),
+            false,
+            0,
+            Some(1),
+        );
+        assert!(
+            serde_json::to_string(&unslimmed).unwrap().len() > K8S_CONFIGMAP_LIMIT,
+            "the test fixture must actually exceed the limit unslimmed, else it proves nothing"
+        );
+
+        // Slimmed via the real prepare path, the same 1000 entries fit comfortably.
+        let (slim, _, _) = prepare_catalog_entries(raw, None);
+        let result = BootstrapResult::ready(
+            false,
+            Some("u".into()),
+            slim.len() as i64,
+            slim,
+            false,
+            0,
+            Some(1),
+        );
+        let size = serde_json::to_string(&result).unwrap().len();
+        assert!(
+            size < RESULT_SIZE_BUDGET_BYTES,
+            "slimmed 1000-entry result must fit the budget, was {size} bytes"
+        );
+    }
+
+    #[test]
+    fn enforce_result_size_budget_trims_over_budget_and_flags_truncated() {
+        let slim: Vec<SnapshotListEntry> = (0..200)
+            .map(|i| slim_catalog_entry(fat_entry(&format!("k{i}"))))
+            .collect();
+        let result = BootstrapResult::ready(false, Some("u".into()), 200, slim, false, 0, Some(1));
+        // A deliberately tiny budget forces trimming.
+        let guarded = enforce_result_size_budget(result, 4_096);
+        assert!(guarded.snapshots.len() < 200, "must have dropped entries");
+        assert!(guarded.snapshots_truncated, "must flag the truncation");
+        // The authoritative count is never rewritten by the size guard.
+        assert_eq!(guarded.snapshot_count, 200);
+        assert!(
+            serde_json::to_string(&guarded).unwrap().len() <= 4_096 || guarded.snapshots.is_empty(),
+            "trims until it fits (or nothing is left to drop)"
+        );
+    }
+
+    #[test]
+    fn enforce_result_size_budget_is_a_noop_under_budget() {
+        let slim = vec![slim_catalog_entry(fat_entry("k1"))];
+        let result = BootstrapResult::ready(false, Some("u".into()), 1, slim, false, 0, Some(1));
+        let before = result.clone();
+        let guarded = enforce_result_size_budget(result, RESULT_SIZE_BUDGET_BYTES);
+        assert_eq!(
+            guarded, before,
+            "an in-budget result must be left untouched"
+        );
     }
 }
