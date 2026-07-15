@@ -2538,7 +2538,16 @@ async fn report_inherit_outcome(
         io::InheritOutcome::Inherited { uid: None, .. } => return,
     };
 
-    let existing = backup
+    // Re-read the Snapshot rather than using the copy this reconcile started with.
+    // `assess_backup_security_context` runs just above and may have already patched
+    // `SecurityContextCompatible` into status. A `conditions` patch REPLACES the whole array, so
+    // computing it from the stale in-memory copy would silently erase that condition — two
+    // writers in one reconcile, last one wins. (This is not hypothetical: it is what made the
+    // e2e regression guard pass against a deliberately-reintroduced bug.)
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let name = backup.name_any();
+    let live = io::live_conditions_source(&api, &name, backup).await;
+    let existing = live
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
@@ -2554,11 +2563,10 @@ async fn report_inherit_outcome(
     // Guard the Event behind an actual status transition. `publish_warning_event` has no dedup
     // of its own, and a Snapshot re-reconciles; without this the warning would re-fire on every
     // pass. `patch_status_if_changed` makes a repeat a true no-op.
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let current = serde_json::to_value(&backup.status).ok();
+    let current = serde_json::to_value(&live.status).ok();
     match io::patch_status_if_changed(
         &api,
-        &backup.name_any(),
+        &name,
         current.as_ref(),
         serde_json::json!({ "conditions": conditions }),
     )

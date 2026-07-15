@@ -2273,7 +2273,14 @@ async fn assess_restore_security_context(
         return;
     };
 
-    let existing = restore
+    // Re-read rather than trust the copy this reconcile started with: an earlier step may have
+    // already patched `SecurityContextInherited` (the InheritFallback report) into status, and a
+    // `conditions` patch REPLACES the whole array — computing it from the stale copy would erase
+    // that condition.
+    let name = restore.name_any();
+    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
+    let live = io::live_conditions_source(&api, &name, restore).await;
+    let existing = live
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
@@ -2287,9 +2294,7 @@ async fn assess_restore_security_context(
          UID, or a shared fsGroup on the fresh volume)",
         restore.metadata.generation,
     );
-    let name = restore.name_any();
-    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
-    let current = serde_json::to_value(&restore.status).ok();
+    let current = serde_json::to_value(&live.status).ok();
     if let Err(e) = io::patch_status_if_changed(
         &api,
         &name,

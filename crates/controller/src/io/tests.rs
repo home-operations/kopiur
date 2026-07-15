@@ -2596,3 +2596,70 @@ fn pvc_consumer_inherits_the_container_that_mounts_the_claim_not_the_first() {
     );
     assert_eq!(src.uid(), Some(1000), "and inherit the app's UID, not 1337");
 }
+
+/// Two condition writers in one reconcile must not erase each other.
+///
+/// A `status.conditions` patch REPLACES the whole array. `assess_backup_security_context` and
+/// `report_inherit_outcome` both run in a single Snapshot reconcile, and both build their array
+/// with `upsert_condition`. If the second builds from the object as it looked at the START of
+/// the reconcile, it drops whatever the first just wrote — silently.
+///
+/// This is not hypothetical: it is exactly what made the e2e regression guard PASS against a
+/// deliberately-reintroduced `SecurityContextCompatible=True` bug. The `True` was written, then
+/// wiped by the InheritPinnedNoUid write moments later, so the guard saw no `True` and was
+/// green for the wrong reason. The fix is that the second writer re-reads the live object; this
+/// test pins the property that makes that necessary.
+#[test]
+fn upsert_from_stale_conditions_drops_a_concurrent_write() {
+    use crate::io::upsert_condition;
+
+    // Reconcile starts: no conditions.
+    let at_reconcile_start: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> = vec![];
+
+    // Writer 1 (assess) patches SecurityContextCompatible=True.
+    let after_first = upsert_condition(
+        &at_reconcile_start,
+        "SecurityContextCompatible",
+        true,
+        "SecurityContextCompatible",
+        "the mover's uid matches",
+        Some(1),
+    );
+    assert_eq!(after_first.len(), 1);
+
+    // Writer 2 building from the STALE snapshot — the bug.
+    let stale = upsert_condition(
+        &at_reconcile_start,
+        "SecurityContextInherited",
+        false,
+        "InheritOverridden",
+        "explicit uid displaced the inherited one",
+        Some(1),
+    );
+    assert!(
+        !stale.iter().any(|c| c.type_ == "SecurityContextCompatible"),
+        "building from the reconcile-start copy DROPS the first writer's condition — this is \
+         why the second writer must re-read the live object"
+    );
+
+    // Writer 2 building from what is actually on the object — correct.
+    let fresh = upsert_condition(
+        &after_first,
+        "SecurityContextInherited",
+        false,
+        "InheritOverridden",
+        "explicit uid displaced the inherited one",
+        Some(1),
+    );
+    assert_eq!(fresh.len(), 2, "both conditions must survive");
+    assert!(
+        fresh
+            .iter()
+            .any(|c| c.type_ == "SecurityContextCompatible" && c.status == "True")
+    );
+    assert!(
+        fresh
+            .iter()
+            .any(|c| c.type_ == "SecurityContextInherited" && c.status == "False")
+    );
+}

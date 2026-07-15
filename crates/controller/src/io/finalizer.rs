@@ -126,6 +126,32 @@ pub fn child_meta(
     }
 }
 
+/// The object to build a `conditions` array from: the LIVE one when it can be re-read, else
+/// the caller's (possibly stale) copy.
+///
+/// A `status.conditions` patch REPLACES the whole array, so a reconcile with two condition
+/// writers must not build the second array from the object as it looked at the *start* — that
+/// silently erases whatever the first writer just wrote. Any writer that is not the first in
+/// its reconcile should source `existing` through this.
+///
+/// Falls back to `fallback` (the stale copy) on a read error rather than skipping the write: a
+/// possibly-clobbered condition beats derailing the run. Returns the fallback's clone on 404
+/// only if the object is gone — callers that care should check before patching.
+pub async fn live_conditions_source<K>(api: &Api<K>, name: &str, fallback: &K) -> K
+where
+    K: Clone + serde::de::DeserializeOwned + std::fmt::Debug + Resource,
+    K::DynamicType: Default,
+{
+    match api.get_opt(name).await {
+        Ok(Some(live)) => live,
+        Ok(None) => fallback.clone(),
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "conditions: re-read failed; using stale status");
+            fallback.clone()
+        }
+    }
+}
+
 /// Upsert a status condition by `type_`, returning the full conditions vector to
 /// patch. An existing condition of the same `type_` keeps its
 /// `lastTransitionTime` while its `status` is unchanged (the timestamp marks the
