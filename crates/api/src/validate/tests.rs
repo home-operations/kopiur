@@ -993,10 +993,19 @@ fn pvc_consumer_is_forbidden_on_non_backup_kinds() {
     assert!(forbid_pvc_consumer(&MoverSpec::default(), "maintenance", "x").is_ok());
 }
 
-// --- validate_mover: inheritSecurityContextFrom XOR explicit (container OR pod) ---
+// --- validate_mover: inheritSecurityContextFrom COMBINES with explicit (container / pod) ---
 
+/// `inheritSecurityContextFrom` alongside an explicit `securityContext`/`podSecurityContext`
+/// used to be rejected as mutually exclusive. They are adjacent merge layers
+/// (`inherited ⊂ explicit`), so the pair is now accepted: the explicit context overrides the
+/// inherited one field-wise, fills what the workload does not pin, and stands in alone when
+/// inheritance cannot resolve a pod.
+///
+/// The old rationale — "so the privileged-mover gate runs on exactly one source" — was never
+/// true: the gate has always evaluated the merged hardened+moverDefaults+recipe product, which
+/// `enforce_security_context_invariants` normalizes first.
 #[test]
-fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
+fn mover_inherit_combines_with_explicit_contexts() {
     use crate::common::ObjectRef;
     use crate::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
     use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
@@ -1009,7 +1018,7 @@ fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         }))
     };
 
-    // inherit + container securityContext → rejected.
+    // inherit + container securityContext → accepted (explicit overrides the inherited UID).
     let with_container = MoverSpec {
         security_context: Some(SecurityContext {
             run_as_user: Some(1000),
@@ -1018,12 +1027,9 @@ fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         inherit_security_context_from: inherit(),
         ..Default::default()
     };
-    assert!(matches!(
-        validate_mover(&with_container, "Restore mover"),
-        Err(ValidationError::MutuallyExclusive { .. })
-    ));
+    assert!(validate_mover(&with_container, "Restore mover").is_ok());
 
-    // inherit + POD securityContext → also rejected (inherit copies the pod context too).
+    // inherit + POD securityContext → accepted (e.g. force an fsGroup, inherit the rest).
     let with_pod = MoverSpec {
         pod_security_context: Some(PodSecurityContext {
             fs_group: Some(1000),
@@ -1032,12 +1038,9 @@ fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         inherit_security_context_from: inherit(),
         ..Default::default()
     };
-    assert!(matches!(
-        validate_mover(&with_pod, "Restore mover"),
-        Err(ValidationError::MutuallyExclusive { .. })
-    ));
+    assert!(validate_mover(&with_pod, "Restore mover").is_ok());
 
-    // Surfaced through the Restore validator.
+    // …and through the Restore validator, which is where users actually hit it.
     let mut spec = restore_with(
         RestoreSource::SnapshotRef(ObjectRef {
             name: "b".into(),
@@ -1046,12 +1049,9 @@ fn mover_inherit_is_mutually_exclusive_with_both_explicit_contexts() {
         None,
     );
     spec.mover = Some(with_container);
-    assert!(matches!(
-        validate_restore(&spec),
-        Err(ValidationError::MutuallyExclusive { .. })
-    ));
+    assert!(validate_restore(&spec).is_ok());
 
-    // inherit alone, or explicit container+pod together (no inherit), are both fine.
+    // inherit alone, and explicit container+pod together, remain fine.
     let inherit_only = MoverSpec {
         inherit_security_context_from: inherit(),
         ..Default::default()
@@ -4052,4 +4052,42 @@ fn day_constrained_sub_hourly_schedule_still_warns() {
     // schedule is measured during an active hour (a fixed Monday hour would miss it).
     let w = schedule_cr_growth_warning("*/10 * * * 0").expect("sunday */10 warns");
     assert!(w.contains("6×/hour"), "{w}");
+}
+
+/// The `merged` snippet in `deploy/examples/18-inherit-security-context.yaml` — inherit +
+/// explicit override — must deserialize into the real typed spec AND pass validation. Guards
+/// the example the docs page teaches from rotting (and from the field names being wrong:
+/// these types do not `deny_unknown_fields`, so a typo'd optional key is silently dropped).
+#[test]
+fn example_18_merged_policy_is_valid() {
+    let file = include_str!("../../../../deploy/examples/18-inherit-security-context.yaml");
+    // Pick the document by name — the file's last document is a commented-out Restore, so
+    // "take the last chunk" would silently test nothing.
+    let doc = file
+        .split("\n---\n")
+        .find(|d| d.contains("name: app-data-merged"))
+        .expect("the `merged` policy document must exist in example 18");
+    // YAML -> serde_json::Value -> typed, the way the cluster does it (CLAUDE.md §5):
+    // serde_yaml 0.9 mis-encodes externally-tagged enums when deserialized directly.
+    let policy: crate::snapshot_policy::SnapshotPolicy = crate::testutil::from_yaml(doc);
+
+    let mover = policy.spec.mover.as_ref().expect("mover set");
+    assert!(
+        mover.inherit_security_context_from.is_some(),
+        "inheritSecurityContextFrom must survive deserialization (not a dropped unknown key)"
+    );
+    assert_eq!(
+        mover.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1000),
+        "the explicit override must survive deserialization"
+    );
+    assert_eq!(
+        mover
+            .pod_security_context
+            .as_ref()
+            .and_then(|p| p.supplemental_groups.clone()),
+        Some(vec![3001]),
+    );
+    // And the pair the docs teach must actually be accepted.
+    validate_mover(mover, "SnapshotPolicy mover").expect("inherit + explicit must be accepted");
 }

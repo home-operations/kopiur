@@ -70,10 +70,9 @@ fn invalid_backup_config(name: &str) -> SnapshotPolicy {
 }
 
 /// A SnapshotPolicy whose mover sets BOTH `securityContext` and
-/// `inheritSecurityContextFrom` — structurally valid, but the shared `validate_mover`
-/// rejects it (they're mutually exclusive). Exercises the mover-validation path
-/// through admission.
-fn mover_mutually_exclusive_backup_config(name: &str) -> SnapshotPolicy {
+/// `inheritSecurityContextFrom`. This used to be webhook-rejected as mutually exclusive; the
+/// two are adjacent merge layers (`inherited ⊂ explicit`), so admission must now ACCEPT it.
+fn mover_inherit_plus_explicit_backup_config(name: &str) -> SnapshotPolicy {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
         "kind": "SnapshotPolicy",
@@ -158,23 +157,21 @@ async fn self_managed_webhook_tls_bootstraps_and_gates_admission() {
     );
     let _ = configs.delete(bad, &DeleteParams::default()).await;
 
-    // 5. A mover that sets BOTH securityContext and inheritSecurityContextFrom is
-    //    rejected by the shared mover validator (mutually exclusive).
-    let bad_mover = "webhook-deny-mover";
-    let _ = configs.delete(bad_mover, &DeleteParams::default()).await;
-    let err = configs
+    // 5. A mover that sets BOTH securityContext and inheritSecurityContextFrom is ACCEPTED:
+    //    they are adjacent merge layers (explicit overrides inherited field-wise, and stands
+    //    in alone when inheritance cannot resolve a pod), not competing sources. This asserts
+    //    the relaxation reaches a live cluster — a unit test on `validate_mover` alone cannot
+    //    prove the deployed webhook stopped rejecting it.
+    let merged_mover = "webhook-allow-inherit-plus-explicit";
+    let _ = configs.delete(merged_mover, &DeleteParams::default()).await;
+    configs
         .create(
             &PostParams::default(),
-            &mover_mutually_exclusive_backup_config(bad_mover),
+            &mover_inherit_plus_explicit_backup_config(merged_mover),
         )
         .await
-        .expect_err("securityContext + inheritSecurityContextFrom must be DENIED by the webhook");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
-        "mover mutual-exclusivity rejection should come from the webhook, got: {msg}"
-    );
-    let _ = configs.delete(bad_mover, &DeleteParams::default()).await;
+        .expect("securityContext + inheritSecurityContextFrom must be ACCEPTED by the webhook");
+    let _ = configs.delete(merged_mover, &DeleteParams::default()).await;
 }
 
 /// A SnapshotPolicy whose explicit `spec.identity.username` carries kopia's `@`

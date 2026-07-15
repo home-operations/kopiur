@@ -40,7 +40,7 @@ How the restore reacts to a missing snapshot. `onMissingSnapshot` is `Fail` (fai
 
 ### `mover`
 
-Per-run mover-Job overrides for this restore — resource requests/limits, kopia cache sizing, and the container/pod `securityContext` used to match the workload's UID/GID (and `fsGroup`, to make a fresh restore volume group-writable). This is the same surface a backup gets via `SnapshotPolicy.spec.mover`; an elevated context is namespace-gated exactly like a backup's, and `securityContext` and `inheritSecurityContextFrom` are mutually exclusive. See [Security context](../../security-context.md).
+Per-run mover-Job overrides for this restore — resource requests/limits, kopia cache sizing, and the container/pod `securityContext` used to match the workload's UID/GID (and `fsGroup`, to make a fresh restore volume group-writable). This is the same surface a backup gets via `SnapshotPolicy.spec.mover`; an elevated context is namespace-gated exactly like a backup's, and `securityContext` combines with `inheritSecurityContextFrom` (explicit wins field-wise, and is the fallback when no workload pod resolves). See [Security context](../../security-context.md).
 
 ### `credentialProjection`
 

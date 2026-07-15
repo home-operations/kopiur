@@ -8,7 +8,14 @@
 # has no way to look up which pod mounts a given PVC, so you select it by the
 # labels it already carries; see the recipe in the Permissions guide).
 #
-# Mutually exclusive with `securityContext` — setting BOTH is webhook-rejected.
+# PREREQUISITE: the workload must pin `runAsUser` (container or pod level). A UID
+# that comes from the container image's `USER` line is invisible in the pod spec,
+# so there is nothing to inherit and the mover would silently run as its own
+# image's UID (65532) and fail to read the source.
+#
+# `securityContext` and `inheritSecurityContextFrom` COMBINE (see the bottom of
+# this file): the explicit context is the higher merge layer, so it overrides the
+# inherited values field-wise and stands in alone when no pod can be resolved.
 # A pod matching the selector must be Running so its UID/GID can be read. An
 # inherited *root* context is still elevated and needs the namespace opt-in.
 #
@@ -68,14 +75,17 @@ spec:
   # Copy the securityContext from the live pod that runs (and mounts) this PVC,
   # selected by the labels the workload already carries. The mover then reads the
   # data as the same UID/GID the app writes it as — no hard-coded UID to track.
-  # Do NOT also set `securityContext` here; the two are mutually exclusive.
+  # This only works if that pod PINS `runAsUser` (see the header).
   mover:
     inheritSecurityContextFrom:
       # On a BACKUP source the simplest form is `pvcConsumer: {}` — the operator
-      # finds the pod that mounts `app-data` and inherits its securityContext, so the
-      # mover's UID/GID matches the workload by construction (no selector to maintain):
+      # finds the pod that mounts `app-data` and inherits its securityContext, with
+      # no selector to maintain:
       #
       #   pvcConsumer: {}            # optionally: pvcConsumer: { container: app }
+      #
+      # Name the container when the pod has sidecars — otherwise the FIRST container
+      # is used, which on an injected pod may be istio-proxy rather than your app.
       #
       # Or name the workload explicitly with a label selector:
       workloadSelector:
@@ -84,6 +94,41 @@ spec:
             app.kubernetes.io/name: app # the workload that owns `app-data`
         container: app # optional; defaults to the pod's first container
 # --8<-- [end:policy]
+---
+# --8<-- [start:merged]
+# ── Inherit AND override: the two are merge layers ────────────────────────────
+# Order: hardened ⊂ moverDefaults ⊂ inherited ⊂ mover.securityContext.
+# What you write always wins; inherit fills in what you leave blank; and what you
+# wrote is all that's left when no workload pod can be resolved (scaled to zero).
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data-merged
+  namespace: app
+spec:
+  repository:
+    name: app-primary
+  sources:
+    - pvc:
+        name: app-data
+  retention:
+    keepDaily: 14
+  mover:
+    inheritSecurityContextFrom:
+      pvcConsumer: {}
+    securityContext:
+      # NOTE: this is an OVERRIDE, not a default — it pins the mover to 1000 even
+      # when the workload resolves to a different UID. There is deliberately no
+      # "prefer the workload's UID, else 1000". Omit runAsUser to let inherit
+      # supply it. Kopiur raises SecurityContextInherited=False/InheritOverridden
+      # naming both UIDs when an explicit UID displaces a resolved one.
+      runAsUser: 1000
+    podSecurityContext:
+      # Join the repo backend's shared group WITHOUT disturbing the inherited UID —
+      # supplementalGroups is additive, so this composes with inherit rather than
+      # fighting it (see the NFS shared-group recipe in the docs).
+      supplementalGroups: [3001]
+# --8<-- [end:merged]
 ---
 # ── The SAME knob works on a Restore ──────────────────────────────────────────
 # A Restore writes INTO a PVC, so it has the identical mover surface. Inheriting

@@ -1771,6 +1771,134 @@ fn inherit_uid_follows_kubelet_precedence() {
     assert_eq!(src.uid(), Some(568), "pod-level runAsUser is the fallback");
 }
 
+// --- `inherited ⊂ explicit`: the recipe's explicit context is the HIGHER layer. ---
+//
+// These exercise the same merge helpers `resolve_mover_security_contexts` calls, without a
+// kube::Client. The end-to-end ladder (`hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`) is
+// covered in `kopiur-api`'s `resolve_mover` tests.
+
+/// What the resolver does once a workload's contexts are in hand.
+#[cfg(test)]
+fn merge_explicit_over_inherited(
+    inherited: (
+        Option<k8s_openapi::api::core::v1::SecurityContext>,
+        Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+    ),
+    explicit: &kopiur_api::common::MoverSpec,
+) -> (
+    Option<k8s_openapi::api::core::v1::SecurityContext>,
+    Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+) {
+    (
+        kopiur_api::common::merge_security_context_opt(
+            inherited.0.as_ref(),
+            explicit.security_context.as_ref(),
+        ),
+        kopiur_api::common::merge_pod_security_context_opt(
+            inherited.1.as_ref(),
+            explicit.pod_security_context.as_ref(),
+        ),
+    )
+}
+
+#[test]
+fn explicit_security_context_overrides_the_inherited_one() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // Workload pins uid 1000 + fsGroup 1000; the recipe forces uid 2000 and says nothing
+    // about groups. What you WROTE wins; what you left blank is inherited.
+    let inherited = (
+        Some(SecurityContext {
+            run_as_user: Some(1000),
+            run_as_group: Some(1000),
+            ..Default::default()
+        }),
+        Some(PodSecurityContext {
+            fs_group: Some(1000),
+            ..Default::default()
+        }),
+    );
+    let explicit = kopiur_api::common::MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited(inherited, &explicit);
+    assert_eq!(
+        sc.as_ref().unwrap().run_as_user,
+        Some(2000),
+        "the explicit runAsUser must win — it is the higher layer"
+    );
+    assert_eq!(
+        sc.unwrap().run_as_group,
+        Some(1000),
+        "runAsGroup was not written, so the inherited value fills it"
+    );
+    assert_eq!(
+        psc.unwrap().fs_group,
+        Some(1000),
+        "the pod context is inherited wholesale when the recipe is silent"
+    );
+}
+
+#[test]
+fn inherited_values_fill_what_the_recipe_leaves_blank() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // The mirror image: the recipe pins only an fsGroup (e.g. to make a cache writable) and
+    // inherits the identity. Neither layer is all-or-nothing.
+    let inherited = (
+        Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        Some(PodSecurityContext {
+            fs_group: Some(1000),
+            supplemental_groups: Some(vec![3001]),
+            ..Default::default()
+        }),
+    );
+    let explicit = kopiur_api::common::MoverSpec {
+        pod_security_context: Some(PodSecurityContext {
+            fs_group: Some(2500),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited(inherited, &explicit);
+    assert_eq!(
+        sc.unwrap().run_as_user,
+        Some(1000),
+        "the inherited UID survives — the recipe never mentioned it"
+    );
+    let psc = psc.unwrap();
+    assert_eq!(psc.fs_group, Some(2500), "the explicit fsGroup wins");
+    assert_eq!(
+        psc.supplemental_groups,
+        Some(vec![3001]),
+        "an unmentioned pod field keeps its inherited value (NFS shared-group recipe)"
+    );
+}
+
+#[test]
+fn explicit_context_stands_alone_when_nothing_was_inherited() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+
+    // The fallback shape: inheritance yielded nothing, so the recipe's context is all there is.
+    let explicit = kopiur_api::common::MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited((None, None), &explicit);
+    assert_eq!(sc.unwrap().run_as_user, Some(1000));
+    assert!(psc.is_none());
+}
+
 #[test]
 fn inherit_prefers_a_running_pod() {
     // A Pending replica (uid 5) and a Running one (uid 1000) match — Running wins.

@@ -399,11 +399,11 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#repository-spec-maintenance-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#repository-spec-maintenance-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#repository-spec-maintenance-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ###### `spec.maintenance.mover.cache` { #repository-spec-maintenance-mover-cache }
@@ -1036,11 +1036,11 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#clusterrepository-spec-maintenance-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ###### `spec.maintenance.mover.cache` { #clusterrepository-spec-maintenance-mover-cache }
@@ -1439,11 +1439,11 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#snapshotpolicy-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#snapshotpolicy-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#snapshotpolicy-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ##### `spec.mover.cache` { #snapshotpolicy-spec-mover-cache }
@@ -2022,11 +2022,11 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#restore-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#restore-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#restore-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ##### `spec.mover.cache` { #restore-spec-mover-cache }
@@ -2268,11 +2268,11 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#maintenance-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#maintenance-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#maintenance-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ##### `spec.mover.cache` { #maintenance-spec-mover-cache }
@@ -2644,11 +2644,11 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cache` | [object](#repositoryreplication-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
-| `inheritSecurityContextFrom` | [union](#repositoryreplication-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload instead of setting it explicitly. |
-| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). |
+| `inheritSecurityContextFrom` | [union](#repositoryreplication-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
 | `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
-| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the defaults and hardened base. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
 | `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
 
 ##### `spec.mover.cache` { #repositoryreplication-spec-mover-cache }

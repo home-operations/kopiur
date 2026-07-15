@@ -129,7 +129,27 @@ When `mover.inheritSecurityContextFrom` is set, the controller reads the live wo
 | `sets no securityContext … to inherit` | The matched pod sets **neither** a container nor a pod-level `securityContext`. | Set one on the workload, or use an explicit `mover.securityContext` / `mover.podSecurityContext` instead. |
 | `pvcConsumer … is only valid for a backup source` | `pvcConsumer` was set on a `Restore` or `Maintenance` (rejected at admission). | Use `workloadSelector` (Restore) or an explicit `mover.securityContext`. |
 
-`securityContext` (or `podSecurityContext`) and `inheritSecurityContextFrom` are **mutually exclusive** — setting both is rejected at admission by the webhook.
+`securityContext` (or `podSecurityContext`) and `inheritSecurityContextFrom` **combine** — setting both is fine. The explicit context is the higher merge layer: each field you set overrides the inherited one, fields you omit are inherited, and the whole thing stands in alone when no workload pod can be resolved. (Earlier versions rejected the pair at admission.)
+
+### The backup says `SecurityContextCompatible` but fails with `permission denied`
+
+Symptom: a Snapshot using `inheritSecurityContextFrom` reports `SecurityContextCompatible=True`, yet the mover fails with `permission denied` reading the source.
+
+**This was a bug in Kopiur ≤ 0.7.4** and is fixed: `pvcConsumer` asserted the condition `True` ("matches the workload by construction") from the fact that it had taken the inherit code path, without ever comparing the resolved UIDs. The condition is now derived from the real comparison and can no longer claim a match it hasn't verified.
+
+The underlying misconfiguration it was hiding is almost always this: **inheriting copies pod-spec fields, and your workload pins no `runAsUser`.** Its UID comes from its image's `USER` line, which is invisible in the spec — so there is nothing to inherit and the mover runs as its own image's UID `65532`. Check:
+
+```console
+$ kubectl -n app get pod <consumer> \
+    -o jsonpath='{.spec.securityContext}{"\n"}{range .spec.containers[*]}{.name}{" "}{.securityContext}{"\n"}{end}'
+```
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| No `runAsUser` at either level | Nothing to inherit; mover ran as `65532` | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser` to the image's UID (it merges with, and overrides, inherit) |
+| The first container is a sidecar (e.g. `istio-proxy`) | Inherit took the *first* container's context | Name the right one: `pvcConsumer: { container: app }` |
+| A `runAsUser` is pinned and matches the mover | The files are owned by a *third* UID (root-written data, `lost+found`, an old init container) | Use a [root mover](security-context.md#3-go-root-privileged-mover) |
+| A `runAsUser` is pinned and matches the mover | The `permission denied` is on the **repository**, not the source (e.g. an NFS filesystem repo owned by another UID) | See [NFS filesystem repositories](security-context.md#nfs-filesystem-repositories) — use `supplementalGroups` |
 
 ### Admission warning: securityContext likely can't read the source
 

@@ -714,12 +714,25 @@ pub async fn ensure_cache_pvc(
 }
 
 /// The mover's **recipe-layer** container AND pod security contexts, plus how they were
-/// arrived at: resolved from `inheritSecurityContextFrom` when set (copying the workload's
-/// container and pod contexts), else the explicit `securityContext` / `podSecurityContext`.
-/// Each context is `None` when unset (the Job builder then applies the hardened container
-/// default and no pod context). The result feeds BOTH the privileged-mover gate and the mover
-/// `Job`, so an inherited root context — container or pod — is gated exactly like an explicit
-/// one.
+/// arrived at. Each context is `None` when unset (the Job builder then applies the hardened
+/// container default and no pod context). The result feeds BOTH the privileged-mover gate and
+/// the mover `Job`, so an inherited root context — container or pod — is gated exactly like an
+/// explicit one.
+///
+/// When `inheritSecurityContextFrom` is set, the workload's contexts are copied and the
+/// recipe's **explicit** `securityContext`/`podSecurityContext` are then overlaid on top
+/// (field-wise, explicit wins). The two are layers, not alternatives: what you wrote always
+/// wins, and inheritance fills in whatever the workload pins that you left blank. Doing the
+/// overlay here — rather than threading a fourth layer through
+/// [`kopiur_api::common::resolve_mover`] — keeps that function and all seven of its call sites
+/// untouched, and is field-wise identical because the merge is a per-field `over.or(base)` and
+/// therefore associative: every field resolves to
+/// `explicit.or(inherited).or(moverDefaults).or(hardened)`.
+///
+/// One exception to "explicit wins": an inherited `runAsUser: 0` under an explicit
+/// `runAsNonRoot: true` is normalized by INV-1 ([`kopiur_api::invariants`]) into a *root*
+/// mover, because the kubelet rejects that pair outright. Only `runAsUser` can de-escalate an
+/// inherited root UID; the result stays privileged-gated either way.
 ///
 /// The returned [`ResolvedMoverSecurity::outcome`] carries the *provenance* so callers can
 /// report the mover's identity from what actually happened. Asserting compatibility from the
@@ -766,13 +779,27 @@ pub async fn resolve_mover_security_contexts(
             });
         }
     };
+    let outcome = InheritOutcome::Inherited {
+        pod: source.pod.clone(),
+        container: source.container.clone(),
+        uid: source.uid(),
+    };
+    // `inherited ⊂ explicit`: the recipe's explicit context is the higher layer, so each field
+    // it sets wins and the inherited value fills the rest. Reuses the exhaustive merge helpers
+    // (a k8s-openapi field addition breaks their struct literals) rather than re-deriving one.
+    let (inherited_sc, inherited_psc) = source.contexts;
     Ok(ResolvedMoverSecurity {
-        outcome: InheritOutcome::Inherited {
-            pod: source.pod.clone(),
-            container: source.container.clone(),
-            uid: source.uid(),
-        },
-        contexts: source.contexts,
+        contexts: (
+            kopiur_api::common::merge_security_context_opt(
+                inherited_sc.as_ref(),
+                m.security_context.as_ref(),
+            ),
+            kopiur_api::common::merge_pod_security_context_opt(
+                inherited_psc.as_ref(),
+                m.pod_security_context.as_ref(),
+            ),
+        ),
+        outcome,
         unfiltered_pods,
     })
 }

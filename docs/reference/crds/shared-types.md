@@ -148,8 +148,11 @@ exactly like the container-level setting.
 ### inheritSecurityContextFrom
 
 Copies the UID/GID security context from a live workload instead of setting an
-explicit `securityContext`/`podSecurityContext` (mutually exclusive with both,
-webhook-enforced). Externally tagged, exactly one of:
+explicit `securityContext`/`podSecurityContext`. Combines with both: they are the
+higher merge layer, so an explicit field overrides the inherited one and stands in
+alone when no pod resolves. Requires the workload to pin `runAsUser` — a UID from
+the image's `USER` line is invisible in the pod spec. Externally tagged, exactly one
+of:
 
 - **`workloadSelector`** — match the workload pod(s) by a label selector
   (`podSelector` + optional `container`) and inherit the chosen container's
@@ -157,8 +160,8 @@ webhook-enforced). Externally tagged, exactly one of:
   and restore (restore inherits from the pod that will read the data).
 - **`pvcConsumer`** — **backup sources only.** Auto-derive the workload pod from
   the PVC this snapshot backs up: the operator finds the pod(s) mounting the
-  source claim and inherits their security context, so the mover's UID/GID
-  matches the workload by construction — no hand-written selector. Meaningless on
+  source claim and inherits their security context — no hand-written selector.
+  Meaningless on
   a restore (the consuming pod may not exist yet), so restore must use
   `workloadSelector`. `pvcConsumer` accepts an optional `container`.
 

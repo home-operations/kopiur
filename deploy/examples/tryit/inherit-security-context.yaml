@@ -159,7 +159,7 @@ spec:
   # ── Inherit the mover's UID/GID from the live workload ────────────────────────
   # `pvcConsumer: {}` auto-derives the pod that mounts the source PVC (`app-data`)
   # and copies its securityContext (container UID/GID + pod fsGroup) onto the mover —
-  # no selector to maintain. Mutually exclusive with `securityContext`; the consuming
+  # no selector to maintain. Combines with `securityContext` (explicit wins); the consuming
   # pod must be Running. (To name the workload explicitly instead, use
   # `workloadSelector: { podSelector: {...}, container: app }`.)
   mover:

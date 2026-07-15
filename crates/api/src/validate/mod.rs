@@ -157,29 +157,24 @@ pub fn require_min(field: &str, value: i64, min: i64) -> Option<ValidationError>
     })
 }
 
-/// Validate a `MoverSpec`. `inheritSecurityContextFrom` copies **both** the workload
-/// pod's container and pod security contexts, so it is **mutually exclusive** with
-/// **both** explicit `securityContext` and `podSecurityContext`: the mover's effective
-/// contexts must have a single, unambiguous source so the privileged-mover gate runs on
-/// exactly one. `context` names the owning resource for the message (e.g. `"Restore
-/// mover"`).
+/// Validate a `MoverSpec`. `context` names the owning resource for the message (e.g.
+/// `"Restore mover"`).
+///
+/// `inheritSecurityContextFrom` and the explicit `securityContext`/`podSecurityContext` are
+/// **compatible**, not mutually exclusive: they are adjacent layers of the merge ladder
+/// (`hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`), so the explicit context overrides the
+/// inherited one field-wise and fills whatever the workload does not pin — and stands in alone
+/// when inheritance cannot resolve a pod.
+///
+/// This pair used to be rejected here, on the rationale that "the mover's effective contexts
+/// must have a single, unambiguous source so the privileged-mover gate runs on exactly one".
+/// That rationale was never true: the gate has always evaluated the *merged* product of
+/// hardened + `moverDefaults` + recipe (see the callers of
+/// [`crate::common::requires_privilege_resolved`]), which
+/// [`crate::invariants::enforce_security_context_invariants`] normalizes first — INV-1 exists
+/// precisely to reconcile an inherited `runAsUser: 0` against the hardened `runAsNonRoot:
+/// true`. Merging one more layer in cannot smuggle an elevated mover past it.
 pub fn validate_mover(mover: &MoverSpec, context: &str) -> ValidationResult {
-    if mover.inherit_security_context_from.is_some() {
-        if mover.security_context.is_some() {
-            return Err(ValidationError::MutuallyExclusive {
-                a: "mover.securityContext".to_string(),
-                b: "mover.inheritSecurityContextFrom".to_string(),
-                context: context.to_string(),
-            });
-        }
-        if mover.pod_security_context.is_some() {
-            return Err(ValidationError::MutuallyExclusive {
-                a: "mover.podSecurityContext".to_string(),
-                b: "mover.inheritSecurityContextFrom".to_string(),
-                context: context.to_string(),
-            });
-        }
-    }
     if let Some(resources) = &mover.resources {
         validate_resources(resources, context)?;
     }

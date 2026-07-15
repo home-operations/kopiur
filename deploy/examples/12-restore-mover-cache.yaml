@@ -9,7 +9,7 @@
 # Field shapes verified against crates/api:
 #   - spec.mover.securityContext       : core/v1 SecurityContext (container-level)
 #   - spec.mover.inheritSecurityContextFrom : { podSelector: LabelSelector, container? }
-#       (mutually exclusive with securityContext — webhook-rejected if both are set)
+#       (combines with securityContext: explicit fields win, inherit fills the rest)
 #   - spec.mover.cache                 : { capacity, storageClassName,
 #                                          metadataCacheSizeMb, contentCacheSizeMb,
 #                                          mode: Ephemeral|Persistent }
