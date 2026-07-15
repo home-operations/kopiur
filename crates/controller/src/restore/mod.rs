@@ -30,10 +30,12 @@ use kopiur_mover::workspec::{
 use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
-    CREDENTIALS_PROJECTED_REASON, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    ORPHANED_PRIME_REAPED_REASON, POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORPHANED_PRIME_REAPED_REASON,
+    POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     RECREATE_CLAIM_TO_RESTORE_ACTION, RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
     RESTORE_TARGET_ALREADY_BOUND_REASON, SECURITY_CONTEXT_COMPATIBLE_REASON,
+    SECURITY_CONTEXT_INHERITED_CONDITION,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -422,6 +424,58 @@ async fn pin_no_snapshot(api: &Api<Restore>, restore: &Restore, name: &str) -> R
 
 /// Park a populator `Restore` in `AwaitingClaim=True` / `Pending` with `reason`+`msg`
 /// (no claiming PVC yet, or a WaitForFirstConsumer claim that hasn't been scheduled).
+/// Report that this restore's `inheritSecurityContextFrom` could not resolve a workload pod and
+/// its explicit `mover.securityContext` stood in. Warn-only — the run proceeds.
+///
+/// The restore peer of the backup's `report_inherit_outcome`. It carries only the `Fallback`
+/// arm by design: `InheritPinnedNoUid` is backup-only (an fsGroup-only inherit is a blessed
+/// restore shape), and `InheritOverridden` keys on reading the source, which a restore does not.
+async fn report_restore_inherit_fallback(
+    namespace: &str,
+    restore: &Restore,
+    reason: &str,
+    ctx: &Context,
+) {
+    let message = format!(
+        "{reason}. Proceeding with the recipe's explicit mover.securityContext, which pins the \
+         mover's identity itself — so the restored files will be owned as that context says, not \
+         as the workload named by inheritSecurityContextFrom."
+    );
+    let conditions = io::upsert_condition(
+        &existing_conditions(restore),
+        SECURITY_CONTEXT_INHERITED_CONDITION,
+        false,
+        INHERIT_FALLBACK_REASON,
+        &message,
+        restore.metadata.generation,
+    );
+    // Guard the Event behind a real transition: `publish_warning_event` has no dedup and a
+    // Restore re-reconciles, so an unguarded write would re-fire the warning every pass.
+    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
+    let current = serde_json::to_value(&restore.status).ok();
+    match io::patch_status_if_changed(
+        &api,
+        &restore.name_any(),
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        Ok(true) => {
+            io::publish_warning_event(
+                ctx,
+                restore,
+                INHERIT_FALLBACK_REASON,
+                MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+                &message,
+            )
+            .await
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!(error = %e, "restore inherit fallback: condition patch failed"),
+    }
+}
+
 /// Mirrors the pre-handshake stub's status shape so consumers see a stable surface.
 async fn park_awaiting_claim(
     api: &Api<Restore>,
@@ -1745,14 +1799,22 @@ async fn run_restore_mover(
     // from a workload pod via `inheritSecurityContextFrom`.
     // Restore has no backup *source* PVC; `pvcConsumer` is backup-only (validator-rejected
     // for restore), so pass None.
-    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+    let mover_security = io::resolve_mover_security_contexts(
         &ctx.client,
         namespace,
         restore.spec.mover.as_ref(),
         None,
     )
-    .await?
-    .contexts;
+    .await?;
+    // A restore that falls back to its explicit context is NOT tracking the workload it named —
+    // report it, exactly as a backup does. (The backup-only `InheritPinnedNoUid` warning has no
+    // restore counterpart on purpose: an fsGroup-only inherit is a *blessed* restore shape —
+    // `RestoreBasis::FsGroupMatch` — because the target is a fresh read-write volume the kubelet
+    // does apply fsGroup to. Warning there would flag a configuration the operator certifies.)
+    if let io::InheritOutcome::Fallback { reason } = &mover_security.outcome {
+        report_restore_inherit_fallback(namespace, restore, reason, ctx).await;
+    }
+    let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
