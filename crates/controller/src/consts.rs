@@ -289,6 +289,34 @@ pub const SNAPSHOT_INCOMPLETE_REASON: &str = "SnapshotIncompleteUnreadableEntrie
 /// Event `action` (remediation hint) for a likely securityContext mismatch: match the
 /// mover to the workload via `inheritSecurityContextFrom.pvcConsumer` or a matching UID.
 pub const MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION: &str = "MatchWorkloadSecurityContext";
+/// Condition reporting what `mover.inheritSecurityContextFrom` actually achieved this run.
+/// Reported ONLY when inheritance did something other than plainly work, so it is a
+/// standing "look here" signal rather than routine noise:
+///
+/// - [`INHERIT_FALLBACK_REASON`] — no workload pod resolved; the recipe's explicit context
+///   stood in for it.
+/// - [`INHERIT_PINNED_NO_UID_REASON`] — a pod resolved but pins no identity to copy, so
+///   inheriting was a no-op and the mover runs as its own image's UID.
+/// - [`INHERIT_OVERRIDDEN_REASON`] — an explicit `runAsUser` displaced the inherited one, so
+///   inheritance is not tracking the workload for that field.
+///
+/// Distinct from [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`], which is about whether the mover
+/// can *read the source*; this is about whether *inheritance did what you asked*.
+pub const SECURITY_CONTEXT_INHERITED_CONDITION: &str = "SecurityContextInherited";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `False` when inheritance could not
+/// resolve a workload pod and the recipe's explicit context stood in for it.
+pub const INHERIT_FALLBACK_REASON: &str = "InheritFallback";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `False` when the resolved workload
+/// pins no `runAsUser`/`runAsGroup`/`fsGroup`/`supplementalGroups` — its identity comes from
+/// its image, which is invisible in the pod spec, so inheriting copied nothing usable.
+pub const INHERIT_PINNED_NO_UID_REASON: &str = "InheritPinnedNoUid";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `False` when an explicit
+/// `mover.securityContext.runAsUser` displaced the UID inheritance resolved. Explicit wins by
+/// design; this exists so that choice can never be a *silent* no-op — without it a recipe
+/// written as a "fallback" would pin the mover forever with no signal when the workload moves.
+pub const INHERIT_OVERRIDDEN_REASON: &str = "InheritOverridden";
+/// Event `action` (remediation hint) for the inherit-pinned-no-uid case.
+pub const PIN_WORKLOAD_RUN_AS_USER_ACTION: &str = "PinWorkloadRunAsUser";
 /// `Restore` condition reporting whether the *future* consumer of the restore target PVC
 /// will be able to read what the mover writes (a securityContext-only heuristic; no runtime
 /// layer exists for restore since the consumer may not exist yet). Same tri-state semantics

@@ -443,6 +443,24 @@ impl InheritSource {
             self.contexts.1.as_ref(),
         )
     }
+
+    /// Whether the inherited contexts pin **any** identity the mover can act on: an effective
+    /// UID, or any group (`runAsGroup` / `fsGroup` / `supplementalGroups`).
+    ///
+    /// Groups are not a footnote here. A workload that pins only `runAsGroup: 1000`, taking
+    /// its UID from its image, still lets the mover read `0640` data through the group bit —
+    /// so "no UID" alone does not mean inheriting achieved nothing. When BOTH are absent,
+    /// inheriting is a provable no-op: the workload's identity lives in its image, which the
+    /// pod spec cannot show, and the mover falls back to its own image's UID.
+    pub fn pins_identity(&self) -> bool {
+        if self.uid().is_some() {
+            return true;
+        }
+        let sc = self.contexts.0.clone().unwrap_or_default();
+        !kopiur_api::secctx_compat::mover_identity(&sc, self.contexts.1.as_ref())
+            .groups
+            .is_empty()
+    }
 }
 
 /// What `inheritSecurityContextFrom` produced for this run. Exhaustively matched by the
@@ -457,8 +475,19 @@ pub enum InheritOutcome {
         pod: String,
         /// The container whose `securityContext` was copied.
         container: String,
-        /// The effective UID the inherited layer pins, if any (see [`InheritSource::uid`]).
+        /// The effective UID the **inherited layer alone** pins, before the recipe's explicit
+        /// context is overlaid (see [`InheritSource::uid`]). Compared against the resolved UID
+        /// to detect an inherit that an explicit `runAsUser` silently displaced.
         uid: Option<i64>,
+        /// Whether the inherited layer pinned any identity at all — see
+        /// [`InheritSource::pins_identity`]. `false` means inheriting was a provable no-op.
+        pins_identity: bool,
+    },
+    /// Inheritance could not resolve a workload pod, and the recipe's explicit context — which
+    /// pins a real identity — stands in for it. Never silent: the reconciler reports this.
+    Fallback {
+        /// The actionable reason inheritance failed, for the condition/Event message.
+        reason: String,
     },
 }
 
@@ -756,20 +785,16 @@ pub async fn resolve_mover_security_contexts(
         });
     };
     // `unfiltered_pods` is `Some` ONLY for `pvcConsumer` — see `ResolvedMoverSecurity`.
-    let (source, unfiltered_pods) = match &m.inherit_security_context_from {
-        Some(InheritSecurityContextFrom::WorkloadSelector(sel)) => (
-            resolve_inherited_security_context(client, ns, sel).await?,
-            None,
-        ),
+    let resolved = match &m.inherit_security_context_from {
+        Some(InheritSecurityContextFrom::WorkloadSelector(sel)) => {
+            resolve_inherited_security_context(client, ns, sel)
+                .await
+                .map(|source| (source, None))
+        }
         Some(InheritSecurityContextFrom::PvcConsumer(pc)) => {
-            let (source, pods) = resolve_pvc_consumer_security_context(
-                client,
-                ns,
-                source_pvc,
-                pc.container.as_deref(),
-            )
-            .await?;
-            (source, Some(pods))
+            resolve_pvc_consumer_security_context(client, ns, source_pvc, pc.container.as_deref())
+                .await
+                .map(|(source, pods)| (source, Some(pods)))
         }
         None => {
             return Ok(ResolvedMoverSecurity {
@@ -779,10 +804,41 @@ pub async fn resolve_mover_security_contexts(
             });
         }
     };
+    let (source, unfiltered_pods) = match resolved {
+        Ok(ok) => ok,
+        // The workload isn't there to read (scaled to zero, mid-rollout, bad selector). If the
+        // recipe wrote a context that pins a real identity, that context IS the deliberate
+        // fallback — proceed on it rather than holding the run. The reconciler reports this.
+        //
+        // The predicate is `effective_run_as_user(..).is_some()`, NOT "a context field exists":
+        // a context that pins no identity (say, seccomp only) cannot stand in for a workload's,
+        // so falling back on it would just produce a wrong-UID run while claiming to have a
+        // plan. Keying on a pinned identity also makes this mutually exclusive with the
+        // pins-nothing warning by construction — the two can never fire for the same run.
+        Err(Error::MissingDependency(reason))
+            if kopiur_api::common::effective_run_as_user(
+                m.security_context.as_ref(),
+                m.pod_security_context.as_ref(),
+            )
+            .is_some() =>
+        {
+            return Ok(ResolvedMoverSecurity {
+                contexts: (m.security_context.clone(), m.pod_security_context.clone()),
+                outcome: InheritOutcome::Fallback { reason },
+                unfiltered_pods: None,
+            });
+        }
+        // Everything else propagates, including `Error::Kube` (e.g. a 403 listing pods).
+        // A workload that isn't running is workload state; a broken API call is an operator
+        // misconfiguration, and silently degrading it to a fallback would mint wrong-UID
+        // backups namespace-wide until somebody noticed. Requeue instead.
+        Err(e) => return Err(e),
+    };
     let outcome = InheritOutcome::Inherited {
         pod: source.pod.clone(),
         container: source.container.clone(),
         uid: source.uid(),
+        pins_identity: source.pins_identity(),
     };
     // `inherited ⊂ explicit`: the recipe's explicit context is the higher layer, so each field
     // it sets wins and the inherited value fills the rest. Reuses the exhaustive merge helpers

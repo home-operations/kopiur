@@ -133,11 +133,11 @@ spec:
       pvcConsumer: {} # optionally: pvcConsumer: { container: app }
 ```
 
-The controller lists pods in the source namespace, finds the one mounting this snapshot's source PVC (excluding Kopiur's own mover pods), prefers a **Running** one, and copies its container + pod `securityContext` onto the mover. If no workload pod currently mounts the PVC (e.g. it's scaled to zero), the Backup is held with an actionable condition — scale the workload up, or give the mover an explicit `securityContext` to fall back on (below).
+The controller lists pods in the source namespace, finds the one mounting this snapshot's source PVC (excluding Kopiur's own mover pods), prefers a **Running** one, and copies its container + pod `securityContext` onto the mover. If no workload pod currently mounts the PVC (e.g. it's scaled to zero), the Backup is **held** with an actionable condition — scale the workload up. If you'd rather it kept running, give the mover an explicit `securityContext` that pins a `runAsUser`: that becomes the fallback, and the run proceeds on it with a `SecurityContextInherited=False` / `InheritFallback` condition instead of being held (see [Combining inherit with an explicit context](#combining-inherit-with-an-explicit-context)).
 
 /// warning | Your workload must pin `runAsUser` for this to do anything
 
-Inheriting copies the workload's **pod spec** fields. It cannot see the UID baked into the workload's *image* (its `USER` line). If the workload pins no `runAsUser` at either the container or the pod level — a `securityContext` block that only sets `allowPrivilegeEscalation`/`capabilities` counts as pinning nothing — then there is **no UID to inherit**, and the mover falls back to its own image's UID `65532`. Nothing about that is announced by the presence of `inheritSecurityContextFrom`; the backup simply fails with `permission denied`.
+Inheriting copies the workload's **pod spec** fields. It cannot see the UID baked into the workload's *image* (its `USER` line). If the workload pins no `runAsUser` at either the container or the pod level — a `securityContext` block that only sets `allowPrivilegeEscalation`/`capabilities` counts as pinning nothing — then there is **no UID to inherit**, and the mover falls back to its own image's UID `65532` — after which the backup typically fails with `permission denied`. Kopiur reports this as `SecurityContextInherited=False` / `InheritPinnedNoUid` plus a Warning Event naming the pod, rather than letting the run look correctly configured.
 
 Check before relying on it:
 
@@ -177,7 +177,7 @@ app-7c9d8f5b6-h2k4p
 $ kubectl get pod app-7c9d8f5b6-h2k4p -n app --show-labels
 ```
 
-How it resolves: the controller lists pods matching the selector, prefers a **Running** one, picks the named container (or the pod's first), and copies **that container's `securityContext` and the pod's pod-level `securityContext`** onto the mover. If no pod matches, the selector is empty, the named container is absent, or the pod sets *neither* a container nor a pod-level `securityContext`, the Backup/Restore is held with an actionable `MissingDependency`-style condition telling you exactly what to fix. The matched workload must be **running** so its identity can be read.
+How it resolves: the controller lists pods matching the selector, prefers a **Running** one, picks the named container (or the pod's first), and copies **that container's `securityContext` and the pod's pod-level `securityContext`** onto the mover. If no pod matches, the selector is empty, the named container is absent, or the pod sets *neither* a container nor a pod-level `securityContext`, the Backup/Restore is held with an actionable `MissingDependency`-style condition telling you exactly what to fix — unless the recipe also sets a `mover.securityContext` pinning a `runAsUser`, which is then used as the fallback (`InheritFallback`) and the run proceeds. The matched workload must be **running** so its identity can be read.
 
 Things to remember:
 
@@ -208,9 +208,25 @@ spec:
 
 Because explicit wins, `runAsUser: 1000` above pins the mover to `1000` **always** — inheritance never gets a say on that field, even when the workload is running as something else. There is deliberately no way to express "prefer the workload's UID, else `1000`": one field, one rule.
 
-If that's not what you meant, leave `runAsUser` out and let inherit supply it. Kopiur raises a `SecurityContextInherited=False` / `InheritOverridden` condition naming both UIDs when your explicit UID displaces a resolved one, so this can't silently drift.
+If that's not what you meant, leave `runAsUser` out and let inherit supply it. Kopiur raises `SecurityContextInherited=False` / `InheritOverridden` naming both UIDs when your explicit UID displaces a resolved one, so this can't silently drift.
 
 ///
+
+#### The `SecurityContextInherited` condition
+
+`SecurityContextCompatible` answers *"can the mover read the source?"*. `SecurityContextInherited` answers a different question — *"did inheriting do what you think it did?"* — and appears **only** when the answer is "not quite". No condition means inheritance resolved a workload and its values stuck.
+
+| `reason` | What happened | What to do |
+| --- | --- | --- |
+| `InheritFallback` | No workload pod resolved (scaled to zero, mid-rollout, selector matches nothing). Your explicit context stood in, so the run proceeded rather than being held. | Nothing, if that's the intent. Otherwise scale the workload up. |
+| `InheritPinnedNoUid` | A pod resolved, but pins no `runAsUser`/`runAsGroup`/`fsGroup`/`supplementalGroups` — its identity is in its image. Inheriting copied nothing; the mover runs as `65532`. | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser`. |
+| `InheritOverridden` | Inheritance resolved a UID, but your explicit `runAsUser` (or `moverDefaults`) overrode it. Correct by design — but inherit is a no-op for that field and won't follow the workload. | Drop the explicit `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
+
+```console
+$ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextInherited")]}'
+```
+
+Each also emits one Warning Event, fired on the status transition rather than every reconcile.
 
 Two consequences worth internalizing:
 
@@ -450,6 +466,8 @@ $ kubectl -n app get pod <mover-pod> \
 /// tip | Scale the workload to zero and inherit fails loudly
 
 `kubectl -n app scale deploy/app --replicas=0`, then re-create the Snapshot: with no Running pod to read, the Snapshot is held with an actionable condition telling you exactly that — inherit is selection of a live pod, not a stored value. Scale back up and it proceeds.
+
+That's the behavior when the recipe has **nothing else to go on**, as here. Add a `mover.securityContext` that pins a `runAsUser` and the same scale-to-zero instead *proceeds* on that context, reporting `SecurityContextInherited=False` / `InheritFallback` — see [Combining inherit with an explicit context](#combining-inherit-with-an-explicit-context). Holding is the default precisely because a wrong-UID backup is worse than a missing one; you opt out of it by writing the identity you want used instead.
 
 ///
 

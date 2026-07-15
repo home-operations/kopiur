@@ -2365,3 +2365,122 @@ mod reconcile_failure_events {
         assert_eq!(r.uid.as_deref(), Some("uid-1234"));
     }
 }
+
+// --- `InheritSource::pins_identity`: did inheriting actually copy anything usable? ---
+
+#[test]
+fn pins_identity_is_true_for_a_uid() {
+    let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(src.pins_identity());
+}
+
+#[test]
+fn pins_identity_is_true_for_groups_alone() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // A workload pinning ONLY runAsGroup (UID from its image) still lets the mover read
+    // 0640 group-readable data through the group bit. Treating "no UID" as "inherit did
+    // nothing" would warn — falsely — about a setup that works.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {
+        run_as_group: Some(1000),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None, "no UID was pinned");
+    assert!(
+        src.pins_identity(),
+        "but a group WAS — inheriting was not a no-op"
+    );
+
+    // Same for an fsGroup-only workload (the blessed restore shape).
+    let mut pod = pod_with(Some("Running"), &[("app", None)], Some(2500));
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.pins_identity(),
+        "fsGroup is an identity worth inheriting"
+    );
+
+    // …and supplementalGroups (the NFS shared-group recipe).
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        supplemental_groups: Some(vec![3001]),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(src.pins_identity());
+}
+
+#[test]
+fn pins_identity_is_false_when_the_workload_pins_nothing() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+
+    // THE REPORTED SHAPE: a hardened block that pins no identity at all. Inheriting from
+    // this is a provable no-op — the mover falls back to its own image's 65532.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None);
+    assert!(
+        !src.pins_identity(),
+        "no UID and no group: inheriting copied nothing the mover can act on"
+    );
+}
+
+// --- §3's fallback predicate: an explicit context is a fallback only if it pins an identity.
+//
+// `resolve_mover_security_contexts` needs a kube::Client, so these exercise the predicate it
+// keys on directly. Keying on "a context field exists" instead would make the fallback and the
+// pins-nothing warning fire for the SAME run — the reconciler would report "proceeding with
+// your explicit context" and "nothing was pinned" together, which is incoherent.
+
+#[test]
+fn a_context_pinning_a_uid_is_a_usable_fallback() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    let sc = SecurityContext {
+        run_as_user: Some(1000),
+        ..Default::default()
+    };
+    assert!(kopiur_api::common::effective_run_as_user(Some(&sc), None).is_some());
+}
+
+#[test]
+fn a_context_pinning_no_identity_is_not_a_fallback() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // Newly legal alongside inherit once the exclusion is lifted: a recipe that sets only
+    // seccomp/caps. It cannot stand in for a workload's identity, so a failed inherit must
+    // still hold the run rather than silently proceed at the mover image's UID.
+    let sc = SecurityContext {
+        allow_privilege_escalation: Some(false),
+        ..Default::default()
+    };
+    assert!(
+        kopiur_api::common::effective_run_as_user(Some(&sc), None).is_none(),
+        "seccomp/caps pin no identity — not a fallback"
+    );
+
+    // An fsGroup-only pod context likewise pins no UID for the *backup* fallback decision.
+    let psc = PodSecurityContext {
+        fs_group: Some(2500),
+        ..Default::default()
+    };
+    assert!(kopiur_api::common::effective_run_as_user(None, Some(&psc)).is_none());
+
+    // Pod-level runAsUser DOES count (kubelet precedence).
+    let psc = PodSecurityContext {
+        run_as_user: Some(568),
+        ..Default::default()
+    };
+    assert_eq!(
+        kopiur_api::common::effective_run_as_user(None, Some(&psc)),
+        Some(568)
+    );
+}

@@ -151,6 +151,18 @@ $ kubectl -n app get pod <consumer> \
 | A `runAsUser` is pinned and matches the mover | The files are owned by a *third* UID (root-written data, `lost+found`, an old init container) | Use a [root mover](security-context.md#3-go-root-privileged-mover) |
 | A `runAsUser` is pinned and matches the mover | The `permission denied` is on the **repository**, not the source (e.g. an NFS filesystem repo owned by another UID) | See [NFS filesystem repositories](security-context.md#nfs-filesystem-repositories) — use `supplementalGroups` |
 
+The first two now report themselves — check the `SecurityContextInherited` condition before digging:
+
+```console
+$ kubectl get snapshot <name> -o jsonpath='{.status.conditions[?(@.type=="SecurityContextInherited")]}'
+```
+
+| `reason` | Meaning |
+| --- | --- |
+| `InheritPinnedNoUid` | The resolved workload pins no identity at all — inheriting copied nothing and the mover ran as `65532`. |
+| `InheritFallback` | No workload pod resolved; the run proceeded on your explicit `mover.securityContext` instead of being held. |
+| `InheritOverridden` | Inherit resolved a UID but your explicit `runAsUser` (or `moverDefaults`) overrode it — inherit is a no-op for that field and won't follow the workload. |
+
 ### Admission warning: securityContext likely can't read the source
 
 At `kubectl apply` time the webhook may attach a **non-blocking warning** (the apply still succeeds):
