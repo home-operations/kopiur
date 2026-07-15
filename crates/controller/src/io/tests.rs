@@ -1913,25 +1913,73 @@ fn inherit_prefers_a_running_pod() {
 
 #[test]
 fn inherit_errors_are_actionable() {
+    // Each message must carry WHAT went wrong, WHERE (so it can be found), and a FIX the user
+    // can act on — a bare "no pod matches" leaves someone staring at a held Snapshot.
+
     // No pod matches.
     let err =
         inherited_security_context_from_pods(&[], Some("app"), "billing", "app=x").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("no pod matches") && msg.contains("billing") && msg.contains("app=x"));
+    assert!(msg.contains("no pod matches"), "what: {msg}");
+    assert!(
+        msg.contains("billing") && msg.contains("app=x"),
+        "where — the namespace and the selector that found nothing: {msg}"
+    );
+    assert!(
+        msg.contains("Scale it up") && msg.contains("podSelector.matchLabels"),
+        "fix — the two things that actually resolve it: {msg}"
+    );
+    assert!(
+        msg.contains("mover.securityContext.runAsUser") && msg.contains("fallback"),
+        "fix — and the fallback, which is the difference between a held run and a running \
+         one, so the message must not merely offer it as an 'alternative': {msg}"
+    );
 
     // Named container absent.
     let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
     let err =
         inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x").unwrap_err();
-    assert!(err.to_string().contains("no container `nope`"));
+    let msg = err.to_string();
+    assert!(msg.contains("no container `nope`"), "what + where: {msg}");
+    assert!(
+        msg.contains("inheritSecurityContextFrom.container"),
+        "fix — name the field to correct: {msg}"
+    );
 
     // The pod has NEITHER a container nor a pod-level securityContext to inherit.
     let bare = pod_with(Some("Running"), &[("app", None)], None);
     let err =
         inherited_security_context_from_pods(&[bare], Some("app"), "billing", "app=x").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("sets no securityContext"), "what: {msg}");
     assert!(
-        err.to_string().contains("sets no securityContext")
-            && err.to_string().contains("to inherit")
+        msg.contains("comes from its container image"),
+        "why — the non-obvious part users hit, and the reason inheriting cannot help: {msg}"
+    );
+    assert!(
+        msg.contains("Set runAsUser on the workload")
+            && msg.contains("mover.securityContext.runAsUser"),
+        "fix — both remedies: {msg}"
+    );
+}
+
+#[test]
+fn pvc_consumer_error_names_the_claim_and_the_fallback() {
+    // The `pvcConsumer` twin of the above: the message must name the claim it looked for (so
+    // the user knows WHICH PVC has no consumer) and the fallback that keeps backups running.
+    let err = pvc_consumer_security_context_from_pods(&[], "pgdata", "db", None).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`pgdata`") && msg.contains("`db`"),
+        "where — the claim and namespace: {msg}"
+    );
+    assert!(
+        msg.contains("Scale the workload up"),
+        "fix — the primary remedy: {msg}"
+    );
+    assert!(
+        msg.contains("mover.securityContext.runAsUser") && msg.contains("fallback"),
+        "fix — the fallback that avoids the hold entirely: {msg}"
     );
 }
 

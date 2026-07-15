@@ -560,9 +560,12 @@ pub fn inherited_security_context_from_pods(
 ) -> Result<InheritSource> {
     if pods.is_empty() {
         return Err(Error::MissingDependency(format!(
-            "no pod matches mover.inheritSecurityContextFrom (`{query}`) in namespace `{ns}` — the \
-             workload whose securityContext the mover inherits must be running so its UID/GID can \
-             be read; scale it up or fix the selector"
+            "no pod matches mover.inheritSecurityContextFrom (`{query}`) in namespace `{ns}` — \
+             inheriting reads a LIVE pod's securityContext, so the workload must be running for \
+             its UID/GID to be read. Scale it up, or fix podSelector.matchLabels. To keep backups \
+             running while it is down, set mover.securityContext.runAsUser: an explicit context \
+             that pins an identity is used as the fallback (and this run proceeds) instead of \
+             being held here."
         )));
     }
     // Prefer a Running pod; otherwise take the first match.
@@ -617,9 +620,11 @@ fn extract_inherited_contexts(
     let pod_sc = pod.spec.as_ref().and_then(|s| s.security_context.clone());
     if container_sc.is_none() && pod_sc.is_none() {
         return Err(Error::MissingDependency(format!(
-            "pod `{}` (mover.inheritSecurityContextFrom, `{ns}`) sets no securityContext — neither \
-             a container nor a pod-level one — to inherit; set one on the workload, or use an \
-             explicit mover.securityContext / mover.podSecurityContext instead",
+            "pod `{}` (mover.inheritSecurityContextFrom, `{ns}`) sets no securityContext at all \
+             — neither a container nor a pod-level one — so there is nothing to inherit. Its UID \
+             comes from its container image, which Kopiur cannot read from the pod spec. Set \
+             runAsUser on the workload, or set mover.securityContext.runAsUser to that image's \
+             UID (it merges with, and overrides, inherited values).",
             pod.name_any()
         )));
     }
@@ -682,10 +687,12 @@ pub fn pvc_consumer_security_context_from_pods(
     });
     let pod = consumers.first().ok_or_else(|| {
         Error::MissingDependency(format!(
-            "no running workload pod mounts the backup source PVC `{claim}` in namespace `{ns}` — \
-             mover.inheritSecurityContextFrom.pvcConsumer derives the mover's UID/GID from the pod \
-             that consumes this PVC, so that pod must be running; scale the workload up, or use an \
-             explicit mover.securityContext / workloadSelector instead"
+            "no running workload pod mounts the backup source PVC `{claim}` in namespace `{ns}` \
+             — mover.inheritSecurityContextFrom.pvcConsumer derives the mover's UID/GID from the \
+             pod that consumes this PVC, so that pod must be running. Scale the workload up. To \
+             keep backups running while it is down, set mover.securityContext.runAsUser: an \
+             explicit context that pins an identity is used as the fallback (and this run \
+             proceeds) instead of being held here."
         ))
     })?;
     // Pass the claim: with no explicit `container`, prefer the one that actually MOUNTS the
