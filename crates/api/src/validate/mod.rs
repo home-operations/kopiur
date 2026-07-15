@@ -299,6 +299,65 @@ pub fn validate_cron(expr: &str) -> ValidationResult {
     }
 }
 
+/// A non-blocking admission WARNING (never a rejection) when a schedule's cron
+/// fires more often than hourly (issue #249). Every fire creates one per-run
+/// `Snapshot` CR per source, and they accumulate up to the `SnapshotPolicy`
+/// retention window — each terminal one is then re-reconciled for that whole
+/// window — so a sub-hourly cadence with a wide (or absent) retention can produce
+/// thousands of CRs. Sub-hourly is legitimate for some workloads, so this is a
+/// footgun heads-up, not a block.
+///
+/// Pure and cron-only: the schedule webhook is client-less and can't read the
+/// referenced policy's retention, so the message states the cadence and the
+/// CR-count relationship rather than an exact number. `None` for an hourly-or-slower
+/// cadence, or a cron that doesn't parse (that error is surfaced by [`validate_cron`]).
+pub fn schedule_cr_growth_warning(cron: &str) -> Option<String> {
+    let fires = schedule_fires_per_hour(cron)?;
+    if fires <= 1 {
+        return None;
+    }
+    Some(format!(
+        "schedule fires ~{fires}×/hour: each fire creates one Snapshot CR per source, and \
+         they accumulate up to the SnapshotPolicy retention window (CR count ≈ fires × \
+         retained snapshots). A sub-hourly schedule with a wide or absent retention can \
+         produce thousands of Snapshot CRs, each re-reconciled for its whole retention \
+         window. If unintended, use a coarser schedule, bound SnapshotPolicy.spec.retention, \
+         or set the Snapshot deletionPolicy to Retain/Orphan. See docs/backups.md \
+         ('How many Snapshot CRs will I have?')."
+    ))
+}
+
+/// Count how many times `cron` fires within one representative active hour. Pure and
+/// clock-free — anchored on the cron's FIRST fire from a fixed instant (not a fixed
+/// calendar hour), so a day-of-week / day-of-month constrained cron is measured
+/// during an hour it is actually active. `H` tokens are substituted to a fixed value
+/// first (they pick a minute within the window, not the cadence, so the count is
+/// H-independent). `None` if the cron doesn't parse.
+fn schedule_fires_per_hour(cron: &str) -> Option<u32> {
+    use chrono::{Duration, TimeZone, Utc};
+    let probe = cron
+        .split_whitespace()
+        .map(|f| if f == "H" { "0" } else { f })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let parsed = crate::jitter::cron_parser().parse(&probe).ok()?;
+    let anchor = Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).single()?;
+    let first = parsed.find_next_occurrence(&anchor, true).ok()?;
+    let horizon = first + Duration::hours(1);
+    let mut cursor = first;
+    let mut count = 0u32;
+    // The cron grammar has no seconds field, so at most 60 fires/hour; cap defensively.
+    for _ in 0..61 {
+        let next = parsed.find_next_occurrence(&cursor, true).ok()?;
+        if next >= horizon {
+            break;
+        }
+        count += 1;
+        cursor = next + Duration::seconds(1);
+    }
+    Some(count)
+}
+
 /// Validate an optional Go-style `jitter` duration (`30m`, `1h`, …) against the SAME
 /// parser the controller uses at scheduling time, so a typo or an out-of-range value
 /// is rejected at apply time rather than silently degrading to *no jitter* at the

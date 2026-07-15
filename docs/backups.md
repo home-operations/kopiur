@@ -167,6 +167,22 @@ If you set `retention:` but leave every bucket unset or `0`, GFS would prune **e
 kopia's `snapshot create` normally applies its own retention after every backup, and with nothing configured it falls back to kopia's defaults (`keepLatest: 10`, etc.) — values a wide `retention:` window above would blow right past, deleting backups behind Kopiur's back. Kopiur pins kopia's own retention to effectively-infinite on every identity it manages, so `retention:` above is the only thing that ever deletes a backup.
 ///
 
+### How many `Snapshot` CRs will I have?
+
+Kopiur keeps **one `Snapshot` CR per retained snapshot per source** — the CR _is_ the backup's lifecycle handle (finalizer + `deletionPolicy`), so the live CR count equals the retained snapshot count **by design**. It is set by _retention_, not by how often you schedule: a faster schedule fills the GFS window sooner but never exceeds it. Three independent populations add up:
+
+- **Successful backups** — bounded by GFS `retention`. The per-source upper bound is roughly the sum of the buckets you set (`keepLatest + keepHourly + keepDaily + …`, before GFS de-dups the overlap), times your number of sources. A policy with `keepHourly: 24, keepDaily: 14, keepWeekly: 8` retains ~40 CRs per source.
+- **Failed backups** — bounded by [`SnapshotSchedule.spec.failedJobsHistoryLimit`](#snapshotschedule--the-cron) (default `10` per schedule).
+- **Discovered snapshots** — materialized from the repository and bounded by [`spec.catalog.retain`](repositories.md) (`perIdentity` / `maxAgeDays`) on the `Repository` / `ClusterRepository`.
+
+A cluster with ~30 sources on a typical GFS window sits around 1–2k `Snapshot` CRs. Each is a few KiB in etcd (tens of MB total — comfortably fine), and each _terminal_ CR only re-reconciles as a no-op roughly every 45 minutes, so this scales. Because retention sets the count, a **sub-hourly** schedule paired with a wide retention is the way to accidentally accumulate thousands of CRs — the admission webhook emits a heads-up warning for sub-hourly crons (a warning, not a limit).
+
+/// warning | `retention` absent = unbounded CR growth
+
+Omitting `retention` entirely means Kopiur never prunes successful backups — the `Snapshot` CRs (and their kopia snapshots) grow **forever**. That is a legitimate "keep everything" choice, but it is genuinely unbounded, so budget for it or set a GFS window. (An empty-but-present `retention:` block is rejected — see above — so the only way to grow without bound is to omit `retention` deliberately.)
+
+///
+
 ### Identity — what kopia records (`username@hostname:path`)
 
 kopia stores every snapshot under an identity. Kopiur **re-resolves it from the live spec on every run** — the live `SnapshotPolicy.spec.identity` plus the live referenced repository's `identityDefaults` — not once at admission and frozen. `status.resolved.identity` mirrors the most recent resolution rather than being the source of truth a later run reads back. The defaults:

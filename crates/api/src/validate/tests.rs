@@ -3936,3 +3936,37 @@ fn maintenance_owner_aliases_are_shape_validated_but_owner_is_not_tightened() {
     // regression) — the lease sanitizer collapses it safely at run time.
     assert!(validate_maintenance(&spec("admin@legacy-host", Vec::new())).is_empty());
 }
+
+// --- schedule_cr_growth_warning (issue #249) ---
+
+#[test]
+fn hourly_or_slower_schedules_get_no_growth_warning() {
+    // Hourly, jittered-hourly (H is minute-of-window, not cadence), and daily are
+    // all within the "one CR per hour or less" comfort zone → no warning.
+    for cron in ["0 * * * *", "H * * * *", "0 2 * * *", "0 0 * * 0"] {
+        assert_eq!(
+            schedule_cr_growth_warning(cron),
+            None,
+            "{cron} should not warn"
+        );
+    }
+}
+
+#[test]
+fn sub_hourly_schedules_warn_with_the_fires_per_hour_count() {
+    let ten = schedule_cr_growth_warning("*/10 * * * *").expect("*/10 warns");
+    assert!(ten.contains("6×/hour"), "{ten}");
+    assert!(ten.contains("docs/backups.md"), "{ten}");
+    let five = schedule_cr_growth_warning("*/5 * * * *").expect("*/5 warns");
+    assert!(five.contains("12×/hour"), "{five}");
+    let twice = schedule_cr_growth_warning("0,30 * * * *").expect("0,30 warns");
+    assert!(twice.contains("2×/hour"), "{twice}");
+}
+
+#[test]
+fn day_constrained_sub_hourly_schedule_still_warns() {
+    // The window anchors on the cron's FIRST fire, so a Sunday-only every-10-min
+    // schedule is measured during an active hour (a fixed Monday hour would miss it).
+    let w = schedule_cr_growth_warning("*/10 * * * 0").expect("sunday */10 warns");
+    assert!(w.contains("6×/hour"), "{w}");
+}

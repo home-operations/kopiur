@@ -384,7 +384,15 @@ fn handle_snapshot_schedule(
     // CRD schema (ADR-0005 §1), so the apiserver materializes them. The webhook writes
     // no user spec (the status-only-write invariant, ADR-0005 §14(d)) — a write-back
     // into spec makes Argo/Flux perpetually `OutOfSync`.
-    Ok(resp)
+
+    // Non-blocking footgun warning for a sub-hourly cadence (issue #249): per-run
+    // Snapshot CRs accumulate up to the retention window and each re-reconciles for
+    // its whole life, so a sub-hourly schedule with a wide retention can pile up
+    // thousands of CRs. A warning, not a rejection — sub-hourly is legitimate.
+    let warnings = api::validate::schedule_cr_growth_warning(&spec.schedule.cron)
+        .into_iter()
+        .collect();
+    Ok(with_warnings(resp, warnings))
 }
 
 // --- Restore ----------------------------------------------------------------
