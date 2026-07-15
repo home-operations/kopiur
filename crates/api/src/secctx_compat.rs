@@ -289,6 +289,55 @@ pub fn pods_mounting_pvc<'a>(pods: &'a [Pod], claim_name: &str) -> Vec<&'a Pod> 
         .collect()
 }
 
+/// The **container** within `pod` that mounts `claim_name`: resolve the pod volume(s) backed
+/// by the claim, then find the container whose `volumeMounts` reference one.
+///
+/// [`pod_mounts_claim`] is pod-level and cannot answer "which container is the app?" — a
+/// question that matters because `inheritSecurityContextFrom` copies ONE container's
+/// `securityContext`. Falling back to the pod's first container picks whatever the manifest or
+/// a sidecar injector listed first, which on an istio-injected pod is `istio-proxy` (uid 1337),
+/// not the app. The container actually mounting the data is a far better guess at whose
+/// identity wrote it.
+///
+/// Returns `None` when nothing mounts the claim or when **several** containers do — ambiguous
+/// is not a guess worth making, and the caller falls back to the first container as before.
+/// Init containers are excluded: they are not the long-running writer.
+pub fn container_mounting_claim<'a>(
+    pod: &'a Pod,
+    claim_name: &str,
+) -> Option<&'a k8s_openapi::api::core::v1::Container> {
+    let spec = pod.spec.as_ref()?;
+    // Pod volume names backed by this claim (usually exactly one).
+    let volume_names: BTreeSet<&str> = spec
+        .volumes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|v| {
+            v.persistent_volume_claim
+                .as_ref()
+                .is_some_and(|pvc| pvc.claim_name == claim_name)
+        })
+        .map(|v| v.name.as_str())
+        .collect();
+    if volume_names.is_empty() {
+        return None;
+    }
+    let mut mounters = spec.containers.iter().filter(|c| {
+        c.volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|m| volume_names.contains(m.name.as_str()))
+    });
+    let first = mounters.next()?;
+    // More than one container mounts it → ambiguous; let the caller decide.
+    if mounters.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// Whether a pod is a kopiur-managed object (carries `app.kubernetes.io/managed-by=kopiur`).
 /// A mover Job's pod mounts the source PVC too, so consumer-discovery and compatibility
 /// reasoning must exclude these — otherwise the mover would be compared against (or inherit
@@ -668,6 +717,79 @@ mod tests {
                 MoverReadCompat::Compatible { .. }
             ),
             "the app writes as 1000; a 1337 mover is not provably able to read it"
+        );
+    }
+
+    /// `container_mounting_claim` exists because `containers.first()` is a coin flip on any
+    /// pod with an injected sidecar — and inheriting the sidecar's UID yields a mover that
+    /// cannot read the app's files.
+    #[test]
+    fn container_mounting_claim_picks_the_app_over_a_first_listed_sidecar() {
+        use k8s_openapi::api::core::v1::VolumeMount;
+
+        let mut p = pod("app-1", "app", Some(1000), None, "app-data");
+        // The app container mounts the claim.
+        p.spec.as_mut().unwrap().containers[0].volume_mounts = Some(vec![VolumeMount {
+            name: "data".into(),
+            mount_path: "/data".into(),
+            ..Default::default()
+        }]);
+        // istio-proxy is injected FIRST and mounts nothing of ours.
+        p.spec.as_mut().unwrap().containers.insert(
+            0,
+            Container {
+                name: "istio-proxy".into(),
+                security_context: Some(sc(Some(1337), None, Some(true))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            p.spec.as_ref().unwrap().containers.first().unwrap().name,
+            "istio-proxy",
+            "precondition: the naive pick would take the sidecar"
+        );
+        let picked = container_mounting_claim(&p, "app-data").expect("the app mounts the claim");
+        assert_eq!(picked.name, "app");
+        assert_eq!(
+            picked.security_context.as_ref().unwrap().run_as_user,
+            Some(1000),
+            "and it carries the identity that actually wrote the data"
+        );
+    }
+
+    #[test]
+    fn container_mounting_claim_abstains_when_ambiguous_or_absent() {
+        use k8s_openapi::api::core::v1::VolumeMount;
+
+        let mount = || {
+            Some(vec![VolumeMount {
+                name: "data".into(),
+                mount_path: "/data".into(),
+                ..Default::default()
+            }])
+        };
+
+        // Nothing mounts the claim -> None (caller keeps its old first-container behavior).
+        let p = pod("app-1", "app", Some(1000), None, "app-data");
+        assert!(container_mounting_claim(&p, "app-data").is_none());
+
+        // A DIFFERENT claim -> None.
+        let mut p = pod("app-1", "app", Some(1000), None, "app-data");
+        p.spec.as_mut().unwrap().containers[0].volume_mounts = mount();
+        assert!(container_mounting_claim(&p, "other-claim").is_none());
+
+        // TWO containers mount it -> ambiguous, abstain rather than guess.
+        let mut p = pod("app-1", "app", Some(1000), None, "app-data");
+        p.spec.as_mut().unwrap().containers[0].volume_mounts = mount();
+        p.spec.as_mut().unwrap().containers.push(Container {
+            name: "sidecar-backup".into(),
+            security_context: Some(sc(Some(2000), None, Some(true))),
+            volume_mounts: mount(),
+            ..Default::default()
+        });
+        assert!(
+            container_mounting_claim(&p, "app-data").is_none(),
+            "two mounters: no basis to prefer either"
         );
     }
 

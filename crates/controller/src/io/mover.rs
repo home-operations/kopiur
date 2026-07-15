@@ -567,7 +567,9 @@ pub fn inherited_security_context_from_pods(
     }
     // Prefer a Running pod; otherwise take the first match.
     let pod = pods.iter().find(|p| pod_is_running(p)).unwrap_or(&pods[0]);
-    extract_inherited_contexts(pod, container, ns)
+    // `None` claim: a label selector names a workload, not a volume, so there is no claim to
+    // identify the app container by — an unnamed container falls back to the pod's first.
+    extract_inherited_contexts(pod, container, None, ns)
 }
 
 /// Whether a pod's `status.phase` is `Running`.
@@ -580,12 +582,18 @@ fn pod_is_running(p: &Pod) -> bool {
 }
 
 /// Extract the inherited `(container, pod)` security contexts from one chosen workload
-/// pod: the named container's context (or the first container's), plus the pod-level
-/// `spec.securityContext`. Shared by `workloadSelector` and `pvcConsumer`. Errors when the
-/// named container is absent or the pod sets neither context.
+/// pod, plus the pod-level `spec.securityContext`. Shared by `workloadSelector` and
+/// `pvcConsumer`. Errors when the named container is absent or the pod sets neither context.
+///
+/// Container choice, in order: the **named** container (a config error if absent); else, when
+/// `claim` is known (`pvcConsumer`), the single container that **mounts the claim**; else the
+/// pod's first. The claim-mounter step matters on sidecar-injected pods, where "first" is
+/// whatever the injector prepended (`istio-proxy`, uid 1337) rather than the app that wrote
+/// the data.
 fn extract_inherited_contexts(
     pod: &Pod,
     container: Option<&str>,
+    claim: Option<&str>,
     ns: &str,
 ) -> Result<InheritSource> {
     let containers = pod
@@ -593,8 +601,6 @@ fn extract_inherited_contexts(
         .as_ref()
         .map(|s| s.containers.as_slice())
         .unwrap_or(&[]);
-    // The chosen container: a NAMED container must exist (config error otherwise); without a
-    // name, the pod's first.
     let chosen = match container {
         Some(name) => Some(containers.iter().find(|c| c.name == name).ok_or_else(|| {
             Error::MissingDependency(format!(
@@ -603,7 +609,9 @@ fn extract_inherited_contexts(
                 pod.name_any()
             ))
         })?),
-        None => containers.first(),
+        None => claim
+            .and_then(|c| kopiur_api::secctx_compat::container_mounting_claim(pod, c))
+            .or_else(|| containers.first()),
     };
     let container_sc = chosen.and_then(|c| c.security_context.clone());
     let pod_sc = pod.spec.as_ref().and_then(|s| s.security_context.clone());
@@ -680,7 +688,9 @@ pub fn pvc_consumer_security_context_from_pods(
              explicit mover.securityContext / workloadSelector instead"
         ))
     })?;
-    extract_inherited_contexts(pod, container, ns)
+    // Pass the claim: with no explicit `container`, prefer the one that actually MOUNTS the
+    // source PVC over the pod's first, which on a sidecar-injected pod is the injected proxy.
+    extract_inherited_contexts(pod, container, Some(claim), ns)
 }
 
 /// `(namespace, name)` key for deterministic pod ordering.

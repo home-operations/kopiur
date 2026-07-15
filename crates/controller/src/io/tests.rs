@@ -2484,3 +2484,67 @@ fn a_context_pinning_no_identity_is_not_a_fallback() {
         Some(568)
     );
 }
+
+#[test]
+fn pvc_consumer_inherits_the_container_that_mounts_the_claim_not_the_first() {
+    use k8s_openapi::api::core::v1::{
+        Container, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PodStatus, SecurityContext,
+        Volume, VolumeMount,
+    };
+
+    // A sidecar-injected pod: istio-proxy (uid 1337) is listed FIRST and mounts nothing of
+    // ours; the app (uid 1000) mounts the source claim and is what actually wrote the data.
+    // Inheriting the sidecar yields a mover that cannot read the app's files — and, before the
+    // condition was made honest, one that claimed it could.
+    let pod = Pod {
+        metadata: kube::core::ObjectMeta {
+            name: Some("app-7c9d8f5b6-h2k4p".into()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![
+                Container {
+                    name: "istio-proxy".into(),
+                    security_context: Some(SecurityContext {
+                        run_as_user: Some(1337),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Container {
+                    name: "app".into(),
+                    security_context: Some(SecurityContext {
+                        run_as_user: Some(1000),
+                        ..Default::default()
+                    }),
+                    volume_mounts: Some(vec![VolumeMount {
+                        name: "data".into(),
+                        mount_path: "/data".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ],
+            volumes: Some(vec![Volume {
+                name: "data".into(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: "app-data".into(),
+                    read_only: None,
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        status: Some(PodStatus {
+            phase: Some("Running".into()),
+            ..Default::default()
+        }),
+    };
+
+    let src = pvc_consumer_security_context_from_pods(&[pod], "app-data", "app", None).unwrap();
+    assert_eq!(
+        src.container, "app",
+        "must pick the container that mounts the claim, not the injected first one"
+    );
+    assert_eq!(src.uid(), Some(1000), "and inherit the app's UID, not 1337");
+}
