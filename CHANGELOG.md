@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.7.4](https://github.com/home-operations/kopiur/compare/0.7.3...0.7.4) (2026-07-15)
+
+
+### Features
+
+* bound Snapshot CR reconcile cost at scale ([#249](https://github.com/home-operations/kopiur/issues/249)) ([#253](https://github.com/home-operations/kopiur/issues/253)) ([3697aa9](https://github.com/home-operations/kopiur/commit/3697aa9ec618a40f32cae5d2f01a71ea050c0598))
+* **docs:** clean up admonitions in docs ([71c5d85](https://github.com/home-operations/kopiur/commit/71c5d85068a8bfb468587275b12afc0f1c25db35))
+* multi-cluster shared repository support — cluster identity, foreign-aware discovery, collision-free maintenance leases ([#251](https://github.com/home-operations/kopiur/issues/251)) ([a4593d8](https://github.com/home-operations/kopiur/commit/a4593d82049e6fd6a51903a788738c265bfe0f01))
+
+
+### Bug Fixes
+
+* batch of six open-issue fixes ([#248](https://github.com/home-operations/kopiur/issues/248) [#238](https://github.com/home-operations/kopiur/issues/238) [#245](https://github.com/home-operations/kopiur/issues/245) [#196](https://github.com/home-operations/kopiur/issues/196) [#237](https://github.com/home-operations/kopiur/issues/237) [#250](https://github.com/home-operations/kopiur/issues/250)) ([#252](https://github.com/home-operations/kopiur/issues/252)) ([045a5a5](https://github.com/home-operations/kopiur/commit/045a5a5038f4d5b2af28d4be5e15a004c6afde14))
+* **deps:** update rust crate http-body-util (0.1.3 → 0.1.4) ([#244](https://github.com/home-operations/kopiur/issues/244)) ([4878006](https://github.com/home-operations/kopiur/commit/4878006e9750027792bef58e8ba22a0309a3bad4))
+* **deps:** update rust crate rustls (0.23.41 → 0.23.42) ([#243](https://github.com/home-operations/kopiur/issues/243)) ([13b1dc4](https://github.com/home-operations/kopiur/commit/13b1dc4758a0401c54bcb2f577ff291af8c2620f))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.7.3 manifest ([d521675](https://github.com/home-operations/kopiur/commit/d5216755f2b1af9cf1e535fc929d4af9f63fee89))
+* **mise:** Update tool aqua:EmbarkStudios/cargo-deny (0.19.9 → 0.20.2) ([#226](https://github.com/home-operations/kopiur/issues/226)) ([9c109b4](https://github.com/home-operations/kopiur/commit/9c109b4e4dc6be24b16249da17bdd1b38b62d8ad))
+* **mise:** Update tool oxfmt (0.58.0 → 0.59.0) ([#246](https://github.com/home-operations/kopiur/issues/246)) ([41625e9](https://github.com/home-operations/kopiur/commit/41625e9487be3bf93d039559d5f5374c5af1e273))
+* **mise:** Update tool zizmor (1.26.1 → 1.27.0) ([#247](https://github.com/home-operations/kopiur/issues/247)) ([fe10a6a](https://github.com/home-operations/kopiur/commit/fe10a6a74409a95adcff8c934698dcf4203ca234))
+
 ## [0.7.3](https://github.com/home-operations/kopiur/compare/0.7.2...0.7.3) (2026-07-12)
 
 
