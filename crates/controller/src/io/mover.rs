@@ -418,6 +418,78 @@ pub fn label_selector_to_string(sel: &LabelSelector) -> String {
 /// At least one is `Some` (a fully context-less workload is an error to inherit from).
 pub type InheritedContexts = (Option<SecurityContext>, Option<PodSecurityContext>);
 
+/// One successful inherit: the copied contexts plus **which** pod/container they came from.
+/// The provenance is not decoration — it is what lets the reconciler report the mover's
+/// identity honestly (naming the pod in a condition/Event) instead of asserting a match from
+/// the fact that the inherit code path ran, which is the bug this type exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InheritSource {
+    /// The workload's container + pod security contexts, copied verbatim.
+    pub contexts: InheritedContexts,
+    /// The pod the contexts were read from.
+    pub pod: String,
+    /// The container within that pod whose `securityContext` was copied.
+    pub container: String,
+}
+
+impl InheritSource {
+    /// The **effective** UID these inherited contexts pin, following kubelet precedence
+    /// (`container.runAsUser ?? pod.runAsUser`). `None` when the workload pins no UID at
+    /// either level — its identity then comes from its image's `USER`, which is unreadable
+    /// from the spec, and inheriting contributes no UID at all.
+    pub fn uid(&self) -> Option<i64> {
+        kopiur_api::common::effective_run_as_user(
+            self.contexts.0.as_ref(),
+            self.contexts.1.as_ref(),
+        )
+    }
+}
+
+/// What `inheritSecurityContextFrom` produced for this run. Exhaustively matched by the
+/// reconcilers so a new variant cannot be silently ignored (§5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum InheritOutcome {
+    /// The recipe requested no inheritance — the explicit contexts are the only source.
+    NotRequested,
+    /// Inherited from a live workload pod.
+    Inherited {
+        /// The pod the contexts were read from.
+        pod: String,
+        /// The container whose `securityContext` was copied.
+        container: String,
+        /// The effective UID the inherited layer pins, if any (see [`InheritSource::uid`]).
+        uid: Option<i64>,
+    },
+}
+
+/// The mover's recipe-layer security contexts plus how they were arrived at.
+///
+/// `contexts` feeds [`kopiur_api::common::resolve_mover`] as `recipe_sc`/`recipe_psc`;
+/// `outcome` lets the caller report provenance instead of guessing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMoverSecurity {
+    /// The recipe layer's container + pod contexts.
+    pub contexts: InheritedContexts,
+    /// How `contexts` was arrived at.
+    pub outcome: InheritOutcome,
+    /// Pods from an **unfiltered** namespace LIST, reusable by the compat assessment so it
+    /// need not LIST again.
+    ///
+    /// `Some` ONLY on the `pvcConsumer` path, which lists the whole namespace. This is a
+    /// correctness invariant, not an optimization toggle:
+    ///
+    /// - `workloadSelector` lists **label-filtered** ([`resolve_inherited_security_context`]),
+    ///   so its result is a subset of the claim's consumers. Feeding it to
+    ///   `workload_identities` would narrow the writer set and could flip a
+    ///   `LikelyIncompatible` verdict to `Compatible` — a false `SecurityContextCompatible=True`,
+    ///   the very bug the honest assessment exists to kill.
+    /// - `NotRequested` lists nothing, so an empty `Vec` would be indistinguishable from
+    ///   "listed, found zero consumers" and would suppress `True` for every non-inherit run.
+    ///
+    /// Hence `None` for both: the assessment then does its own unfiltered LIST, as today.
+    pub unfiltered_pods: Option<Vec<Pod>>,
+}
+
 /// Resolve `inheritSecurityContextFrom` to the workload's **container** AND **pod**
 /// security contexts: find a pod in `ns` matching the selector, pick the named
 /// container (or the pod's first), and return that container's `securityContext`
@@ -430,7 +502,7 @@ pub async fn resolve_inherited_security_context(
     client: &kube::Client,
     ns: &str,
     selector: &PodSelector,
-) -> Result<InheritedContexts> {
+) -> Result<InheritSource> {
     let query = label_selector_to_string(&selector.pod_selector);
     if query.is_empty() {
         return Err(Error::MissingDependency(format!(
@@ -456,7 +528,7 @@ pub fn inherited_security_context_from_pods(
     container: Option<&str>,
     ns: &str,
     query: &str,
-) -> Result<InheritedContexts> {
+) -> Result<InheritSource> {
     if pods.is_empty() {
         return Err(Error::MissingDependency(format!(
             "no pod matches mover.inheritSecurityContextFrom (`{query}`) in namespace `{ns}` — the \
@@ -486,27 +558,25 @@ fn extract_inherited_contexts(
     pod: &Pod,
     container: Option<&str>,
     ns: &str,
-) -> Result<InheritedContexts> {
+) -> Result<InheritSource> {
     let containers = pod
         .spec
         .as_ref()
         .map(|s| s.containers.as_slice())
         .unwrap_or(&[]);
-    // The chosen container's context: a NAMED container must exist (config error
-    // otherwise); without a name, the first container's (None if there are none).
-    let container_sc = match container {
-        Some(name) => {
-            let c = containers.iter().find(|c| c.name == name).ok_or_else(|| {
-                Error::MissingDependency(format!(
-                    "pod `{}` (matched by mover.inheritSecurityContextFrom in `{ns}`) has no \
-                     container `{name}` — fix `inheritSecurityContextFrom.container`",
-                    pod.name_any()
-                ))
-            })?;
-            c.security_context.clone()
-        }
-        None => containers.first().and_then(|c| c.security_context.clone()),
+    // The chosen container: a NAMED container must exist (config error otherwise); without a
+    // name, the pod's first.
+    let chosen = match container {
+        Some(name) => Some(containers.iter().find(|c| c.name == name).ok_or_else(|| {
+            Error::MissingDependency(format!(
+                "pod `{}` (matched by mover.inheritSecurityContextFrom in `{ns}`) has no \
+                 container `{name}` — fix `inheritSecurityContextFrom.container`",
+                pod.name_any()
+            ))
+        })?),
+        None => containers.first(),
     };
+    let container_sc = chosen.and_then(|c| c.security_context.clone());
     let pod_sc = pod.spec.as_ref().and_then(|s| s.security_context.clone());
     if container_sc.is_none() && pod_sc.is_none() {
         return Err(Error::MissingDependency(format!(
@@ -516,7 +586,11 @@ fn extract_inherited_contexts(
             pod.name_any()
         )));
     }
-    Ok((container_sc, pod_sc))
+    Ok(InheritSource {
+        contexts: (container_sc, pod_sc),
+        pod: pod.name_any(),
+        container: chosen.map(|c| c.name.clone()).unwrap_or_default(),
+    })
 }
 
 /// Resolve `inheritSecurityContextFrom.pvcConsumer` (backup sources only): find the
@@ -529,7 +603,7 @@ pub async fn resolve_pvc_consumer_security_context(
     ns: &str,
     source_pvc: Option<&str>,
     container: Option<&str>,
-) -> Result<InheritedContexts> {
+) -> Result<(InheritSource, Vec<Pod>)> {
     let claim = source_pvc.ok_or_else(|| {
         Error::MissingDependency(
             "mover.inheritSecurityContextFrom.pvcConsumer is only valid for a backup whose source \
@@ -539,8 +613,11 @@ pub async fn resolve_pvc_consumer_security_context(
         )
     })?;
     let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    // Unfiltered on purpose: the compat assessment needs EVERY pod mounting the claim, so
+    // this list is handed back for reuse rather than re-listed. See `ResolvedMoverSecurity`.
     let pods = api.list(&ListParams::default()).await?.items;
-    pvc_consumer_security_context_from_pods(&pods, claim, ns, container)
+    let source = pvc_consumer_security_context_from_pods(&pods, claim, ns, container)?;
+    Ok((source, pods))
 }
 
 /// Pure core of [`resolve_pvc_consumer_security_context`]: from all pods in the namespace,
@@ -554,7 +631,7 @@ pub fn pvc_consumer_security_context_from_pods(
     claim: &str,
     ns: &str,
     container: Option<&str>,
-) -> Result<InheritedContexts> {
+) -> Result<InheritSource> {
     let mut consumers: Vec<&Pod> = pods
         .iter()
         .filter(|p| pod_mounts_claim(p, claim))
@@ -636,13 +713,17 @@ pub async fn ensure_cache_pvc(
     }
 }
 
-/// The mover's **effective** container AND pod security contexts: resolved from
-/// `inheritSecurityContextFrom` when set (the workload's container + pod contexts),
-/// else the explicit `securityContext` / `podSecurityContext` (inherit is mutually
-/// exclusive with both — webhook/`validate_mover`-enforced). Each is `None` when
-/// unset (the Job builder then applies the hardened container default and no pod
-/// context). The result feeds BOTH the privileged-mover gate and the mover `Job`, so
-/// an inherited root context — container or pod — is gated exactly like an explicit one.
+/// The mover's **recipe-layer** container AND pod security contexts, plus how they were
+/// arrived at: resolved from `inheritSecurityContextFrom` when set (copying the workload's
+/// container and pod contexts), else the explicit `securityContext` / `podSecurityContext`.
+/// Each context is `None` when unset (the Job builder then applies the hardened container
+/// default and no pod context). The result feeds BOTH the privileged-mover gate and the mover
+/// `Job`, so an inherited root context — container or pod — is gated exactly like an explicit
+/// one.
+///
+/// The returned [`ResolvedMoverSecurity::outcome`] carries the *provenance* so callers can
+/// report the mover's identity from what actually happened. Asserting compatibility from the
+/// fact that a given branch ran is exactly the defect this signature exists to prevent.
 ///
 /// `source_pvc` is the backup source claim name, used only by the
 /// `inheritSecurityContextFrom.pvcConsumer` mode to discover the workload that mounts it;
@@ -653,25 +734,47 @@ pub async fn resolve_mover_security_contexts(
     ns: &str,
     mover: Option<&MoverSpec>,
     source_pvc: Option<&str>,
-) -> Result<InheritedContexts> {
-    match mover {
-        Some(m) => match &m.inherit_security_context_from {
-            Some(InheritSecurityContextFrom::WorkloadSelector(sel)) => {
-                resolve_inherited_security_context(client, ns, sel).await
-            }
-            Some(InheritSecurityContextFrom::PvcConsumer(pc)) => {
-                resolve_pvc_consumer_security_context(
-                    client,
-                    ns,
-                    source_pvc,
-                    pc.container.as_deref(),
-                )
-                .await
-            }
-            None => Ok((m.security_context.clone(), m.pod_security_context.clone())),
+) -> Result<ResolvedMoverSecurity> {
+    let Some(m) = mover else {
+        return Ok(ResolvedMoverSecurity {
+            contexts: (None, None),
+            outcome: InheritOutcome::NotRequested,
+            unfiltered_pods: None,
+        });
+    };
+    // `unfiltered_pods` is `Some` ONLY for `pvcConsumer` — see `ResolvedMoverSecurity`.
+    let (source, unfiltered_pods) = match &m.inherit_security_context_from {
+        Some(InheritSecurityContextFrom::WorkloadSelector(sel)) => (
+            resolve_inherited_security_context(client, ns, sel).await?,
+            None,
+        ),
+        Some(InheritSecurityContextFrom::PvcConsumer(pc)) => {
+            let (source, pods) = resolve_pvc_consumer_security_context(
+                client,
+                ns,
+                source_pvc,
+                pc.container.as_deref(),
+            )
+            .await?;
+            (source, Some(pods))
+        }
+        None => {
+            return Ok(ResolvedMoverSecurity {
+                contexts: (m.security_context.clone(), m.pod_security_context.clone()),
+                outcome: InheritOutcome::NotRequested,
+                unfiltered_pods: None,
+            });
+        }
+    };
+    Ok(ResolvedMoverSecurity {
+        outcome: InheritOutcome::Inherited {
+            pod: source.pod.clone(),
+            container: source.container.clone(),
+            uid: source.uid(),
         },
-        None => Ok((None, None)),
-    }
+        contexts: source.contexts,
+        unfiltered_pods,
+    })
 }
 
 /// Container `waiting.reason` values that mean the pod will never start without a spec

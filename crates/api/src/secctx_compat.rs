@@ -552,6 +552,125 @@ mod tests {
         ));
     }
 
+    /// The exact reported bug, end-to-end through the real merge + assessment: a
+    /// `pvcConsumer` mover inheriting from a workload whose container securityContext EXISTS
+    /// but pins no `runAsUser` (its UID comes from the image's `USER` line).
+    ///
+    /// Inherit "succeeds" — the block is non-empty — but contributes no UID, so the merged
+    /// mover has none either and runs as the mover image's 65532. The reconciler used to
+    /// short-circuit this to `SecurityContextCompatible=True` ("matches the workload by
+    /// construction") without ever asking this engine; the backup then failed with
+    /// `permission denied`. The engine's answer has always been `Unknown` — it was simply
+    /// never consulted on the pvcConsumer path.
+    #[test]
+    fn inheriting_a_uidless_workload_is_never_compatible() {
+        // The workload: hardened container context, no runAsUser at either level.
+        let mut w_pod = pod("app-7c9d8f5b6", "app", None, None, "app-data");
+        w_pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        });
+        w_pod.spec.as_mut().unwrap().security_context = None;
+
+        // What `inheritSecurityContextFrom` copies off it, through the real merge ladder.
+        let inherited_sc = w_pod.spec.as_ref().unwrap().containers[0]
+            .security_context
+            .clone();
+        let inherited_psc = w_pod.spec.as_ref().unwrap().security_context.clone();
+        let resolved = crate::common::resolve_mover(
+            None,
+            inherited_sc.as_ref(),
+            inherited_psc.as_ref(),
+            None,
+            None,
+            None,
+        );
+
+        let m = mover_identity(
+            &resolved.security_context,
+            resolved.pod_security_context.as_ref(),
+        );
+        assert_eq!(
+            m.uid, None,
+            "inheriting pinned no UID — the mover silently runs as the image's 65532"
+        );
+
+        let ids = workload_identities(std::slice::from_ref(&w_pod), "app-data");
+        assert!(
+            !matches!(
+                assess_read_compat(&m, &ids),
+                MoverReadCompat::Compatible { .. }
+            ),
+            "must never be Compatible: nothing here proves the mover can read the source"
+        );
+    }
+
+    /// The companion: when the workload DOES pin a UID, inheriting it is provably compatible.
+    /// Guards against over-correcting the fix above into never confirming anything.
+    #[test]
+    fn inheriting_a_uid_pinning_workload_is_compatible() {
+        let w_pod = pod("app-7c9d8f5b6", "app", Some(1000), None, "app-data");
+        let inherited_sc = w_pod.spec.as_ref().unwrap().containers[0]
+            .security_context
+            .clone();
+        let resolved =
+            crate::common::resolve_mover(None, inherited_sc.as_ref(), None, None, None, None);
+        let m = mover_identity(
+            &resolved.security_context,
+            resolved.pod_security_context.as_ref(),
+        );
+        assert_eq!(m.uid, Some(1000));
+        assert!(matches!(
+            assess_read_compat(
+                &m,
+                &workload_identities(std::slice::from_ref(&w_pod), "app-data")
+            ),
+            MoverReadCompat::Compatible {
+                basis: CompatBasis::ExactUidMatch
+            }
+        ));
+    }
+
+    /// Cause (b): a sidecar-injected pod. `containers.first()` may hand the mover the
+    /// sidecar's UID while the app writes the files as its own. The whole-namespace writer
+    /// set catches the mismatch — "matches by construction" never could.
+    #[test]
+    fn inheriting_a_sidecars_uid_is_not_compatible_with_the_apps_files() {
+        let mut w_pod = pod("app-7c9d8f5b6", "app", Some(1000), None, "app-data");
+        // istio-proxy injected ahead of the app container, running as 1337.
+        w_pod.spec.as_mut().unwrap().containers.insert(
+            0,
+            Container {
+                name: "istio-proxy".into(),
+                security_context: Some(sc(Some(1337), None, Some(true))),
+                ..Default::default()
+            },
+        );
+        // The mover inherited the SIDECAR (containers.first()).
+        let resolved = crate::common::resolve_mover(
+            None,
+            Some(&sc(Some(1337), None, Some(true))),
+            None,
+            None,
+            None,
+            None,
+        );
+        let m = mover_identity(
+            &resolved.security_context,
+            resolved.pod_security_context.as_ref(),
+        );
+        assert!(
+            !matches!(
+                assess_read_compat(
+                    &m,
+                    &workload_identities(std::slice::from_ref(&w_pod), "app-data")
+                ),
+                MoverReadCompat::Compatible { .. }
+            ),
+            "the app writes as 1000; a 1337 mover is not provably able to read it"
+        );
+    }
+
     #[test]
     fn stock_hardened_mover_is_unknown_never_warns() {
         // Hardened mover: runAsNonRoot:true, no runAsUser → UID unpinned → Unknown.

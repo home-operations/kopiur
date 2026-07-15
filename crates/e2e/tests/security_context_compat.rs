@@ -130,7 +130,21 @@ async fn cleanup(client: &Client, repo: &str, policy: &str, backup: &str, pod: &
     let _ = backups.delete(backup, &DeleteParams::default()).await;
     let _ = policies.delete(policy, &DeleteParams::default()).await;
     let _ = repos.delete(repo, &DeleteParams::default()).await;
-    let _ = pods.delete(pod, &DeleteParams::default()).await;
+    // Delete the workload pod with NO grace period and WAIT for it to actually be gone.
+    // Every scenario here parks a pod on the SAME source claim (`e2e-src`), and the compat
+    // assessment unions the writer UIDs of every pod mounting it — a still-Terminating pod is
+    // returned by that LIST, so its UID would leak into the next scenario's verdict and flip a
+    // `Compatible` to `Unknown`. The default 30s grace made these scenarios order-dependent.
+    let _ = pods
+        .delete(pod, &DeleteParams::default().grace_period(0))
+        .await;
+    let _ = wait_until(
+        "workload pod fully gone (not just Terminating)",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pods.get_opt(pod).await?.is_none().then_some(())) },
+    )
+    .await;
 }
 
 /// Scenario (a): `pvcConsumer: {}` auto-derives the workload pod that mounts the source PVC —
@@ -355,6 +369,157 @@ async fn mismatched_mover_is_not_flagged_false_up_front() {
         "e2e-scc-mm-policy",
         "e2e-scc-mm-backup",
         "e2e-scc-mismatch-pod",
+    )
+    .await;
+}
+
+/// A workload pod that mounts `e2e-src` but pins **no** `runAsUser` at either level — its
+/// identity would come from its image's `USER` line, which the operator cannot read from the
+/// spec. The container securityContext is present but hardened-only (the restricted-PSA /
+/// bjw-s house style), which is exactly what made the old code accept it.
+fn uidless_workload_pod_json(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE, "labels": { "app": name } },
+        "spec": {
+            "containers": [{
+                "name": "app",
+                "image": "registry.k8s.io/pause:3.9",
+                // Present, hardened — but pins no identity whatsoever.
+                "securityContext": { "allowPrivilegeEscalation": false },
+                "volumeMounts": [{ "name": "src", "mountPath": "/data" }]
+            }],
+            "volumes": [{ "name": "src", "persistentVolumeClaim": { "claimName": "e2e-src" } }]
+        }
+    })
+}
+
+/// Scenario (c) — **the regression guard for the reported bug.** `pvcConsumer` against a
+/// workload that pins no UID must NEVER report `SecurityContextCompatible=True`.
+///
+/// On `main` this fails: the reconciler short-circuited `pvcConsumer` straight to `True`
+/// ("the mover inherited the source PVC consumer's securityContext (pvcConsumer), so its
+/// UID/GID matches the workload by construction") without consulting the compat engine at
+/// all. Inheriting a UID-less workload copies no UID, so the mover silently ran as its own
+/// image's 65532 and the backup then failed with `permission denied` — while the CR claimed
+/// the identities matched.
+///
+/// The assertion is deliberately about the CONDITION, not the backup outcome: whether the
+/// mover can read `e2e-src` depends on file modes the harness doesn't pin. What must hold is
+/// that the operator never *claims* a match it did not verify.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn pvc_consumer_never_claims_compatible_for_a_uidless_workload() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    pods.create(
+        &PostParams::default(),
+        &cr(uidless_workload_pod_json("e2e-scc-uidless")),
+    )
+    .await
+    .expect("create UID-less workload pod");
+    wait_pod_running(&pods, "e2e-scc-uidless").await;
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json("e2e-scc-nouid-repo")),
+        )
+        .await
+        .expect("create Repository");
+
+    let policy = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "e2e-scc-nouid-policy", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "e2e-scc-nouid-repo" },
+            "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            "copyMethod": "Direct",
+            "retention": { "keepLatest": 5 },
+            "mover": { "inheritSecurityContextFrom": { "pvcConsumer": {} } }
+        }
+    });
+    policies
+        .create(&PostParams::default(), &cr(policy))
+        .await
+        .expect("create SnapshotPolicy with pvcConsumer");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(backup_json("e2e-scc-nouid-backup", "e2e-scc-nouid-policy")),
+        )
+        .await
+        .expect("create Snapshot");
+
+    // Wait for the reconcile to have actually run and made its compatibility decision — the
+    // mover Job's existence is the proof it got past the resolve/gate path.
+    wait_until(
+        "mover Job created (the reconcile reached its compat decision)",
+        default_timeout(),
+        poll_interval(),
+        || async { jobs.get_opt("e2e-scc-nouid-backup").await },
+    )
+    .await
+    .expect("mover Job should be created");
+
+    // The mover carries NO inherited runAsUser: there was none to inherit. It will run as the
+    // mover image's own 65532 — which is precisely why claiming a match would be a lie.
+    let job = jobs
+        .get("e2e-scc-nouid-backup")
+        .await
+        .expect("get mover Job");
+    let inherited_uid = job
+        .spec
+        .and_then(|s| s.template.spec)
+        .and_then(|p| p.containers.first().cloned())
+        .and_then(|c| c.security_context)
+        .and_then(|sc| sc.run_as_user);
+    assert_eq!(
+        inherited_uid, None,
+        "inheriting a UID-less workload cannot pin a mover UID; got {inherited_uid:?}"
+    );
+
+    // THE ASSERTION — a direct read, not an inverted timeout. The compat decision is made and
+    // patched BEFORE the mover Job is applied, so the Job existing above already proves this
+    // reconcile reached and answered the question. Asserting on a `wait_until(...).is_err()`
+    // would instead pass for any reason the poll failed (RBAC, dead apiserver) — a test that
+    // cannot fail for the right reason is worse than no test.
+    let backup = backups
+        .get("e2e-scc-nouid-backup")
+        .await
+        .expect("get Snapshot after its reconcile stamped the compat decision");
+    let compat = backup.status.as_ref().and_then(|s| {
+        s.conditions
+            .iter()
+            .find(|c| c.type_ == SECURITY_CONTEXT_COMPATIBLE)
+    });
+    assert!(
+        !matches!(compat, Some(c) if c.status == "True"),
+        "regression: the operator claimed SecurityContextCompatible=True for a mover that \
+         inherited no UID from a UID-less workload — condition: {compat:?}"
+    );
+
+    cleanup(
+        &client,
+        "e2e-scc-nouid-repo",
+        "e2e-scc-nouid-policy",
+        "e2e-scc-nouid-backup",
+        "e2e-scc-uidless",
     )
     .await;
 }

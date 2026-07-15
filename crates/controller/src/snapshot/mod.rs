@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
 use kube::api::DeleteParams;
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType};
@@ -800,13 +800,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         jobs::MountSource::Pvc { claim_name } => Some(claim_name.as_str()),
         jobs::MountSource::Nfs { .. } => None,
     });
-    let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
+    let mover_security = io::resolve_mover_security_contexts(
         &ctx.client,
         &namespace,
         config.spec.mover.as_ref(),
         source_pvc,
     )
     .await?;
+    let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
@@ -914,42 +915,25 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
     }
 
-    // SecurityContext-compatibility (positive-only, best-effort): confirm `True` when the
-    // mover provably can read the source. `pvcConsumer` matches the source PVC's consumer by
-    // construction — set `True` directly without a second namespace pod LIST (the inherit
-    // resolver already listed). Otherwise assess against the live consumers. Never writes
-    // `False`/Event here — that comes certainly from `assess_completed_backup`.
+    // SecurityContext-compatibility (positive-only, best-effort): confirm `True` only when the
+    // RESOLVED mover provably can read the source. Every inherit mode goes through the same
+    // honest assessment — `pvcConsumer` used to short-circuit to `True` "by construction",
+    // which asserted a match from the fact that this branch ran and was wrong whenever the
+    // workload pinned no UID (its identity coming from its image) or the inherited container
+    // was a sidecar. `unfiltered_pods` reuses the LIST the pvcConsumer resolver already did, so
+    // dropping the short-circuit costs no extra API call. Never writes `False`/Event here —
+    // that comes certainly from `assess_completed_backup`.
     if let Some(claim) = source_pvc {
-        let used_pvc_consumer = matches!(
-            config
-                .spec
-                .mover
-                .as_ref()
-                .and_then(|m| m.inherit_security_context_from.as_ref()),
-            Some(kopiur_api::common::InheritSecurityContextFrom::PvcConsumer(
-                _
-            ))
-        );
-        if used_pvc_consumer {
-            set_security_context_compatible(
-                &api,
-                &name,
-                backup,
-                "the mover inherited the source PVC consumer's securityContext (pvcConsumer), so \
-                 its UID/GID matches the workload by construction",
-            )
-            .await;
-        } else {
-            assess_backup_security_context(
-                &namespace,
-                backup,
-                claim,
-                &resolved_mover.security_context,
-                resolved_mover.pod_security_context.as_ref(),
-                ctx,
-            )
-            .await;
-        }
+        assess_backup_security_context(
+            &namespace,
+            backup,
+            claim,
+            &resolved_mover.security_context,
+            resolved_mover.pod_security_context.as_ref(),
+            mover_security.unfiltered_pods.as_deref(),
+            ctx,
+        )
+        .await;
     }
 
     let owner = io::owner_ref_for(backup, "Snapshot")?;
@@ -2397,41 +2381,61 @@ async fn resolve_recipe(
 /// a UID mismatch is not proof of unreadability (world-readable data reads fine). The certain
 /// `False`+Event comes only from [`assess_completed_backup`] (kopia's own output); the
 /// advisory negative lives in the admission warning. Never returns an error.
+/// `listed_pods` is an already-fetched **unfiltered** namespace pod list to reuse instead of
+/// listing again (the `pvcConsumer` resolver's). It MUST be unfiltered: `workload_identities`
+/// needs every pod mounting the claim, and a narrowed writer set can flip a mismatch to a false
+/// `Compatible`. `None` → list here, as every other caller does.
 async fn assess_backup_security_context(
     namespace: &str,
     backup: &Snapshot,
     claim: &str,
     sc: &k8s_openapi::api::core::v1::SecurityContext,
     psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
+    listed_pods: Option<&[Pod]>,
     ctx: &Context,
 ) {
-    use k8s_openapi::api::core::v1::Pod;
     use kube::api::ListParams;
 
-    let pods = match Api::<Pod>::namespaced(ctx.client.clone(), namespace)
-        .list(&ListParams::default())
-        .await
-    {
-        Ok(list) => list.items,
-        // Best-effort: a transient list failure must never derail the backup.
-        Err(e) => {
-            tracing::debug!(error = %e, %namespace, "securityContext compat: pod list failed; skipping");
-            return;
+    let listed;
+    let pods: &[Pod] = match listed_pods {
+        Some(pods) => pods,
+        None => {
+            listed = match Api::<Pod>::namespaced(ctx.client.clone(), namespace)
+                .list(&ListParams::default())
+                .await
+            {
+                Ok(list) => list.items,
+                // Best-effort: a transient list failure must never derail the backup.
+                Err(e) => {
+                    tracing::debug!(error = %e, %namespace, "securityContext compat: pod list failed; skipping");
+                    return;
+                }
+            };
+            &listed
         }
     };
     let mover = kopiur_api::secctx_compat::mover_identity(sc, psc);
-    let identities = kopiur_api::secctx_compat::workload_identities(&pods, claim);
-    if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { .. } =
+    let identities = kopiur_api::secctx_compat::workload_identities(pods, claim);
+    if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { basis } =
         kopiur_api::secctx_compat::assess_read_compat(&mover, &identities)
     {
+        // Name the basis and the actual UID: a bare "compatible" is what let the old
+        // "by construction" claim hide the fact that nothing had been checked.
+        let message = match basis {
+            kopiur_api::secctx_compat::CompatBasis::RootMover => {
+                "the mover runs as root (uid 0), so it can read the source regardless of ownership"
+                    .to_string()
+            }
+            kopiur_api::secctx_compat::CompatBasis::ExactUidMatch => format!(
+                "the mover's uid ({}) exactly matches every workload writing the source PVC `{claim}`",
+                mover
+                    .uid
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "?".into()),
+            ),
+        };
         let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-        set_security_context_compatible(
-            &api,
-            &backup.name_any(),
-            backup,
-            "the mover's UID can read the source (root, or an exact UID match with the workload)",
-        )
-        .await;
+        set_security_context_compatible(&api, &backup.name_any(), backup, &message).await;
     }
     // Undecidable / likely-incompatible from securityContext alone → stay silent on the
     // reconcile path (no false alarms). The mover verifies it for real at runtime.

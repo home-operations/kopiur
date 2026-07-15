@@ -614,7 +614,8 @@ async fn spawn_maintenance_job(
         maint.spec.mover.as_ref(),
         None,
     )
-    .await?;
+    .await?
+    .contexts;
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
         effective_sc.as_ref(),

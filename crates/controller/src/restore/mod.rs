@@ -1751,7 +1751,8 @@ async fn run_restore_mover(
         restore.spec.mover.as_ref(),
         None,
     )
-    .await?;
+    .await?
+    .contexts;
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective

@@ -1669,10 +1669,14 @@ fn inherit_picks_named_container_else_first() {
         None,
     );
     let pods = std::slice::from_ref(&pod);
-    let (csc, _) = inherited_security_context_from_pods(pods, Some("app"), "ns", "app=x").unwrap();
+    let (csc, _) = inherited_security_context_from_pods(pods, Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
     // No container named → the pod's FIRST container.
-    let (csc, _) = inherited_security_context_from_pods(pods, None, "ns", "app=x").unwrap();
+    let (csc, _) = inherited_security_context_from_pods(pods, None, "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(101));
 }
 
@@ -1681,18 +1685,90 @@ fn inherit_copies_both_container_and_pod_security_context() {
     // The workload's CONTAINER runAsUser AND its POD fsGroup are both inherited, so an
     // inheriting mover matches the app at both levels (UID + writable-volume fsGroup).
     let pod = pod_with(Some("Running"), &[("app", Some(1000))], Some(1000));
-    let (csc, psc) =
-        inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    let (csc, psc) = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
     assert_eq!(psc.unwrap().fs_group, Some(1000));
 
     // A workload with ONLY a pod-level context (no container securityContext) still
     // inherits successfully — the pod context alone is enough.
     let pod = pod_with(Some("Running"), &[("app", None)], Some(2000));
-    let (csc, psc) =
-        inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    let (csc, psc) = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert!(csc.is_none());
     assert_eq!(psc.unwrap().fs_group, Some(2000));
+}
+
+#[test]
+fn inherit_reports_the_pod_and_container_it_read() {
+    // Provenance is load-bearing: the reconciler reports the mover's identity from WHERE the
+    // context came from. Asserting a match from "the inherit branch ran" is the bug this
+    // field exists to prevent, so the source must be nameable.
+    let mut pod = pod_with(
+        Some("Running"),
+        &[("sidecar", Some(101)), ("app", Some(1000))],
+        None,
+    );
+    pod.metadata.name = Some("app-7c9d8f5b6-h2k4p".to_string());
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.pod, "app-7c9d8f5b6-h2k4p");
+    assert_eq!(src.container, "app");
+    assert_eq!(src.uid(), Some(1000));
+}
+
+#[test]
+fn inherit_from_a_uidless_workload_pins_no_uid() {
+    // THE REPORTED BUG. A workload whose securityContext block exists but pins no runAsUser
+    // (its UID comes from the image's USER line) inherits "successfully" — the block is
+    // non-empty, so the extractor is happy — yet contributes NO uid. The mover then silently
+    // runs as its own image's 65532 and fails to read the source with permission denied.
+    //
+    // This is why `SecurityContextCompatible` may never be asserted from the fact that the
+    // pvcConsumer branch ran: here it would claim a UID match "by construction" that does not
+    // exist. `uid() == None` is the signal the honest assessment keys on.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], Some(65532));
+    // A hardened-but-UID-less container context — the bjw-s / restricted-PSA house style.
+    pod.spec.as_mut().unwrap().containers[0].security_context =
+        Some(k8s_openapi::api::core::v1::SecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.contexts.0.is_some(),
+        "the container block exists, so the extractor accepts it — that is the trap"
+    );
+    assert_eq!(
+        src.uid(),
+        None,
+        "inheriting pinned no UID: the mover would run as its own image's 65532"
+    );
+}
+
+#[test]
+fn inherit_uid_follows_kubelet_precedence() {
+    // container.runAsUser wins over pod.runAsUser; pod-level is the fallback. Shared with
+    // the invariants + compat engines via `effective_run_as_user`, so they cannot fork.
+    let mut pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), Some(1000), "container-level runAsUser wins");
+
+    // Pod-level only (the very common chart shape) still pins the UID.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_user: Some(568),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), Some(568), "pod-level runAsUser is the fallback");
 }
 
 #[test]
@@ -1702,7 +1778,8 @@ fn inherit_prefers_a_running_pod() {
     let running = pod_with(Some("Running"), &[("app", Some(1000))], None);
     let (csc, _) =
         inherited_security_context_from_pods(&[pending, running], Some("app"), "ns", "app=x")
-            .unwrap();
+            .unwrap()
+            .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
 }
 
@@ -1789,8 +1866,9 @@ fn pod_mounting(
 #[test]
 fn pvc_consumer_inherits_from_the_mounting_workload() {
     let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
-    let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[workload], "pgdata", "db", None).unwrap();
+    let (csc, _) = pvc_consumer_security_context_from_pods(&[workload], "pgdata", "db", None)
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(999));
 }
 
@@ -1808,7 +1886,9 @@ fn pvc_consumer_excludes_the_kopiur_mover_pod() {
     );
     let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
     let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[mover, workload], "pgdata", "db", None).unwrap();
+        pvc_consumer_security_context_from_pods(&[mover, workload], "pgdata", "db", None)
+            .unwrap()
+            .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(999));
 
     // With ONLY the mover mounting it (workload scaled to zero) → actionable error, not
@@ -1836,9 +1916,11 @@ fn pvc_consumer_pick_is_deterministic() {
     let b = pod_mounting("b-pod", "ns", Some("Running"), Some(2000), "data", false);
     let (csc_fwd, _) =
         pvc_consumer_security_context_from_pods(&[a.clone(), b.clone()], "data", "ns", None)
-            .unwrap();
-    let (csc_rev, _) =
-        pvc_consumer_security_context_from_pods(&[b, a], "data", "ns", None).unwrap();
+            .unwrap()
+            .contexts;
+    let (csc_rev, _) = pvc_consumer_security_context_from_pods(&[b, a], "data", "ns", None)
+        .unwrap()
+        .contexts;
     assert_eq!(csc_fwd.unwrap().run_as_user, Some(1000));
     assert_eq!(csc_rev.unwrap().run_as_user, Some(1000));
 }
@@ -1847,8 +1929,9 @@ fn pvc_consumer_pick_is_deterministic() {
 fn pvc_consumer_prefers_running_over_pending() {
     let pending = pod_mounting("a-pod", "ns", Some("Pending"), Some(5), "data", false);
     let running = pod_mounting("z-pod", "ns", Some("Running"), Some(1000), "data", false);
-    let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[pending, running], "data", "ns", None).unwrap();
+    let (csc, _) = pvc_consumer_security_context_from_pods(&[pending, running], "data", "ns", None)
+        .unwrap()
+        .contexts;
     assert_eq!(
         csc.unwrap().run_as_user,
         Some(1000),
