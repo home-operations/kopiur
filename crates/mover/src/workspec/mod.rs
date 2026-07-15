@@ -863,8 +863,13 @@ pub struct QuickVerify {
 
 impl QuickVerify {
     /// Convert to the kopia client's [`VerifyOptions`](kopiur_kopia::VerifyOptions).
+    ///
+    /// `sources` is left empty here — the tier knobs carry no identity. The
+    /// mover scopes the verify to the run's resolved identity
+    /// (`spec.identity.source_spec()`) at the call site (issue #250).
     pub fn to_kopia(&self) -> kopiur_kopia::VerifyOptions {
         kopiur_kopia::VerifyOptions {
+            sources: Vec::new(),
             verify_files_percent: self.verify_files_percent,
             max_errors: self.max_errors,
             parallel: self.parallel,
@@ -1009,6 +1014,19 @@ pub struct ResolvedIdentity {
     pub hostname: String,
     /// kopia source path component.
     pub source_path: String,
+}
+
+impl ResolvedIdentity {
+    /// The full kopia source spec (`username@hostname:path`) for this identity.
+    ///
+    /// This is the exact form kopia records a snapshot under (via
+    /// `snapshot create --override-source`) and the form `snapshot verify
+    /// --sources` / `snapshot list --source` match against, so scoping a verify
+    /// or list to this string targets precisely this policy's snapshots and no
+    /// other identity sharing the repository (issue #250).
+    pub fn source_spec(&self) -> String {
+        format!("{}@{}:{}", self.username, self.hostname, self.source_path)
+    }
 }
 
 /// How to reach the repository. Externally tagged: exactly one backend.

@@ -629,6 +629,7 @@ fn verify_args_builds_flags() {
         vec!["snapshot", "verify"]
     );
     let opts = VerifyOptions {
+        sources: vec!["app-config@app:/pvc/app-config".into()],
         verify_files_percent: Some(10),
         max_errors: Some(3),
         parallel: Some(8),
@@ -640,6 +641,10 @@ fn verify_args_builds_flags() {
         vec![
             "snapshot",
             "verify",
+            // `--sources` scopes the verify to one policy's identity (issue #250);
+            // emitted first, in kopia's `snapshot verify --help` flag order.
+            "--sources",
+            "app-config@app:/pvc/app-config",
             "--verify-files-percent",
             "10",
             "--max-errors",
@@ -652,6 +657,9 @@ fn verify_args_builds_flags() {
     // The two new knobs (M3 / issue #216 category sweep) — each independently absent
     // by default, and both emitted in kopia's `snapshot verify --help` order when set.
     let opts_full = VerifyOptions {
+        // Empty `sources` (the default) must NOT emit `--sources`, even when
+        // other flags are set — the whole-repository verify is still reachable.
+        sources: vec![],
         verify_files_percent: None,
         max_errors: Some(1),
         parallel: Some(2),

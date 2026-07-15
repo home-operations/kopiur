@@ -1383,7 +1383,16 @@ async fn run_verify_flow(
     // failure is terminal; a clean run yields the stats the predicate inspects.
     let (stats, restored, snapshot_id) = match &op.tier {
         VerifyTier::Quick(q) => {
-            if let Err(e) = client.snapshot_verify(&q.to_kopia()).await {
+            // Scope the verify to THIS policy's resolved identity. Without
+            // `--sources`, `kopia snapshot verify` verifies every snapshot in
+            // the repository, so on a shared ClusterRepository a per-policy
+            // quick verify would re-verify every other identity's data and
+            // `verifyFilesPercent` would sample the whole repository — issue
+            // #250. The identity is the same `username@hostname:path` kopia
+            // recorded the snapshot under.
+            let mut opts = q.to_kopia();
+            opts.sources = vec![spec.identity.source_spec()];
+            if let Err(e) = client.snapshot_verify(&opts).await {
                 patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
                 error!(class = %e.class(), "snapshot verify failed");
                 return Err(MoverError::Kopia {
