@@ -1,0 +1,129 @@
+# Scenario 09 — Share one repository across clusters
+#
+# Two clusters ("east" and "west") back up to the SAME S3 bucket, each through
+# its OWN ClusterRepository object with a distinct identityDefaults.cluster so
+# same-named namespaces on either cluster never collide on kopia identity (the
+# default hostname becomes <namespace>.<cluster> instead of bare <namespace>).
+#
+# IMPORTANT — this file shows BOTH clusters' manifests together for
+# comparison, but they are NEVER applied to the same cluster:
+#   * The FIRST ClusterRepository (identityDefaults.cluster: east) is applied
+#     to cluster "east".
+#   * The SECOND (identityDefaults.cluster: west) is applied to cluster
+#     "west".
+# They deliberately reuse the SAME ClusterRepository name ("shared-primary") —
+# that's what a real rollout looks like: each cluster's operator only ever
+# sees its OWN copy of the object, in its OWN etcd, so there is no naming
+# collision to avoid.
+#
+# Maintenance ownership (see docs/maintenance.md "pick ONE owner" — kopia has
+# no cross-cluster lock of its own beyond kopiur's lease): "east" is the ONE
+# cluster that runs maintenance here (maintenance.enabled defaults to true).
+# "west" explicitly disables its own managed Maintenance (enabled: false)
+# rather than leaving it enabled to yield forever, which is safe but noisy.
+#
+# REQUIRES the operator (and mover image) upgraded to a version that supports
+# identityDefaults.cluster on BOTH clusters BEFORE this is applied to either —
+# see docs/scenarios/shared-repository-multi-cluster.md step 0. Also requires
+# installScope=cluster on both (ClusterRepository is cluster-scoped).
+#
+# Field shapes verified against crates/api: identityDefaults.cluster is an
+# RFC 1123 label (<=32 chars, no dots) on IdentityDefaults, shared by
+# Repository and ClusterRepository.
+---
+# ============================================================================
+# CLUSTER "east" — the maintenance owner
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopia-shared-creds
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # MUST be the byte-identical value on every cluster sharing this repository —
+  # kopia bakes the resolved password into the repository format at creation.
+  KOPIA_PASSWORD: "REPLACE_ME_same_value_on_every_cluster"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-primary
+spec:
+  backend:
+    s3:
+      bucket: org-kopia-repo # the SAME bucket every cluster points at
+      prefix: ""
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: kopia-shared-creds
+          namespace: kopiur-system
+  encryption:
+    passwordSecretRef:
+      name: kopia-shared-creds
+      namespace: kopiur-system
+      key: KOPIA_PASSWORD
+  allowedNamespaces:
+    all: true
+  identityDefaults:
+    cluster: east # THIS cluster's identity suffix — distinct per cluster
+  catalog:
+    # Recommended on a shared repo: keep discovering peers' snapshots as they
+    # write, rather than only ever seeing them at the next spec change.
+    periodicRefresh: true
+    refreshInterval: 1h
+  maintenance:
+    namespace: kopiur-system
+    # enabled defaults to true — "east" is the ONE cluster that runs it.
+---
+# ============================================================================
+# CLUSTER "west" — NOT the maintenance owner
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopia-shared-creds
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME_same_value_on_every_cluster"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-primary # SAME name as "east" — this cluster's OWN copy of it
+spec:
+  backend:
+    s3:
+      bucket: org-kopia-repo
+      prefix: ""
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: kopia-shared-creds
+          namespace: kopiur-system
+  encryption:
+    passwordSecretRef:
+      name: kopia-shared-creds
+      namespace: kopiur-system
+      key: KOPIA_PASSWORD
+  allowedNamespaces:
+    all: true
+  identityDefaults:
+    cluster: west # distinct from "east" above — never reuse a cluster suffix
+  catalog:
+    periodicRefresh: true
+    refreshInterval: 1h
+  maintenance:
+    # "west" is NOT the maintenance owner: disable it here rather than leaving
+    # the default takeoverPolicy: Never to yield on every cron slot forever
+    # (safe, but a noisy MaintenanceYielding warning + a wasted mover Job each
+    # time). See docs/maintenance.md "pick ONE owner".
+    enabled: false

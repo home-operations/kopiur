@@ -152,19 +152,43 @@ pub(super) fn build_backup_run(
 /// Stable identity anchors for a Snapshot's kopia manifest, read from its
 /// recorded status. kopia rewrites a snapshot's manifest id on pin, so the pin
 /// and delete movers re-resolve the live id by these anchors (source path +
-/// start time, both stable across the rewrite). Empty when the Snapshot has no
-/// recorded identity/timing yet (the mover then falls back to id-only behavior).
+/// start time, both stable across the rewrite) — AND, when recorded,
+/// username/hostname, so the re-resolve can never cross-match a different
+/// identity's snapshot at the same path (the same PVC subpath repeats across
+/// namespaces, and, in a shared repository, across clusters). Empty when the
+/// Snapshot has no recorded identity/timing yet (the mover then falls back to
+/// id-only / path-only behavior).
 pub(super) fn snapshot_anchor(backup: &Snapshot) -> SnapshotAnchor {
     let status = backup.status.as_ref();
+    let identity = status
+        .and_then(|s| s.snapshot.as_ref())
+        .map(|s| &s.identity);
     SnapshotAnchor {
-        source_path: status
-            .and_then(|s| s.snapshot.as_ref())
-            .and_then(|s| s.identity.source_path.clone())
+        source_path: identity
+            .and_then(|i| i.source_path.clone())
             .unwrap_or_default(),
         start_time: status
             .and_then(|s| s.timing.as_ref())
             .and_then(|t| t.start_time.clone()),
+        username: identity.map(|i| i.username.clone()),
+        hostname: identity.map(|i| i.hostname.clone()),
     }
+}
+
+/// Whether a `kopia snapshot list` `entry` IS the snapshot for `identity`:
+/// source path AND username/hostname must all match. Path alone is NOT
+/// authoritative once two sources share it — the same PVC subpath repeats
+/// across namespaces, and, in a shared repository, across clusters — so
+/// identity disambiguates. Pulled out of `resolve_succeeded_snapshot` (the
+/// filesystem-repo in-process resolution) so the predicate is unit-testable
+/// without a live kopia connection.
+pub(super) fn matches_snapshot_identity(
+    entry: &kopiur_kopia::SnapshotListEntry,
+    identity: &MoverIdentity,
+) -> bool {
+    entry.source.path == identity.source_path
+        && entry.source.user_name == identity.username
+        && entry.source.host == identity.hostname
 }
 
 /// The hook plan summary carried on the work spec (`<index>:<form>` per hook) —
@@ -189,8 +213,9 @@ fn hook_plan_for(config: &SnapshotPolicy) -> kopiur_mover::workspec::HookPlanSum
 /// Resolve identity from a `SnapshotPolicy` (overrides + the repository's CEL
 /// `identityDefaults`) into the mover wire identity. Reuses
 /// `api::identity::resolve_identity` (the tested kernel). `defaults` is the
-/// `ClusterRepository`'s `identityDefaults` (ADR-0004 §5), `None` for a namespaced
-/// `Repository`.
+/// referenced repository's `identityDefaults` (ADR-0004 §5) — `Repository` or
+/// `ClusterRepository`, whichever `config.spec.repository` targets; `None` when
+/// it has none set.
 pub(super) fn resolve_identity_for(
     config: &SnapshotPolicy,
     namespace: &str,

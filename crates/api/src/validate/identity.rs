@@ -1,3 +1,4 @@
+use crate::common::IdentityDefaults;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot_policy::{SnapshotPolicySpec, Source};
 use std::collections::BTreeMap;
@@ -117,6 +118,68 @@ pub fn validate_identity_component(field: &str, value: &str) -> ValidationResult
     }
 }
 
+/// Maximum length of `Repository`/`ClusterRepository` `identityDefaults.cluster`.
+/// A cluster identity is a short, human-chosen suffix appended onto a namespace
+/// name — not free text — so this is generous headroom well under DNS's 253-byte
+/// label ceiling, not a real constraint in practice.
+pub const CLUSTER_NAME_MAX_LEN: usize = 32;
+
+/// Validate a `Repository`/`ClusterRepository` `identityDefaults.cluster`: an RFC 1123 label
+/// (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), 1..=[`CLUSTER_NAME_MAX_LEN`] characters,
+/// with dots called out explicitly as forbidden even though a well-formed RFC
+/// 1123 label never contains one anyway — the message needs to explain *why* to
+/// whoever hits it: `cluster` is concatenated onto a namespace as
+/// `<namespace>.<cluster>` for the default hostname (see
+/// [`crate::identity::resolve_identity`]), and [`crate::identity::classify_hostname`]
+/// splits that hostname back apart at the FIRST `.`, so a dot anywhere in
+/// `cluster` would make that split ambiguous.
+pub fn validate_cluster_name(value: &str) -> ValidationResult {
+    if value.is_empty() {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    if value.len() > CLUSTER_NAME_MAX_LEN {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: format!(
+                "is {} characters; the maximum is {CLUSTER_NAME_MAX_LEN}",
+                value.len()
+            ),
+        });
+    }
+    if value.contains('.') {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must not contain '.' — the first '.' in a hostname is the \
+                     namespace/cluster delimiter"
+                .to_string(),
+        });
+    }
+    let is_rfc1123_label = value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !is_rfc1123_label {
+        return Err(ValidationError::ClusterNameInvalid {
+            value: value.to_string(),
+            reason: "must be a lowercase RFC 1123 label: lowercase alphanumeric \
+                     characters or '-', starting and ending with an alphanumeric \
+                     character"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate a kopia identity `sourcePath` (the part after the first `:`). Lenient:
 /// spaces and `:` are allowed (only the first `:` is kopia's delimiter, and the rest
 /// is the path verbatim), but the path must be non-empty and free of newlines / ASCII
@@ -220,4 +283,48 @@ pub fn detect_source_path_fork(
         }
     }
     None
+}
+
+// --- Repository identityDefaults edit guard (fleet-wide silent re-identification) ---
+
+/// Pure decision for the repository `identityDefaults`-edit guard. An edit to a
+/// `Repository`/`ClusterRepository`'s `identityDefaults` (`cluster`,
+/// `hostnameExpr`, or `usernameExpr`) changes what every consumer
+/// `SnapshotPolicy` relying on those defaults resolves to — silently, with no
+/// per-policy edit to acknowledge it (unlike [`detect_identity_fork`], which
+/// guards a policy's own edit). Returns
+/// `Some(`[`ValidationError::RepositoryIdentityWouldFork`]`)` iff
+/// `identityDefaults` actually changed, at least one consumer has snapshot
+/// history, and the change is not acknowledged. The webhook does the IO (list
+/// consumer `SnapshotPolicy`s, read the ack annotation) and calls this.
+///
+/// ```
+/// use kopiur_api::common::IdentityDefaults;
+/// use kopiur_api::validate::detect_repository_identity_change;
+///
+/// let old = IdentityDefaults { cluster: Some("east".into()), ..Default::default() };
+/// let new = IdentityDefaults { cluster: Some("west".into()), ..Default::default() };
+/// let consumers = ["billing/pg".to_string()];
+///
+/// // Change + a consumer with history + no ack → rejected, naming the consumer.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), false, &consumers).is_some());
+/// // No consumers with history → nothing to orphan → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), false, &[]).is_none());
+/// // Acknowledged → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&new), true, &consumers).is_none());
+/// // No actual change → allowed.
+/// assert!(detect_repository_identity_change(Some(&old), Some(&old), false, &consumers).is_none());
+/// ```
+pub fn detect_repository_identity_change(
+    old: Option<&IdentityDefaults>,
+    new: Option<&IdentityDefaults>,
+    acknowledged: bool,
+    consumers_with_history: &[String],
+) -> Option<ValidationError> {
+    if acknowledged || consumers_with_history.is_empty() || old == new {
+        return None;
+    }
+    Some(ValidationError::RepositoryIdentityWouldFork {
+        consumers: consumers_with_history.to_vec(),
+    })
 }

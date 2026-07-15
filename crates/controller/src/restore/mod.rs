@@ -2106,13 +2106,17 @@ enum ResolveOutcome {
 /// self-heal a STALE pinned id: kopia rewrites a snapshot's manifest id on pin,
 /// so a `snapshotRef`/`identity` restore of a snapshot pinned before the
 /// re-stamp fix points at a deleted manifest. The anchors (source path + start
-/// time) survive the rewrite.
+/// time, plus username/hostname when known) survive the rewrite; identity
+/// additionally guards against re-resolving to a DIFFERENT source's snapshot
+/// at the same path (the same PVC subpath repeats across namespaces, and, in a
+/// shared repository, across clusters).
 ///
 /// `snapshotRef` reads the referenced `Snapshot` CR's recorded status (which
 /// keeps the correct identity/timing even when its id went stale). `identity`/
-/// `fromPolicy` use the pinned `status.resolved.identity` source path
-/// (best-effort, no start time — those resolve from a live list at admission).
-/// Empty when nothing is recorded yet (the mover then restores by id only).
+/// `fromPolicy` use the pinned `status.resolved.identity` (best-effort, no
+/// start time — those resolve from a live list at admission), falling back to
+/// the raw `IdentitySource` when nothing is pinned yet. Empty when nothing is
+/// recorded yet (the mover then restores by id only).
 async fn restore_source_anchor(
     ctx: &Context,
     restore: &Restore,
@@ -2123,31 +2127,43 @@ async fn restore_source_anchor(
         let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
         if let Ok(Some(snap)) = api.get_opt(&r.name).await {
             let st = snap.status.as_ref();
+            let identity = st.and_then(|s| s.snapshot.as_ref()).map(|s| &s.identity);
             return SnapshotAnchor {
-                source_path: st
-                    .and_then(|s| s.snapshot.as_ref())
-                    .and_then(|s| s.identity.source_path.clone())
+                source_path: identity
+                    .and_then(|i| i.source_path.clone())
                     .unwrap_or_default(),
                 start_time: st
                     .and_then(|s| s.timing.as_ref())
                     .and_then(|t| t.start_time.clone()),
+                username: identity.map(|i| i.username.clone()),
+                hostname: identity.map(|i| i.hostname.clone()),
             };
         }
     }
-    let source_path = restore
+    let resolved_identity = restore
         .status
         .as_ref()
         .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.identity.as_ref())
+        .and_then(|r| r.identity.as_ref());
+    let source_path = resolved_identity
         .and_then(|i| i.source_path.clone())
         .or_else(|| match &restore.spec.source {
             RestoreSource::Identity(id) => id.source_path.clone(),
             _ => None,
         })
         .unwrap_or_default();
+    let (username, hostname) = match resolved_identity {
+        Some(i) => (Some(i.username.clone()), Some(i.hostname.clone())),
+        None => match &restore.spec.source {
+            RestoreSource::Identity(id) => (Some(id.username.clone()), Some(id.hostname.clone())),
+            _ => (None, None),
+        },
+    };
     SnapshotAnchor {
         source_path,
         start_time: None,
+        username,
+        hostname,
     }
 }
 

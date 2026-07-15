@@ -187,7 +187,11 @@ impl PolicyArgsSpec {
 
     /// Convert to the kopia client's [`PolicyArgs`](kopiur_kopia::PolicyArgs).
     /// `splitter` is never set here — the object splitter is a repository property
-    /// (ADR-0004 §4b removed the per-policy splitter).
+    /// (ADR-0004 §4b removed the per-policy splitter). The six `keep_*`
+    /// (create-time retention) fields are likewise never set here: `PolicyArgsSpec`
+    /// is the wire work-spec, and Kopiur's `KOPIA_KEEP_MAX` pin is deliberately NOT
+    /// user-configurable — the mover applies it directly at the identity scope
+    /// (`crates/mover/src/main.rs`), so it never rides this struct.
     pub fn to_kopia(&self) -> kopiur_kopia::PolicyArgs {
         kopiur_kopia::PolicyArgs {
             compression: self.compression.clone(),
@@ -201,6 +205,7 @@ impl PolicyArgsSpec {
             max_parallel_snapshots: self.max_parallel_snapshots,
             max_parallel_file_reads: self.max_parallel_file_reads,
             extra_args: self.extra_args.clone(),
+            ..Default::default()
         }
     }
 
@@ -296,17 +301,34 @@ impl CreateOptionsSpec {
 /// stale id at delete/restore time. All fields are optional so older work specs
 /// (and Snapshots with no recorded identity/timing) still round-trip and fall
 /// back to the previous behavior.
+///
+/// `source_path` alone is NOT globally unique: the same PVC subpath repeats
+/// across namespaces, and — in a shared repository — across clusters, so a
+/// path-only match can select (and, in the delete path, DELETE) a different
+/// identity's snapshot. `username`/`hostname` close that hole: when both are
+/// present the matchers additionally require them to match; when they are
+/// absent (anchors captured before this fix) matching falls back to the
+/// previous path-only behavior exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotAnchor {
-    /// The snapshotted source path — the authoritative match key (the
-    /// mover-recorded user/host can differ from the resolved identity).
+    /// The snapshotted source path — necessary but not sufficient to match
+    /// once two sources share a path; see `username`/`hostname`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_path: String,
     /// RFC3339 start time recorded for this snapshot — the disambiguator when
     /// several snapshots share `source_path`. Absent on older work specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
+    /// The recorded kopia `username`, when known — required (with `hostname`)
+    /// to disambiguate a match by identity, not path alone. Absent on anchors
+    /// captured before this fix; matchers then fall back to path-only
+    /// behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The recorded kopia `hostname`, when known. See `username`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 impl SnapshotAnchor {
@@ -322,6 +344,13 @@ impl SnapshotAnchor {
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&chrono::Utc))
+    }
+
+    /// The `(username, hostname)` identity filter for
+    /// [`crate::resolve::match_current_manifest`], or `None` when either half
+    /// is missing (older anchors) — in which case matching stays path-only.
+    pub fn identity_filter(&self) -> Option<(&str, &str)> {
+        self.username.as_deref().zip(self.hostname.as_deref())
     }
 }
 
@@ -539,6 +568,41 @@ pub struct BootstrapRepositoryOp {
     /// hash,ecc}` (ADR-0005 §13(a)); they're immutable post-create (§7).
     #[serde(default, skip_serializing_if = "CreateOptionsSpec::is_empty")]
     pub create_options: CreateOptionsSpec,
+    /// This cluster's `identityDefaults.cluster` (multi-cluster shared repo),
+    /// carried ONLY when the controller determined cluster identity is on AND the
+    /// effective `catalog.foreignSnapshots` policy is `Ignore` — never under
+    /// `Fallback` (those entries must still come back so the controller can
+    /// materialize them into `catalog.fallbackNamespace`). When set, the mover
+    /// drops listing entries whose hostname classifies
+    /// [`kopiur_api::HostClass::ForeignCluster`] against it BEFORE
+    /// [`crate::bootstrap::MAX_RETURNED_SNAPSHOTS`] is applied (see
+    /// [`crate::bootstrap::apply_foreign_prefilter`]); absent on old work specs
+    /// (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_foreign_prefilter_cluster: Option<String>,
+    /// How aggressively the connect-to-existing self-heal (see
+    /// [`maintenance_restamp_target`]) may re-stamp a stale maintenance owner.
+    /// Defaults to [`RestampPolicy::AnyStale`] (the pre-M6 behavior) so old
+    /// work-spec JSON decodes unchanged.
+    #[serde(default)]
+    pub restamp_policy: RestampPolicy,
+    /// Pre-derived kopia OWNER strings (`kopia_owner_for_lease(alias_lease)`,
+    /// not raw lease strings) for this repository's recognized legacy leases
+    /// (M6 migration path — see
+    /// [`kopiur_api::maintenance::Ownership::owner_aliases`]). Consulted by
+    /// [`maintenance_restamp_target`] under [`RestampPolicy::OwnFormatsOnly`].
+    /// Absent on old work specs (serde default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintenance_owner_aliases: Vec<String>,
+    /// Connect with `--readonly` (`kopia repository connect --readonly`)
+    /// instead of the normal read-write connect. Set ONLY for the bootstrap of
+    /// a `mode: ReadOnly` repository (M6): bootstrap is a connect/scan probe,
+    /// and read-write-connecting a consumer repo is exactly what let it clobber
+    /// the primary's maintenance owner (the bug this field fixes). Never set
+    /// for restore/delete movers, which legitimately write pins. Absent on old
+    /// work specs (serde default ⇒ `false`, the pre-M6 behavior).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl BootstrapRepositoryOp {
@@ -546,6 +610,76 @@ impl BootstrapRepositoryOp {
     /// create-time format knobs carried here.
     pub fn create_options(&self) -> kopiur_kopia::CreateOptions {
         self.create_options.to_kopia()
+    }
+}
+
+/// How aggressively the bootstrap mover's connect-to-existing self-heal (see
+/// [`maintenance_restamp_target`]) may re-stamp a stale kopia maintenance
+/// owner. Closed enum — a new policy cannot compile until every caller
+/// accounts for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestampPolicy {
+    /// Re-stamp whenever the recorded owner differs from the desired one — the
+    /// pre-M6 behavior. Safe for a repository with no cluster dimension: at
+    /// most one cluster's operator ever bootstraps it, so any stale owner is
+    /// either the ephemeral pod identity kopia auto-assigned on create, or an
+    /// older-format stamp from THIS SAME operator — never another cluster's.
+    #[default]
+    AnyStale,
+    /// Re-stamp ONLY when the recorded owner is empty, already the desired
+    /// owner, or matches one of [`BootstrapRepositoryOp::maintenance_owner_aliases`]
+    /// — i.e. never clobber a foreign or unrecognized owner. Required once a
+    /// repository has a cluster dimension (`identityDefaults.cluster` set): with
+    /// `AnyStale`, every cluster restamping on every connect would each see the
+    /// OTHER'S owner as "stale" and re-claim it — an infinite ping-pong on a
+    /// shared repo. The tradeoff: an ancient/ephemeral owner this operator has
+    /// never seen before is left alone rather than auto-clobbered, needing a
+    /// one-time `ownership.takeoverPolicy: Force` — auto-clobber is exactly the
+    /// behavior that is unsafe once more than one cluster can reach this repo.
+    OwnFormatsOnly,
+}
+
+/// Decide whether the bootstrap mover should re-stamp the stable maintenance
+/// owner on a *connect-to-existing* repository. Returns `Some(owner)` to stamp,
+/// or `None` to leave the recorded owner alone.
+///
+/// `created` is `true` only for a repository this bootstrap run just CREATED —
+/// its owner was already stamped unconditionally at create time, so this
+/// self-heal never fires there (see the mover's create-path stamp).
+///
+/// Exhaustive over [`RestampPolicy`]:
+/// * [`RestampPolicy::AnyStale`] — restamp whenever `current != desired`
+///   (unconditional on a connect-to-existing; the pre-M6 rule).
+/// * [`RestampPolicy::OwnFormatsOnly`] — the same staleness check, AND ONLY
+///   when `current` is empty, or recognized as one of `aliases` (never a
+///   foreign or unrecognized owner — including an ancient ephemeral one, which
+///   needs a one-time `takeoverPolicy: Force` to move under this policy; see
+///   the variant's doc for why auto-clobber is unsafe here).
+///
+/// Pulled out so the gate is unit-testable without spawning kopia, and shared
+/// (via [`kopiur_mover::workspec`]) with the controller's in-process
+/// (bare-path filesystem) restamp, which needs the identical decision.
+pub fn maintenance_restamp_target<'a>(
+    created: bool,
+    desired: Option<&'a str>,
+    policy: RestampPolicy,
+    aliases: &[String],
+    current: &str,
+) -> Option<&'a str> {
+    let owner = desired?;
+    if created || current == owner {
+        return None;
+    }
+    match policy {
+        RestampPolicy::AnyStale => Some(owner),
+        RestampPolicy::OwnFormatsOnly => {
+            if current.is_empty() || aliases.iter().any(|a| a == current) {
+                Some(owner)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -609,6 +743,12 @@ pub struct MaintenanceOp {
     /// This `Maintenance`'s configured lease holder identity
     /// (`spec.ownership.owner`); compared against the repo's current holder.
     pub owner: String,
+    /// Previous lease strings still recognized as SELF
+    /// (`spec.ownership.ownerAliases`, M6 migration path) — see
+    /// [`kopiur_api::maintenance::lease_held_by_other`]. Absent on old work
+    /// specs (serde default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_aliases: Vec<String>,
     /// What to do if the lease is held by a *different* owner. ADR §3.7.
     #[serde(default)]
     pub takeover_policy: kopiur_api::TakeoverPolicy,
@@ -642,6 +782,37 @@ pub struct SnapshotPinOp {
 /// (ADR-0005 §13(c)). A stable name so add/remove target the same pin and so the
 /// pin is recognizable in `kopia snapshot list` output.
 pub const KOPIUR_PIN_NAME: &str = "kopiur-retain";
+
+/// The value the mover pins every one of kopia's six retention `--keep-*`
+/// fields to, at the identity scope, before the first `snapshot create` on
+/// that identity (M0b, confirmed data-loss bug).
+///
+/// kopia's `snapshot create` unconditionally applies the *source's* retention
+/// policy after every create — even under `--override-source`
+/// (`policy.ApplyRetentionPolicy(ctx, rep, sourceInfo, true)`,
+/// `cli/command_snapshot_create.go`) — and with no policy set, kopia's OWN
+/// defaults apply (keep-latest 10, hourly 48, daily 7, weekly 4, monthly 24,
+/// annual 3; `snapshot/policy/retention_policy.go`). `snapshot/policy/expire.go`
+/// then deletes any manifest with no retention reason and no pin. So any
+/// `SnapshotPolicy.spec.retention` window wider than kopia's defaults (e.g.
+/// `keepDaily: 30`) has kopia silently deleting manifests that Succeeded
+/// `Snapshot` CRs still reference — surfacing only at restore.
+///
+/// Kopiur's design is that CR-driven GFS (`SnapshotPolicy.spec.retention`,
+/// enforced by pruning `Snapshot` CRs) is the SOLE deleter. Pinning every
+/// `--keep-*` field to this value at the identity scope (the path scope
+/// inherits it when unset there) makes kopia's own create-time retention
+/// effectively a no-op, restoring that invariant. This is NOT
+/// user-configurable — kopia-side retention stays forbidden
+/// (`crates/api/src/error.rs`'s `InlineRetentionForbidden`) — so it is
+/// hardcoded here rather than exposed on `PolicyArgsSpec`/any CRD.
+///
+/// The value itself is kopia's largest safely round-tripping retention count:
+/// its policy fields are a Go `int` (`policy.OptionalInt`), and `i32::MAX` is
+/// the conventional "no effective limit" sentinel for a flag of this shape —
+/// comfortably larger than any real backup history, while avoiding the
+/// overflow risk of reaching for an unbounded value on a numeric CLI flag.
+pub const KOPIA_KEEP_MAX: i64 = i32::MAX as i64; // 2_147_483_647
 
 /// Which verification tier to run (ADR-0005 §4). Externally-tagged on the wire so
 /// it round-trips as `{ "quick": {} }` / `{ "deep": {...} }` and a new tier cannot

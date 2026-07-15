@@ -1140,6 +1140,7 @@ fn repository_inline_retention_hook_passes_today() {
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: None,
         on_namespace_delete: Default::default(),
@@ -1430,6 +1431,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: m,
         on_namespace_delete: Default::default(),
@@ -1540,7 +1542,7 @@ fn cluster_repository_rejects_all_false() {
 #[test]
 fn cluster_repository_rejects_bad_identity_expr() {
     use crate::backend::{Backend, FilesystemBackend};
-    use crate::cluster_repository::IdentityDefaults;
+    use crate::common::IdentityDefaults;
     use crate::common::{Encryption, SecretKeyRef};
     let spec = ClusterRepositorySpec {
         backend: Backend::Filesystem(FilesystemBackend {
@@ -1563,6 +1565,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         allowed_namespaces: AllowedNamespaces::All(true),
         // `namspace` is an out-of-scope typo → rejected at admission (ADR-0004 §5).
         identity_defaults: Some(IdentityDefaults {
+            cluster: None,
             hostname_expr: Some("namspace".into()),
             username_expr: None,
         }),
@@ -1614,6 +1617,7 @@ fn repo_spec_create(
         mover_defaults: None,
         schedule_defaults: None,
         catalog: None,
+        identity_defaults: None,
         server: None,
         maintenance: None,
         on_namespace_delete: Default::default(),
@@ -2190,6 +2194,326 @@ catalog:
         errs.iter()
             .any(|e| e.to_string().contains("catalog.refreshInterval")),
         "{errs:?}"
+    );
+}
+
+// --- catalog.foreignSnapshots × identityDefaults.cluster ---
+
+#[test]
+fn foreign_snapshots_fallback_requires_fallback_namespace() {
+    // (b) Fallback with no fallbackNamespace ⇒ rejected.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Fallback" }));
+    let errs = validate_catalog_bounds(&c, true);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("catalog.foreignSnapshots")
+                && e.to_string().contains("fallbackNamespace")),
+        "{errs:?}"
+    );
+
+    // Fallback + fallbackNamespace set ⇒ accepted by validate_catalog_bounds
+    // (the cluster-identity coupling is a separate rule, tested below).
+    let c = catalog(serde_json::json!({
+        "foreignSnapshots": "Fallback",
+        "fallbackNamespace": "backups",
+    }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+
+    // Ignore never needs a fallbackNamespace.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Ignore" }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_fallback_is_cluster_repository_only() {
+    // (c) Fallback on a namespaced Repository (cluster_scoped: false) is
+    // rejected, mirroring the fallbackNamespace-is-ClusterRepository-only
+    // message (its-own-namespace wording).
+    let c = catalog(serde_json::json!({
+        "foreignSnapshots": "Fallback",
+        "fallbackNamespace": "backups",
+    }));
+    assert!(validate_catalog_bounds(&c, true).is_empty());
+
+    let errs = validate_catalog_bounds(&c, false);
+    let msg = errs
+        .iter()
+        .map(|e| e.to_string())
+        .find(|m| m.contains("catalog.foreignSnapshots"))
+        .unwrap_or_else(|| panic!("expected a foreignSnapshots error: {errs:?}"));
+    assert!(msg.contains("its own namespace"), "{msg}");
+    assert!(msg.contains("Ignore or omit"), "{msg}");
+
+    // Ignore is fine on a namespaced Repository.
+    let c = catalog(serde_json::json!({ "foreignSnapshots": "Ignore" }));
+    assert!(validate_catalog_bounds(&c, false).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_unknown_variant_is_rejected() {
+    let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
+    assert!(
+        serde_json::from_value::<crate::common::CatalogBounds>(value).is_err(),
+        "an unknown foreignSnapshots variant must be rejected"
+    );
+}
+
+#[test]
+fn foreign_snapshots_requires_a_cluster_identity_on_both_kinds() {
+    // (a) foreignSnapshots set + no cluster identity ⇒ rejected on BOTH kinds,
+    // with a kind-neutral message (never claims a field doesn't exist).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        None,
+    );
+    assert_eq!(errs.len(), 1);
+    assert!(matches!(
+        errs[0],
+        ValidationError::ForeignSnapshotsRequiresCluster
+    ));
+    let msg = errs[0].to_string();
+    assert!(
+        msg.contains("requires a cluster identity (`identityDefaults.cluster`)"),
+        "{msg}"
+    );
+
+    // Empty-string cluster behaves like unset (matches classify_hostname's own rule).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        Some(""),
+    );
+    assert_eq!(errs.len(), 1);
+
+    // A real cluster identity clears rule (a) (and there's no fallbackNamespace, so (d) is inert).
+    let errs = validate_foreign_snapshots_cluster_coupling(
+        Some(&catalog(
+            serde_json::json!({ "foreignSnapshots": "Ignore" }),
+        )),
+        Some("east"),
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+
+    // No catalog at all ⇒ nothing to validate.
+    assert!(validate_foreign_snapshots_cluster_coupling(None, None).is_empty());
+    assert!(validate_foreign_snapshots_cluster_coupling(None, Some("east")).is_empty());
+}
+
+#[test]
+fn foreign_snapshots_choice_required_when_cluster_and_fallback_namespace_both_set() {
+    // (d) cluster + fallbackNamespace set but foreignSnapshots ABSENT ⇒ rejected.
+    let c = catalog(serde_json::json!({ "fallbackNamespace": "backups" }));
+    let errs = validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east"));
+    assert_eq!(errs.len(), 1);
+    assert!(matches!(
+        errs[0],
+        ValidationError::ForeignSnapshotsChoiceRequired
+    ));
+
+    // Explicit Ignore accepted.
+    let c = catalog(serde_json::json!({
+        "fallbackNamespace": "backups",
+        "foreignSnapshots": "Ignore",
+    }));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+
+    // Explicit Fallback accepted.
+    let c = catalog(serde_json::json!({
+        "fallbackNamespace": "backups",
+        "foreignSnapshots": "Fallback",
+    }));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+
+    // No fallbackNamespace ⇒ rule (d) does not apply even with a cluster identity.
+    let c = catalog(serde_json::json!({}));
+    assert!(validate_foreign_snapshots_cluster_coupling(Some(&c), Some("east")).is_empty());
+}
+
+#[test]
+fn repository_validators_route_foreign_snapshots_cluster_coupling() {
+    // The aggregate validators must actually call
+    // validate_foreign_snapshots_cluster_coupling, or the webhook silently
+    // admits what the docs forbid.
+
+    // A namespaced Repository with no identityDefaults set — any
+    // foreignSnapshots is rejected via the generic, kind-neutral message.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // M5: a namespaced Repository WITH identityDefaults.cluster set — Ignore is
+    // now legal, exactly like a ClusterRepository with a cluster identity.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // A ClusterRepository with no identityDefaults.cluster: same rejection.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // With identityDefaults.cluster set, foreignSnapshots is legal.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Ignore
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+
+    // Cluster + fallbackNamespace set but foreignSnapshots absent ⇒ (d) fires
+    // through the aggregate validator too.
+    let crepo: ClusterRepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+    namespace: kopiur-system
+allowedNamespaces:
+  all: true
+identityDefaults:
+  cluster: east
+catalog:
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_cluster_repository(&crepo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsChoiceRequired)),
+        "{errs:?}"
+    );
+
+    // Fallback on a namespaced Repository: rejected both by rule (a) (no
+    // cluster identity at all) AND rule (c) (Fallback is ClusterRepository-only).
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+catalog:
+  foreignSnapshots: Fallback
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("its own namespace")),
+        "{errs:?}"
+    );
+
+    // M5: Fallback on a namespaced Repository WITH a cluster identity set — rule
+    // (a) no longer fires (there IS a cluster identity now), but rule (c)
+    // (Fallback is ClusterRepository-only) still rejects it. Unchanged by M5.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: east
+catalog:
+  foreignSnapshots: Fallback
+  fallbackNamespace: backups
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForeignSnapshotsRequiresCluster)),
+        "rule (a) must not fire once a cluster identity is set: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("its own namespace")),
+        "rule (c) must still reject Fallback on a namespaced Repository: {errs:?}"
     );
 }
 
@@ -3094,6 +3418,159 @@ fn source_path_is_lenient_but_rejects_empty_and_control() {
     assert!(validate_source_path("f", "/data\nx").is_err());
 }
 
+// --- validate_cluster_name (identityDefaults.cluster, M1) ---
+
+#[test]
+fn cluster_name_accepts_valid_labels() {
+    for v in [
+        "east",
+        "east-prod",
+        "a",
+        "a1",
+        &"a".repeat(CLUSTER_NAME_MAX_LEN),
+    ] {
+        assert!(validate_cluster_name(v).is_ok(), "{v:?} should be accepted");
+    }
+    assert_eq!(CLUSTER_NAME_MAX_LEN, 32, "table below assumes this bound");
+}
+
+#[test]
+fn cluster_name_rejects_over_length() {
+    let too_long = "a".repeat(CLUSTER_NAME_MAX_LEN + 1);
+    let err = validate_cluster_name(&too_long).unwrap_err();
+    assert!(
+        matches!(err, ValidationError::ClusterNameInvalid { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn cluster_name_rejects_empty() {
+    let err = validate_cluster_name("").unwrap_err();
+    assert!(matches!(err, ValidationError::ClusterNameInvalid { .. }));
+}
+
+#[test]
+fn cluster_name_rejects_uppercase() {
+    let err = validate_cluster_name("East").unwrap_err();
+    assert!(matches!(err, ValidationError::ClusterNameInvalid { .. }));
+}
+
+#[test]
+fn cluster_name_rejects_leading_and_trailing_dash() {
+    for v in ["-east", "east-"] {
+        let err = validate_cluster_name(v).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::ClusterNameInvalid { .. }),
+            "{v:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn cluster_name_rejects_dot_with_delimiter_message() {
+    // The "no dots" message must explain the FIRST-dot-is-the-delimiter rule,
+    // since that's what makes a dotted cluster name dangerous (classify_hostname
+    // would silently disagree with intent rather than error).
+    let err = validate_cluster_name("ea.st").unwrap_err();
+    match &err {
+        ValidationError::ClusterNameInvalid { reason, .. } => {
+            assert!(
+                reason.contains("delimiter"),
+                "message should explain the namespace/cluster delimiter rule: {reason}"
+            );
+        }
+        other => panic!("expected ClusterNameInvalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn cluster_repository_rejects_bad_cluster_name() {
+    use crate::backend::{Backend, FilesystemBackend};
+    use crate::common::IdentityDefaults;
+    use crate::common::{Encryption, SecretKeyRef};
+    let spec = ClusterRepositorySpec {
+        backend: Backend::Filesystem(FilesystemBackend {
+            path: "/r".into(),
+            volume: None,
+        }),
+        encryption: Encryption {
+            password_secret_ref: SecretKeyRef {
+                name: "s".into(),
+                namespace: Some("kopia-system".into()),
+                key: None,
+            },
+        },
+        create: None,
+        bootstrap: None,
+        mover_defaults: None,
+        schedule_defaults: None,
+        catalog: None,
+        server: None,
+        allowed_namespaces: AllowedNamespaces::All(true),
+        identity_defaults: Some(IdentityDefaults {
+            cluster: Some("East".into()), // uppercase — invalid RFC 1123 label
+            hostname_expr: None,
+            username_expr: None,
+        }),
+        maintenance: None,
+        on_namespace_delete: Default::default(),
+        mode: Default::default(),
+        suspend: false,
+        health: None,
+        credential_projection: None,
+    };
+    let errs = validate_cluster_repository(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterNameInvalid { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn repository_rejects_bad_cluster_name() {
+    // M5: `RepositorySpec.identityDefaults.cluster` is validated exactly like
+    // `ClusterRepositorySpec`'s field of the same name.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  filesystem:
+    path: /repo
+encryption:
+  passwordSecretRef:
+    name: creds
+identityDefaults:
+  cluster: East
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterNameInvalid { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn repository_rejects_bad_identity_expr() {
+    // M5: `RepositorySpec.identityDefaults.{hostnameExpr,usernameExpr}` are
+    // validated exactly like `ClusterRepositorySpec`'s fields of the same name.
+    // `namspace` is an out-of-scope typo → rejected at admission (ADR-0004 §5),
+    // mirroring `cluster_repository_rejects_bad_identity_expr`.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        "backend: { filesystem: { path: /repo } }\n\
+         encryption: { passwordSecretRef: { name: creds } }\n\
+         identityDefaults:\n  hostnameExpr: namspace\n",
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::IdentityExprEval { .. })),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn backup_config_rejects_bad_identity_override_and_path() {
     let mut spec: SnapshotPolicySpec = crate::testutil::from_yaml(
@@ -3146,6 +3623,80 @@ fn source_path_fork_matches_by_pvc_name() {
     assert!(detect_source_path_fork(&old, &new, false, false).is_none());
     // Same effective path (both default) → allowed.
     assert!(detect_source_path_fork(&mk(None), &mk(None), true, false).is_none());
+}
+
+// --- repository identityDefaults edit guard ---
+
+#[test]
+fn repository_identity_change_decision_table() {
+    use crate::common::IdentityDefaults;
+
+    let east = IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: None,
+        username_expr: None,
+    };
+    let west = IdentityDefaults {
+        cluster: Some("west".into()),
+        hostname_expr: None,
+        username_expr: None,
+    };
+    let consumers = vec!["billing/pg".to_string()];
+
+    // No change ⇒ None, regardless of consumers/ack.
+    assert!(
+        detect_repository_identity_change(Some(&east), Some(&east), false, &consumers).is_none()
+    );
+    assert!(detect_repository_identity_change(None, None, false, &consumers).is_none());
+
+    // Change + no consumers with history ⇒ None (nothing to orphan).
+    assert!(detect_repository_identity_change(Some(&east), Some(&west), false, &[]).is_none());
+
+    // Change + consumers + not acked ⇒ Some, naming the consumer.
+    let err = detect_repository_identity_change(Some(&east), Some(&west), false, &consumers);
+    assert!(
+        matches!(&err, Some(ValidationError::RepositoryIdentityWouldFork { consumers: c }) if c == &consumers),
+        "{err:?}"
+    );
+
+    // Acked ⇒ None even with consumers.
+    assert!(
+        detect_repository_identity_change(Some(&east), Some(&west), true, &consumers).is_none()
+    );
+
+    // Going from `None` (no identityDefaults at all) to `Some` is a change too.
+    assert!(detect_repository_identity_change(None, Some(&west), false, &consumers).is_some());
+
+    // Each of cluster/hostnameExpr/usernameExpr individually triggers.
+    let base = IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: Some("namespace".into()),
+        username_expr: Some("'svc'".into()),
+    };
+    let cluster_changed = IdentityDefaults {
+        cluster: Some("west".into()),
+        ..base.clone()
+    };
+    let hostname_changed = IdentityDefaults {
+        hostname_expr: Some("namespace + '.' + cluster".into()),
+        ..base.clone()
+    };
+    let username_changed = IdentityDefaults {
+        username_expr: Some("'other'".into()),
+        ..base.clone()
+    };
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&cluster_changed), false, &consumers)
+            .is_some()
+    );
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&hostname_changed), false, &consumers)
+            .is_some()
+    );
+    assert!(
+        detect_repository_identity_change(Some(&base), Some(&username_changed), false, &consumers)
+            .is_some()
+    );
 }
 
 // --- validate_access_modes (shared: staging + restore target) ---
@@ -3338,4 +3889,50 @@ fn restore_pvc_target_rejects_unknown_and_rwop_combo_access_modes() {
         access_modes: vec![M::ReadOnlyMany],
     });
     assert!(validate_restore(&spec).is_ok());
+}
+
+/// M6: each `ownership.ownerAliases` entry gets the kopia identity shape rule
+/// (it becomes an identity hostname via `kopia_lease_identity`); `owner`
+/// itself is deliberately NOT tightened (stored pre-M6 CRs may carry strings
+/// the lease sanitizer already handles — a new rejection would hard-stop a
+/// working Maintenance on its next defensive re-validation).
+#[test]
+fn maintenance_owner_aliases_are_shape_validated_but_owner_is_not_tightened() {
+    use crate::maintenance::{MaintenanceSpec, Ownership};
+
+    let spec = |owner: &str, aliases: Vec<String>| MaintenanceSpec {
+        repository: repo_ref(RepositoryKind::Repository, None),
+        schedule: crate::maintenance::default_maintenance_schedule(),
+        ownership: Ownership {
+            owner: owner.into(),
+            owner_aliases: aliases,
+            takeover_policy: Default::default(),
+        },
+        mover: None,
+        failure_policy: None,
+        credential_projection: None,
+    };
+
+    // Well-formed aliases (lease strings) pass.
+    assert!(
+        validate_maintenance(&spec(
+            "kopiur/east/prod/nas",
+            vec!["kopiur/prod/nas".into()]
+        ))
+        .is_empty()
+    );
+
+    // An alias with an identity delimiter is rejected, naming the entry.
+    let errs = validate_maintenance(&spec(
+        "kopiur/east/prod/nas",
+        vec!["kopiur/prod/nas".into(), "bad@alias".into()],
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let msg = errs[0].to_string();
+    assert!(msg.contains("ownerAliases[1]"), "{msg}");
+    assert!(msg.contains('@'), "{msg}");
+
+    // A legacy hand-authored owner with an '@' is still accepted (no stored-CR
+    // regression) — the lease sanitizer collapses it safely at run time.
+    assert!(validate_maintenance(&spec("admin@legacy-host", Vec::new())).is_empty());
 }

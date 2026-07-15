@@ -7,6 +7,20 @@ namespace, a migration changes the app's _coordinate_: a new namespace
 
 That coordinate change is the catch.
 
+/// note | Moving an app vs. running it in several clusters at once
+
+This page is a one-time **move**: the app runs in exactly one place at a time,
+before and after — the destination takes over the original identity and the
+source is decommissioned (below). If you instead want **several clusters
+backing up to the same repository at the same time** — active-active, or a
+warm DR standby — that's a different, supported shape:
+[Share one repository across clusters](shared-repository-multi-cluster.md)
+uses `identityDefaults.cluster` so each cluster writes under its own distinct
+identity and never collides, which is exactly what this page's
+continue-the-lineage approach forbids (see the danger box below).
+
+///
+
 /// warning | Why you can't just use `fromPolicy` in the destination
 
 kopia stores each snapshot under `username@hostname:path`, and **`hostname`
@@ -50,8 +64,18 @@ snapshots **extend the original timeline** or **start a fresh one**:
 
 If you pin the destination to the original identity, **decommission the source
 first.** Two clusters writing the _same_ `username@hostname:path` concurrently
-corrupt the snapshot timeline. Pin-to-original means "the app lives _here_ now,"
-not "the app runs in both places."
+corrupt the snapshot timeline — kopia has no cross-cluster write coordination of
+its own. Pin-to-original means "the app lives _here_ now," not "the app runs in
+both places."
+
+If you actually want two (or more) clusters writing to this repository **at the
+same time**, don't reach for a shared identity — set
+[`identityDefaults.cluster`](../repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters)
+on the repository instead, so each cluster gets its own distinct
+`<namespace>.<cluster>` identity and never collides. See
+[Share one repository across clusters](shared-repository-multi-cluster.md) for
+that supported shape, including the safe order of operations to turn it on for
+a repository already in production.
 
 ///
 
@@ -89,5 +113,6 @@ status, or `kopia snapshot list` against the repo. For a PVC source it's
 ## See also
 
 - [Restores → `identity` source](../restores.md#identity--a-raw-kopia-identity) — the raw-identity restore mode.
-- [Backups → identity](../backups.md#identity--what-kopia-records-usernamehostnamepath) — how the default identity is computed and pinned.
+- [Backups → identity](../backups.md#identity--what-kopia-records-usernamehostnamepath) — how identity is resolved and the fork guards that protect existing history.
 - [Scenario 05 — adopt an existing repo](adopt-existing-repo.md) — a close cousin when the "source" is foreign tooling rather than another Kopiur cluster.
+- [Share one repository across clusters](shared-repository-multi-cluster.md) — the active-active/standby shape this page's danger box points at, instead of a one-time move.

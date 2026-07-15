@@ -331,7 +331,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
+/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -370,6 +370,35 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, false));
     }
+    // Identity CEL expressions must compile + trial-evaluate to a string at admission
+    // (ADR-0004 §5), so a typo / out-of-scope variable is rejected on `kubectl apply`.
+    // Mirrors `validate_cluster_repository`'s identical block.
+    if let Some(id) = &spec.identity_defaults {
+        if let Some(expr) = &id.hostname_expr
+            && let Err(e) = crate::identity::validate_identity_expr(expr)
+        {
+            errs.push(e);
+        }
+        if let Some(expr) = &id.username_expr
+            && let Err(e) = crate::identity::validate_identity_expr(expr)
+        {
+            errs.push(e);
+        }
+        // `cluster` becomes part of the default hostname (`<namespace>.<cluster>`)
+        // and `classify_hostname` splits on the first `.`, so it must be a clean
+        // RFC 1123 label with no dot of its own (M1/M5).
+        if let Some(cluster) = &id.cluster
+            && let Err(e) = validate_cluster_name(cluster)
+        {
+            errs.push(e);
+        }
+    }
+    errs.extend(validate_foreign_snapshots_cluster_coupling(
+        spec.catalog.as_ref(),
+        spec.identity_defaults
+            .as_ref()
+            .and_then(|id| id.cluster.as_deref()),
+    ));
     if let Some(md) = &spec.mover_defaults
         && let Some(res) = &md.resources
         && let Err(e) = validate_resources(res, "Repository moverDefaults")
@@ -514,6 +543,59 @@ pub fn validate_catalog_bounds(
                 .to_string(),
         });
     }
+    // `foreignSnapshots: Fallback` needs somewhere to land, and only a
+    // ClusterRepository can place discovered Snapshots outside their own
+    // namespace — mirrors the fallbackNamespace rule directly above.
+    if matches!(
+        catalog.foreign_snapshots,
+        Some(crate::common::ForeignSnapshots::Fallback)
+    ) {
+        if catalog.fallback_namespace.is_none() {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: "catalog.foreignSnapshots".to_string(),
+                reason: "Fallback requires catalog.fallbackNamespace to be set (there is \
+                         nowhere to materialize a foreign snapshot otherwise); set \
+                         fallbackNamespace, or use Ignore"
+                    .to_string(),
+            });
+        }
+        if !cluster_scoped {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: "catalog.foreignSnapshots".to_string(),
+                reason: "Fallback is only meaningful on a ClusterRepository; a namespaced \
+                         Repository already materializes into its own namespace; use Ignore or \
+                         omit"
+                    .to_string(),
+            });
+        }
+    }
+    errs
+}
+
+/// The `identityDefaults.cluster` × `catalog.foreignSnapshots` cross-field
+/// rules (multi-cluster shared-repo): classifying a snapshot as another
+/// cluster's is undecidable without a cluster identity (a), and adopting one
+/// must never silently switch off an already-configured fallback collector
+/// (d). Shared by both repository kinds — `cluster` is the resolved
+/// `identityDefaults.cluster` value, `None` when the repository has no cluster
+/// identity set (or, on a namespaced `Repository`, no `identityDefaults` set at
+/// all). Without a cluster, rule (d) is a no-op (it requires one to fire) while
+/// rule (a) still rejects any `foreignSnapshots` set there.
+pub fn validate_foreign_snapshots_cluster_coupling(
+    catalog: Option<&crate::common::CatalogBounds>,
+    cluster: Option<&str>,
+) -> Vec<ValidationError> {
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    let mut errs = Vec::new();
+    let has_cluster = cluster.is_some_and(|c| !c.is_empty());
+    if catalog.foreign_snapshots.is_some() && !has_cluster {
+        errs.push(ValidationError::ForeignSnapshotsRequiresCluster);
+    }
+    if has_cluster && catalog.fallback_namespace.is_some() && catalog.foreign_snapshots.is_none() {
+        errs.push(ValidationError::ForeignSnapshotsChoiceRequired);
+    }
     errs
 }
 
@@ -625,6 +707,20 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
     if let Err(e) = validate_repository_ref(&spec.repository) {
         errs.push(e);
     }
+    // `ownership.ownerAliases` become kopia identity components once run
+    // through `kopia_lease_identity` (M6), so each alias gets the identity
+    // shape rule — the same validator the resolved hostname/username go
+    // through. `owner` itself is deliberately NOT tightened here: it predates
+    // this rule, stored CRs may carry arbitrary strings the lease sanitizer
+    // already handles, and the controller re-validates defensively on every
+    // reconcile — a new rejection would hard-stop a working Maintenance.
+    // Aliases are new with this rule, so no stored object can regress.
+    for (i, alias) in spec.ownership.owner_aliases.iter().enumerate() {
+        if let Err(e) = validate_identity_component(&format!("ownership.ownerAliases[{i}]"), alias)
+        {
+            errs.push(e);
+        }
+    }
     if let Err(e) = validate_cron(&spec.schedule.quick.cron) {
         errs.push(e);
     }
@@ -690,10 +786,24 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         {
             errs.push(e);
         }
+        // `cluster` becomes part of the default hostname (`<namespace>.<cluster>`)
+        // and `classify_hostname` splits on the first `.`, so it must be a clean
+        // RFC 1123 label with no dot of its own (M1).
+        if let Some(cluster) = &id.cluster
+            && let Err(e) = validate_cluster_name(cluster)
+        {
+            errs.push(e);
+        }
     }
     if let Some(c) = &spec.catalog {
         errs.extend(validate_catalog_bounds(c, true));
     }
+    errs.extend(validate_foreign_snapshots_cluster_coupling(
+        spec.catalog.as_ref(),
+        spec.identity_defaults
+            .as_ref()
+            .and_then(|id| id.cluster.as_deref()),
+    ));
     if let Some(md) = &spec.mover_defaults
         && let Some(res) = &md.resources
         && let Err(e) = validate_resources(res, "ClusterRepository moverDefaults")

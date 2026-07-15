@@ -28,6 +28,30 @@
 //!   stale row is expired. Skipped when the listing was truncated (absence is
 //!   unknowable from a partial list).
 //!
+//! ## Identity-aware placement (multi-cluster shared repo)
+//!
+//! When a repository's `identityDefaults.cluster` is set (M1: [`kopiur_api::classify_hostname`]/
+//! [`kopiur_api::HostClass`]), a scan runs ONE placement pass over the FULL listing
+//! BEFORE [`plan_catalog`] ([`plan_placements`]): every distinct hostname is classified
+//! `Bare`/`OwnCluster`/`ForeignCluster` and decided [`Place`](PlacementDecision::Place)/
+//! [`Unplaced`](PlacementDecision::Unplaced)/[`ForeignIgnored`](PlacementDecision::ForeignIgnored)
+//! ([`decide_cluster_placement`]/[`decide_namespace_placement`], pure). Entries decided
+//! `ForeignIgnored` are fed to `plan_catalog` exactly like `produced_ids` — filtered in
+//! the same `eligible` chain spot, so they never consume a `retain.perIdentity` slot,
+//! and any PRE-EXISTING discovered row for one expires via the ordinary absence
+//! mechanics once it's no longer eligible. Without a cluster identity, every hostname
+//! classifies `Bare` and this pass is byte-identical to the pre-M4 per-entry placement
+//! (proven by fixture tests). `spec.catalog.foreignSnapshots` (M3:
+//! [`ForeignSnapshots`]/[`CatalogBounds::effective_foreign_snapshots`]) decides what
+//! happens to a `ForeignCluster`-classified entry: `Ignore` (default) drops it,
+//! `Fallback` materializes it into `catalog.fallbackNamespace` like any other entry.
+//! The mover's `BootstrapRepository` op additionally pre-filters `ForeignCluster`
+//! entries BEFORE its own `MAX_RETURNED_SNAPSHOTS` cap when cluster mode is on and the
+//! effective policy is `Ignore` (`catalog_foreign_prefilter_cluster`); this pass still
+//! sees (and must still ignore) any **bare**-hostname foreign entries, which the mover
+//! cannot pre-filter (classifying them needs a namespace lookup only the controller
+//! can do).
+//!
 //! ## Refresh cadence
 //!
 //! An **initial** scan always runs — on first bootstrap and again on any spec
@@ -52,9 +76,9 @@ use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, ListParams};
 
 use kopiur_api::cluster_repository::AllowedNamespaces;
-use kopiur_api::common::{CatalogBounds, CatalogRetain, RepositoryKind};
+use kopiur_api::common::{CatalogBounds, CatalogRetain, ForeignSnapshots, RepositoryKind};
 use kopiur_api::snapshot::repository_ref_for;
-use kopiur_api::{Snapshot, validate};
+use kopiur_api::{HostClass, Snapshot, classify_hostname, validate};
 use kopiur_kopia::{SnapshotListEntry, SnapshotSource};
 
 use crate::consts::{ORIGIN_LABEL, REPOSITORY_UID_LABEL, SNAPSHOT_ID_LABEL};
@@ -249,16 +273,25 @@ pub struct CatalogPlan<'a> {
 }
 
 /// Decide creations and expiries. Pure — see the module docs for the rules.
+///
+/// `foreign_ignored_ids` (M4, multi-cluster shared repo: [`plan_placements`]'s
+/// [`PlacementPass::foreign_ignored_ids`]) is filtered in the exact same spot as
+/// `produced_ids`: a `ForeignIgnored`-decided entry is never eligible, so it never
+/// consumes a `retain.perIdentity` slot, and — because it still appears in `listing`
+/// (only `eligible` excludes it, not `listing`/`listed`) — any PRE-EXISTING discovered
+/// row for it expires via the ordinary absence-expiry rule below, on the exact same
+/// terms as any other row (safe under truncation once the entry is physically seen).
 pub fn plan_catalog<'a>(
     rows: &[CatalogRow],
     produced_ids: &BTreeSet<String>,
+    foreign_ignored_ids: &BTreeSet<String>,
     listing: &'a [SnapshotListEntry],
     listing_truncated: bool,
     retain: Option<&CatalogRetain>,
     now: DateTime<Utc>,
 ) -> CatalogPlan<'a> {
-    // Eligible = in the listing, not produced by this repository CR, within the
-    // age bound.
+    // Eligible = in the listing, not produced by this repository CR, not decided
+    // ForeignIgnored by the placement pass, within the age bound.
     let max_age = retain
         .and_then(|r| r.max_age_days)
         .filter(|d| *d >= 1)
@@ -266,6 +299,7 @@ pub fn plan_catalog<'a>(
     let eligible = listing
         .iter()
         .filter(|e| !produced_ids.contains(&e.id))
+        .filter(|e| !foreign_ignored_ids.contains(&e.id))
         .filter(|e| max_age.is_none_or(|a| e.end_time + a > now));
 
     // Keep-set: the most-recent `perIdentity` eligible entries per identity.
@@ -434,6 +468,235 @@ pub enum Placement<'a> {
     },
 }
 
+/// Where the identity-aware placement pass ([`plan_placements`]) landed one
+/// hostname, for the materialize loop in [`scan`] to consult (it no longer does
+/// its own placement IO).
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlacementDecision {
+    /// Materialize into this namespace.
+    Place(String),
+    /// Skip + a `DiscoveredSnapshotUnplaced` Warning event — a genuine
+    /// misconfiguration (no allowed namespace AND no fallback).
+    Unplaced,
+    /// Skip + count towards `foreign`; NEVER a Warning — expected and routine on
+    /// a repository shared across clusters.
+    ForeignIgnored,
+}
+
+/// Where a discovered snapshot lands under a `ClusterRepository`'s cross-namespace
+/// placement (ADR §2.3), extended for a repository shared across clusters: an entry
+/// another cluster wrote is either dropped (`ForeignSnapshots::Ignore`) or collected
+/// in `catalog.fallbackNamespace` (`ForeignSnapshots::Fallback`) — see
+/// [`classify_hostname`].
+///
+/// `ns_allowed`: the candidate namespace ([`HostClass::Bare`]/[`HostClass::OwnCluster`]'s
+/// `namespace`) exists AND passes `allowedNamespaces`; meaningless for
+/// [`HostClass::ForeignCluster`] (no candidate namespace to check) — callers pass
+/// `false`.
+///
+/// `cluster_mode`: whether the consuming repository actually has
+/// `identityDefaults.cluster` set. Load-bearing for [`HostClass::Bare`]:
+/// `classify_hostname` returns `Bare` BOTH when cluster identity is off (every
+/// hostname reads as legacy) AND when it's on but this particular hostname has no
+/// `.` — those two situations must not be conflated, or turning cluster identity on
+/// would silently change what happens to an already-disallowed bare host. With
+/// cluster identity OFF there is no "foreign" concept at all (the validator rejects
+/// `foreignSnapshots` in that state, so `foreign` is always the default `Ignore`
+/// here too) — a disallowed `Bare` host falls straight to fallback/unplaced exactly
+/// as [`crate::cluster_repository`]'s pre-M4 `placement_namespace` always did. With
+/// cluster identity ON, an unrecognized bare hostname is treated the same as an
+/// explicitly foreign one under `foreign` (a repository with cluster identity turned
+/// on cannot tell "a snapshot written before cluster identity existed" from
+/// "another party's" once the namespace it names isn't ours): `Ignore` skips it;
+/// `Fallback` behaves exactly like the `OwnCluster`/disallowed case below.
+///
+/// Exhaustive match, no `_ =>`.
+pub fn decide_cluster_placement(
+    class: HostClass<'_>,
+    ns_allowed: bool,
+    cluster_mode: bool,
+    foreign: ForeignSnapshots,
+    fallback: Option<&str>,
+) -> PlacementDecision {
+    fn fallback_or_unplaced(fallback: Option<&str>) -> PlacementDecision {
+        match fallback {
+            Some(f) => PlacementDecision::Place(f.to_string()),
+            None => PlacementDecision::Unplaced,
+        }
+    }
+    match class {
+        HostClass::Bare { namespace } => {
+            if ns_allowed {
+                return PlacementDecision::Place(namespace.to_string());
+            }
+            if cluster_mode && matches!(foreign, ForeignSnapshots::Ignore) {
+                return PlacementDecision::ForeignIgnored;
+            }
+            fallback_or_unplaced(fallback)
+        }
+        HostClass::OwnCluster { namespace } => {
+            if ns_allowed {
+                PlacementDecision::Place(namespace.to_string())
+            } else {
+                fallback_or_unplaced(fallback)
+            }
+        }
+        HostClass::ForeignCluster { .. } => match foreign {
+            ForeignSnapshots::Ignore => PlacementDecision::ForeignIgnored,
+            ForeignSnapshots::Fallback => fallback_or_unplaced(fallback),
+        },
+    }
+}
+
+/// Where a discovered snapshot lands under a namespaced `Repository`: always its
+/// own `namespace` for [`HostClass::Bare`]/[`HostClass::OwnCluster`] — a repository's
+/// own namespace needs no tenancy gate, unlike a `ClusterRepository`'s cross-namespace
+/// placement. [`HostClass::ForeignCluster`] is ALWAYS `ForeignIgnored`, regardless of
+/// `catalog.foreignSnapshots`: a namespaced `Repository` has no `fallbackNamespace`
+/// concept, so even a `Fallback` policy value somehow reaching here (the validator
+/// rejects that combination on a non-cluster-scoped repository; this is a defensive
+/// backstop) must never fall through to materializing a foreign entry into the repo's
+/// own namespace by accident.
+///
+/// Exhaustive match, no `_ =>`.
+pub fn decide_namespace_placement(class: HostClass<'_>, namespace: &str) -> PlacementDecision {
+    match class {
+        HostClass::Bare { .. } | HostClass::OwnCluster { .. } => {
+            PlacementDecision::Place(namespace.to_string())
+        }
+        HostClass::ForeignCluster { .. } => PlacementDecision::ForeignIgnored,
+    }
+}
+
+/// Every distinct candidate namespace name ([`HostClass::Bare`]/[`HostClass::OwnCluster`]'s
+/// `namespace`) that at least one entry in `listing` needs a tenancy-gate answer for,
+/// under `cluster`. Thin helper so [`scan`] knows exactly which (cached) `Namespace`
+/// GETs to perform; [`plan_placements`] then takes the resolved answers as a plain
+/// map, so it stays pure and unit-testable with a stub. Pure.
+pub fn candidate_namespaces<'a>(
+    listing: &'a [SnapshotListEntry],
+    cluster: Option<&str>,
+) -> BTreeSet<&'a str> {
+    listing
+        .iter()
+        .filter_map(|e| match classify_hostname(&e.source.host, cluster) {
+            HostClass::Bare { namespace } | HostClass::OwnCluster { namespace } => Some(namespace),
+            HostClass::ForeignCluster { .. } => None,
+        })
+        .collect()
+}
+
+/// Outcome of the identity-aware placement pass ([`plan_placements`]) over a FULL
+/// kopia listing — see the module docs for the pipeline this feeds into.
+#[derive(Debug, Default)]
+pub struct PlacementPass {
+    /// Per-hostname decision the materialize loop in [`scan`] consults.
+    pub decisions: BTreeMap<String, PlacementDecision>,
+    /// Kopia ids of listing entries whose host decided [`PlacementDecision::ForeignIgnored`] —
+    /// fed to [`plan_catalog`] exactly like `produced_ids`.
+    pub foreign_ignored_ids: BTreeSet<String>,
+    /// Entries this scan counted as foreign: every foreign-SUFFIXED entry, plus
+    /// bare-disallowed hosts only when they decided [`PlacementDecision::ForeignIgnored`]
+    /// (under `Fallback`, a bare-disallowed host materializes into the fallback and is
+    /// NOT counted — see the `ForeignSnapshots` doc in `common/cache.rs`, which states
+    /// the same rule). Feeds `status.catalog.foreignSnapshotCount` /
+    /// `kopiur_repo_foreign_snapshots` (plus any count the mover's prefilter already
+    /// dropped before this pass ever saw them — the caller adds that in, never
+    /// double-counted).
+    pub foreign_count: i64,
+    /// Bounded top-N (by count desc) foreign-suffix breakdown for the scan's info
+    /// log — NEVER surfaced in status (cardinality is foreign-writer-controlled).
+    /// Keyed by the [`HostClass::ForeignCluster`] suffix, or the full hostname for a
+    /// bare host treated as foreign (it carries no suffix).
+    pub foreign_suffix_counts: BTreeMap<String, i64>,
+}
+
+/// Run the identity-aware placement pass over a FULL kopia `listing`, BEFORE
+/// [`plan_catalog`] (see the module docs). Pure: `ns_allowed` is the tenancy-gate
+/// answer for every [`candidate_namespaces`] entry, ALREADY resolved by the caller
+/// (a cached `Namespace` GET + [`validate::validate_consumer_against_cluster_repo`]
+/// for [`scan`]; a stub in tests) — no IO happens here.
+pub fn plan_placements(
+    listing: &[SnapshotListEntry],
+    cluster: Option<&str>,
+    foreign: ForeignSnapshots,
+    placement: &Placement<'_>,
+    ns_allowed: &BTreeMap<String, bool>,
+) -> PlacementPass {
+    let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
+
+    // Pass 1: one decision per DISTINCT hostname (a host's classification/decision
+    // never varies across its entries within one scan).
+    let mut decisions: BTreeMap<String, PlacementDecision> = BTreeMap::new();
+    let mut foreign_suffix_by_host: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for entry in listing {
+        let host = entry.source.host.as_str();
+        if decisions.contains_key(host) {
+            continue;
+        }
+        let class = classify_hostname(host, cluster);
+        foreign_suffix_by_host.insert(
+            host.to_string(),
+            match class {
+                HostClass::ForeignCluster { suffix } => Some(suffix.to_string()),
+                HostClass::Bare { .. } | HostClass::OwnCluster { .. } => None,
+            },
+        );
+        let decision = match placement {
+            Placement::Namespace(ns) => decide_namespace_placement(class, ns),
+            Placement::Cluster { fallback, .. } => {
+                // The tenancy gate itself (`allowedNamespaces`) was already applied by
+                // the caller when it resolved `ns_allowed`; this pure pass just reads
+                // the answer for the candidate namespace `class` names.
+                let candidate_allowed = match class {
+                    HostClass::Bare { namespace } | HostClass::OwnCluster { namespace } => {
+                        ns_allowed.get(namespace).copied().unwrap_or(false)
+                    }
+                    HostClass::ForeignCluster { .. } => false,
+                };
+                decide_cluster_placement(class, candidate_allowed, cluster_mode, foreign, *fallback)
+            }
+        };
+        decisions.insert(host.to_string(), decision);
+    }
+
+    // Pass 2: per-ENTRY accounting (a host with N entries contributes N to
+    // `foreign_count`/the suffix breakdown — `status.catalog.foreignSnapshotCount`
+    // counts snapshots, not hosts).
+    let mut foreign_ignored_ids: BTreeSet<String> = BTreeSet::new();
+    let mut foreign_count: i64 = 0;
+    let mut foreign_suffix_counts: BTreeMap<String, i64> = BTreeMap::new();
+    for entry in listing {
+        let host = entry.source.host.as_str();
+        let Some(decision) = decisions.get(host) else {
+            // Invariant: pass 1 above classified every distinct host in `listing`.
+            // Never observed; defensive rather than a panic in a reconcile path.
+            tracing::error!(
+                host,
+                "no placement decision cached for a listing host (bug)"
+            );
+            continue;
+        };
+        let foreign_suffix = foreign_suffix_by_host.get(host).cloned().flatten();
+        let is_foreign = foreign_suffix.is_some() || *decision == PlacementDecision::ForeignIgnored;
+        if is_foreign {
+            foreign_count += 1;
+            let key = foreign_suffix.unwrap_or_else(|| host.to_string());
+            *foreign_suffix_counts.entry(key).or_insert(0) += 1;
+        }
+        if *decision == PlacementDecision::ForeignIgnored {
+            foreign_ignored_ids.insert(entry.id.clone());
+        }
+    }
+
+    PlacementPass {
+        decisions,
+        foreign_ignored_ids,
+        foreign_count,
+        foreign_suffix_counts,
+    }
+}
+
 /// What a [`scan`] did, for the caller's status patch / metrics / events.
 #[derive(Debug, Default)]
 pub struct ScanOutcome {
@@ -448,12 +711,23 @@ pub struct ScanOutcome {
     /// namespace and had no `fallbackNamespace` — their snapshots got no row.
     /// The caller surfaces these (Event + log) with the fix.
     pub unplaced_hosts: BTreeSet<String>,
+    /// Snapshots in this scan's listing classified as another cluster's (or a bare
+    /// host treated the same way — see [`PlacementPass::foreign_count`]). The
+    /// caller adds any count the mover's prefilter already dropped before this
+    /// scan ever saw them (never double-counted: a mover-dropped entry never
+    /// reaches this scan). The `status.catalog.foreignSnapshotCount` /
+    /// `kopiur_repo_foreign_snapshots` value.
+    pub foreign: i64,
 }
 
-/// Run a catalog scan: LIST the relevant `Snapshot` CRs, [`plan_catalog`], then
-/// create/expire rows. The caller supplies the kopia listing (in-process for
-/// bare-path filesystem, from the bootstrap Job's result for everything else)
-/// and patches its own status from the returned outcome.
+/// Run a catalog scan: LIST the relevant `Snapshot` CRs, run the identity-aware
+/// placement pass ([`plan_placements`]), [`plan_catalog`], then create/expire rows.
+/// The caller supplies the kopia listing (in-process for bare-path filesystem, from
+/// the bootstrap Job's result for everything else) and patches its own status from
+/// the returned outcome.
+///
+/// `cluster` is the consuming repository's `identityDefaults.cluster` (`Repository`
+/// or `ClusterRepository`; `None` when the repository has no cluster identity set).
 #[allow(clippy::too_many_arguments)]
 pub async fn scan(
     ctx: &Context,
@@ -461,6 +735,7 @@ pub async fn scan(
     owner_ref: OwnerReference,
     repo_uid: &str,
     placement: Placement<'_>,
+    cluster: Option<&str>,
     catalog: Option<&CatalogBounds>,
     listing: &[SnapshotListEntry],
     listing_truncated: bool,
@@ -486,56 +761,60 @@ pub async fn scan(
     let rows = rows_for(repo_uid, &all_snapshots);
     let produced_ids = produced_ids_for(owner, &all_snapshots);
 
+    // Identity-aware placement pass over the FULL listing, BEFORE plan_catalog (see
+    // the module docs): thin IO here (one cached `Namespace` GET per distinct
+    // candidate namespace, only for the `Cluster` placement kind), then the pure
+    // decision in `plan_placements`.
+    let foreign = CatalogBounds::effective_foreign_snapshots(catalog);
+    let mut ns_allowed: BTreeMap<String, bool> = BTreeMap::new();
+    if let Placement::Cluster { allowed, .. } = &placement {
+        for candidate in candidate_namespaces(listing, cluster) {
+            let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
+            let labels = ns_api
+                .get_opt(candidate)
+                .await?
+                .map(|n| n.metadata.labels.unwrap_or_default());
+            let ok = labels.as_ref().is_some_and(|l| {
+                validate::validate_consumer_against_cluster_repo(
+                    candidate,
+                    repo_name,
+                    allowed,
+                    Some(l),
+                )
+                .is_ok()
+            });
+            ns_allowed.insert(candidate.to_string(), ok);
+        }
+    }
+    let pass = plan_placements(listing, cluster, foreign, &placement, &ns_allowed);
+
     let retain = catalog.and_then(|c| c.retain.as_ref());
     let plan = plan_catalog(
         &rows,
         &produced_ids,
+        &pass.foreign_ignored_ids,
         listing,
         listing_truncated,
         retain,
         Utc::now(),
     );
 
-    let mut outcome = ScanOutcome::default();
+    let mut outcome = ScanOutcome {
+        foreign: pass.foreign_count,
+        ..Default::default()
+    };
 
-    // Resolve placement per entry (cached Namespace lookups for the cluster case),
-    // then materialize.
-    let mut ns_cache: BTreeMap<String, Option<BTreeMap<String, String>>> = BTreeMap::new();
     for entry in &plan.create {
-        let target_ns: String = match &placement {
-            Placement::Namespace(ns) => (*ns).to_string(),
-            Placement::Cluster { allowed, fallback } => {
-                let host = entry.source.host.as_str();
-                let labels = match ns_cache.get(host) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
-                        let looked_up = ns_api
-                            .get_opt(host)
-                            .await?
-                            .map(|n| n.metadata.labels.unwrap_or_default());
-                        ns_cache.insert(host.to_string(), looked_up.clone());
-                        looked_up
-                    }
-                };
-                let allowed_here = labels.as_ref().is_some_and(|l| {
-                    validate::validate_consumer_against_cluster_repo(
-                        host,
-                        repo_name,
-                        allowed,
-                        Some(l),
-                    )
-                    .is_ok()
-                });
-                match crate::cluster_repository::placement_namespace(host, allowed_here, *fallback)
-                {
-                    Some(ns) => ns.to_string(),
-                    None => {
-                        outcome.unplaced_hosts.insert(host.to_string());
-                        continue;
-                    }
-                }
+        let host = entry.source.host.as_str();
+        let target_ns = match pass.decisions.get(host) {
+            Some(PlacementDecision::Place(ns)) => ns.clone(),
+            Some(PlacementDecision::Unplaced) | None => {
+                outcome.unplaced_hosts.insert(host.to_string());
+                continue;
             }
+            // Excluded from `plan.create` via `foreign_ignored_ids` above; this arm
+            // is defensive (never actually reached).
+            Some(PlacementDecision::ForeignIgnored) => continue,
         };
         materialize_discovered(ctx, &owner_ref, &target_ns, repo_name, repo_uid, entry).await?;
         outcome.created += 1;
@@ -551,12 +830,18 @@ pub async fn scan(
     }
 
     outcome.discovered = (rows.len() as i64 - outcome.expired).max(0) + outcome.created;
-    if outcome.created > 0 || outcome.expired > 0 {
+    if outcome.created > 0 || outcome.expired > 0 || outcome.foreign > 0 {
+        // Bounded top-N (never in status: cardinality is foreign-writer-controlled).
+        let mut top: Vec<(&String, &i64)> = pass.foreign_suffix_counts.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        top.truncate(5);
         tracing::info!(
             repo = repo_name,
             created = outcome.created,
             expired = outcome.expired,
             discovered = outcome.discovered,
+            foreign = outcome.foreign,
+            foreign_top_suffixes = ?top,
             "catalog scan reconciled discovered Snapshot CRs"
         );
     }
@@ -695,7 +980,15 @@ mod tests {
             entry("bbb", ("u", "h", "/p"), t(5)),
         ];
         let rows = vec![row("r-aaa", "aaa", Some(t(10)))];
-        let plan = plan_catalog(&rows, &BTreeSet::new(), &listing, false, None, Utc::now());
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
         assert_eq!(ids(&plan), vec!["bbb"]);
         assert!(plan.expire.is_empty());
     }
@@ -709,7 +1002,15 @@ mod tests {
             entry("foreign", ("legacy", "old-host", "/data"), t(7)),
         ];
         let produced: BTreeSet<String> = ["ours".to_string()].into();
-        let plan = plan_catalog(&[], &produced, &listing, false, None, Utc::now());
+        let plan = plan_catalog(
+            &[],
+            &produced,
+            &BTreeSet::new(),
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
         assert_eq!(ids(&plan), vec!["foreign"]);
     }
 
@@ -719,7 +1020,15 @@ mod tests {
         let listing = vec![entry("ours", ("app", "ns", "/data"), t(5))];
         let produced: BTreeSet<String> = ["ours".to_string()].into();
         let rows = vec![row("r-ours", "ours", Some(t(5)))];
-        let plan = plan_catalog(&rows, &produced, &listing, false, None, Utc::now());
+        let plan = plan_catalog(
+            &rows,
+            &produced,
+            &BTreeSet::new(),
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
         assert!(plan.create.is_empty());
         assert_eq!(expired(&plan), vec!["r-ours"]);
     }
@@ -741,6 +1050,7 @@ mod tests {
         let plan = plan_catalog(
             &[],
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
             false,
             Some(&retain),
@@ -760,6 +1070,7 @@ mod tests {
         };
         let plan = plan_catalog(
             &[],
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &listing,
             false,
@@ -790,6 +1101,7 @@ mod tests {
         let plan = plan_catalog(
             &rows,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
             false,
             Some(&retain),
@@ -816,6 +1128,7 @@ mod tests {
         let plan = plan_catalog(
             &rows,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
             false,
             Some(&retain),
@@ -831,10 +1144,26 @@ mod tests {
         let rows = vec![row("r-gone", "gone", Some(t(10)))];
         let listing = vec![entry("still", ("u", "h", "/p"), t(5))];
         // Complete listing → stale row expires.
-        let plan = plan_catalog(&rows, &BTreeSet::new(), &listing, false, None, Utc::now());
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
         assert_eq!(expired(&plan), vec!["r-gone"]);
         // Truncated listing → absence is unknowable; the row survives.
-        let plan = plan_catalog(&rows, &BTreeSet::new(), &listing, true, None, Utc::now());
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            true,
+            None,
+            Utc::now(),
+        );
         assert!(plan.expire.is_empty());
     }
 
@@ -854,6 +1183,7 @@ mod tests {
         };
         let plan = plan_catalog(
             &rows,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &listing,
             true,
@@ -1276,5 +1606,459 @@ mod tests {
             path: "/data".into(),
         };
         assert_eq!(identity_key(&src), "legacy@media:/data");
+    }
+
+    // --- decide_cluster_placement / decide_namespace_placement: decision table ---
+    // Row numbers refer to the table in the M4 design doc / catalog.rs module doc.
+
+    #[test]
+    fn row1_bare_ns_allowed_places_into_the_candidate_namespace() {
+        let class = HostClass::Bare {
+            namespace: "billing",
+        };
+        for cluster_mode in [false, true] {
+            for foreign in [ForeignSnapshots::Ignore, ForeignSnapshots::Fallback] {
+                assert_eq!(
+                    decide_cluster_placement(
+                        class,
+                        true,
+                        cluster_mode,
+                        foreign,
+                        Some("fallback-ns")
+                    ),
+                    PlacementDecision::Place("billing".to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row2_bare_disallowed_fallback_places_regardless_of_cluster_mode() {
+        let class = HostClass::Bare { namespace: "evil" };
+        assert_eq!(
+            decide_cluster_placement(
+                class,
+                false,
+                true,
+                ForeignSnapshots::Fallback,
+                Some("kopia-system")
+            ),
+            PlacementDecision::Place("kopia-system".to_string())
+        );
+    }
+
+    #[test]
+    fn row3_bare_disallowed_fallback_no_fallback_ns_is_defensively_unplaced() {
+        let class = HostClass::Bare { namespace: "evil" };
+        assert_eq!(
+            decide_cluster_placement(class, false, true, ForeignSnapshots::Fallback, None),
+            PlacementDecision::Unplaced
+        );
+    }
+
+    #[test]
+    fn row4_bare_disallowed_ignore_cluster_mode_on_is_foreign_ignored() {
+        let class = HostClass::Bare { namespace: "ghost" };
+        // "any" fallback: even a configured fallback doesn't rescue it under Ignore.
+        for fallback in [None, Some("kopia-system")] {
+            assert_eq!(
+                decide_cluster_placement(class, false, true, ForeignSnapshots::Ignore, fallback),
+                PlacementDecision::ForeignIgnored,
+                "fallback={fallback:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row5_bare_disallowed_ignore_cluster_mode_off_falls_back_exactly_like_today() {
+        // Back-compat: cluster identity off is exactly the pre-M4 `placement_namespace`
+        // behavior (migrated from cluster_repository.rs's
+        // `disallowed_namespace_falls_back`), regardless of what `foreign` happens to be
+        // (the validator prevents `foreignSnapshots` being set with no cluster identity,
+        // so it is always the default `Ignore` in practice — but the decision must not
+        // depend on that, only on `cluster_mode`).
+        let class = HostClass::Bare { namespace: "evil" };
+        assert_eq!(
+            decide_cluster_placement(
+                class,
+                false,
+                false,
+                ForeignSnapshots::Ignore,
+                Some("kopia-system")
+            ),
+            PlacementDecision::Place("kopia-system".to_string())
+        );
+    }
+
+    #[test]
+    fn row6_bare_disallowed_ignore_cluster_mode_off_no_fallback_is_unplaced_exactly_like_today() {
+        // Migrated from cluster_repository.rs's `disallowed_and_no_fallback_yields_none`.
+        let class = HostClass::Bare { namespace: "evil" };
+        assert_eq!(
+            decide_cluster_placement(class, false, false, ForeignSnapshots::Ignore, None),
+            PlacementDecision::Unplaced
+        );
+    }
+
+    #[test]
+    fn row1_allowed_namespace_is_used_directly_back_compat() {
+        // Migrated from cluster_repository.rs's `allowed_namespace_is_used_directly`.
+        let class = HostClass::Bare {
+            namespace: "billing",
+        };
+        assert_eq!(
+            decide_cluster_placement(
+                class,
+                true,
+                false,
+                ForeignSnapshots::Ignore,
+                Some("kopia-system")
+            ),
+            PlacementDecision::Place("billing".to_string())
+        );
+    }
+
+    #[test]
+    fn row7_own_cluster_allowed_places_into_the_candidate_namespace() {
+        let class = HostClass::OwnCluster { namespace: "prod" };
+        for foreign in [ForeignSnapshots::Ignore, ForeignSnapshots::Fallback] {
+            assert_eq!(
+                decide_cluster_placement(class, true, true, foreign, Some("fallback-ns")),
+                PlacementDecision::Place("prod".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn row8_own_cluster_disallowed_falls_back_regardless_of_foreign_policy() {
+        let class = HostClass::OwnCluster { namespace: "prod" };
+        for foreign in [ForeignSnapshots::Ignore, ForeignSnapshots::Fallback] {
+            assert_eq!(
+                decide_cluster_placement(class, false, true, foreign, Some("kopia-system")),
+                PlacementDecision::Place("kopia-system".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn row9_own_cluster_disallowed_no_fallback_is_unplaced() {
+        let class = HostClass::OwnCluster { namespace: "prod" };
+        assert_eq!(
+            decide_cluster_placement(class, false, true, ForeignSnapshots::Ignore, None),
+            PlacementDecision::Unplaced
+        );
+    }
+
+    #[test]
+    fn row10_foreign_cluster_ignore_is_foreign_ignored_regardless_of_ns_allowed_or_fallback() {
+        let class = HostClass::ForeignCluster { suffix: "west" };
+        for ns_allowed in [false, true] {
+            for fallback in [None, Some("kopia-system")] {
+                assert_eq!(
+                    decide_cluster_placement(
+                        class,
+                        ns_allowed,
+                        true,
+                        ForeignSnapshots::Ignore,
+                        fallback
+                    ),
+                    PlacementDecision::ForeignIgnored,
+                    "ns_allowed={ns_allowed} fallback={fallback:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row11_foreign_cluster_fallback_places_into_the_fallback_namespace() {
+        let class = HostClass::ForeignCluster { suffix: "west" };
+        assert_eq!(
+            decide_cluster_placement(
+                class,
+                false,
+                true,
+                ForeignSnapshots::Fallback,
+                Some("kopia-system")
+            ),
+            PlacementDecision::Place("kopia-system".to_string())
+        );
+    }
+
+    #[test]
+    fn row12_foreign_cluster_fallback_no_fallback_ns_is_defensively_unplaced() {
+        let class = HostClass::ForeignCluster { suffix: "west" };
+        assert_eq!(
+            decide_cluster_placement(class, false, true, ForeignSnapshots::Fallback, None),
+            PlacementDecision::Unplaced
+        );
+    }
+
+    #[test]
+    fn namespaced_placement_is_byte_identical_to_today_when_cluster_is_none() {
+        // A namespaced Repository with no identityDefaults.cluster set (the
+        // overwhelming common case): `cluster` is None, so classify_hostname is
+        // total-Bare regardless of hostname shape (even one that LOOKS like
+        // <namespace>.<cluster>) — the repository always materializes into its own
+        // namespace exactly as before M5 gave Repository an identityDefaults field.
+        for host in ["billing", "billing.east", "ns.", ".east", ""] {
+            let class = classify_hostname(host, None);
+            assert_eq!(
+                decide_namespace_placement(class, "prod"),
+                PlacementDecision::Place("prod".to_string()),
+                "host={host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespaced_placement_ignores_foreign_cluster_defensively() {
+        // Defensive backstop kept exhaustive for `HostClass::ForeignCluster`: never
+        // materialize a foreign entry into the repo's own namespace, even if a
+        // Fallback policy value somehow reached here (the validator rejects
+        // Fallback on a namespaced Repository — see rule (c) — so this never fires
+        // in practice, but the match stays total).
+        let class = classify_hostname("billing.west", Some("east"));
+        assert_eq!(
+            decide_namespace_placement(class, "prod"),
+            PlacementDecision::ForeignIgnored
+        );
+    }
+
+    // --- plan_placements: the placement pass, with a stubbed ns_allowed resolver ---
+
+    #[test]
+    fn placement_pass_over_a_mixed_listing_yields_correct_ignore_set_count_and_decisions() {
+        let listing = vec![
+            entry("own1", ("u", "billing.east", "/p"), t(5)), // OwnCluster, allowed
+            entry("foreign1", ("u", "billing.west", "/p"), t(5)), // ForeignCluster
+            entry("bareown1", ("u", "checkout", "/p"), t(5)), // Bare, allowed
+            entry("bareunknown1", ("u", "ghost", "/p"), t(5)), // Bare, disallowed
+        ];
+        let mut ns_allowed = BTreeMap::new();
+        ns_allowed.insert("billing".to_string(), true);
+        ns_allowed.insert("checkout".to_string(), true);
+        ns_allowed.insert("ghost".to_string(), false);
+        let allowed = AllowedNamespaces::List(vec!["billing".into(), "checkout".into()]);
+        let placement = Placement::Cluster {
+            allowed: &allowed,
+            fallback: None,
+        };
+        let pass = plan_placements(
+            &listing,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &ns_allowed,
+        );
+
+        assert_eq!(
+            pass.decisions.get("billing.east"),
+            Some(&PlacementDecision::Place("billing".to_string()))
+        );
+        assert_eq!(
+            pass.decisions.get("billing.west"),
+            Some(&PlacementDecision::ForeignIgnored)
+        );
+        assert_eq!(
+            pass.decisions.get("checkout"),
+            Some(&PlacementDecision::Place("checkout".to_string()))
+        );
+        // cluster mode on, ns disallowed, Ignore → treated the same as ForeignCluster.
+        assert_eq!(
+            pass.decisions.get("ghost"),
+            Some(&PlacementDecision::ForeignIgnored)
+        );
+
+        assert_eq!(
+            pass.foreign_ignored_ids,
+            ["foreign1".to_string(), "bareunknown1".to_string()].into()
+        );
+        assert_eq!(pass.foreign_count, 2);
+        assert_eq!(pass.foreign_suffix_counts.get("west"), Some(&1));
+        // The bare-unknown host has no suffix, so it's keyed by the full hostname.
+        assert_eq!(pass.foreign_suffix_counts.get("ghost"), Some(&1));
+    }
+
+    #[test]
+    fn placement_pass_over_the_namespace_kind_never_does_cluster_ios_or_looks_at_ns_allowed() {
+        let listing = vec![
+            entry("a", ("u", "checkout", "/p"), t(5)),
+            entry("b", ("u", "billing.west", "/p"), t(5)),
+        ];
+        let placement = Placement::Namespace("prod");
+        // Empty ns_allowed map: the Namespace placement kind must never consult it.
+        let pass = plan_placements(
+            &listing,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            pass.decisions.get("checkout"),
+            Some(&PlacementDecision::Place("prod".to_string()))
+        );
+        assert_eq!(
+            pass.decisions.get("billing.west"),
+            Some(&PlacementDecision::ForeignIgnored)
+        );
+    }
+
+    #[test]
+    fn namespaced_placement_pass_with_cluster_identity_places_own_and_bare_ignores_foreign() {
+        // M5: a namespaced Repository with identityDefaults.cluster set gets the
+        // SAME cluster-aware placement pass a ClusterRepository does — own-cluster
+        // and bare hostnames still land in the repo's own namespace; a
+        // foreign-cluster hostname is ignored (never materialized) but still
+        // counted (status.catalog.foreignSnapshotCount).
+        let listing = vec![
+            entry("own1", ("u", "prod.east", "/p"), t(5)), // OwnCluster
+            entry("bare1", ("u", "legacy", "/p"), t(5)),   // Bare (pre-cluster-identity hostname)
+            entry("foreign1", ("u", "prod.west", "/p"), t(5)), // ForeignCluster
+        ];
+        let placement = Placement::Namespace("prod");
+        let pass = plan_placements(
+            &listing,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            pass.decisions.get("prod.east"),
+            Some(&PlacementDecision::Place("prod".to_string())),
+            "OwnCluster host must place into the repo's own namespace"
+        );
+        assert_eq!(
+            pass.decisions.get("legacy"),
+            Some(&PlacementDecision::Place("prod".to_string())),
+            "Bare host must place into the repo's own namespace"
+        );
+        assert_eq!(
+            pass.decisions.get("prod.west"),
+            Some(&PlacementDecision::ForeignIgnored),
+            "ForeignCluster host must be ignored, never materialized"
+        );
+        assert_eq!(pass.foreign_ignored_ids, ["foreign1".to_string()].into());
+        assert_eq!(pass.foreign_count, 1, "the foreign entry is still counted");
+        assert_eq!(pass.foreign_suffix_counts.get("west"), Some(&1));
+    }
+
+    // --- plan_catalog: foreign_ignored_ids interaction ---
+
+    #[test]
+    fn foreign_ignored_ids_are_excluded_from_creation() {
+        let listing = vec![
+            entry("own", ("u", "billing", "/p"), t(5)),
+            entry("foreign", ("u", "billing.west", "/p"), t(3)),
+        ];
+        let foreign_ignored: BTreeSet<String> = ["foreign".to_string()].into();
+        let plan = plan_catalog(
+            &[],
+            &BTreeSet::new(),
+            &foreign_ignored,
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(ids(&plan), vec!["own"]);
+    }
+
+    #[test]
+    fn foreign_ignored_ids_pre_existing_rows_expire_on_complete_listings() {
+        let listing = vec![entry("foreign", ("u", "billing.west", "/p"), t(5))];
+        let rows = vec![row("r-foreign", "foreign", Some(t(5)))];
+        let foreign_ignored: BTreeSet<String> = ["foreign".to_string()].into();
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &foreign_ignored,
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
+        assert!(plan.create.is_empty());
+        assert_eq!(expired(&plan), vec!["r-foreign"]);
+    }
+
+    #[test]
+    fn foreign_ignored_rows_still_respect_the_general_absence_expiry_rule_under_truncation() {
+        // The general absence-expiry rule (skipped under a truncated listing) must
+        // still hold for a row whose snapshot doesn't appear in `listing` at all this
+        // scan (e.g. it was already dropped by the mover's foreign-suffix prefilter
+        // before `listing`/`foreign_ignored_ids` were even built) — a plain absence
+        // case, unaffected by adding the new parameter.
+        let rows = vec![row("r-gone", "gone", Some(t(10)))];
+        let listing = vec![entry("still", ("u", "h", "/p"), t(5))];
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            true,
+            None,
+            Utc::now(),
+        );
+        assert!(
+            plan.expire.is_empty(),
+            "absence expiry must be skipped under truncation"
+        );
+    }
+
+    #[test]
+    fn foreign_ignored_entries_never_consume_the_per_identity_cap() {
+        // Identity "a" has 3 eligible entries and cap=2; "a3" is foreign-ignored, so
+        // it must not occupy a keep-slot — the two REMAINING entries both survive.
+        let listing = vec![
+            entry("a1", ("u", "a", "/p"), t(30)),
+            entry("a2", ("u", "a", "/p"), t(20)),
+            entry("a3", ("u", "a", "/p"), t(10)),
+        ];
+        let foreign_ignored: BTreeSet<String> = ["a3".to_string()].into();
+        let retain = CatalogRetain {
+            per_identity: Some(2),
+            max_age_days: None,
+        };
+        let plan = plan_catalog(
+            &[],
+            &BTreeSet::new(),
+            &foreign_ignored,
+            &listing,
+            false,
+            Some(&retain),
+            Utc::now(),
+        );
+        let mut got = ids(&plan);
+        got.sort();
+        assert_eq!(got, vec!["a1", "a2"]);
+    }
+
+    #[test]
+    fn fallback_placed_foreign_entries_still_consume_caps() {
+        // A Fallback-placed foreign entry is NOT in foreign_ignored_ids (it
+        // materializes), so it competes for the per-identity cap like any entry.
+        let listing = vec![
+            entry("a1", ("u", "a", "/p"), t(30)),
+            entry("a2", ("u", "a", "/p"), t(20)),
+            entry("a3", ("u", "a", "/p"), t(10)),
+        ];
+        let retain = CatalogRetain {
+            per_identity: Some(2),
+            max_age_days: None,
+        };
+        let plan = plan_catalog(
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            false,
+            Some(&retain),
+            Utc::now(),
+        );
+        let mut got = ids(&plan);
+        got.sort();
+        assert_eq!(got, vec!["a2", "a3"]);
     }
 }

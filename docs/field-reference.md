@@ -33,6 +33,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `catalog` | [object](#repository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
 | `create` | [object](#repository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `health` | [object](#repository-spec-health) | — | Repository health thresholds (tunes the index-blob-count warning). |
+| `identityDefaults` | [object](#repository-spec-identitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. Set `cluster` when this repository's backend is shared across clusters (e.g. one bucket backed up from more than one Kubernetes cluster) — the default kopia identity hostname then becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of bare `&lt;namespace&gt;`, so same-named namespaces on different clusters never collide. Same semantics as `ClusterRepository`'s field of the same name (ADR-0004 §5); a consumer's explicit `spec.identity` still wins over anything here. |
 | `maintenance` | [object](#repository-spec-maintenance) | — | Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR. |
 | `mode` | enum: ReadWrite \| ReadOnly | `ReadWrite` | Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only). |
 | `moverDefaults` | [object](#repository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
@@ -322,6 +323,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
+| `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster. `status.catalog.foreignSnapshotCount` counts an identity hostname carrying a different `.&lt;cluster&gt;` suffix ALWAYS, under either value below, plus — under `Ignore` only — a bare hostname naming no allowed namespace here. Under `Fallback`, that same disallowed bare host is NOT counted foreign: it materializes into `catalog.fallbackNamespace` exactly like a disallowed `OwnCluster` host would, so it is placed rather than dropped-and-counted (see `classify_hostname`/`decide_cluster_placement`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
 | `refreshInterval` | string | `1h` | How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum `30s`, default `1h`). Inert unless `periodicRefresh` is enabled. |
 | `retain` | [object](#repository-spec-catalog-retain) | — | How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint). |
@@ -364,6 +366,14 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `enabled` | boolean | — | Turn the probe on. Off by default — existing repositories keep their current behavior until a user opts in. |
 | `failureThreshold` | integer | `3` | How many *consecutive* failing probes to require before raising the loud condition + event (default `3`). Debounces a single transient blip from alarming or nudging a destructive manual recreate. Any success resets it. |
 | `interval` | string | `30m` | How often to re-probe the backend (Go-style duration like `30m` or `1h`; minimum `30s`, default `30m`). Inert unless `enabled`. |
+
+#### `spec.identityDefaults` { #repository-spec-identitydefaults }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cluster` | string | — | This cluster's identity suffix for repositories shared across clusters (an RFC 1123 label, at most 32 characters; dots are rejected — the first `.` in a hostname is the namespace/cluster delimiter). When set, the default kopia identity hostname becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of `&lt;namespace&gt;`, so two clusters backing up same-named namespaces write distinct identities (and one cluster's retention prune can no longer touch the other's snapshots). Also exposed to `hostnameExpr`/ `usernameExpr` as the CEL variable `cluster`. |
+| `hostnameExpr` | string | — | CEL expression for the kopia identity hostname (e.g. `"namespace"`). |
+| `usernameExpr` | string | — | CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`). |
 
 #### `spec.maintenance` { #repository-spec-maintenance }
 
@@ -576,6 +586,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
+| `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
 
 #### `status.conditions[]` { #repository-status-conditions }
@@ -943,6 +954,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
+| `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster. `status.catalog.foreignSnapshotCount` counts an identity hostname carrying a different `.&lt;cluster&gt;` suffix ALWAYS, under either value below, plus — under `Ignore` only — a bare hostname naming no allowed namespace here. Under `Fallback`, that same disallowed bare host is NOT counted foreign: it materializes into `catalog.fallbackNamespace` exactly like a disallowed `OwnCluster` host would, so it is placed rather than dropped-and-counted (see `classify_hostname`/`decide_cluster_placement`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
 | `refreshInterval` | string | `1h` | How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum `30s`, default `1h`). Inert unless `periodicRefresh` is enabled. |
 | `retain` | [object](#clusterrepository-spec-catalog-retain) | — | How many discovered `Snapshot` CRs to keep materialized (bounds etcd footprint). |
@@ -996,6 +1008,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `cluster` | string | — | This cluster's identity suffix for repositories shared across clusters (an RFC 1123 label, at most 32 characters; dots are rejected — the first `.` in a hostname is the namespace/cluster delimiter). When set, the default kopia identity hostname becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of `&lt;namespace&gt;`, so two clusters backing up same-named namespaces write distinct identities (and one cluster's retention prune can no longer touch the other's snapshots). Also exposed to `hostnameExpr`/ `usernameExpr` as the CEL variable `cluster`. |
 | `hostnameExpr` | string | — | CEL expression for the kopia identity hostname (e.g. `"namespace"`). |
 | `usernameExpr` | string | — | CEL expression for the kopia identity username (e.g. `"namespace + '-' + policyName"`). |
 
@@ -1212,6 +1225,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
+| `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
 
 #### `status.conditions[]` { #clusterrepository-status-conditions }
@@ -2200,6 +2214,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `owner` | string | **required** | Stable lease holder identity (e.g. `kopia-operator/nas-primary`). |
+| `ownerAliases` | []string | — | Previous lease strings still recognized as SELF (a migration path): when kopia's currently-recorded maintenance owner matches the owner derived from one of these aliases, a run treats the lease as its own — it claims it and re-stamps `owner`, upgrading the recorded owner to the current format. The operator populates this when a repository's managed Maintenance moves to a cluster-qualified lease (identityDefaults.cluster), so the transition never yields the lease to what merely looks like a foreign owner. |
 | `takeoverPolicy` | enum: Never \| PromptCondition \| Force | `Never` | What to do when the lease is already held by a different `owner`. |
 
 #### `spec.repository` { #maintenance-spec-repository }

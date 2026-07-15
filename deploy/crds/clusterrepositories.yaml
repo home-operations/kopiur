@@ -597,6 +597,24 @@ spec:
                     description: Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
                     nullable: true
                     type: string
+                  foreignSnapshots:
+                    description: |-
+                      How catalog discovery treats snapshots written by ANOTHER cluster.
+                      `status.catalog.foreignSnapshotCount` counts an identity hostname carrying
+                      a different `.<cluster>` suffix ALWAYS, under either value below, plus —
+                      under `Ignore` only — a bare hostname naming no allowed namespace here.
+                      Under `Fallback`, that same disallowed bare host is NOT counted foreign:
+                      it materializes into `catalog.fallbackNamespace` exactly like a disallowed
+                      `OwnCluster` host would, so it is placed rather than dropped-and-counted
+                      (see `classify_hostname`/`decide_cluster_placement`).
+                      Meaningful only when `identityDefaults.cluster` is set: without a cluster
+                      identity there is no notion of "foreign" and the legacy
+                      hostname-names-a-namespace placement applies (validators enforce this).
+                    enum:
+                    - Ignore
+                    - Fallback
+                    nullable: true
+                    type: string
                   periodicRefresh:
                     description: |-
                       Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
@@ -753,6 +771,18 @@ spec:
                 description: Identity defaults (CEL `*Expr`) applied when consumers don't override.
                 nullable: true
                 properties:
+                  cluster:
+                    description: |-
+                      This cluster's identity suffix for repositories shared across clusters
+                      (an RFC 1123 label, at most 32 characters; dots are rejected — the first
+                      `.` in a hostname is the namespace/cluster delimiter). When set, the
+                      default kopia identity hostname becomes `<namespace>.<cluster>` instead
+                      of `<namespace>`, so two clusters backing up same-named namespaces write
+                      distinct identities (and one cluster's retention prune can no longer
+                      touch the other's snapshots). Also exposed to `hostnameExpr`/
+                      `usernameExpr` as the CEL variable `cluster`.
+                    nullable: true
+                    type: string
                   hostnameExpr:
                     description: CEL expression for the kopia identity hostname (e.g. `"namespace"`).
                     nullable: true
@@ -2549,6 +2579,15 @@ spec:
                 properties:
                   discoveredBackupCount:
                     description: How many `Snapshot` CRs were materialized from the catalog scan.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  foreignSnapshotCount:
+                    description: |-
+                      Snapshots in the last complete listing classified as another cluster's
+                      (see `catalog.foreignSnapshots`); never materialized under `Ignore`.
+                      As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it
+                      current.
                     format: int64
                     nullable: true
                     type: integer

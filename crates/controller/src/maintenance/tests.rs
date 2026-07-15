@@ -27,6 +27,7 @@ fn maint_with(quick_cron: &str, full_cron: &str, status: Option<MaintenanceStatu
             },
             ownership: Ownership {
                 owner: "kopiur/prod/nas-primary".into(),
+                owner_aliases: Vec::new(),
                 takeover_policy: TakeoverPolicy::Never,
             },
             mover: None,
@@ -421,4 +422,31 @@ fn manual_job_names_never_collide_with_cron_slot_names() {
     // Long CR names stay within the budget.
     let long = "m".repeat(80);
     assert!(manual_job_name(&long, kopiur_api::ManualRunMode::Full, at).len() <= 52);
+}
+
+/// M6: `spec.ownership.ownerAliases` must ride the mover work spec verbatim —
+/// without it, a Maintenance whose lease moved to a cluster-qualified format
+/// would see kopia's still-recorded legacy owner as foreign and yield forever.
+#[test]
+fn maintenance_op_threads_owner_and_aliases_from_ownership() {
+    let mut m = maint_with("0 */6 * * *", "0 3 * * *", None);
+    m.spec.ownership.owner = "kopiur/east/prod/nas-primary".into();
+    m.spec.ownership.owner_aliases = vec!["kopiur/prod/nas-primary".into()];
+    m.spec.ownership.takeover_policy = TakeoverPolicy::PromptCondition;
+    let op = maintenance_op(&m, MaintenanceMode::Full);
+    assert_eq!(op.mode, MaintenanceMode::Full);
+    assert_eq!(op.owner, "kopiur/east/prod/nas-primary");
+    assert_eq!(
+        op.owner_aliases,
+        vec!["kopiur/prod/nas-primary".to_string()]
+    );
+    assert_eq!(op.takeover_policy, TakeoverPolicy::PromptCondition);
+
+    // No aliases configured (the pre-M6 shape): the op carries none.
+    let plain = maint_with("0 */6 * * *", "0 3 * * *", None);
+    assert!(
+        maintenance_op(&plain, MaintenanceMode::Quick)
+            .owner_aliases
+            .is_empty()
+    );
 }

@@ -31,6 +31,7 @@ clap = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 base64 = "0.22"
+http = "1"
 http-body-util = "0.1"
 serial_test = { workspace = true }
 

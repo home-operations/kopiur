@@ -489,6 +489,35 @@ fn build_backup_run_maps_pvc_source_to_pvc_mount() {
 }
 
 #[test]
+fn build_backup_run_renders_ns_dot_cluster_hostname_for_a_namespaced_repo_with_cluster_identity() {
+    // M5: a namespaced Repository's `identityDefaults.cluster` now flows through
+    // `io::ResolvedRepository` (previously always `None`) with ZERO further glue
+    // changes — `resolve_identity_for`/`build_backup_run` were already kind-agnostic.
+    use kopiur_api::common::IdentityDefaults;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut repo = resolved_s3_repo();
+    repo.identity_defaults = Some(IdentityDefaults {
+        cluster: Some("east".into()),
+        hostname_expr: None,
+        username_expr: None,
+    });
+    let cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "pg-data".into(),
+            }),
+            pvc_selector: None,
+            nfs: None,
+            source_path_override: None,
+            source_path_strategy: None,
+        },
+    );
+    let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "billing", "pg").unwrap();
+    assert_eq!(ws.identity.hostname, "billing.east");
+}
+
+#[test]
 fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() {
     // M4 flag sweep (issue #216 category sweep): `failFast`/`limitMb` (the
     // recipe's `SnapshotPolicy.spec.{errorHandling,upload}`) and `description`
@@ -584,6 +613,69 @@ fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
     );
     let repo = resolved_s3_repo();
     assert!(build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "x").is_err());
+}
+
+// --- matches_snapshot_identity: the resolve_succeeded_snapshot predicate ---
+// (M0a: same path alone must never cross-match a different source's snapshot)
+
+fn list_entry(
+    id: &str,
+    path: &str,
+    user_name: &str,
+    host: &str,
+) -> kopiur_kopia::SnapshotListEntry {
+    let now = chrono::Utc::now();
+    kopiur_kopia::SnapshotListEntry {
+        id: id.to_string(),
+        source: kopiur_kopia::SnapshotSource {
+            host: host.into(),
+            user_name: user_name.into(),
+            path: path.to_string(),
+        },
+        description: String::new(),
+        start_time: now,
+        end_time: now,
+        stats: Default::default(),
+        root_entry: None,
+        retention_reason: vec![],
+    }
+}
+
+fn identity_of(
+    username: &str,
+    hostname: &str,
+    source_path: &str,
+) -> kopiur_mover::workspec::ResolvedIdentity {
+    kopiur_mover::workspec::ResolvedIdentity {
+        username: username.into(),
+        hostname: hostname.into(),
+        source_path: source_path.into(),
+    }
+}
+
+#[test]
+fn matches_snapshot_identity_excludes_same_path_different_identity() {
+    // The exact hazard this predicate exists to close: two sources (e.g.
+    // different namespaces, or different clusters sharing a repository)
+    // wrote to the SAME path. Path alone must not match.
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("theirs", "/pvc/data", "someone-else", "cluster-b");
+    assert!(!matches_snapshot_identity(&entry, &identity));
+}
+
+#[test]
+fn matches_snapshot_identity_accepts_same_path_same_identity() {
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("mine", "/pvc/data", "app", "cluster-a");
+    assert!(matches_snapshot_identity(&entry, &identity));
+}
+
+#[test]
+fn matches_snapshot_identity_excludes_different_path_same_identity() {
+    // Identity alone isn't sufficient either — path still has to match.
+    let identity = identity_of("app", "cluster-a", "/pvc/data");
+    let entry = list_entry("elsewhere", "/pvc/other", "app", "cluster-a");
+    assert!(!matches_snapshot_identity(&entry, &identity));
 }
 
 // --- plan_deletion: exhaustive over every DeletionPolicy ----------------

@@ -797,6 +797,7 @@ fn build_managed_maintenance_for_namespaced_repository() {
         "apps",
         &spec,
         dummy_owner("Repository", "nas"),
+        None,
     );
     // 1:1 naming, lives in the repository's namespace, owned by the repo.
     assert_eq!(m.metadata.name.as_deref(), Some("nas"));
@@ -808,10 +809,30 @@ fn build_managed_maintenance_for_namespaced_repository() {
     assert!(m.spec.repository.namespace.is_none());
     assert_eq!(m.spec.schedule, default_maintenance_schedule());
     assert_eq!(m.spec.ownership.owner, "kopiur/apps/nas");
+    assert!(m.spec.ownership.owner_aliases.is_empty());
     assert_eq!(
         m.spec.ownership.takeover_policy,
         kopiur_api::TakeoverPolicy::Never
     );
+}
+
+#[test]
+fn build_managed_maintenance_for_namespaced_repository_with_cluster_gains_alias() {
+    // M6: once identityDefaults.cluster is set, the managed CR's lease is
+    // cluster-qualified AND carries the pre-cluster lease as its sole alias —
+    // the migration path so turning cluster identity on doesn't make the
+    // repository's own prior lease look foreign to itself.
+    let spec = RepositoryMaintenanceSpec::default();
+    let m = build_managed_maintenance(
+        RepositoryKind::Repository,
+        "nas",
+        "apps",
+        &spec,
+        dummy_owner("Repository", "nas"),
+        Some("east"),
+    );
+    assert_eq!(m.spec.ownership.owner, "kopiur/east/apps/nas");
+    assert_eq!(m.spec.ownership.owner_aliases, vec!["kopiur/apps/nas"]);
 }
 
 #[test]
@@ -843,6 +864,7 @@ fn build_managed_maintenance_for_cluster_repository_uses_overrides() {
         "kopia-system",
         &spec,
         dummy_owner("ClusterRepository", "hetzner"),
+        None,
     );
     assert_eq!(m.metadata.namespace.as_deref(), Some("kopia-system"));
     assert_eq!(m.spec.repository.kind, RepositoryKind::ClusterRepository);
@@ -850,7 +872,127 @@ fn build_managed_maintenance_for_cluster_repository_uses_overrides() {
     assert!(m.spec.repository.namespace.is_none());
     assert_eq!(m.spec.schedule.quick.cron, "0 */2 * * *");
     assert_eq!(m.spec.ownership.owner, "kopiur/clusterrepository/hetzner");
+    assert!(m.spec.ownership.owner_aliases.is_empty());
     assert_eq!(m.spec.ownership.takeover_policy, TakeoverPolicy::Force);
+}
+
+#[test]
+fn build_managed_maintenance_for_cluster_repository_with_cluster_gains_alias() {
+    let spec = RepositoryMaintenanceSpec::default();
+    let m = build_managed_maintenance(
+        RepositoryKind::ClusterRepository,
+        "hetzner",
+        "kopia-system",
+        &spec,
+        dummy_owner("ClusterRepository", "hetzner"),
+        Some("east"),
+    );
+    assert_eq!(
+        m.spec.ownership.owner,
+        "kopiur/east/clusterrepository/hetzner"
+    );
+    assert_eq!(
+        m.spec.ownership.owner_aliases,
+        vec!["kopiur/clusterrepository/hetzner"]
+    );
+}
+
+#[test]
+fn bootstrap_maintenance_owner_plan_suppressed_is_always_none_any_stale_no_aliases() {
+    // Suppressed (ReadOnly / disabled / foreign-covered) must NEVER stamp or
+    // restamp, regardless of cluster — this is the ReadOnly-clobbers-owner fix.
+    for cluster in [None, Some("east")] {
+        let (owner, policy, aliases) = bootstrap_maintenance_owner_plan(
+            RepositoryKind::Repository,
+            "apps",
+            "nas",
+            cluster,
+            true,
+        );
+        assert_eq!(owner, None, "cluster={cluster:?}");
+        assert_eq!(policy, RestampPolicy::AnyStale, "cluster={cluster:?}");
+        assert!(aliases.is_empty(), "cluster={cluster:?}");
+    }
+}
+
+#[test]
+fn bootstrap_maintenance_owner_plan_no_cluster_is_any_stale_no_aliases() {
+    let (owner, policy, aliases) =
+        bootstrap_maintenance_owner_plan(RepositoryKind::Repository, "apps", "nas", None, false);
+    assert_eq!(owner.as_deref(), Some("kopiur@kopiur-apps-nas"));
+    assert_eq!(policy, RestampPolicy::AnyStale);
+    assert!(aliases.is_empty());
+}
+
+#[test]
+fn bootstrap_maintenance_owner_plan_with_cluster_is_own_formats_only_with_legacy_alias() {
+    let (owner, policy, aliases) = bootstrap_maintenance_owner_plan(
+        RepositoryKind::Repository,
+        "apps",
+        "nas",
+        Some("east"),
+        false,
+    );
+    assert_eq!(owner.as_deref(), Some("kopiur@kopiur.east.apps.nas"));
+    assert_eq!(policy, RestampPolicy::OwnFormatsOnly);
+    assert_eq!(aliases, vec!["kopiur@kopiur-apps-nas".to_string()]);
+}
+
+/// M6 regression (fix round 1): the in-process create path must stamp the
+/// desired owner UNCONDITIONALLY — never defer to `maintenance_restamp_target`
+/// with a hardcoded `created: false`, which under `OwnFormatsOnly` (whenever
+/// `cluster` is set) would refuse to restamp a freshly-created repo's
+/// kopia-assigned ephemeral owner forever. The create-vs-connect distinction
+/// is the entire point of this test, exercised across both the cluster-qualified
+/// and legacy owner shapes.
+#[test]
+fn in_process_create_owner_target_covers_the_create_vs_connect_matrix() {
+    // created=true stamps the cluster-qualified owner unconditionally.
+    let (desired, _, _) = bootstrap_maintenance_owner_plan(
+        RepositoryKind::Repository,
+        "apps",
+        "nas",
+        Some("east"),
+        false,
+    );
+    assert_eq!(
+        in_process_create_owner_target(true, desired.as_deref()),
+        Some("kopiur@kopiur.east.apps.nas")
+    );
+
+    // created=true stamps the legacy owner unconditionally when cluster is unset.
+    let (desired, _, _) =
+        bootstrap_maintenance_owner_plan(RepositoryKind::Repository, "apps", "nas", None, false);
+    assert_eq!(
+        in_process_create_owner_target(true, desired.as_deref()),
+        Some("kopiur@kopiur-apps-nas")
+    );
+
+    // created=false (connect-to-existing) always defers to the self-heal path,
+    // regardless of cluster.
+    for cluster in [None, Some("east")] {
+        let (desired, _, _) = bootstrap_maintenance_owner_plan(
+            RepositoryKind::Repository,
+            "apps",
+            "nas",
+            cluster,
+            false,
+        );
+        assert_eq!(
+            in_process_create_owner_target(false, desired.as_deref()),
+            None,
+            "cluster={cluster:?}"
+        );
+    }
+
+    // Suppressed (desired=None) never stamps, regardless of created.
+    for created in [true, false] {
+        assert_eq!(
+            in_process_create_owner_target(created, None),
+            None,
+            "created={created}"
+        );
+    }
 }
 
 #[test]
@@ -969,6 +1111,7 @@ fn maint_referencing(
             schedule: default_maintenance_schedule(),
             ownership: Ownership {
                 owner: "lease".into(),
+                owner_aliases: Vec::new(),
                 takeover_policy: Default::default(),
             },
             mover: None,
@@ -1709,6 +1852,7 @@ mod bootstrap_outcomes {
             snapshot_count: 0,
             snapshots: vec![],
             snapshots_truncated: false,
+            foreign_suffix_dropped: 0,
             index_blob_count: None,
             failure: None,
         }
@@ -1968,6 +2112,7 @@ mod reconcile_failure_events {
                 schedule: kopiur_api::maintenance::default_maintenance_schedule(),
                 ownership: kopiur_api::Ownership {
                     owner: "lease".into(),
+                    owner_aliases: Vec::new(),
                     takeover_policy: Default::default(),
                 },
                 mover: None,

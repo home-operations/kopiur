@@ -149,10 +149,10 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression (`hostnameExpr` /
-    /// `usernameExpr`) failed to **compile** (a syntax error, or it exceeds the
-    /// length budget). Surfaced at admission so a bad expression never reaches
-    /// status (ADR-0004 §5).
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// (`hostnameExpr` / `usernameExpr`) failed to **compile** (a syntax error, or
+    /// it exceeds the length budget). Surfaced at admission so a bad expression
+    /// never reaches status (ADR-0004 §5).
     #[error("identity CEL expression {expr:?} failed to compile: {reason} (check the CEL syntax)")]
     IdentityExprCompile {
         /// The offending CEL expression.
@@ -161,13 +161,13 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression referenced a variable
-    /// outside its environment (e.g. a typo), or otherwise failed to evaluate at
-    /// admission (ADR-0004 §5). The environment is `namespace`, `policyName`,
-    /// `labels`, `annotations`.
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// referenced a variable outside its environment (e.g. a typo), or otherwise
+    /// failed to evaluate at admission (ADR-0004 §5). The environment is
+    /// `namespace`, `policyName`, `labels`, `annotations`, `cluster`.
     #[error(
         "identity CEL expression {expr:?} failed to evaluate: {reason} \
-         (available variables: namespace, policyName, labels, annotations)"
+         (available variables: namespace, policyName, labels, annotations, cluster)"
     )]
     IdentityExprEval {
         /// The offending CEL expression.
@@ -176,9 +176,9 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A `ClusterRepository.identityDefaults` CEL expression evaluated to a
-    /// non-string value. `hostnameExpr`/`usernameExpr` must return a string
-    /// (ADR-0004 §5).
+    /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+    /// evaluated to a non-string value. `hostnameExpr`/`usernameExpr` must return
+    /// a string (ADR-0004 §5).
     #[error(
         "identity CEL expression {expr:?} must return a string, got {got} \
          (hostnameExpr/usernameExpr must evaluate to a string)"
@@ -294,18 +294,37 @@ pub enum ValidationError {
         reason: String,
     },
 
+    /// A `Repository`/`ClusterRepository` `identityDefaults.cluster` is not a
+    /// valid RFC 1123 label, or contains a `.`. `cluster` is appended onto the namespace as
+    /// `<namespace>.<cluster>` for the default hostname, and
+    /// [`crate::identity::classify_hostname`] splits that hostname back apart at
+    /// the FIRST `.` — a `cluster` value with an embedded dot would just shift
+    /// which suffix classifies as "own cluster" rather than error, so the value is
+    /// rejected outright at admission instead of letting classification silently
+    /// disagree with intent.
+    #[error("identityDefaults.cluster {value:?} is not a valid cluster identity suffix: {reason}")]
+    ClusterNameInvalid {
+        /// The rejected cluster name.
+        value: String,
+        /// What's wrong and how to fix it (e.g. the RFC 1123 shape, or the dot-as-delimiter rule).
+        reason: String,
+    },
+
     /// An UPDATE to a `SnapshotPolicy` would change its resolved kopia identity
     /// (`username@hostname`, or a source's path) while the policy already has snapshot
-    /// history. New snapshots would land under the new kopia source, orphaning the old
-    /// history — GFS retention treats them as separate sources and never prunes the
-    /// old set (a storage leak), and the new identity restarts retention from zero.
-    /// Rejected unless the change is acknowledged with the
+    /// history. New snapshots would land under the new kopia source: Kopiur's own GFS
+    /// retention pools ALL of a policy's `Snapshot` CRs regardless of identity, so the
+    /// old and new lineages don't get independent retention — they compete for the same
+    /// `keepLatest`/`keepDaily`/etc. buckets in one merged timeline, and restore/verify/
+    /// `fromPolicy` resolve only the new identity (the old lineage stays reachable via
+    /// `Restore.source.identity`). Rejected unless the change is acknowledged with the
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
         "this edit changes the policy's resolved kopia identity from {old:?} to {new:?}, but the \
-         policy already has snapshot history; new snapshots would orphan the old history (kopia \
-         treats them as a separate source and GFS retention never prunes the old set). To \
+         policy already has snapshot history; new snapshots would land under a new kopia source \
+         while the old lineage's Snapshot CRs keep competing in the same GFS retention timeline \
+         (not independent retention), and restore/verify resolve only the new identity. To \
          intentionally re-identify, set annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
@@ -314,6 +333,39 @@ pub enum ValidationError {
         old: String,
         /// The new identity (or source path) this edit would resolve to.
         new: String,
+    },
+
+    /// An UPDATE to a `Repository`/`ClusterRepository`'s `identityDefaults`
+    /// (`cluster`, `hostnameExpr`, or `usernameExpr`) would silently re-identify
+    /// every consumer `SnapshotPolicy` that resolves through those defaults —
+    /// identity is re-resolved from the LIVE repository on every reconcile/backup
+    /// (nothing about a *repository's* defaults is pinned the way a policy's own
+    /// `spec.identity` is), so this edit changes what each affected policy
+    /// resolves to on its very next backup with **no per-policy edit** to
+    /// acknowledge it. Exactly like [`Self::IdentityWouldFork`], new snapshots
+    /// would land under a new kopia lineage while the old lineage's `Snapshot`
+    /// CRs keep competing with it in the same merged GFS retention timeline
+    /// (Kopiur pools a policy's CRs regardless of identity, so nothing is
+    /// independently retained) — but here it happens fleet-wide in one apply.
+    /// Rejected unless the repository carries the
+    /// `kopiur.home-operations.com/allow-identity-change` annotation
+    /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
+    #[error(
+        "this edit changes identityDefaults, which would re-identify {} — new snapshots would \
+         fork to a new kopia lineage while the old and new lineages keep competing in the same \
+         GFS retention timeline (not independent retention), and restore/verify resolve only the \
+         new identity. To intentionally re-identify, set annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value, e.g. \
+         \"intentional\") on this repository; or pin an explicit spec.identity (both username \
+         AND hostname) on the affected policies first",
+        describe_identity_change_consumers(consumers)
+    )]
+    RepositoryIdentityWouldFork {
+        /// `namespace/name` of every consumer `SnapshotPolicy` with existing
+        /// snapshot history that this edit would re-identify (the message
+        /// truncates the rendered list to 5 names; this field carries all of
+        /// them).
+        consumers: Vec<String>,
     },
 
     /// A verification `successExpr` (ADR-0005 §4/§15) failed to **compile** (a
@@ -416,7 +468,72 @@ pub enum ValidationError {
         /// The `spec.maintenance.namespace` value set on the namespaced `Repository`.
         namespace: String,
     },
+
+    /// `catalog.foreignSnapshots` is set, but there is no cluster identity to
+    /// classify a snapshot's origin against — `Ignore`/`Fallback` decide what
+    /// to do with a snapshot [`crate::identity::classify_hostname`] classifies
+    /// as another cluster's, and that classification is undecidable without
+    /// `identityDefaults.cluster`. Fires on either repository kind (`Repository`
+    /// or `ClusterRepository`) whose `identityDefaults.cluster` is unset —
+    /// kind-neutral wording, since the rule is identical either way.
+    #[error(
+        "catalog.foreignSnapshots is set, but classifying a snapshot as \"foreign\" requires a \
+         cluster identity (`identityDefaults.cluster`); without one there is nothing to compare \
+         it against. Fix: set identityDefaults.cluster, or remove catalog.foreignSnapshots"
+    )]
+    ForeignSnapshotsRequiresCluster,
+
+    /// A `ClusterRepository` sets both `identityDefaults.cluster` and
+    /// `catalog.fallbackNamespace` but leaves `catalog.foreignSnapshots`
+    /// unset. Both being set at once is a strong signal the fallback
+    /// collector is actually relied upon, so adopting a cluster identity must
+    /// never silently switch it off by defaulting to `Ignore` — the choice is
+    /// forced explicit instead.
+    #[error(
+        "catalog.foreignSnapshots must be set explicitly: both identityDefaults.cluster and \
+         catalog.fallbackNamespace are set, so adopting a cluster identity must not silently \
+         change what the fallback collector does. `Ignore` stops materializing foreign \
+         snapshots (existing rows in fallbackNamespace age out under catalog.retain); \
+         `Fallback` keeps collecting them there. Set one explicitly"
+    )]
+    ForeignSnapshotsChoiceRequired,
 }
+
+/// Render the consumer list for [`ValidationError::RepositoryIdentityWouldFork`]:
+/// the count, then up to [`CONSUMER_LIST_SHOWN`] `namespace/name`s, then
+/// `"and N more"` for the rest. Also reused verbatim by the webhook to build the
+/// admission WARNING when the same change is acknowledged, so the deny message
+/// and the warning always name the same policies the same way.
+///
+/// ```
+/// use kopiur_api::error::describe_identity_change_consumers;
+///
+/// assert_eq!(
+///     describe_identity_change_consumers(&["billing/pg".to_string()]),
+///     "1 SnapshotPolicy consumer(s) with existing snapshot history (billing/pg)",
+/// );
+/// let many: Vec<String> = (0..7).map(|i| format!("ns/pg-{i}")).collect();
+/// let rendered = describe_identity_change_consumers(&many);
+/// assert!(rendered.starts_with("7 SnapshotPolicy consumer(s)"));
+/// assert!(rendered.ends_with("and 2 more)"), "{rendered}");
+/// ```
+pub fn describe_identity_change_consumers(consumers: &[String]) -> String {
+    let total = consumers.len();
+    let mut names = consumers
+        .iter()
+        .take(CONSUMER_LIST_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > CONSUMER_LIST_SHOWN {
+        names.push_str(&format!(", and {} more", total - CONSUMER_LIST_SHOWN));
+    }
+    format!("{total} SnapshotPolicy consumer(s) with existing snapshot history ({names})")
+}
+
+/// How many consumer names [`describe_identity_change_consumers`] spells out
+/// before collapsing the rest into `"and N more"`.
+const CONSUMER_LIST_SHOWN: usize = 5;
 
 /// Result alias for validators. Defaults to `()` for the common "pass/fail with no
 /// value" case.

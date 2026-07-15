@@ -93,6 +93,16 @@ pub struct MaintenanceSchedule {
 pub struct Ownership {
     /// Stable lease holder identity (e.g. `kopia-operator/nas-primary`).
     pub owner: String,
+    /// Previous lease strings still recognized as SELF (a migration path):
+    /// when kopia's currently-recorded maintenance owner matches the owner
+    /// derived from one of these aliases, a run treats the lease as its own —
+    /// it claims it and re-stamps `owner`, upgrading the recorded owner to the
+    /// current format. The operator populates this when a repository's managed
+    /// Maintenance moves to a cluster-qualified lease (identityDefaults.cluster),
+    /// so the transition never yields the lease to what merely looks like a
+    /// foreign owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_aliases: Vec<String>,
     /// What to do when the lease is already held by a different `owner`.
     #[serde(default)]
     pub takeover_policy: TakeoverPolicy,
@@ -161,21 +171,51 @@ pub fn lease_action(policy: TakeoverPolicy, held_by_other: bool) -> LeaseAction 
 /// managed-Maintenance projection and the bootstrap mover's initial kopia
 /// owner stamp, so they cannot drift.
 ///
+/// `cluster` is `Repository`/`ClusterRepository.spec.identityDefaults.cluster`
+/// (M1/M5): `None` keeps the original, pre-multi-cluster format (a same-named
+/// `ClusterRepository`/`Repository` in two clusters would otherwise derive the
+/// SAME lease and race each other's maintenance on a shared repo — kopia has no
+/// cross-host maintenance lock of its own, only this owner lease); `Some(c)`
+/// inserts the cluster as the second path segment so each cluster claims a
+/// distinct lease (and, via [`kopia_lease_identity`], a distinct kopia owner)
+/// for what is otherwise the same repository name.
+///
 /// ```
 /// use kopiur_api::common::RepositoryKind;
 /// use kopiur_api::maintenance::managed_lease;
 ///
-/// assert_eq!(managed_lease(RepositoryKind::Repository, "media", "nas"), "kopiur/media/nas");
 /// assert_eq!(
-///     managed_lease(RepositoryKind::ClusterRepository, "ignored", "shared"),
+///     managed_lease(RepositoryKind::Repository, "media", "nas", None),
+///     "kopiur/media/nas"
+/// );
+/// assert_eq!(
+///     managed_lease(RepositoryKind::Repository, "media", "nas", Some("east")),
+///     "kopiur/east/media/nas"
+/// );
+/// assert_eq!(
+///     managed_lease(RepositoryKind::ClusterRepository, "ignored", "shared", None),
 ///     "kopiur/clusterrepository/shared"
 /// );
+/// assert_eq!(
+///     managed_lease(RepositoryKind::ClusterRepository, "ignored", "shared", Some("east")),
+///     "kopiur/east/clusterrepository/shared"
+/// );
 /// ```
-pub fn managed_lease(kind: crate::common::RepositoryKind, namespace: &str, name: &str) -> String {
-    match kind {
-        crate::common::RepositoryKind::Repository => format!("kopiur/{namespace}/{name}"),
-        crate::common::RepositoryKind::ClusterRepository => {
+pub fn managed_lease(
+    kind: crate::common::RepositoryKind,
+    namespace: &str,
+    name: &str,
+    cluster: Option<&str>,
+) -> String {
+    use crate::common::RepositoryKind;
+    match (kind, cluster) {
+        (RepositoryKind::Repository, None) => format!("kopiur/{namespace}/{name}"),
+        (RepositoryKind::Repository, Some(c)) => format!("kopiur/{c}/{namespace}/{name}"),
+        (RepositoryKind::ClusterRepository, None) => {
             format!("kopiur/clusterrepository/{name}")
+        }
+        (RepositoryKind::ClusterRepository, Some(c)) => {
+            format!("kopiur/{c}/clusterrepository/{name}")
         }
     }
 }
@@ -194,34 +234,129 @@ pub const LEASE_HELD_BY_OTHER_REASON: &str = "LeaseHeldByOther";
 /// to set `Force`.
 pub const LEASE_TAKEOVER_PROMPT_REASON: &str = "LeaseTakeoverPrompt";
 
+/// Hostname-unsafe-character rule shared by every `kopia_lease_identity` path:
+/// lowercase, `[a-z0-9-]` kept, everything else collapses to `-`, repeated `-`
+/// collapsed, then trimmed from both ends. Pulled out so the character class
+/// itself can never drift between the legacy (whole-string) and
+/// cluster-qualified (per-segment) sanitizers below.
+fn sanitize_lease_fragment(s: &str) -> String {
+    let mut out: String = s
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// A single DNS label's worth of cap for the legacy (pre-multi-cluster)
+/// hostname derivation. Unchanged from the original implementation — every
+/// existing doctest/behavior for a non-cluster-qualified lease must stay
+/// byte-identical.
+const LEGACY_HOSTNAME_MAX: usize = 63;
+
+/// Cap for the cluster-qualified (dot-joined) hostname derivation below —
+/// kopia's identity hostname has no real limit, but this mirrors DNS's overall
+/// name ceiling as a defensive backstop (see [`kopia_lease_identity`] doc).
+const CLUSTER_HOSTNAME_MAX: usize = 253;
+
 /// The STABLE kopia client identity a maintenance mover assumes for `lease`
 /// (`(username, hostname)`); the mover sets it with `kopia repository
 /// set-client` so kopia's designated-owner check compares something stable —
 /// the pod's own identity is ephemeral (a new hostname every run), which is
 /// why comparing kopia's recorded owner against it can never work.
 ///
+/// The derivation forks on the lease's own shape (the mover only ever sees the
+/// lease STRING, never the CR it came from, so the rule must be derivable from
+/// the string alone):
+///
+/// * **Exactly 4 `/`-separated segments, AND the first is literally `"kopiur"`**
+///   — [`managed_lease`]'s two cluster-qualified formats
+///   (`kopiur/{cluster}/{namespace}/{name}`,
+///   `kopiur/{cluster}/clusterrepository/{name}`) — sanitize each segment
+///   INDEPENDENTLY (the same character rule, but with no per-segment cap and
+///   without ever crossing a segment boundary) and join with `.`. Every
+///   generated segment is already a lowercase, dot-free RFC 1123 label (the
+///   cluster name is validated as such; Kubernetes namespace/resource names
+///   are too), so for a generated lease this is verbatim
+///   `kopiur.{cluster}.{namespace}.{name}` — and CRITICALLY, injective: two
+///   leases can only produce the same hostname if they were `/`-split
+///   identically, because a `-` inside one segment can no longer be forged
+///   into a fake `.` boundary the way collapsing everything to `-` allowed
+///   (`kopiur/east-prod/db/x` and `kopiur/east/prod-db/x` used to collide).
+///   No per-segment cap also means a long cluster/namespace/name no longer
+///   collides via truncation — capped defensively only on the TOTAL, at
+///   [`CLUSTER_HOSTNAME_MAX`] (253, the identity-hostname byte cap enforced by
+///   [`crate::validate::validate_identity_component`]), which cluster (≤32) +
+///   two Kubernetes names + `"kopiur"` cannot reach in practice.
+///
+///   The `"kopiur"`-first-segment check matters because [`managed_lease`] is
+///   NOT the only source of lease strings: `Ownership.owner` is a free-form
+///   field a user can hand-author, and a hand-authored value that HAPPENS to
+///   have 4 `/`-separated segments (e.g. `a/b/c/d`) is not one of our
+///   generated formats at all. Gating the dot-join on the reserved `"kopiur"`
+///   prefix — which [`managed_lease`] always emits and a user has no reason to
+///   — guarantees a hand-authored owner's derivation can never change across
+///   an operator upgrade merely because it happens to split into 4 segments;
+///   it always falls to the legacy whole-string sanitizer below, exactly as it
+///   did pre-M6. Without this gate, such an owner would silently switch from
+///   its `a-b-c-d` identity to `a.b.c.d`, and with `takeoverPolicy: Never` the
+///   repository's maintenance would then yield forever.
+/// * **Any other shape** (the legacy 3-segment formats, a 4-segment lease NOT
+///   `"kopiur"`-prefixed, or any other hand-authored `Ownership.owner`/alias)
+///   — the ORIGINAL whole-string sanitizer: collapse the entire lease through
+///   the same character rule and cap at [`LEGACY_HOSTNAME_MAX`] (63, a DNS
+///   label). Byte-identical to every pre-M6 lease this function has ever
+///   produced.
+///
 /// ```
 /// use kopiur_api::maintenance::kopia_lease_identity;
 ///
+/// // Legacy (3-segment / hand-authored): unchanged.
 /// assert_eq!(
 ///     kopia_lease_identity("kopiur/media/nas"),
 ///     ("kopiur".to_string(), "kopiur-media-nas".to_string())
 /// );
+///
+/// // Cluster-qualified (4-segment, "kopiur"-prefixed): dot-joined, segment-preserving.
+/// assert_eq!(
+///     kopia_lease_identity("kopiur/east/media/nas"),
+///     ("kopiur".to_string(), "kopiur.east.media.nas".to_string())
+/// );
+///
+/// // A hand-authored 4-segment owner that is NOT "kopiur"-prefixed: legacy
+/// // sanitization, byte-identical to pre-M6 — never dot-joined.
+/// assert_eq!(
+///     kopia_lease_identity("a/b/c/d"),
+///     ("kopiur".to_string(), "a-b-c-d".to_string())
+/// );
+///
+/// // Injective: a '-' inside a segment can no longer masquerade as a boundary.
+/// assert_ne!(
+///     kopia_lease_identity("kopiur/east-prod/db/x").1,
+///     kopia_lease_identity("kopiur/east/prod-db/x").1
+/// );
 /// ```
 pub fn kopia_lease_identity(lease: &str) -> (String, String) {
-    // Hostname-safe: lowercase, [a-z0-9-], everything else collapses to '-',
-    // trimmed and capped at 63 chars (a DNS label).
-    let mut host: String = lease
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    while host.contains("--") {
-        host = host.replace("--", "-");
-    }
-    let host = host.trim_matches('-');
-    let host: String = host.chars().take(63).collect();
-    let host = host.trim_end_matches('-').to_string();
+    let segments: Vec<&str> = lease.split('/').collect();
+    let host = match segments.as_slice() {
+        [a, b, c, d] if *a == "kopiur" => {
+            let joined = [a, b, c, d]
+                .iter()
+                .map(|s| sanitize_lease_fragment(s))
+                .collect::<Vec<_>>()
+                .join(".");
+            let capped: String = joined.chars().take(CLUSTER_HOSTNAME_MAX).collect();
+            capped.trim_end_matches(['.', '-']).to_string()
+        }
+        _ => {
+            let host = sanitize_lease_fragment(lease);
+            let capped: String = host.chars().take(LEGACY_HOSTNAME_MAX).collect();
+            capped.trim_end_matches('-').to_string()
+        }
+    };
     ("kopiur".to_string(), host)
 }
 
@@ -237,6 +372,47 @@ pub fn kopia_lease_identity(lease: &str) -> (String, String) {
 pub fn kopia_owner_for_lease(lease: &str) -> String {
     let (user, host) = kopia_lease_identity(lease);
     format!("{user}@{host}")
+}
+
+/// Whether kopia's currently-recorded maintenance owner is a DIFFERENT owner
+/// than us — i.e. neither our own lease's owner nor one of our recognized
+/// [`Ownership::owner_aliases`] (the migration path: a repo whose managed
+/// `Maintenance` moved to a new lease format still recognizes the owner it
+/// used to stamp as itself, so the transition claims and re-stamps rather than
+/// yielding to what would otherwise look like a foreign owner).
+///
+/// `current` is empty for a never-run repository (kopia's own "no owner set"
+/// state) — never "held by another".
+///
+/// ```
+/// use kopiur_api::maintenance::{kopia_owner_for_lease, lease_held_by_other};
+///
+/// let lease = "kopiur/east/media/nas";
+/// let alias = "kopiur/media/nas"; // the pre-cluster lease this repo used to use
+/// let mine = kopia_owner_for_lease(lease);
+/// let legacy = kopia_owner_for_lease(alias);
+///
+/// // Never-run repository: empty owner is never "held by another".
+/// assert!(!lease_held_by_other("", lease, &[]));
+/// // Already ours: not held by another.
+/// assert!(!lease_held_by_other(&mine, lease, &[]));
+/// // The recognized alias's owner: treated as self (migration path).
+/// assert!(!lease_held_by_other(&legacy, lease, &[alias.to_string()]));
+/// // The SAME string but the alias isn't registered: a genuine foreign owner.
+/// assert!(lease_held_by_other(&legacy, lease, &[]));
+/// // Any other owner: foreign.
+/// assert!(lease_held_by_other("someone@else", lease, &[alias.to_string()]));
+/// ```
+pub fn lease_held_by_other(current: &str, lease: &str, aliases: &[String]) -> bool {
+    if current.is_empty() {
+        return false;
+    }
+    if current == kopia_owner_for_lease(lease) {
+        return false;
+    }
+    !aliases
+        .iter()
+        .any(|alias| current == kopia_owner_for_lease(alias))
 }
 
 /// Parse the `run-requested`/`run-mode` annotations into a manual-run request.
@@ -686,5 +862,159 @@ failurePolicy:
         assert_eq!(ManualRunMode::parse("full"), Some(ManualRunMode::Full));
         assert_eq!(ManualRunMode::parse("FULL"), None); // exact, lowercase only
         assert_eq!(serde_json::to_value(ManualRunMode::Quick).unwrap(), "quick");
+    }
+
+    // --- M6: cluster-qualified maintenance lease -----------------------------
+
+    #[test]
+    fn managed_lease_covers_all_four_arms() {
+        assert_eq!(
+            managed_lease(RepositoryKind::Repository, "media", "nas", None),
+            "kopiur/media/nas"
+        );
+        assert_eq!(
+            managed_lease(RepositoryKind::Repository, "media", "nas", Some("east")),
+            "kopiur/east/media/nas"
+        );
+        assert_eq!(
+            managed_lease(RepositoryKind::ClusterRepository, "ignored", "shared", None),
+            "kopiur/clusterrepository/shared"
+        );
+        assert_eq!(
+            managed_lease(
+                RepositoryKind::ClusterRepository,
+                "ignored",
+                "shared",
+                Some("east")
+            ),
+            "kopiur/east/clusterrepository/shared"
+        );
+    }
+
+    #[test]
+    fn legacy_lease_shapes_are_byte_identical_to_pre_m6() {
+        // 3-segment namespaced-Repository format: unchanged.
+        assert_eq!(
+            kopia_lease_identity("kopiur/media/nas"),
+            ("kopiur".to_string(), "kopiur-media-nas".to_string())
+        );
+        // 3-segment ClusterRepository format: unchanged.
+        assert_eq!(
+            kopia_lease_identity("kopiur/clusterrepository/shared"),
+            (
+                "kopiur".to_string(),
+                "kopiur-clusterrepository-shared".to_string()
+            )
+        );
+        // 2-segment hand-authored owner: unchanged (falls through to legacy).
+        assert_eq!(
+            kopia_lease_identity("kopia-operator/nas-primary"),
+            (
+                "kopiur".to_string(),
+                "kopia-operator-nas-primary".to_string()
+            )
+        );
+        // Mixed-case/punctuation whole-string sanitization: unchanged.
+        let (user, host) = kopia_lease_identity("kopiur/media/My_App.x");
+        assert_eq!(user, "kopiur");
+        assert_eq!(host, "kopiur-media-my-app-x");
+        // Long legacy leases still cap at a DNS label and never end with '-'.
+        let (_, host) = kopia_lease_identity(&format!("kopiur/{}/x", "n".repeat(100)));
+        assert!(host.len() <= 63, "{host}");
+        assert!(!host.ends_with('-'), "{host}");
+    }
+
+    /// Hardening (fix round 1): a hand-authored `Ownership.owner` that HAPPENS
+    /// to be 4 `/`-separated segments must NOT be mistaken for one of
+    /// `managed_lease`'s generated cluster-qualified formats — those are always
+    /// `"kopiur"`-first-segment. Without this gate, an owner like `a/b/c/d`
+    /// would silently change derivation from the legacy `a-b-c-d` to the
+    /// dot-joined `a.b.c.d` across an operator upgrade, and with
+    /// `takeoverPolicy: Never` maintenance would then yield forever.
+    #[test]
+    fn four_segment_non_kopiur_lease_is_legacy_byte_identical_to_pre_m6() {
+        assert_eq!(
+            kopia_lease_identity("a/b/c/d"),
+            ("kopiur".to_string(), "a-b-c-d".to_string())
+        );
+        // Still legacy even when the segments individually look plausible.
+        assert_eq!(
+            kopia_lease_identity("east/media/nas/extra"),
+            ("kopiur".to_string(), "east-media-nas-extra".to_string())
+        );
+    }
+
+    #[test]
+    fn cluster_qualified_lease_is_dot_joined_and_injective() {
+        // Verbatim dot-join for already-clean generated segments.
+        assert_eq!(
+            kopia_lease_identity("kopiur/east/media/nas"),
+            ("kopiur".to_string(), "kopiur.east.media.nas".to_string())
+        );
+        assert_eq!(
+            kopia_lease_identity("kopiur/east/clusterrepository/shared"),
+            (
+                "kopiur".to_string(),
+                "kopiur.east.clusterrepository.shared".to_string()
+            )
+        );
+
+        // Adversarial: a '-' inside a segment must not be forgeable into a
+        // fake '.' boundary (the whole-string collapse this replaces would
+        // make these two leases collide).
+        assert_ne!(
+            kopia_lease_identity("kopiur/east-prod/db/x").1,
+            kopia_lease_identity("kopiur/east/prod-db/x").1
+        );
+
+        // Two 32-char clusters sharing a 31-char prefix must stay distinct —
+        // the old cap-at-63 truncation would have collided these.
+        let cluster_a = format!("{}x", "a".repeat(31));
+        let cluster_b = format!("{}y", "a".repeat(31));
+        assert_eq!(cluster_a.len(), 32);
+        assert_eq!(cluster_b.len(), 32);
+        let lease_a = format!("kopiur/{cluster_a}/media/nas");
+        let lease_b = format!("kopiur/{cluster_b}/media/nas");
+        assert_ne!(
+            kopia_lease_identity(&lease_a).1,
+            kopia_lease_identity(&lease_b).1
+        );
+
+        // Dots land in the hostname, and the shared identity-shape validator
+        // (kopia's username/hostname contract) accepts them: dots are
+        // explicitly permitted, only '@'/':'/whitespace/control chars/length
+        // are rejected.
+        let (_, host) = kopia_lease_identity("kopiur/east/media/nas");
+        assert!(host.contains('.'));
+        assert!(crate::validate::validate_identity_component("hostname", &host).is_ok());
+    }
+
+    #[test]
+    fn lease_held_by_other_table() {
+        let lease = "kopiur/east/media/nas";
+        let alias = "kopiur/media/nas";
+        let mine = kopia_owner_for_lease(lease);
+        let alias_owner = kopia_owner_for_lease(alias);
+
+        // empty current: never-run repo, never "held by another".
+        assert!(!lease_held_by_other("", lease, &[]));
+        assert!(!lease_held_by_other("", lease, &[alias.to_string()]));
+        // own owner: not held by another, with or without aliases configured.
+        assert!(!lease_held_by_other(&mine, lease, &[]));
+        assert!(!lease_held_by_other(&mine, lease, &[alias.to_string()]));
+        // a registered alias's owner: treated as self (migration path).
+        assert!(!lease_held_by_other(
+            &alias_owner,
+            lease,
+            &[alias.to_string()]
+        ));
+        // the SAME owner string, but the alias isn't registered: foreign.
+        assert!(lease_held_by_other(&alias_owner, lease, &[]));
+        // a genuinely foreign owner, with an unrelated alias configured: foreign.
+        assert!(lease_held_by_other(
+            "someone@else",
+            lease,
+            &[alias.to_string()]
+        ));
     }
 }

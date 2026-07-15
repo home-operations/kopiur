@@ -16,6 +16,7 @@ use kopiur_api::common::{RepositoryKind, RepositoryRef};
 use kopiur_api::maintenance::{
     MaintenanceSpec, Ownership, RepositoryMaintenanceSpec, default_maintenance_schedule,
 };
+pub use kopiur_mover::workspec::RestampPolicy;
 
 use crate::consts::{
     CHECK_MAINTENANCE_ACTION, MAINTENANCE_APPLY_FAILED_REASON, MAINTENANCE_CONFIGURED_CONDITION,
@@ -218,6 +219,121 @@ pub fn classify_maintenance(
     (foreign, managed)
 }
 
+/// Whether an externally-authored `Maintenance` already covers repository
+/// `(kind, name)` — the [`MaintenanceCoverage::CoveredByForeign`] question,
+/// answered from the shared informer store so it is cheaply accessible at
+/// bootstrap-work-spec build time (M6), not just from inside
+/// [`ensure_maintenance`]'s own pass. A repository whose bootstrap discovers
+/// foreign coverage skips stamping/restamping a maintenance owner at all
+/// (`BootstrapRepositoryOp::maintenance_owner: None`) — a foreign Maintenance
+/// manages its own `ownership.owner`, which has no relation to this
+/// repository's lease-derived owner.
+///
+/// Degrade-not-crash: if the shared informer store has not synced yet, this
+/// conservatively answers `false` (unknown ⇒ proceed with the normal
+/// stamp/restamp path) rather than blocking bootstrap on cache warmth — the
+/// SAME cold-cache tradeoff [`ensure_maintenance`] already makes by skipping
+/// entirely until synced.
+pub fn maintenance_covered_by_foreign(
+    ctx: &Context,
+    kind: RepositoryKind,
+    owner_kind: &str,
+    name: &str,
+    match_namespace: Option<&str>,
+) -> bool {
+    if !ctx.maintenance_synced.load(Ordering::Relaxed) {
+        return false;
+    }
+    classify_maintenance(
+        ctx.maintenance_store.state().iter().map(|m| (**m).clone()),
+        kind,
+        owner_kind,
+        name,
+        match_namespace,
+    )
+    .0
+}
+
+/// The `BootstrapRepositoryOp` maintenance-owner / restamp-policy / alias
+/// triple for a repository's bootstrap work spec (M6).
+///
+/// `suppress` collects every reason bootstrap must not stamp/restamp a
+/// maintenance owner AT ALL: `mode: ReadOnly` (a read-only consumer repo
+/// connecting read-write to stamp an owner was exactly the bug that let it
+/// clobber the primary's — see the bootstrap `read_only` field instead),
+/// `spec.maintenance.enabled: false` (a deliberate opt-out), or an
+/// externally-authored `Maintenance` already covering the repository (see
+/// [`maintenance_covered_by_foreign`] — its own `ownership.owner` has no
+/// relation to this repository's lease-derived one). Every one of those is
+/// `None`, never merely "stamp with `AnyStale`".
+///
+/// When not suppressed: `cluster` absent keeps the pre-M6, single-cluster
+/// behavior ([`RestampPolicy::AnyStale`], no aliases — at most one cluster's
+/// operator ever bootstraps this repository, so any stale owner is provably
+/// this operator's own older stamp or kopia's ephemeral pod identity, never
+/// another cluster's). `cluster` present cluster-qualifies the owner and
+/// requires [`RestampPolicy::OwnFormatsOnly`] plus the PRE-cluster lease as
+/// the sole alias — the anti-ping-pong protection two clusters sharing a
+/// same-named repository need (see the variant's own doc for why).
+pub fn bootstrap_maintenance_owner_plan(
+    kind: RepositoryKind,
+    namespace: &str,
+    name: &str,
+    cluster: Option<&str>,
+    suppress: bool,
+) -> (Option<String>, RestampPolicy, Vec<String>) {
+    if suppress {
+        return (None, RestampPolicy::AnyStale, Vec::new());
+    }
+    let owner = kopiur_api::maintenance::kopia_owner_for_lease(
+        &kopiur_api::maintenance::managed_lease(kind, namespace, name, cluster),
+    );
+    match cluster {
+        None => (Some(owner), RestampPolicy::AnyStale, Vec::new()),
+        Some(_) => {
+            let legacy_owner = kopiur_api::maintenance::kopia_owner_for_lease(
+                &kopiur_api::maintenance::managed_lease(kind, namespace, name, None),
+            );
+            (
+                Some(owner),
+                RestampPolicy::OwnFormatsOnly,
+                vec![legacy_owner],
+            )
+        }
+    }
+}
+
+/// The maintenance owner an in-process (bare-path filesystem) `Repository`
+/// reconcile should stamp UNCONDITIONALLY on the pass that just CREATED the
+/// repository — mirrors the mover's create-path stamp
+/// (`crates/mover/src/main.rs`) exactly: kopia auto-assigns the controller
+/// pod's ephemeral identity as owner on `repository create`, and nothing
+/// recognizes that owner yet, so there is no staleness check to apply. This is
+/// distinct from — and takes priority over — the connect-to-existing
+/// self-heal, which must instead go through [`maintenance_restamp_target`]
+/// against the repository's already-recorded owner so it never clobbers a
+/// legitimate foreign one.
+///
+/// Returns `None` on a connect-to-existing pass (`created: false`) so the
+/// caller falls through to the self-heal path, and also returns `None`
+/// whenever `desired` is `None` — stamping is suppressed altogether
+/// (ReadOnly / `spec.maintenance.enabled: false` / foreign-covered) —
+/// regardless of `created`.
+///
+/// Fixes an M6 regression: the in-process create path used to hardcode
+/// `created: false` into `maintenance_restamp_target` even right after its own
+/// create, so a freshly-created bare-path `Repository` with
+/// `identityDefaults.cluster` set recorded the ephemeral pod identity as
+/// owner, and `RestampPolicy::OwnFormatsOnly` (required once `cluster` is set)
+/// refused to ever restamp it (the recorded owner is neither empty nor a
+/// recognized alias) — the managed `Maintenance`'s `takeoverPolicy: Never`
+/// then yielded forever. Pre-M6 self-healed this unconditionally; hand-authored
+/// owners are a separate concern (see [`bootstrap_maintenance_owner_plan`]'s
+/// `suppress` gate).
+pub fn in_process_create_owner_target(created: bool, desired: Option<&str>) -> Option<&str> {
+    if created { desired } else { None }
+}
+
 /// Build the operator-managed `Maintenance` CR projected from a repository's
 /// `spec.maintenance` (ADR §3.7). Pure — the reconciler server-side-applies the
 /// result. Naming is 1:1 with the repository (at most one `Maintenance` per
@@ -229,14 +345,36 @@ pub fn classify_maintenance(
 /// namespace for a `ClusterRepository`. The `repository` ref omits a namespace —
 /// a `Repository` ref resolves via the Maintenance's own namespace, and a
 /// `ClusterRepository` ref must not carry one.
+///
+/// `cluster` is `spec.identityDefaults.cluster` (M6): when set, the lease is
+/// cluster-qualified (`managed_lease`'s 4-segment format) and the PRE-cluster
+/// lease is recorded as the sole owner alias — the migration path so a
+/// repository that turns cluster identity on doesn't yield its own lease to
+/// what now looks like a foreign owner (`lease_held_by_other`). This CR is
+/// only ever projected while maintenance is `enabled` (see
+/// [`ensure_maintenance`]'s `Manage` arm), so "an alias exists only where
+/// maintenance actually runs" holds structurally — there is no managed
+/// `Maintenance` at all to carry a stale alias once disabled.
 pub fn build_managed_maintenance(
     kind: RepositoryKind,
     name: &str,
     placement_namespace: &str,
     spec: &RepositoryMaintenanceSpec,
     owner: OwnerReference,
+    cluster: Option<&str>,
 ) -> Maintenance {
-    let owner_lease = kopiur_api::maintenance::managed_lease(kind, placement_namespace, name);
+    let owner_lease =
+        kopiur_api::maintenance::managed_lease(kind, placement_namespace, name, cluster);
+    let owner_aliases = if cluster.is_some() {
+        vec![kopiur_api::maintenance::managed_lease(
+            kind,
+            placement_namespace,
+            name,
+            None,
+        )]
+    } else {
+        Vec::new()
+    };
     let mut m = Maintenance::new(
         name,
         MaintenanceSpec {
@@ -251,6 +389,7 @@ pub fn build_managed_maintenance(
                 .unwrap_or_else(default_maintenance_schedule),
             ownership: Ownership {
                 owner: owner_lease,
+                owner_aliases,
                 takeover_policy: spec.takeover_policy.unwrap_or_default(),
             },
             mover: spec.mover.clone(),
@@ -301,6 +440,10 @@ pub fn build_managed_maintenance(
 /// `match_namespace` is the repository's namespace for ref-matching (`None` for a
 /// `ClusterRepository`); `placement_namespace` is where the namespaced managed
 /// `Maintenance` lives (`None` → unresolved, only possible for a `ClusterRepository`).
+/// `cluster` is `spec.identityDefaults.cluster` (M6); threaded straight to
+/// [`build_managed_maintenance`] so the managed CR's lease format and alias
+/// follow the SAME live spec value this reconcile observed — SSA converges it
+/// promptly on a cluster change with no separate bootstrap/migration step.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_maintenance<K>(
     ctx: &Context,
@@ -314,6 +457,7 @@ pub async fn ensure_maintenance<K>(
     placement_namespace: Option<&str>,
     name: &str,
     maintenance: Option<&RepositoryMaintenanceSpec>,
+    cluster: Option<&str>,
     existing_conditions: &[Condition],
     observed_generation: Option<i64>,
 ) where
@@ -347,7 +491,7 @@ pub async fn ensure_maintenance<K>(
             let ns = placement_namespace.expect("Manage implies a resolved placement namespace");
             match owner_ref_for(obj, metric_kind) {
                 Ok(owner) => {
-                    let desired = build_managed_maintenance(kind, name, ns, &spec, owner);
+                    let desired = build_managed_maintenance(kind, name, ns, &spec, owner, cluster);
                     let mapi: Api<Maintenance> = Api::namespaced(ctx.client.clone(), ns);
                     match apply(&mapi, name, &desired).await {
                         Ok(_) => MaintenanceCoverage::CoveredByManaged,

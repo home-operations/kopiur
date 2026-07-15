@@ -33,20 +33,20 @@ pub mod validate;
 pub use backend::{Backend, NfsVolume, PvcVolume, RepoVolume};
 pub use cluster_repository::{
     AllowedNamespaces, ClusterRepoCredentialProjection, ClusterRepository, ClusterRepositorySpec,
-    ClusterRepositoryStatus, IdentityDefaults,
+    ClusterRepositoryStatus,
 };
 pub use common::{
-    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, InheritSecurityContextFrom,
-    MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel, PodSelector, PolicyRef,
-    PvcConsumerInherit, ResolvedMover, SourceColocation, SourceColocationMode,
-    effective_run_as_user, hardened_security_context, merge_pod_security_context, merge_resources,
-    merge_security_context, resolve_mover,
+    CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, IdentityDefaults,
+    InheritSecurityContextFrom, MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel,
+    PodSelector, PolicyRef, PvcConsumerInherit, ResolvedMover, SourceColocation,
+    SourceColocationMode, effective_run_as_user, hardened_security_context,
+    merge_pod_security_context, merge_resources, merge_security_context, resolve_mover,
 };
 pub use maintenance::{
     LeaseAction, Maintenance, MaintenanceSchedule, MaintenanceSpec, MaintenanceStatus,
     ManualRunMode, ManualRunPhase, ManualRunStatus, Ownership, RepositoryMaintenanceSpec,
     TakeoverPolicy, default_maintenance_schedule, kopia_lease_identity, kopia_owner_for_lease,
-    lease_action, managed_lease, parse_run_annotations,
+    lease_action, lease_held_by_other, managed_lease, parse_run_annotations,
 };
 pub use repository::{Repository, RepositoryPhase, RepositorySpec, RepositoryStatus};
 pub use repository_replication::{
@@ -75,7 +75,10 @@ pub use snapshot_schedule::{
 // Shared logic re-exports.
 pub use duration::{parse_go_duration, resolve_timeout};
 pub use error::{ValidationError, ValidationResult};
-pub use identity::{IdentityInputs, identity_string, resolve_identity, validate_identity_expr};
+pub use identity::{
+    HostClass, IdentityInputs, classify_hostname, identity_string, resolve_identity,
+    validate_identity_expr,
+};
 pub use jitter::{offset as jitter_offset, substitute_h};
 pub use preflight::{
     PreflightCheck, PreflightInputs, PreflightSpec, eval_preflight_expr, validate_preflight_expr,

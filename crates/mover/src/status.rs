@@ -1225,6 +1225,7 @@ mod tests {
         MaintenanceOp {
             mode,
             owner: "kopiur/prod/nas".into(),
+            owner_aliases: Vec::new(),
             takeover_policy: kopiur_api::TakeoverPolicy::Never,
         }
     }

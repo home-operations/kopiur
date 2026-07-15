@@ -4,11 +4,12 @@
 //! `SnapshotPolicy` is *edited* so its resolved identity changes — renamed, a
 //! namespace/label change feeding an `identityDefaults` CEL expression, a hand-edited
 //! `spec.identity`, or a per-source `sourcePathOverride` change — new snapshots land
-//! under the **new** kopia source while the old history orphans: GFS retention treats
-//! them as separate sources and never prunes the old set (a storage leak), and the new
-//! identity restarts retention from zero. That is silent data-loss, so the webhook
-//! **rejects** such an edit unless the operator acknowledges it with the
-//! [`ALLOW_IDENTITY_CHANGE_ANNOTATION`].
+//! under the **new** kopia source while the old history stays under the old one:
+//! restore/verify/`fromPolicy` resolve the new identity (old history is reachable only
+//! via `Restore.spec.source.identity`), and old- and new-lineage `Snapshot` CRs keep
+//! competing in the policy's one GFS retention timeline. That is a silent
+//! re-identification, so the webhook **rejects** such an edit unless the operator
+//! acknowledges it with the [`ALLOW_IDENTITY_CHANGE_ANNOTATION`].
 //!
 //! ## Pure core + thin IO (mirrors [`crate::identity_collision`])
 //!
@@ -18,8 +19,8 @@
 //!   complete).
 //! - [`check_identity_fork`] is the thin IO caller: it reads the old object's pinned
 //!   identity + history from `oldObject.status`, resolves the *new* identity (fetching
-//!   the referenced `ClusterRepository`'s `identityDefaults` for CEL), and calls the
-//!   pure decisions.
+//!   the referenced repository's — `Repository` or `ClusterRepository` —
+//!   `identityDefaults` for CEL), and calls the pure decisions.
 //! - It only fires on UPDATE, only when the policy has real history
 //!   (`status.lastSuccessfulSnapshot`), and **degrades to allow** when it cannot make
 //!   a confident decision (no client, or no pinned identity yet) — the same
@@ -51,8 +52,8 @@ fn acknowledged(annotations: Option<&BTreeMap<String, String>>) -> bool {
 ///   yet (`status.lastSuccessfulSnapshot` unset → no history to orphan);
 /// - checks per-source path forks purely (no client);
 /// - checks the `username@hostname` fork by resolving the new identity, which needs the
-///   `ClusterRepository` `identityDefaults` for CEL — if there is no client, or the old
-///   identity was never pinned, it degrades to allow.
+///   referenced repository's `identityDefaults` for CEL — if there is no client, or the
+///   old identity was never pinned, it degrades to allow.
 #[allow(clippy::too_many_arguments)]
 pub async fn check_identity_fork(
     client: Option<&Client>,
@@ -79,13 +80,18 @@ pub async fn check_identity_fork(
     // username@hostname fork: compare the previously-pinned identity against the
     // freshly-resolved one. The old identity must have been pinned (else there is no
     // baseline — degrade to allow), and resolving the new identity needs the
-    // ClusterRepository identityDefaults (CEL), so without a client we degrade to allow.
+    // referenced repository's identityDefaults (CEL), so without a client we degrade
+    // to allow.
     let old_id = old_status.resolved.as_ref()?.identity.as_ref()?;
     let old_uh = format!("{}@{}", old_id.username, old_id.hostname);
 
     let client = client?;
-    let defaults =
-        crate::identity_collision::cluster_repo_defaults_for(client, &new_spec.repository).await;
+    let defaults = crate::identity_collision::cluster_repo_defaults_for(
+        client,
+        &new_spec.repository,
+        namespace,
+    )
+    .await;
     let new_id = crate::identity_collision::resolve_policy_identity(
         name,
         namespace,

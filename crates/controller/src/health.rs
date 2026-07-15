@@ -3,7 +3,7 @@
 //! kopia's content index is a set of "index blobs" that periodic maintenance
 //! compacts. When maintenance stops keeping up — most often because a stale
 //! maintenance-lease owner makes every run yield (see
-//! `crates/mover/src/main.rs::maintenance_restamp_target`) — the index-blob count
+//! `kopiur_mover::workspec::maintenance_restamp_target`) — the index-blob count
 //! climbs unbounded and kopia eventually warns "Found too many index blobs (N)",
 //! after which backups degrade.
 //!

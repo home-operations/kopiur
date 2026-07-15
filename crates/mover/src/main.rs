@@ -35,7 +35,7 @@ use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
 use kopiur_mover::env::{RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
-use kopiur_mover::resolve::match_current_manifest;
+use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
     StatusReporter, StatusUpdate, lease_blocked_body, maintenance_failed_body,
@@ -43,9 +43,9 @@ use kopiur_mover::status::{
     verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
-    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
-    Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor,
-    SnapshotPinOp, VerifyOp, VerifyTier,
+    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
+    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
+    SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier, maintenance_restamp_target,
 };
 
 fn main() -> std::process::ExitCode {
@@ -374,31 +374,42 @@ async fn run_operation(
             // all key on this identity.
             let id = &spec.identity;
             let override_source = format!("{}@{}:{}", id.username, id.hostname, id.source_path);
+            let identity_scope = format!("{}@{}", id.username, id.hostname);
             // Apply the resolved kopia `policy set` knobs (compression / never-compress
             // / ignore rules / ignore-cache-dirs / backup-side error handling / upload
             // parallelism / extraArgs) against this snapshot's source identity BEFORE
             // creating the snapshot, so SnapshotPolicy.spec.{compression,files,
             // errorHandling,upload,extraArgs} actually reach kopia (ADR-0005 §13(b)/§13(f),
-            // ADR-0004 §4b). Skipped when nothing is configured.
+            // ADR-0004 §4b). The path-scoped `policy set` is skipped when nothing is
+            // configured, but the identity-scoped one below ALWAYS runs — it also
+            // carries the mandatory `KOPIA_KEEP_MAX` retention pin (see its doc
+            // comment): kopia's `snapshot create` unconditionally applies the
+            // source's OWN retention policy after every create, so an unset
+            // identity policy would otherwise fall back to kopia's defaults
+            // (keep-latest 10, …), silently deleting manifests a Kopiur `Snapshot`
+            // CR still references.
+            let mut user_identity_policy = None;
             if !op.policy.is_empty() {
                 // kopia rejects `--max-parallel-snapshots` on a path-scoped
                 // policy ("only global, username@hostname or @hostname"), so
-                // that one knob is applied in a second `policy set` at the
-                // identity scope (the policy_knobs e2e regression).
-                let (path_policy, identity_policy) =
+                // that one knob is folded into the identity-scope policy_set
+                // below instead of the path-scoped one (the policy_knobs e2e
+                // regression).
+                let (path_policy, split_identity_policy) =
                     kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
                 client
                     .policy_set(&override_source, &path_policy)
                     .await
                     .map_err(kopia(KopiaOp::PolicySet))?;
-                if let Some(p) = identity_policy {
-                    let identity_scope = format!("{}@{}", id.username, id.hostname);
-                    client
-                        .policy_set(&identity_scope, &p)
-                        .await
-                        .map_err(kopia(KopiaOp::PolicySet))?;
-                }
+                user_identity_policy = split_identity_policy;
             }
+            client
+                .policy_set(
+                    &identity_scope,
+                    &identity_retention_policy(user_identity_policy),
+                )
+                .await
+                .map_err(kopia(KopiaOp::PolicySet))?;
             let result = client
                 .snapshot_create_with(
                     &op.source_path,
@@ -766,7 +777,13 @@ async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Optio
         return None;
     }
     let list = client.snapshot_list(None).await.ok()?;
-    match_current_manifest(&list, &anchor.source_path, anchor.start_instant()).map(|e| e.id.clone())
+    match_current_manifest(
+        &list,
+        &anchor.source_path,
+        anchor.start_instant(),
+        anchor.identity_filter(),
+    )
+    .map(|e| e.id.clone())
 }
 
 /// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
@@ -789,7 +806,12 @@ async fn pin_start_anchor(
 /// After a pin/unpin, re-resolve the snapshot's CURRENT manifest id (kopia
 /// rewrote it) into a `SnapshotInfo` for `status.snapshot`. Matches on the
 /// snapshot's stable source path (anchor, else the resolved identity) plus the
-/// pre-pin start-time anchor. `None` when unresolvable or ambiguous.
+/// pre-pin start-time anchor, narrowed by `op.anchor.identity_filter()`
+/// (`username`/`hostname`) when the anchor carries one — required so a shared
+/// repository never cross-matches another namespace's or cluster's snapshot
+/// that happens to share the exact same source path (see
+/// `kopiur_mover::resolve::match_current_manifest`). `None` when unresolvable
+/// or ambiguous.
 async fn resolve_pinned_info(
     client: &KopiaClient,
     op: &SnapshotPinOp,
@@ -802,7 +824,7 @@ async fn resolve_pinned_info(
         op.anchor.source_path.clone()
     };
     let list = client.snapshot_list(None).await.ok()?;
-    let entry = match_current_manifest(&list, &source_path, start)?;
+    let entry = match_current_manifest(&list, &source_path, start, op.anchor.identity_filter())?;
     Some(SnapshotInfo {
         kopia_snapshot_id: entry.id.clone(),
         identity: ResolvedIdentity {
@@ -869,30 +891,45 @@ async fn run_bootstrap_flow(
     }
 }
 
-/// Decide whether the bootstrap mover should re-stamp the stable maintenance
-/// owner on a *connect-to-existing* repository. Returns `Some(owner)` to stamp,
-/// or `None` to leave the recorded owner alone.
-///
-/// The self-heal fires only when ALL hold:
-///   * `!created` — on a repo we just CREATED the owner was already stamped
-///     unconditionally, so re-reading/re-stamping would be redundant work.
-///   * a stable owner is configured (`desired.is_some()`).
-///   * kopia's currently-recorded `current` owner differs from `desired` — i.e.
-///     it's the ephemeral bootstrap-pod identity (or any foreign value), the
-///     exact state that makes `takeoverPolicy: Never` maintenance yield forever.
-///
-/// Pulled out of `run_bootstrap` so the gate is unit-testable without spawning
-/// kopia. The string we return is `kopia_owner_for_lease(managed_lease(..))` —
-/// exactly the `my_owner` the maintenance mover compares against, so after a
-/// re-stamp `held_by_other` is false and `maintenance run` proceeds.
-fn maintenance_restamp_target<'a>(
-    created: bool,
-    desired: Option<&'a str>,
-    current: &str,
-) -> Option<&'a str> {
-    match desired {
-        Some(owner) if !created && current != owner => Some(owner),
-        _ => None,
+/// Build the identity-scope `policy set` args applied before every `snapshot
+/// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
+/// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
+/// (the one knob `split_policy_scopes` moves to the identity scope —
+/// currently only `max_parallel_snapshots`) folded in on top when the
+/// operator configured it. Pulled out of `run_operation` so the mandatory
+/// pin is unit-testable without spawning kopia.
+fn identity_retention_policy(
+    user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
+) -> kopiur_kopia::PolicyArgs {
+    kopiur_kopia::PolicyArgs {
+        keep_latest: Some(KOPIA_KEEP_MAX),
+        keep_hourly: Some(KOPIA_KEEP_MAX),
+        keep_daily: Some(KOPIA_KEEP_MAX),
+        keep_weekly: Some(KOPIA_KEEP_MAX),
+        keep_monthly: Some(KOPIA_KEEP_MAX),
+        keep_annual: Some(KOPIA_KEEP_MAX),
+        max_parallel_snapshots: user_identity_policy.and_then(|p| p.max_parallel_snapshots),
+        ..Default::default()
+    }
+}
+
+/// Connect for bootstrap, honoring [`BootstrapRepositoryOp::read_only`]
+/// (M6): a `mode: ReadOnly` repository's bootstrap connects with `--readonly`
+/// (`repository_connect_readonly`) instead of the normal read-write connect —
+/// bootstrap is a connect/scan probe, and a read-write connect from a
+/// ReadOnly consumer repo was exactly what let it clobber the primary's
+/// maintenance owner. Every other mover flow (restore, delete, snapshot)
+/// stays on the plain read-write connect regardless.
+async fn bootstrap_connect(
+    client: &KopiaClient,
+    spec: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+    read_only: bool,
+) -> std::result::Result<(), KopiaError> {
+    if read_only {
+        client.repository_connect_readonly(spec, cache).await
+    } else {
+        client.repository_connect(spec, cache).await
     }
 }
 
@@ -909,7 +946,7 @@ async fn run_bootstrap(
     // it connects with kopia's default cache budgets.
     let cache = kopiur_kopia::CacheTuning::default();
     let mut created = false;
-    if let Err(e) = client.repository_connect(&connect_spec, cache).await {
+    if let Err(e) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
         if !should_attempt_create(op.auto_create, e.class()) {
             // We will NOT create. Two distinct decline reasons → two distinct,
             // accurate messages:
@@ -945,7 +982,7 @@ async fn run_bootstrap(
         {
             return BootstrapResult::failed(&ce);
         }
-        if let Err(ce) = client.repository_connect(&connect_spec, cache).await {
+        if let Err(ce) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
             return BootstrapResult::failed(&ce);
         }
         created = true;
@@ -980,8 +1017,13 @@ async fn run_bootstrap(
     if !created && let Some(desired) = op.maintenance_owner.as_deref() {
         match client.maintenance_info().await {
             Ok(info) => {
-                if let Some(owner) = maintenance_restamp_target(created, Some(desired), &info.owner)
-                {
+                if let Some(owner) = maintenance_restamp_target(
+                    created,
+                    Some(desired),
+                    op.restamp_policy,
+                    &op.maintenance_owner_aliases,
+                    &info.owner,
+                ) {
                     match client.maintenance_set_owner(owner).await {
                         Ok(()) => info!(
                             %owner,
@@ -1008,28 +1050,33 @@ async fn run_bootstrap(
         Err(e) => return BootstrapResult::failed(&e),
     };
 
-    // Always list to report an authoritative snapshot count; return the entries
-    // for materialization only when scanning is requested.
+    // Always list to report an authoritative snapshot count (unaffected by either
+    // the foreign-suffix prefilter or the cap below); return the entries for
+    // materialization only when scanning is requested.
     let listing = match client.snapshot_list(None).await {
         Ok(l) => l,
         Err(e) => return BootstrapResult::failed(&e),
     };
     let snapshot_count = listing.len() as i64;
-    let (snapshots, truncated) = if op.scan_catalog {
-        let truncated = listing.len() > MAX_RETURNED_SNAPSHOTS;
-        let mut s = listing;
-        if truncated {
-            s.truncate(MAX_RETURNED_SNAPSHOTS);
-        }
-        (s, truncated)
+    let (snapshots, truncated, foreign_suffix_dropped) = if op.scan_catalog {
+        kopiur_mover::bootstrap::prepare_catalog_entries(
+            listing,
+            op.catalog_foreign_prefilter_cluster.as_deref(),
+        )
     } else {
-        (Vec::new(), false)
+        (Vec::new(), false, 0)
     };
     if truncated {
         warn!(
             snapshot_count,
             returned = MAX_RETURNED_SNAPSHOTS,
             "more snapshots than the materialization cap; only the newest were returned"
+        );
+    }
+    if foreign_suffix_dropped > 0 {
+        info!(
+            dropped = foreign_suffix_dropped,
+            "dropped foreign-cluster snapshot entries before the materialization cap"
         );
     }
 
@@ -1054,6 +1101,7 @@ async fn run_bootstrap(
         snapshot_count,
         snapshots,
         truncated,
+        foreign_suffix_dropped,
         index_blob_count,
     )
 }
@@ -1173,12 +1221,27 @@ async fn run_maintenance_flow(
             });
         }
     };
-    // Held by another when kopia's recorded owner is neither empty nor OUR
-    // stable identity. Comparing against `op.owner` (the logical lease string,
-    // never a kopia user@hostname) was the bug that made every run on a
+    // Held by another when kopia's recorded owner is neither empty, OUR stable
+    // identity, nor one of our recognized owner-format aliases (the M6
+    // migration path — a repo whose managed Maintenance moved to a new lease
+    // format still recognizes what it used to stamp as itself). Comparing
+    // against `op.owner` (the logical lease string, never a kopia
+    // user@hostname) directly was the bug that made every run on a
     // mover-bootstrapped repo yield forever.
-    let my_owner = kopiur_api::maintenance::kopia_owner_for_lease(&op.owner);
-    let held_by_other = !info.owner.is_empty() && info.owner != my_owner;
+    let held_by_other =
+        kopiur_api::maintenance::lease_held_by_other(&info.owner, &op.owner, &op.owner_aliases);
+    // Shared remediation appended to both blocked outcomes below: this mover
+    // cannot tell a hand-authored Maintenance from an operator-managed one
+    // (that distinction lives on the CR's ownerReferences, which the work spec
+    // doesn't carry), so it is worded neutrally — conditioned on "for
+    // operator-managed maintenance" rather than asserted outright. Hand-authored
+    // Maintenance CRs are always honored regardless of any Repository's
+    // `spec.maintenance`, so telling every reader to flip `enabled: false` would
+    // be actively wrong advice for those.
+    const REMEDIATION: &str = "for operator-managed maintenance: if another cluster is the \
+         designated maintenance runner, set spec.maintenance.enabled: false on this \
+         repository's non-owner clusters; to move ownership here instead, set \
+         ownership.takeoverPolicy: Force once";
     match lease_action(op.takeover_policy, held_by_other) {
         LeaseAction::Yield => {
             patch_maintenance_status(
@@ -1187,7 +1250,7 @@ async fn run_maintenance_flow(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_HELD_BY_OTHER_REASON,
                     &format!(
-                        "maintenance lease held by {}; takeoverPolicy=Never",
+                        "maintenance lease held by {}; takeoverPolicy=Never ({REMEDIATION})",
                         info.owner
                     ),
                 ),
@@ -1202,10 +1265,7 @@ async fn run_maintenance_flow(
                 &lease_blocked_body(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_TAKEOVER_PROMPT_REASON,
-                    &format!(
-                        "lease held by {}; set takeoverPolicy=Force to claim",
-                        info.owner
-                    ),
+                    &format!("lease held by {}; {REMEDIATION}", info.owner),
                 ),
             )
             .await;
@@ -1438,18 +1498,28 @@ async fn run_verify_flow(
     Ok(())
 }
 
-/// The newest snapshot for this run's identity, by source path (the kopia catalog
-/// records the path authoritatively; the pod's user/host differ). The full manifest
-/// entry is returned so callers can read both its id (deep-verify restore target) and
-/// its `stats` (quick-verify predicate environment).
+/// The newest snapshot for this run's identity: source path AND
+/// username/hostname must all match, not path alone — the same path repeats
+/// across namespaces (and, in a shared repository, across clusters), so a
+/// path-only pick could quick/deep-verify or restore-heal a DIFFERENT
+/// source's data. Reuses [`kopiur_mover::resolve::matches_source`], the same
+/// identity-aware predicate the delete/pin self-heal matchers use. The full
+/// manifest entry is returned so callers can read both its id (deep-verify
+/// restore target) and its `stats` (quick-verify predicate environment).
 async fn resolve_latest_snapshot(
     client: &KopiaClient,
     spec: &MoverWorkSpec,
 ) -> Result<Option<kopiur_kopia::SnapshotListEntry>, KopiaError> {
     let mut list = client.snapshot_list(None).await?;
     list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
-    let path = &spec.identity.source_path;
-    Ok(list.into_iter().find(|e| e.source.path == *path))
+    let identity = &spec.identity;
+    Ok(list.into_iter().find(|e| {
+        matches_source(
+            e,
+            &identity.source_path,
+            Some((&identity.username, &identity.hostname)),
+        )
+    }))
 }
 
 /// Best-effort recursive file count under `dir` for the deep-verify result
@@ -1765,61 +1835,33 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 mod tests {
     use super::*;
 
-    // --- maintenance-owner self-heal gate (connect-to-existing re-stamp) ---
+    // --- M0b: identity-scope retention pin (KOPIA_KEEP_MAX) is mandatory ---
 
     #[test]
-    fn restamp_fires_on_existing_repo_with_foreign_owner() {
-        // The bug case: connect-to-existing (`created == false`), a stable owner
-        // is configured, and kopia recorded a foreign (ephemeral) owner. The
-        // self-heal must re-stamp the stable owner so `takeoverPolicy: Never`
-        // maintenance stops yielding forever.
-        assert_eq!(
-            maintenance_restamp_target(
-                false,
-                Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
-                "nonroot@rustfs-kopiur-bootstrap-5trlr",
-            ),
-            Some("kopiur@kopiur-clusterrepository-rustfs-kopiur"),
-        );
+    fn identity_retention_policy_always_pins_keep_max_with_no_user_policy() {
+        let p = identity_retention_policy(None);
+        assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_hourly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_daily, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_weekly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_monthly, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.max_parallel_snapshots, None);
     }
 
     #[test]
-    fn restamp_skipped_when_owner_already_stable() {
-        // Idempotent: the recorded owner already equals the stable value, so
-        // there is nothing to heal and we avoid a needless `maintenance set`.
-        assert_eq!(
-            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), "kopiur@kopiur-prod"),
-            None,
-        );
-    }
-
-    #[test]
-    fn restamp_skipped_on_create_path() {
-        // On CREATE the owner is stamped unconditionally elsewhere; the connect
-        // self-heal must not also fire (even if `current` looks foreign).
-        assert_eq!(
-            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), "ephemeral@pod-xyz"),
-            None,
-        );
-    }
-
-    #[test]
-    fn restamp_skipped_without_configured_owner() {
-        // No stable owner configured (e.g. maintenance disabled) → never stamp.
-        assert_eq!(
-            maintenance_restamp_target(false, None, "ephemeral@pod-xyz"),
-            None
-        );
-    }
-
-    #[test]
-    fn restamp_heals_empty_recorded_owner() {
-        // An empty recorded owner is still foreign relative to the stable value,
-        // so we stamp it (kopia would otherwise leave it unowned).
-        assert_eq!(
-            maintenance_restamp_target(false, Some("kopiur@kopiur-prod"), ""),
-            Some("kopiur@kopiur-prod"),
-        );
+    fn identity_retention_policy_folds_in_user_max_parallel_snapshots() {
+        // The one user knob kopia allows only at identity/global scope
+        // (`split_policy_scopes`) rides alongside the mandatory pin, not
+        // instead of it.
+        let user = kopiur_kopia::PolicyArgs {
+            max_parallel_snapshots: Some(3),
+            ..Default::default()
+        };
+        let p = identity_retention_policy(Some(user));
+        assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
+        assert_eq!(p.max_parallel_snapshots, Some(3));
     }
 
     // --- `kopiur-mover ready` probe mode: the pure marker decision ---

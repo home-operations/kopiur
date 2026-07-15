@@ -3,40 +3,63 @@
 //! Kopia records every snapshot under `username@hostname:sourcePath`. Kopiur makes
 //! that identity an explicit, overridable part of the API rather than an accident
 //! of `metadata.name`/`metadata.namespace` (ADR §2.2 principle 9). This module is
-//! the single place the defaulting + templating rules live; the webhook calls it at
-//! admission and pins the result into `status.resolved.identity`, which is **never
-//! re-rendered** afterwards (ADR §4.2).
+//! the single place the defaulting + templating rules live. The webhook calls it
+//! at admission (so a bad expression/component is rejected on `kubectl apply`) and
+//! the controller calls it again on every reconcile, resolving from the LIVE
+//! `SnapshotPolicy.spec.identity` and the LIVE referenced repository's
+//! `identityDefaults` — **not** a value pinned once and frozen. `status.resolved.identity`
+//! mirrors the most recent resolution for observability; it is not the source of
+//! truth a later run reads back. What actually keeps an already-snapshotted policy
+//! stable is the fork guard (`ValidationError::IdentityWouldFork`/
+//! `RepositoryIdentityWouldFork`): an edit that would change the resolved identity
+//! on a policy (or repository) with existing history is rejected at admission
+//! unless acknowledged with the `allow-identity-change` annotation.
 //!
 //! ## Defaults (ADR §4.2)
 //! - `username` ← `SnapshotPolicy.metadata.name`
 //! - `hostname` ← namespace
 //! - `sourcePath` ← `/pvc/<pvcName>`
 //!
-//! ## ClusterRepository identity expressions (CEL)
+//! ## Repository/ClusterRepository identity expressions (CEL)
 //!
-//! A [`crate::cluster_repository::IdentityDefaults`] supplies
-//! `hostnameExpr`/`usernameExpr`, **CEL** expressions ([`cel`]) evaluated at
-//! admission (ADR-0004 §5). A consumer's explicit [`Identity`] override **always
+//! A [`crate::common::IdentityDefaults`] (`Repository.spec.identityDefaults` or
+//! `ClusterRepository.spec.identityDefaults`) supplies `hostnameExpr`/
+//! `usernameExpr`, **CEL** expressions ([`cel`]) validated (compiled + trial-evaluated
+//! via [`validate_identity_expr`]) at admission, then actually rendered against the
+//! LIVE consumer + LIVE repository on every reconcile (ADR-0004 §5) — so editing
+//! `identityDefaults` re-renders every consumer that resolves through it on its
+//! next backup (guarded by [`ValidationError::RepositoryIdentityWouldFork`], see
+//! the module intro above). A consumer's explicit [`Identity`] override **always
 //! wins** over the expression.
 //!
 //! ### CEL environment
 //!
 //! Each expression returns a **string** and is evaluated against:
 //! `namespace` (the consumer's namespace), `policyName` (the `SnapshotPolicy`'s
-//! name), `labels` and `annotations` (its metadata maps). Examples:
-//! `hostnameExpr: "namespace"`, `usernameExpr: "namespace + '-' + policyName"`,
-//! `"'team' in labels ? labels['team'] : namespace"`. CEL is sandboxed (no I/O, no
-//! arbitrary code); a syntax error or out-of-scope variable is rejected at
-//! `kubectl apply` via [`validate_identity_expr`], and a non-string result is a
-//! typed error. Expressions are length-capped ([`MAX_EXPR_LEN`]) as the
-//! cost-budget surrogate.
+//! name), `labels` and `annotations` (its metadata maps), and `cluster`
+//! ([`IdentityDefaults::cluster`], or `""` when unset — see [`identity_context`]).
+//! Examples: `hostnameExpr: "namespace"`,
+//! `usernameExpr: "namespace + '-' + policyName"`,
+//! `"'team' in labels ? labels['team'] : namespace"`,
+//! `"namespace + '.' + cluster"`. CEL is sandboxed (no I/O, no arbitrary code); a
+//! syntax error or out-of-scope variable is rejected at `kubectl apply` via
+//! [`validate_identity_expr`], and a non-string result is a typed error.
+//! Expressions are length-capped ([`MAX_EXPR_LEN`]) as the cost-budget surrogate.
+//!
+//! ### Multi-cluster hostname default
+//!
+//! When a repository's [`IdentityDefaults::cluster`] is set, the default
+//! (no override, no `hostnameExpr`) kopia identity hostname becomes
+//! `<namespace>.<cluster>` instead of bare `<namespace>`, so N clusters sharing one
+//! repository never collide on a same-named namespace. [`classify_hostname`]
+//! recovers the namespace/cluster split on the read path (retention, discovered
+//! `Snapshot` placement).
 
 use std::collections::BTreeMap;
 
 use cel::{Context, Program, Value};
 
-use crate::cluster_repository::IdentityDefaults;
-use crate::common::{Identity, ResolvedIdentity};
+use crate::common::{Identity, IdentityDefaults, ResolvedIdentity};
 use crate::error::{ValidationError, ValidationResult};
 
 /// Maximum CEL expression length accepted at admission (the cost-budget surrogate;
@@ -56,8 +79,11 @@ pub struct IdentityInputs<'a> {
     pub namespace: &'a str,
     /// Explicit overrides from `SnapshotPolicy.spec.identity`, if any.
     pub overrides: Option<&'a Identity>,
-    /// `ClusterRepository.spec.identityDefaults` (CEL `*Expr`), if the consumer
-    /// targets one.
+    /// The referenced repository's `spec.identityDefaults` — `Repository` or
+    /// `ClusterRepository`, whichever the consumer targets. Carries the CEL
+    /// `*Expr` pair (`hostnameExpr`/`usernameExpr`) AND `cluster`, the
+    /// multi-cluster hostname-default suffix (see [`IdentityDefaults::cluster`]
+    /// and the module's "Multi-cluster hostname default" section).
     pub defaults: Option<&'a IdentityDefaults>,
     /// The consumer's `metadata.labels`, exposed to CEL as `labels`.
     pub labels: Option<&'a BTreeMap<String, String>>,
@@ -94,7 +120,11 @@ fn compile_expr(expr: &str) -> ValidationResult<Program> {
 }
 
 /// Build the CEL evaluation context for identity expressions: `namespace`,
-/// `policyName`, `labels`, `annotations`.
+/// `policyName`, `labels`, `annotations`, `cluster`. `cluster` is **always**
+/// declared (so an expression referencing it never hits an undeclared-variable
+/// error), taking `inputs.defaults.and_then(|d| d.cluster.as_deref())` or `""`
+/// when the consumer's repository has no `identityDefaults.cluster` set (bare
+/// single-cluster deployments never see a `cluster` variable value).
 fn identity_context<'a>(inputs: &IdentityInputs<'_>) -> Context<'a> {
     let mut ctx = Context::default();
     // `add_variable` only errors if a value cannot serialize; these are
@@ -104,6 +134,11 @@ fn identity_context<'a>(inputs: &IdentityInputs<'_>) -> Context<'a> {
     let _ = ctx.add_variable("policyName", inputs.object_name);
     let _ = ctx.add_variable("labels", inputs.labels.unwrap_or(&empty));
     let _ = ctx.add_variable("annotations", inputs.annotations.unwrap_or(&empty));
+    let cluster = inputs
+        .defaults
+        .and_then(|d| d.cluster.as_deref())
+        .unwrap_or("");
+    let _ = ctx.add_variable("cluster", cluster);
     ctx
 }
 
@@ -135,23 +170,33 @@ fn render_expr(expr: &str, inputs: &IdentityInputs<'_>) -> ValidationResult<Stri
     eval_expr(expr, &program, inputs)
 }
 
-/// Validate a `ClusterRepository.identityDefaults` CEL expression at admission
-/// (ADR-0004 §5): it must compile, and — because CEL reports an out-of-scope
-/// variable only at *evaluation* time — it must also evaluate against a
-/// representative context without referencing an undeclared variable. A non-string
-/// result is rejected. Missing *map keys* (e.g. `labels['env']` when the trial data
-/// lacks `env`) are tolerated: they are data-dependent, not a structural error.
+/// Validate a `Repository`/`ClusterRepository` `identityDefaults` CEL expression
+/// at admission (ADR-0004 §5): it must compile, and — because CEL reports an
+/// out-of-scope variable only at *evaluation* time — it must also evaluate
+/// against a representative context without referencing an undeclared variable.
+/// A non-string result is rejected. Missing *map keys* (e.g. `labels['env']`
+/// when the trial data lacks `env`) are tolerated: they are data-dependent, not
+/// a structural error.
 pub fn validate_identity_expr(expr: &str) -> ValidationResult {
     let program = compile_expr(expr)?;
     // Representative trial context: non-empty maps so `'k' in labels`-style guards
-    // behave, plus placeholder scalars.
+    // behave, plus placeholder scalars. `cluster` gets a non-empty placeholder too
+    // (rather than the "unset" empty string [`identity_context`] would otherwise
+    // supply) so an expression referencing it — e.g. `namespace + '.' + cluster` —
+    // trial-evaluates the same way regardless of whether *this particular*
+    // repository happens to set `identityDefaults.cluster`.
     let labels = BTreeMap::from([("app".to_string(), "trial".to_string())]);
     let annotations = BTreeMap::from([("note".to_string(), "trial".to_string())]);
+    let trial_defaults = IdentityDefaults {
+        cluster: Some("trial-cluster".to_string()),
+        hostname_expr: None,
+        username_expr: None,
+    };
     let inputs = IdentityInputs {
         object_name: "policy",
         namespace: "namespace",
         overrides: None,
-        defaults: None,
+        defaults: Some(&trial_defaults),
         labels: Some(&labels),
         annotations: Some(&annotations),
         pvc_name: None,
@@ -178,10 +223,18 @@ pub fn validate_identity_expr(expr: &str) -> ValidationResult {
     }
 }
 
-/// Resolve a [`ResolvedIdentity`] from defaults, an optional `ClusterRepository`
-/// identity expression set, and explicit consumer overrides (ADR §4.2 / ADR-0004 §5).
+/// Resolve a [`ResolvedIdentity`] from defaults, an optional `Repository`/
+/// `ClusterRepository` identity expression set, and explicit consumer overrides
+/// (ADR §4.2 / ADR-0004 §5).
 ///
-/// Precedence per component: **explicit override > expression > default**. Returns a
+/// Precedence per component: **explicit override, then expression, then default**.
+/// For `hostname` specifically, the default step itself has two tiers: with
+/// [`IdentityDefaults::cluster`] set, the default is `<namespace>.<cluster>`
+/// (M1, multi-cluster shared repositories); otherwise it's the bare `namespace`
+/// (ADR §4.2). So the full hostname chain, highest precedence first, is:
+/// explicit override, `hostnameExpr`, `<namespace>.<cluster>` (cluster set),
+/// `namespace`. `username` is unaffected — `cluster` is not part of its default.
+/// Returns a
 /// [`ValidationError::IdentityExprCompile`]/`IdentityExprEval`/`IdentityExprType` if a
 /// supplied expression fails (so the webhook rejects it at admission rather than
 /// pinning garbage).
@@ -224,7 +277,14 @@ pub fn resolve_identity(inputs: &IdentityInputs<'_>) -> ValidationResult<Resolve
         Some(h) => h.to_string(),
         None => match inputs.defaults.and_then(|t| t.hostname_expr.as_deref()) {
             Some(expr) => render_expr(expr, inputs)?,
-            None => inputs.namespace.to_string(),
+            // No explicit expression: fall back to `<namespace>.<cluster>` when this
+            // repository has a cluster identity configured (M1 — distinguishes
+            // same-named namespaces across clusters sharing one repository), else the
+            // plain namespace (ADR §4.2).
+            None => match inputs.defaults.and_then(|d| d.cluster.as_deref()) {
+                Some(cluster) => format!("{}.{cluster}", inputs.namespace),
+                None => inputs.namespace.to_string(),
+            },
         },
     };
 
@@ -285,6 +345,89 @@ pub fn identity_string(id: &ResolvedIdentity) -> String {
     }
 }
 
+/// Classification of a snapshot identity hostname relative to THIS cluster.
+/// Kubernetes namespace names cannot contain `.`, so the FIRST `.` unambiguously
+/// ends the namespace part of a `<namespace>.<cluster>` hostname. Total: with no
+/// cluster identity every hostname is `Bare`; an empty namespace part (".east")
+/// or empty suffix ("ns.") also classifies `Bare` (never a panic, never an
+/// invalid empty namespace). Suffix comparison is case-sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostClass<'a> {
+    /// No dot (or cluster mode off): the legacy `hostname == namespace` form.
+    Bare {
+        /// The hostname verbatim (there is no separate suffix to strip).
+        namespace: &'a str,
+    },
+    /// `<namespace>.<suffix>` where suffix == this cluster: written by us.
+    OwnCluster {
+        /// The part of the hostname before the first `.`.
+        namespace: &'a str,
+    },
+    /// `<namespace>.<suffix>` with a different suffix: another cluster's.
+    ForeignCluster {
+        /// Everything after the first `.` (may itself contain further dots).
+        suffix: &'a str,
+    },
+}
+
+/// Classify a kopia identity `hostname` against `my_cluster`
+/// ([`IdentityDefaults::cluster`], resolved from the consuming repository), so a
+/// reader (retention pruning, discovered-`Snapshot` placement) can tell whether a
+/// hostname it sees was written by this cluster, another cluster sharing the same
+/// repository, or predates cluster identity entirely.
+///
+/// Total and pure — never panics, never fabricates an empty namespace:
+/// - `my_cluster` is `None` or `""` (no cluster identity configured): always
+///   [`HostClass::Bare`].
+/// - No `.` in `hostname`: [`HostClass::Bare`].
+/// - The part before the first `.` is empty (e.g. `".east"`), or the part after
+///   is empty (e.g. `"ns."`): [`HostClass::Bare`] with the **whole** hostname as
+///   `namespace` — these aren't well-formed `<namespace>.<cluster>` hostnames, so
+///   classification declines to guess which part is which.
+/// - The suffix (everything after the first `.`) exactly equals `my_cluster`:
+///   [`HostClass::OwnCluster`].
+/// - Otherwise: [`HostClass::ForeignCluster`] — note `"ns.east.x"` under cluster
+///   `"east"` is `ForeignCluster { suffix: "east.x" }`, not `OwnCluster`; only an
+///   **exact** suffix match is ours.
+///
+/// ```
+/// use kopiur_api::identity::{HostClass, classify_hostname};
+///
+/// assert_eq!(
+///     classify_hostname("billing.east", Some("east")),
+///     HostClass::OwnCluster { namespace: "billing" }
+/// );
+/// assert_eq!(
+///     classify_hostname("billing.west", Some("east")),
+///     HostClass::ForeignCluster { suffix: "west" }
+/// );
+/// // No cluster identity configured => every hostname reads as legacy/bare.
+/// assert_eq!(
+///     classify_hostname("billing.east", None),
+///     HostClass::Bare { namespace: "billing.east" }
+/// );
+/// ```
+pub fn classify_hostname<'a>(hostname: &'a str, my_cluster: Option<&str>) -> HostClass<'a> {
+    let my_cluster = match my_cluster {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return HostClass::Bare {
+                namespace: hostname,
+            };
+        }
+    };
+    match hostname.split_once('.') {
+        None => HostClass::Bare {
+            namespace: hostname,
+        },
+        Some((namespace, suffix)) if namespace.is_empty() || suffix.is_empty() => HostClass::Bare {
+            namespace: hostname,
+        },
+        Some((namespace, suffix)) if suffix == my_cluster => HostClass::OwnCluster { namespace },
+        Some((_, suffix)) => HostClass::ForeignCluster { suffix },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +454,20 @@ mod tests {
 
     fn defaults(host: Option<&str>, user: Option<&str>) -> IdentityDefaults {
         IdentityDefaults {
+            cluster: None,
+            hostname_expr: host.map(String::from),
+            username_expr: user.map(String::from),
+        }
+    }
+
+    /// Like [`defaults`] but also sets `identityDefaults.cluster` (M1 precedence tests).
+    fn defaults_with_cluster(
+        host: Option<&str>,
+        user: Option<&str>,
+        cluster: Option<&str>,
+    ) -> IdentityDefaults {
+        IdentityDefaults {
+            cluster: cluster.map(String::from),
             hostname_expr: host.map(String::from),
             username_expr: user.map(String::from),
         }
@@ -348,6 +505,109 @@ mod tests {
         assert_eq!(r.username, "postgres-data");
         assert_eq!(r.hostname, "billing");
         assert_eq!(r.source_path.as_deref(), Some("/pvc/postgres-data"));
+    }
+
+    // --- M1: identityDefaults.cluster hostname precedence -------------------
+    // explicit override > hostnameExpr > `<namespace>.<cluster>` (cluster set) > namespace.
+
+    #[test]
+    fn cluster_default_is_used_when_no_override_or_expr() {
+        let d = defaults_with_cluster(None, None, Some("east"));
+        let r = resolve_identity(&inputs(
+            "postgres-data",
+            "billing",
+            None,
+            Some(&d),
+            Some("data"),
+        ))
+        .unwrap();
+        assert_eq!(r.hostname, "billing.east");
+        // username is unaffected — cluster is not part of its default.
+        assert_eq!(r.username, "postgres-data");
+    }
+
+    #[test]
+    fn no_cluster_no_expr_no_override_falls_back_to_bare_namespace() {
+        // The `defaults_use_name_namespace_and_pvc_path` test above already covers
+        // `defaults: None`; this covers `defaults: Some(..)` with `cluster: None`.
+        let d = defaults_with_cluster(None, None, None);
+        let r = resolve_identity(&inputs("cfg", "billing", None, Some(&d), Some("data"))).unwrap();
+        assert_eq!(r.hostname, "billing");
+    }
+
+    #[test]
+    fn explicit_hostname_override_beats_cluster_default() {
+        let d = defaults_with_cluster(None, None, Some("east"));
+        let ovr = Identity {
+            username: None,
+            hostname: Some("pinned-host".to_string()),
+        };
+        let r = resolve_identity(&inputs(
+            "postgres-data",
+            "billing",
+            Some(&ovr),
+            Some(&d),
+            Some("data"),
+        ))
+        .unwrap();
+        assert_eq!(r.hostname, "pinned-host");
+    }
+
+    #[test]
+    fn hostname_expr_beats_cluster_default() {
+        // Both a hostnameExpr AND a cluster default are set; the expr wins (the
+        // cluster tier only applies when there is no expression at all).
+        let d = defaults_with_cluster(Some("namespace"), None, Some("east"));
+        let r = resolve_identity(&inputs(
+            "postgres-data",
+            "billing",
+            None,
+            Some(&d),
+            Some("data"),
+        ))
+        .unwrap();
+        assert_eq!(r.hostname, "billing"); // NOT "billing.east"
+    }
+
+    #[test]
+    fn hostname_expr_can_reference_cluster_variable() {
+        // hostnameExpr explicitly renders using `cluster` — the brief's example.
+        let d = defaults_with_cluster(Some("namespace + '.' + cluster"), None, Some("east"));
+        let r = resolve_identity(&inputs(
+            "postgres-data",
+            "billing",
+            None,
+            Some(&d),
+            Some("data"),
+        ))
+        .unwrap();
+        assert_eq!(r.hostname, "billing.east");
+    }
+
+    #[test]
+    fn cluster_variable_is_empty_string_when_defaults_lack_cluster() {
+        // Same expression, but `identityDefaults.cluster` isn't set: `cluster`
+        // evaluates to "" (identity_context's documented "unset" value).
+        let d = defaults_with_cluster(Some("namespace + '.' + cluster"), None, None);
+        let r = resolve_identity(&inputs(
+            "postgres-data",
+            "billing",
+            None,
+            Some(&d),
+            Some("data"),
+        ))
+        .unwrap();
+        assert_eq!(r.hostname, "billing.");
+    }
+
+    #[test]
+    fn validate_identity_expr_admits_cluster_reference_even_without_a_real_cluster_default() {
+        // The *admission-time trial* always declares `cluster` (a placeholder),
+        // independent of whether the real ClusterRepository sets
+        // identityDefaults.cluster — so this must admit even though no `defaults`
+        // is threaded through validate_identity_expr's caller in this test.
+        assert!(validate_identity_expr("namespace + '.' + cluster").is_ok());
+        assert!(validate_identity_expr("cluster").is_ok());
     }
 
     #[test]
@@ -523,5 +783,106 @@ mod tests {
         let long = format!("'{}'", "a".repeat(MAX_EXPR_LEN));
         let err = validate_identity_expr(&long).unwrap_err();
         assert!(matches!(err, ValidationError::IdentityExprCompile { .. }));
+    }
+
+    // --- classify_hostname (M1) ---
+
+    #[test]
+    fn classify_hostname_table() {
+        let cases: &[(&str, Option<&str>, HostClass<'_>)] = &[
+            // No cluster identity configured at all: always Bare, dot or no dot.
+            (
+                "billing",
+                None,
+                HostClass::Bare {
+                    namespace: "billing",
+                },
+            ),
+            (
+                "billing.east",
+                None,
+                HostClass::Bare {
+                    namespace: "billing.east",
+                },
+            ),
+            // Empty cluster string behaves like None (defensive; shouldn't occur post
+            // admission-validation, but classify_hostname is total).
+            (
+                "billing",
+                Some(""),
+                HostClass::Bare {
+                    namespace: "billing",
+                },
+            ),
+            // No dot in the hostname at all.
+            (
+                "billing",
+                Some("east"),
+                HostClass::Bare {
+                    namespace: "billing",
+                },
+            ),
+            // Exact suffix match => ours.
+            (
+                "ns.east",
+                Some("east"),
+                HostClass::OwnCluster { namespace: "ns" },
+            ),
+            // Different suffix => another cluster's.
+            (
+                "ns.west",
+                Some("east"),
+                HostClass::ForeignCluster { suffix: "west" },
+            ),
+            // Only an EXACT suffix match is "own" — "east.x" != "east".
+            (
+                "ns.east.x",
+                Some("east"),
+                HostClass::ForeignCluster { suffix: "east.x" },
+            ),
+            // Empty namespace part or empty suffix: Bare, whole hostname verbatim.
+            (
+                ".east",
+                Some("east"),
+                HostClass::Bare { namespace: ".east" },
+            ),
+            ("ns.", Some("east"), HostClass::Bare { namespace: "ns." }),
+            // Case-sensitive suffix comparison.
+            (
+                "ns.East",
+                Some("east"),
+                HostClass::ForeignCluster { suffix: "East" },
+            ),
+            // Hostname exactly equal to the cluster name, no dot => Bare, never
+            // OwnCluster (there is no namespace/cluster split to make).
+            ("east", Some("east"), HostClass::Bare { namespace: "east" }),
+        ];
+        for (hostname, cluster, expected) in cases {
+            assert_eq!(
+                classify_hostname(hostname, *cluster),
+                *expected,
+                "classify_hostname({hostname:?}, {cluster:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_hostname_round_trips_the_rendered_default() {
+        // For any valid namespace + cluster, classifying the hostname
+        // resolve_identity's own default would render must come back OwnCluster
+        // with the original namespace — the write path and the read path agree.
+        for (ns, cluster) in [
+            ("billing", "east"),
+            ("a", "b"),
+            ("kube-system", "prod-1"),
+            ("default", "us-west-2"),
+        ] {
+            let rendered = format!("{ns}.{cluster}");
+            assert_eq!(
+                classify_hostname(&rendered, Some(cluster)),
+                HostClass::OwnCluster { namespace: ns },
+                "rendered={rendered:?} cluster={cluster:?}"
+            );
+        }
     }
 }
