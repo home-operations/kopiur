@@ -573,7 +573,7 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
     crepos
         .create(
             &PostParams::default(),
-            &cr(s3_cluster_repository_json(crepo, "e2e-proj-orphan")),
+            &cr(s3_cluster_repository_json(crepo, "kopiur-proj-orphan")),
         )
         .await
         .expect("create ClusterRepository");

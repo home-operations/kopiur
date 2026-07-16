@@ -212,6 +212,9 @@ pub const BUCKETS: &[&str] = &[
     "kopiur-proj-restore",
     "kopiur-proj-maint",
     "kopiur-proj-stable",
+    // #255: the SnapshotPolicy is deleted BEFORE its Snapshot, so the delete Job must
+    // re-project credentials against the opt-in pinned at run time.
+    "kopiur-proj-orphan",
     "kopiur-leak-crepo",
     // Backed-via-rclone repository (rclone `s3` remote pointing at this MinIO).
     "kopiur-rclone",

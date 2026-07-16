@@ -942,6 +942,13 @@ async fn writable_source_reaches_the_job_and_direct_needs_an_acknowledgement() {
         .and_then(|s| s.template.spec)
         .expect("the mover Job must carry a pod template");
 
+    // Both k8s `readOnly` fields are Go `bool` with `json:"readOnly,omitempty"`, so the
+    // apiserver DROPS `false` on the way out — reading the Job back yields `None`, which
+    // means false. Assert the effective value (absent-or-false), not the literal
+    // `Some(false)` the controller constructed: the unit tests in `kopiur_mover::jobs`
+    // pin that, before any apiserver round trip. `Some(true)` is the only failure.
+    let writable = |v: Option<bool>| !v.unwrap_or(false);
+
     // Field 1 of 2: the PVC volume source.
     let src_vol = pod
         .volumes
@@ -950,11 +957,11 @@ async fn writable_source_reaches_the_job_and_direct_needs_an_acknowledgement() {
         .and_then(|v| v.persistent_volume_claim.clone())
         .expect("the mover pod must mount the source PVC");
     assert_eq!(src_vol.claim_name, "e2e-src");
-    assert_eq!(
-        src_vol.read_only,
-        Some(false),
+    assert!(
+        writable(src_vol.read_only),
         "readOnly: false must reach the pod's PVC volume source — with readOnly: true here \
-         the kubelet skips the fsGroup chgrp no matter what the volumeMount says"
+         the kubelet skips the fsGroup chgrp no matter what the volumeMount says (got {:?})",
+        src_vol.read_only
     );
 
     // Field 2 of 2: the container volumeMount. Both, or fsGroup stays inert.
@@ -965,11 +972,11 @@ async fn writable_source_reaches_the_job_and_direct_needs_an_acknowledgement() {
         .and_then(|mounts| mounts.iter().find(|m| m.name == "source"))
         .cloned()
         .expect("the mover container must mount the source volume");
-    assert_eq!(
-        src_mount.read_only,
-        Some(false),
+    assert!(
+        writable(src_mount.read_only),
         "readOnly: false must reach the container volumeMount too — one API field drives \
-         both, and the kubelet needs both to be false"
+         both, and the kubelet needs both to be false (got {:?})",
+        src_mount.read_only
     );
 
     // The fsGroup that the writable mount exists to enable must actually be on the pod.
