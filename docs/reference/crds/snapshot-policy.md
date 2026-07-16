@@ -40,6 +40,22 @@ Per-source fields:
   source path is derived: `PvcName` (default) uses the name alone;
   `PvcNamespacedName` uses `<namespace>/<name>` to disambiguate same-named PVCs
   across namespaces.
+- `readOnly` — mount the source read-only (default `true`; kopia only reads it).
+  Set `false` **only** to make `fsGroup` apply: the kubelet implements `fsGroup`
+  by recursively rewriting the volume's group ownership, and skips that rewrite
+  entirely on a read-only mount, so a mover's `fsGroup`/`fsGroupChangePolicy` is
+  otherwise inert here. Rejected at admission on an `nfs` source (the kubelet
+  never applies `fsGroup` to in-tree NFS volumes, so it cannot help) and when
+  `staging.accessModes` is `[ReadOnlyMany]` (a read-only stage cannot be mounted
+  read-write).
+- `acknowledgeLiveMutation` — required with `copyMethod: Direct` + `readOnly:
+  false`, the one combination that reaches the **live** volume: the kubelet will
+  recursively chgrp your running application's files to the mover's `fsGroup`
+  (`65532` by default) and make them group-writable, permanently. Under
+  `Snapshot`/`Clone` the rewrite lands on a throwaway staged PVC and no
+  acknowledgement is needed. Ignored where it is not needed, so switching
+  `copyMethod` is never a two-step edit. See
+  [Copy methods](../../copy-methods.md#making-fsgroup-apply-to-the-source).
 
 ### `copyMethod`
 

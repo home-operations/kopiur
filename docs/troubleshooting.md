@@ -294,6 +294,41 @@ $ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.conditions[?(@.type=
 
 A staged backup that stays `Pending` with a `Pending` staged PVC (`<name>-src`) is usually a `WaitForFirstConsumer` class (normal — it binds when the mover starts) or, for `Clone`, a driver that can't clone the volume (`kubectl describe pvc <name>-src` shows the driver event). Staged objects are auto-cleaned when the backup finishes. Full guide: **[Copy methods](copy-methods.md)**.
 
+## `Snapshot` stuck `Terminating` on the cleanup finalizer
+
+The CR won't go away and `metadata.finalizers` still lists `kopiur.home-operations.com/snapshot-cleanup`:
+
+```console
+$ kubectl get snapshot <name> -n <ns> -o jsonpath='{.metadata.finalizers}{"\n"}'
+$ kubectl describe snapshot <name> -n <ns> | tail -20
+```
+
+This is `deletionPolicy: Delete` doing its job: it holds the CR until the kopia snapshot is really deleted, rather than dropping the finalizer and leaving an orphan behind. So it is **blocked on something it needs**, and the reconcile error says which. It retries every 30s, so it recovers on its own the moment you fix the cause.
+
+| Symptom                                                                          | Cause                                                                                                                          | Fix                                                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `missing dependency: credentials Secret … does not exist in namespace …`, and the repository is a `ClusterRepository` whose Secret lives elsewhere | Projection is not permitted for this deletion. Either the repo owner set `credentialProjection.allowed: false` (or removed it), or the run itself never used projection and you have since removed the Secret you were managing yourself. | Restore whichever one applies: set `credentialProjection.allowed: true` on the `ClusterRepository`, or re-create the Secret in the workload namespace. On ≤ 0.7.5 this also happened when the `SnapshotPolicy` was deleted **before** the `Snapshot` — fixed; the opt-in is now pinned into `status.resolved.credentialProjection` at run time. |
+| `has no pinned identity … and its SnapshotPolicy is gone`                        | The `Snapshot` never completed a run (so nothing was pinned) **and** its recipe is gone, so the delete Job can't be built.      | Re-create the `SnapshotPolicy`, or use the escape hatch below — there is likely no kopia snapshot to delete anyway.                                                                                                                                                          |
+| The `ClusterRepository`/`Repository` itself was deleted                          | The deletion path resolves the repository live — it needs the backend config to connect at all, and that is not pinned.        | Re-create the repository CR (pointing at the same backend), or use the escape hatch.                                                                                                                                                                                          |
+| The bucket/NAS is genuinely gone, or you're tearing everything down              | Nothing to delete, and nothing to delete it with.                                                                              | Escape hatch.                                                                                                                                                                                                                                                                |
+| A `<snapshot>-delete` Job exists and is failing                                  | The delete Job itself is erroring — read its logs, not the CR.                                                                 | `kubectl logs job/<snapshot>-delete -n <ns>`. Treat as a normal mover failure ([above](#backup-runs-but-failed)).                                                                                                                                                            |
+
+/// tip | The escape hatch: release the CR, keep the snapshot
+
+```console
+$ kubectl annotate snapshot <name> -n <ns> kopiur.home-operations.com/skip-snapshot-cleanup=true
+```
+
+The finalizer drops immediately without contacting the repository. The kopia snapshot **survives** and the catalog can rediscover it later. Presence-only — the value is ignored. See [Backups → what `Delete` needs to succeed](backups.md#what-delete-needs-to-succeed).
+
+///
+
+/// warning | A whole terminating namespace behaves differently
+
+If the namespace itself is being deleted, the repository's `onNamespaceDelete` policy decides — and it **defaults to `Orphan`**, so a `kubectl delete ns` keeps your backup history rather than cascading into the repository. That is deliberate. See [Repositories → onNamespaceDelete](repositories.md#onnamespacedelete--what-kubectl-delete-ns-does-to-snapshots).
+
+///
+
 ## Restore won't complete
 
 ```console

@@ -263,17 +263,21 @@ So under `Snapshot`/`Clone` this is free, and it is the combination to reach for
 --8<-- "deploy/examples/31-source-fsgroup-normalize.yaml"
 ```
 
-!!! danger "`Direct` + `readOnly: false` rewrites live data"
+/// danger | `Direct` + `readOnly: false` rewrites your live data
 
-    With `Direct` there is no stage: the kubelet chgrp's **your running application's files** to the mover's `fsGroup` and makes them group-writable. Postgres and Redis both refuse to start on an over-permissive data directory; anything asserting on group ownership can break the same way.
+With `Direct` there is no stage: the kubelet chgrp's **your running application's files** to the mover's `fsGroup` and makes them group-writable — permanently, on the next backup. Postgres and Redis both refuse to start on an over-permissive data directory; anything asserting on group ownership can break the same way. There is no undo.
 
-    Because that is not inferable from intent — you set one flag to fix a permission error, not to re-own your data — Kopiur rejects the combination unless you say so explicitly:
+Because that is not inferable from intent — you set one flag to fix a permission error, not to re-own your data — Kopiur rejects the combination at admission unless you say so explicitly with `acknowledgeLiveMutation: true`.
 
-    ```yaml
-    --8<-- "deploy/examples/32-source-writable-direct.yaml"
-    ```
+Prefer `copyMethod: Snapshot`/`Clone` if your storage supports it. `acknowledgeLiveMutation` is ignored anywhere it is not needed, so it is safe to leave in place if you switch back.
 
-    Prefer `copyMethod: Snapshot`/`Clone` if your storage supports it. `acknowledgeLiveMutation` is ignored anywhere else, so it is safe to leave in place if you switch back.
+///
+
+The acknowledged form, for storage with no CSI snapshot support:
+
+```yaml
+--8<-- "deploy/examples/32-source-writable-direct.yaml"
+```
 
 Two more rejections you may hit, both at admission:
 

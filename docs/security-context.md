@@ -83,7 +83,7 @@ The `fsGroup` matches the mover image's GID so the operator-managed **kopia cach
 - An **NFS backup source** is the same story, which is why `sources[].readOnly: false` is *rejected* on one: the flag exists only to make `fsGroup` apply, and on NFS it never can.
 ///
 
-/// warning | `fsGroup` has no effect on a backup **source** either — by default
+/// warning | `fsGroup` has no effect on a backup source either, by default
 A backup source is mounted **read-only** (kopia only reads it), and the kubelet skips its `fsGroup` chown on a read-only mount just as it does on NFS. So `fsGroup`/`fsGroupChangePolicy` are silently inert on the source unless you set `sources[].readOnly: false`.
 
 Under `copyMethod: Snapshot`/`Clone` that is safe — the chown lands on the throwaway staged PVC. Under `copyMethod: Direct` it rewrites your **live** volume and requires `acknowledgeLiveMutation: true`. See [Copy methods → making `fsGroup` apply to the source](copy-methods.md#making-fsgroup-apply-to-the-source).
