@@ -30,6 +30,15 @@
 //!    naming of versions ≤ 0.7.1 minted a new copy per run, forever.
 //! 6. **Copies do not accumulate across runs (#240 guard).** Two backups from one
 //!    policy leave ZERO projected copies behind.
+//! 7. **Deletion survives a policy deleted first (#255 guard).** A `deletionPolicy:
+//!    Delete` Snapshot whose `SnapshotPolicy` is deleted BEFORE it still releases its
+//!    cleanup finalizer — the delete Job re-projects against the opt-in pinned into
+//!    `status.resolved.credentialProjection` at run time.
+//!
+//! Scenario 7 is the ordering the others structurally cannot catch: every one of them
+//! deletes the Snapshot before the policy, keeping the recipe alive exactly as long as
+//! the delete path happens to need it. That is not a property of the operator — it is a
+//! property of the test order.
 //!
 //! A projected copy holds live repository credentials, so its lifetime is the mover
 //! Job's, NOT the consuming CR's. Scenarios 1 and 6 are the ones that pin this: the
@@ -522,6 +531,139 @@ async fn projected_copies_do_not_accumulate_across_runs() {
         .delete("e2e-leak-run-2", &DeleteParams::default())
         .await;
     let _ = configs.delete(cfg, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+}
+
+/// **The stuck-finalizer guard (#255).** Delete the `SnapshotPolicy` BEFORE the
+/// `Snapshot` it produced, and a `deletionPolicy: Delete` Snapshot must still finish
+/// deleting.
+///
+/// This is the ordering every other scenario in this file avoids: they delete the
+/// Snapshot first, then the policy, which keeps the recipe alive for exactly as long as
+/// the delete path needs it. Nothing forces a user to be so considerate. Once the run
+/// succeeds its projected copy is reaped, so the delete Job must re-project — and the
+/// opt-in that authorizes that lives ONLY on the recipe. Reading an absent recipe as
+/// "projection off" sent the delete Job hunting for the ClusterRepository's canonical
+/// Secret name in the workload namespace, which projection exists precisely because
+/// nobody put there: `MissingDependency` every 30s, finalizer held, forever.
+///
+/// The fix pins the opt-in into `status.resolved.credentialProjection` at run time, so
+/// assert the pin too — without it this test would still pass the day someone
+/// "fixes" the symptom by defaulting a gone recipe to projection-on, which would
+/// silently mint credentials in namespaces that never opted in.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn snapshot_deletion_survives_a_policy_deleted_first() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio, Need::ProjectionNs])
+        .await
+        .expect("provision MinIO + projection namespace (source PVC, no creds Secret)");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), PROJECTION_NS);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), PROJECTION_NS);
+
+    let crepo = "e2e-proj-orphan-crepo";
+    let cfg = "e2e-proj-orphan-cfg";
+    let backup = "e2e-proj-orphan-backup";
+
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(s3_cluster_repository_json(crepo, "e2e-proj-orphan")),
+        )
+        .await
+        .expect("create ClusterRepository");
+    wait_phase(&crepos, crepo, "Ready")
+        .await
+        .expect("ClusterRepository should bootstrap to Ready");
+
+    configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json(PROJECTION_NS, cfg, crepo, true)),
+        )
+        .await
+        .expect("create projection-on SnapshotPolicy");
+    // deletionPolicy: Delete is what arms the cleanup finalizer — the whole point.
+    let mut backup_spec = backup_json(PROJECTION_NS, backup, cfg);
+    backup_spec["spec"]["deletionPolicy"] = serde_json::json!("Delete");
+    backups
+        .create(&PostParams::default(), &cr(backup_spec))
+        .await
+        .expect("create deletable Snapshot");
+    wait_phase(&backups, backup, "Succeeded")
+        .await
+        .expect("Snapshot should reach Succeeded via projected credentials");
+
+    // The run pinned the opt-in it actually executed under. This is the state the
+    // delete path reads once the recipe is gone.
+    let status = status_json(&backups, backup).await;
+    assert_eq!(
+        status
+            .get("resolved")
+            .and_then(|r| r.get("credentialProjection"))
+            .and_then(|p| p.get("enabled"))
+            .and_then(|e| e.as_bool()),
+        Some(true),
+        "the run must pin its credentialProjection opt-in into status.resolved — the \
+         deletion path has no other honest source once the SnapshotPolicy is gone: {status:#}"
+    );
+
+    // The reap is what makes this hard: the run's projected copy is GONE, so the
+    // delete Job must re-project from scratch rather than reuse a lingering Secret.
+    wait_until(
+        &format!("{backup} status.cleanup.credsReapedAt stamped"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&backups, backup).await;
+            Ok(s.get("cleanup")
+                .and_then(|c| c.get("credsReapedAt"))
+                .is_some()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the projected copy must be reaped once the run is terminal");
+
+    // The reporter's ordering: recipe first...
+    configs
+        .delete(cfg, &DeleteParams::default())
+        .await
+        .expect("delete the SnapshotPolicy BEFORE the Snapshot");
+    wait_until(
+        &format!("SnapshotPolicy {cfg} gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(configs.get_opt(cfg).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the SnapshotPolicy should delete cleanly");
+
+    // ...then the Snapshot, which must re-project creds against the pinned opt-in,
+    // run its delete Job, and release the finalizer.
+    backups
+        .delete(backup, &DeleteParams::default())
+        .await
+        .expect("delete Snapshot");
+    wait_until(
+        &format!("{backup} removed after the cleanup finalizer ran"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(backups.get_opt(backup).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect(
+        "the Snapshot must finish deleting with its SnapshotPolicy already gone — before \
+         #255 it hung on kopiur.home-operations.com/snapshot-cleanup forever, because the \
+         delete path read the absent recipe as 'projection off' and then demanded a \
+         namespace-local Secret that projection was the only thing supplying",
+    );
+
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
 }
 

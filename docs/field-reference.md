@@ -1752,8 +1752,15 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `credentialProjection` | [object](#snapshot-status-resolved-credentialprojection) | — | The recipe's `spec.credentialProjection` as it stood for this run.<br>The deletion path re-projects the mover's credentials, but the opt-in lives on the `SnapshotPolicy` — which a user may delete first. Pinning it here lets the finalizer honor the opt-in that was actually in force, instead of reading an absent recipe as "projection off" and blocking on a Secret that was never meant to be namespace-local (#255). Absent only on a `Snapshot` that predates the pin or never ran; a run always writes it, including `enabled: false`, so absent stays distinguishable from off. |
 | `repository` | [object](#snapshot-status-resolved-repository) | — | The repository this run targeted, frozen at run time. |
 | `sources` | [][object](#snapshot-status-resolved-sources) | — | The concrete PVCs + source paths backed up this run. |
+
+##### `status.resolved.credentialProjection` { #snapshot-status-resolved-credentialprojection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default. |
 
 ##### `status.resolved.repository` { #snapshot-status-resolved-repository }
 

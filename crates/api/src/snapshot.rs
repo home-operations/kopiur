@@ -6,7 +6,9 @@
 //! - `manual`    — created by `kubectl create` / external automation; spec carries `policyRef`.
 //! - `discovered`— materialized by the catalog scan; spec is empty/absent.
 
-use crate::common::{DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef, ResolvedIdentity};
+use crate::common::{
+    CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef, ResolvedIdentity,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -316,6 +318,16 @@ pub struct ResolvedSnapshot {
     /// The concrete PVCs + source paths backed up this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<ResolvedSource>,
+    /// The recipe's `spec.credentialProjection` as it stood for this run.
+    ///
+    /// The deletion path re-projects the mover's credentials, but the opt-in lives on the
+    /// `SnapshotPolicy` — which a user may delete first. Pinning it here lets the finalizer
+    /// honor the opt-in that was actually in force, instead of reading an absent recipe as
+    /// "projection off" and blocking on a Secret that was never meant to be namespace-local
+    /// (#255). Absent only on a `Snapshot` that predates the pin or never ran; a run always
+    /// writes it, including `enabled: false`, so absent stays distinguishable from off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_projection: Option<CredentialProjection>,
 }
 
 /// One resolved source backed up by a run — a concrete PVC and its kopia path.
