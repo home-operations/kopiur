@@ -223,6 +223,16 @@ pub struct BootstrapResult {
     /// apply must remain VISIBLE as drift from `spec` rather than silently doing nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<kopiur_api::repository::ObservedEpochParameters>,
+    /// Why `kopia repository set-parameters` did not apply, when it was asked to and
+    /// failed (#258). `None` means "nothing to do, or it worked".
+    ///
+    /// The apply is deliberately best-effort — a bad parameter must not take an otherwise
+    /// healthy repository to `Failed`, matching the maintenance-owner restamp a few lines
+    /// above it. But best-effort must not mean SILENT: without this the only trace is a
+    /// mover log line nobody reads and a `status.parameters.epoch` that quietly disagrees
+    /// with `spec`. The controller turns this into a Warning event on the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_error: Option<String>,
     /// Structured failure block on `success == false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureBlock>,
@@ -249,6 +259,7 @@ impl BootstrapResult {
             foreign_suffix_dropped,
             index_blob_count,
             epoch: None,
+            epoch_error: None,
             failure: None,
         }
     }
@@ -259,8 +270,10 @@ impl BootstrapResult {
     pub fn with_epoch(
         mut self,
         epoch: Option<kopiur_api::repository::ObservedEpochParameters>,
+        epoch_error: Option<String>,
     ) -> Self {
         self.epoch = epoch;
+        self.epoch_error = epoch_error;
         self
     }
 
@@ -276,6 +289,7 @@ impl BootstrapResult {
             foreign_suffix_dropped: 0,
             index_blob_count: None,
             epoch: None,
+            epoch_error: None,
             failure: Some(failure_block_from_kopia(err)),
         }
     }
@@ -298,6 +312,7 @@ impl BootstrapResult {
             foreign_suffix_dropped: 0,
             index_blob_count: None,
             epoch: None,
+            epoch_error: None,
             failure: Some(FailureBlock {
                 kopia_error_class: REPOSITORY_NOT_INITIALIZED_CLASS.to_string(),
                 message: REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),

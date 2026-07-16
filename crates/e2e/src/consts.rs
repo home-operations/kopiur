@@ -78,7 +78,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "copymethod",
     "copymethod-csi",
     "idxhealth",
+    // #258: two scenarios, each needing its OWN kopia repository — the first MUTATES
+    // epoch params, so sharing one repo would leak that into the defaults assertion.
     "epochparams",
+    "epochparams-default",
     "staging-recover",
     "staging-timeout",
     "staging-override",

@@ -1493,14 +1493,21 @@ async fn a_repository_without_parameters_keeps_kopias_defaults() {
     };
     world.ensure(&[Need::Filesystem]).await.expect("fixtures");
     let client = world.client().clone();
-    ensure_repo(&client, "epochparams").await;
+    // Its OWN repo, not the one the test above MUTATES: an isolated hostPath dir is
+    // one kopia repository, so sharing `epochparams` would let that test's
+    // minDuration: 6h leak in here and this assertion would depend on test ORDER.
+    ensure_repo(&client, "epochparams-default").await;
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let repo = "e2e-epoch-default-repo";
 
     repos
         .create(
             &PostParams::default(),
-            &cr(repository_json(repo, "epochparams", serde_json::json!({}))),
+            &cr(repository_json(
+                repo,
+                "epochparams-default",
+                serde_json::json!({}),
+            )),
         )
         .await
         .expect("create Repository with no spec.parameters");

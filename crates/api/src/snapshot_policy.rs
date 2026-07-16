@@ -258,7 +258,7 @@ pub enum CopyMethod {
     /// Point-in-time CSI volume snapshot (the default; requires the CSI snapshot stack + a `VolumeSnapshotClass`).
     #[default]
     Snapshot,
-    /// CSI volume clone of the source, mounted read-only (opt-in; requires a cloning-capable CSI driver).
+    /// CSI volume clone of the source (opt-in; requires a cloning-capable CSI driver). Mounted per `sources[].readOnly` — read-only by default.
     Clone,
     /// Read the live PVC directly with no intermediate snapshot/clone (opt-in; works on any storage, no CSI required).
     Direct,
@@ -294,8 +294,9 @@ pub struct StagingSpec {
     pub storage_class_name: Option<String>,
     /// Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes.
     /// `[ReadOnlyMany]` pairs with snapshot-backed read-only classes (e.g. CephFS
-    /// `backingSnapshot`); the mover always mounts the staged PVC read-only
-    /// regardless of the mode.
+    /// `backingSnapshot`); the mover mounts the staged PVC read-only to match, and
+    /// rejects it at admission if a source sets `readOnly: false` (a read-only stage
+    /// cannot be mounted read-write).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_modes: Vec<PvcAccessMode>,
 }
@@ -359,10 +360,20 @@ pub fn source_read_only(source: &Source) -> bool {
 /// `copyMethod: Snapshot`/`Clone` interpose a throwaway staged PVC, so the kubelet's
 /// recursive `fsGroup` chgrp lands on a copy that is deleted when the run ends. Only
 /// `Direct` mounts the workload's own PVC, where that same walk permanently rewrites
-/// group ownership on production data. Pure, and the single definition of the hazard
-/// shared by the validator and the read-compat assessment.
+/// group ownership on production data. Pure, and the single definition of the hazard.
+///
+/// An `nfs` source is excluded, and not merely because [`validate_source`] rejects a
+/// writable one anyway: the kubelet does not apply `fsGroup` to in-tree NFS volumes at
+/// all, so no walk ever happens and this predicate's premise is simply false there.
+/// Answering `true` would also make admission emit two errors for one mistake, the
+/// second of them advice — "set `acknowledgeLiveMutation`" — that could never make the
+/// configuration valid.
+///
+/// [`validate_source`]: crate::validate::validate_source
 pub fn source_mutates_live_volume(copy_method: CopyMethod, source: &Source) -> bool {
-    matches!(copy_method, CopyMethod::Direct) && !source_read_only(source)
+    matches!(copy_method, CopyMethod::Direct)
+        && !source_read_only(source)
+        && (source.pvc.is_some() || source.pvc_selector.is_some())
 }
 
 /// schemars default for `PvcSnapshotPolicy::default_deletion_policy` — `Delete`,

@@ -2137,6 +2137,7 @@ mod bootstrap_outcomes {
             foreign_suffix_dropped: 0,
             index_blob_count: None,
             epoch: None,
+            epoch_error: None,
             failure: None,
         }
     }

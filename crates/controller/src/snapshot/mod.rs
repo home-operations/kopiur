@@ -331,6 +331,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await? {
                 return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
             }
+            // `Failed` does NOT imply "no kopia snapshot to delete": a run can create the
+            // snapshot, stamp Succeeded + status.snapshot, and only then fail its
+            // afterSnapshot hook — `patch_hook_failure` merge-patches phase/conditions and
+            // leaves status.snapshot intact. Such a Snapshot still owns real repository
+            // data behind a `Delete` finalizer, so it needs the projection pin exactly as
+            // much as a Succeeded one. Self-gated, and a no-op when there is no snapshot.
+            backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
             return Ok(Action::await_change());
         }
         RunDecision::Wait => return Ok(Action::await_change()),

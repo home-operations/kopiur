@@ -1054,6 +1054,7 @@ async fn run_bootstrap(
     };
     let unique_id = Some(status.unique_id_hex.clone());
 
+    let mut epoch_error: Option<String> = None;
     // Reconcile mutable repository parameters (#258). Applies on the connect-to-existing
     // branch as much as on a create — that is the point: `spec.parameters.epoch` is a
     // declaration about a LIVE repository, and the generation-bump re-bootstrap is what
@@ -1097,11 +1098,26 @@ async fn run_bootstrap(
                     ),
                 }
             }
-            Err(e) => warn!(
-                class = %e.class(),
-                "could not apply repository set-parameters; continuing bootstrap — \
-                 status.parameters.epoch will show the drift"
-            ),
+            Err(e) => {
+                // Best-effort, like the maintenance-owner restamp above: a bad parameter
+                // must not take an otherwise healthy repository to `Failed`. But it must
+                // not be silent either — carry the reason back so the controller can raise
+                // a Warning event, rather than leaving only this log line and a
+                // status.parameters that quietly disagrees with spec.
+                warn!(
+                    class = %e.class(),
+                    "could not apply repository set-parameters; continuing bootstrap — \
+                     status.parameters.epoch will show the drift"
+                );
+                epoch_error = Some(format!(
+                    "kopia repository set-parameters failed ({}): {}. spec.parameters.epoch \
+                     was NOT applied — status.parameters.epoch reports what the repository \
+                     actually has. The bootstrap re-runs on the next spec change; edit \
+                     spec.parameters.epoch to retry.",
+                    e.class(),
+                    e
+                ));
+            }
         }
     }
     let observed_epoch = status
@@ -1164,7 +1180,7 @@ async fn run_bootstrap(
         foreign_suffix_dropped,
         index_blob_count,
     )
-    .with_epoch(observed_epoch)
+    .with_epoch(observed_epoch, epoch_error)
 }
 
 /// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning

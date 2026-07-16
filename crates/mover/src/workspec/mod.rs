@@ -786,9 +786,15 @@ pub fn epoch_drift(
         });
     };
     // Compare a desired duration against an observed nanosecond count.
+    //
+    // `try_from`, never `as`: `as` on a u128 that exceeds i64::MAX WRAPS (silently, and to
+    // a negative number), which would report drift against every possible observation and
+    // re-run set-parameters on every bootstrap. Admission rejects durations beyond kopia's
+    // i64-nanosecond range, so this is the belt to that braces — an unrepresentable value
+    // is treated as "no comparable target" rather than as garbage.
     let dur_drift = |want: &Option<String>, have_ns: i64| -> Option<String> {
         let want = want.as_deref()?;
-        let want_ns = kopiur_api::parse_go_duration(want)?.as_nanos() as i64;
+        let want_ns = i64::try_from(kopiur_api::parse_go_duration(want)?.as_nanos()).ok()?;
         (want_ns != have_ns).then(|| want.to_string())
     };
     let num_drift = |want: Option<i64>, have: i64| -> Option<i64> { want.filter(|w| *w != have) };

@@ -31,6 +31,15 @@ use crate::io;
 pub const TOO_MANY_INDEX_BLOBS_REASON: &str = "TooManyIndexBlobs";
 /// Remediation `action` carried on the Warning event.
 pub const ENSURE_MAINTENANCE_ACTION: &str = "EnsureMaintenance";
+
+/// Event reason when `kopia repository set-parameters` was asked for and did not apply
+/// (#258). The apply is best-effort by design — a bad parameter must not fail an otherwise
+/// healthy repository — so this event is how the user finds out at all; without it the only
+/// evidence is a `status.parameters.epoch` that quietly disagrees with `spec`.
+pub const EPOCH_PARAMETERS_NOT_APPLIED_REASON: &str = "EpochParametersNotApplied";
+/// Remediation label for [`EPOCH_PARAMETERS_NOT_APPLIED_REASON`].
+pub const FIX_EPOCH_PARAMETERS_ACTION: &str = "FixEpochParameters";
+
 /// Machine reason when the count is within threshold.
 pub const INDEX_BLOBS_HEALTHY_REASON: &str = "Healthy";
 

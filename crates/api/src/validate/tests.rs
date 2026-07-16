@@ -4386,6 +4386,30 @@ fn direct_plus_writable_source_needs_an_acknowledgement() {
 }
 
 #[test]
+fn a_writable_nfs_source_is_rejected_once_not_told_to_acknowledge_it() {
+    // `Direct` + writable + nfs used to yield TWO errors: the (correct) nfs rejection,
+    // and advice to set acknowledgeLiveMutation — which could never make it valid, since
+    // the nfs rule rejects regardless. The kubelet does not apply fsGroup to in-tree NFS
+    // at all, so "the kubelet will rewrite your live volume" is false there to begin with.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Direct\n\
+         sources: [ { nfs: { server: nas.lan, path: /export/media }, readOnly: false } ]\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = format!("{errs:?}");
+    assert_eq!(errs.len(), 1, "one mistake, one error: {errs:#?}");
+    assert!(
+        msg.contains("fsGroup"),
+        "and it must be the nfs rejection: {msg}"
+    );
+    assert!(
+        !msg.contains("acknowledgeLiveMutation"),
+        "must not advise an acknowledgement that cannot help: {msg}"
+    );
+}
+
+#[test]
 fn a_stale_acknowledgement_is_ignored_rather_than_rejected() {
     // Deliberate deviation from the reject-don't-silently-ignore precedent: rejecting a
     // no-longer-needed ack would make switching copyMethod between Direct and
@@ -4468,6 +4492,34 @@ fn an_unparseable_epoch_duration_is_rejected_at_admission() {
         msg.contains("6h") || msg.contains("Go-style"),
         "must show the grammar: {msg}"
     );
+}
+
+#[test]
+fn an_epoch_duration_beyond_kopias_range_is_rejected() {
+    // parse_go_duration accepts a bare seconds count of any size, but kopia stores these
+    // as a Go time.Duration — an i64 NANOSECOND count, max ~292 years. Left unbounded,
+    // `as_nanos() as i64` in the drift comparator wraps to a NEGATIVE number
+    // (999999999999999999s -> -6930898828444486144), which would report drift against
+    // every observation and re-apply set-parameters on every bootstrap forever.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: \"999999999999999999\"\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(
+        !errs.is_empty(),
+        "a duration beyond i64 nanoseconds must be rejected"
+    );
+    assert!(
+        msg.contains("292 years") || msg.contains("too large"),
+        "{msg}"
+    );
+
+    // The realistic values stay valid — the bound must not tax anyone.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 6h\n    refreshFrequency: 20m\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
 }
 
 #[test]

@@ -161,17 +161,34 @@ pub fn validate_repository_parameters(
         });
     }
     let mut duration = |field: &str, raw: &Option<String>| {
-        if let Some(raw) = raw.as_deref()
-            && crate::duration::parse_go_duration(raw).is_none()
-        {
-            errs.push(ValidationError::InvalidFieldValue {
-                field: format!("{context} spec.parameters.epoch.{field}"),
+        let Some(raw) = raw.as_deref() else { return };
+        let field = format!("{context} spec.parameters.epoch.{field}");
+        match crate::duration::parse_go_duration(raw) {
+            None => errs.push(ValidationError::InvalidFieldValue {
+                field,
                 reason: format!(
                     "{raw:?} is not a valid duration. Use a Go-style duration with a single \
                      unit, like 6h, 90m, or 30s; omit the field to leave kopia's current \
                      value untouched"
                 ),
-            });
+            }),
+            // kopia stores these as a Go `time.Duration` — an i64 NANOSECOND count, so it
+            // tops out near 292 years, and `parse_go_duration` happily accepts far more
+            // than that (`"999999999999999999"` is a valid bare-seconds value). Bound it
+            // here rather than let the drift comparator's `as i64` wrap it to a negative
+            // number, and to keep this module's contract: a value the webhook admits must
+            // never fail at reconcile time.
+            Some(d) if i64::try_from(d.as_nanos()).is_err() => {
+                errs.push(ValidationError::InvalidFieldValue {
+                    field,
+                    reason: format!(
+                        "{raw:?} is too large: kopia stores epoch durations as a 64-bit \
+                         nanosecond count, so the maximum is roughly 292 years. Use a \
+                         realistic epoch duration (hours, e.g. 6h)"
+                    ),
+                });
+            }
+            Some(_) => {}
         }
     };
     duration("minDuration", &epoch.min_duration);

@@ -63,8 +63,9 @@ How the source volume is captured before kopia reads it. `Snapshot` (the
 default) takes a point-in-time CSI volume snapshot, giving a crash-consistent
 capture decoupled from the app's node; it needs the CSI snapshot stack and a
 `VolumeSnapshotClass` for the source's driver. `Clone` takes a CSI volume
-clone, mounted read-only, for drivers that support cloning but not
-snapshotting. `Direct` reads the live PVC with no intermediate snapshot or
+clone, for drivers that support cloning but not snapshotting. Both stages are
+mounted per `sources[].readOnly` — read-only by default. `Direct` reads the live
+PVC with no intermediate snapshot or
 clone — it works on **any** storage with no CSI snapshot stack required, but
 gives no point-in-time guarantee (the mover co-locates on the volume's node
 for RWO); set it explicitly for non-CSI/static sources or clusters without the

@@ -1323,6 +1323,19 @@ async fn finalize_cluster_bootstrap(
     if let Some(epoch) = &result.epoch {
         status_patch["parameters"] = serde_json::json!({ "epoch": epoch });
     }
+    // The apply is best-effort (see the mover), so a failure leaves the repository Ready
+    // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —
+    // the whole point of #258 is that a user set a value expecting it to take effect.
+    if let Some(err) = &result.epoch_error {
+        io::publish_warning_event(
+            ctx,
+            repo,
+            health::EPOCH_PARAMETERS_NOT_APPLIED_REASON,
+            health::FIX_EPOCH_PARAMETERS_ACTION,
+            err,
+        )
+        .await;
+    }
     if !health_status.is_null() {
         status_patch["health"] = health_status;
     }
