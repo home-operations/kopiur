@@ -40,6 +40,15 @@ fn pinned_mover_identity(mover: Option<&MoverSpec>) -> Option<secctx_compat::Mov
     id.uid.map(|_| id)
 }
 
+/// One checkable backup source: the PVC to assess, and how the mover will mount it.
+struct ClaimMount<'a> {
+    /// The `source.pvc` name to look for consuming pods of.
+    claim: &'a str,
+    /// The source's effective `readOnly`. A read-write mount lets the kubelet apply the
+    /// mover's `fsGroup` to the tree, which changes the verdict (see `assess_read_compat`).
+    read_only: bool,
+}
+
 /// Best-effort admission warnings for a backup config's `source.pvc` entries. Fails open:
 /// no client, no pods, or any error → no warning.
 pub async fn backup_warnings(
@@ -55,9 +64,17 @@ pub async fn backup_warnings(
         return Vec::new();
     };
     // Only PVC sources can be checked at admission (pvcSelector is dynamic; NFS has no pod).
-    let claims: Vec<&str> = sources
+    // Each carries its own mount mode: `readOnly` is per-source, and it decides whether
+    // the mover's fsGroup can reach the tree at all — a bare bool in a tuple here would
+    // be unreadable at the use site 20 lines down.
+    let claims: Vec<ClaimMount<'_>> = sources
         .iter()
-        .filter_map(|s| s.pvc.as_ref().map(|p| p.name.as_str()))
+        .filter_map(|s| {
+            s.pvc.as_ref().map(|p| ClaimMount {
+                claim: p.name.as_str(),
+                read_only: kopiur_api::snapshot_policy::source_read_only(s),
+            })
+        })
         .collect();
     if claims.is_empty() {
         return Vec::new();
@@ -71,11 +88,11 @@ pub async fn backup_warnings(
     };
 
     let mut warnings = Vec::new();
-    for claim in claims {
+    for ClaimMount { claim, read_only } in claims {
         // `workload_identities` mounts-the-claim + excludes kopiur mover pods (shared core).
         let identities = secctx_compat::workload_identities(&pods, claim);
         if let MoverReadCompat::LikelyIncompatible { .. } =
-            secctx_compat::assess_read_compat(&mover_id, &identities)
+            secctx_compat::assess_read_compat(&mover_id, &identities, read_only)
         {
             warnings.push(format!(
                 "securityContext: the mover's UID likely cannot read the source PVC `{claim}` \

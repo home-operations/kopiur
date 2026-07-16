@@ -203,7 +203,9 @@ pub struct VolumeMountSpec {
     pub source: MountSource,
     /// Absolute mount path inside the mover container.
     pub mount_path: String,
-    /// Whether the mount is read-only (Snapshot sources are mounted read-only).
+    /// Whether the mount is read-only. Drives BOTH the volume source's `readOnly` and the
+    /// container `volumeMount`'s — the kubelet needs both to be false before it will apply
+    /// `fsGroup`. Snapshot sources default to read-only (`Source::readOnly`).
     pub read_only: bool,
 }
 
@@ -311,8 +313,9 @@ pub struct MoverJobInputs<'a> {
     pub affinity: Option<Affinity>,
     /// Extra labels applied to both objects (origin/config/snapshot keys).
     pub labels: BTreeMap<String, String>,
-    /// The source volume to back up (PVC or inline NFS), mounted read-only at the
-    /// snapshot source path (Snapshot ops). `None` for restore / delete ops.
+    /// The source volume to back up (PVC or inline NFS), mounted at the snapshot source
+    /// path (Snapshot ops) — read-only unless the recipe sets `source.readOnly: false`.
+    /// `None` for restore / delete ops.
     pub source_volume: Option<VolumeMountSpec>,
     /// The repo volume for the filesystem backend (PVC or inline NFS), mounted
     /// read-write at the repo path so kopia can write the repository. `None` for
@@ -1177,6 +1180,46 @@ mod tests {
 
         // Image pull policy applied.
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
+    }
+
+    /// #254: one `VolumeMountSpec.read_only` must drive BOTH Kubernetes fields. They are
+    /// separate knobs — `PersistentVolumeClaimVolumeSource.readOnly` on the volume and
+    /// `VolumeMount.readOnly` on the container — and the kubelet declines to apply
+    /// `fsGroup` if either says read-only. Setting one and missing the other yields a
+    /// mount that looks writable and still silently skips the chgrp.
+    #[test]
+    fn a_writable_source_is_writable_on_both_the_volume_and_the_mount() {
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.source_volume = Some(VolumeMountSpec::pvc("data-pvc", "/data", false));
+
+        let job = build_job(&i).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let src = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "source")
+            .expect("source vol");
+        assert_eq!(
+            src.persistent_volume_claim.as_ref().unwrap().read_only,
+            Some(false),
+            "the PVC volume source must be writable"
+        );
+        let src_mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "source")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            src_mount.read_only,
+            Some(false),
+            "the container volumeMount must be writable too — fsGroup needs both"
+        );
     }
 
     #[test]

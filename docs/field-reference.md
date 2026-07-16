@@ -1510,9 +1510,11 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly, mounted read-only. Mutually exclusive with `pvc`/`pvcSelector`. |
+| `acknowledgeLiveMutation` | boolean | — | Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it group-writable — permanently, while the workload is running. Required for that combination alone.<br>Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to carry, and rejecting a stale one would make switching `copyMethod` between `Direct` and `Snapshot`/`Clone` a two-step edit in both directions. |
+| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`. |
 | `pvc` | [object](#snapshotpolicy-spec-sources-pvc) | — | Single PVC by name. Mutually exclusive with `pvcSelector`/`nfs`. |
 | `pvcSelector` | [object](#snapshotpolicy-spec-sources-pvcselector) | — | Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`. |
+| `readOnly` | boolean | `true` | Mount the source read-only (default `true`; kopia only ever reads it).<br>Set `false` **only** to make `fsGroup` work on the source. The kubelet applies `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it skips that walk entirely on a read-only mount, which is why a mover `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume, which requires `acknowledgeLiveMutation`.<br>Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to in-tree NFS volumes at all, so a read-write mount would grant nothing. |
 | `sourcePathOverride` | string | —<br><sub>maxLength 4096</sub> | What kopia records as the source path (default `/pvc/&lt;name&gt;`, or the NFS export `path`). |
 | `sourcePathStrategy` | enum: PvcName \| PvcNamespacedName | `PvcName` | How a selector-matched PVC's source path is derived. Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs and each needs a distinct kopia source path. Defaults to `PvcName`. |
 

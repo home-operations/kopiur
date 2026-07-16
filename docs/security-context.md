@@ -80,6 +80,13 @@ The `fsGroup` matches the mover image's GID so the operator-managed **kopia cach
 
 - A kopia **cache** on an NFS StorageClass stays `root:root` and the mover gets `permission denied`. A content-addressed scratch cache has no business on networked storage anyway — leave `moverDefaults.cache` unset (the default is a node-local `emptyDir`, always writable) or point `cache.storageClass` at a block class (e.g. Ceph RBD) that honors `fsGroup`.
 - An **inline-NFS filesystem repository** can't be made writable with `fsGroup`. Use `supplementalGroups` against a group-writable export, `runAsUser` matching the export owner, or remap server-side — see [NFS filesystem repositories](#nfs-filesystem-repositories) below. The admission webhook **warns** when an NFS filesystem repo relies only on `fsGroup`.
+- An **NFS backup source** is the same story, which is why `sources[].readOnly: false` is *rejected* on one: the flag exists only to make `fsGroup` apply, and on NFS it never can.
+///
+
+/// warning | `fsGroup` has no effect on a backup **source** either — by default
+A backup source is mounted **read-only** (kopia only reads it), and the kubelet skips its `fsGroup` chown on a read-only mount just as it does on NFS. So `fsGroup`/`fsGroupChangePolicy` are silently inert on the source unless you set `sources[].readOnly: false`.
+
+Under `copyMethod: Snapshot`/`Clone` that is safe — the chown lands on the throwaway staged PVC. Under `copyMethod: Direct` it rewrites your **live** volume and requires `acknowledgeLiveMutation: true`. See [Copy methods → making `fsGroup` apply to the source](copy-methods.md#making-fsgroup-apply-to-the-source).
 ///
 
 ## How to decide what to set

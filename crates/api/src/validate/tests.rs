@@ -181,6 +181,7 @@ fn source_with_both_pvc_and_selector_is_rejected() {
         nfs: None,
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(matches!(
         validate_source(&src),
@@ -196,6 +197,7 @@ fn source_with_neither_is_rejected() {
         nfs: None,
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(matches!(
         validate_source(&src),
@@ -214,6 +216,7 @@ fn nfs_source_alone_is_accepted() {
         }),
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(validate_source(&src).is_ok());
 }
@@ -230,6 +233,7 @@ fn nfs_source_with_pvc_is_mutually_exclusive() {
         }),
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(matches!(
         validate_source(&src),
@@ -248,6 +252,7 @@ fn nfs_source_with_relative_path_is_rejected() {
         }),
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(matches!(
         validate_source(&src),
@@ -580,6 +585,7 @@ fn nfs_source_with_empty_server_is_rejected() {
         }),
         source_path_override: None,
         source_path_strategy: None,
+        ..Default::default()
     };
     assert!(matches!(
         validate_source(&src),
@@ -1204,6 +1210,7 @@ fn backup_config_valid_spec_has_no_errors() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         }],
         copy_method: Default::default(),
         volume_snapshot_class_name: None,
@@ -4274,4 +4281,144 @@ fn e2e_inherit_scenario_mover_shapes_deserialize() {
         None,
         "the e2e's UID-less workload must genuinely pin no UID, or scenario (c) proves nothing"
     );
+}
+
+// --- #254: source readOnly ------------------------------------------------
+
+/// Parse a SnapshotPolicy spec the way the apiserver would (YAML → Value → typed),
+/// per the repo's testutil rule — never `serde_yaml` straight into a typed value.
+fn policy_yaml(body: &str) -> SnapshotPolicySpec {
+    crate::testutil::from_yaml(body)
+}
+
+#[test]
+fn source_read_only_defaults_to_true_and_accepts_an_explicit_false() {
+    use crate::snapshot_policy::source_read_only;
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(
+        source_read_only(&spec.sources[0]),
+        "an unset readOnly must resolve to the CRD's advertised default (true)"
+    );
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Snapshot\n\
+         sources: [ { pvc: { name: data }, readOnly: false } ]\n",
+    );
+    assert!(!source_read_only(&spec.sources[0]));
+    // Staged copyMethods need no acknowledgement: the fsGroup walk lands on the
+    // throwaway staged PVC, never on the workload's volume.
+    assert!(validate_backup_config(&spec).is_empty());
+}
+
+#[test]
+fn writable_nfs_source_is_rejected_because_fsgroup_never_applies_to_it() {
+    // readOnly: false exists for exactly one reason — making fsGroup apply — and the
+    // kubelet does not apply fsGroup to in-tree NFS volumes at all. Allowing it would
+    // ship a knob that cannot do the only thing it is for, while making the export
+    // writable to the mover.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas.lan, path: /export/media }, readOnly: false } ]\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "a writable nfs source must be rejected");
+    assert!(msg.contains("fsGroup"), "must say WHY: {msg}");
+    // ...and point at what does work on NFS.
+    assert!(
+        msg.contains("supplementalGroups") || msg.contains("runAsUser"),
+        "{msg}"
+    );
+    // A read-only nfs source stays valid — this rule must not break existing configs.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas.lan, path: /export/media } } ]\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty());
+}
+
+#[test]
+fn direct_plus_writable_source_needs_an_acknowledgement() {
+    // The hazard: Direct mounts the LIVE volume, so the kubelet's recursive fsGroup
+    // chgrp rewrites production data — and the mover ships fsGroup 65532 by default,
+    // so one bool would silently re-group a running app's files.
+    let direct = |ack: &str| {
+        policy_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             copyMethod: Direct\n\
+             sources: [ {{ pvc: {{ name: data }}, readOnly: false{ack} }} ]\n"
+        ))
+    };
+    let errs = validate_backup_config(&direct(""));
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "Direct + readOnly: false must be gated");
+    assert!(
+        msg.contains("acknowledgeLiveMutation"),
+        "must name the way through: {msg}"
+    );
+    assert!(
+        msg.contains("Snapshot/Clone"),
+        "must offer the safe alternative: {msg}"
+    );
+
+    // Acknowledged → allowed. The user has said the words.
+    assert!(validate_backup_config(&direct(", acknowledgeLiveMutation: true")).is_empty());
+    // Explicitly declined is not an acknowledgement.
+    assert!(!validate_backup_config(&direct(", acknowledgeLiveMutation: false")).is_empty());
+
+    // Direct + read-only (the default) is untouched — this gate must not tax the
+    // overwhelmingly common config.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Direct\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty());
+}
+
+#[test]
+fn a_stale_acknowledgement_is_ignored_rather_than_rejected() {
+    // Deliberate deviation from the reject-don't-silently-ignore precedent: rejecting a
+    // no-longer-needed ack would make switching copyMethod between Direct and
+    // Snapshot/Clone a two-step edit in BOTH directions. An ack is never harmful to carry.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Snapshot\n\
+         sources: [ { pvc: { name: data }, acknowledgeLiveMutation: true } ]\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty());
+}
+
+#[test]
+fn writable_source_conflicts_with_a_read_only_many_staged_pvc() {
+    // A ReadOnlyMany staged PVC cannot be mounted read-write: without this the kubelet
+    // fails the mount at backup time with an opaque error, long after admission.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Snapshot\n\
+         staging: { accessModes: [ReadOnlyMany] }\n\
+         sources: [ { pvc: { name: data }, readOnly: false } ]\n",
+    );
+    let errs = validate_backup_config(&spec);
+    let msg = format!("{errs:?}");
+    assert!(
+        !errs.is_empty(),
+        "ReadOnlyMany + readOnly: false must be rejected"
+    );
+    assert!(msg.contains("ReadOnlyMany"), "{msg}");
+    // The same conflict exists for a read-only staged CLASS, which admission cannot see.
+    assert!(
+        msg.contains("backingSnapshot"),
+        "must warn about the invisible twin: {msg}"
+    );
+
+    // ReadOnlyMany + the read-only default is the documented pairing — still valid.
+    let spec = policy_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         copyMethod: Snapshot\n\
+         staging: { accessModes: [ReadOnlyMany] }\n\
+         sources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty());
 }

@@ -451,6 +451,7 @@ fn build_backup_run_maps_nfs_source_to_inline_nfs_mount() {
             }),
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -468,7 +469,10 @@ fn build_backup_run_maps_nfs_source_to_inline_nfs_mount() {
         }
     );
     assert_eq!(src.mount_path, "/mnt/eros/Media");
-    assert!(src.read_only, "a backup source is mounted read-only");
+    assert!(
+        src.read_only,
+        "a backup source is mounted read-only unless the recipe opts out"
+    );
     // kopia records the export path as the snapshot source path.
     match ws.operation {
         Operation::Snapshot(op) => assert_eq!(op.source_path, "/mnt/eros/Media"),
@@ -493,6 +497,7 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
             }),
             source_path_override: Some("/data".into()),
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -504,6 +509,63 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
         Operation::Snapshot(op) => assert_eq!(op.source_path, "/data"),
         other => panic!("expected a Snapshot operation, got {other:?}"),
     }
+}
+
+#[test]
+fn build_backup_run_honors_source_read_only_false() {
+    // #254: kopia only reads the source, so read-only is the default — but the kubelet
+    // skips its recursive fsGroup chgrp on a read-only mount, which makes a mover's
+    // fsGroup/fsGroupChangePolicy silently inert. `readOnly: false` re-enables it.
+    use crate::jobs::MountSource;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let cfg = config_with_source(
+        "data",
+        Source {
+            pvc: Some(PvcSource {
+                name: "app-data".into(),
+            }),
+            read_only: Some(false),
+            ..Default::default()
+        },
+    );
+    let repo = resolved_s3_repo();
+    let (_ws, source_volume, _repo, _creds) =
+        build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "data").unwrap();
+    let src = source_volume.expect("a PVC source mount");
+    assert_eq!(
+        src.source,
+        MountSource::Pvc {
+            claim_name: "app-data".into()
+        }
+    );
+    assert!(
+        !src.read_only,
+        "readOnly: false must reach the mount — one VolumeMountSpec.read_only drives BOTH \
+         the PVC volume source's readOnly and the container volumeMount's readOnly, and \
+         fsGroup needs both"
+    );
+}
+
+#[test]
+fn build_backup_run_defaults_an_unset_source_read_only_to_true() {
+    // The CRD advertises `default: true` for sources[].readOnly. That schema default is
+    // only honest because this resolver maps absent to exactly the same value — the
+    // apiserver does not default a field whose parent object the user omitted.
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let cfg = config_with_source(
+        "data",
+        Source {
+            pvc: Some(PvcSource {
+                name: "app-data".into(),
+            }),
+            read_only: None,
+            ..Default::default()
+        },
+    );
+    let repo = resolved_s3_repo();
+    let (_ws, source_volume, _repo, _creds) =
+        build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "data").unwrap();
+    assert!(source_volume.expect("a PVC source mount").read_only);
 }
 
 #[test]
@@ -527,6 +589,7 @@ fn build_backup_run_remaps_nfs_pseudo_root_source_off_container_rootfs() {
             }),
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -569,6 +632,7 @@ fn build_backup_run_maps_pvc_source_to_pvc_mount() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -607,6 +671,7 @@ fn build_backup_run_renders_ns_dot_cluster_hostname_for_a_namespaced_repo_with_c
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "billing", "pg").unwrap();
@@ -631,6 +696,7 @@ fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() 
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     cfg.spec.error_handling = Some(ErrorHandling {
@@ -674,6 +740,7 @@ fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() 
                 nfs: None,
                 source_path_override: None,
                 source_path_strategy: None,
+                ..Default::default()
             },
         ),
         &repo,
@@ -705,6 +772,7 @@ fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -1017,6 +1085,7 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();

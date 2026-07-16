@@ -13,6 +13,9 @@
 //!   4. inherit + explicit merge, explicit wins on the Job, reported as `InheritOverridden`.
 //!   5. inherit with no resolvable pod falls back to the explicit context (`InheritFallback`)
 //!      instead of holding the run.
+//!   6. `sources[].readOnly: false` (#254) reaches BOTH the pod's PVC volume source and the
+//!      container volumeMount — the kubelet needs both false before it will apply `fsGroup` —
+//!      and `copyMethod: Direct` without `acknowledgeLiveMutation` is denied at admission.
 //!
 //! Why these are e2e rather than unit tests: the defect behind (3) was not in the compat
 //! engine — that engine was always right — but in the controller never *calling* it. Only a
@@ -824,6 +827,168 @@ async fn inherit_falls_back_to_the_explicit_context_when_no_pod_resolves() {
         "e2e-scc-fb-backup",
         // No workload pod in this scenario; cleanup tolerates the 404.
         "e2e-scc-fb-absent",
+    )
+    .await;
+}
+
+/// Scenario (f): `sources[].readOnly: false` (#254) reaches the mover Job's pod spec on
+/// **both** Kubernetes fields, and `copyMethod: Direct` without the acknowledgement is
+/// denied at admission.
+///
+/// Why this is e2e and not a unit test: the unit tests prove `build_backup_run` threads the
+/// flag and that `build_job` maps one `read_only` onto both k8s fields. Neither can prove the
+/// two halves are actually wired to each other through a real reconcile — which is the same
+/// class of defect as scenario (3): an engine that was always right, never called.
+///
+/// The stakes are specific. `readOnly: false` exists only to un-block the kubelet's recursive
+/// `fsGroup` chgrp, and the kubelet declines that walk if EITHER the volume source or the
+/// container volumeMount says read-only. A regression that flipped one and not the other
+/// would produce a Job that looks writable, backs up fine, and silently never applies
+/// `fsGroup` — exactly the inert-flag symptom the feature was built to end.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn writable_source_reaches_the_job_and_direct_needs_an_acknowledgement() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision the filesystem repository fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json("e2e-scc-ro-repo")),
+        )
+        .await
+        .expect("create Repository");
+
+    // `e2e-src` is a statically-provisioned (non-CSI) hostPath PVC, so these scenarios must
+    // use copyMethod: Direct — which makes this the acknowledgement path by construction.
+    let policy_json = |name: &str, ack: bool| {
+        let mut source = serde_json::json!({
+            "pvc": { "name": "e2e-src" },
+            "readOnly": false
+        });
+        if ack {
+            source["acknowledgeLiveMutation"] = serde_json::json!(true);
+        }
+        serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "e2e-scc-ro-repo" },
+                "sources": [ source ],
+                "copyMethod": "Direct",
+                "retention": { "keepLatest": 5 },
+                "mover": { "podSecurityContext": { "fsGroup": 1000 } }
+            }
+        })
+    };
+
+    // Direct + readOnly: false with NO acknowledgement → the webhook denies it. This is the
+    // guard: the kubelet would recursively chgrp the LIVE volume to fsGroup 1000, and a user
+    // reaches for readOnly: false to fix a permission error, not to re-own their data.
+    let err = policies
+        .create(
+            &PostParams::default(),
+            &cr(policy_json("e2e-scc-ro-unacked", false)),
+        )
+        .await
+        .expect_err(
+            "copyMethod: Direct + readOnly: false without acknowledgeLiveMutation must be \
+             DENIED by the webhook — it rewrites the live volume's group ownership",
+        );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("acknowledgeLiveMutation"),
+        "the denial must name the way through, not just say no: {msg}"
+    );
+
+    // Acknowledged → admitted, and the flag must survive all the way to the Job.
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(policy_json("e2e-scc-ro-policy", true)),
+        )
+        .await
+        .expect("an acknowledged writable Direct source must be admitted");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(backup_json("e2e-scc-ro-backup", "e2e-scc-ro-policy")),
+        )
+        .await
+        .expect("create Snapshot");
+
+    let job = wait_until(
+        "mover Job created for the writable-source backup",
+        default_timeout(),
+        poll_interval(),
+        || async { jobs.get_opt("e2e-scc-ro-backup").await },
+    )
+    .await
+    .expect("the operator should create a mover Job for the writable-source Snapshot");
+
+    let pod = job
+        .spec
+        .and_then(|s| s.template.spec)
+        .expect("the mover Job must carry a pod template");
+
+    // Field 1 of 2: the PVC volume source.
+    let src_vol = pod
+        .volumes
+        .as_ref()
+        .and_then(|vols| vols.iter().find(|v| v.name == "source"))
+        .and_then(|v| v.persistent_volume_claim.clone())
+        .expect("the mover pod must mount the source PVC");
+    assert_eq!(src_vol.claim_name, "e2e-src");
+    assert_eq!(
+        src_vol.read_only,
+        Some(false),
+        "readOnly: false must reach the pod's PVC volume source — with readOnly: true here \
+         the kubelet skips the fsGroup chgrp no matter what the volumeMount says"
+    );
+
+    // Field 2 of 2: the container volumeMount. Both, or fsGroup stays inert.
+    let src_mount = pod
+        .containers
+        .first()
+        .and_then(|c| c.volume_mounts.as_ref())
+        .and_then(|mounts| mounts.iter().find(|m| m.name == "source"))
+        .cloned()
+        .expect("the mover container must mount the source volume");
+    assert_eq!(
+        src_mount.read_only,
+        Some(false),
+        "readOnly: false must reach the container volumeMount too — one API field drives \
+         both, and the kubelet needs both to be false"
+    );
+
+    // The fsGroup that the writable mount exists to enable must actually be on the pod.
+    assert_eq!(
+        pod.security_context.and_then(|sc| sc.fs_group),
+        Some(1000),
+        "the mover's fsGroup must survive to the pod, or the writable mount buys nothing"
+    );
+
+    let _ = policies
+        .delete("e2e-scc-ro-unacked", &DeleteParams::default())
+        .await;
+    cleanup(
+        &client,
+        "e2e-scc-ro-repo",
+        "e2e-scc-ro-policy",
+        "e2e-scc-ro-backup",
+        // No workload pod in this scenario; cleanup tolerates the 404.
+        "e2e-scc-ro-absent",
     )
     .await;
 }

@@ -58,7 +58,27 @@ pub fn validate_source(source: &Source) -> ValidationResult {
             context: "snapshot source".to_string(),
         }),
         [_only] => match &source.nfs {
-            Some(nfs) => validate_nfs_volume(nfs, "snapshot source"),
+            Some(nfs) => {
+                // `readOnly: false` exists for exactly one purpose — letting the kubelet
+                // apply `fsGroup` to the source — and the kubelet does not apply `fsGroup`
+                // to in-tree NFS volumes at all. So on NFS it buys nothing and only makes
+                // the export writable to the mover. Reject it rather than ship a knob that
+                // silently does the opposite of what its user wants.
+                if !crate::snapshot_policy::source_read_only(source) {
+                    return Err(ValidationError::InvalidFieldValue {
+                        field: "spec.sources[].readOnly".to_string(),
+                        reason: "readOnly: false is not supported on an nfs source: the kubelet \
+                                 does not apply fsGroup to in-tree NFS volumes, so a read-write \
+                                 mount grants the mover no additional readability and only \
+                                 exposes the export to writes. Remove readOnly (NFS is read \
+                                 directly), and grant access with mover.podSecurityContext \
+                                 supplementalGroups / mover.securityContext runAsUser matching \
+                                 the export's ownership, or with a server-side ID remap"
+                            .to_string(),
+                    });
+                }
+                validate_nfs_volume(nfs, "snapshot source")
+            }
             None => Ok(()),
         },
     }

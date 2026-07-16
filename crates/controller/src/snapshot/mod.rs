@@ -936,6 +936,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             &namespace,
             backup,
             claim,
+            // The mount the assessment must reason about — already decided, so this
+            // costs nothing to thread (`readOnly: false` changes what fsGroup means).
+            source_volume.as_ref().is_none_or(|v| v.read_only),
             &resolved_mover.security_context,
             resolved_mover.pod_security_context.as_ref(),
             mover_security.unfiltered_pods.as_deref(),
@@ -1111,6 +1114,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         io::StagingOutcome::Ready(staged) => {
             // Mount the staged PVC in place of the live source — same mount path and
             // kopia source path, so the snapshot's recorded identity is unchanged.
+            // `read_only` carries over deliberately: `readOnly: false` (#254) asks the
+            // kubelet to apply fsGroup to whatever the mover mounts, and under a staged
+            // copyMethod that IS the staged PVC. Dropping it here would silently disable
+            // the flag for Snapshot/Clone — the very copyMethods where it is safe.
             if let Some(mount) = source_volume.as_mut() {
                 *mount = VolumeMountSpec::pvc(
                     staged.pvc_name.clone(),
@@ -2449,10 +2456,12 @@ async fn resolve_recipe(
 /// listing again (the `pvcConsumer` resolver's). It MUST be unfiltered: `workload_identities`
 /// needs every pod mounting the claim, and a narrowed writer set can flip a mismatch to a false
 /// `Compatible`. `None` → list here, as every other caller does.
+#[allow(clippy::too_many_arguments)]
 async fn assess_backup_security_context(
     namespace: &str,
     backup: &Snapshot,
     claim: &str,
+    source_read_only: bool,
     sc: &k8s_openapi::api::core::v1::SecurityContext,
     psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
     listed_pods: Option<&[Pod]>,
@@ -2481,7 +2490,7 @@ async fn assess_backup_security_context(
     let mover = kopiur_api::secctx_compat::mover_identity(sc, psc);
     let identities = kopiur_api::secctx_compat::workload_identities(pods, claim);
     if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { basis } =
-        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities)
+        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities, source_read_only)
     {
         // Name the basis and the actual UID: a bare "compatible" is what let the old
         // "by construction" claim hide the fact that nothing had been checked.

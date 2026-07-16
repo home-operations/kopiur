@@ -119,6 +119,7 @@ fn sample_backup_config(name: &str) -> SnapshotPolicy {
                 nfs: None,
                 source_path_override: None,
                 source_path_strategy: None,
+                ..Default::default()
             }],
             copy_method: Default::default(),
             volume_snapshot_class_name: None,

@@ -1,0 +1,49 @@
+# Example 32 — copyMethod: Direct + readOnly: false — REWRITES YOUR LIVE VOLUME
+#
+# READ THIS BEFORE COPYING. Example 31 is almost certainly what you want instead.
+#
+# readOnly: false asks the kubelet to apply fsGroup to whatever the mover mounts.
+# Under copyMethod: Snapshot/Clone that is a throwaway staged PVC and it costs you
+# nothing. Under Direct there IS no stage — the mover mounts your live PVC, so the
+# kubelet recursively chgrp's YOUR RUNNING APPLICATION'S FILES to fsGroup and makes
+# them group-writable. Permanently. On the next backup.
+#
+# Postgres and Redis both refuse to start on an over-permissive data directory.
+# Anything that asserts on group ownership can break the same way. There is no undo.
+#
+# Kopiur rejects this combination at admission unless you set
+# acknowledgeLiveMutation: true, because the intent is not inferable: you would be
+# setting readOnly: false to fix a permission error, not to re-own your data.
+#
+# ONLY use this when your storage genuinely cannot do CSI snapshots or clones (so
+# copyMethod: Snapshot/Clone is unavailable) AND you have confirmed your workload
+# tolerates the group-ownership change.
+#
+# acknowledgeLiveMutation is IGNORED anywhere it is not needed, so it is safe to
+# leave in place if you later switch to copyMethod: Snapshot — no two-step edit.
+#
+# See docs/copy-methods.md#making-fsgroup-apply-to-the-source
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: legacy-share
+  namespace: files
+spec:
+  repository:
+    name: nas
+  # No CSI snapshot stack on this storage class, so there is no stage to interpose.
+  copyMethod: Direct
+  mover:
+    podSecurityContext:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+  sources:
+    - pvc:
+        name: legacy-share-data
+      readOnly: false
+      # "I understand the kubelet will chgrp legacy-share-data's contents to 1000
+      #  and make them group-writable, and this workload tolerates that."
+      acknowledgeLiveMutation: true
+  retention:
+    keepDaily: 7

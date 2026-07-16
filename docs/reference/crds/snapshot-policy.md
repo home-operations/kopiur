@@ -75,8 +75,9 @@ mover:
   read-only mount instead of a minutes-long full subvolume clone.
 - `accessModes` — access modes for the staged PVC (absent ⇒ copy the source's);
   a closed enum of the four Kubernetes modes. `[ReadOnlyMany]` pairs with
-  snapshot-backed read-only classes; the mover always mounts the stage
-  read-only regardless.
+  snapshot-backed read-only classes. The mover mounts the stage read-only
+  unless a source sets `readOnly: false`, which `[ReadOnlyMany]` is rejected
+  with (a read-only stage cannot be mounted read-write).
 
 The two overrides need a staged PVC to act on, so they are **rejected at
 admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources. See

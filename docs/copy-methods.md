@@ -197,7 +197,7 @@ spec:
 ```
 
 - **`storageClassName`** — stage on a different class of the **same CSI driver**, typically one with different *restore parameters*. Kopiur verifies the driver matches up front and fails fast with `StagedClassMismatch` if it doesn't (a foreign driver can never provision from your source's snapshot — without the check you'd get an opaque bind timeout instead).
-- **`accessModes`** — request different modes for the stage (e.g. `[ReadOnlyMany]` for a snapshot-backed read-only class). The mover always mounts the staged source read-only regardless.
+- **`accessModes`** — request different modes for the stage (e.g. `[ReadOnlyMany]` for a snapshot-backed read-only class). The mover mounts the staged source read-only unless the source sets [`readOnly: false`](#making-fsgroup-apply-to-the-source) — and `[ReadOnlyMany]` is rejected together with that, since a read-only stage cannot be mounted read-write.
 - Both are meaningless without a staged PVC, so they're **rejected at admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources.
 
 ### The flagship use: CephFS shallow snapshots
@@ -227,6 +227,60 @@ Because the live volume is mounted, Kopiur **co-locates** the mover on the node 
 ```
 
 `Direct` reads a **live filesystem**, so the backup is *crash-consistent* — fine for most file data, but for a busy database prefer `Snapshot`, or quiesce the app with hooks (below).
+
+---
+
+## Making `fsGroup` apply to the source
+
+By default the mover mounts the source **read-only** — kopia only ever reads it. That default has one surprising consequence: **`fsGroup` does nothing on the source.**
+
+`fsGroup` is not a passive grant. The kubelet implements it by *walking the volume and rewriting it*: `chgrp` every file to the group, `chmod g+rw`, setgid on directories. That rewrite is the whole mechanism — and **the kubelet skips it entirely on a read-only mount**. So a mover `podSecurityContext.fsGroup` (or `fsGroupChangePolicy`) has no effect on a backup source, no matter what you set it to.
+
+That matters when the mover must run as a *specific* uid:gid for reasons of its own — a non-ID-squashed NFS repository export, say — and the source PVC's files are owned by someone else. Set `readOnly: false` on the source and the kubelet does the walk:
+
+```yaml
+spec:
+  copyMethod: Snapshot        # the stage is what gets rewritten — see below
+  mover:
+    podSecurityContext:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+  sources:
+    - pvc: { name: app-data }
+      readOnly: false
+```
+
+**What gets rewritten depends entirely on `copyMethod`:**
+
+| `copyMethod` | The mover mounts | `readOnly: false` rewrites |
+| --- | --- | --- |
+| `Snapshot` / `Clone` | a temporary **staged PVC** | the throwaway stage, deleted when the run ends. Your volume is never touched. |
+| `Direct` | your **live PVC** | your production data — permanently, while the app runs. |
+
+So under `Snapshot`/`Clone` this is free, and it is the combination to reach for:
+
+```yaml
+--8<-- "deploy/examples/31-source-fsgroup-normalize.yaml"
+```
+
+!!! danger "`Direct` + `readOnly: false` rewrites live data"
+
+    With `Direct` there is no stage: the kubelet chgrp's **your running application's files** to the mover's `fsGroup` and makes them group-writable. Postgres and Redis both refuse to start on an over-permissive data directory; anything asserting on group ownership can break the same way.
+
+    Because that is not inferable from intent — you set one flag to fix a permission error, not to re-own your data — Kopiur rejects the combination unless you say so explicitly:
+
+    ```yaml
+    --8<-- "deploy/examples/32-source-writable-direct.yaml"
+    ```
+
+    Prefer `copyMethod: Snapshot`/`Clone` if your storage supports it. `acknowledgeLiveMutation` is ignored anywhere else, so it is safe to leave in place if you switch back.
+
+Two more rejections you may hit, both at admission:
+
+- **`nfs` sources.** The kubelet does not apply `fsGroup` to in-tree NFS volumes *at all*, so `readOnly: false` cannot achieve anything there and only makes the export writable. Use `mover.podSecurityContext.supplementalGroups` / `mover.securityContext.runAsUser` matching the export's ownership, or remap IDs server-side. See [Security context](security-context.md).
+- **`staging.accessModes: [ReadOnlyMany]`** (and read-only staged classes generally, like CephFS `backingSnapshot`). A read-only stage cannot be mounted read-write — the kubelet would fail the mount at backup time.
+
+Even with all this correct, whether the kubelet *actually* performs the walk still depends on your CSI driver: `fsGroupPolicy: None` skips it, and the default `ReadWriteOnceWithFSType` skips RWX volumes. Kopiur therefore never claims `SecurityContextCompatible=True` on an `fsGroup` basis — it reports `Unknown` and lets the mover's readability preflight be the arbiter at runtime.
 
 ---
 

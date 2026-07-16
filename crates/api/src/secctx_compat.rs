@@ -21,13 +21,23 @@
 //!
 //! ## `fsGroup` is excluded from *backup-source* reasoning
 //!
-//! A backup mounts the source PVC **read-only**, so the kubelet never recursively chgrp's
-//! it and `fsGroup` grants nothing for readability there. We therefore never treat an
+//! A backup mounts the source PVC **read-only** by default, so the kubelet never recursively
+//! chgrp's it and `fsGroup` grants nothing for readability there. We therefore never treat an
 //! `fsGroup` match as a path to `Compatible` for backups. (`fsGroup` is only counted toward
 //! the mover's *process* group set, which can only ever *soften* a mismatch to `Unknown` —
 //! the safe direction.) On **restore** the target is a fresh read-write volume where the
 //! kubelet *does* apply `fsGroup`, so [`assess_restore_compat`] treats an `fsGroup` match as
 //! a positive signal — the predicates are intentionally asymmetric.
+//!
+//! `Source::readOnly: false` (#254) exists precisely to re-enable that walk on the source, so
+//! it partially unwinds this: with a writable source and an `fsGroup`, the kubelet MAY chgrp
+//! the tree to the mover's own group, which would make the source readable no matter who wrote
+//! it. That is not enough for `Compatible` — whether the walk happens depends on the
+//! CSIDriver's `fsGroupPolicy` and on `fsGroupChangePolicy`, neither of which is in the spec —
+//! but it IS enough to invalidate every workload-ownership comparison. So
+//! [`assess_read_compat`] takes the effective `readOnly` and short-circuits to
+//! `Unknown { FsGroupMayApply }`. Without that, the one configuration the flag exists to
+//! enable would be reported `LikelyIncompatible` while working fine.
 
 use std::collections::BTreeSet;
 
@@ -45,6 +55,12 @@ pub struct MoverIdentity {
     /// `supplementalGroups`, and pod `fsGroup` (the kubelet adds `fsGroup` to the pod's
     /// supplementary GIDs). Sorted for determinism. Used only to *soften* a UID mismatch.
     pub groups: BTreeSet<i64>,
+    /// Effective pod `fsGroup`, kept separately from [`Self::groups`] (which folds it in
+    /// among the process's GIDs and so cannot answer *which* one it was). Load-bearing
+    /// only on a **read-write** source mount, where the kubelet may recursively chgrp the
+    /// tree to it — on the read-only default it grants nothing. Symmetric with
+    /// [`MoverWriteIdentity::fs_group`].
+    pub fs_group: Option<i64>,
 }
 
 /// The mover's effective identity for **write** reasoning (restore target).
@@ -105,6 +121,13 @@ pub enum UnknownReason {
     /// The source is NFS (or has no single PVC) — ownership is NAS-determined and `fsGroup`
     /// is ignored; nothing to assess.
     NfsOrNoPvc,
+    /// The source is mounted read-write and the mover declares an `fsGroup`, so the kubelet
+    /// **may** recursively chgrp the tree to it before the mover reads — which would make
+    /// the source readable regardless of who wrote it. Whether it actually does is not
+    /// knowable from the spec (the CSIDriver's `fsGroupPolicy` may be `None`, or the default
+    /// `ReadWriteOnceWithFSType`, which skips RWX volumes; and `fsGroupChangePolicy:
+    /// OnRootMismatch` skips the walk when the root group already matches), so we abstain.
+    FsGroupMayApply,
 }
 
 /// Whether a backup mover can read the source PVC's files. See the module docs for why
@@ -193,6 +216,7 @@ pub fn mover_identity(sc: &SecurityContext, psc: Option<&PodSecurityContext>) ->
     MoverIdentity {
         uid: effective_run_as_user(Some(sc), psc),
         groups,
+        fs_group: psc.and_then(|p| p.fs_group),
     }
 }
 
@@ -365,9 +389,15 @@ pub fn workload_identities(pods: &[Pod], claim_name: &str) -> Vec<WorkloadIdenti
 /// Assess whether a backup mover can read the source PVC's files, given the workload pods
 /// mounting it. See the module docs for the conservative posture; the result is deterministic
 /// (independent of `workloads` ordering).
+///
+/// `source_read_only` is the source mount's effective `readOnly` (`Source::readOnly`, default
+/// `true`). It is load-bearing rather than incidental: the module's whole `fsGroup` posture
+/// rests on the mount being read-only, and a writable source invalidates every group
+/// comparison below — see [`UnknownReason::FsGroupMayApply`].
 pub fn assess_read_compat(
     mover: &MoverIdentity,
     workloads: &[WorkloadIdentity],
+    source_read_only: bool,
 ) -> MoverReadCompat {
     // Root reads everything — independent of any workload (so this holds even with no pod).
     if mover.uid == Some(0) {
@@ -400,6 +430,20 @@ pub fn assess_read_compat(
     if all_writers == BTreeSet::from([mover_uid]) {
         return MoverReadCompat::Compatible {
             basis: CompatBasis::ExactUidMatch,
+        };
+    }
+    // Everything below reasons about the ownership the WORKLOAD left on the volume. A
+    // read-write mount plus an `fsGroup` breaks that premise at the root: the kubelet may
+    // chgrp the whole tree to the mover's own `fsGroup` and add group-write before the
+    // mover ever reads, at which point who wrote the files stops mattering. Bail out here
+    // rather than after the group chain — `mover.groups` already contains `fs_group`, so
+    // `shares_group` below would otherwise catch this first and blame "a shared group with
+    // the workload", which is not what happened. Still `Unknown`, never `Compatible`: the
+    // module reserves that for provable verdicts, and whether the kubelet performs the walk
+    // is not a property of the spec (see `FsGroupMayApply`).
+    if !source_read_only && mover.fs_group.is_some() {
+        return MoverReadCompat::Unknown {
+            why: UnknownReason::FsGroupMayApply,
         };
     }
     // UIDs differ somewhere. If the mover shares any group with any file group, a group-read
@@ -505,6 +549,10 @@ impl UnknownReason {
             UnknownReason::OnlyGroupOverlap => "UIDs differ but a group is shared",
             UnknownReason::NoConsumerPod => "no pod currently mounts the source PVC",
             UnknownReason::NfsOrNoPvc => "source is NFS or has no single PVC",
+            UnknownReason::FsGroupMayApply => {
+                "the source is mounted read-write, so the kubelet may apply the mover's fsGroup \
+                 to it"
+            }
         }
     }
 }
@@ -578,7 +626,7 @@ mod tests {
     fn root_mover_is_compatible_even_with_no_consumer() {
         let m = mover_identity(&sc(Some(0), None, Some(false)), None);
         assert!(matches!(
-            assess_read_compat(&m, &[]),
+            assess_read_compat(&m, &[], true),
             MoverReadCompat::Compatible {
                 basis: CompatBasis::RootMover
             }
@@ -594,7 +642,7 @@ mod tests {
         );
         assert_eq!(m.uid, Some(0));
         assert!(matches!(
-            assess_read_compat(&m, &[]),
+            assess_read_compat(&m, &[], true),
             MoverReadCompat::Compatible {
                 basis: CompatBasis::RootMover
             }
@@ -647,7 +695,7 @@ mod tests {
         let ids = workload_identities(std::slice::from_ref(&w_pod), "app-data");
         assert!(
             !matches!(
-                assess_read_compat(&m, &ids),
+                assess_read_compat(&m, &ids, true),
                 MoverReadCompat::Compatible { .. }
             ),
             "must never be Compatible: nothing here proves the mover can read the source"
@@ -672,7 +720,8 @@ mod tests {
         assert!(matches!(
             assess_read_compat(
                 &m,
-                &workload_identities(std::slice::from_ref(&w_pod), "app-data")
+                &workload_identities(std::slice::from_ref(&w_pod), "app-data"),
+                true
             ),
             MoverReadCompat::Compatible {
                 basis: CompatBasis::ExactUidMatch
@@ -712,7 +761,8 @@ mod tests {
             !matches!(
                 assess_read_compat(
                     &m,
-                    &workload_identities(std::slice::from_ref(&w_pod), "app-data")
+                    &workload_identities(std::slice::from_ref(&w_pod), "app-data"),
+                    true
                 ),
                 MoverReadCompat::Compatible { .. }
             ),
@@ -803,7 +853,7 @@ mod tests {
         );
         let w = workload_identity(&pod("pg-0", "db", Some(999), None, "data"));
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::Unknown {
                 why: UnknownReason::MoverUidUnpinned
             }
@@ -815,7 +865,7 @@ mod tests {
         let m = mover_identity(&sc(Some(999), None, Some(true)), None);
         let w = workload_identity(&pod("pg-0", "db", Some(999), None, "data"));
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::Compatible {
                 basis: CompatBasis::ExactUidMatch
             }
@@ -827,7 +877,7 @@ mod tests {
         let m = mover_identity(&sc(Some(65532), None, Some(true)), None);
         let w = workload_identity(&pod("pg-0", "db", Some(999), None, "data"));
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::LikelyIncompatible { .. }
         ));
     }
@@ -842,7 +892,7 @@ mod tests {
         );
         let w = workload_identity(&pod("pg-0", "db", Some(999), Some(2000), "data"));
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::Unknown {
                 why: UnknownReason::OnlyGroupOverlap
             }
@@ -864,8 +914,95 @@ mod tests {
         assert!(w.writer_uids.contains(&0) && w.writer_uids.contains(&999));
         // mover 999 doesn't match the {0,999} set exactly, no shared group → LikelyIncompatible.
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::LikelyIncompatible { .. }
+        ));
+    }
+
+    /// #254: the exact configuration `Source::readOnly: false` exists to enable must not
+    /// be reported as a near-certain failure.
+    #[test]
+    fn a_writable_source_with_an_fsgroup_softens_likely_incompatible_to_unknown() {
+        // The workload writes as 1000 and shares no group with the mover. Read-only, that
+        // is the textbook LikelyIncompatible — and it is the verdict a user gets today.
+        let m = mover_identity(
+            &sc(Some(65532), None, Some(true)),
+            Some(&psc(None, Some(65532), vec![])),
+        );
+        let w = workload_identity(&pod("app-0", "ns", Some(1000), Some(1000), "data"));
+        assert!(
+            matches!(
+                assess_read_compat(&m, std::slice::from_ref(&w), true),
+                MoverReadCompat::LikelyIncompatible { .. }
+            ),
+            "read-only source: fsGroup grants nothing, so the mismatch stands"
+        );
+        // Writable, the kubelet MAY chgrp the whole tree to the mover's own fsGroup before
+        // it reads, at which point who wrote the files stops mattering. Abstain.
+        assert!(
+            matches!(
+                assess_read_compat(&m, std::slice::from_ref(&w), false),
+                MoverReadCompat::Unknown {
+                    why: UnknownReason::FsGroupMayApply
+                }
+            ),
+            "a writable source + an fsGroup invalidates the ownership comparison"
+        );
+    }
+
+    /// The verdict is `Unknown`, never `Compatible` — whether the kubelet performs the walk
+    /// is not a property of the spec (CSIDriver `fsGroupPolicy: None`, or the default
+    /// `ReadWriteOnceWithFSType` skipping RWX; `fsGroupChangePolicy: OnRootMismatch`).
+    #[test]
+    fn a_writable_source_never_reaches_compatible_on_an_fsgroup_basis() {
+        let m = mover_identity(
+            &sc(Some(65532), None, Some(true)),
+            Some(&psc(None, Some(65532), vec![])),
+        );
+        let w = workload_identity(&pod("app-0", "ns", Some(1000), Some(1000), "data"));
+        assert!(!matches!(
+            assess_read_compat(&m, &[w], false),
+            MoverReadCompat::Compatible { .. }
+        ));
+    }
+
+    /// The softening is keyed on the mover actually HAVING an fsGroup — without one there
+    /// is no walk to hope for, and a writable mount changes nothing.
+    #[test]
+    fn a_writable_source_without_an_fsgroup_still_reports_likely_incompatible() {
+        let m = mover_identity(&sc(Some(65532), None, Some(true)), None);
+        let w = workload_identity(&pod("app-0", "ns", Some(1000), Some(1000), "data"));
+        assert!(matches!(
+            assess_read_compat(&m, &[w], false),
+            MoverReadCompat::LikelyIncompatible { .. }
+        ));
+    }
+
+    /// The fsGroup short-circuit sits AFTER the provable verdicts, so it can never mask a
+    /// real `Compatible` into an abstention.
+    #[test]
+    fn a_writable_source_does_not_mask_a_provable_compatible() {
+        let root = mover_identity(
+            &sc(Some(0), None, Some(false)),
+            Some(&psc(None, Some(65532), vec![])),
+        );
+        let w = workload_identity(&pod("app-0", "ns", Some(1000), Some(1000), "data"));
+        assert!(matches!(
+            assess_read_compat(&root, std::slice::from_ref(&w), false),
+            MoverReadCompat::Compatible {
+                basis: CompatBasis::RootMover
+            }
+        ));
+        // ...and an exact UID match likewise survives.
+        let exact = mover_identity(
+            &sc(Some(1000), None, Some(true)),
+            Some(&psc(None, Some(65532), vec![])),
+        );
+        assert!(matches!(
+            assess_read_compat(&exact, &[w], false),
+            MoverReadCompat::Compatible {
+                basis: CompatBasis::ExactUidMatch
+            }
         ));
     }
 
@@ -878,7 +1015,7 @@ mod tests {
         let m = mover_identity(&sc(Some(65532), None, Some(true)), None);
         let w = workload_identity(&p);
         assert!(matches!(
-            assess_read_compat(&m, &[w]),
+            assess_read_compat(&m, &[w], true),
             MoverReadCompat::Unknown {
                 why: UnknownReason::WorkloadUidUnpinned
             }
@@ -890,8 +1027,8 @@ mod tests {
         let m = mover_identity(&sc(Some(65532), None, Some(true)), None);
         let a = workload_identity(&pod("a", "ns", Some(999), None, "data"));
         let b = workload_identity(&pod("b", "ns", Some(1000), None, "data"));
-        let forward = assess_read_compat(&m, &[a.clone(), b.clone()]);
-        let reversed = assess_read_compat(&m, &[b, a]);
+        let forward = assess_read_compat(&m, &[a.clone(), b.clone()], true);
+        let reversed = assess_read_compat(&m, &[b, a], true);
         assert_eq!(forward, reversed, "verdict must not depend on input order");
     }
 

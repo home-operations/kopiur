@@ -45,6 +45,32 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
+    // `copyMethod: Direct` + `readOnly: false` is the one combination that reaches the
+    // workload's own volume. `readOnly: false` is only ever set to make `fsGroup` apply,
+    // and the kubelet applies it by recursively chgrp-ing the mount and adding
+    // group-write. Under Snapshot/Clone that walk rewrites a throwaway staged PVC and is
+    // free; under Direct it permanently rewrites live production data while the workload
+    // runs — and the mover ships `fsGroup: 65532` by DEFAULT, so a user who sets one bool
+    // to fix a permissions error would have their data re-grouped with no other signal.
+    // Databases that refuse an over-permissive data directory (postgres, redis) fail to
+    // restart afterwards. Require the intent to be stated; it is not inferable.
+    for (i, source) in spec.sources.iter().enumerate() {
+        if crate::snapshot_policy::source_mutates_live_volume(spec.copy_method, source)
+            && !source.acknowledge_live_mutation.unwrap_or(false)
+        {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: format!("spec.sources[{i}].readOnly"),
+                reason: "copyMethod: Direct with readOnly: false mounts the LIVE source volume \
+                         read-write, so the kubelet will recursively chgrp its contents to the \
+                         mover's fsGroup (65532 by default) and make them group-writable — \
+                         permanently, while the workload is running. Prefer copyMethod: \
+                         Snapshot/Clone, which applies fsGroup to a throwaway staged copy and \
+                         never touches your data. If you do mean to rewrite the live volume, \
+                         set acknowledgeLiveMutation: true on this source"
+                    .to_string(),
+            });
+        }
+    }
     // `volumeSnapshotClassName` only applies when a PVC source is CSI-snapshotted/cloned
     // (`copyMethod: Snapshot`/`Clone`). An NFS source has no PVC to snapshot, so pairing
     // it with an explicit class is a configuration mistake — reject it at admission with
@@ -266,6 +292,26 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
         "spec.staging.accessModes",
         &st.access_modes,
     ));
+    // A ReadOnlyMany staged PVC cannot be mounted read-write: the kubelet fails the
+    // mount and the backup dies at run time with an opaque error. Catch it here.
+    if st.access_modes.contains(&PvcAccessMode::ReadOnlyMany)
+        && let Some(i) = spec
+            .sources
+            .iter()
+            .position(|s| !crate::snapshot_policy::source_read_only(s))
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: format!("spec.sources[{i}].readOnly"),
+            reason: "readOnly: false cannot be honored when spec.staging.accessModes is \
+                     [ReadOnlyMany]: the staged PVC is read-only, so mounting it read-write \
+                     fails at the kubelet and the backup never starts. Drop ReadOnlyMany (a \
+                     read-write staged PVC is what lets the kubelet apply fsGroup), or drop \
+                     readOnly: false. The same conflict exists — invisibly here, because the \
+                     class is only resolvable in-cluster — with a read-only staged class such \
+                     as a rook-ceph CephFS class with backingSnapshot: \"true\""
+                .to_string(),
+        });
+    }
     let overrides: Vec<&str> = [
         (
             "spec.staging.storageClassName",
