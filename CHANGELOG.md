@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.5](https://github.com/home-operations/kopiur/compare/0.7.4...0.7.5) (2026-07-16)
+
+
+### Bug Fixes
+
+* **readme:** update readme admonition ([987957c](https://github.com/home-operations/kopiur/commit/987957c38b9ddfa1fe0ff75cdc3cac8d2d529181))
+* **secctx:** SecurityContextCompatible is verified, not asserted; inherit merges with explicit ([#259](https://github.com/home-operations/kopiur/issues/259)) ([cbfd97d](https://github.com/home-operations/kopiur/commit/cbfd97dabb15c40807ef64c0ef4d51a3608da34e))
+
 ## [0.7.4](https://github.com/home-operations/kopiur/compare/0.7.3...0.7.4) (2026-07-15)
 
 
