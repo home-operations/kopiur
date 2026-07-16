@@ -2,9 +2,17 @@
 //! surface (at `kubectl apply`). Non-blocking and fail-open: the authoritative checks are the
 //! reconcile-time condition and the mover's runtime readability preflight.
 //!
-//! The webhook sees only the *recipe* securityContext (no `moverDefaults`), so it warns only
-//! when the recipe **explicitly pins** a `runAsUser` — otherwise the mover UID is undetermined
-//! and we stay silent. We warn only on a near-certain `LikelyIncompatible` verdict.
+//! The webhook sees only the *recipe* securityContext, so it warns only when the recipe
+//! **explicitly pins** a `runAsUser` — otherwise the mover UID is undetermined and we stay
+//! silent. We warn only on a near-certain `LikelyIncompatible` verdict.
+//!
+//! Two things it is blind to, both of which can only make a warning WRONG, never missing:
+//!
+//! - **`moverDefaults`** — a repository-level `runAsUser`/`fsGroup` it cannot see.
+//! - **`inheritSecurityContextFrom`** — resolved from a live pod at reconcile time, which
+//!   admission cannot do. Its inherited `fsGroup`/`supplementalGroups` land in the mover's
+//!   group set and can soften a UID mismatch to `Unknown`, so judging an inherit recipe from
+//!   its explicit context alone would warn about a mismatch that does not exist.
 
 use api::common::MoverSpec;
 use api::secctx_compat::{self, MoverReadCompat, MoverWriteIdentity, RestoreWriteCompat};
@@ -18,6 +26,14 @@ use kube::{Api, Client};
 /// the recipe (so the webhook can actually decide). `None` ⇒ stay silent.
 fn pinned_mover_identity(mover: Option<&MoverSpec>) -> Option<secctx_compat::MoverIdentity> {
     let m = mover?;
+    // An inherit recipe's real identity is only known once a live workload pod is resolved at
+    // reconcile time. Judging it from the explicit context alone would miss the inherited
+    // groups that soften a mismatch, producing a warning that contradicts what the operator
+    // actually does. (The two were mutually exclusive before, so this path never spoke; the
+    // guard keeps that silence now that they combine.)
+    if m.inherit_security_context_from.is_some() {
+        return None;
+    }
     let sc = m.security_context.as_ref()?;
     // Only when the recipe pins a UID (container or pod) — else the resolved UID is unknown.
     let id = secctx_compat::mover_identity(sc, m.pod_security_context.as_ref());

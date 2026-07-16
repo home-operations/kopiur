@@ -150,6 +150,23 @@ talks to both backends:
   `AWS_SECRET_ACCESS_KEY`, `B2_KEY_ID`/`B2_KEY`, `KOPIA_WEBDAV_*`, or the file-based
   `KOPIA_SFTP_KEY_DATA` / `KOPIA_GCS_CREDENTIALS` / `KOPIA_RCLONE_CONFIG`).
 
+/// note | `inheritSecurityContextFrom` is rejected here
+
+A replication mover copies blobs repository → repository and never reads a workload's
+files, so there is no workload whose identity it could take. `spec.mover.inheritSecurityContextFrom`
+is therefore **rejected at admission** rather than accepted and ignored.
+
+Set `spec.mover.securityContext` explicitly if the destination needs a particular
+UID/GID — e.g. a filesystem repository on an NFS export, where the usual answer is a
+shared `supplementalGroups` (see [NFS filesystem repositories](security-context.md#nfs-filesystem-repositories)).
+
+Versions ≤ 0.7.4 accepted the field and silently dropped it: the manifest said the
+mover ran as the workload, and it did not. If you have such a manifest, it will now be
+rejected — remove the field (it was never doing anything) or replace it with an
+explicit `securityContext`.
+
+///
+
 The source and destination may use **entirely different credentials** — even two
 different accounts on the same provider (e.g. mirroring MinIO → Cloudflare R2, or one
 S3 account to another). Kopiur delivers the destination Secret to the pod under a

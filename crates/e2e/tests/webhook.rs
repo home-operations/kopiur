@@ -27,7 +27,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 use k8s_openapi::api::core::v1::Secret;
 
 use kopiur_api::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION;
-use kopiur_api::{ClusterRepository, Repository, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Repository, RepositoryReplication, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
 
 /// Names the chart renders for release "kopiur" (the e2e release).
@@ -70,10 +70,9 @@ fn invalid_backup_config(name: &str) -> SnapshotPolicy {
 }
 
 /// A SnapshotPolicy whose mover sets BOTH `securityContext` and
-/// `inheritSecurityContextFrom` — structurally valid, but the shared `validate_mover`
-/// rejects it (they're mutually exclusive). Exercises the mover-validation path
-/// through admission.
-fn mover_mutually_exclusive_backup_config(name: &str) -> SnapshotPolicy {
+/// `inheritSecurityContextFrom`. This used to be webhook-rejected as mutually exclusive; the
+/// two are adjacent merge layers (`inherited ⊂ explicit`), so admission must now ACCEPT it.
+fn mover_inherit_plus_explicit_backup_config(name: &str) -> SnapshotPolicy {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
         "kind": "SnapshotPolicy",
@@ -158,23 +157,60 @@ async fn self_managed_webhook_tls_bootstraps_and_gates_admission() {
     );
     let _ = configs.delete(bad, &DeleteParams::default()).await;
 
-    // 5. A mover that sets BOTH securityContext and inheritSecurityContextFrom is
-    //    rejected by the shared mover validator (mutually exclusive).
-    let bad_mover = "webhook-deny-mover";
-    let _ = configs.delete(bad_mover, &DeleteParams::default()).await;
-    let err = configs
+    // 5. A mover that sets BOTH securityContext and inheritSecurityContextFrom is ACCEPTED:
+    //    they are adjacent merge layers (explicit overrides inherited field-wise, and stands
+    //    in alone when inheritance cannot resolve a pod), not competing sources. This asserts
+    //    the relaxation reaches a live cluster — a unit test on `validate_mover` alone cannot
+    //    prove the deployed webhook stopped rejecting it.
+    let merged_mover = "webhook-allow-inherit-plus-explicit";
+    let _ = configs.delete(merged_mover, &DeleteParams::default()).await;
+    configs
         .create(
             &PostParams::default(),
-            &mover_mutually_exclusive_backup_config(bad_mover),
+            &mover_inherit_plus_explicit_backup_config(merged_mover),
         )
         .await
-        .expect_err("securityContext + inheritSecurityContextFrom must be DENIED by the webhook");
+        .expect("securityContext + inheritSecurityContextFrom must be ACCEPTED by the webhook");
+    let _ = configs.delete(merged_mover, &DeleteParams::default()).await;
+
+    // 6. A RepositoryReplication mover that sets inheritSecurityContextFrom is DENIED. A
+    //    replication mover copies blobs repo->repo and never reads a workload's files, so
+    //    there is no workload identity to take — and the reconciler never resolves the field.
+    //    It used to be accepted and silently dropped: the manifest claimed the mover ran as
+    //    the workload, and it did not.
+    let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let bad_repl = "webhook-deny-repl-inherit";
+    let _ = repls.delete(bad_repl, &DeleteParams::default()).await;
+    let err = repls
+        .create(&PostParams::default(), &replication_with_inherit(bad_repl))
+        .await
+        .expect_err("inheritSecurityContextFrom on a replication mover must be DENIED");
     let msg = err.to_string();
     assert!(
         msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
-        "mover mutual-exclusivity rejection should come from the webhook, got: {msg}"
+        "the rejection should come from the admission webhook, got: {msg}"
     );
-    let _ = configs.delete(bad_mover, &DeleteParams::default()).await;
+    let _ = repls.delete(bad_repl, &DeleteParams::default()).await;
+}
+
+/// A `RepositoryReplication` whose mover sets `inheritSecurityContextFrom` — structurally
+/// valid, but unhonorable: replication never reads workload files, so the reconciler would
+/// silently drop it. Admission rejects it instead.
+fn replication_with_inherit(name: &str) -> RepositoryReplication {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "RepositoryReplication",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "sourceRef": { "kind": "Repository", "name": "any" },
+            "destination": { "s3": { "bucket": "mirror", "region": "us-east-1" } },
+            "schedule": { "cron": "0 5 * * *" },
+            "mover": {
+                "inheritSecurityContextFrom": { "pvcConsumer": {} }
+            }
+        }
+    }))
+    .expect("RepositoryReplication JSON deserializes")
 }
 
 /// A SnapshotPolicy whose explicit `spec.identity.username` carries kopia's `@`

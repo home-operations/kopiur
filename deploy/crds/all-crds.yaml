@@ -802,7 +802,15 @@ spec:
                             type: string
                         type: object
                       inheritSecurityContextFrom:
-                        description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                        description: |-
+                          Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                          Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                          from the container image's `USER` line is invisible in the pod spec and cannot be
+                          inherited — the mover would silently run as its own image's UID instead.
+
+                          May be combined with `securityContext`/`podSecurityContext`, which override it
+                          field-wise and act as the fallback when no workload pod can be resolved.
                         nullable: true
                         oneOf:
                         - required:
@@ -860,7 +868,10 @@ spec:
                             type: object
                         type: object
                       podSecurityContext:
-                        description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                        description: |-
+                          Pod security context for the mover (notably `fsGroup` for group-writable restore
+                          volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                          combinable with `inheritSecurityContextFrom`.
                         nullable: true
                         properties:
                           appArmorProfile:
@@ -1031,7 +1042,12 @@ spec:
                             type: object
                         type: object
                       securityContext:
-                        description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                        description: |-
+                          Container security context for the mover; merged field-wise over the hardened base,
+                          `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                          set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                          workload's, fields you omit are inherited, and this context stands in alone when
+                          inheritance cannot resolve a pod.
                         nullable: true
                         properties:
                           allowPrivilegeEscalation:
@@ -3562,7 +3578,15 @@ spec:
                             type: string
                         type: object
                       inheritSecurityContextFrom:
-                        description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                        description: |-
+                          Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                          Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                          from the container image's `USER` line is invisible in the pod spec and cannot be
+                          inherited — the mover would silently run as its own image's UID instead.
+
+                          May be combined with `securityContext`/`podSecurityContext`, which override it
+                          field-wise and act as the fallback when no workload pod can be resolved.
                         nullable: true
                         oneOf:
                         - required:
@@ -3620,7 +3644,10 @@ spec:
                             type: object
                         type: object
                       podSecurityContext:
-                        description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                        description: |-
+                          Pod security context for the mover (notably `fsGroup` for group-writable restore
+                          volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                          combinable with `inheritSecurityContextFrom`.
                         nullable: true
                         properties:
                           appArmorProfile:
@@ -3791,7 +3818,12 @@ spec:
                             type: object
                         type: object
                       securityContext:
-                        description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                        description: |-
+                          Container security context for the mover; merged field-wise over the hardened base,
+                          `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                          set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                          workload's, fields you omit are inherited, and this context stands in alone when
+                          inheritance cannot resolve a pod.
                         nullable: true
                         properties:
                           allowPrivilegeEscalation:
@@ -5899,7 +5931,15 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                    description: |-
+                      Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                      Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                      from the container image's `USER` line is invisible in the pod spec and cannot be
+                      inherited — the mover would silently run as its own image's UID instead.
+
+                      May be combined with `securityContext`/`podSecurityContext`, which override it
+                      field-wise and act as the fallback when no workload pod can be resolved.
                     nullable: true
                     oneOf:
                     - required:
@@ -5957,7 +5997,10 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                    description: |-
+                      Pod security context for the mover (notably `fsGroup` for group-writable restore
+                      volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                      combinable with `inheritSecurityContextFrom`.
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -6128,7 +6171,12 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                    description: |-
+                      Container security context for the mover; merged field-wise over the hardened base,
+                      `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                      set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                      workload's, fields you omit are inherited, and this context stands in alone when
+                      inheritance cannot resolve a pod.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -7549,7 +7597,15 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                    description: |-
+                      Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                      Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                      from the container image's `USER` line is invisible in the pod spec and cannot be
+                      inherited — the mover would silently run as its own image's UID instead.
+
+                      May be combined with `securityContext`/`podSecurityContext`, which override it
+                      field-wise and act as the fallback when no workload pod can be resolved.
                     nullable: true
                     oneOf:
                     - required:
@@ -7607,7 +7663,10 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                    description: |-
+                      Pod security context for the mover (notably `fsGroup` for group-writable restore
+                      volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                      combinable with `inheritSecurityContextFrom`.
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -7778,7 +7837,12 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                    description: |-
+                      Container security context for the mover; merged field-wise over the hardened base,
+                      `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                      set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                      workload's, fields you omit are inherited, and this context stands in alone when
+                      inheritance cannot resolve a pod.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -8463,7 +8527,15 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                    description: |-
+                      Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                      Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                      from the container image's `USER` line is invisible in the pod spec and cannot be
+                      inherited — the mover would silently run as its own image's UID instead.
+
+                      May be combined with `securityContext`/`podSecurityContext`, which override it
+                      field-wise and act as the fallback when no workload pod can be resolved.
                     nullable: true
                     oneOf:
                     - required:
@@ -8521,7 +8593,10 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                    description: |-
+                      Pod security context for the mover (notably `fsGroup` for group-writable restore
+                      volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                      combinable with `inheritSecurityContextFrom`.
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -8692,7 +8767,12 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                    description: |-
+                      Container security context for the mover; merged field-wise over the hardened base,
+                      `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                      set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                      workload's, fields you omit are inherited, and this context stands in alone when
+                      inheritance cannot resolve a pod.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
@@ -9604,7 +9684,15 @@ spec:
                         type: string
                     type: object
                   inheritSecurityContextFrom:
-                    description: Copy the UID/GID security context from a live workload instead of setting it explicitly.
+                    description: |-
+                      Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                      Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                      from the container image's `USER` line is invisible in the pod spec and cannot be
+                      inherited — the mover would silently run as its own image's UID instead.
+
+                      May be combined with `securityContext`/`podSecurityContext`, which override it
+                      field-wise and act as the fallback when no workload pod can be resolved.
                     nullable: true
                     oneOf:
                     - required:
@@ -9662,7 +9750,10 @@ spec:
                         type: object
                     type: object
                   podSecurityContext:
-                    description: Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+                    description: |-
+                      Pod security context for the mover (notably `fsGroup` for group-writable restore
+                      volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                      combinable with `inheritSecurityContextFrom`.
                     nullable: true
                     properties:
                       appArmorProfile:
@@ -9833,7 +9924,12 @@ spec:
                         type: object
                     type: object
                   securityContext:
-                    description: Container security context for the mover; merged field-wise over the defaults and hardened base.
+                    description: |-
+                      Container security context for the mover; merged field-wise over the hardened base,
+                      `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                      set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                      workload's, fields you omit are inherited, and this context stands in alone when
+                      inheritance cannot resolve a pod.
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:

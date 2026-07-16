@@ -1669,10 +1669,14 @@ fn inherit_picks_named_container_else_first() {
         None,
     );
     let pods = std::slice::from_ref(&pod);
-    let (csc, _) = inherited_security_context_from_pods(pods, Some("app"), "ns", "app=x").unwrap();
+    let (csc, _) = inherited_security_context_from_pods(pods, Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
     // No container named → the pod's FIRST container.
-    let (csc, _) = inherited_security_context_from_pods(pods, None, "ns", "app=x").unwrap();
+    let (csc, _) = inherited_security_context_from_pods(pods, None, "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(101));
 }
 
@@ -1681,18 +1685,218 @@ fn inherit_copies_both_container_and_pod_security_context() {
     // The workload's CONTAINER runAsUser AND its POD fsGroup are both inherited, so an
     // inheriting mover matches the app at both levels (UID + writable-volume fsGroup).
     let pod = pod_with(Some("Running"), &[("app", Some(1000))], Some(1000));
-    let (csc, psc) =
-        inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    let (csc, psc) = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
     assert_eq!(psc.unwrap().fs_group, Some(1000));
 
     // A workload with ONLY a pod-level context (no container securityContext) still
     // inherits successfully — the pod context alone is enough.
     let pod = pod_with(Some("Running"), &[("app", None)], Some(2000));
-    let (csc, psc) =
-        inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    let (csc, psc) = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x")
+        .unwrap()
+        .contexts;
     assert!(csc.is_none());
     assert_eq!(psc.unwrap().fs_group, Some(2000));
+}
+
+#[test]
+fn inherit_reports_the_pod_and_container_it_read() {
+    // Provenance is load-bearing: the reconciler reports the mover's identity from WHERE the
+    // context came from. Asserting a match from "the inherit branch ran" is the bug this
+    // field exists to prevent, so the source must be nameable.
+    let mut pod = pod_with(
+        Some("Running"),
+        &[("sidecar", Some(101)), ("app", Some(1000))],
+        None,
+    );
+    pod.metadata.name = Some("app-7c9d8f5b6-h2k4p".to_string());
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.pod, "app-7c9d8f5b6-h2k4p");
+    assert_eq!(src.container.as_deref(), Some("app"));
+    assert_eq!(src.uid(), Some(1000));
+}
+
+#[test]
+fn inherit_from_a_uidless_workload_pins_no_uid() {
+    // THE REPORTED BUG. A workload whose securityContext block exists but pins no runAsUser
+    // (its UID comes from the image's USER line) inherits "successfully" — the block is
+    // non-empty, so the extractor is happy — yet contributes NO uid. The mover then silently
+    // runs as its own image's 65532 and fails to read the source with permission denied.
+    //
+    // This is why `SecurityContextCompatible` may never be asserted from the fact that the
+    // pvcConsumer branch ran: here it would claim a UID match "by construction" that does not
+    // exist. `uid() == None` is the signal the honest assessment keys on.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], Some(65532));
+    // A hardened-but-UID-less container context — the bjw-s / restricted-PSA house style.
+    pod.spec.as_mut().unwrap().containers[0].security_context =
+        Some(k8s_openapi::api::core::v1::SecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.contexts.0.is_some(),
+        "the container block exists, so the extractor accepts it — that is the trap"
+    );
+    assert_eq!(
+        src.uid(),
+        None,
+        "inheriting pinned no UID: the mover would run as its own image's 65532"
+    );
+}
+
+#[test]
+fn inherit_uid_follows_kubelet_precedence() {
+    // container.runAsUser wins over pod.runAsUser; pod-level is the fallback. Shared with
+    // the invariants + compat engines via `effective_run_as_user`, so they cannot fork.
+    let mut pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), Some(1000), "container-level runAsUser wins");
+
+    // Pod-level only (the very common chart shape) still pins the UID.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_user: Some(568),
+            ..Default::default()
+        });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), Some(568), "pod-level runAsUser is the fallback");
+}
+
+// --- `inherited ⊂ explicit`: the recipe's explicit context is the HIGHER layer. ---
+//
+// These exercise the same merge helpers `resolve_mover_security_contexts` calls, without a
+// kube::Client. The end-to-end ladder (`hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`) is
+// covered in `kopiur-api`'s `resolve_mover` tests.
+
+/// What the resolver does once a workload's contexts are in hand.
+#[cfg(test)]
+fn merge_explicit_over_inherited(
+    inherited: (
+        Option<k8s_openapi::api::core::v1::SecurityContext>,
+        Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+    ),
+    explicit: &kopiur_api::common::MoverSpec,
+) -> (
+    Option<k8s_openapi::api::core::v1::SecurityContext>,
+    Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+) {
+    (
+        kopiur_api::common::merge_security_context_opt(
+            inherited.0.as_ref(),
+            explicit.security_context.as_ref(),
+        ),
+        kopiur_api::common::merge_pod_security_context_opt(
+            inherited.1.as_ref(),
+            explicit.pod_security_context.as_ref(),
+        ),
+    )
+}
+
+#[test]
+fn explicit_security_context_overrides_the_inherited_one() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // Workload pins uid 1000 + fsGroup 1000; the recipe forces uid 2000 and says nothing
+    // about groups. What you WROTE wins; what you left blank is inherited.
+    let inherited = (
+        Some(SecurityContext {
+            run_as_user: Some(1000),
+            run_as_group: Some(1000),
+            ..Default::default()
+        }),
+        Some(PodSecurityContext {
+            fs_group: Some(1000),
+            ..Default::default()
+        }),
+    );
+    let explicit = kopiur_api::common::MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited(inherited, &explicit);
+    assert_eq!(
+        sc.as_ref().unwrap().run_as_user,
+        Some(2000),
+        "the explicit runAsUser must win — it is the higher layer"
+    );
+    assert_eq!(
+        sc.unwrap().run_as_group,
+        Some(1000),
+        "runAsGroup was not written, so the inherited value fills it"
+    );
+    assert_eq!(
+        psc.unwrap().fs_group,
+        Some(1000),
+        "the pod context is inherited wholesale when the recipe is silent"
+    );
+}
+
+#[test]
+fn inherited_values_fill_what_the_recipe_leaves_blank() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // The mirror image: the recipe pins only an fsGroup (e.g. to make a cache writable) and
+    // inherits the identity. Neither layer is all-or-nothing.
+    let inherited = (
+        Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        Some(PodSecurityContext {
+            fs_group: Some(1000),
+            supplemental_groups: Some(vec![3001]),
+            ..Default::default()
+        }),
+    );
+    let explicit = kopiur_api::common::MoverSpec {
+        pod_security_context: Some(PodSecurityContext {
+            fs_group: Some(2500),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited(inherited, &explicit);
+    assert_eq!(
+        sc.unwrap().run_as_user,
+        Some(1000),
+        "the inherited UID survives — the recipe never mentioned it"
+    );
+    let psc = psc.unwrap();
+    assert_eq!(psc.fs_group, Some(2500), "the explicit fsGroup wins");
+    assert_eq!(
+        psc.supplemental_groups,
+        Some(vec![3001]),
+        "an unmentioned pod field keeps its inherited value (NFS shared-group recipe)"
+    );
+}
+
+#[test]
+fn explicit_context_stands_alone_when_nothing_was_inherited() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+
+    // The fallback shape: inheritance yielded nothing, so the recipe's context is all there is.
+    let explicit = kopiur_api::common::MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited((None, None), &explicit);
+    assert_eq!(sc.unwrap().run_as_user, Some(1000));
+    assert!(psc.is_none());
 }
 
 #[test]
@@ -1702,31 +1906,80 @@ fn inherit_prefers_a_running_pod() {
     let running = pod_with(Some("Running"), &[("app", Some(1000))], None);
     let (csc, _) =
         inherited_security_context_from_pods(&[pending, running], Some("app"), "ns", "app=x")
-            .unwrap();
+            .unwrap()
+            .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(1000));
 }
 
 #[test]
 fn inherit_errors_are_actionable() {
+    // Each message must carry WHAT went wrong, WHERE (so it can be found), and a FIX the user
+    // can act on — a bare "no pod matches" leaves someone staring at a held Snapshot.
+
     // No pod matches.
     let err =
         inherited_security_context_from_pods(&[], Some("app"), "billing", "app=x").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("no pod matches") && msg.contains("billing") && msg.contains("app=x"));
+    assert!(msg.contains("no pod matches"), "what: {msg}");
+    assert!(
+        msg.contains("billing") && msg.contains("app=x"),
+        "where — the namespace and the selector that found nothing: {msg}"
+    );
+    assert!(
+        msg.contains("Scale it up") && msg.contains("podSelector.matchLabels"),
+        "fix — the two things that actually resolve it: {msg}"
+    );
+    assert!(
+        msg.contains("mover.securityContext.runAsUser") && msg.contains("fallback"),
+        "fix — and the fallback, which is the difference between a held run and a running \
+         one, so the message must not merely offer it as an 'alternative': {msg}"
+    );
 
     // Named container absent.
     let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
     let err =
         inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x").unwrap_err();
-    assert!(err.to_string().contains("no container `nope`"));
+    let msg = err.to_string();
+    assert!(msg.contains("no container `nope`"), "what + where: {msg}");
+    assert!(
+        msg.contains("inheritSecurityContextFrom.container"),
+        "fix — name the field to correct: {msg}"
+    );
 
     // The pod has NEITHER a container nor a pod-level securityContext to inherit.
     let bare = pod_with(Some("Running"), &[("app", None)], None);
     let err =
         inherited_security_context_from_pods(&[bare], Some("app"), "billing", "app=x").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("sets no securityContext"), "what: {msg}");
     assert!(
-        err.to_string().contains("sets no securityContext")
-            && err.to_string().contains("to inherit")
+        msg.contains("comes from its container image"),
+        "why — the non-obvious part users hit, and the reason inheriting cannot help: {msg}"
+    );
+    assert!(
+        msg.contains("Set runAsUser on the workload")
+            && msg.contains("mover.securityContext.runAsUser"),
+        "fix — both remedies: {msg}"
+    );
+}
+
+#[test]
+fn pvc_consumer_error_names_the_claim_and_the_fallback() {
+    // The `pvcConsumer` twin of the above: the message must name the claim it looked for (so
+    // the user knows WHICH PVC has no consumer) and the fallback that keeps backups running.
+    let err = pvc_consumer_security_context_from_pods(&[], "pgdata", "db", None).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`pgdata`") && msg.contains("`db`"),
+        "where — the claim and namespace: {msg}"
+    );
+    assert!(
+        msg.contains("Scale the workload up"),
+        "fix — the primary remedy: {msg}"
+    );
+    assert!(
+        msg.contains("mover.securityContext.runAsUser") && msg.contains("fallback"),
+        "fix — the fallback that avoids the hold entirely: {msg}"
     );
 }
 
@@ -1789,8 +2042,9 @@ fn pod_mounting(
 #[test]
 fn pvc_consumer_inherits_from_the_mounting_workload() {
     let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
-    let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[workload], "pgdata", "db", None).unwrap();
+    let (csc, _) = pvc_consumer_security_context_from_pods(&[workload], "pgdata", "db", None)
+        .unwrap()
+        .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(999));
 }
 
@@ -1808,7 +2062,9 @@ fn pvc_consumer_excludes_the_kopiur_mover_pod() {
     );
     let workload = pod_mounting("pg-0", "db", Some("Running"), Some(999), "pgdata", false);
     let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[mover, workload], "pgdata", "db", None).unwrap();
+        pvc_consumer_security_context_from_pods(&[mover, workload], "pgdata", "db", None)
+            .unwrap()
+            .contexts;
     assert_eq!(csc.unwrap().run_as_user, Some(999));
 
     // With ONLY the mover mounting it (workload scaled to zero) → actionable error, not
@@ -1836,9 +2092,11 @@ fn pvc_consumer_pick_is_deterministic() {
     let b = pod_mounting("b-pod", "ns", Some("Running"), Some(2000), "data", false);
     let (csc_fwd, _) =
         pvc_consumer_security_context_from_pods(&[a.clone(), b.clone()], "data", "ns", None)
-            .unwrap();
-    let (csc_rev, _) =
-        pvc_consumer_security_context_from_pods(&[b, a], "data", "ns", None).unwrap();
+            .unwrap()
+            .contexts;
+    let (csc_rev, _) = pvc_consumer_security_context_from_pods(&[b, a], "data", "ns", None)
+        .unwrap()
+        .contexts;
     assert_eq!(csc_fwd.unwrap().run_as_user, Some(1000));
     assert_eq!(csc_rev.unwrap().run_as_user, Some(1000));
 }
@@ -1847,8 +2105,9 @@ fn pvc_consumer_pick_is_deterministic() {
 fn pvc_consumer_prefers_running_over_pending() {
     let pending = pod_mounting("a-pod", "ns", Some("Pending"), Some(5), "data", false);
     let running = pod_mounting("z-pod", "ns", Some("Running"), Some(1000), "data", false);
-    let (csc, _) =
-        pvc_consumer_security_context_from_pods(&[pending, running], "data", "ns", None).unwrap();
+    let (csc, _) = pvc_consumer_security_context_from_pods(&[pending, running], "data", "ns", None)
+        .unwrap()
+        .contexts;
     assert_eq!(
         csc.unwrap().run_as_user,
         Some(1000),
@@ -2153,4 +2412,293 @@ mod reconcile_failure_events {
         assert_eq!(r.namespace.as_deref(), Some("apps"));
         assert_eq!(r.uid.as_deref(), Some("uid-1234"));
     }
+}
+
+// --- `InheritSource::pins_identity`: did inheriting actually copy anything usable? ---
+
+#[test]
+fn pins_identity_is_true_for_a_uid() {
+    let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(src.pins_identity());
+}
+
+#[test]
+fn pins_identity_is_true_for_groups_alone() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // A workload pinning ONLY runAsGroup (UID from its image) still lets the mover read
+    // 0640 group-readable data through the group bit. Treating "no UID" as "inherit did
+    // nothing" would warn — falsely — about a setup that works.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {
+        run_as_group: Some(1000),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None, "no UID was pinned");
+    assert!(
+        src.pins_identity(),
+        "but a group WAS — inheriting was not a no-op"
+    );
+
+    // Same for an fsGroup-only workload (the blessed restore shape).
+    let mut pod = pod_with(Some("Running"), &[("app", None)], Some(2500));
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.pins_identity(),
+        "fsGroup is an identity worth inheriting"
+    );
+
+    // …and supplementalGroups (the NFS shared-group recipe).
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        supplemental_groups: Some(vec![3001]),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(src.pins_identity());
+}
+
+#[test]
+fn pins_identity_is_false_when_the_workload_pins_nothing() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+
+    // THE REPORTED SHAPE: a hardened block that pins no identity at all. Inheriting from
+    // this is a provable no-op — the mover falls back to its own image's 65532.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None);
+    assert!(
+        !src.pins_identity(),
+        "no UID and no group: inheriting copied nothing the mover can act on"
+    );
+}
+
+// --- §3's fallback predicate: an explicit context is a fallback only if it pins an identity.
+//
+// `resolve_mover_security_contexts` needs a kube::Client, so these exercise the predicate it
+// keys on directly. Keying on "a context field exists" instead would make the fallback and the
+// pins-nothing warning fire for the SAME run — the reconciler would report "proceeding with
+// your explicit context" and "nothing was pinned" together, which is incoherent.
+
+#[test]
+fn a_context_pinning_a_uid_is_a_usable_fallback() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    let sc = SecurityContext {
+        run_as_user: Some(1000),
+        ..Default::default()
+    };
+    assert!(kopiur_api::common::effective_run_as_user(Some(&sc), None).is_some());
+}
+
+#[test]
+fn a_context_pinning_no_identity_is_not_a_fallback() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // Newly legal alongside inherit once the exclusion is lifted: a recipe that sets only
+    // seccomp/caps. It cannot stand in for a workload's identity, so a failed inherit must
+    // still hold the run rather than silently proceed at the mover image's UID.
+    let sc = SecurityContext {
+        allow_privilege_escalation: Some(false),
+        ..Default::default()
+    };
+    assert!(
+        kopiur_api::common::effective_run_as_user(Some(&sc), None).is_none(),
+        "seccomp/caps pin no identity — not a fallback"
+    );
+
+    // An fsGroup-only pod context likewise pins no UID for the *backup* fallback decision.
+    let psc = PodSecurityContext {
+        fs_group: Some(2500),
+        ..Default::default()
+    };
+    assert!(kopiur_api::common::effective_run_as_user(None, Some(&psc)).is_none());
+
+    // Pod-level runAsUser DOES count (kubelet precedence).
+    let psc = PodSecurityContext {
+        run_as_user: Some(568),
+        ..Default::default()
+    };
+    assert_eq!(
+        kopiur_api::common::effective_run_as_user(None, Some(&psc)),
+        Some(568)
+    );
+}
+
+#[test]
+fn pvc_consumer_inherits_the_container_that_mounts_the_claim_not_the_first() {
+    use k8s_openapi::api::core::v1::{
+        Container, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PodStatus, SecurityContext,
+        Volume, VolumeMount,
+    };
+
+    // A sidecar-injected pod: istio-proxy (uid 1337) is listed FIRST and mounts nothing of
+    // ours; the app (uid 1000) mounts the source claim and is what actually wrote the data.
+    // Inheriting the sidecar yields a mover that cannot read the app's files — and, before the
+    // condition was made honest, one that claimed it could.
+    let pod = Pod {
+        metadata: kube::core::ObjectMeta {
+            name: Some("app-7c9d8f5b6-h2k4p".into()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![
+                Container {
+                    name: "istio-proxy".into(),
+                    security_context: Some(SecurityContext {
+                        run_as_user: Some(1337),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Container {
+                    name: "app".into(),
+                    security_context: Some(SecurityContext {
+                        run_as_user: Some(1000),
+                        ..Default::default()
+                    }),
+                    volume_mounts: Some(vec![VolumeMount {
+                        name: "data".into(),
+                        mount_path: "/data".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ],
+            volumes: Some(vec![Volume {
+                name: "data".into(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: "app-data".into(),
+                    read_only: None,
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        status: Some(PodStatus {
+            phase: Some("Running".into()),
+            ..Default::default()
+        }),
+    };
+
+    let src = pvc_consumer_security_context_from_pods(&[pod], "app-data", "app", None).unwrap();
+    assert_eq!(
+        src.container.as_deref(),
+        Some("app"),
+        "must pick the container that mounts the claim, not the injected first one"
+    );
+    assert_eq!(src.uid(), Some(1000), "and inherit the app's UID, not 1337");
+}
+
+/// Two condition writers in one reconcile must not erase each other.
+///
+/// A `status.conditions` patch REPLACES the whole array. `assess_backup_security_context` and
+/// `report_inherit_outcome` both run in a single Snapshot reconcile, and both build their array
+/// with `upsert_condition`. If the second builds from the object as it looked at the START of
+/// the reconcile, it drops whatever the first just wrote — silently.
+///
+/// This is not hypothetical: it is exactly what made the e2e regression guard PASS against a
+/// deliberately-reintroduced `SecurityContextCompatible=True` bug. The `True` was written, then
+/// wiped by the InheritPinnedNoUid write moments later, so the guard saw no `True` and was
+/// green for the wrong reason. The fix is that the second writer re-reads the live object; this
+/// test pins the property that makes that necessary.
+#[test]
+fn upsert_from_stale_conditions_drops_a_concurrent_write() {
+    use crate::io::upsert_condition;
+
+    // Reconcile starts: no conditions.
+    let at_reconcile_start: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> = vec![];
+
+    // Writer 1 (assess) patches SecurityContextCompatible=True.
+    let after_first = upsert_condition(
+        &at_reconcile_start,
+        "SecurityContextCompatible",
+        true,
+        "SecurityContextCompatible",
+        "the mover's uid matches",
+        Some(1),
+    );
+    assert_eq!(after_first.len(), 1);
+
+    // Writer 2 building from the STALE snapshot — the bug.
+    let stale = upsert_condition(
+        &at_reconcile_start,
+        "SecurityContextInherited",
+        false,
+        "InheritOverridden",
+        "explicit uid displaced the inherited one",
+        Some(1),
+    );
+    assert!(
+        !stale.iter().any(|c| c.type_ == "SecurityContextCompatible"),
+        "building from the reconcile-start copy DROPS the first writer's condition — this is \
+         why the second writer must re-read the live object"
+    );
+
+    // Writer 2 building from what is actually on the object — correct.
+    let fresh = upsert_condition(
+        &after_first,
+        "SecurityContextInherited",
+        false,
+        "InheritOverridden",
+        "explicit uid displaced the inherited one",
+        Some(1),
+    );
+    assert_eq!(fresh.len(), 2, "both conditions must survive");
+    assert!(
+        fresh
+            .iter()
+            .any(|c| c.type_ == "SecurityContextCompatible" && c.status == "True")
+    );
+    assert!(
+        fresh
+            .iter()
+            .any(|c| c.type_ == "SecurityContextInherited" && c.status == "False")
+    );
+}
+
+#[test]
+fn pins_identity_is_false_for_a_group_the_hardened_default_already_gives() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // A workload pinning nothing but `fsGroup: 65532` — the exact value
+    // `hardened_pod_security_context()` already supplies. Inheriting it produces a mover
+    // byte-identical to the no-inherit default (uid 65532 from its own image, fsGroup 65532
+    // from the hardened base), so inheritance achieved nothing and the user must be told.
+    // Testing "are there any groups" instead of "any groups BEYOND the baseline" would call
+    // this a contribution and stay silent.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        fs_group: Some(kopiur_api::common::MOVER_NONROOT_ID),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None);
+    assert!(
+        !src.pins_identity(),
+        "fsGroup 65532 is what the hardened default already gives — inheriting it contributed \
+         nothing, so this must still warn"
+    );
+
+    // One above the baseline IS a contribution.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        fs_group: Some(1000),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.pins_identity(),
+        "fsGroup 1000 is not the default — inheriting it changed the mover"
+    );
 }

@@ -17,16 +17,29 @@ pub struct MoverSpec {
     /// Override the repository's [`CacheDefaults`] for this recipe's movers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheDefaults>,
-    /// Container security context for the mover; merged field-wise over the defaults and hardened base.
+    /// Container security context for the mover; merged field-wise over the hardened base,
+    /// `moverDefaults`, and any inherited context — this is the highest layer, so every field
+    /// set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+    /// workload's, fields you omit are inherited, and this context stands in alone when
+    /// inheritance cannot resolve a pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_context: Option<k8s_openapi::api::core::v1::SecurityContext>,
-    /// Pod security context for the mover (notably `fsGroup` for group-writable restore volumes).
+    /// Pod security context for the mover (notably `fsGroup` for group-writable restore
+    /// volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+    /// combinable with `inheritSecurityContextFrom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
     /// Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged_mode: Option<bool>,
-    /// Copy the UID/GID security context from a live workload instead of setting it explicitly.
+    /// Copy the UID/GID security context from a live workload rather than hard-coding it.
+    ///
+    /// Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+    /// from the container image's `USER` line is invisible in the pod spec and cannot be
+    /// inherited — the mover would silently run as its own image's UID instead.
+    ///
+    /// May be combined with `securityContext`/`podSecurityContext`, which override it
+    /// field-wise and act as the fallback when no workload pod can be resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_security_context_from: Option<InheritSecurityContextFrom>,
     /// Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
@@ -176,13 +189,15 @@ pub struct ResolvedMover {
 /// `hardened ⊂ moverDefaults ⊂ recipe` (ADR-0004 §1/§2).
 ///
 /// - `defaults`: the repository's `moverDefaults` (None when the repo sets none).
-/// - `recipe_sc`/`recipe_psc`: the recipe's **effective** container/pod context — the
-///   explicit `mover.securityContext`/`podSecurityContext`, OR the context the controller
-///   resolved from `inheritSecurityContextFrom`. Inheritance is mutually exclusive with
-///   explicit (webhook-enforced), so at most one is `Some`. Inherited context enters here
-///   as the *recipe layer*, NOT a whole-chain replacement — so the hardened base +
-///   `moverDefaults` still supply `drop:[ALL]`/seccomp and an inherited partial context
-///   can only tighten.
+/// - `recipe_sc`/`recipe_psc`: the recipe's **effective** container/pod context, which the
+///   controller has already resolved — the explicit `mover.securityContext`/
+///   `podSecurityContext` overlaid on top of any context inherited from a workload via
+///   `inheritSecurityContextFrom` (they combine; explicit wins field-wise). The full ladder
+///   is therefore `hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`. Because each merge is a
+///   per-field `over.or(base)`, folding the inner two layers before this call is field-wise
+///   identical to a flat four-layer merge. The recipe layer enters here as a *layer*, NOT a
+///   whole-chain replacement — so the hardened base + `moverDefaults` still supply
+///   `drop:[ALL]`/seccomp and a partial recipe context can only tighten.
 /// - `recipe_resources`/`recipe_cache`: from `mover.resources` / `mover.cache`.
 ///
 /// `node_selector`/`tolerations`/`affinity`/`ttl` flow from `moverDefaults` (no per-recipe

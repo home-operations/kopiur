@@ -1155,3 +1155,185 @@ fn staged_watchdog_budget_pins_zero_absent_and_positive() {
         Some(crate::consts::DEFAULT_STAGING_TIMEOUT)
     );
 }
+
+// --- inherit_verdict: what `inheritSecurityContextFrom` actually achieved. ---
+//
+// Pure, so every arm is exercised without a cluster. The property that matters most is that
+// EVERY requested-inherit path yields a verdict — including the healthy one. An arm that
+// returned `None` on success would make the condition write-once-and-stick: a user who fixed
+// their recipe would keep a stale `InheritOverridden` forever.
+
+#[cfg(test)]
+mod inherit_verdict_tests {
+    use super::*;
+    use crate::io::InheritOutcome;
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+    use kopiur_api::common::{MoverDefaults, MoverSpec, ResolvedMover, resolve_mover};
+
+    /// A `ResolvedMover` whose effective uid is `uid` (container-level).
+    fn resolved_with_uid(uid: Option<i64>) -> ResolvedMover {
+        let sc = uid.map(|u| SecurityContext {
+            run_as_user: Some(u),
+            ..Default::default()
+        });
+        resolve_mover(None, sc.as_ref(), None, None, None, None)
+    }
+
+    fn inherited(uid: Option<i64>, pins_identity: bool) -> InheritOutcome {
+        InheritOutcome::Inherited {
+            pod: "app-7c9d8f5b6".into(),
+            container: Some("app".into()),
+            uid,
+            pins_identity,
+        }
+    }
+
+    #[test]
+    fn no_inheritance_requested_yields_no_condition_at_all() {
+        assert!(
+            inherit_verdict(
+                &InheritOutcome::NotRequested,
+                &resolved_with_uid(None),
+                None
+            )
+            .is_none(),
+            "the condition must not appear on recipes that never asked to inherit"
+        );
+    }
+
+    #[test]
+    fn a_working_inherit_reports_positively_so_a_stale_warning_clears() {
+        // THE STICKY-CONDITION GUARD. If this arm returned None, a user who fixed an
+        // InheritOverridden recipe would keep the stale False forever — nothing would flip it.
+        let v = inherit_verdict(
+            &inherited(Some(1000), true),
+            &resolved_with_uid(Some(1000)),
+            None,
+        )
+        .expect("a resolved inherit must still produce a verdict");
+        assert!(
+            v.ok,
+            "inheritance resolved and stuck — this is the healthy state"
+        );
+        assert_eq!(v.reason, INHERIT_APPLIED_REASON);
+        assert!(
+            v.message.contains("app-7c9d8f5b6") && v.message.contains("uid 1000"),
+            "the positive verdict should name the pod and the identity: {}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn groups_only_inherit_is_healthy_not_a_warning() {
+        // No UID, but the workload contributed a group — the mover reads 0640 data through the
+        // group bit. Legitimate; warning here would flag a working setup.
+        let v = inherit_verdict(&inherited(None, true), &resolved_with_uid(None), None).unwrap();
+        assert!(v.ok);
+        assert_eq!(v.reason, INHERIT_APPLIED_REASON);
+    }
+
+    #[test]
+    fn inherit_that_pinned_nothing_warns_and_names_the_real_identity() {
+        let v = inherit_verdict(&inherited(None, false), &resolved_with_uid(None), None).unwrap();
+        assert!(!v.ok);
+        assert_eq!(v.reason, INHERIT_PINNED_NO_UID_REASON);
+        assert!(
+            v.message.contains("its own image's uid 65532"),
+            "with no layer pinning a UID the mover really does run as 65532: {}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn pinned_nothing_does_not_claim_65532_when_moverdefaults_supplied_a_uid() {
+        // The message used to hardcode "runs as its own image's UID 65532". If moverDefaults
+        // pins a UID, the mover runs as THAT — saying 65532 would be a plain lie in the very
+        // message meant to explain the problem.
+        let defaults = MoverDefaults {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(Some(&defaults), None, None, None, None, None);
+        let v = inherit_verdict(&inherited(None, false), &resolved, None).unwrap();
+        assert!(!v.ok);
+        assert!(
+            v.message.contains("uid 2000") && !v.message.contains("65532"),
+            "must name the uid the mover actually runs as: {}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn an_overridden_inherit_names_the_recipe_when_the_recipe_won() {
+        let explicit = MoverSpec {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(1000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v = inherit_verdict(
+            &inherited(Some(2500), true),
+            &resolved_with_uid(Some(1000)),
+            Some(&explicit),
+        )
+        .unwrap();
+        assert!(!v.ok);
+        assert_eq!(v.reason, INHERIT_OVERRIDDEN_REASON);
+        assert!(
+            v.message.contains("this recipe's mover.securityContext")
+                && v.message.contains("Remove the explicit runAsUser"),
+            "{}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn an_overridden_inherit_names_moverdefaults_when_the_recipe_sets_no_uid() {
+        // The remedy used to say "Remove the explicit runAsUser" unconditionally. With the
+        // override coming from the repository, the user reads their policy, finds no
+        // runAsUser, and has nowhere to go.
+        let defaults = MoverDefaults {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(Some(&defaults), None, None, None, None, None);
+        // A recipe that sets a context but NO uid (e.g. seccomp only).
+        let explicit = MoverSpec {
+            pod_security_context: Some(PodSecurityContext {
+                fs_group: Some(1234),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v = inherit_verdict(&inherited(Some(2500), true), &resolved, Some(&explicit)).unwrap();
+        assert!(!v.ok);
+        assert_eq!(v.reason, INHERIT_OVERRIDDEN_REASON);
+        assert!(
+            v.message.contains("moverDefaults") && v.message.contains("NOT this recipe"),
+            "must point at the layer that actually won: {}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn a_fallback_names_the_identity_it_stood_in_with() {
+        let v = inherit_verdict(
+            &InheritOutcome::Fallback {
+                reason: "no running workload pod mounts the backup source PVC `data`".into(),
+            },
+            &resolved_with_uid(Some(1000)),
+            None,
+        )
+        .unwrap();
+        assert!(!v.ok);
+        assert_eq!(v.reason, INHERIT_FALLBACK_REASON);
+        assert!(v.message.contains("uid 1000") && v.message.contains("not tracking the workload"));
+    }
+}

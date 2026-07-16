@@ -126,6 +126,35 @@ pub fn child_meta(
     }
 }
 
+/// The object to build a `conditions` array from: the LIVE one when it can be re-read, else
+/// the caller's (possibly stale) copy. `None` means the object is **gone** — skip the write.
+///
+/// A `status.conditions` patch REPLACES the whole array, so a reconcile with two condition
+/// writers must not build the second array from the object as it looked at the *start* — that
+/// silently erases whatever the first writer just wrote. **Any writer that is not the first in
+/// its reconcile must source `existing` through this.**
+///
+/// The three outcomes are deliberately distinct:
+/// - live object → use it (the point).
+/// - 404 → `None`. The object was deleted mid-reconcile; patching it would only 404 again and
+///   any Event would name a gone object. Callers return.
+/// - read error → the stale copy. Transient API trouble must not derail the run, and a
+///   possibly-clobbered condition is the lesser harm.
+pub async fn live_conditions_source<K>(api: &Api<K>, name: &str, fallback: &K) -> Option<K>
+where
+    K: Clone + serde::de::DeserializeOwned + std::fmt::Debug + Resource,
+    K::DynamicType: Default,
+{
+    match api.get_opt(name).await {
+        Ok(Some(live)) => Some(live),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(error = %e, %name, "conditions: re-read failed; using stale status");
+            Some(fallback.clone())
+        }
+    }
+}
+
 /// Upsert a status condition by `type_`, returning the full conditions vector to
 /// patch. An existing condition of the same `type_` keeps its
 /// `lastTransitionTime` while its `status` is unchanged (the timestamp marks the
