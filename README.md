@@ -2,12 +2,8 @@
 
 > [!WARNING]
 >
-> ## 🚧 Heavy construction — this repo is less than a month old 🚧
->
-> **Kopiur is brand new and under active, breaking development.** Things are
-> incomplete, untested in the wild, and the CRD surface, behavior, and APIs
-> **will change without notice**. Do **not** run this against data you care about.
->
+> ## 🚧 Heavy construction 🚧
+> 
 > **Please do not open Pull Requests.** The codebase is moving too fast for
 > external PRs to be reviewable right now — they'll likely conflict or target
 > code that's about to be rewritten. **[Open an Issue instead](../../issues/new)**
