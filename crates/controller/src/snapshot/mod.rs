@@ -36,10 +36,10 @@ use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
-    HOOKS_SUCCEEDED_CONDITION, INHERIT_FALLBACK_REASON, INHERIT_OVERRIDDEN_REASON,
-    INHERIT_PINNED_NO_UID_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORIGIN_LABEL,
-    PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
+    INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON,
+    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
+    ORIGIN_LABEL, PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
     SECURITY_CONTEXT_INHERITED_CONDITION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
     SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
@@ -943,7 +943,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the recipe plainly asked for. The compat condition above answers "can the mover read the
     // source"; this answers "did inheriting do what you think it did" — and its silence is the
     // failure mode that produced the false-`True` bug in the first place.
-    report_inherit_outcome(&namespace, backup, &mover_security, &resolved_mover, ctx).await;
+    report_inherit_outcome(
+        &namespace,
+        backup,
+        &mover_security,
+        &resolved_mover,
+        config.spec.mover.as_ref(),
+        ctx,
+    )
+    .await;
 
     let owner = io::owner_ref_for(backup, "Snapshot")?;
     // Resolve the credential Secret names the mover loads via envFrom. With
@@ -2470,72 +2478,11 @@ async fn report_inherit_outcome(
     backup: &Snapshot,
     mover_security: &io::ResolvedMoverSecurity,
     resolved: &kopiur_api::common::ResolvedMover,
+    explicit: Option<&kopiur_api::common::MoverSpec>,
     ctx: &Context,
 ) {
-    let (reason, action, message) = match &mover_security.outcome {
-        // Nothing to say: no inheritance was asked for.
-        io::InheritOutcome::NotRequested => return,
-        io::InheritOutcome::Fallback { reason } => (
-            INHERIT_FALLBACK_REASON,
-            MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-            format!(
-                "{reason}. Proceeding with the recipe's explicit mover.securityContext, which \
-                 pins the mover's identity itself — so this run is not tracking the workload."
-            ),
-        ),
-        io::InheritOutcome::Inherited {
-            pod,
-            container,
-            pins_identity: false,
-            ..
-        } => (
-            INHERIT_PINNED_NO_UID_REASON,
-            PIN_WORKLOAD_RUN_AS_USER_ACTION,
-            format!(
-                "pod `{pod}` (container `{container}`) pins no runAsUser, runAsGroup, fsGroup or \
-                 supplementalGroups — its identity comes from its container image, which Kopiur \
-                 cannot read from the pod spec. Inheriting therefore copied nothing, and the \
-                 mover runs as its own image's UID {}, which will likely fail to read the source \
-                 with permission denied. Set runAsUser on the workload, or set \
-                 mover.securityContext.runAsUser (it merges with, and overrides, inherited \
-                 values).",
-                kopiur_api::common::MOVER_NONROOT_ID,
-            ),
-        ),
-        io::InheritOutcome::Inherited {
-            pod,
-            uid: Some(inherited_uid),
-            ..
-        } => {
-            let effective = kopiur_api::common::effective_run_as_user(
-                Some(&resolved.security_context),
-                resolved.pod_security_context.as_ref(),
-            );
-            // Explicit (or moverDefaults) `runAsUser` displaced what inheritance resolved.
-            // Intended — explicit is the higher layer — but it means inheritance is not
-            // tracking this workload, which is invisible without saying so: the compat
-            // condition is positive-only and stays silent on exactly this shape.
-            match effective {
-                Some(e) if e != *inherited_uid => (
-                    INHERIT_OVERRIDDEN_REASON,
-                    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-                    format!(
-                        "the mover runs as uid {e}, not the uid {inherited_uid} inherited from \
-                         pod `{pod}`: an explicit mover.securityContext/podSecurityContext (or \
-                         the repository's moverDefaults) overrides inherited values by design. \
-                         inheritSecurityContextFrom is a no-op for runAsUser here and will not \
-                         follow the workload if it changes. Remove the explicit runAsUser to \
-                         track the workload, or drop inheritSecurityContextFrom to stop implying \
-                         that it does."
-                    ),
-                ),
-                // Inheritance worked and stuck: nothing to report.
-                _ => return,
-            }
-        }
-        // Inherited an identity made of groups only (no UID) — legitimate: the mover reads
-        // group-readable data via the group bit. Nothing to warn about.
-        io::InheritOutcome::Inherited { uid: None, .. } => return,
+    let Some(verdict) = inherit_verdict(&mover_security.outcome, resolved, explicit) else {
+        return; // no inheritance requested — the condition never applies
     };
 
     // Re-read the Snapshot rather than using the copy this reconcile started with.
@@ -2546,7 +2493,9 @@ async fn report_inherit_outcome(
     // e2e regression guard pass against a deliberately-reintroduced bug.)
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
     let name = backup.name_any();
-    let live = io::live_conditions_source(&api, &name, backup).await;
+    let Some(live) = io::live_conditions_source(&api, &name, backup).await else {
+        return; // deleted mid-reconcile
+    };
     let existing = live
         .status
         .as_ref()
@@ -2555,9 +2504,9 @@ async fn report_inherit_outcome(
     let conditions = io::upsert_condition(
         &existing,
         SECURITY_CONTEXT_INHERITED_CONDITION,
-        false,
-        reason,
-        &message,
+        verdict.ok,
+        verdict.reason,
+        &verdict.message,
         backup.meta().generation,
     );
     // Guard the Event behind an actual status transition. `publish_warning_event` has no dedup
@@ -2572,9 +2521,155 @@ async fn report_inherit_outcome(
     )
     .await
     {
-        Ok(true) => io::publish_warning_event(ctx, backup, reason, action, &message).await,
-        Ok(false) => {}
+        // Only a problem is worth an Event; the healthy arm is a silent confirmation.
+        Ok(true) if !verdict.ok => {
+            io::publish_warning_event(
+                ctx,
+                backup,
+                verdict.reason,
+                verdict.action,
+                &verdict.message,
+            )
+            .await
+        }
+        Ok(_) => {}
         Err(e) => tracing::debug!(error = %e, "inherit outcome: condition patch failed"),
+    }
+}
+
+/// The `SecurityContextInherited` verdict for one run. `None` ⇒ no inheritance was requested,
+/// so the condition does not apply at all.
+struct InheritVerdict {
+    /// Condition status: `true` when inheritance did what the recipe implies.
+    ok: bool,
+    reason: &'static str,
+    action: &'static str,
+    message: String,
+}
+
+/// Decide what `inheritSecurityContextFrom` actually achieved. Pure — no IO — so every arm is
+/// unit-testable without a cluster.
+///
+/// **Every requested-inherit path yields a verdict, including the healthy one.** An
+/// early-return on the happy path would make the condition write-once-and-stick: a user who
+/// fixed their recipe would keep a stale `InheritOverridden` forever, because nothing would
+/// ever flip it back. This is why `MoverPermitted` carries an explicit "clear the stale False"
+/// block — modelling the healthy state as a real verdict removes the need for one.
+fn inherit_verdict(
+    outcome: &io::InheritOutcome,
+    resolved: &kopiur_api::common::ResolvedMover,
+    explicit: Option<&kopiur_api::common::MoverSpec>,
+) -> Option<InheritVerdict> {
+    // What the mover ACTUALLY runs as, after every layer merged. `None` ⇒ no layer pinned a
+    // UID, so it is the mover image's own.
+    let effective = kopiur_api::common::effective_run_as_user(
+        Some(&resolved.security_context),
+        resolved.pod_security_context.as_ref(),
+    );
+    let identity = || match effective {
+        Some(u) => format!("uid {u}"),
+        None => format!(
+            "its own image's uid {}",
+            kopiur_api::common::MOVER_NONROOT_ID
+        ),
+    };
+
+    match outcome {
+        io::InheritOutcome::NotRequested => None,
+        io::InheritOutcome::Fallback { reason } => Some(InheritVerdict {
+            ok: false,
+            reason: INHERIT_FALLBACK_REASON,
+            action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+            message: format!(
+                "{reason}. Proceeding with the recipe's explicit mover.securityContext ({}), \
+                 which pins the mover's identity itself — so this run is not tracking the \
+                 workload.",
+                identity()
+            ),
+        }),
+        // Inheriting copied nothing the mover would not have had anyway.
+        io::InheritOutcome::Inherited {
+            pod,
+            container,
+            pins_identity: false,
+            ..
+        } => Some(InheritVerdict {
+            ok: false,
+            reason: INHERIT_PINNED_NO_UID_REASON,
+            action: PIN_WORKLOAD_RUN_AS_USER_ACTION,
+            message: format!(
+                "pod `{pod}`{} pins no runAsUser, and no runAsGroup/fsGroup/supplementalGroups \
+                 beyond the mover's own defaults — its identity comes from its container image, \
+                 which Kopiur cannot read from the pod spec. Inheriting therefore copied \
+                 nothing, and the mover runs as {}, which did NOT come from the workload and \
+                 will likely fail to read the source with permission denied. Set runAsUser on \
+                 the workload, or set mover.securityContext.runAsUser (it merges with, and \
+                 overrides, inherited values).",
+                container
+                    .as_deref()
+                    .map(|c| format!(" (container `{c}`)"))
+                    .unwrap_or_default(),
+                identity(),
+            ),
+        }),
+        io::InheritOutcome::Inherited {
+            pod,
+            uid: Some(inherited_uid),
+            ..
+        } if effective != Some(*inherited_uid) => {
+            // A higher layer displaced the inherited UID. Intended — explicit wins by design —
+            // but it makes inheritance a permanent no-op for that field, and the compat
+            // condition is positive-only so it stays silent on exactly this shape. Name the
+            // layer that actually won: telling someone to "remove the explicit runAsUser" when
+            // the override came from the repository's moverDefaults sends them hunting through
+            // a recipe that does not contain one.
+            let recipe_uid = kopiur_api::common::effective_run_as_user(
+                explicit.and_then(|m| m.security_context.as_ref()),
+                explicit.and_then(|m| m.pod_security_context.as_ref()),
+            );
+            let (layer, remedy) = if recipe_uid.is_some() && recipe_uid == effective {
+                (
+                    "this recipe's mover.securityContext",
+                    "Remove the explicit runAsUser to track the workload",
+                )
+            } else {
+                (
+                    "the repository's moverDefaults.securityContext (NOT this recipe — it sets \
+                     no runAsUser)",
+                    "Clear runAsUser from the repository's moverDefaults, or override it here",
+                )
+            };
+            Some(InheritVerdict {
+                ok: false,
+                reason: INHERIT_OVERRIDDEN_REASON,
+                action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+                message: format!(
+                    "the mover runs as {}, not the uid {inherited_uid} inherited from pod \
+                     `{pod}`: {layer} overrides inherited values by design. \
+                     inheritSecurityContextFrom is a no-op for runAsUser here and will not \
+                     follow the workload if it changes. {remedy}, or drop \
+                     inheritSecurityContextFrom to stop implying that it does.",
+                    identity()
+                ),
+            })
+        }
+        // Inheritance resolved and stuck: either the workload's UID survived every layer, or it
+        // contributed groups (no UID) which is legitimate — the mover reads group-readable data
+        // through the group bit. Reported positively so a stale warning from a previous
+        // reconcile is cleared rather than left to rot.
+        io::InheritOutcome::Inherited { pod, container, .. } => Some(InheritVerdict {
+            ok: true,
+            reason: INHERIT_APPLIED_REASON,
+            action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+            message: format!(
+                "the mover inherited its security context from pod `{pod}`{} and runs as {}",
+                container
+                    .as_deref()
+                    .map(|c| format!(" (container `{c}`)"))
+                    .unwrap_or_default(),
+                identity(),
+            ),
+        }),
     }
 }
 
@@ -2586,7 +2681,14 @@ async fn set_security_context_compatible(
     backup: &Snapshot,
     message: &str,
 ) {
-    let existing = backup
+    // Not the first conditions writer in this reconcile — the "clear any stale
+    // MoverPermitted=False" block runs above and may have already patched. Building `existing`
+    // from the reconcile-start copy would revert that clear, flipping MoverPermitted back to
+    // False on a run that IS permitted. See `io::live_conditions_source`.
+    let Some(live) = io::live_conditions_source(api, name, backup).await else {
+        return; // deleted mid-reconcile
+    };
+    let existing = live
         .status
         .as_ref()
         .map(|s| s.conditions.clone())

@@ -1714,7 +1714,7 @@ fn inherit_reports_the_pod_and_container_it_read() {
     pod.metadata.name = Some("app-7c9d8f5b6-h2k4p".to_string());
     let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
     assert_eq!(src.pod, "app-7c9d8f5b6-h2k4p");
-    assert_eq!(src.container, "app");
+    assert_eq!(src.container.as_deref(), Some("app"));
     assert_eq!(src.uid(), Some(1000));
 }
 
@@ -2591,7 +2591,8 @@ fn pvc_consumer_inherits_the_container_that_mounts_the_claim_not_the_first() {
 
     let src = pvc_consumer_security_context_from_pods(&[pod], "app-data", "app", None).unwrap();
     assert_eq!(
-        src.container, "app",
+        src.container.as_deref(),
+        Some("app"),
         "must pick the container that mounts the claim, not the injected first one"
     );
     assert_eq!(src.uid(), Some(1000), "and inherit the app's UID, not 1337");
@@ -2661,5 +2662,43 @@ fn upsert_from_stale_conditions_drops_a_concurrent_write() {
         fresh
             .iter()
             .any(|c| c.type_ == "SecurityContextInherited" && c.status == "False")
+    );
+}
+
+#[test]
+fn pins_identity_is_false_for_a_group_the_hardened_default_already_gives() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // A workload pinning nothing but `fsGroup: 65532` — the exact value
+    // `hardened_pod_security_context()` already supplies. Inheriting it produces a mover
+    // byte-identical to the no-inherit default (uid 65532 from its own image, fsGroup 65532
+    // from the hardened base), so inheritance achieved nothing and the user must be told.
+    // Testing "are there any groups" instead of "any groups BEYOND the baseline" would call
+    // this a contribution and stay silent.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        fs_group: Some(kopiur_api::common::MOVER_NONROOT_ID),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert_eq!(src.uid(), None);
+    assert!(
+        !src.pins_identity(),
+        "fsGroup 65532 is what the hardened default already gives — inheriting it contributed \
+         nothing, so this must still warn"
+    );
+
+    // One above the baseline IS a contribution.
+    let mut pod = pod_with(Some("Running"), &[("app", None)], None);
+    pod.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext::default());
+    pod.spec.as_mut().unwrap().security_context = Some(PodSecurityContext {
+        fs_group: Some(1000),
+        ..Default::default()
+    });
+    let src = inherited_security_context_from_pods(&[pod], Some("app"), "ns", "app=x").unwrap();
+    assert!(
+        src.pins_identity(),
+        "fsGroup 1000 is not the default — inheriting it changed the mover"
     );
 }

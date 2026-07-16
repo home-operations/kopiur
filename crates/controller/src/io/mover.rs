@@ -414,8 +414,12 @@ pub fn label_selector_to_string(sel: &LabelSelector) -> String {
     terms.join(",")
 }
 
-/// The container- and pod-level security contexts inherited from a workload pod.
-/// At least one is `Some` (a fully context-less workload is an error to inherit from).
+/// A (container, pod) security-context pair.
+///
+/// Both are `Option` and **either may be `None`** — including both, for a recipe with no
+/// `mover` block at all (see [`ResolvedMoverSecurity::contexts`]). The stronger "at least one
+/// is `Some`" invariant holds only for [`InheritSource::contexts`], where a fully
+/// context-less workload is an error to inherit from; do not assume it here.
 pub type InheritedContexts = (Option<SecurityContext>, Option<PodSecurityContext>);
 
 /// One successful inherit: the copied contexts plus **which** pod/container they came from.
@@ -428,8 +432,10 @@ pub struct InheritSource {
     pub contexts: InheritedContexts,
     /// The pod the contexts were read from.
     pub pod: String,
-    /// The container within that pod whose `securityContext` was copied.
-    pub container: String,
+    /// The container whose `securityContext` was copied. `None` when the pod exposed no
+    /// container to choose (only reachable if the pod-level context alone carried the
+    /// inherit) — an empty string would encode that as a *valid container named ""*.
+    pub container: Option<String>,
 }
 
 impl InheritSource {
@@ -444,22 +450,38 @@ impl InheritSource {
         )
     }
 
-    /// Whether the inherited contexts pin **any** identity the mover can act on: an effective
-    /// UID, or any group (`runAsGroup` / `fsGroup` / `supplementalGroups`).
+    /// Whether inheriting contributed **anything the mover would not have had anyway**: an
+    /// effective UID, or a group the hardened defaults do not already supply.
     ///
-    /// Groups are not a footnote here. A workload that pins only `runAsGroup: 1000`, taking
-    /// its UID from its image, still lets the mover read `0640` data through the group bit —
-    /// so "no UID" alone does not mean inheriting achieved nothing. When BOTH are absent,
-    /// inheriting is a provable no-op: the workload's identity lives in its image, which the
-    /// pod spec cannot show, and the mover falls back to its own image's UID.
+    /// Groups are not a footnote. A workload that pins only `runAsGroup: 1000`, taking its UID
+    /// from its image, still lets the mover read `0640` data through the group bit — so "no
+    /// UID" alone does not mean inheriting achieved nothing.
+    ///
+    /// But a group is only a *contribution* if it beats the baseline. The hardened pod default
+    /// already sets `fsGroup: 65532`, so a workload that pins nothing but `fsGroup: 65532`
+    /// produces a mover byte-identical to the no-inherit default — inheriting was a no-op even
+    /// though a group is technically present. Comparing against
+    /// [`kopiur_api::common::hardened_pod_security_context`] rather than against "empty" is
+    /// what makes this answer the question the caller is actually asking.
     pub fn pins_identity(&self) -> bool {
+        use kopiur_api::secctx_compat::mover_identity;
+
         if self.uid().is_some() {
             return true;
         }
-        let sc = self.contexts.0.clone().unwrap_or_default();
-        !kopiur_api::secctx_compat::mover_identity(&sc, self.contexts.1.as_ref())
-            .groups
-            .is_empty()
+        // Borrow an all-`None` context rather than cloning the real one just to make a ref.
+        static EMPTY_SC: std::sync::LazyLock<SecurityContext> =
+            std::sync::LazyLock::new(SecurityContext::default);
+        let sc = self.contexts.0.as_ref().unwrap_or(&EMPTY_SC);
+        let inherited = mover_identity(sc, self.contexts.1.as_ref()).groups;
+
+        // What the mover holds WITHOUT inheriting anything (the lowest merge layer).
+        let baseline = mover_identity(
+            &kopiur_api::common::hardened_security_context(),
+            Some(&kopiur_api::common::hardened_pod_security_context()),
+        )
+        .groups;
+        !inherited.is_subset(&baseline)
     }
 }
 
@@ -473,8 +495,9 @@ pub enum InheritOutcome {
     Inherited {
         /// The pod the contexts were read from.
         pod: String,
-        /// The container whose `securityContext` was copied.
-        container: String,
+        /// The container whose `securityContext` was copied; `None` when the pod exposed
+        /// none to choose (see [`InheritSource::container`]).
+        container: Option<String>,
         /// The effective UID the **inherited layer alone** pins, before the recipe's explicit
         /// context is overlaid (see [`InheritSource::uid`]). Compared against the resolved UID
         /// to detect an inherit that an explicit `runAsUser` silently displaced.
@@ -631,7 +654,7 @@ fn extract_inherited_contexts(
     Ok(InheritSource {
         contexts: (container_sc, pod_sc),
         pod: pod.name_any(),
-        container: chosen.map(|c| c.name.clone()).unwrap_or_default(),
+        container: chosen.map(|c| c.name.clone()),
     })
 }
 

@@ -156,6 +156,39 @@ async fn wait_inherited_condition(backups: &Api<Snapshot>, name: &str) -> (Strin
     .expect("the SecurityContextInherited condition should be stamped on the Snapshot")
 }
 
+/// Block until no non-kopiur pod mounts the shared `e2e-src` claim, then assert it.
+///
+/// Scenarios in this file share one namespace and one source claim; a leftover consumer
+/// silently changes what `pvcConsumer` resolves. Any test whose meaning depends on the
+/// absence of a consumer must establish that, not assume it.
+async fn wait_no_consumer_of_source(client: &Client) {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let squatters = wait_until(
+        "no workload pod mounts e2e-src",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let all = pods.list(&Default::default()).await?.items;
+            let names: Vec<String> = all
+                .iter()
+                .filter(|p| kopiur_api::secctx_compat::pod_mounts_claim(p, "e2e-src"))
+                .filter(|p| !kopiur_api::secctx_compat::is_managed_by_kopiur(p))
+                .filter_map(|p| p.metadata.name.clone())
+                .collect();
+            // `Some(..)` ends the wait; keep polling while any consumer lingers.
+            Ok(names.is_empty().then_some(names))
+        },
+    )
+    .await;
+    assert!(
+        squatters.is_ok(),
+        "precondition failed: a pod still mounts `e2e-src`, so pvcConsumer would RESOLVE and \
+         this scenario cannot test the no-pod fallback. A sibling test in this file most \
+         likely panicked before its cleanup ran — fix that failure first; this one is \
+         collateral."
+    );
+}
+
 fn backup_json(name: &str, policy: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
@@ -710,6 +743,15 @@ async fn inherit_falls_back_to_the_explicit_context_when_no_pod_resolves() {
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // PRECONDITION, asserted rather than assumed: this scenario's whole point is that NO pod
+    // mounts the source, but every sibling scenario parks one on the same `e2e-src` claim in
+    // this namespace. A sibling that panics before its cleanup leaves its pod behind, inherit
+    // then RESOLVES, no fallback happens, and this test fails with a confusing
+    // condition-timeout that points here instead of at the real culprit. Wait (siblings clean
+    // up with grace_period=0, but the API is eventually-consistent) and fail loudly naming the
+    // squatter.
+    wait_no_consumer_of_source(&client).await;
 
     repos
         .create(

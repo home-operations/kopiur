@@ -315,6 +315,15 @@ pub const INHERIT_PINNED_NO_UID_REASON: &str = "InheritPinnedNoUid";
 /// design; this exists so that choice can never be a *silent* no-op — without it a recipe
 /// written as a "fallback" would pin the mover forever with no signal when the workload moves.
 pub const INHERIT_OVERRIDDEN_REASON: &str = "InheritOverridden";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `True`: inheritance resolved a
+/// workload and its values survived every higher merge layer.
+///
+/// The healthy state is a real, written verdict rather than "write nothing", so that a stale
+/// `False` from a previous reconcile is CLEARED once the user fixes the recipe. Conditions are
+/// sticky: an arm that returns without writing leaves the old warning contradicting reality
+/// forever (the reason [`MOVER_PERMITTED_CONDITION`] needs an explicit clear-the-stale-False
+/// block).
+pub const INHERIT_APPLIED_REASON: &str = "InheritApplied";
 /// Event `action` (remediation hint) for the inherit-pinned-no-uid case.
 pub const PIN_WORKLOAD_RUN_AS_USER_ACTION: &str = "PinWorkloadRunAsUser";
 /// `Restore` condition reporting whether the *future* consumer of the restore target PVC

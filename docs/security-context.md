@@ -195,14 +195,10 @@ hardened  ⊂  moverDefaults  ⊂  inherited  ⊂  mover.securityContext
 So **what you write always wins**, inheritance fills in whatever the workload pins that you left blank, and your context stands in **alone** when inheritance can't resolve a pod. That last property makes it the natural fallback:
 
 ```yaml
-spec:
-  mover:
-    inheritSecurityContextFrom:
-      pvcConsumer: {}
-    securityContext:
-      runAsUser: 1000 # used when the workload is scaled to zero — and it OVERRIDES
-      # the inherited UID whenever it resolves, because explicit wins
+--8<-- "deploy/examples/18-inherit-security-context.yaml:merged"
 ```
+
+The pattern that composes best is overriding a *group* while inheriting the *identity*, as above: `supplementalGroups` is additive, so it doesn't fight inherit the way a `runAsUser` override does.
 
 /// warning | An explicit field is an override, not a default
 
@@ -214,19 +210,22 @@ If that's not what you meant, leave `runAsUser` out and let inherit supply it. K
 
 #### The `SecurityContextInherited` condition
 
-`SecurityContextCompatible` answers *"can the mover read the source?"*. `SecurityContextInherited` answers a different question — *"did inheriting do what you think it did?"* — and appears **only** when the answer is "not quite". No condition means inheritance resolved a workload and its values stuck.
+`SecurityContextCompatible` answers *"can the mover read the source?"*. `SecurityContextInherited` answers a different question — *"did inheriting do what you think it did?"*. It appears on every run that asks to inherit, and **not at all** on runs that don't.
 
-| `reason` | What happened | What to do |
+| `status` / `reason` | What happened | What to do |
 | --- | --- | --- |
-| `InheritFallback` | No workload pod resolved (scaled to zero, mid-rollout, selector matches nothing). Your explicit context stood in, so the run proceeded rather than being held. | Nothing, if that's the intent. Otherwise scale the workload up. |
-| `InheritPinnedNoUid` | A pod resolved, but pins no `runAsUser`/`runAsGroup`/`fsGroup`/`supplementalGroups` — its identity is in its image. Inheriting copied nothing; the mover runs as `65532`. | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser`. |
-| `InheritOverridden` | Inheritance resolved a UID, but your explicit `runAsUser` (or `moverDefaults`) overrode it. Correct by design — but inherit is a no-op for that field and won't follow the workload. | Drop the explicit `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
+| `True` / `InheritApplied` | Inheritance resolved a workload and its values survived every layer. The message names the pod and the uid the mover runs as. | Nothing. |
+| `False` / `InheritFallback` | No workload pod resolved (scaled to zero, mid-rollout, selector matches nothing). Your explicit context stood in, so the run proceeded rather than being held. | Nothing, if that's the intent. Otherwise scale the workload up. |
+| `False` / `InheritPinnedNoUid` | A pod resolved, but pins no `runAsUser` and no group beyond the mover's own defaults — its identity is in its image, which Kopiur cannot read. Inheriting copied nothing. | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser`. |
+| `False` / `InheritOverridden` | Inheritance resolved a UID, but a higher layer overrode it. Correct by design — but inherit is a no-op for that field and won't follow the workload. The message names **which** layer won: this recipe, or the repository's `moverDefaults`. | Drop the winning `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
 
 ```console
 $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextInherited")]}'
 ```
 
-Each also emits one Warning Event, fired on the status transition rather than every reconcile.
+The `False` states each emit one Warning Event, fired on the status transition rather than every reconcile; `True` is a silent confirmation. Because the healthy state is reported rather than merely implied by silence, fixing your recipe **clears** a previous warning instead of leaving it to rot.
+
+A `Restore` reports `InheritFallback` the same way. It has no `InheritPinnedNoUid`: a restore that inherits only an `fsGroup` is a [blessed configuration](#preserving-original-ownership-on-restore) — the target is a fresh read-write volume the kubelet *does* apply `fsGroup` to — so warning there would flag a setup Kopiur itself certifies.
 
 Two consequences worth internalizing:
 
@@ -239,11 +238,6 @@ Full, apply-ready example (SnapshotPolicy + the same knob on a `Restore`):
 --8<-- "deploy/examples/18-inherit-security-context.yaml"
 ```
 
-The pattern that composes best is overriding a *group* while inheriting the *identity* — `supplementalGroups` is additive, so it doesn't fight inherit the way a `runAsUser` override does:
-
-```yaml
---8<-- "deploy/examples/18-inherit-security-context.yaml:merged"
-```
 
 ### 3. Go root (privileged mover)
 

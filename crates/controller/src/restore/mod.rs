@@ -441,8 +441,17 @@ async fn report_restore_inherit_fallback(
          mover's identity itself — so the restored files will be owned as that context says, not \
          as the workload named by inheritSecurityContextFrom."
     );
+    // Not the first conditions writer in this reconcile — the privileged-mover gate and the
+    // "clear stale MoverPermitted" block run above. Building `existing` from the
+    // reconcile-start copy would let them erase this condition, which would then be re-written
+    // and re-Evented on every subsequent reconcile. See `io::live_conditions_source`.
+    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
+    let name = restore.name_any();
+    let Some(live) = io::live_conditions_source(&api, &name, restore).await else {
+        return; // deleted mid-reconcile
+    };
     let conditions = io::upsert_condition(
-        &existing_conditions(restore),
+        &existing_conditions(&live),
         SECURITY_CONTEXT_INHERITED_CONDITION,
         false,
         INHERIT_FALLBACK_REASON,
@@ -451,11 +460,10 @@ async fn report_restore_inherit_fallback(
     );
     // Guard the Event behind a real transition: `publish_warning_event` has no dedup and a
     // Restore re-reconciles, so an unguarded write would re-fire the warning every pass.
-    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
-    let current = serde_json::to_value(&restore.status).ok();
+    let current = serde_json::to_value(&live.status).ok();
     match io::patch_status_if_changed(
         &api,
-        &restore.name_any(),
+        &name,
         current.as_ref(),
         serde_json::json!({ "conditions": conditions }),
     )
@@ -1806,14 +1814,6 @@ async fn run_restore_mover(
         None,
     )
     .await?;
-    // A restore that falls back to its explicit context is NOT tracking the workload it named —
-    // report it, exactly as a backup does. (The backup-only `InheritPinnedNoUid` warning has no
-    // restore counterpart on purpose: an fsGroup-only inherit is a *blessed* restore shape —
-    // `RestoreBasis::FsGroupMatch` — because the target is a fresh read-write volume the kubelet
-    // does apply fsGroup to. Warning there would flag a configuration the operator certifies.)
-    if let io::InheritOutcome::Fallback { reason } = &mover_security.outcome {
-        report_restore_inherit_fallback(namespace, restore, reason, ctx).await;
-    }
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -1901,6 +1901,29 @@ async fn run_restore_mover(
             restore.metadata.generation,
         );
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
+    }
+
+    // A restore that falls back to its explicit context is NOT tracking the workload it named —
+    // report it, exactly as a backup does.
+    //
+    // Placed HERE, not at the resolve site, for two reasons. (1) After the privileged-mover
+    // gate: reporting before it emits a Warning Event about fallback behavior for a run the
+    // gate then refuses, which never happens. (2) After the "clear stale MoverPermitted" block:
+    // that block rebuilds `conditions` from the reconcile-start copy, so a condition written
+    // before it is erased — and then re-written and re-Evented on the next reconcile, forever.
+    //
+    // Matched exhaustively (CLAUDE.md: "prefer an `enum` + exhaustive `match` over `if let` /
+    // `_ =>` catch-alls in reconcile paths") so a new `InheritOutcome` variant cannot be
+    // silently dropped here — the very failure mode this feature exists to remove.
+    match &mover_security.outcome {
+        io::InheritOutcome::Fallback { reason } => {
+            report_restore_inherit_fallback(namespace, restore, reason, ctx).await;
+        }
+        // The backup-only `InheritPinnedNoUid` warning has no restore counterpart on purpose:
+        // an fsGroup-only inherit is a *blessed* restore shape (`RestoreBasis::FsGroupMatch`),
+        // because the target is a fresh read-write volume the kubelet does apply fsGroup to.
+        // Warning there would flag a configuration the operator itself certifies as compatible.
+        io::InheritOutcome::Inherited { .. } | io::InheritOutcome::NotRequested => {}
     }
 
     // Restore-direction securityContext (positive-only): confirm `True` when the future
@@ -2279,7 +2302,9 @@ async fn assess_restore_security_context(
     // that condition.
     let name = restore.name_any();
     let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
-    let live = io::live_conditions_source(&api, &name, restore).await;
+    let Some(live) = io::live_conditions_source(&api, &name, restore).await else {
+        return; // deleted mid-reconcile
+    };
     let existing = live
         .status
         .as_ref()
