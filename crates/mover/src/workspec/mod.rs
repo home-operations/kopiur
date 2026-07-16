@@ -568,6 +568,15 @@ pub struct BootstrapRepositoryOp {
     /// hash,ecc}` (ADR-0005 §13(a)); they're immutable post-create (§7).
     #[serde(default, skip_serializing_if = "CreateOptionsSpec::is_empty")]
     pub create_options: CreateOptionsSpec,
+    /// MUTABLE repository parameters from `Repository.spec.parameters.epoch` (#258),
+    /// re-applied on drift on every bootstrap — including a connect-to-existing, which is
+    /// the whole point. The sibling of `create_options` and its opposite: those are
+    /// create-time-fixed, these are the ones you can still change.
+    ///
+    /// Empty for a `mode: ReadOnly` repository — the controller does not send them, because
+    /// `set-parameters` hard-errors on a read-only connection.
+    #[serde(default, skip_serializing_if = "EpochParametersSpec::is_empty")]
+    pub epoch_parameters: EpochParametersSpec,
     /// This cluster's `identityDefaults.cluster` (multi-cluster shared repo),
     /// carried ONLY when the controller determined cluster identity is on AND the
     /// effective `catalog.foreignSnapshots` policy is `Ignore` — never under
@@ -680,6 +689,144 @@ pub fn maintenance_restamp_target<'a>(
                 None
             }
         }
+    }
+}
+
+/// One MiB in bytes. kopia's `--epoch-advance-on-size-mb` flag multiplies by this — `7`
+/// yields `7340032`, NOT 7_000_000 — even though its own log renders the result as "7.3 MB".
+/// Getting this wrong makes the drift comparison below never converge, which would re-run
+/// `set-parameters` on every bootstrap and invalidate every other client's format cache each
+/// time.
+const MIB: i64 = 1_048_576;
+
+/// Serializable mirror of the epoch knobs from `Repository.spec.parameters.epoch`, carried
+/// on [`BootstrapRepositoryOp`]. `serde(default)` throughout: an older controller's work
+/// spec has no `parameters` key and must still decode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochParametersSpec {
+    /// Go-style duration, already rendered with a unit for kopia's CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_duration: Option<String>,
+    /// Go-style duration, already rendered with a unit for kopia's CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_frequency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(missing_docs)]
+    pub advance_on_count: Option<i64>,
+    /// MiB (kopia's flag is `-mb` but means MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance_on_size_mb: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(missing_docs)]
+    pub checkpoint_frequency: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(missing_docs)]
+    pub delete_parallelism: Option<i64>,
+}
+
+impl EpochParametersSpec {
+    /// Build from the api crate's `EpochParameters`, rendering each duration through
+    /// [`kopiur_api::render_go_duration`] so what reaches kopia's argv is never the user's
+    /// raw text. kopia rejects a bare number (`3600`) that `parse_go_duration` accepts, so
+    /// passing the string through would admit at the webhook and fail in the mover; an
+    /// unparseable value (already rejected at admission) drops to `None` rather than
+    /// forwarding garbage.
+    pub fn from_api(e: &kopiur_api::repository::EpochParameters) -> Self {
+        let render = |s: &Option<String>| -> Option<String> {
+            s.as_deref()
+                .and_then(kopiur_api::parse_go_duration)
+                .map(kopiur_api::render_go_duration)
+        };
+        Self {
+            min_duration: render(&e.min_duration),
+            refresh_frequency: render(&e.refresh_frequency),
+            advance_on_count: e.advance_on_count,
+            advance_on_size_mb: e.advance_on_size_mb,
+            checkpoint_frequency: e.checkpoint_frequency,
+            delete_parallelism: e.delete_parallelism,
+        }
+    }
+
+    /// Whether nothing is declared (so the whole set-parameters step is skipped and a
+    /// repository that never mentions `spec.parameters` is completely unaffected).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The `set-parameters` flags needed to bring `observed` in line with `desired`, or `None`
+/// when they already agree.
+///
+/// Pure and unit-tested, deliberately mirroring [`maintenance_restamp_target`]: read live
+/// state, compare, mutate only on drift. That matters more here than for the maintenance
+/// owner — `kopia repository set-parameters` invalidates every other client's cached format
+/// blob, so an unconditional apply would churn the whole fleet on every bootstrap.
+///
+/// Comparison is in kopia's OWN units (nanoseconds, bytes), never on the rendered strings:
+/// `"6h"`, `"360m"` and `"21600s"` are the same parameter, and a string compare would report
+/// drift forever.
+pub fn epoch_drift(
+    desired: &EpochParametersSpec,
+    observed: Option<&kopiur_kopia::model::EpochParameters>,
+) -> Option<kopiur_kopia::client::SetParametersArgs> {
+    if desired.is_empty() {
+        return None;
+    }
+    // No observation (older kopia, or a status we could not read) → apply what is declared
+    // rather than silently skip. `set-parameters` is idempotent.
+    let Some(o) = observed else {
+        return Some(kopiur_kopia::client::SetParametersArgs {
+            epoch_min_duration: desired.min_duration.clone(),
+            epoch_refresh_frequency: desired.refresh_frequency.clone(),
+            epoch_advance_on_count: desired.advance_on_count,
+            epoch_advance_on_size_mb: desired.advance_on_size_mb,
+            epoch_checkpoint_frequency: desired.checkpoint_frequency,
+            epoch_delete_parallelism: desired.delete_parallelism,
+        });
+    };
+    // Compare a desired duration against an observed nanosecond count.
+    let dur_drift = |want: &Option<String>, have_ns: i64| -> Option<String> {
+        let want = want.as_deref()?;
+        let want_ns = kopiur_api::parse_go_duration(want)?.as_nanos() as i64;
+        (want_ns != have_ns).then(|| want.to_string())
+    };
+    let num_drift = |want: Option<i64>, have: i64| -> Option<i64> { want.filter(|w| *w != have) };
+    let args = kopiur_kopia::client::SetParametersArgs {
+        epoch_min_duration: dur_drift(&desired.min_duration, o.min_epoch_duration_ns),
+        epoch_refresh_frequency: dur_drift(
+            &desired.refresh_frequency,
+            o.epoch_refresh_frequency_ns,
+        ),
+        epoch_advance_on_count: num_drift(desired.advance_on_count, o.advance_on_count),
+        // MiB on the flag, bytes in the report.
+        epoch_advance_on_size_mb: num_drift(
+            desired.advance_on_size_mb,
+            o.advance_on_total_size_bytes / MIB,
+        ),
+        epoch_checkpoint_frequency: num_drift(desired.checkpoint_frequency, o.checkpoint_frequency),
+        epoch_delete_parallelism: num_drift(desired.delete_parallelism, o.delete_parallelism),
+    };
+    (!args.is_empty()).then_some(args)
+}
+
+/// Mirror kopia's reported epoch parameters into the api crate's status type, rendering
+/// nanosecond durations back to Go-style strings so `status.parameters.epoch` is directly
+/// comparable to `spec.parameters.epoch`.
+pub fn observed_epoch(
+    o: &kopiur_kopia::model::EpochParameters,
+) -> kopiur_api::repository::ObservedEpochParameters {
+    let dur =
+        |ns: i64| kopiur_api::render_go_duration(std::time::Duration::from_nanos(ns.max(0) as u64));
+    kopiur_api::repository::ObservedEpochParameters {
+        enabled: o.enabled,
+        min_duration: dur(o.min_epoch_duration_ns),
+        refresh_frequency: dur(o.epoch_refresh_frequency_ns),
+        cleanup_safety_margin: dur(o.cleanup_safety_margin_ns),
+        advance_on_count: o.advance_on_count,
+        advance_on_size_mb: o.advance_on_total_size_bytes / MIB,
+        checkpoint_frequency: o.checkpoint_frequency,
+        delete_parallelism: o.delete_parallelism,
     }
 }
 

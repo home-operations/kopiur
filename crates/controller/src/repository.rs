@@ -856,6 +856,7 @@ async fn bootstrap_via_mover(
         read_only,
         maintenance_enabled,
         foreign_maintenance,
+        repo.spec.parameters.as_ref(),
     );
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
@@ -1026,6 +1027,29 @@ async fn bootstrap_via_mover(
 /// the consumer-clobbers-the-primary's-owner bug), a deliberate
 /// `spec.maintenance.enabled: false`, or a repository an externally-authored
 /// Maintenance already covers.
+/// The epoch parameters to send to a bootstrap mover, or an empty set when there is
+/// nothing to apply (#258). Pure; shared by both repository kinds, which have separate
+/// work-spec builders.
+///
+/// A `ReadOnly` repository sends NOTHING. `kopia repository set-parameters` rewrites the
+/// repository-global format blob and hard-errors outright on a read-only connection
+/// (`unable to write blobcfg blob: ... storage is read-only`). It is the same hazard shape
+/// as a consumer cluster clobbering the primary's maintenance owner, and gets the same
+/// answer: a ReadOnly repository never mutates repository-global state. Admission rejects
+/// the pairing as well, so this is defense in depth rather than the only guard.
+pub(crate) fn epoch_parameters_for(
+    read_only: bool,
+    parameters: Option<&kopiur_api::repository::RepositoryParameters>,
+) -> kopiur_mover::workspec::EpochParametersSpec {
+    if read_only {
+        return Default::default();
+    }
+    parameters
+        .and_then(|p| p.epoch.as_ref())
+        .map(kopiur_mover::workspec::EpochParametersSpec::from_api)
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_work_spec(
     backend: &Backend,
@@ -1040,6 +1064,7 @@ fn bootstrap_work_spec(
     read_only: bool,
     maintenance_enabled: bool,
     foreign_maintenance: bool,
+    parameters: Option<&kopiur_api::repository::RepositoryParameters>,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
@@ -1061,6 +1086,13 @@ fn bootstrap_work_spec(
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
             // when the bootstrap creates the repo (ADR-0005 §13(a)).
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
+            // MUTABLE parameters (#258) — the opposite of create_options: re-applied on
+            // drift on every bootstrap, including a connect-to-existing. Never sent for a
+            // ReadOnly repository: `set-parameters` rewrites the format blob and kopia
+            // hard-errors on a read-only connection. (Admission rejects that pairing too;
+            // this is the belt to its braces, and the same hazard shape as the
+            // consumer-clobbers-the-primary's-maintenance-owner bug M6 fixed.)
+            epoch_parameters: epoch_parameters_for(read_only, parameters),
             // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
             // every connect-to-existing when stale (`maintenance_restamp_target`);
             // `None` means neither ever happens — see the doc above.
@@ -1215,6 +1247,13 @@ async fn finalize_bootstrap(
         // re-reporting the old repository's identity forever.
         "observedGeneration": repo.metadata.generation,
     });
+    // Mirror the epoch parameters the repository actually reports (#258). The apply is
+    // best-effort in the mover, so this is what keeps it honest: a `spec.parameters.epoch`
+    // that failed to land stays visible here as drift from spec, rather than as silence.
+    // Merge-patch, so this key does not disturb the rest of status.
+    if let Some(epoch) = &result.epoch {
+        status_patch["parameters"] = serde_json::json!({ "epoch": epoch });
+    }
     if let Some(count) = result.index_blob_count {
         let upd = health::reconcile_index_blob_health(
             &conditions,
@@ -1604,7 +1643,7 @@ mod tests {
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
                 &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
-                false,
+                false, None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -1650,6 +1689,7 @@ mod tests {
                 read_only,
                 enabled,
                 foreign_m,
+                None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op,

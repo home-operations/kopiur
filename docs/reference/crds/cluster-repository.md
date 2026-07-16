@@ -22,7 +22,11 @@ a namespace is rejected on apply.
 
 Fields shared with `Repository` — `backend`, `create`, `moverDefaults`,
 `scheduleDefaults`, `catalog`, `maintenance`, `onNamespaceDelete`, `mode`,
-`suspend`, `health` — behave exactly as on the [Repository](repository.md) page.
+`suspend`, `health`, `parameters` — behave exactly as on the
+[Repository](repository.md) page. (`parameters.epoch` is worth calling out for a
+shared repository: it describes the repository itself, so declare it on the cluster
+that owns it — two clusters declaring different values will fight over them, and a
+`mode: ReadOnly` consumer is rejected for declaring any.)
 The differences and additions:
 
 ### `encryption`

@@ -216,6 +216,13 @@ pub struct BootstrapResult {
     /// warns when this crosses `spec.health.indexBlobWarnThreshold`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_count: Option<i64>,
+    /// The epoch parameters the repository reports (`repository status`), for the
+    /// controller to mirror into `status.parameters.epoch` (#258). Best-effort: `None` when
+    /// the status could not be read or the format predates epoch indexes. This is what
+    /// makes the set-parameters apply honest — it is deliberately non-fatal, so a failed
+    /// apply must remain VISIBLE as drift from `spec` rather than silently doing nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<kopiur_api::repository::ObservedEpochParameters>,
     /// Structured failure block on `success == false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureBlock>,
@@ -241,8 +248,20 @@ impl BootstrapResult {
             snapshots_truncated,
             foreign_suffix_dropped,
             index_blob_count,
+            epoch: None,
             failure: None,
         }
+    }
+
+    /// Attach the epoch parameters observed at the end of the bootstrap. Separate from
+    /// [`BootstrapResult::ready`] rather than an eighth positional argument to it — the
+    /// call site is already at the limit of what a positional list can carry legibly.
+    pub fn with_epoch(
+        mut self,
+        epoch: Option<kopiur_api::repository::ObservedEpochParameters>,
+    ) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// A terminal-failure outcome carrying the kopia error class + stderr tail.
@@ -256,6 +275,7 @@ impl BootstrapResult {
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
             index_blob_count: None,
+            epoch: None,
             failure: Some(failure_block_from_kopia(err)),
         }
     }
@@ -277,6 +297,7 @@ impl BootstrapResult {
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
             index_blob_count: None,
+            epoch: None,
             failure: Some(FailureBlock {
                 kopia_error_class: REPOSITORY_NOT_INITIALIZED_CLASS.to_string(),
                 message: REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),

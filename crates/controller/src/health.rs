@@ -119,10 +119,22 @@ pub fn reconcile_index_blob_health(
 
     match classify_index_blob_health(count, threshold) {
         IndexBlobHealth::TooMany { count, threshold } => {
+            // Three remedies, in the order they are usually the answer. The epoch one is
+            // last but is the fix when maintenance is demonstrably running and the count
+            // still will not fall: kopia cannot compact an index blob until its epoch
+            // closes, an epoch cannot close before `minDuration` (24h by default) no matter
+            // how many blobs pile up, and compaction then trails two epochs behind. A fleet
+            // producing tens of blobs an hour is therefore held at thousands of uncompacted
+            // blobs by the gate alone — no maintenance schedule can help, which is exactly
+            // the dead end #258 was reported from.
             let message = format!(
                 "repository has {count} content-index blobs (threshold {threshold}); kopia \
                  maintenance is not compacting them. Ensure maintenance runs — if it is stuck on a \
                  stale lease owner, set spec.maintenance.takeoverPolicy: Force once to recover. \
+                 If maintenance IS running, the epoch-advance gate is the usual cause on a busy \
+                 repository: an epoch cannot close before spec.parameters.epoch.minDuration \
+                 (kopia's default is 24h) and compaction trails two epochs behind, so lowering \
+                 it (e.g. 6h) lets blobs be compacted sooner. \
                  Raise spec.health.indexBlobWarnThreshold (or set it to 0) to silence this."
             );
             let conditions = io::upsert_condition(
@@ -448,6 +460,15 @@ mod tests {
         assert_eq!(ev.reason, TOO_MANY_INDEX_BLOBS_REASON);
         assert!(ev.message.contains("1448"));
         assert!(ev.message.contains("takeoverPolicy: Force"));
+        // #258: the reporter arrived here having already ruled out both of the original
+        // remedies — maintenance was running, and raising the threshold only hides the
+        // number. The epoch-advance gate was the actual cause, so the message must name it;
+        // a warning whose every suggestion is a dead end is worse than no warning.
+        assert!(
+            ev.message.contains("spec.parameters.epoch.minDuration"),
+            "the epoch remedy must be offered: {}",
+            ev.message
+        );
 
         // Still unhealthy on the next reconcile: condition stays False, NO new event.
         let again = reconcile_index_blob_health(&[cond("False")], 1500, 1000, Some(3));

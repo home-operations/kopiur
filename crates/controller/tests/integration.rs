@@ -95,6 +95,7 @@ fn sample_repository(name: &str) -> Repository {
             mode: Default::default(),
             suspend: false,
             health: None,
+            parameters: None,
             server: None,
         },
     )

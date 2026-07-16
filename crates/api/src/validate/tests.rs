@@ -1153,6 +1153,7 @@ fn repository_inline_retention_hook_passes_today() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
     };
     assert!(validate_repository_no_inline_retention(&spec).is_ok());
 }
@@ -1445,6 +1446,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
     }
 }
 
@@ -1541,6 +1543,7 @@ fn cluster_repository_rejects_all_false() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
         credential_projection: None,
     };
     assert!(!validate_cluster_repository(&spec).is_empty());
@@ -1581,6 +1584,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);
@@ -1631,6 +1635,7 @@ fn repo_spec_create(
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
     }
 }
 
@@ -1690,6 +1695,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
         credential_projection: None,
     };
     assert!(
@@ -1787,6 +1793,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
         credential_projection: None,
     };
     let old = mk("FIXED-4M");
@@ -3608,6 +3615,7 @@ fn cluster_repository_rejects_bad_cluster_name() {
         mode: Default::default(),
         suspend: false,
         health: None,
+        parameters: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);
@@ -4421,4 +4429,110 @@ fn writable_source_conflicts_with_a_read_only_many_staged_pvc() {
          sources: [ { pvc: { name: data } } ]\n",
     );
     assert!(validate_backup_config(&spec).is_empty());
+}
+
+// --- #258: spec.parameters.epoch ------------------------------------------
+
+fn repo_yaml(body: &str) -> RepositorySpec {
+    crate::testutil::from_yaml(body)
+}
+
+const REPO_BASE: &str = "backend: { filesystem: { path: /repo } }\n\
+                         encryption: { passwordSecretRef: { name: s, key: KOPIA_PASSWORD } }\n";
+
+#[test]
+fn epoch_parameters_are_optional_and_accept_go_durations() {
+    // The inert case: no parameters block at all changes nothing.
+    assert!(validate_repository(&repo_yaml(REPO_BASE)).is_empty());
+    // The reporter's fix.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 6h\n    refreshFrequency: 20m\n    \
+         advanceOnCount: 20\n    advanceOnSizeMiB: 10\n    checkpointFrequency: 7\n    \
+         deleteParallelism: 4\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn an_unparseable_epoch_duration_is_rejected_at_admission() {
+    // These are the first CRD durations that reach a kopia CLI, so the webhook's promise —
+    // a value it admits never fails at reconcile time — has teeth here.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: every-6-hours\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty());
+    assert!(msg.contains("minDuration"), "{msg}");
+    assert!(
+        msg.contains("6h") || msg.contains("Go-style"),
+        "must show the grammar: {msg}"
+    );
+}
+
+#[test]
+fn non_positive_epoch_counts_are_rejected() {
+    for field in [
+        "advanceOnCount",
+        "advanceOnSizeMiB",
+        "checkpointFrequency",
+        "deleteParallelism",
+    ] {
+        let spec = repo_yaml(&format!(
+            "{REPO_BASE}parameters:\n  epoch:\n    {field}: 0\n"
+        ));
+        let errs = validate_repository(&spec);
+        assert!(!errs.is_empty(), "{field}: 0 must be rejected");
+        assert!(format!("{errs:?}").contains(field));
+    }
+}
+
+#[test]
+fn a_read_only_repository_cannot_declare_epoch_parameters() {
+    // `kopia repository set-parameters` rewrites the repository-global format blob and
+    // HARD-ERRORS on a read-only connection (`storage is read-only`). Silently ignoring
+    // the block would leave the user watching a setting that can never land; reject it,
+    // the way an NFS source + volumeSnapshotClassName is rejected.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}mode: ReadOnly\nparameters:\n  epoch:\n    minDuration: 6h\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "ReadOnly + parameters must be rejected");
+    assert!(msg.contains("ReadOnly"), "{msg}");
+    assert!(msg.contains("set-parameters"), "must say WHY: {msg}");
+
+    // ReadOnly WITHOUT parameters stays valid — this must not tax a plain consumer repo.
+    let spec = repo_yaml(&format!("{REPO_BASE}mode: ReadOnly\n"));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn cluster_repository_gets_the_identical_parameters_rules() {
+    // The two kinds have fully duplicated reconcilers, so a rule that lands on only one of
+    // them is the classic way half this API surface ships as a silent no-op.
+    let base = "backend: { filesystem: { path: /repo } }\n\
+                encryption: { passwordSecretRef: { name: s, namespace: kopiur-system, key: KOPIA_PASSWORD } }\n\
+                allowedNamespaces: { all: true }\n";
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: nonsense\n"
+    ));
+    let errs = validate_cluster_repository(&spec);
+    assert!(
+        format!("{errs:?}").contains("minDuration"),
+        "ClusterRepository must validate spec.parameters too: {errs:?}"
+    );
+
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}mode: ReadOnly\nparameters:\n  epoch:\n    minDuration: 6h\n"
+    ));
+    assert!(
+        !validate_cluster_repository(&spec).is_empty(),
+        "a ReadOnly ClusterRepository must reject parameters as well"
+    );
+
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: 6h\n"
+    ));
+    assert!(validate_cluster_repository(&spec).is_empty());
 }

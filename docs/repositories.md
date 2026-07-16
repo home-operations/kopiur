@@ -352,6 +352,23 @@ This is distinct from a single `kubectl delete snapshot`, which always honors th
 
 `mode: ReadWrite` (default) or `ReadOnly`. A `ReadOnly` repository connects read-only and serves **restores only** — the operator refuses backup Jobs and skips maintenance projection. Use it to decommission a backend or migrate between repositories without any risk of writes.
 
+## `parameters` — mutable kopia repository parameters
+
+`spec.parameters.epoch` tunes kopia's epoch manager, which decides how quickly index blobs become compactable. Reach for it when your repository sits at thousands of index blobs (`IndexBlobHealth=False` / `TooManyIndexBlobs`) *even though maintenance is running* — kopia cannot compact a blob until its epoch closes, and an epoch cannot close before `minDuration` (24h by default) no matter how many blobs pile up.
+
+```yaml
+spec:
+  parameters:
+    epoch:
+      minDuration: 6h # kopia's default is 24h
+```
+
+Every field is optional and kopiur has no defaults of its own: **absent means "leave kopia's current value alone"**, so a repository that declares nothing here is untouched by this. The corollary is that *removing* a value does not restore kopia's default — it leaves the repository at whatever you last applied.
+
+kopiur applies these only when they drift from what the repository reports (the call invalidates other kopia clients' cached format blob), and mirrors what it observes into `status.parameters.epoch` — so a value that failed to apply is visible as a mismatch rather than as silence. Not available on `mode: ReadOnly`, which kopia refuses to accept repository-wide writes on.
+
+Full field set and rationale: [Maintenance → when maintenance is running and the count still won't fall](maintenance.md#when-maintenance-is-running-and-the-count-still-wont-fall).
+
 ## `suspend` — pause a repository
 
 `suspend: true` pauses connect/bootstrap and maintenance projection declaratively, without deleting the `Repository`. Surfaced via a condition. `suspend` is consistent across `Repository`/`ClusterRepository`/`SnapshotPolicy`/`RepositoryReplication`.
@@ -489,6 +506,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
 | `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`) and, for a repository shared across clusters, `cluster`. |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
+| `parameters.epoch.minDuration`                          | Lower it (e.g. `6h`) when index blobs stay in the thousands despite maintenance running. |
 | `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |

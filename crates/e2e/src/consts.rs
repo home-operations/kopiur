@@ -78,6 +78,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "copymethod",
     "copymethod-csi",
     "idxhealth",
+    "epochparams",
     "staging-recover",
     "staging-timeout",
     "staging-override",

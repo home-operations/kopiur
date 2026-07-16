@@ -1,6 +1,5 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
-assertion_line: 24
 expression: "body(&artifacts, \"repositories\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -2135,6 +2134,58 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              parameters:
+                description: Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
+                nullable: true
+                properties:
+                  epoch:
+                    description: |-
+                      Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
+                      blobs get compacted.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: |-
+                          Index blobs in an epoch that trigger an advance, once older than `minDuration`
+                          (kopia default `20`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: |-
+                          Total index size in an epoch that triggers an advance, once older than `minDuration`
+                          (kopia default `10` MiB).
+
+                          Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
+                          (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
+                          kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760
+                          bytes — even though kopia's own log renders the result as "MB". That ambiguity is
+                          this field's main hazard; the API surface should not reproduce it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      checkpointFrequency:
+                        description: Epochs between full index checkpoints (kopia default `7`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      deleteParallelism:
+                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      minDuration:
+                        description: |-
+                          Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
+                          (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+                        nullable: true
+                        type: string
+                      refreshFrequency:
+                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
               scheduleDefaults:
                 description: |-
                   Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
@@ -2622,6 +2673,57 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              parameters:
+                description: |-
+                  The kopia repository parameters actually observed at the last bootstrap. Compare
+                  against `spec.parameters` to see whether a declared value landed.
+                nullable: true
+                properties:
+                  epoch:
+                    description: The epoch parameters the repository reports.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: Observed index-blob count that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      checkpointFrequency:
+                        description: Observed epochs between full index checkpoints.
+                        format: int64
+                        type: integer
+                      cleanupSafetyMargin:
+                        description: |-
+                          Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis;
+                          not settable through `spec.parameters`.
+                        type: string
+                      deleteParallelism:
+                        description: Observed epoch-cleanup delete parallelism.
+                        format: int64
+                        type: integer
+                      enabled:
+                        description: Whether kopia's epoch manager is enabled on this repository at all.
+                        type: boolean
+                      minDuration:
+                        description: Observed minimum epoch age, as a Go-style duration.
+                        type: string
+                      refreshFrequency:
+                        description: Observed epoch-state refresh frequency, as a Go-style duration.
+                        type: string
+                    required:
+                    - advanceOnCount
+                    - advanceOnSizeMiB
+                    - checkpointFrequency
+                    - cleanupSafetyMargin
+                    - deleteParallelism
+                    - enabled
+                    - minDuration
+                    - refreshFrequency
+                    type: object
+                type: object
               phase:
                 description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:

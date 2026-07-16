@@ -38,6 +38,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `mode` | enum: ReadWrite \| ReadOnly | `ReadWrite` | Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only). |
 | `moverDefaults` | [object](#repository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
+| `parameters` | [object](#repository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
 | `scheduleDefaults` | [object](#repository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
 | `server` | [object](#repository-spec-server) | — | Optional kopia web-UI server, exposed via a `Service` in this namespace. |
 | `suspend` | boolean | — | Pause this repository: skip connect/bootstrap and maintenance projection. |
@@ -510,6 +511,23 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
 | `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
+#### `spec.parameters` { #repository-spec-parameters }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `epoch` | [object](#repository-spec-parameters-epoch) | — | Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index blobs get compacted. |
+
+##### `spec.parameters.epoch` { #repository-spec-parameters-epoch }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+
 #### `spec.scheduleDefaults` { #repository-spec-scheduledefaults }
 
 | Field | Type | Default | Description |
@@ -575,6 +593,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `health` | [object](#repository-status-health) | — | Backend health-probe state (`spec.health.probe`), when enabled. |
 | `lastReverifyAt` | string | — | Last reverify-request token honored from a `Snapshot`'s re-probe nudge (RFC3339); the loop guard that keeps each request a one-shot. |
 | `observedGeneration` | integer | — | `metadata.generation` of the `spec` last reconciled; drives staleness detection. |
+| `parameters` | [object](#repository-status-parameters) | — | The kopia repository parameters actually observed at the last bootstrap. Compare against `spec.parameters` to see whether a declared value landed. |
 | `phase` | enum: Pending \| Initializing \| Ready \| Degraded \| Failed | — | Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`. |
 | `resolvedCredentialVersion` | string | — | `resourceVersion` of the password Secret observed at the last connect attempt. |
 | `server` | [object](#repository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
@@ -608,6 +627,25 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `firstFailureAt` | string | — | RFC 3339 timestamp of the first failure in the current failing streak. |
 | `lastHealthyAt` | string | — | RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present). |
 | `lastProbeAt` | string | — | RFC 3339 timestamp of the last completed probe (success or failure); drives the `health_probe_due` timer so the probe re-fires on cadence. |
+
+#### `status.parameters` { #repository-status-parameters }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `epoch` | [object](#repository-status-parameters-epoch) | — | The epoch parameters the repository reports. |
+
+##### `status.parameters.epoch` { #repository-status-parameters-epoch }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
+| `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
+| `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |
+| `enabled` | boolean | **required** | Whether kopia's epoch manager is enabled on this repository at all. |
+| `minDuration` | string | **required** | Observed minimum epoch age, as a Go-style duration. |
+| `refreshFrequency` | string | **required** | Observed epoch-state refresh frequency, as a Go-style duration. |
 
 #### `status.server` { #repository-status-server }
 
@@ -659,6 +697,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `mode` | enum: ReadWrite \| ReadOnly | `ReadWrite` | Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only). |
 | `moverDefaults` | [object](#clusterrepository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
+| `parameters` | [object](#clusterrepository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
 | `scheduleDefaults` | [object](#clusterrepository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
 | `server` | [object](#clusterrepository-spec-server) | — | Optional kopia web-UI server (the target `namespace` is required). |
 | `suspend` | boolean | — | Pause this cluster repository: skip connect/bootstrap and maintenance projection. |
@@ -1147,6 +1186,23 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 | `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
 | `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
+#### `spec.parameters` { #clusterrepository-spec-parameters }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `epoch` | [object](#clusterrepository-spec-parameters-epoch) | — | Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index blobs get compacted. |
+
+##### `spec.parameters.epoch` { #clusterrepository-spec-parameters-epoch }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+
 #### `spec.scheduleDefaults` { #clusterrepository-spec-scheduledefaults }
 
 | Field | Type | Default | Description |
@@ -1214,6 +1270,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `health` | [object](#clusterrepository-status-health) | — | Backend health-probe state (`spec.health.probe`), when enabled. |
 | `lastReverifyAt` | string | — | Last reverify-request token honored from a `Snapshot`'s re-probe nudge (RFC3339); the loop guard that keeps each request a one-shot. |
 | `observedGeneration` | integer | — | `metadata.generation` of the `spec` last reconciled; drives staleness detection. |
+| `parameters` | [object](#clusterrepository-status-parameters) | — | The kopia repository parameters actually observed at the last bootstrap. Compare against `spec.parameters` to see whether a declared value landed. |
 | `phase` | enum: Pending \| Initializing \| Ready \| Degraded \| Failed | — | Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`. |
 | `resolvedCredentialVersion` | string | — | `resourceVersion` of the password Secret observed at the last connect attempt. |
 | `server` | [object](#clusterrepository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
@@ -1247,6 +1304,25 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `firstFailureAt` | string | — | RFC 3339 timestamp of the first failure in the current failing streak. |
 | `lastHealthyAt` | string | — | RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present). |
 | `lastProbeAt` | string | — | RFC 3339 timestamp of the last completed probe (success or failure); drives the `health_probe_due` timer so the probe re-fires on cadence. |
+
+#### `status.parameters` { #clusterrepository-status-parameters }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `epoch` | [object](#clusterrepository-status-parameters-epoch) | — | The epoch parameters the repository reports. |
+
+##### `status.parameters.epoch` { #clusterrepository-status-parameters-epoch }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
+| `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
+| `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |
+| `enabled` | boolean | **required** | Whether kopia's epoch manager is enabled on this repository at all. |
+| `minDuration` | string | **required** | Observed minimum epoch age, as a Go-style duration. |
+| `refreshFrequency` | string | **required** | Observed epoch-state refresh frequency, as a Go-style duration. |
 
 #### `status.server` { #clusterrepository-status-server }
 

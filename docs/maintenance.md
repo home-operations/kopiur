@@ -224,6 +224,51 @@ spec:
     indexBlobWarnThreshold: 500   # warn sooner than the default 1000
 ```
 
+### When maintenance is running and the count still won't fall
+
+Raising the threshold hides the warning; it doesn't compact anything, and it has no effect on kopia's own hard-coded "Found too many index blobs" message or on how long your movers take to connect. If maintenance is demonstrably running and the count is still stuck in the thousands, the cause is usually kopia's **epoch-advance gate**, and no maintenance schedule can fix it.
+
+kopia cannot compact an index blob until its **epoch** closes. An epoch may only close once it is older than `MinEpochDuration` — **24h by default** — no matter how many blobs accumulate inside it, and compaction then trails two epochs behind. So a fleet producing, say, ~60 index blobs an hour is forced to ~1700 blobs before an epoch may close, and permanently carries 1700–3400 uncompacted blobs. Compaction pace was never the bottleneck; the 24h floor is.
+
+`spec.parameters.epoch` exposes that gate on both `Repository` and `ClusterRepository`:
+
+```yaml
+spec:
+  parameters:
+    epoch:
+      minDuration: 6h   # kopia's default is 24h
+```
+
+Every field is optional and kopiur has no defaults of its own — **absent means "leave kopia's current value alone"**, so a repository that declares nothing here is completely unaffected. Applying a change rewrites the repository's format blob, which invalidates other kopia clients' cached copy of it (they re-read within ~15 minutes), so kopiur calls `set-parameters` **only when the declared values actually differ** from what the repository reports.
+
+Check what landed under `status.parameters.epoch` — it reports what the *repository* says, not what you asked for, so a value that failed to apply shows as a mismatch rather than as silence:
+
+```console
+$ kubectl get repository primary -o jsonpath='{.status.parameters.epoch}' | jq
+{
+  "enabled": true,
+  "minDuration": "6h",
+  "refreshFrequency": "20m",
+  "cleanupSafetyMargin": "4h",
+  "advanceOnCount": 20,
+  "advanceOnSizeMiB": 10,
+  "checkpointFrequency": 7,
+  "deleteParallelism": 4
+}
+```
+
+The full field set, plus the sharp edges:
+
+```yaml
+--8<-- "deploy/examples/33-repository-epoch-parameters.yaml"
+```
+
+Three things worth knowing:
+
+- **Removing a value does not restore kopia's default.** Under "absent means don't touch", deleting `minDuration` from your manifest leaves the repository at 6h forever. Set it back explicitly if you want 24h again.
+- **`mode: ReadOnly` repositories cannot declare parameters.** `set-parameters` is a repository-wide write and kopia refuses it on a read-only connection, so the combination is rejected at admission. In a multi-cluster layout, declare them on the cluster that owns the repository — they describe the repository, not each consumer. Two clusters declaring *different* values for one repository will fight over it.
+- **`cleanupSafetyMargin` is reported but not settable.** It is the grace window that stops kopia deleting index blobs a concurrent writer still needs, and there is no safe generic advice for lowering it.
+
 /// warning | A high index-blob count means maintenance isn't running
 
 The warning is a symptom; the fix is to get maintenance compacting again. Check that a `Maintenance` exists and is `Ready`, that it isn't yielding (`LeaseOwned=False`, reason `LeaseHeldByOther`), and that its owner is the stable lease owner — not an ephemeral `…-bootstrap-…` identity. The operator self-heals a stale owner on the next bootstrap; to recover **now**, set `spec.maintenance.takeoverPolicy: Force` once. Raising or zeroing `indexBlobWarnThreshold` only silences the warning — it does not compact the index.

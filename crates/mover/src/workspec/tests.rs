@@ -293,6 +293,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             auto_create: true,
             scan_catalog: true,
             create_options: Default::default(),
+            epoch_parameters: Default::default(),
             maintenance_owner: Some("kopiur@kopiur-ns-repo".into()),
             catalog_foreign_prefilter_cluster: Some("east".into()),
             restamp_policy: RestampPolicy::OwnFormatsOnly,
@@ -361,6 +362,10 @@ fn bootstrap_repository_old_wire_json_without_the_prefilter_field_still_decodes(
     assert_eq!(parsed.restamp_policy, RestampPolicy::AnyStale);
     assert!(parsed.maintenance_owner_aliases.is_empty());
     assert!(!parsed.read_only);
+    // #258 compat: a work spec written before spec.parameters existed carries no
+    // epochParameters key, and must decode to "declare nothing" — NOT to a set of
+    // defaults that would then be applied to the repository.
+    assert!(parsed.epoch_parameters.is_empty());
 }
 
 #[test]
@@ -372,6 +377,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         auto_create: true,
         scan_catalog: true,
         create_options: Default::default(),
+        epoch_parameters: Default::default(),
         maintenance_owner: None,
         catalog_foreign_prefilter_cluster: None,
         restamp_policy: RestampPolicy::AnyStale,
@@ -381,6 +387,9 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     let v = serde_json::to_value(&op).unwrap();
     assert!(v.get("maintenanceOwnerAliases").is_none());
     assert!(v.get("readOnly").is_none());
+    // #258: same contract. A repository that declares no spec.parameters must put no
+    // epochParameters key on the wire at all.
+    assert!(v.get("epochParameters").is_none());
     // restampPolicy has no `skip_serializing_if` (it's not carried as absent
     // vs. present the way an Option/Vec is) — it always serializes, but at its
     // default value, which an old mover that has never heard of the key
@@ -1539,4 +1548,149 @@ fn restamp_target_decision_table() {
         None,
         "ephemeral x OwnFormatsOnly"
     );
+}
+
+// --- #258: epoch parameter drift ------------------------------------------
+
+/// kopia's observed defaults, straight from `crates/kopia/tests/fixtures/repository_status.json`.
+fn observed_defaults() -> kopiur_kopia::model::EpochParameters {
+    kopiur_kopia::model::EpochParameters {
+        enabled: true,
+        min_epoch_duration_ns: 86_400_000_000_000, // 24h
+        epoch_refresh_frequency_ns: 1_200_000_000_000, // 20m
+        cleanup_safety_margin_ns: 14_400_000_000_000, // 4h
+        advance_on_count: 20,
+        advance_on_total_size_bytes: 10_485_760, // 10 MiB
+        checkpoint_frequency: 7,
+        delete_parallelism: 4,
+    }
+}
+
+#[test]
+fn epoch_drift_is_none_when_nothing_is_declared() {
+    // The inert case, and the one that matters most: a repository that never mentions
+    // spec.parameters must never trigger set-parameters — which invalidates every other
+    // kopia client's cached format blob.
+    let desired = EpochParametersSpec::default();
+    assert!(desired.is_empty());
+    assert!(epoch_drift(&desired, Some(&observed_defaults())).is_none());
+    assert!(epoch_drift(&desired, None).is_none());
+}
+
+#[test]
+fn epoch_drift_is_none_when_the_declared_values_already_match() {
+    // Converged: declaring kopia's current values must be a no-op, not a re-apply on
+    // every single bootstrap.
+    let desired = EpochParametersSpec {
+        min_duration: Some("24h".into()),
+        refresh_frequency: Some("20m".into()),
+        advance_on_count: Some(20),
+        advance_on_size_mb: Some(10),
+        checkpoint_frequency: Some(7),
+        delete_parallelism: Some(4),
+    };
+    assert!(
+        epoch_drift(&desired, Some(&observed_defaults())).is_none(),
+        "declaring exactly what the repository already reports is not drift"
+    );
+}
+
+#[test]
+fn epoch_drift_compares_durations_by_value_not_by_string() {
+    // "24h", "1440m" and "86400s" are the same parameter. A string compare would report
+    // drift forever and re-apply on every bootstrap — the fleet-wide reconnect churn this
+    // whole drift check exists to avoid.
+    for equivalent in ["24h", "1440m", "86400s", "86400"] {
+        let desired = EpochParametersSpec {
+            min_duration: Some(equivalent.into()),
+            ..Default::default()
+        };
+        assert!(
+            epoch_drift(&desired, Some(&observed_defaults())).is_none(),
+            "{equivalent:?} is 24h and must not read as drift"
+        );
+    }
+}
+
+#[test]
+fn epoch_drift_emits_only_the_parameters_that_actually_differ() {
+    // The reporter's fix: 24h -> 6h, everything else left alone.
+    let desired = EpochParametersSpec {
+        min_duration: Some("6h".into()),
+        refresh_frequency: Some("20m".into()), // already matches
+        advance_on_count: Some(20),            // already matches
+        ..Default::default()
+    };
+    let args = epoch_drift(&desired, Some(&observed_defaults())).expect("minDuration drifted");
+    assert_eq!(args.epoch_min_duration.as_deref(), Some("6h"));
+    assert_eq!(
+        args.epoch_refresh_frequency, None,
+        "a converged parameter must not be re-sent"
+    );
+    assert_eq!(args.epoch_advance_on_count, None);
+    assert_eq!(args.args(), vec!["--epoch-min-duration", "6h"]);
+}
+
+#[test]
+fn epoch_drift_converts_the_size_threshold_in_mebibytes() {
+    // kopia reports BYTES; the flag is named `-mb` and means MiB. 10485760 == 10 MiB, so
+    // declaring 10 is converged. Dividing by 1e6 would read 10485760 as ~10.49 and report
+    // drift every time, re-applying forever.
+    let converged = EpochParametersSpec {
+        advance_on_size_mb: Some(10),
+        ..Default::default()
+    };
+    assert!(epoch_drift(&converged, Some(&observed_defaults())).is_none());
+
+    let changed = EpochParametersSpec {
+        advance_on_size_mb: Some(32),
+        ..Default::default()
+    };
+    let args = epoch_drift(&changed, Some(&observed_defaults())).expect("size drifted");
+    assert_eq!(args.epoch_advance_on_size_mb, Some(32));
+}
+
+#[test]
+fn epoch_drift_applies_everything_when_nothing_was_observed() {
+    // Older kopia, or a status we could not read: apply what is declared rather than skip.
+    // set-parameters is idempotent, so re-applying a converged value is harmless; silently
+    // never applying a declared one is not.
+    let desired = EpochParametersSpec {
+        min_duration: Some("6h".into()),
+        advance_on_count: Some(50),
+        ..Default::default()
+    };
+    let args = epoch_drift(&desired, None).expect("no observation ⇒ apply the declaration");
+    assert_eq!(args.epoch_min_duration.as_deref(), Some("6h"));
+    assert_eq!(args.epoch_advance_on_count, Some(50));
+}
+
+#[test]
+fn epoch_parameters_spec_renders_durations_for_kopias_cli() {
+    // kopia REJECTS a bare number (`--epoch-min-duration=3600` → "missing unit"), while
+    // kopiur's parse_go_duration accepts one. Rendering at the boundary is what stops the
+    // webhook admitting a value the mover then dies on.
+    let api = kopiur_api::repository::EpochParameters {
+        min_duration: Some("3600".into()),
+        refresh_frequency: Some("20m".into()),
+        ..Default::default()
+    };
+    let spec = EpochParametersSpec::from_api(&api);
+    assert_eq!(spec.min_duration.as_deref(), Some("1h"));
+    assert_eq!(spec.refresh_frequency.as_deref(), Some("20m"));
+}
+
+#[test]
+fn observed_epoch_renders_nanoseconds_back_to_go_durations() {
+    // status.parameters.epoch must be directly comparable to spec.parameters.epoch, so the
+    // mirror renders kopia's nanoseconds through the same grammar the spec is written in.
+    let o = observed_epoch(&observed_defaults());
+    assert!(o.enabled);
+    assert_eq!(o.min_duration, "24h");
+    assert_eq!(o.refresh_frequency, "20m");
+    assert_eq!(o.cleanup_safety_margin, "4h");
+    assert_eq!(o.advance_on_count, 20);
+    assert_eq!(o.advance_on_size_mb, 10, "bytes → MiB");
+    assert_eq!(o.checkpoint_frequency, 7);
+    assert_eq!(o.delete_parallelism, 4);
 }

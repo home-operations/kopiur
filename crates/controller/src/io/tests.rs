@@ -2136,6 +2136,7 @@ mod bootstrap_outcomes {
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
             index_blob_count: None,
+            epoch: None,
             failure: None,
         }
     }

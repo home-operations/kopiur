@@ -92,3 +92,46 @@ fn tolerates_unknown_fields() {
     assert_eq!(r.id, "x");
     assert_eq!(r.total_bytes(), 0); // no rootEntry → defaults
 }
+
+/// The epoch parameters kopia 0.23 actually reports (#258). This block is the one place in
+/// `model.rs` that does NOT follow the crate's `rename_all = "camelCase"` convention —
+/// kopia serializes the Go struct's field names verbatim, with no consistent rule between
+/// them — so the per-field renames are exactly what this pins.
+#[test]
+fn parse_repository_status_epoch_parameters() {
+    let s: RepositoryStatus = serde_json::from_str(REPOSITORY_STATUS).unwrap();
+    let e = s
+        .content_format
+        .epoch_parameters
+        .expect("kopia 0.23 reports contentFormat.epochParameters");
+
+    assert!(e.enabled);
+    // Durations are Go time.Duration NANOSECONDS, not seconds or millis.
+    assert_eq!(
+        e.min_epoch_duration_ns, 86_400_000_000_000,
+        "kopia's 24h default — the advance gate #258 is about"
+    );
+    assert_eq!(e.epoch_refresh_frequency_ns, 1_200_000_000_000, "20m");
+    assert_eq!(e.cleanup_safety_margin_ns, 14_400_000_000_000, "4h");
+    assert_eq!(e.advance_on_count, 20);
+    assert_eq!(e.checkpoint_frequency, 7);
+    assert_eq!(e.delete_parallelism, 4);
+    // The size threshold is reported in BYTES while the flag that sets it is named
+    // `--epoch-advance-on-size-mb` and means MiB. 10485760 == 10 * 1024 * 1024 — proof
+    // the conversion is 1048576, not 1e6. Dividing by the wrong constant makes the drift
+    // comparison never converge, re-running set-parameters on every bootstrap forever.
+    assert_eq!(e.advance_on_total_size_bytes, 10_485_760);
+    assert_eq!(e.advance_on_total_size_bytes / (1024 * 1024), 10);
+}
+
+/// A pre-epoch (or trimmed) status must still parse — `epochParameters` is `Option`, and a
+/// serde error here would take down the whole bootstrap.
+#[test]
+fn repository_status_without_epoch_parameters_still_parses() {
+    let s: RepositoryStatus = serde_json::from_str(
+        r#"{"configFile":"/c","uniqueIDHex":"ab","clientOptions":{},"storage":{},
+            "contentFormat":{"hash":"BLAKE2B-256-128","encryption":"AES256-GCM-HMAC-SHA256","version":1}}"#,
+    )
+    .unwrap();
+    assert!(s.content_format.epoch_parameters.is_none());
+}
