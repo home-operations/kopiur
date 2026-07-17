@@ -15,13 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kopiur_api::Snapshot;
-use kopiur_api::common::{RepositoryKind, RepositoryRef};
+use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
 use kopiur_mover::workspec::SnapshotAnchor;
 use kube::{Resource, ResourceExt};
 
 use super::plan::{
     BreakerState, DeletionFacts, DeletionPlan, OwnerState, effective_deletion_policy,
-    effective_on_schedule_delete, plan_deletion, pruned_by, resolve_origin,
+    effective_on_schedule_delete, pinned_repository, plan_deletion, pruned_by, resolve_origin,
+    schedule_owner_ref,
 };
 
 /// Stable per-repo key from the `status.resolved.repository` pin:
@@ -74,6 +75,20 @@ pub struct PendingMember {
     pub external: bool,
     /// The CR's `metadata.deletionTimestamp`, converted to `chrono`.
     pub deletion_timestamp: chrono::DateTime<chrono::Utc>,
+    /// Whether the CR carries a `status.resolved.repository` pin (pre-#255 CRs
+    /// have none). The COUNTING set treats a pin-less CR as matching EVERY key
+    /// (over-count is fail-safe; see [`repo_matches`]); the FIRE set uses this
+    /// to enroll a pin-less PEER into NO repository's batch — only its own
+    /// self-fire, whose live repo resolution is authoritative, drains it
+    /// ([`fire_eligible`], IMPORTANT-4).
+    pub pinned: bool,
+    /// Whether the CR carries a `SnapshotSchedule` controller ownerRef
+    /// ([`schedule_owner_ref`]). The FIRE set drops a schedule-OWNED peer while
+    /// the schedule reflector store is unsynced (its owner state defaults to
+    /// `Alive`, turning the cascade guard off — a cascade-retain child would
+    /// look fireable); it stays in the COUNTING set regardless
+    /// ([`fire_eligible`], IMPORTANT-3a).
+    pub schedule_owned: bool,
 }
 
 /// The `Snapshot`'s `metadata.deletionTimestamp`, converted from the
@@ -183,6 +198,8 @@ fn pending_member_for(
         anchor: anchor_for(backup),
         external: pruned_by(backup.annotations()).is_none(),
         deletion_timestamp,
+        pinned: pinned_repository(backup).is_some(),
+        schedule_owned: schedule_owner_ref(backup).is_some(),
     })
 }
 
@@ -230,6 +247,140 @@ pub const MAX_BATCH_MEMBERS: usize = 200;
 /// How long a burst of pending deletions is allowed to accumulate before it
 /// fires (bounded latency vs. bounded batching — small bursts still coalesce).
 pub const BATCH_QUIET_WINDOW: Duration = Duration::from_secs(10);
+
+/// Everything the FIRE-eligibility filter ([`fire_eligible`]) needs, all pure.
+///
+/// The counting set ([`pending_members`]) is maximally INCLUSIVE — over-count
+/// trips the breaker EARLIER, and an extra candidate is still gated downstream,
+/// so over-counting is the fail-safe direction there. The FIRE set is the polar
+/// opposite: maximally EXCLUSIVE. An excluded member is not deleted this pass; it
+/// merely requeues and is retried (draining via its OWN reconcile's self-fire, or
+/// once the excluding condition clears), so UNDER-firing is the fail-safe
+/// direction here. Every field below narrows the FIRE set past the counting set.
+pub struct FireEligibility<'a> {
+    /// The triggering CR's uid. It is ALWAYS fireable: the finalizer path
+    /// ([`super::handle_deletion`]) already authorized it with LIVE fallbacks
+    /// (its owner/breaker/namespace state resolved authoritatively, not from a
+    /// possibly-cold store), and the repo the batch targets IS its own live
+    /// resolution. The exclusions below therefore apply only to PEERS swept in
+    /// by the inclusive counting set.
+    pub self_uid: &'a str,
+    /// The repository's mass-deletion breaker threshold (`0` disables it).
+    pub threshold: u32,
+    /// The repository's `allow-mass-deletion` ack, parsed + clock-skew-clamped
+    /// exactly as the breaker does ([`super::plan::parse_mass_deletion_ack`]).
+    pub ack: Option<chrono::DateTime<chrono::Utc>>,
+    /// The repository's namespace-deletion cascade policy — a terminating-
+    /// namespace peer is fireable ONLY under `Delete`.
+    pub on_namespace_delete: NamespaceDeletePolicy,
+    /// The member namespaces observed TERMINATING at fire time (resolved once
+    /// per distinct namespace by the caller). A namespace whose terminating-ness
+    /// could not be read is treated as terminating here — fail-safe UNDER-fire.
+    pub terminating_namespaces: &'a HashSet<String>,
+    /// Whether the `SnapshotSchedule` reflector store is synced. While `false`,
+    /// a schedule-owned EXTERNAL peer is excluded (its owner state would default
+    /// to `Alive`, disabling the cascade guard).
+    pub schedule_synced: bool,
+}
+
+/// The FIRE set: the subset of the inclusive `pending` (counting) set that this
+/// reconcile may actually enroll into a new batch Job. Maximally EXCLUSIVE
+/// (fail-safe = under-fire) — the four review findings, one pass:
+///
+/// - CRITICAL-1: while the breaker is TRIPPING (`threshold > 0 && unacked >=
+///   threshold`, counted over the FULL pending set), a HELD external peer
+///   (`external && deletion_timestamp > ack`) is excluded — a breaker-exempt
+///   trigger (an operator prune, or an acked older wave) must never drain the
+///   held wave's kopia data without an ack.
+/// - IMPORTANT-2: a peer whose namespace is terminating is excluded unless the
+///   repository's `onNamespaceDelete` is `Delete` (an `Orphan`-destined member
+///   plans `OrphanSnapshot` on its own reconcile — never delete it here).
+/// - IMPORTANT-3a: while the schedule store is unsynced, a schedule-owned
+///   EXTERNAL peer is excluded (cascade-retain-destined children would look
+///   fireable when the owner lookup defaults to `Alive`).
+/// - IMPORTANT-4: a pin-less PEER is excluded — the counting set matches it to
+///   EVERY repo key, but its `{snapshot_id, anchor}` must not ride an UNRELATED
+///   repo's batch (against a replication TARGET that deletes the replica).
+///
+/// The triggering `self_uid` bypasses every exclusion (see [`FireEligibility`]).
+pub fn fire_eligible(pending: Vec<PendingMember>, cx: &FireEligibility<'_>) -> Vec<PendingMember> {
+    // Whether the breaker is tripping is decided over the FULL (inclusive)
+    // pending set — before any fire-path narrowing — so a peer's held-ness is
+    // judged against the same total the breaker itself would see.
+    let unacked = unacked_breaker_count(&pending, cx.ack);
+    let breaker_tripping = cx.threshold > 0 && unacked >= cx.threshold as usize;
+    pending
+        .into_iter()
+        .filter(|m| {
+            m.uid == cx.self_uid
+                || (fire_pin_ok(m)
+                    && fire_schedule_ok(m, cx.schedule_synced)
+                    && fire_namespace_ok(m, cx.terminating_namespaces, cx.on_namespace_delete)
+                    && fire_breaker_ok(m, breaker_tripping, cx.ack))
+        })
+        .collect()
+}
+
+/// IMPORTANT-4: a pin-less PEER enrolls into NO repo's batch (only its own
+/// self-fire, whose live resolution is authoritative, drains it).
+fn fire_pin_ok(m: &PendingMember) -> bool {
+    m.pinned
+}
+
+/// IMPORTANT-3a: exclude a schedule-owned EXTERNAL peer while the schedule store
+/// is unsynced. A PRUNE bypasses the cascade guard entirely (owner state is
+/// irrelevant to it), so it is never withheld here — retention must keep working
+/// even during the store's startup window.
+fn fire_schedule_ok(m: &PendingMember, schedule_synced: bool) -> bool {
+    schedule_synced || !m.external || !m.schedule_owned
+}
+
+/// IMPORTANT-2: a terminating-namespace peer is fireable only under
+/// `onNamespaceDelete: Delete`. Exhaustive over [`NamespaceDeletePolicy`] so a
+/// new policy variant cannot compile until its fire-eligibility is decided.
+fn fire_namespace_ok(
+    m: &PendingMember,
+    terminating: &HashSet<String>,
+    policy: NamespaceDeletePolicy,
+) -> bool {
+    if !terminating.contains(&m.namespace) {
+        return true;
+    }
+    match policy {
+        NamespaceDeletePolicy::Delete => true,
+        NamespaceDeletePolicy::Orphan => false,
+    }
+}
+
+/// CRITICAL-1: while the breaker is tripping, a HELD external peer is excluded.
+/// A member is NOT held iff it is a prune (`!external`) or acknowledged
+/// (`deletion_timestamp <= ack`). Below threshold (or threshold 0) nothing is
+/// excluded — sub-threshold externals were always allowed.
+fn fire_breaker_ok(
+    m: &PendingMember,
+    breaker_tripping: bool,
+    ack: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if !breaker_tripping {
+        return true;
+    }
+    !m.external || ack.is_some_and(|a| m.deletion_timestamp <= a)
+}
+
+/// Whether an authoritative bounded (`limit=1`) `SnapshotSchedule` LIST proves
+/// the reflector store *trivially* synced. The fire-path schedule exclusion
+/// (IMPORTANT-3a) is released by [`super::Context::mark_schedule_synced`], flipped
+/// from a SnapshotSchedule reconcile — which NEVER runs on a cluster with zero
+/// SnapshotSchedules. An empty authoritative LIST proves there is nothing for the
+/// store to be behind on, so the flag can be flipped at startup:
+///
+/// - `Some(0)` (empty cluster) ⇒ flip.
+/// - `Some(n > 0)` ⇒ don't (a reconcile will flip it).
+/// - `None` (the LIST failed) ⇒ don't — leave it unsynced (fail-safe: never read
+///   a cold store as "no schedule owners").
+pub fn empty_schedule_list_proves_synced(item_count: Option<usize>) -> bool {
+    item_count == Some(0)
+}
 
 /// The subset of `pending` eligible for a NEW batch: excludes any UID already
 /// `covered` by a non-FAILED batch Job ([`covered_uids`] — LIVE or SUCCEEDED). THE
@@ -430,19 +581,33 @@ pub enum MemberDisposition {
 /// preferred to reporting failure. A UID in no Job is `NotAMember`, carrying
 /// whether any live batch exists for the repo.
 pub fn member_disposition(this_uid: &str, jobs: &[BatchJobView]) -> MemberDisposition {
-    let covering = |state: BatchJobState| {
-        jobs.iter()
-            .any(|j| j.state == state && j.members.iter().any(|u| u == this_uid))
-    };
-    if covering(BatchJobState::Succeeded) {
+    // Fold every covering Job's state via an EXHAUSTIVE match over
+    // `BatchJobState` (no `==`/`matches!` that would silently ignore a future
+    // variant): a new state cannot compile until its coverage is decided here.
+    let (mut succeeded, mut live, mut failed, mut any_live) = (false, false, false, false);
+    for j in jobs {
+        let covers = j.members.iter().any(|u| u == this_uid);
+        match j.state {
+            BatchJobState::Succeeded => succeeded |= covers,
+            BatchJobState::Live => {
+                live |= covers;
+                any_live = true;
+            }
+            BatchJobState::Failed => failed |= covers,
+        }
+    }
+    // Fail-safe precedence: SUCCEEDED (delete confirmed) > LIVE (retry in flight)
+    // > FAILED (needs another wave) — so the finalizer releases ONLY on a
+    // confirmed success and a live retry is preferred to reporting failure.
+    if succeeded {
         MemberDisposition::SucceededMember
-    } else if covering(BatchJobState::Live) {
+    } else if live {
         MemberDisposition::LiveMember
-    } else if covering(BatchJobState::Failed) {
+    } else if failed {
         MemberDisposition::FailedMember
     } else {
         MemberDisposition::NotAMember {
-            live_batch_exists: jobs.iter().any(|j| j.state == BatchJobState::Live),
+            live_batch_exists: any_live,
         }
     }
 }
@@ -464,10 +629,19 @@ pub fn member_disposition(this_uid: &str, jobs: &[BatchJobView]) -> MemberDispos
 /// FAILED job (or none), so a genuine retry is never blocked. Derived from the SAME
 /// LIST [`member_disposition`] reads, so the two can never disagree.
 pub fn covered_uids(jobs: &[BatchJobView]) -> HashSet<String> {
-    jobs.iter()
-        .filter(|j| matches!(j.state, BatchJobState::Live | BatchJobState::Succeeded))
-        .flat_map(|j| j.members.iter().cloned())
-        .collect()
+    let mut covered = HashSet::new();
+    for j in jobs {
+        // EXHAUSTIVE over `BatchJobState` (not `matches!`): a new terminal state
+        // must decide here whether it covers its members, never fall through.
+        let covers = match j.state {
+            BatchJobState::Live | BatchJobState::Succeeded => true,
+            BatchJobState::Failed => false,
+        };
+        if covers {
+            covered.extend(j.members.iter().cloned());
+        }
+    }
+    covered
 }
 
 /// A terminal batch Job the dispatcher should reap, and which whole-Job outcome
@@ -478,6 +652,13 @@ pub struct ReapTarget {
     pub name: String,
     /// The metric to bump — the ONLY place a whole-Job outcome is counted.
     pub outcome: crate::metrics::BatchJobOutcome,
+    /// The reaped Job's member count. For a FAILED Job this is the single point
+    /// where `kopiur_snapshot_delete_batch_members{outcome="failed"}` is emitted
+    /// (once, for every member of the reaped failed Job) — a failed member never
+    /// drains its own finalizer, so it has no per-member emission site of its own
+    /// (a SUCCEEDED Job's members each emit `deleted` as they drain, so this
+    /// count is unused for that outcome).
+    pub members: usize,
 }
 
 /// A failed batch Job is reaped once it has been terminal this long — a bounded
@@ -516,6 +697,7 @@ pub fn reap_targets(
                 .then(|| ReapTarget {
                     name: j.name.clone(),
                     outcome: crate::metrics::BatchJobOutcome::Succeeded,
+                    members: j.members.len(),
                 }),
             BatchJobState::Failed => j
                 .terminal_at
@@ -527,6 +709,7 @@ pub fn reap_targets(
                 .then(|| ReapTarget {
                     name: j.name.clone(),
                     outcome: crate::metrics::BatchJobOutcome::Failed,
+                    members: j.members.len(),
                 }),
         })
         .collect()
@@ -683,6 +866,40 @@ mod tests {
         assert_eq!(members[0].name, "a");
         assert_eq!(members[0].snapshot_id, "k-a");
         assert!(members[0].external);
+        assert!(members[0].pinned, "a repo-pinned CR is `pinned`");
+        assert!(
+            !members[0].schedule_owned,
+            "the fixture has no SnapshotSchedule ownerRef"
+        );
+    }
+
+    #[test]
+    fn pending_members_flags_schedule_owned_from_the_owner_ref() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let mut backup = member_fixture(
+            "a",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        backup.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: crate::consts::API_VERSION.to_string(),
+            kind: "SnapshotSchedule".to_string(),
+            name: "nightly".to_string(),
+            uid: "sched-uid".to_string(),
+            controller: Some(true),
+            ..Default::default()
+        }]);
+        let members = pending_members(&[Arc::new(backup)], KEY, alive);
+        assert_eq!(members.len(), 1);
+        assert!(
+            members[0].schedule_owned,
+            "a SnapshotSchedule controller ownerRef sets `schedule_owned`"
+        );
     }
 
     #[test]
@@ -813,7 +1030,12 @@ mod tests {
             true,
             None,
         ));
-        assert_eq!(pending_members(&[Arc::clone(&s)], KEY, alive).len(), 1);
+        let matched = pending_members(&[Arc::clone(&s)], KEY, alive);
+        assert_eq!(matched.len(), 1);
+        assert!(
+            !matched[0].pinned,
+            "an unpinned CR is `pinned: false` — the FIRE set excludes it as a peer"
+        );
         assert_eq!(
             pending_members(&[s], "clusterrepository:other", alive).len(),
             1
@@ -831,6 +1053,12 @@ mod tests {
             anchor: SnapshotAnchor::default(),
             external: true,
             deletion_timestamp: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            // Defaults for the pre-existing (non-fire-eligibility) tests: a
+            // pinned, non-schedule-owned member matches the repo key and passes
+            // the pin/schedule fire-path filters. `fire_eligible` tests below
+            // override these per case.
+            pinned: true,
+            schedule_owned: false,
         }
     }
 
@@ -841,6 +1069,249 @@ mod tests {
         let fireable = fireable_members(pending, &covered);
         let uids: Vec<&str> = fireable.iter().map(|m| m.uid.as_str()).collect();
         assert_eq!(uids, vec!["a", "c"]);
+    }
+
+    // --- fire_eligible (the exclusive FIRE set; count stays inclusive) --------
+
+    /// A `PendingMember` with every fire-eligibility-relevant flag set explicitly.
+    #[allow(clippy::too_many_arguments)]
+    fn fmember(
+        uid: &str,
+        ns: &str,
+        secs: i64,
+        external: bool,
+        pinned: bool,
+        schedule_owned: bool,
+    ) -> PendingMember {
+        PendingMember {
+            namespace: ns.into(),
+            name: uid.into(),
+            uid: uid.into(),
+            snapshot_id: format!("k-{uid}"),
+            anchor: SnapshotAnchor::default(),
+            external,
+            deletion_timestamp: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            pinned,
+            schedule_owned,
+        }
+    }
+
+    /// A `FireEligibility` with benign defaults: no breaker (threshold 0), no
+    /// ack, `Delete` ns policy, nothing terminating, schedule synced. Each test
+    /// perturbs exactly the axis it exercises.
+    fn fire_cx<'a>(self_uid: &'a str, terminating: &'a HashSet<String>) -> FireEligibility<'a> {
+        FireEligibility {
+            self_uid,
+            threshold: 0,
+            ack: None,
+            on_namespace_delete: NamespaceDeletePolicy::Delete,
+            terminating_namespaces: terminating,
+            schedule_synced: true,
+        }
+    }
+
+    /// The member UIDs of a FIRE set, sorted (set-identity, order-independent).
+    fn sorted_uids(members: Vec<PendingMember>) -> Vec<String> {
+        let mut u: Vec<String> = members.into_iter().map(|m| m.uid).collect();
+        u.sort();
+        u
+    }
+
+    #[test]
+    fn fire_eligible_excludes_held_externals_when_breaker_tripping() {
+        // THE flagship counterexample (CRITICAL-1): a breaker-exempt trigger — an
+        // operator PRUNE (`self`) — fires while a wave of external deletions is
+        // HELD. The held externals must NOT ride the prune's batch; only the
+        // prune members and any acked externals do.
+        let none = HashSet::new();
+        let cx = FireEligibility {
+            threshold: 2,
+            ..fire_cx("self-prune", &none)
+        };
+        let pending = vec![
+            fmember("self-prune", "media", 100, false, true, false), // trigger (prune)
+            fmember("prune-peer", "media", 100, false, true, false), // another prune
+            fmember("held-1", "media", 300, true, true, false),      // held external
+            fmember("held-2", "media", 400, true, true, false),      // held external
+        ];
+        // unacked externals = 2 (held-1, held-2) >= threshold 2 ⇒ tripping.
+        assert_eq!(unacked_breaker_count(&pending, None), 2);
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["prune-peer", "self-prune"],
+            "held externals must be excluded; prune members included"
+        );
+    }
+
+    #[test]
+    fn fire_eligible_includes_acked_externals_excludes_newer_unacked() {
+        // Stale-ack-inertia (CRITICAL-1): an ACKED older wave (its member is the
+        // trigger) must not drain a NEWER unacked wave. ack at t=200 releases the
+        // <=200 members; the >200 members are still held (>= threshold).
+        let none = HashSet::new();
+        let ack = chrono::DateTime::from_timestamp(200, 0);
+        let cx = FireEligibility {
+            threshold: 2,
+            ack,
+            ..fire_cx("acked-self", &none)
+        };
+        let pending = vec![
+            fmember("acked-self", "media", 100, true, true, false), // acked (<=200), trigger
+            fmember("acked-peer", "media", 200, true, true, false), // acked (<=200)
+            fmember("newer-1", "media", 300, true, true, false),    // unacked (>200)
+            fmember("newer-2", "media", 400, true, true, false),    // unacked (>200)
+        ];
+        assert_eq!(unacked_breaker_count(&pending, ack), 2); // newer-1, newer-2
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["acked-peer", "acked-self"],
+            "acked members fire; newer unacked wave excluded"
+        );
+    }
+
+    #[test]
+    fn fire_eligible_no_breaker_exclusion_below_threshold_or_disabled() {
+        let none = HashSet::new();
+        let pending = || {
+            vec![
+                fmember("self", "media", 100, true, true, false),
+                fmember("peer", "media", 200, true, true, false),
+            ]
+        };
+        // Below threshold (2 < 5): nothing excluded.
+        let below = FireEligibility {
+            threshold: 5,
+            ..fire_cx("self", &none)
+        };
+        assert_eq!(fire_eligible(pending(), &below).len(), 2);
+        // Threshold 0 (breaker disabled): nothing excluded, even at high count.
+        let disabled = FireEligibility {
+            threshold: 0,
+            ..fire_cx("self", &none)
+        };
+        assert_eq!(fire_eligible(pending(), &disabled).len(), 2);
+    }
+
+    #[test]
+    fn fire_eligible_excludes_unpinned_peers_keeps_unpinned_self() {
+        // IMPORTANT-4: an unpinned PEER (matches every key in the count) must not
+        // ride this repo's batch; the unpinned SELF (its live resolution IS this
+        // repo) always does.
+        let none = HashSet::new();
+        let cx = fire_cx("self", &none);
+        let pending = vec![
+            fmember("self", "media", 100, true, false, false), // unpinned trigger
+            fmember("pinned-peer", "media", 100, true, true, false),
+            fmember("unpinned-peer", "media", 100, true, false, false),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["pinned-peer", "self"]
+        );
+    }
+
+    #[test]
+    fn fire_eligible_excludes_terminating_orphan_peer_only() {
+        // IMPORTANT-2: a peer in a TERMINATING namespace is fireable only under
+        // `onNamespaceDelete: Delete`; under `Orphan` it is excluded (it plans
+        // OrphanSnapshot on its own reconcile). A non-terminating peer is always in.
+        let terminating: HashSet<String> = HashSet::from(["dying".to_string()]);
+        let pending = || {
+            vec![
+                fmember("self", "live", 100, true, true, false),
+                fmember("term-peer", "dying", 100, true, true, false),
+                fmember("live-peer", "live", 100, true, true, false),
+            ]
+        };
+        // Orphan: the terminating peer is dropped.
+        let orphan = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Orphan,
+            ..fire_cx("self", &terminating)
+        };
+        assert_eq!(
+            sorted_uids(fire_eligible(pending(), &orphan)),
+            vec!["live-peer", "self"]
+        );
+        // Delete: the terminating peer cascades and IS fireable.
+        let delete = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Delete,
+            ..fire_cx("self", &terminating)
+        };
+        assert_eq!(fire_eligible(pending(), &delete).len(), 3);
+    }
+
+    #[test]
+    fn fire_eligible_excludes_schedule_owned_external_peer_while_unsynced() {
+        // IMPORTANT-3a: while the schedule store is unsynced, a schedule-owned
+        // EXTERNAL peer is excluded (its owner lookup defaults to Alive). A
+        // schedule-owned PRUNE peer is NOT excluded (prunes bypass the cascade
+        // guard — retention must keep working during the startup window).
+        let none = HashSet::new();
+        let unsynced = FireEligibility {
+            schedule_synced: false,
+            ..fire_cx("self", &none)
+        };
+        let pending = vec![
+            fmember("self", "media", 100, true, true, false),
+            fmember("ext-owned", "media", 100, true, true, true), // external + schedule-owned
+            fmember("prune-owned", "media", 100, false, true, true), // prune + schedule-owned
+            fmember("ext-unowned", "media", 100, true, true, false),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &unsynced)),
+            vec!["ext-unowned", "prune-owned", "self"],
+            "only the external schedule-owned peer is withheld while unsynced"
+        );
+    }
+
+    #[test]
+    fn fire_eligible_synced_includes_schedule_owned_peer() {
+        // Same shape, but synced: the schedule-owned external peer is now included
+        // (its owner state is trustworthy).
+        let none = HashSet::new();
+        let cx = fire_cx("self", &none); // schedule_synced: true
+        let pending = vec![
+            fmember("self", "media", 100, true, true, false),
+            fmember("ext-owned", "media", 100, true, true, true),
+        ];
+        assert_eq!(fire_eligible(pending, &cx).len(), 2);
+    }
+
+    #[test]
+    fn fire_eligible_always_keeps_the_trigger_even_if_it_would_be_excluded() {
+        // The trigger is authoritatively authorized by the finalizer path; even a
+        // pin-less, schedule-owned, terminating-Orphan, held-external SELF fires.
+        let terminating: HashSet<String> = HashSet::from(["dying".to_string()]);
+        let ack = None;
+        let cx = FireEligibility {
+            threshold: 1,
+            ack,
+            on_namespace_delete: NamespaceDeletePolicy::Orphan,
+            schedule_synced: false,
+            ..fire_cx("self", &terminating)
+        };
+        let pending = vec![
+            fmember("self", "dying", 500, true, false, true), // every exclusion axis tripped
+            fmember("peer", "dying", 500, true, false, true),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["self"],
+            "the trigger is never excluded; the peer is"
+        );
+    }
+
+    #[test]
+    fn empty_schedule_list_proves_synced_decision() {
+        assert!(empty_schedule_list_proves_synced(Some(0)), "empty ⇒ flip");
+        assert!(
+            !empty_schedule_list_proves_synced(Some(3)),
+            "non-empty ⇒ no"
+        );
+        assert!(
+            !empty_schedule_list_proves_synced(None),
+            "LIST error ⇒ no (fail-safe)"
+        );
     }
 
     // --- batch_fire_decision -------------------------------------------------
@@ -1226,6 +1697,9 @@ mod tests {
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].name, "done");
         assert_eq!(reaped[0].outcome, BatchJobOutcome::Succeeded);
+        // Member count is carried for the metric point (unused for Succeeded —
+        // its members each emit `deleted` on drain — but still populated).
+        assert_eq!(reaped[0].members, 2);
     }
 
     #[test]
@@ -1248,6 +1722,9 @@ mod tests {
         let reaped = reap_targets(&jobs, &holding, old, FAILED_BATCH_REAP_AGE);
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].outcome, BatchJobOutcome::Failed);
+        // The FAILED reap carries the member count — the single point where the
+        // per-member `failed` metric is emitted (once, for every reaped member).
+        assert_eq!(reaped[0].members, 1);
     }
 
     #[test]

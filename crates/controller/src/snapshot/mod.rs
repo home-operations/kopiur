@@ -33,7 +33,7 @@ use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
 use kopiur_api::snapshot::SnapshotPhase;
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy, SnapshotSchedule};
 
-use crate::metrics::{BatchMemberOutcome, SnapshotDeletionOutcome};
+use crate::metrics::{BatchJobOutcome, BatchMemberOutcome, SnapshotDeletionOutcome};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, SnapshotDeleteBatchOp, SnapshotDeleteItem,
     SnapshotPinOp, TargetRef,
@@ -2259,10 +2259,19 @@ async fn drive_batch_deletion(
         }
     };
 
-    // Fail-safe store gate: never fire (or reap against) an unsynced snapshot
+    // Fail-safe store gate: never fire (or reap against) an unsynced SNAPSHOT
     // store — a cold cache must never read as "nothing pending". The breaker
     // already defers external-destructive CRs, but PRUNES reach here un-gated, so
     // the dispatcher repeats the check (same requeue as `StoresNotSynced`).
+    //
+    // NOTE (IMPORTANT-3): this gate INTENTIONALLY covers only the snapshot store,
+    // not the SCHEDULE store. The plan originally gated both, but a hard
+    // schedule-store gate here would defer EVERY deletion (prunes included) on a
+    // cluster that legitimately has zero SnapshotSchedules until the empty-cluster
+    // startup sync flips the flag. The refined design instead lets the FIRE set's
+    // `fire_eligible` narrow just the schedule-OWNED members while the schedule
+    // store is unsynced (`schedule_synced` → IMPORTANT-3a), so an unowned
+    // deletion is never blocked on the schedule store's readiness.
     use std::sync::atomic::Ordering;
     let present = ctx.snapshot_store.get().is_some();
     let synced = ctx.snapshot_synced.load(Ordering::Acquire);
@@ -2353,8 +2362,12 @@ async fn dispatch_batch_for_member(
 /// namespace-deletion cascade). `Some(action)` means a legacy Job exists and this
 /// reconcile is fully handled by the shim; `None` hands over to the batch path.
 ///
-/// Remove this shim one release after batching ships — no operator that has run
-/// the batch dispatcher will ever create a `{name}-delete` Job again.
+/// TODO(one-release): one release after batching ships, remove this adoption
+/// shim AND the now-unused per-CR [`super::plan::delete_job_placement`] it stands
+/// in for — no operator that has run the batch dispatcher will ever create a
+/// `{name}-delete` Job again, so the shim only has to bridge a single in-place
+/// upgrade. (Tracked in the mass-deletion release notes; a real GH issue is filed
+/// at PR time.)
 async fn adopt_legacy_delete_job(
     backup: &Snapshot,
     ctx: &Context,
@@ -2554,13 +2567,57 @@ async fn reap_batch_jobs(
             .delete(&target.name, &DeleteParams::background())
             .await
         {
-            Ok(_) => ctx.metrics.inc_snapshot_delete_batch_job(target.outcome),
+            Ok(_) => {
+                ctx.metrics.inc_snapshot_delete_batch_job(target.outcome);
+                // The FAILED per-member metric is emitted ONCE here (its members
+                // never drain their own finalizers, so they have no per-member
+                // site). A SUCCEEDED Job's members each emit `deleted` as they
+                // drain (`dispatch_batch_for_member`), so nothing is counted here
+                // for it. Exhaustive over the outcome so a new one must decide.
+                match target.outcome {
+                    BatchJobOutcome::Failed => ctx.metrics.inc_snapshot_delete_batch_members(
+                        BatchMemberOutcome::Failed,
+                        target.members as u64,
+                    ),
+                    BatchJobOutcome::Succeeded => {}
+                }
+            }
             Err(kube::Error::Api(e)) if e.code == 404 => {}
             Err(e) => {
                 tracing::warn!(job = %target.name, error = %e, "batch delete Job reap failed (skipped)")
             }
         }
     }
+}
+
+/// Resolve, once per DISTINCT member namespace, whether it is TERMINATING (the
+/// same `namespace_is_terminating` check the finalizer path uses for the self
+/// CR). Feeds the FIRE set's IMPORTANT-2 exclusion: an `onNamespaceDelete:
+/// Orphan` peer whose namespace is being torn down plans `OrphanSnapshot` on its
+/// OWN reconcile and must never be deleted by a peer's fire. Bounded — a batch is
+/// ≤200 members, and distinct namespaces are typically far fewer.
+///
+/// Fail-safe (fire-path = UNDER-fire): a namespace whose terminating-ness cannot
+/// be read is treated as terminating, so its `Orphan` peers are withheld and
+/// retried rather than deleted on a guess. (A 403 in a namespaced-scope install
+/// resolves to "not terminating" inside `namespace_is_terminating`, so this never
+/// wedges an install that legitimately cannot read Namespaces.)
+async fn terminating_member_namespaces(
+    ctx: &Context,
+    pending: &[PendingMember],
+) -> HashSet<String> {
+    let distinct: std::collections::BTreeSet<&str> =
+        pending.iter().map(|m| m.namespace.as_str()).collect();
+    let mut terminating = HashSet::new();
+    for ns in distinct {
+        if io::namespace_is_terminating(&ctx.client, ns)
+            .await
+            .unwrap_or(true)
+        {
+            terminating.insert(ns.to_string());
+        }
+    }
+    terminating
 }
 
 /// §3: this CR is not enrolled — pick the fireable set for its repository
@@ -2583,9 +2640,35 @@ async fn fire_batch(
     state: &[Arc<Snapshot>],
     views: &[BatchJobView],
 ) -> Result<Action> {
+    use std::sync::atomic::Ordering;
     let key = repo_key(repo_ref);
+    // COUNTING set: maximally inclusive (over-count is fail-safe).
     let pending = pending_members(state, &key, schedule_owner_lookup(ctx));
-    let fireable = fireable_members(pending, &covered_uids(views));
+    // FIRE set: maximally EXCLUSIVE (under-fire is fail-safe). Drop members the
+    // count deliberately over-includes — breaker-HELD externals (CRITICAL-1),
+    // ns-Orphan-destined peers (IMPORTANT-2), schedule-owned peers while the
+    // schedule store is unsynced (IMPORTANT-3a), and unpinned PEERS
+    // (IMPORTANT-4) — BEFORE the no-overlap exclusion. The ack is parsed exactly
+    // as the breaker does; its invalid-value warning is already published by
+    // `resolve_breaker` on the external-CR path, so it is not re-emitted here.
+    let now = chrono::Utc::now();
+    let (ack, _invalid) = parse_mass_deletion_ack(repo.mass_deletion_ack.as_deref(), now);
+    let threshold =
+        kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
+    let terminating = terminating_member_namespaces(ctx, &pending).await;
+    let self_uid = backup.uid().unwrap_or_default();
+    let eligible = fire_eligible(
+        pending,
+        &FireEligibility {
+            self_uid: &self_uid,
+            threshold,
+            ack,
+            on_namespace_delete: repo.on_namespace_delete,
+            terminating_namespaces: &terminating,
+            schedule_synced: ctx.schedule_synced.load(Ordering::Acquire),
+        },
+    );
+    let fireable = fireable_members(eligible, &covered_uids(views));
     if fireable.is_empty() {
         // This CR is not (yet) an eligible member — e.g. its own pending state has
         // not propagated to the store, or every pending member is already in flight.

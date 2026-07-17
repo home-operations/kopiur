@@ -10,6 +10,7 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Namespace, PersistentVolumeClaim, Secret, Service, ServiceAccount,
 };
+use kube::api::ListParams;
 use kube::core::PartialObjectMeta;
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher::Config as WatcherConfig;
@@ -259,6 +260,35 @@ pub(crate) async fn spawn_all(
     let sched_ctrl = Controller::new(sched_api, cfg.clone()).with_config(ctrl_cfg.clone());
     let sched_store = sched_ctrl.store();
     publish_store(&ctx.schedule_store, sched_store.clone());
+    // Empty-cluster schedule sync (IMPORTANT-3b): `mark_schedule_synced` flips
+    // ONLY from a SnapshotSchedule reconcile, which never runs on a cluster with
+    // zero SnapshotSchedules — leaving the FIRE-path schedule exclusion
+    // (`fire_eligible`, IMPORTANT-3a) armed indefinitely after a restart (the
+    // incident shape: only the schedule deleted, operator restarts). A one-shot
+    // bounded authoritative LIST breaks that: an EMPTY list proves the store
+    // trivially synced (nothing to be behind on) and flips the flag; a non-empty
+    // list is left to the reconcile; a LIST error leaves it unsynced (fail-safe).
+    // A bounded LIST, never `wait_until_ready` (single-waker hazard — see the M4b
+    // flip-from-reconcile fix rationale).
+    {
+        let sched_api: Api<SnapshotSchedule> = scoped_api(&client, &scope);
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let count = sched_api
+                .list(&ListParams::default().limit(1))
+                .await
+                .map(|l| l.items.len());
+            if snapshot::empty_schedule_list_proves_synced(count.as_ref().ok().copied()) {
+                ctx.mark_schedule_synced();
+            } else if let Err(e) = &count {
+                tracing::warn!(
+                    error = %e,
+                    "startup SnapshotSchedule LIST failed; the schedule store stays unsynced \
+                     until a reconcile flips it (fail-safe)"
+                );
+            }
+        });
+    }
     let mut sched_ctrl = sched_ctrl
         .owns(scoped_api::<Snapshot>(&client, &scope), cfg.clone())
         .watches(

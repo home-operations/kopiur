@@ -512,9 +512,6 @@ pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
 /// Event reason on a `Snapshot` whose own deletion is held by the
 /// mass-deletion breaker.
 pub const SNAPSHOT_DELETION_HELD_REASON: &str = "SnapshotDeletionHeld";
-/// Event reason on a `Repository`/`ClusterRepository` when its mass-deletion
-/// breaker trips (pairs with `kopiur_api::consts::MASS_DELETION_HELD_CONDITION`).
-pub const MASS_DELETION_HELD_REASON: &str = "MassDeletionHeld";
 /// Event reason when a `Snapshot` is retained by the schedule-deletion cascade
 /// guard (`onScheduleDelete: Retain` with a gone/replaced owning
 /// `SnapshotSchedule`).
