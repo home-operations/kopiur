@@ -1,5 +1,6 @@
 use super::*;
 use crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kopiur_api::common::NamespaceDeletePolicy;
 
 #[test]
@@ -843,28 +844,71 @@ fn matches_snapshot_identity_excludes_different_path_same_identity() {
     assert!(!matches_snapshot_identity(&entry, &identity));
 }
 
-// --- plan_deletion: exhaustive over every DeletionPolicy ----------------
+// --- plan_deletion: the mass-deletion-protection decision table (M2) ----
+//
+// Decision order under test (see `plan_deletion`'s doc comment for the full
+// table): (1) skip-cleanup annotation, absolute; (2) namespace-terminating
+// cascade; (3) schedule cascade guard; (4) operator prune; (5)/(6) external
+// destructive/non-destructive with the mass-deletion breaker.
+
+use kopiur_api::common::ScheduleDeletePolicy;
+use kopiur_api::consts::PRUNED_BY_ANNOTATION;
+use kopiur_api::snapshot::PrunedBy;
+
+/// Base facts: external (live owner), live namespace, breaker allowed, policy
+/// Delete. Each test overrides only the fields it's exercising — keeps every
+/// call site legible, matching `DeletionFacts`'s own rationale.
+fn base_facts(annotations: &BTreeMap<String, String>) -> DeletionFacts<'_> {
+    DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        annotations,
+        owner: OwnerState::Alive,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: false,
+        ns_policy: None,
+        breaker: BreakerState::Allowed,
+    }
+}
+
+/// Annotations carrying a `pruned-by: <kind>` stamp.
+fn pruned(kind: PrunedBy) -> BTreeMap<String, String> {
+    ann(&[(PRUNED_BY_ANNOTATION, kind.annotation_value())])
+}
+
+// -- ported: the pre-M2 plan_deletion(policy, annotations) tests ---------
 
 #[test]
 fn delete_policy_plans_snapshot_delete() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::DeleteSnapshot
     );
 }
 
 #[test]
 fn retain_policy_plans_retain() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Retain, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Retain,
+            ..base_facts(&a)
+        }),
         DeletionPlan::RetainSnapshot
     );
 }
 
 #[test]
 fn orphan_policy_plans_orphan() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Orphan, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Orphan,
+            ..base_facts(&a)
+        }),
         DeletionPlan::OrphanSnapshot
     );
 }
@@ -875,7 +919,10 @@ fn skip_annotation_overrides_delete_to_orphan() {
     // contact a dead repository.
     let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &a),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::OrphanSnapshot
     );
 }
@@ -883,12 +930,19 @@ fn skip_annotation_overrides_delete_to_orphan() {
 #[test]
 fn skip_annotation_overrides_every_policy() {
     let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "")]);
-    for p in [
+    for policy in [
         DeletionPolicy::Delete,
         DeletionPolicy::Retain,
         DeletionPolicy::Orphan,
     ] {
-        assert_eq!(plan_deletion(p, &a), DeletionPlan::OrphanSnapshot);
+        assert_eq!(
+            plan_deletion(DeletionFacts {
+                policy,
+                ..base_facts(&a)
+            }),
+            DeletionPlan::OrphanSnapshot,
+            "{policy:?}"
+        );
     }
 }
 
@@ -896,64 +950,873 @@ fn skip_annotation_overrides_every_policy() {
 fn unrelated_annotations_do_not_trigger_skip() {
     let a = ann(&[("kopiur.home-operations.com/other", "x")]);
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &a),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::DeleteSnapshot
     );
 }
 
-// --- namespace_delete_plan (ADR-0005 §5 data-loss prevention) -----------
+// -- ported: the pre-M2 namespace_delete_plan tests ----------------------
 
 #[test]
 fn non_terminating_namespace_keeps_the_per_snapshot_plan() {
-    // A lone `kubectl delete snapshot` (namespace healthy) honors the Snapshot's
-    // own plan regardless of the repository's onNamespaceDelete policy.
-    for policy in [NamespaceDeletePolicy::Orphan, NamespaceDeletePolicy::Delete] {
-        for base in [
-            DeletionPlan::DeleteSnapshot,
-            DeletionPlan::RetainSnapshot,
-            DeletionPlan::OrphanSnapshot,
+    // A lone `kubectl delete snapshot` (namespace healthy) honors the
+    // Snapshot's own plan regardless of the repository's onNamespaceDelete
+    // policy (or whether it could even be resolved).
+    let a = BTreeMap::new();
+    for ns_policy in [
+        None,
+        Some(NamespaceDeletePolicy::Orphan),
+        Some(NamespaceDeletePolicy::Delete),
+    ] {
+        for (policy, expected) in [
+            (DeletionPolicy::Delete, DeletionPlan::DeleteSnapshot),
+            (DeletionPolicy::Retain, DeletionPlan::RetainSnapshot),
+            (DeletionPolicy::Orphan, DeletionPlan::OrphanSnapshot),
         ] {
-            assert_eq!(namespace_delete_plan(policy, false, base), base);
+            let plan = plan_deletion(DeletionFacts {
+                policy,
+                ns_terminating: false,
+                ns_policy,
+                ..base_facts(&a)
+            });
+            assert_eq!(plan, expected, "{policy:?}/{ns_policy:?}");
         }
     }
 }
 
+// -- named intent tests (approved semantics) -----------------------------
+
 #[test]
-fn terminating_namespace_orphan_policy_forces_orphan() {
-    // The fail-safe default: a deleted namespace must not run `kopia snapshot
-    // delete`, even when the Snapshot's own plan was DeleteSnapshot.
-    for base in [
-        DeletionPlan::DeleteSnapshot,
-        DeletionPlan::RetainSnapshot,
-        DeletionPlan::OrphanSnapshot,
+fn external_owner_gone_delete_downgrades_to_cascade_guard_retain() {
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn external_owner_exists_but_terminating_downgrades() {
+    // Foreground-cascade: the schedule still exists (same uid) but is itself
+    // terminating — GC hasn't reaped this Snapshot yet, but the schedule is
+    // as good as gone.
+    let owner_ref = schedule_owner_ref_fixture("sched-uid");
+    let sched = schedule_fixture("sched-uid", true);
+    let owner = owner_state_from(Some(&sched), &owner_ref);
+    assert_eq!(owner, OwnerState::GoneOrReplaced);
+
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn external_owner_uid_mismatch_downgrades() {
+    // kro-style delete+recreate: a same-name schedule exists but with a
+    // different uid, so the ownerRef points at a schedule that's really gone.
+    let owner_ref = schedule_owner_ref_fixture("old-uid");
+    let sched = schedule_fixture("new-uid", false);
+    let owner = owner_state_from(Some(&sched), &owner_ref);
+    assert_eq!(owner, OwnerState::GoneOrReplaced);
+
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn cascade_delete_opt_in_still_deletes_when_owner_gone() {
+    let a = BTreeMap::new();
+    let allowed = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Delete,
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // ...and still holdable: the opt-in cascade is still an external
+    // deletion, so the breaker applies to it exactly as it would without the
+    // cascade in play.
+    let held = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Delete,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn single_external_delete_with_live_schedule_unchanged() {
+    // Status quo: an Alive owner never puts the cascade guard in play, so a
+    // lone external delete plans exactly as it did pre-M2.
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::Alive,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn operator_pruned_bypasses_guard_and_breaker() {
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        let plan = plan_deletion(DeletionFacts {
+            owner: OwnerState::GoneOrReplaced, // would otherwise trigger the guard
+            cascade: ScheduleDeletePolicy::Retain, // would otherwise downgrade
+            breaker: BreakerState::Held,       // would otherwise hold
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::DeleteSnapshot, "{kind:?}");
+    }
+}
+
+#[test]
+fn unknown_pruned_by_value_treated_external() {
+    let a = ann(&[(PRUNED_BY_ANNOTATION, "garbage")]);
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    // Unrecognized value parses to None => external => the cascade guard
+    // applies exactly as if no pruned-by annotation were present at all.
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn skip_cleanup_wins_even_over_held() {
+    let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
+    let plan = plan_deletion(DeletionFacts {
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
+#[test]
+fn ns_terminating_default_orphan_beats_cascade_guard() {
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced, // would otherwise trigger the guard
+        cascade: ScheduleDeletePolicy::Delete, // would otherwise cascade-delete
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Orphan),
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
+#[test]
+fn ns_terminating_unresolved_repo_orphans() {
+    // Ports the pre-M2 fail-safe: when the repository can't be resolved while
+    // the namespace terminates, the caller passes `ns_policy: None`, and that
+    // must orphan regardless of the Snapshot's own policy.
+    let a = BTreeMap::new();
+    for policy in [
+        DeletionPolicy::Delete,
+        DeletionPolicy::Retain,
+        DeletionPolicy::Orphan,
     ] {
-        assert_eq!(
-            namespace_delete_plan(NamespaceDeletePolicy::Orphan, true, base),
-            DeletionPlan::OrphanSnapshot
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            ns_terminating: true,
+            ns_policy: None,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::OrphanSnapshot, "{policy:?}");
+    }
+}
+
+#[test]
+fn ns_terminating_delete_optin_bypasses_guard_but_not_breaker() {
+    let a = BTreeMap::new();
+    // Guard bypassed: owner gone + cascade Retain would normally downgrade to
+    // RetainSnapshotOnScheduleDelete, but ns_policy: Delete skips straight to
+    // the breaker check instead.
+    let allowed = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // Not the breaker: still holdable.
+    let held = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn breaker_never_holds_retain_or_orphan() {
+    let a = BTreeMap::new();
+    for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_ne!(plan, DeletionPlan::HoldSnapshotDeletion, "{policy:?}");
+    }
+}
+
+#[test]
+fn orphaned_ownerref_children_get_their_own_policy() {
+    // NoScheduleOwner: manual/discovered/`--cascade=orphan` children never
+    // consult the cascade guard, whatever `cascade` happens to carry.
+    let a = BTreeMap::new();
+    for (policy, expected) in [
+        (DeletionPolicy::Delete, DeletionPlan::DeleteSnapshot),
+        (DeletionPolicy::Retain, DeletionPlan::RetainSnapshot),
+        (DeletionPolicy::Orphan, DeletionPlan::OrphanSnapshot),
+    ] {
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            owner: OwnerState::NoScheduleOwner,
+            cascade: ScheduleDeletePolicy::Retain,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, expected, "{policy:?}");
+    }
+}
+
+// -- table test: every meaningful row of the decision matrix -------------
+
+/// One row of the decision matrix: the facts that matter for that row plus
+/// the expected [`DeletionPlan`]. `skip`/`pruned` build the annotations map;
+/// everything else maps 1:1 onto [`DeletionFacts`].
+struct Row {
+    policy: DeletionPolicy,
+    owner: OwnerState,
+    cascade: ScheduleDeletePolicy,
+    pruned: Option<PrunedBy>,
+    skip: bool,
+    ns_terminating: bool,
+    ns_policy: Option<NamespaceDeletePolicy>,
+    breaker: BreakerState,
+    expected: DeletionPlan,
+}
+
+#[test]
+fn plan_deletion_table_covers_every_meaningful_row() {
+    use DeletionPlan::*;
+    use DeletionPolicy as P;
+    use NamespaceDeletePolicy as NDP;
+    use OwnerState as O;
+    use ScheduleDeletePolicy as SDP;
+
+    let rows = [
+        // -- namespace terminating, ns_policy unresolved (None): always Orphan,
+        // whatever the per-CR policy.
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- namespace terminating, ns_policy Orphan (default): always Orphan.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Orphan),
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- namespace terminating, ns_policy Delete (opt-in cascade): bypasses
+        // the schedule cascade guard, but NOT the breaker/prune logic.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Held,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner gone/replaced, external (no prune): cascade
+        // guard applies.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshotOnScheduleDelete,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner gone/replaced, operator-pruned: guard bypassed.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::FailedHistory),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner Alive: plain external, breaker gates Delete
+        // only.
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, no schedule owner at all: same as Alive.
+        Row {
+            policy: P::Delete,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- skip-cleanup: absolute, beats everything else including Held and
+        // ns-terminating.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: true,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: true,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+    ];
+
+    for (i, row) in rows.iter().enumerate() {
+        let mut a = BTreeMap::new();
+        if let Some(p) = row.pruned {
+            a.insert(
+                PRUNED_BY_ANNOTATION.to_string(),
+                p.annotation_value().to_string(),
+            );
+        }
+        if row.skip {
+            a.insert(
+                SKIP_SNAPSHOT_CLEANUP_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
+        }
+        let plan = plan_deletion(DeletionFacts {
+            policy: row.policy,
+            annotations: &a,
+            owner: row.owner,
+            cascade: row.cascade,
+            ns_terminating: row.ns_terminating,
+            ns_policy: row.ns_policy,
+            breaker: row.breaker,
+        });
+        assert_eq!(plan, row.expected, "row {i}");
+    }
+}
+
+// -- schedule_owner_ref / owner_state_from --------------------------------
+
+fn schedule_owner_ref_fixture(uid: &str) -> OwnerReference {
+    OwnerReference {
+        api_version: crate::consts::API_VERSION.to_string(),
+        kind: "SnapshotSchedule".to_string(),
+        name: "nightly".to_string(),
+        uid: uid.to_string(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    }
+}
+
+fn schedule_fixture(uid: &str, terminating: bool) -> kopiur_api::SnapshotSchedule {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    let mut sched = kopiur_api::SnapshotSchedule::new(
+        "nightly",
+        kopiur_api::SnapshotScheduleSpec {
+            policy_ref: Some(kopiur_api::common::PolicyRef {
+                name: "pg".into(),
+                namespace: None,
+            }),
+            policy_selector: None,
+            schedule: kopiur_api::ScheduleSpec {
+                cron: "H 2 * * *".into(),
+                jitter: None,
+                timezone: None,
+                run_on_create: false,
+                suspend: false,
+                concurrency_policy: kopiur_api::ConcurrencyPolicy::Forbid,
+                starting_deadline_seconds: None,
+            },
+            failed_jobs_history_limit: None,
+            deletion: None,
+        },
+    );
+    sched.metadata.namespace = Some("media".into());
+    sched.metadata.uid = Some(uid.to_string());
+    if terminating {
+        sched.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    }
+    sched
+}
+
+#[test]
+fn owner_state_from_same_uid_live_is_alive() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    let sched = schedule_fixture("uid-1", false);
+    assert_eq!(owner_state_from(Some(&sched), &owner), OwnerState::Alive);
+}
+
+#[test]
+fn owner_state_from_404_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    assert_eq!(owner_state_from(None, &owner), OwnerState::GoneOrReplaced);
+}
+
+#[test]
+fn owner_state_from_terminating_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    let sched = schedule_fixture("uid-1", true);
+    assert_eq!(
+        owner_state_from(Some(&sched), &owner),
+        OwnerState::GoneOrReplaced
+    );
+}
+
+#[test]
+fn owner_state_from_uid_mismatch_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("old-uid");
+    let sched = schedule_fixture("new-uid", false);
+    assert_eq!(
+        owner_state_from(Some(&sched), &owner),
+        OwnerState::GoneOrReplaced
+    );
+}
+
+#[test]
+fn schedule_owner_ref_finds_the_controller_ownerref() {
+    let mut backup = dummy_backup();
+    backup.metadata.owner_references = Some(vec![schedule_owner_ref_fixture("uid-1")]);
+    let found = schedule_owner_ref(&backup).expect("found");
+    assert_eq!(found.uid, "uid-1");
+    assert_eq!(found.kind, "SnapshotSchedule");
+}
+
+#[test]
+fn schedule_owner_ref_is_none_without_a_schedule_owner() {
+    // No ownerRef at all.
+    let backup = dummy_backup();
+    assert!(schedule_owner_ref(&backup).is_none());
+
+    // A foreign-kind ownerRef (e.g. a Repository) doesn't count.
+    let mut foreign = dummy_backup();
+    foreign.metadata.owner_references = Some(vec![OwnerReference {
+        api_version: crate::consts::API_VERSION.to_string(),
+        kind: "Repository".to_string(),
+        name: "nas".to_string(),
+        uid: "uid-1".to_string(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    }]);
+    assert!(schedule_owner_ref(&foreign).is_none());
+}
+
+// -- breaker_state / clamp_ack --------------------------------------------
+
+fn t(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs, 0).unwrap()
+}
+
+#[test]
+fn breaker_state_below_and_at_threshold() {
+    let now = t(1_700_000_000);
+    assert_eq!(breaker_state(4, 5, now, None), BreakerState::Allowed);
+    assert_eq!(breaker_state(5, 5, now, None), BreakerState::Held);
+}
+
+#[test]
+fn breaker_state_threshold_zero_disables() {
+    let now = t(1_700_000_000);
+    assert_eq!(
+        breaker_state(1_000_000, 0, now, None),
+        BreakerState::Allowed
+    );
+}
+
+#[test]
+fn breaker_state_ack_releases_at_or_before_deletion_timestamp_only() {
+    let ack = t(1_700_000_000);
+    let at_ack = t(1_700_000_000);
+    let before_ack = t(1_699_999_000);
+    let after_ack = t(1_700_000_001);
+    assert_eq!(
+        breaker_state(10, 5, at_ack, Some(ack)),
+        BreakerState::Allowed
+    );
+    assert_eq!(
+        breaker_state(10, 5, before_ack, Some(ack)),
+        BreakerState::Allowed
+    );
+    // Newer than the ack: stays held despite the ack existing.
+    assert_eq!(
+        breaker_state(10, 5, after_ack, Some(ack)),
+        BreakerState::Held
+    );
+}
+
+#[test]
+fn clamp_ack_pulls_future_acks_back_to_now() {
+    let now = t(1_700_000_000);
+    let future = t(1_700_001_000);
+    let past = t(1_699_000_000);
+    assert_eq!(clamp_ack(Some(future), now), Some(now));
+    assert_eq!(clamp_ack(Some(past), now), Some(past));
+    assert_eq!(clamp_ack(None, now), None);
+}
+
+// -- counts_toward_breaker -------------------------------------------------
+
+#[test]
+fn counts_toward_breaker_external_delete_is_true() {
+    let a = BTreeMap::new();
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_pruned_is_false() {
+    let a = pruned(PrunedBy::Retention);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_retain_and_orphan_are_false() {
+    let a = BTreeMap::new();
+    for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy,
+                ..base_facts(&a)
+            }),
+            "{policy:?}"
         );
     }
 }
 
 #[test]
-fn terminating_namespace_delete_policy_cascades_to_base_plan() {
-    // Opt-in cascade: with onNamespaceDelete=Delete, the per-Snapshot plan applies
-    // (so a produced Snapshot still runs the snapshot delete).
+fn counts_toward_breaker_skip_annotated_is_false() {
+    let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_cascade_retained_is_false() {
+    // The cascade-wave-does-not-inflate-count guarantee: an owner-gone Retain
+    // downgrade must not itself count as a pending destructive deletion.
+    let a = BTreeMap::new();
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    }));
+}
+
+// -- effective_on_schedule_delete ------------------------------------------
+
+#[test]
+fn effective_on_schedule_delete_none_is_retain() {
     assert_eq!(
-        namespace_delete_plan(
-            NamespaceDeletePolicy::Delete,
-            true,
-            DeletionPlan::DeleteSnapshot
-        ),
-        DeletionPlan::DeleteSnapshot
+        effective_on_schedule_delete(None),
+        ScheduleDeletePolicy::Retain
     );
-    // ...and a Retain/Orphan base is preserved unchanged.
     assert_eq!(
-        namespace_delete_plan(
-            NamespaceDeletePolicy::Delete,
-            true,
-            DeletionPlan::RetainSnapshot
-        ),
-        DeletionPlan::RetainSnapshot
+        effective_on_schedule_delete(Some(ScheduleDeletePolicy::Delete)),
+        ScheduleDeletePolicy::Delete
     );
 }
 
@@ -1030,6 +1893,66 @@ fn terminating_operator_namespace_itself_orphans() {
                 reason.contains("kopiur-system"),
                 "names the namespace: {reason}"
             );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+// --- batch_job_placement (mirrors delete_job_placement, no per-Snapshot
+// namespace fallback — a batch always runs at the repository's home) --------
+
+#[test]
+fn batch_placement_runs_in_the_namespaced_repos_home_namespace() {
+    assert_eq!(
+        batch_job_placement(Some("storage"), Some("kopiur-system"), None),
+        DeleteJobPlacement::RunIn("storage".into())
+    );
+    // Terminating elsewhere doesn't matter.
+    assert_eq!(
+        batch_job_placement(Some("storage"), Some("kopiur-system"), Some("app")),
+        DeleteJobPlacement::RunIn("storage".into())
+    );
+}
+
+#[test]
+fn batch_placement_runs_in_the_operator_namespace_for_cluster_repo() {
+    assert_eq!(
+        batch_job_placement(None, Some("kopiur-system"), None),
+        DeleteJobPlacement::RunIn("kopiur-system".into())
+    );
+}
+
+#[test]
+fn batch_placement_orphans_when_repo_namespace_is_terminating() {
+    match batch_job_placement(Some("storage"), Some("kopiur-system"), Some("storage")) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(
+                reason.contains("kopia snapshot delete"),
+                "actionable: {reason}"
+            );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_placement_orphans_when_operator_namespace_is_terminating() {
+    match batch_job_placement(None, Some("kopiur-system"), Some("kopiur-system")) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(
+                reason.contains("kopiur-system"),
+                "names the namespace: {reason}"
+            );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_placement_orphans_when_operator_namespace_unknown() {
+    match batch_job_placement(None, None, None) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(reason.contains("KOPIUR_NAMESPACE"), "actionable: {reason}");
         }
         other => panic!("expected OrphanFallback, got {other:?}"),
     }

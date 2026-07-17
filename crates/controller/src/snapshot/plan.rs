@@ -6,19 +6,22 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kopiur_api::common::{
     CredentialProjection, NamespaceDeletePolicy, RepositoryKind, RepositoryRef,
+    ScheduleDeletePolicy,
 };
-use kopiur_api::snapshot::SnapshotPhase;
-use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy};
+use kopiur_api::consts::PRUNED_BY_ANNOTATION;
+use kopiur_api::snapshot::{PrunedBy, SnapshotPhase};
+use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy, SnapshotSchedule};
 use kopiur_mover::workspec::{MoverWorkSpec, ResolvedIdentity as MoverIdentity};
 use kube::{Resource, ResourceExt};
 
-use crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION;
+use crate::consts::{API_VERSION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION};
 use crate::io;
 
-/// The decision the deletion handler must execute. Derived purely from the
-/// effective `DeletionPolicy` and the object's annotations — no IO.
+/// The decision the deletion handler must execute. Derived purely from
+/// [`DeletionFacts`] — no IO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletionPlan {
     /// Run `kopia snapshot delete <id>` (via a short Job) then remove the
@@ -32,21 +35,179 @@ pub enum DeletionPlan {
     /// snapshot orphaned, emit `SnapshotOrphaned`, bump the orphan metric. Used
     /// by `Orphan` and by the `skip-snapshot-cleanup` annotation escape hatch.
     OrphanSnapshot,
+    /// Cascade guard fired: external deletion, owner gone/replaced, stamped
+    /// policy Retain, effective policy was Delete. Executor = `RetainSnapshot`'s
+    /// (release finalizer, no repo contact) PLUS a Warning event
+    /// `SnapshotRetainedOnScheduleDelete` + cascade-retained counter — loud
+    /// but not an orphan-metric storm. (Executor lands in M4.)
+    RetainSnapshotOnScheduleDelete,
+    /// Mass-deletion breaker: do NO delete work, keep the finalizer, phase
+    /// Deleting + `DeletionHeld=True` condition, requeue long. Drained by the
+    /// repo ack annotation. (Executor lands in M4.)
+    HoldSnapshotDeletion,
 }
 
-/// Decide what to do on deletion. **Exhaustive** over [`DeletionPolicy`] with no
-/// catch-all: a new variant fails to compile until handled here (ADR §5.5).
+/// Observed state of the `Snapshot`'s owning `SnapshotSchedule` at finalizer
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerState {
+    /// The ownerRef's schedule exists with the SAME uid and is not terminating.
+    Alive,
+    /// Gone (404), PRESENT BUT TERMINATING (`deletionTimestamp` set — the
+    /// `--cascade=foreground` case), or a same-name schedule with a DIFFERENT
+    /// uid (deleted-and-recreated; GC still reaps the old children).
+    GoneOrReplaced,
+    /// No `SnapshotSchedule` controller ownerRef at all (manual, discovered, or
+    /// deliberately orphaned via `kubectl delete --cascade=orphan`): the CR's
+    /// own `deletionPolicy` is honored, the cascade guard never fires.
+    NoScheduleOwner,
+}
+
+/// Per-repository mass-deletion breaker verdict for THIS deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerState {
+    /// Under the repository's threshold (or acknowledged, or the breaker is
+    /// disabled): this deletion may proceed.
+    Allowed,
+    /// At/over the repository's unacked-pending threshold: hold this deletion.
+    Held,
+}
+
+/// Everything the deletion decision needs. One struct so the decision table is
+/// legible at call sites and in tests.
+pub struct DeletionFacts<'a> {
+    /// Effective (origin-aware) policy — [`effective_deletion_policy`] output,
+    /// so `origin: discovered` is already folded to `Retain` here.
+    pub policy: DeletionPolicy,
+    /// Skip-cleanup + pruned-by are parsed from here.
+    pub annotations: &'a BTreeMap<String, String>,
+    /// Observed state of the owning `SnapshotSchedule`, if any.
+    pub owner: OwnerState,
+    /// [`effective_on_schedule_delete`]`(spec.on_schedule_delete)` — absent →
+    /// `Retain`.
+    pub cascade: ScheduleDeletePolicy,
+    /// Whether the `Snapshot`'s own namespace is terminating.
+    pub ns_terminating: bool,
+    /// The repository's `onNamespaceDelete`; `None` = repo unresolvable while
+    /// the namespace terminates (existing forced-orphan fail-safe).
+    pub ns_policy: Option<NamespaceDeletePolicy>,
+    /// This repository's mass-deletion breaker verdict for this deletion.
+    pub breaker: BreakerState,
+}
+
+/// Which operator lifecycle pruned this `Snapshot`, parsed from the
+/// `pruned-by` annotation. `None` for anything absent or unrecognized — the
+/// finalizer must treat that as an EXTERNAL deletion (fail-safe), never guess
+/// "operator".
+pub fn pruned_by(annotations: &BTreeMap<String, String>) -> Option<PrunedBy> {
+    annotations
+        .get(PRUNED_BY_ANNOTATION)
+        .and_then(|v| PrunedBy::parse(v))
+}
+
+/// Decide what to do on deletion. **Exhaustive** over every enum it touches
+/// (`DeletionPolicy`, `ScheduleDeletePolicy`, `NamespaceDeletePolicy`,
+/// `OwnerState`, `BreakerState`) with no catch-all: a new variant fails to
+/// compile until handled here (ADR §5.5).
 ///
-/// The `skip-snapshot-cleanup` annotation is the repo-offline escape hatch and
-/// **overrides everything** — even `Delete` — because its entire purpose is "the
-/// bucket is gone, just let me remove the CR" (ADR §4.5).
-pub fn plan_deletion(
-    policy: DeletionPolicy,
-    annotations: &BTreeMap<String, String>,
-) -> DeletionPlan {
-    if annotations.contains_key(SKIP_SNAPSHOT_CLEANUP_ANNOTATION) {
+/// Decision order:
+/// 1. `SKIP_SNAPSHOT_CLEANUP_ANNOTATION` present → [`OrphanSnapshot`](DeletionPlan::OrphanSnapshot).
+///    Absolute — even over `Held` (it deletes nothing and is the documented
+///    per-CR drain lever; ADR §4.5).
+/// 2. `ns_terminating`:
+///    - `ns_policy == None` → `OrphanSnapshot` (existing fail-safe, unchanged).
+///    - `Some(Orphan)` → `OrphanSnapshot` (existing default, unchanged).
+///    - `Some(Delete)` → fall through to steps 4/5 BYPASSING step 3 (during ns
+///      teardown the schedule is always gone; letting the cascade guard fire
+///      would silently nullify the documented repo-level opt-in) — but NOT
+///      bypassing the breaker.
+/// 3. Cascade guard (only when not ns-terminating): `pruned_by == None && owner
+///    == GoneOrReplaced`:
+///    - cascade `Retain` && policy `Delete` → `RetainSnapshotOnScheduleDelete`
+///    - cascade `Retain` && policy `Retain` → `RetainSnapshot`
+///    - cascade `Retain` && policy `Orphan` → `OrphanSnapshot`
+///    - cascade `Delete` → fall through (opt-in cascade; still external ⇒
+///      breaker applies).
+/// 4. Operator prune (`pruned_by == Some(_)`): match policy exhaustively —
+///    Delete→DeleteSnapshot, Retain→RetainSnapshot, Orphan→OrphanSnapshot.
+///    NEVER held (retention must keep working during an incident; its rate is
+///    bounded elsewhere).
+/// 5. External destructive (policy Delete): breaker Held →
+///    `HoldSnapshotDeletion`; Allowed → `DeleteSnapshot`.
+/// 6. External Retain/Orphan → RetainSnapshot/OrphanSnapshot (never held — no
+///    repo contact; holding would wedge CR removal for zero protection).
+pub fn plan_deletion(f: DeletionFacts<'_>) -> DeletionPlan {
+    if f.annotations.contains_key(SKIP_SNAPSHOT_CLEANUP_ANNOTATION) {
         return DeletionPlan::OrphanSnapshot;
     }
+    if f.ns_terminating {
+        return plan_ns_terminating(&f);
+    }
+    plan_live_namespace(&f)
+}
+
+/// Step 2: namespace-deletion cascade (ADR-0005 §5). `Delete` bypasses the
+/// cascade guard (step 3) but not the breaker (steps 4-6 still apply).
+fn plan_ns_terminating(f: &DeletionFacts<'_>) -> DeletionPlan {
+    match f.ns_policy {
+        None => DeletionPlan::OrphanSnapshot,
+        Some(NamespaceDeletePolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        Some(NamespaceDeletePolicy::Delete) => plan_prune_or_external(f),
+    }
+}
+
+/// Steps 3-6: not namespace-terminating. The cascade guard (step 3) only
+/// applies when the owner is gone/replaced; an operator prune bypasses it
+/// regardless of owner state (that's step 4, handled inside
+/// [`plan_prune_or_external`]).
+fn plan_live_namespace(f: &DeletionFacts<'_>) -> DeletionPlan {
+    if !cascade_guard_applies(f.owner) || pruned_by(f.annotations).is_some() {
+        return plan_prune_or_external(f);
+    }
+    match plan_cascade_guard(f.cascade, f.policy) {
+        Some(plan) => plan,
+        None => plan_prune_or_external(f),
+    }
+}
+
+/// Exhaustive over [`OwnerState`]: only a gone/replaced owner puts the cascade
+/// guard in play at all.
+fn cascade_guard_applies(owner: OwnerState) -> bool {
+    match owner {
+        OwnerState::GoneOrReplaced => true,
+        OwnerState::Alive | OwnerState::NoScheduleOwner => false,
+    }
+}
+
+/// Step 3 body. `None` means the opt-in cascade (`cascade == Delete`): the
+/// caller falls through to steps 4-6 (still external ⇒ breaker applies).
+fn plan_cascade_guard(
+    cascade: ScheduleDeletePolicy,
+    policy: DeletionPolicy,
+) -> Option<DeletionPlan> {
+    match cascade {
+        ScheduleDeletePolicy::Retain => Some(match policy {
+            DeletionPolicy::Delete => DeletionPlan::RetainSnapshotOnScheduleDelete,
+            DeletionPolicy::Retain => DeletionPlan::RetainSnapshot,
+            DeletionPolicy::Orphan => DeletionPlan::OrphanSnapshot,
+        }),
+        ScheduleDeletePolicy::Delete => None,
+    }
+}
+
+/// Steps 4-6: an operator prune (step 4) bypasses the breaker entirely;
+/// everything else is external and steps 5-6 apply (the breaker only ever
+/// gates `Delete`).
+fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
+    match pruned_by(f.annotations) {
+        Some(_) => plan_prune(f.policy),
+        None => plan_external(f.policy, f.breaker),
+    }
+}
+
+/// Step 4: operator prune. NEVER held — retention/history-limit pruning must
+/// keep working during an incident; its own rate is bounded elsewhere.
+fn plan_prune(policy: DeletionPolicy) -> DeletionPlan {
     match policy {
         DeletionPolicy::Delete => DeletionPlan::DeleteSnapshot,
         DeletionPolicy::Retain => DeletionPlan::RetainSnapshot,
@@ -54,34 +215,100 @@ pub fn plan_deletion(
     }
 }
 
-/// Reshape a per-`Snapshot` deletion plan for the **namespace-deletion** cascade
-/// policy (ADR-0005 §5). This is the data-loss-prevention fix: a `kubectl delete ns`
-/// must not silently destroy off-site backup history.
-///
-/// - When the owning namespace is NOT terminating, a single `kubectl delete snapshot`
-///   honors the `Snapshot`'s own plan unchanged (`base_plan`).
-/// - When the namespace IS terminating, the owning repository's
-///   [`NamespaceDeletePolicy`] decides:
-///   - `Orphan` (the fail-safe default) → force [`DeletionPlan::OrphanSnapshot`]:
-///     remove the finalizer WITHOUT `kopia snapshot delete`, keeping history.
-///   - `Delete` → opt-in cascade: fall through to the per-`Snapshot` `base_plan`.
-///
-/// Pure + exhaustive over [`NamespaceDeletePolicy`] (no `_ =>`), so a new variant
-/// cannot compile until handled here (ADR §5.5). The fail-safe path is also taken
-/// when the repository can't be resolved (repo already gone) — the caller passes
-/// `Orphan` in that case.
-pub fn namespace_delete_plan(
-    policy: NamespaceDeletePolicy,
-    ns_terminating: bool,
-    base_plan: DeletionPlan,
-) -> DeletionPlan {
-    if !ns_terminating {
-        return base_plan;
-    }
+/// Steps 5-6: external destructive/non-destructive. `Retain`/`Orphan` never
+/// contact the repository, so holding them would wedge CR removal for zero
+/// protection — only `Delete` consults the breaker.
+fn plan_external(policy: DeletionPolicy, breaker: BreakerState) -> DeletionPlan {
     match policy {
-        NamespaceDeletePolicy::Orphan => DeletionPlan::OrphanSnapshot,
-        NamespaceDeletePolicy::Delete => base_plan,
+        DeletionPolicy::Delete => match breaker {
+            BreakerState::Held => DeletionPlan::HoldSnapshotDeletion,
+            BreakerState::Allowed => DeletionPlan::DeleteSnapshot,
+        },
+        DeletionPolicy::Retain => DeletionPlan::RetainSnapshot,
+        DeletionPolicy::Orphan => DeletionPlan::OrphanSnapshot,
     }
+}
+
+/// The `Snapshot`'s `SnapshotSchedule` controller ownerRef, if any (apiVersion
+/// group matches ours, kind == `SnapshotSchedule`).
+pub fn schedule_owner_ref(backup: &Snapshot) -> Option<&OwnerReference> {
+    backup
+        .metadata
+        .owner_references
+        .as_deref()?
+        .iter()
+        .find(|o| o.api_version == API_VERSION && o.kind == "SnapshotSchedule")
+}
+
+/// Classify the fetched schedule (`None` = 404) against the ownerRef.
+/// Present-but-terminating or uid-mismatched ⇒ [`GoneOrReplaced`](OwnerState::GoneOrReplaced).
+pub fn owner_state_from(fetched: Option<&SnapshotSchedule>, owner: &OwnerReference) -> OwnerState {
+    let Some(sched) = fetched else {
+        return OwnerState::GoneOrReplaced;
+    };
+    let same_uid = sched.meta().uid.as_deref() == Some(owner.uid.as_str());
+    let terminating = sched.meta().deletion_timestamp.is_some();
+    if same_uid && !terminating {
+        OwnerState::Alive
+    } else {
+        OwnerState::GoneOrReplaced
+    }
+}
+
+/// Whether this pending deletion counts toward its repository's breaker:
+/// external (no valid pruned-by) AND its plan WITHOUT the breaker is
+/// `DeleteSnapshot`. Implemented by re-running [`plan_deletion`] with
+/// `breaker = Allowed` — one decision function, no forked logic.
+pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
+    if pruned_by(f.annotations).is_some() {
+        return false;
+    }
+    matches!(
+        plan_deletion(DeletionFacts {
+            breaker: BreakerState::Allowed,
+            ..f
+        }),
+        DeletionPlan::DeleteSnapshot
+    )
+}
+
+/// Clamp a parsed ack timestamp to `<= now` (clock-skew guard): a future ack
+/// value must never pre-acknowledge deletions that haven't happened yet.
+pub fn clamp_ack(
+    ack: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    ack.map(|a| a.min(now))
+}
+
+/// Breaker verdict for one deletion. `threshold == 0` disables the breaker.
+/// `ack` is the repo's allow-mass-deletion annotation parsed to UTC and
+/// ALREADY CLAMPED by the caller (see [`clamp_ack`]). A deletion is
+/// acknowledged iff its `deletionTimestamp <= ack`. Unacked pending count `>=
+/// threshold` holds every unacked pending deletion.
+pub fn breaker_state(
+    unacked_pending_for_repo: usize,
+    threshold: u32,
+    deletion_timestamp: chrono::DateTime<chrono::Utc>,
+    ack: Option<chrono::DateTime<chrono::Utc>>,
+) -> BreakerState {
+    if threshold == 0 {
+        return BreakerState::Allowed;
+    }
+    if ack.is_some_and(|a| deletion_timestamp <= a) {
+        return BreakerState::Allowed;
+    }
+    if unacked_pending_for_repo >= threshold as usize {
+        BreakerState::Held
+    } else {
+        BreakerState::Allowed
+    }
+}
+
+/// Effective cascade policy for a `Snapshot`: the stamped value, else `Retain`
+/// (covers pre-upgrade + manual + discovered — all safe).
+pub fn effective_on_schedule_delete(stamped: Option<ScheduleDeletePolicy>) -> ScheduleDeletePolicy {
+    stamped.unwrap_or_default()
 }
 
 /// Where a `SnapshotDelete` Job may run. The Kubernetes `NamespaceLifecycle`
@@ -147,6 +374,49 @@ pub fn delete_job_placement(
                          is nowhere to run the ClusterRepository snapshot-delete Job during \
                          namespace deletion; set KOPIUR_NAMESPACE on the controller Deployment — \
                          the kopia snapshot is orphaned instead"
+                    .to_string(),
+            },
+        },
+    }
+}
+
+/// Where a BATCH delete Job runs (mass-deletion protection): always the
+/// repository's home namespace (`repo_namespace` for a namespaced `Repository`,
+/// `operator_namespace` for a `ClusterRepository`), unless that namespace is
+/// itself the terminating one, or the operator namespace is unknown →
+/// [`DeleteJobPlacement::OrphanFallback`]. Unlike [`delete_job_placement`],
+/// there is no "Snapshot's own namespace" fallback — a batch spans many
+/// `Snapshot`s (possibly many namespaces), so it always runs at the
+/// repository's home.
+pub fn batch_job_placement(
+    repo_namespace: Option<&str>,
+    operator_namespace: Option<&str>,
+    terminating_ns: Option<&str>,
+) -> DeleteJobPlacement {
+    match repo_namespace {
+        Some(rns) if terminating_ns != Some(rns) => DeleteJobPlacement::RunIn(rns.to_string()),
+        Some(rns) => DeleteJobPlacement::OrphanFallback {
+            reason: format!(
+                "the Repository lives in `{rns}`, the same namespace being deleted, so no \
+                 surviving namespace can host the snapshot-delete batch Job; the kopia snapshots \
+                 are orphaned instead — delete them manually with `kopia snapshot delete` if \
+                 unwanted"
+            ),
+        },
+        None => match operator_namespace {
+            Some(op) if terminating_ns != Some(op) => DeleteJobPlacement::RunIn(op.to_string()),
+            Some(op) => DeleteJobPlacement::OrphanFallback {
+                reason: format!(
+                    "the operator namespace `{op}` is itself the namespace being deleted, so it \
+                     cannot host the snapshot-delete batch Job; the kopia snapshots are orphaned \
+                     instead"
+                ),
+            },
+            None => DeleteJobPlacement::OrphanFallback {
+                reason: "the operator namespace is unknown (KOPIUR_NAMESPACE is unset), so there \
+                         is nowhere to run the ClusterRepository snapshot-delete batch Job; set \
+                         KOPIUR_NAMESPACE on the controller Deployment — the kopia snapshots are \
+                         orphaned instead"
                     .to_string(),
             },
         },

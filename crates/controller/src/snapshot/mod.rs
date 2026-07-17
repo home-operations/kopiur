@@ -8,10 +8,12 @@
 //!    EXHAUSTIVE [`plan_deletion`] decision, execute its IO, then remove the
 //!    finalizer.
 //!
-//! [`plan_deletion`] is a pure function over `(DeletionPolicy, annotations)`
-//! returning a [`DeletionPlan`]. It is the single most important thing to get
-//! right and is exhaustively unit-tested — the `match` has **no** `_ =>` arm, so
-//! a new `DeletionPolicy` variant cannot compile until handled (SKILL thesis).
+//! [`plan_deletion`] is a pure function over [`DeletionFacts`] returning a
+//! [`DeletionPlan`]. It is the single most important thing to get right and is
+//! exhaustively unit-tested — every `match` over `DeletionPolicy`,
+//! `ScheduleDeletePolicy`, `NamespaceDeletePolicy`, `OwnerState`, and
+//! `BreakerState` has **no** `_ =>` arm, so a new variant of any of them cannot
+//! compile until handled (SKILL thesis).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,9 +52,11 @@ use crate::error::{Error, Result, error_policy_for};
 use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 
+mod batch;
 mod build;
 mod plan;
 
+pub use batch::*;
 pub(crate) use build::*;
 pub use plan::*;
 
@@ -1511,8 +1515,89 @@ async fn fail_for_hook(
     Ok(Action::await_change())
 }
 
-/// Execute the deletion plan (the tested [`plan_deletion`] decision) against the
-/// cluster, then remove the finalizer when cleanup completes.
+/// Assemble [`DeletionFacts`] and decide the [`DeletionPlan`] for
+/// `handle_deletion`, resolving the repository along the way when needed.
+/// Split out of `handle_deletion` itself purely to keep its own cognitive
+/// complexity down — everything here is a linear assemble-then-decide, no
+/// branchy executor logic.
+///
+/// This call site always supplies `owner: Alive | NoScheduleOwner` (never
+/// `GoneOrReplaced` — M4 adds the real owner GET) and `breaker: Allowed` (M4
+/// wires the real repository-scoped count). Per [`plan_deletion`]'s decision
+/// table, the cascade guard (step 3) only fires for `owner == GoneOrReplaced`,
+/// and `Alive`/`NoScheduleOwner` produce IDENTICAL plans in every row (both
+/// skip straight to steps 4-6) — so this is behavior-preserving: with these
+/// facts, [`DeletionPlan::RetainSnapshotOnScheduleDelete`] and
+/// [`DeletionPlan::HoldSnapshotDeletion`] cannot be produced, and every other
+/// plan matches exactly what the pre-M2 `plan_deletion` +
+/// `namespace_delete_plan` pair computed.
+async fn resolve_deletion_plan(
+    ctx: &Context,
+    backup: &Snapshot,
+    namespace: &str,
+    policy: DeletionPolicy,
+    ns_terminating: bool,
+) -> (
+    DeletionPlan,
+    Option<Result<(RepositoryRef, ResolvedRepository)>>,
+) {
+    let owner =
+        schedule_owner_ref(backup).map_or(OwnerState::NoScheduleOwner, |_| OwnerState::Alive);
+    let cascade = effective_on_schedule_delete(backup.spec.on_schedule_delete);
+
+    // Pre-check whether the repository must be resolved at all: needed for the
+    // namespace cascade (to read `onNamespaceDelete`) or to place/build the
+    // delete Job for a per-CR Delete plan. Evaluated with `ns_terminating: false`
+    // — the pre-check only needs the per-CR half; a real terminating namespace
+    // already forces the resolve on its own via the `ns_terminating ||` below.
+    let would_delete = matches!(
+        plan_deletion(DeletionFacts {
+            policy,
+            annotations: backup.annotations(),
+            owner,
+            cascade,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+        }),
+        DeletionPlan::DeleteSnapshot
+    );
+
+    // Resolve the repository once for the whole deletion path — preferring the
+    // ref pinned into `status.resolved.repository` over the live recipe, which
+    // the namespace reaper usually deletes (no finalizer) before this finalizer
+    // runs. Only needed when the cascade policy must be consulted or a delete
+    // Job must be built; Retain/Orphan of a lone CR stays IO-free.
+    let resolved = if ns_terminating || would_delete {
+        Some(resolve_repo_for_deletion(ctx, backup, namespace).await)
+    } else {
+        None
+    };
+    // The repository itself can no longer be resolved (already gone): `None`
+    // routes `plan_deletion`'s ns-terminating fail-safe to Orphan — never guess
+    // Delete with history at stake.
+    let ns_policy = resolved
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, repo)| repo.on_namespace_delete);
+
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        annotations: backup.annotations(),
+        owner,
+        cascade,
+        ns_terminating,
+        ns_policy,
+        // M4 wires the real repository-scoped breaker count; this call site
+        // never sees `Held` (see the invariant above).
+        breaker: BreakerState::Allowed,
+    });
+    (plan, resolved)
+}
+
+/// Execute the deletion plan (the tested [`plan_deletion`] decision, assembled
+/// by [`resolve_deletion_plan`]) against the cluster, then remove the
+/// finalizer when cleanup completes.
 async fn handle_deletion(
     backup: &Snapshot,
     ctx: &Context,
@@ -1542,8 +1627,6 @@ async fn handle_deletion(
         io::cleanup_staged_source(&ctx.client, namespace, name).await?;
     }
 
-    let base_plan = plan_deletion(policy, backup.annotations());
-
     // Namespace-deletion cascade (ADR-0005 §5): if the owning namespace is being torn
     // down, the repository's `onNamespaceDelete` decides. Default `Orphan` keeps
     // off-site history (a `kubectl delete ns` must not be a data-loss event); only an
@@ -1554,27 +1637,8 @@ async fn handle_deletion(
         .await
         .unwrap_or(false);
 
-    // Resolve the repository once for the whole deletion path — preferring the
-    // ref pinned into `status.resolved.repository` over the live recipe, which
-    // the namespace reaper usually deletes (no finalizer) before this finalizer
-    // runs. Only needed when the cascade policy must be consulted or a delete
-    // Job must be built; Retain/Orphan of a lone CR stays IO-free.
-    let resolved = if ns_terminating || matches!(base_plan, DeletionPlan::DeleteSnapshot) {
-        Some(resolve_repo_for_deletion(ctx, backup, namespace).await)
-    } else {
-        None
-    };
-
-    let plan = if ns_terminating {
-        match resolved.as_ref() {
-            Some(Ok((_, repo))) => namespace_delete_plan(repo.on_namespace_delete, true, base_plan),
-            // The repository itself can no longer be resolved (already gone):
-            // fail safe to Orphan — never guess Delete with history at stake.
-            _ => DeletionPlan::OrphanSnapshot,
-        }
-    } else {
-        base_plan
-    };
+    let (plan, resolved) =
+        resolve_deletion_plan(ctx, backup, namespace, policy, ns_terminating).await;
     tracing::info!(?plan, backup = %name, ns_terminating, "executing backup deletion plan");
 
     match plan {
@@ -1634,7 +1698,41 @@ async fn handle_deletion(
             )
             .await
         }
+        // Unreachable by construction with this call site's facts (`owner` is
+        // never `GoneOrReplaced` here — see `resolve_deletion_plan`'s doc
+        // comment): routed to the safe, non-panicking executor M4 will
+        // exercise for real.
+        DeletionPlan::RetainSnapshotOnScheduleDelete => {
+            retain_on_schedule_delete(api, backup).await
+        }
+        // Unreachable by construction with this call site's facts (`breaker`
+        // is always `Allowed` here). Conservative: keep the finalizer and
+        // requeue rather than panic.
+        DeletionPlan::HoldSnapshotDeletion => hold_deletion(name),
     }
+}
+
+/// Executor for [`DeletionPlan::RetainSnapshotOnScheduleDelete`] — same as
+/// [`DeletionPlan::RetainSnapshot`] (release the finalizer, no repo contact).
+/// M4 adds the Warning event (`SnapshotRetainedOnScheduleDelete`) + the
+/// cascade-retained counter; this call site never produces this plan yet (see
+/// `resolve_deletion_plan`'s doc comment), so it's a safe, unexercised default.
+async fn retain_on_schedule_delete(api: &Api<Snapshot>, backup: &Snapshot) -> Result<Action> {
+    io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    Ok(Action::await_change())
+}
+
+/// Executor for [`DeletionPlan::HoldSnapshotDeletion`] — conservative
+/// placeholder: keep the finalizer and requeue rather than panic. This call
+/// site never produces this plan yet (`breaker` is always `Allowed`); M4
+/// wires the real hold (phase `Deleting` + `DeletionHeld=True` + long
+/// requeue).
+fn hold_deletion(name: &str) -> Result<Action> {
+    tracing::debug!(
+        backup = %name,
+        "deletion held by mass-deletion breaker (unreachable with M2 facts); requeueing"
+    );
+    Ok(Action::requeue(Duration::from_secs(60)))
 }
 
 /// Release the finalizer WITHOUT contacting the repository: record the orphan
