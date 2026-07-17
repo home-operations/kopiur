@@ -359,6 +359,27 @@ pub enum MoverError {
     /// degrades inside `init_tracing` and never reaches here).
     #[error(transparent)]
     Telemetry(#[from] kopiur_telemetry::TelemetryError),
+
+    /// A `SnapshotDeleteBatch` run deleted some, but not all, of its members.
+    /// Every member is attempted independently — never short-circuited by an
+    /// earlier failure, since kopia's delete is idempotent and every retry of
+    /// the WHOLE batch monotonically shrinks the truly-remaining set — so a
+    /// transient repo blip mid-batch converges on the next Job retry instead
+    /// of wedging on the first failure. Per-item causes are only logged (a
+    /// `warn!` per failing member); this variant just names how many failed,
+    /// since the batch has no per-item CR status to carry a breakdown.
+    #[error(
+        "batch snapshot delete completed incompletely: {failed} of {total} member deletes \
+         failed; see the mover pod logs for the per-item kopia errors. Deletes are idempotent, \
+         so retrying (the Job, or the next scheduled batch) only re-attempts what is still \
+         outstanding"
+    )]
+    BatchDeleteIncomplete {
+        /// How many of the batch's members failed to delete.
+        failed: usize,
+        /// The batch's total member count.
+        total: usize,
+    },
 }
 
 impl MoverError {
@@ -394,7 +415,8 @@ impl MoverError {
             | MoverError::StatusPatch { .. }
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
-            | MoverError::Telemetry(_) => KopiaErrorClass::Unknown,
+            | MoverError::Telemetry(_)
+            | MoverError::BatchDeleteIncomplete { .. } => KopiaErrorClass::Unknown,
         }
     }
 
@@ -616,6 +638,20 @@ mod tests {
             f.to_string(),
             "verification successExpr evaluated false: \"stats.files > 0\""
         );
+    }
+
+    #[test]
+    fn batch_delete_incomplete_names_the_counts_and_is_idempotent_retry_friendly() {
+        let err = MoverError::BatchDeleteIncomplete {
+            failed: 2,
+            total: 5,
+        };
+        let msg = err.to_string();
+        // what: how many of the batch failed
+        assert!(msg.contains("2 of 5 member deletes failed"), "{msg}");
+        // fix: retrying only re-attempts what's outstanding (idempotent deletes)
+        assert!(msg.contains("idempotent"), "{msg}");
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
     }
 
     #[test]

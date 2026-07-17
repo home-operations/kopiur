@@ -286,6 +286,127 @@ fn snapshot_delete_roundtrip() {
 }
 
 #[test]
+fn snapshot_delete_legacy_wire_still_decodes_after_batch_variant_added() {
+    // Wire-shape guard: adding the sibling `SnapshotDeleteBatch` Operation
+    // variant must not perturb `SnapshotDelete`'s existing external tag/shape
+    // — an in-flight `{name}-delete` Job spawned by an older controller
+    // during an operator upgrade must still decode against the new mover
+    // image.
+
+    // The oldest wire shape: no anchor key at all (pre-anchor Jobs).
+    let bare = serde_json::json!({
+        "snapshotDelete": { "snapshotId": "todelete" }
+    });
+    let op: Operation = serde_json::from_value(bare).expect("bare SnapshotDelete decodes");
+    assert_eq!(op.kind_str(), "SnapshotDelete");
+    match op {
+        Operation::SnapshotDelete(SnapshotDeleteOp {
+            snapshot_id,
+            anchor,
+        }) => {
+            assert_eq!(snapshot_id, "todelete");
+            assert_eq!(anchor, SnapshotAnchor::default());
+        }
+        other => panic!("expected SnapshotDelete, got {other:?}"),
+    }
+
+    // Today's exact wire shape: snapshotId + a populated anchor.
+    let current = serde_json::json!({
+        "snapshotDelete": {
+            "snapshotId": "todelete",
+            "anchor": {
+                "sourcePath": "/pvc/db",
+                "startTime": "2026-06-19T05:54:19Z",
+            }
+        }
+    });
+    let op: Operation = serde_json::from_value(current).expect("current SnapshotDelete decodes");
+    assert_eq!(op.kind_str(), "SnapshotDelete");
+    match op {
+        Operation::SnapshotDelete(SnapshotDeleteOp {
+            snapshot_id,
+            anchor,
+        }) => {
+            assert_eq!(snapshot_id, "todelete");
+            assert_eq!(anchor.source_path, "/pvc/db");
+            assert_eq!(anchor.start_time.as_deref(), Some("2026-06-19T05:54:19Z"));
+        }
+        other => panic!("expected SnapshotDelete, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_delete_batch_roundtrip() {
+    let spec = MoverWorkSpec {
+        version: 2,
+        operation: Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp {
+            items: vec![
+                SnapshotDeleteItem {
+                    snapshot_id: "a1".into(),
+                    anchor: SnapshotAnchor {
+                        source_path: "/pvc/db".into(),
+                        start_time: Some("2026-06-19T05:54:19Z".into()),
+                        username: Some("mydb".into()),
+                        hostname: Some("prod".into()),
+                    },
+                },
+                SnapshotDeleteItem {
+                    snapshot_id: "a2".into(),
+                    anchor: SnapshotAnchor::default(),
+                },
+            ],
+        }),
+        identity: sample_identity(),
+        repository: RepositoryConnect::Filesystem {
+            path: "/repo".into(),
+        },
+        target_ref: TargetRef {
+            kind: "SnapshotDeleteBatch".into(),
+            ..sample_target()
+        },
+        hook_plan: HookPlanSummary::default(),
+        options: MoverOptions::default(),
+        cache: Default::default(),
+        throttle: Default::default(),
+    };
+    assert_eq!(roundtrip(&spec), spec);
+    assert_eq!(spec.operation.kind_str(), "SnapshotDeleteBatch");
+    // Externally tagged: { "snapshotDeleteBatch": { "items": [...] } }, camelCase.
+    let v = serde_json::to_value(&spec).unwrap();
+    let items = &v["operation"]["snapshotDeleteBatch"]["items"];
+    assert_eq!(items[0]["snapshotId"], "a1");
+    assert_eq!(items[0]["anchor"]["startTime"], "2026-06-19T05:54:19Z");
+    assert_eq!(items[0]["anchor"]["username"], "mydb");
+    assert_eq!(items[1]["snapshotId"], "a2");
+}
+
+#[test]
+fn snapshot_delete_batch_item_omits_empty_anchor() {
+    // Wire-shape guard: an item with no anchor must elide the key entirely
+    // (mirrors SnapshotDeleteOp's own idiom), not serialize `"anchor":{}`.
+    let item = SnapshotDeleteItem {
+        snapshot_id: "a1".into(),
+        anchor: SnapshotAnchor::default(),
+    };
+    let v = serde_json::to_value(&item).unwrap();
+    assert_eq!(v["snapshotId"], "a1");
+    assert!(
+        v.get("anchor").is_none(),
+        "an empty anchor must be omitted from the wire, not emitted as {{}}"
+    );
+    // And an item WITH an anchor keeps it.
+    let with_anchor = SnapshotDeleteItem {
+        snapshot_id: "a2".into(),
+        anchor: SnapshotAnchor {
+            source_path: "/pvc/db".into(),
+            ..Default::default()
+        },
+    };
+    let v2 = serde_json::to_value(&with_anchor).unwrap();
+    assert_eq!(v2["anchor"]["sourcePath"], "/pvc/db");
+}
+
+#[test]
 fn bootstrap_repository_roundtrip_and_wire_shape() {
     let spec = MoverWorkSpec {
         version: 1,
