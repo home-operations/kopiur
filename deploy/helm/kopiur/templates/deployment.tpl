@@ -88,6 +88,10 @@ spec:
             - name: KOPIUR_STREAMING_LISTS
               value: "true"
             {{- end }}
+            # Cap on concurrently running Snapshot-delete BATCH mover Jobs,
+            # across every repository (mass-deletion protection).
+            - name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
+              value: {{ .Values.maxConcurrentDeleteJobs | quote }}
             # Bind address for the HTTP server (/metrics, /healthz, /readyz),
             # rendered "[::]:<port>" from metrics.port — the dual-stack wildcard
             # serves both IPv4 and IPv6 kubelets.

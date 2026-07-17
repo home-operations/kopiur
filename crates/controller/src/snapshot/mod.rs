@@ -3058,21 +3058,26 @@ async fn reap_backup_creds_once(
     Ok(true)
 }
 
-/// Backfill `status.resolved.credentialProjection` onto a `Snapshot` that ran before the
-/// pin existed (#255).
+/// Backfill `status.resolved.credentialProjection` and/or `status.resolved.repository`
+/// onto a `Snapshot` that ran before either pin existed.
 ///
-/// The pin is written at job-creation time (`resolved_run_status`), so every run from this
-/// version on carries it. A `Snapshot` that already succeeded under an older operator has
-/// none — and would strand its finalizer the moment its `SnapshotPolicy` is deleted. Every
+/// The credential-projection pin is written at job-creation time (`resolved_run_status`),
+/// so every run from that version on carries it; a `Snapshot` that already succeeded under
+/// an older operator has none and would strand its finalizer the moment its `SnapshotPolicy`
+/// is deleted (#255). The repository pin exists for a different consumer: the mass-deletion
+/// breaker counts pending destructive deletions PER REPOSITORY straight from the `Snapshot`
+/// store, keyed on this pin — a pre-#255 `Snapshot` without it would be invisible to that
+/// per-repo count and fall into the conservative unpinned ("unknown") bucket forever. Every
 /// `Snapshot` reconciles at least once on operator startup and lands here, so backfilling
 /// from this branch converts the whole existing fleet before any recipe can disappear.
 ///
-/// Cost: gated on the pin being absent AND a kopia snapshot existing, so it is one GET per
-/// legacy `Snapshot`, once — the patch makes the guard false forever after. The one case
-/// that re-GETs per steady-state pass is a legacy `Snapshot` whose recipe is ALREADY gone,
-/// a shrinking set that is by definition already stuck. That retry is deliberate rather
-/// than tolerated: re-creating the `SnapshotPolicy` is one of the documented remedies for
-/// that state, and re-checking makes it self-healing.
+/// Idempotent and independently gated per pin (`needs_projection`/`needs_repository`): a
+/// `Snapshot` needing only one is patched with only that key, and the guard for each is false
+/// forever after its first backfill. Cost: at most one `SnapshotPolicy` GET per legacy
+/// `Snapshot`, once. The one case that re-GETs per steady-state pass is a legacy `Snapshot`
+/// whose recipe is ALREADY gone — a shrinking, already-stuck set — and even then the
+/// repository pin is deliberately left unset (tolerated: the conservative unpinned bucket
+/// covers it) rather than blocking on a recipe that will never come back.
 async fn backfill_projection_pin(
     backup: &Snapshot,
     ctx: &Context,
@@ -3085,9 +3090,12 @@ async fn backfill_projection_pin(
         .as_ref()
         .and_then(|s| s.snapshot.as_ref())
         .is_some();
-    // Already pinned, or there is no kopia snapshot for a finalizer to delete — either
-    // way the deletion path never consults the pin.
-    if pinned_projection(backup).is_some() || !has_snapshot {
+    // Credential projection only matters once there is a kopia snapshot for a
+    // finalizer to delete; the repository pin has no such gate — it matters
+    // the moment the Snapshot exists, so the breaker can attribute it.
+    let needs_projection = pinned_projection(backup).is_none() && has_snapshot;
+    let needs_repository = plan::needs_repository_backfill(backup);
+    if !needs_projection && !needs_repository {
         return Ok(());
     }
     let Some(policy_ref) = backup.spec.policy_ref.as_ref() else {
@@ -3098,17 +3106,17 @@ async fn backfill_projection_pin(
     let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
         return Ok(());
     };
-    let pinned = plan::projection_to_pin(&config);
-    io::patch_status(
-        api,
-        name,
-        serde_json::json!({ "resolved": { "credentialProjection": pinned } }),
-    )
-    .await?;
+    let Some(body) =
+        plan::backfill_patch_body(&config, namespace, needs_projection, needs_repository)
+    else {
+        return Ok(());
+    };
+    io::patch_status(api, name, body).await?;
     tracing::info!(
         backup = %name,
-        enabled = pinned.enabled,
-        "backfilled the credential-projection pin onto a Snapshot that predates it"
+        needs_projection,
+        needs_repository,
+        "backfilled resolved pin(s) onto a Snapshot that predates them"
     );
     Ok(())
 }

@@ -239,6 +239,13 @@
       "title": "logging",
       "type": "object"
     },
+    "maxConcurrentDeleteJobs": {
+      "default": 2,
+      "description": "Cap on concurrently running Snapshot-delete BATCH mover Jobs, across every\nrepository (mass-deletion protection). Bounds how much delete traffic a\nmass-deletion wave (or an incident's retroactive prune) can put on the\nbackend at once; it does NOT bound how many Snapshots one batch Job deletes,\nnor does it gate whether a deletion is allowed at all — that's\ndeletionProtection.threshold on the Repository/ClusterRepository. Must be\n\u003e= 1: a zero cap would wedge every deletion cluster-wide.",
+      "minimum": 1,
+      "title": "maxConcurrentDeleteJobs",
+      "type": "integer"
+    },
     "metrics": {
       "description": "=============================================================================\nController port \u0026 probes\n=============================================================================",
       "properties": {

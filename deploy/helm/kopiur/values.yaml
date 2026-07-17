@@ -108,6 +108,18 @@ workerThreads: 2
 # your apiserver has the WatchList feature gate disabled — the watches degrade
 # to paged lists either way, but turning it off skips the feature probe.
 streamingLists: true
+# @schema
+# type: integer
+# minimum: 1
+# @schema
+# -- Cap on concurrently running Snapshot-delete BATCH mover Jobs, across every
+# repository (mass-deletion protection). Bounds how much delete traffic a
+# mass-deletion wave (or an incident's retroactive prune) can put on the
+# backend at once; it does NOT bound how many Snapshots one batch Job deletes,
+# nor does it gate whether a deletion is allowed at all — that's
+# deletionProtection.threshold on the Repository/ClusterRepository. Must be
+# >= 1: a zero cap would wedge every deletion cluster-wide.
+maxConcurrentDeleteJobs: 2
 # -- Extra CLI args appended to the controller container.
 extraArgs: []
 # -- Extra environment variables for the controller container.

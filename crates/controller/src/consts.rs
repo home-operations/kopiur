@@ -7,11 +7,12 @@
 //! re-exported here so controller call sites keep their existing import paths.
 
 pub use kopiur_api::consts::{
-    API_VERSION, CONFIG_LABEL, INDEX_BLOB_HEALTH_CONDITION, MAINTENANCE_CONFIGURED_CONDITION,
-    MANAGED_BY_LABEL, MANAGED_BY_VALUE, OP_LABEL, OP_RESTORE, OP_RESTORE_TARGET, ORIGIN_LABEL,
-    READY_CONDITION, RECONCILING_CONDITION, REPOSITORY_UID_LABEL, RUN_MODE_ANNOTATION,
-    RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL, STALLED_CONDITION,
+    ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, CONFIG_LABEL, INDEX_BLOB_HEALTH_CONDITION,
+    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OP_LABEL, OP_RESTORE,
+    OP_RESTORE_TARGET, ORIGIN_LABEL, READY_CONDITION, RECONCILING_CONDITION, REPOSITORY_UID_LABEL,
+    RUN_MODE_ANNOTATION, RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL,
+    STALLED_CONDITION,
 };
 
 /// `Snapshot` condition recording whether its repository accepts writes (§11). Set
@@ -479,3 +480,46 @@ pub const SERVER_INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
 pub const SERVER_NAME_LABEL: &str = "app.kubernetes.io/name";
 /// `app.kubernetes.io/name` value for server objects.
 pub const SERVER_NAME_VALUE: &str = "kopiur-server";
+
+// --- Mass-deletion protection (ADR: DeletionProtectionSpec) ----------------
+
+/// [`OP_LABEL`] value for the mass-deletion batch-delete mover Job — several
+/// `Snapshot`s' kopia manifests deleted in one Job (M2's `SnapshotDeleteBatch`
+/// mover op). Mirrors the shape of [`OP_RESTORE_POPULATE`]; the existing
+/// single-delete finalizer Job stamps its own value as a string literal today
+/// rather than through a named const.
+pub const OP_SNAPSHOT_DELETE_BATCH: &str = "snapshot-delete-batch";
+/// Annotation on a batch-delete Job listing the comma-joined, SORTED
+/// `Snapshot` UIDs it targets — the dispatcher's single source of truth for
+/// "which Snapshots does this Job cover" (single-flight / no-overlap checks).
+/// An annotation, not a label: an arbitrary-length UID list can exceed a
+/// label-value's 63-char limit for anything but a tiny batch.
+pub const DELETE_MEMBERS_ANNOTATION: &str = "kopiur.home-operations.com/delete-members";
+/// Label on a batch-delete Job carrying the target repository's hash
+/// (`crate::snapshot::repo_label`), so the dispatcher can LIST live batch Jobs
+/// for one repository (single-flight / concurrency-cap enforcement) without
+/// listing every batch Job in the install scope.
+pub const DELETE_REPO_LABEL: &str = "kopiur.home-operations.com/delete-repo";
+
+/// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
+/// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
+/// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the
+/// repository.
+pub const DELETION_HELD_CONDITION: &str = "DeletionHeld";
+/// `reason` for [`DELETION_HELD_CONDITION`] = `True`.
+pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
+
+/// Event reason on a `Snapshot` whose own deletion is held by the
+/// mass-deletion breaker.
+pub const SNAPSHOT_DELETION_HELD_REASON: &str = "SnapshotDeletionHeld";
+/// Event reason on a `Repository`/`ClusterRepository` when its mass-deletion
+/// breaker trips (pairs with `kopiur_api::consts::MASS_DELETION_HELD_CONDITION`).
+pub const MASS_DELETION_HELD_REASON: &str = "MassDeletionHeld";
+/// Event reason when a `Snapshot` is retained by the schedule-deletion cascade
+/// guard (`onScheduleDelete: Retain` with a gone/replaced owning
+/// `SnapshotSchedule`).
+pub const SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON: &str = "SnapshotRetainedOnScheduleDelete";
+/// Event reason when [`ALLOW_MASS_DELETION_ANNOTATION`]'s value fails to parse
+/// as an RFC3339 timestamp — the ack is ignored (fail-safe) rather than
+/// silently disarming the breaker.
+pub const INVALID_MASS_DELETION_ACK_REASON: &str = "InvalidMassDeletionAck";

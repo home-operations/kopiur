@@ -165,6 +165,24 @@ pub const WORK_SPEC_SWEEP_MIN_AGE_ENV: &str = "KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SE
 /// comfortable margin over any apply/crash window).
 pub const DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS: i64 = 3600;
 
+/// Cap on concurrently RUNNING `Snapshot`-delete BATCH mover Jobs across every
+/// repository the controller manages (the operator's own GFS-retention prunes
+/// included) — the throttle the batch dispatcher checks before firing a new
+/// one (`crate::snapshot::throttle_verdict`). Bounds how much delete traffic a
+/// mass-deletion wave (or an incident's retroactive prune) can put on the
+/// backend at once; it does NOT bound how many `Snapshot`s one batch Job
+/// deletes (see `crate::snapshot::MAX_BATCH_MEMBERS`), nor does it gate
+/// whether a deletion is allowed at all — that is
+/// `Repository`/`ClusterRepository` `spec.deletionProtection.threshold`.
+/// Defaults to [`DEFAULT_MAX_CONCURRENT_DELETE_JOBS`]. Reachable via the
+/// chart's `controller.maxConcurrentDeleteJobs`.
+pub const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_JOBS";
+
+/// Fallback cap when [`MAX_CONCURRENT_DELETE_JOBS_ENV`] is unset: 2 concurrent
+/// batch-delete Jobs cluster-wide — enough to make progress on a queued wave
+/// without saturating the backend.
+pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: usize = 2;
+
 /// Steady-state cadence for re-checking the webhook cert for rotation and
 /// re-asserting the `caBundle`. The leaf is long-lived and renewed well before
 /// expiry, so a slow cadence is ample once the cert is established.
@@ -299,6 +317,16 @@ pub struct ControllerArgs {
           default_value_t = DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS,
           value_parser = parse_sweep_min_age)]
     pub work_spec_sweep_min_age_secs: i64,
+
+    /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
+    /// every repository. `0` is rejected: it would wedge every deletion, not
+    /// just a mass-deletion wave — use `deletionProtection.threshold: 0` (or
+    /// the per-Snapshot skip-snapshot-cleanup annotation) to disable
+    /// protection instead of trying to disable deletion via this knob.
+    #[arg(long, env = MAX_CONCURRENT_DELETE_JOBS_ENV,
+          default_value_t = DEFAULT_MAX_CONCURRENT_DELETE_JOBS,
+          value_parser = parse_max_concurrent_delete_jobs)]
+    pub max_concurrent_delete_jobs: usize,
 
     /// Cluster-scoped install: watch every namespace and reconcile
     /// ClusterRepository. The chart stamps it for `installScope: cluster`.
@@ -514,6 +542,9 @@ pub struct ControllerConfig {
     pub work_spec_sweep_interval_secs: u64,
     /// Minimum age (seconds) before the sweep may reap a work-spec ConfigMap.
     pub work_spec_sweep_min_age_secs: i64,
+    /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
+    /// every repository (>= 1; `0` is rejected at parse time).
+    pub max_concurrent_delete_jobs: usize,
 }
 
 impl ControllerArgs {
@@ -590,6 +621,7 @@ impl ControllerArgs {
             leader_election,
             work_spec_sweep_interval_secs: self.work_spec_sweep_interval_secs,
             work_spec_sweep_min_age_secs: self.work_spec_sweep_min_age_secs.max(0),
+            max_concurrent_delete_jobs: self.max_concurrent_delete_jobs,
         })
     }
 }
@@ -639,6 +671,31 @@ fn parse_sweep_min_age(value: &str) -> Result<i64, String> {
              seconds; unset it to use the default {DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS}"
         )
     })
+}
+
+/// Value parser for [`MAX_CONCURRENT_DELETE_JOBS_ENV`]. Empty means "unset" (→
+/// the default); `0` is REJECTED — a zero cap would wedge every Snapshot
+/// deletion cluster-wide, not just a mass-deletion wave, which is never the
+/// intended remedy (the message names the actual knobs for that intent).
+fn parse_max_concurrent_delete_jobs(value: &str) -> Result<usize, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_MAX_CONCURRENT_DELETE_JOBS);
+    }
+    match value.parse::<usize>() {
+        Ok(0) => Err(format!(
+            "KOPIUR_MAX_CONCURRENT_DELETE_JOBS='0' would wedge every Snapshot deletion \
+             cluster-wide, not just a mass-deletion wave; to disable the mass-deletion breaker \
+             instead, set deletionProtection.threshold: 0 on the repository (or use the \
+             per-Snapshot skip-snapshot-cleanup annotation); unset this to use the default \
+             {DEFAULT_MAX_CONCURRENT_DELETE_JOBS}"
+        )),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!(
+            "KOPIUR_MAX_CONCURRENT_DELETE_JOBS='{value}' is not a valid job count; use a \
+             positive integer, e.g. 2; unset it to use the default \
+             {DEFAULT_MAX_CONCURRENT_DELETE_JOBS}"
+        )),
+    }
 }
 
 /// Value parser for [`WORKER_THREADS_ENV`]/`--worker-threads`: empty ≡ unset
@@ -715,6 +772,10 @@ mod tests {
         // Off-chart runs keep the pre-flag behavior: cluster-wide, no election.
         assert_eq!(cfg.watch_scope, WatchScope::Cluster);
         assert_eq!(cfg.leader_election, None);
+        assert_eq!(
+            cfg.max_concurrent_delete_jobs,
+            DEFAULT_MAX_CONCURRENT_DELETE_JOBS
+        );
     }
 
     #[test]
@@ -749,6 +810,8 @@ mod tests {
             "vwc",
             "--webhook-mutating-config",
             "mwc",
+            "--max-concurrent-delete-jobs",
+            "4",
         ]);
         assert_eq!(cfg.mover_image, "example.com/mover:v1");
         assert!(cfg.mover_image_overridden);
@@ -765,6 +828,7 @@ mod tests {
         assert_eq!(cfg.webhook_service_name, "webhook-svc");
         assert_eq!(cfg.webhook_validating_config.as_deref(), Some("vwc"));
         assert_eq!(cfg.webhook_mutating_config.as_deref(), Some("mwc"));
+        assert_eq!(cfg.max_concurrent_delete_jobs, 4);
     }
 
     // --- the chart argv contract: deployment.tpl has stamped these args since
@@ -867,6 +931,7 @@ mod tests {
             "--webhook-mutating-config=",
             "--namespace=",
             "--lease-name=",
+            "--max-concurrent-delete-jobs=",
         ]);
         assert_eq!(cfg.mover_image, crate::jobs::DEFAULT_MOVER_IMAGE);
         assert!(!cfg.mover_image_overridden);
@@ -881,6 +946,10 @@ mod tests {
         assert_eq!(cfg.webhook_mutating_config, None);
         // An empty --namespace means "no narrowing", not Namespaced("").
         assert_eq!(cfg.watch_scope, WatchScope::Cluster);
+        assert_eq!(
+            cfg.max_concurrent_delete_jobs,
+            DEFAULT_MAX_CONCURRENT_DELETE_JOBS
+        );
     }
 
     #[test]
@@ -984,6 +1053,55 @@ mod tests {
         assert!(!cfg.streaming_lists);
         assert!(!cfg.webhook_tls_managed);
         assert_eq!(cfg.leader_election, None);
+    }
+
+    // --- KOPIUR_MAX_CONCURRENT_DELETE_JOBS: 0 is a hard reject (would wedge
+    // every deletion), unlike worker-threads' clamp-to-1. ---
+
+    #[test]
+    #[serial]
+    fn max_concurrent_delete_jobs_zero_is_rejected_with_an_actionable_message() {
+        // Like worker-threads/sweep-interval, the value_parser runs at PARSE
+        // time (not resolve()), so the rejection surfaces from try_parse_from.
+        let err = ControllerArgs::try_parse_from([
+            "kopiur-controller",
+            "--max-concurrent-delete-jobs",
+            "0",
+        ])
+        .expect_err("a zero cap must not silently wedge every deletion");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KOPIUR_MAX_CONCURRENT_DELETE_JOBS='0'"),
+            "{msg}"
+        );
+        assert!(msg.contains("deletionProtection.threshold: 0"), "{msg}");
+        assert!(msg.contains("skip-snapshot-cleanup"), "{msg}");
+        assert!(msg.contains("unset this to use the default"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_delete_jobs_garbage_fails_loudly() {
+        let err = ControllerArgs::try_parse_from([
+            "kopiur-controller",
+            "--max-concurrent-delete-jobs",
+            "many",
+        ])
+        .expect_err("garbage job count must not silently default");
+        assert!(
+            err.to_string()
+                .contains("KOPIUR_MAX_CONCURRENT_DELETE_JOBS='many'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_delete_jobs_flag_overrides_the_default() {
+        assert_eq!(
+            resolve(&["--max-concurrent-delete-jobs", "10"]).max_concurrent_delete_jobs,
+            10
+        );
     }
 
     #[test]

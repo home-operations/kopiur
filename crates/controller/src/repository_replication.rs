@@ -611,6 +611,8 @@ mod tests {
             credential_projection_allowed: false,
             owner_ref: Default::default(),
             mode: RepositoryMode::ReadWrite,
+            deletion_protection: None,
+            mass_deletion_ack: None,
         }
     }
 

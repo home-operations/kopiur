@@ -161,6 +161,8 @@ mod tests {
             mode: Default::default(),
             credential_projection_allowed: false,
             owner_ref: Default::default(),
+            deletion_protection: None,
+            mass_deletion_ack: None,
         }
     }
 

@@ -124,6 +124,24 @@ tests:
           path: spec.template.spec.containers[0].ports[0].containerPort
           value: 9090
 
+  - it: defaults the delete-job concurrency cap to 2
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
+            value: "2"
+
+  - it: renders a custom maxConcurrentDeleteJobs
+    set:
+      maxConcurrentDeleteJobs: 5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
+            value: "5"
+
   - it: renders the default controller probes
     asserts:
       - equal:

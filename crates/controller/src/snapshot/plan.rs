@@ -499,6 +499,63 @@ pub(super) fn pinned_projection(backup: &Snapshot) -> Option<&CredentialProjecti
         .as_ref()
 }
 
+/// The repository ref pinned into `status.resolved.repository` at run time.
+/// `None` means the `Snapshot` predates the pin (pre-#255 fleet) — the
+/// mass-deletion breaker's per-repo count treats an unpinned `Snapshot` as
+/// conservatively unattributable to any one repository. `pub` (not
+/// `pub(super)`, unlike its `pinned_projection` sibling): the deletion
+/// gauge observer in `crate::metrics` reads it too.
+pub fn pinned_repository(backup: &Snapshot) -> Option<&RepositoryRef> {
+    backup
+        .status
+        .as_ref()?
+        .resolved
+        .as_ref()?
+        .repository
+        .as_ref()
+}
+
+/// Whether a `Snapshot`'s `status.resolved.repository` pin needs backfilling:
+/// the pin is absent AND the `Snapshot` has a `policyRef` to resolve one from.
+/// A `Snapshot` with no `policyRef` (discovered/manual)
+/// has no recipe to pin from and stays in the conservative unpinned bucket —
+/// that is the documented, accepted outcome, not a bug. Pure so the backfill's
+/// IO gate (`super::backfill_projection_pin`) is unit-tested without a cluster.
+pub(super) fn needs_repository_backfill(backup: &Snapshot) -> bool {
+    backup.spec.policy_ref.is_some() && pinned_repository(backup).is_none()
+}
+
+/// Build the partial `status.resolved` JSON merge-patch body for
+/// `super::backfill_projection_pin`: only the keys that actually need
+/// backfilling, so a `Snapshot` needing just one of the two pins never
+/// clobbers (or redundantly re-writes) the other. `None` when neither pin
+/// needs backfilling — the caller skips the patch entirely.
+pub(super) fn backfill_patch_body(
+    config: &SnapshotPolicy,
+    namespace: &str,
+    needs_projection: bool,
+    needs_repository: bool,
+) -> Option<serde_json::Value> {
+    if !needs_projection && !needs_repository {
+        return None;
+    }
+    let mut resolved = serde_json::Map::new();
+    if needs_projection {
+        resolved.insert(
+            "credentialProjection".to_string(),
+            serde_json::json!(projection_to_pin(config)),
+        );
+    }
+    if needs_repository {
+        let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
+        resolved.insert(
+            "repository".to_string(),
+            serde_json::json!(pinned_repository_ref(&config.spec.repository, &config_ns)),
+        );
+    }
+    Some(serde_json::json!({ "resolved": resolved }))
+}
+
 /// The mover identity pinned into `status.snapshot.identity` when the snapshot
 /// succeeded — the identity the snapshot was actually recorded under. The
 /// deletion path prefers it over re-deriving from a recipe that may since have

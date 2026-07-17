@@ -6,8 +6,8 @@ use kube::runtime::reflector::Store;
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{
-    Encryption, IdentityDefaults, MoverDefaults, NamespaceDeletePolicy, PhaseLabel, RepositoryKind,
-    RepositoryMode, RepositoryRef, ScheduleDefaults,
+    DeletionProtectionSpec, Encryption, IdentityDefaults, MoverDefaults, NamespaceDeletePolicy,
+    PhaseLabel, RepositoryKind, RepositoryMode, RepositoryRef, ScheduleDefaults,
 };
 use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
 use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
@@ -91,6 +91,17 @@ pub struct ResolvedRepository {
     /// owner references are invalid) — the repository, which outlives the
     /// namespace, owns the Job instead so GC still reaps it.
     pub owner_ref: OwnerReference,
+    /// The repository's mass-deletion breaker config
+    /// (`spec.deletionProtection`), cloned verbatim from either repo kind.
+    /// `None` → the breaker's default threshold applies
+    /// (`kopiur_api::consts::effective_mass_deletion_threshold`).
+    pub deletion_protection: Option<DeletionProtectionSpec>,
+    /// The RAW value of [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] from
+    /// the repository's `metadata.annotations`, if present. Deliberately
+    /// unparsed here: parsing/clamping the RFC3339 ack (and rejecting a
+    /// malformed value loudly rather than silently disarming the breaker) is
+    /// the consumer's job (M4's breaker evaluation), not this resolver's.
+    pub mass_deletion_ack: Option<String>,
 }
 
 /// Which API a [`RepositoryRef`] resolves against, derived purely from `kind`.
@@ -176,6 +187,7 @@ pub async fn resolve_repository_ref(
                 Error::MissingDependency(format!("Repository {namespace}/{name}"))
             })?;
             let owner_ref = super::owner_ref_for(&repo, "Repository")?;
+            let mass_deletion_ack = mass_deletion_ack(&repo);
             Ok(ResolvedRepository {
                 repo_namespace: Some(namespace),
                 backend: repo.spec.backend,
@@ -190,6 +202,8 @@ pub async fn resolve_repository_ref(
                 credential_projection_allowed: false,
                 mode: repo.spec.mode,
                 owner_ref,
+                deletion_protection: repo.spec.deletion_protection,
+                mass_deletion_ack,
             })
         }
         RepoLookup::Cluster { name } => {
@@ -199,6 +213,7 @@ pub async fn resolve_repository_ref(
                 .await?
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
             let owner_ref = super::owner_ref_for(&repo, "ClusterRepository")?;
+            let mass_deletion_ack = mass_deletion_ack(&repo);
             Ok(ResolvedRepository {
                 repo_namespace: None,
                 backend: repo.spec.backend,
@@ -214,9 +229,22 @@ pub async fn resolve_repository_ref(
                     .unwrap_or(false),
                 mode: repo.spec.mode,
                 owner_ref,
+                deletion_protection: repo.spec.deletion_protection,
+                mass_deletion_ack,
             })
         }
     }
+}
+
+/// The RAW [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] value from a
+/// repository object's `metadata.annotations`, shared by both repo kinds so
+/// the resolver's two arms don't duplicate the lookup.
+fn mass_deletion_ack<K: kube::Resource>(repo: &K) -> Option<String> {
+    repo.meta()
+        .annotations
+        .as_ref()?
+        .get(crate::consts::ALLOW_MASS_DELETION_ANNOTATION)
+        .cloned()
 }
 
 /// Whether the referenced repository is connected and healthy

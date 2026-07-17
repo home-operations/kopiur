@@ -9,10 +9,10 @@
 //! decision logic is kept pure and unit-tested separately.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use kopiur_api::Maintenance;
+use kopiur_api::{Maintenance, Snapshot, SnapshotSchedule};
 use kopiur_kopia::{KopiaClient, KopiaClientBuilder, env as kopia_env};
 use kube::Client;
 use kube::runtime::events::Recorder;
@@ -180,6 +180,33 @@ pub struct Context {
     /// cluster-wide LIST under a namespaced install's Role RBAC is a permanent
     /// 403 that wedges the reconcile.
     pub watch_scope: crate::config::WatchScope,
+    /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
+    /// every repository (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`, default
+    /// [`crate::config::DEFAULT_MAX_CONCURRENT_DELETE_JOBS`]). Consulted by the
+    /// batch dispatcher's throttle (`crate::snapshot::throttle_verdict`).
+    pub max_concurrent_delete_jobs: usize,
+    /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
+    /// controller's own reflector (`Controller::store()`). `OnceLock` because
+    /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
+    /// controllers whose store handles this holds — unlike
+    /// [`maintenance_store`](Self::maintenance_store), which `startup::run`
+    /// builds and drives itself ahead of `Context::new`. Consumers (M4/M5: the
+    /// mass-deletion breaker's per-repo pending count) MUST treat an unset cell
+    /// — or one whose [`snapshot_synced`](Self::snapshot_synced) flag hasn't
+    /// flipped yet — as "fail safe: requeue, never fire destructive work".
+    pub snapshot_store: Arc<OnceLock<Store<Snapshot>>>,
+    /// `true` once [`snapshot_store`](Self::snapshot_store) has completed its
+    /// initial list (the reflector synced). Until then a cold/absent cache must
+    /// never be read as "nothing pending" — see [`snapshot_store`](Self::snapshot_store).
+    pub snapshot_synced: Arc<AtomicBool>,
+    /// Shared informer cache of all `SnapshotSchedule` CRs, reused from the
+    /// `SnapshotSchedule` controller's own reflector. Same `OnceLock`
+    /// construction-order rationale and fail-safe consumption contract as
+    /// [`snapshot_store`](Self::snapshot_store).
+    pub schedule_store: Arc<OnceLock<Store<SnapshotSchedule>>>,
+    /// `true` once [`schedule_store`](Self::schedule_store) has completed its
+    /// initial list. Same fail-safe contract as [`snapshot_synced`](Self::snapshot_synced).
+    pub schedule_synced: Arc<AtomicBool>,
 }
 
 impl Context {
@@ -202,6 +229,7 @@ impl Context {
         maintenance_synced: Arc<AtomicBool>,
         operator_namespace: Option<String>,
         watch_scope: crate::config::WatchScope,
+        max_concurrent_delete_jobs: usize,
     ) -> Self {
         Context {
             client,
@@ -219,6 +247,11 @@ impl Context {
             maintenance_synced,
             operator_namespace,
             watch_scope,
+            max_concurrent_delete_jobs,
+            snapshot_store: Arc::new(OnceLock::new()),
+            snapshot_synced: Arc::new(AtomicBool::new(false)),
+            schedule_store: Arc::new(OnceLock::new()),
+            schedule_synced: Arc::new(AtomicBool::new(false)),
         }
     }
 

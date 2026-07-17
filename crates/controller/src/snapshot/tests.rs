@@ -351,6 +351,97 @@ fn projection_to_pin_records_an_absent_opt_in_as_an_explicit_off() {
     assert_eq!(super::plan::projection_to_pin(&policy), projection(true));
 }
 
+// --- repository-ref backfill (mass-deletion breaker per-repo counting) ----
+
+/// A produced `Snapshot` (has `policyRef`), optionally already carrying a
+/// `status.resolved.repository` pin.
+fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>) -> Snapshot {
+    let mut backup = Snapshot::new(
+        "b1",
+        kopiur_api::snapshot::SnapshotSpec {
+            policy_ref: Some(kopiur_api::common::PolicyRef {
+                name: "pg".into(),
+                namespace: None,
+            }),
+            tags: None,
+            failure_policy: None,
+            deletion_policy: None,
+            on_schedule_delete: None,
+            pin: false,
+            description: None,
+        },
+    );
+    if let Some(repository) = pinned_repo {
+        backup.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            resolved: Some(kopiur_api::snapshot::ResolvedSnapshot {
+                repository: Some(repository),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    backup
+}
+
+#[test]
+fn needs_repository_backfill_when_pin_absent_but_recipe_reachable() {
+    use kopiur_api::common::{RepositoryKind, RepositoryRef};
+
+    assert!(super::plan::needs_repository_backfill(
+        &backup_with_policy_ref(None)
+    ));
+    let already_pinned = backup_with_policy_ref(Some(RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "r".into(),
+        namespace: Some("ns".into()),
+    }));
+    assert!(!super::plan::needs_repository_backfill(&already_pinned));
+}
+
+#[test]
+fn needs_repository_backfill_is_false_without_a_policy_ref() {
+    // Discovered/manual Snapshots have no recipe to pin from; they stay in the
+    // conservative unpinned bucket forever, by design — not a bug.
+    assert!(!super::plan::needs_repository_backfill(&dummy_backup()));
+}
+
+#[test]
+fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
+    let policy = sample_policy();
+    assert_eq!(
+        super::plan::backfill_patch_body(&policy, "ns", false, false),
+        None
+    );
+}
+
+#[test]
+fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
+    let policy = sample_policy();
+
+    // Only the repository pin needs backfilling: the body carries just that key.
+    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true)
+        .expect("repository backfill needed");
+    let resolved = repo_only["resolved"].as_object().expect("object");
+    assert!(!resolved.contains_key("credentialProjection"));
+    assert_eq!(resolved["repository"]["name"], "r");
+    // The pinned ref carries the fallback namespace ("ns") since the recipe's
+    // own repository ref and metadata both leave the namespace unset.
+    assert_eq!(resolved["repository"]["namespace"], "ns");
+
+    // Only the projection pin needs backfilling: the body carries just that key.
+    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false)
+        .expect("projection backfill needed");
+    let resolved = projection_only["resolved"].as_object().expect("object");
+    assert!(!resolved.contains_key("repository"));
+    assert_eq!(resolved["credentialProjection"]["enabled"], false);
+
+    // Both needed: both keys present.
+    let both = super::plan::backfill_patch_body(&policy, "ns", true, true).expect("both needed");
+    let resolved = both["resolved"].as_object().expect("object");
+    assert!(resolved.contains_key("credentialProjection"));
+    assert!(resolved.contains_key("repository"));
+}
+
 // backend_to_repository_connect's exhaustive every-variant test moved with
 // the fn to `kopiur_mover::repo_meta`.
 
@@ -385,6 +476,8 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         mode: Default::default(),
         credential_projection_allowed: false,
         owner_ref: Default::default(),
+        deletion_protection: None,
+        mass_deletion_ack: None,
     }
 }
 
