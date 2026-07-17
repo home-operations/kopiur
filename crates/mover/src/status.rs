@@ -157,7 +157,8 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::StatusPatch { .. }
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
-            | MoverError::Telemetry(_) => (None, None),
+            | MoverError::Telemetry(_)
+            | MoverError::BatchDeleteIncomplete { .. } => (None, None),
         };
         FailureBlock {
             kopia_error_class: err.kopia_class().as_str().to_string(),
@@ -639,6 +640,22 @@ pub struct StatusReporter {
 }
 
 impl StatusReporter {
+    /// Build a reporter that ALWAYS logs and NEVER PATCHes, regardless of
+    /// whether an in-cluster kube client happens to be reachable.
+    ///
+    /// Unlike [`Self::try_new`]'s best-effort fallback (which only degrades
+    /// to logging when a kube client can't be built), this never even
+    /// attempts one — for operations whose `targetRef` names no CR the
+    /// controller owns and for which the mover is deliberately NOT granted
+    /// RBAC to PATCH (e.g. `SnapshotDeleteBatch`, whose `targetRef` names the
+    /// Job itself).
+    pub fn log_only(target: workspec::TargetRef) -> Self {
+        StatusReporter {
+            inner: None,
+            target,
+        }
+    }
+
     /// Build a reporter for the work spec's target, falling back to a
     /// log-only reporter when no kube client is reachable.
     pub async fn try_new(spec: &MoverWorkSpec) -> Self {
@@ -1203,6 +1220,25 @@ mod tests {
         // terminal transition — the status-churn rule).
         let body = StatusUpdate::progress(ts()).as_patch_body();
         assert!(body["status"].get("logTail").is_none());
+    }
+
+    #[test]
+    fn log_only_reporter_never_carries_a_kube_client() {
+        // The whole point of `log_only`: no kube client is ever built, so
+        // `.report()`/`.pin_resolved()` can only ever log — ​never PATCH —
+        // regardless of whether a client happens to be reachable in-cluster.
+        // (RBAC is deliberately not granted for this target, e.g.
+        // SnapshotDeleteBatch's targetRef names the Job itself.)
+        let target = workspec::TargetRef {
+            api_version: "kopiur.home-operations.com/v1alpha1".into(),
+            kind: "SnapshotDeleteBatch".into(),
+            name: "prune-job".into(),
+            namespace: "backups".into(),
+        };
+        let reporter = StatusReporter::log_only(target.clone());
+        assert!(reporter.inner.is_none());
+        assert_eq!(reporter.target.name, target.name);
+        assert_eq!(reporter.target.kind, target.kind);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use crate::backend::Backend;
 use crate::common::{
-    CatalogBounds, CreateBehavior, Encryption, FailurePolicy, IdentityDefaults, MoverDefaults,
-    NamespaceDeletePolicy, RepositoryMode, ScheduleDefaults, default_namespace_delete_policy,
-    default_repository_mode,
+    CatalogBounds, CreateBehavior, DeletionProtectionSpec, Encryption, FailurePolicy,
+    IdentityDefaults, MoverDefaults, NamespaceDeletePolicy, RepositoryMode, ScheduleDefaults,
+    default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::server::{ServerSpec, ServerStatus};
@@ -91,6 +91,9 @@ pub struct RepositorySpec {
     #[serde(default = "default_namespace_delete_policy")]
     #[schemars(default = "default_namespace_delete_policy")]
     pub on_namespace_delete: NamespaceDeletePolicy,
+    /// Mass-deletion circuit breaker for this repository's Snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_protection: Option<DeletionProtectionSpec>,
     /// Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
@@ -681,6 +684,68 @@ health:
         assert_eq!(
             resolve_index_blob_warn_threshold(disabled.health.as_ref()),
             0
+        );
+    }
+
+    #[test]
+    fn deletion_protection_threshold_schema_default_matches_the_constant() {
+        // Mirrors repository_schema_emits_context_free_defaults: a context-free
+        // default is safe to server-side-materialize because
+        // effective_mass_deletion_threshold maps absent → this same value.
+        let crd = Repository::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["properties"]["deletionProtection"]["properties"]["threshold"]["default"],
+            serde_json::json!(crate::consts::DEFAULT_MASS_DELETION_THRESHOLD)
+        );
+        assert_eq!(
+            crate::consts::effective_mass_deletion_threshold(None),
+            crate::consts::DEFAULT_MASS_DELETION_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn deletion_protection_round_trips_and_zero_disables() {
+        use crate::common::DeletionProtectionSpec;
+
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             deletionProtection:\n  threshold: 25\n",
+        );
+        assert_eq!(
+            spec.deletion_protection.as_ref().and_then(|d| d.threshold),
+            Some(25)
+        );
+        assert_eq!(
+            crate::consts::effective_mass_deletion_threshold(spec.deletion_protection.as_ref()),
+            25
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["deletionProtection"]["threshold"], 25);
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // `Some(0)` is the disable sentinel — it passes through, not "fall back to default".
+        let disabled = DeletionProtectionSpec { threshold: Some(0) };
+        assert_eq!(
+            crate::consts::effective_mass_deletion_threshold(Some(&disabled)),
+            0
+        );
+
+        // Absent deletionProtection stays None and is elided (no stored-object churn).
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n",
+        );
+        assert!(bare.deletion_protection.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("deletionProtection")
+                .is_none(),
+            "absent deletionProtection must be elided"
         );
     }
 

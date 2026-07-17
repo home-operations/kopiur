@@ -36,6 +36,21 @@ spec:
           spec:
             description: Cron schedule that fires `Snapshot` CRs from a `SnapshotPolicy`.
             properties:
+              deletion:
+                description: Deletion semantics for the Snapshots this schedule produced.
+                nullable: true
+                properties:
+                  onScheduleDelete:
+                    default: Retain
+                    description: |-
+                      Stamped onto every produced Snapshot at creation (`spec.onScheduleDelete`)
+                      and consulted by the Snapshot finalizer when the owning schedule is gone
+                      or replaced. Absent resolves to `Retain`.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
+                type: object
               failedJobsHistoryLimit:
                 default: 10
                 description: |-

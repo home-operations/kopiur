@@ -32,6 +32,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `bootstrap` | [object](#repository-spec-bootstrap) | — | Tuning for the one-shot bootstrap Job that connects/creates an object-store repository the operator cannot reach in-process. |
 | `catalog` | [object](#repository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
 | `create` | [object](#repository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
+| `deletionProtection` | [object](#repository-spec-deletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
 | `health` | [object](#repository-spec-health) | — | Repository health thresholds (tunes the index-blob-count warning). |
 | `identityDefaults` | [object](#repository-spec-identitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. Set `cluster` when this repository's backend is shared across clusters (e.g. one bucket backed up from more than one Kubernetes cluster) — the default kopia identity hostname then becomes `&lt;namespace&gt;.&lt;cluster&gt;` instead of bare `&lt;namespace&gt;`, so same-named namespaces on different clusters never collide. Same semantics as `ClusterRepository`'s field of the same name (ADR-0004 §5); a consumer's explicit `spec.identity` still wins over anything here. |
 | `maintenance` | [object](#repository-spec-maintenance) | — | Maintenance control; when absent or enabled the reconciler creates and owns a `Maintenance` CR. |
@@ -352,6 +353,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | --- | --- | --- | --- |
 | `algorithm` | string | — | ECC algorithm, e.g. `REED-SOLOMON-CRC32` (`--ecc`). |
 | `overheadPercent` | integer | — | Parity overhead as a percentage (`--ecc-overhead-percent`). |
+
+#### `spec.deletionProtection` { #repository-spec-deletionprotection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `threshold` | integer | `10`<br><sub>min 0</sub> | Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set, effective deletionPolicy Delete, not operator-pruned) that trip the breaker for this repository: at or above this, those deletions are HELD (finalizers wait) until acknowledged via the `kopiur.home-operations.com/allow-mass-deletion` annotation. `0` disables the breaker. Default 10. |
 
 #### `spec.health` { #repository-spec-health }
 
@@ -691,6 +698,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `catalog` | [object](#clusterrepository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
 | `create` | [object](#clusterrepository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `credentialProjection` | [object](#clusterrepository-spec-credentialprojection) | — | Repository-owner gate for projecting credential Secrets into a foreign consumer namespace. |
+| `deletionProtection` | [object](#clusterrepository-spec-deletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
 | `health` | [object](#clusterrepository-spec-health) | — | Repository health thresholds (tunes the index-blob-count warning). |
 | `identityDefaults` | [object](#clusterrepository-spec-identitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. |
 | `maintenance` | [object](#clusterrepository-spec-maintenance) | — | Maintenance control; `maintenance.namespace` selects where the owned `Maintenance` CR lands. |
@@ -1027,6 +1035,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `allowed` | boolean | `false` | When `true`, the owner permits projecting this repository's credential Secret(s) into a consumer namespace. |
+
+#### `spec.deletionProtection` { #clusterrepository-spec-deletionprotection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `threshold` | integer | `10`<br><sub>min 0</sub> | Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set, effective deletionPolicy Delete, not operator-pruned) that trip the breaker for this repository: at or above this, those deletions are HELD (finalizers wait) until acknowledged via the `kopiur.home-operations.com/allow-mass-deletion` annotation. `0` disables the breaker. Default 10. |
 
 #### `spec.health` { #clusterrepository-spec-health }
 
@@ -1745,6 +1759,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `deletionPolicy` | enum: Delete \| Retain \| Orphan | — | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
 | `description` | string | —<br><sub>maxLength 1024</sub> | Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`). Per-invocation by nature — scheduled/discovered `Snapshot`s never set this (no templated descriptions). |
 | `failurePolicy` | [object](#snapshot-spec-failurepolicy) | — | Mover Job retry and deadline limits for this run. |
+| `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
 | `tags` | map[string]string | — | Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`). |
@@ -1911,6 +1926,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `schedule` | [object](#snapshotschedule-spec-schedule) | **required** | Cron, jitter, timezone, and concurrency for the firing cadence. |
+| `deletion` | [object](#snapshotschedule-spec-deletion) | — | Deletion semantics for the Snapshots this schedule produced. |
 | `failedJobsHistoryLimit` | integer | `10`<br><sub>min 0</sub> | Maximum number of failed `Snapshot` CRs from this schedule to retain (default `10`; `0` keeps none). |
 | `policyRef` | [object](#snapshotschedule-spec-policyref) | — | The single `SnapshotPolicy` this schedule invokes; mutually exclusive with `policySelector`. |
 | `policySelector` | core/v1 LabelSelector | — | Label selector fanning out over `SnapshotPolicy` objects; mutually exclusive with `policyRef`. |
@@ -1930,6 +1946,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `startingDeadlineSeconds` | integer | — | If a slot is missed by more than this many seconds, skip it instead of firing late. |
 | `suspend` | boolean | — | Skip future firings while true. |
 | `timezone` | string | — | IANA timezone the cron is evaluated in; absent uses the controller's default. |
+
+#### `spec.deletion` { #snapshotschedule-spec-deletion }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `onScheduleDelete` | enum: Retain \| Delete | `Retain` | Stamped onto every produced Snapshot at creation (`spec.onScheduleDelete`) and consulted by the Snapshot finalizer when the owning schedule is gone or replaced. Absent resolves to `Retain`. |
 
 #### `spec.policyRef` { #snapshotschedule-spec-policyref }
 

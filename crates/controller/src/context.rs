@@ -9,10 +9,10 @@
 //! decision logic is kept pure and unit-tested separately.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use kopiur_api::Maintenance;
+use kopiur_api::{Maintenance, Snapshot, SnapshotSchedule};
 use kopiur_kopia::{KopiaClient, KopiaClientBuilder, env as kopia_env};
 use kube::Client;
 use kube::runtime::events::Recorder;
@@ -180,6 +180,45 @@ pub struct Context {
     /// cluster-wide LIST under a namespaced install's Role RBAC is a permanent
     /// 403 that wedges the reconcile.
     pub watch_scope: crate::config::WatchScope,
+    /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
+    /// every repository (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`). `None` (the
+    /// default) means UNCAPPED — batching (one Job per repository per
+    /// accumulation window) is the primary protection against overwhelming
+    /// the backend; a cap is an opt-in backstop for a resource-constrained
+    /// cluster, and a small default risks head-of-line-blocking every OTHER
+    /// repository's deletions behind one slow/failing one. Consulted by the
+    /// batch dispatcher's throttle (`crate::snapshot::throttle_verdict`).
+    pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+    /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
+    /// controller's own reflector (`Controller::store()`). `OnceLock` because
+    /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
+    /// controllers whose store handles this holds — unlike
+    /// [`maintenance_store`](Self::maintenance_store), which `startup::run`
+    /// builds and drives itself ahead of `Context::new`. Consumers (M4/M5: the
+    /// mass-deletion breaker's per-repo pending count) MUST treat an unset cell
+    /// — or one whose [`snapshot_synced`](Self::snapshot_synced) flag hasn't
+    /// flipped yet — as "fail safe: requeue, never fire destructive work".
+    pub snapshot_store: Arc<OnceLock<Store<Snapshot>>>,
+    /// `true` once [`snapshot_store`](Self::snapshot_store) has completed its
+    /// initial list (the reflector synced). Until then a cold/absent cache must
+    /// never be read as "nothing pending" — see [`snapshot_store`](Self::snapshot_store).
+    ///
+    /// Flipped by [`mark_snapshot_synced`](Self::mark_snapshot_synced) from the
+    /// Snapshot reconcile — a running reconcile is proof the reflector synced (the
+    /// applier only dispatches after `store.wait_until_ready()`). This is the
+    /// RELIABLE signal: a dedicated `wait_until_ready()` getter on the same
+    /// `Controller::store()` races the applier's own getter on kube-rs's
+    /// single-waker `DelayedInit` and can hang forever — the bug that left every
+    /// external destructive deletion deferred (`StoresNotSynced`) indefinitely.
+    pub snapshot_synced: Arc<AtomicBool>,
+    /// Shared informer cache of all `SnapshotSchedule` CRs, reused from the
+    /// `SnapshotSchedule` controller's own reflector. Same `OnceLock`
+    /// construction-order rationale and fail-safe consumption contract as
+    /// [`snapshot_store`](Self::snapshot_store).
+    pub schedule_store: Arc<OnceLock<Store<SnapshotSchedule>>>,
+    /// `true` once [`schedule_store`](Self::schedule_store) has completed its
+    /// initial list. Same fail-safe contract as [`snapshot_synced`](Self::snapshot_synced).
+    pub schedule_synced: Arc<AtomicBool>,
 }
 
 impl Context {
@@ -202,6 +241,7 @@ impl Context {
         maintenance_synced: Arc<AtomicBool>,
         operator_namespace: Option<String>,
         watch_scope: crate::config::WatchScope,
+        max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
     ) -> Self {
         Context {
             client,
@@ -219,7 +259,30 @@ impl Context {
             maintenance_synced,
             operator_namespace,
             watch_scope,
+            max_concurrent_delete_jobs,
+            snapshot_store: Arc::new(OnceLock::new()),
+            snapshot_synced: Arc::new(AtomicBool::new(false)),
+            schedule_store: Arc::new(OnceLock::new()),
+            schedule_synced: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Mark the Snapshot informer synced. Called at the top of the Snapshot
+    /// reconcile: the Controller's applier only dispatches a reconcile AFTER the
+    /// Snapshot reflector's initial LIST completed
+    /// (`delay_tasks_until(store.wait_until_ready())`), so a running reconcile is
+    /// proof the store is warm — a reliable signal with NO contention on kube-rs's
+    /// single-waker `DelayedInit`. Idempotent + cheap (relaxed load, release store
+    /// only on the first flip). See [`snapshot_synced`](Self::snapshot_synced).
+    pub fn mark_snapshot_synced(&self) {
+        mark_synced(&self.snapshot_synced, "Snapshot");
+    }
+
+    /// Mark the SnapshotSchedule informer synced, from the SnapshotSchedule
+    /// reconcile. Same reliable-signal rationale as
+    /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
+    pub fn mark_schedule_synced(&self) {
+        mark_synced(&self.schedule_synced, "SnapshotSchedule");
     }
 
     /// The `imagePullPolicy` to stamp on mover `Job` pods: the explicit
@@ -234,9 +297,47 @@ impl Context {
     }
 }
 
+/// Flip an informer-synced flag to `true` (idempotent), logging ONCE on the first
+/// flip (`kind` names the informer — the old `publish_synced_store` log line was
+/// lost when the flip moved into the reconcile). A relaxed load avoids the release
+/// store's write traffic on the (overwhelmingly common) already-synced path; the
+/// `swap` behind it fires the log for exactly the one caller that flips
+/// `false → true` (its return value is the prior state). Free fn so the
+/// load-then-swap is asserted once in [`tests`].
+fn mark_synced(flag: &AtomicBool, kind: &str) {
+    if !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::Release) {
+        tracing::info!(kind, "informer cache synced");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- regression (#store-sync): the mass-deletion breaker gates destructive
+    // deletion on `*_synced`. It used to be flipped by a spawned
+    // `wait_until_ready()` getter on the same `Controller::store()` the applier
+    // already awaits — a second getter on kube-rs's single-waker `DelayedInit`
+    // that loses the waker race and hangs forever, so the flag never flipped and
+    // EVERY external destructive deletion deferred (`StoresNotSynced`) forever. It
+    // is now flipped from the reconcile (proof the reflector synced) via this
+    // idempotent helper. ---
+    #[test]
+    fn mark_synced_flips_false_to_true_and_is_idempotent() {
+        let flag = AtomicBool::new(false);
+        assert!(!flag.load(Ordering::Acquire));
+        mark_synced(&flag, "Snapshot");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the first mark must flip false -> true (the reconcile-driven synced signal)"
+        );
+        // A second call keeps it true (and takes the cheap already-synced fast path).
+        mark_synced(&flag, "Snapshot");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "mark_synced must be idempotent — stay true on repeat reconciles"
+        );
+    }
 
     // --- regression: the controller's in-process kopia inherited no writable
     // cache/log/config dir, so on a read-only rootfs with $HOME=/nonexistent

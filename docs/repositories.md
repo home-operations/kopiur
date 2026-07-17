@@ -346,7 +346,97 @@ inherit it:
 | `Orphan` _(default)_ | Release ownership (drop the `Snapshot` finalizers) **without** deleting the kopia snapshots — off-site history survives. |
 | `Delete` | Cascade: each `Snapshot`'s own `deletionPolicy` applies (produced snapshots are `kopia snapshot delete`d). Opt-in. |
 
-This is distinct from a single `kubectl delete snapshot`, which always honors that one `Snapshot`'s `deletionPolicy`.
+A namespace delete is only one of **three independent axes** a `Snapshot`'s kopia data can go away through — deleting the `Snapshot` itself, deleting its namespace, or deleting its `SnapshotSchedule`. Each has its own opt-in field, and every one of them defaults to keeping the data:
+
+| Axis | Trigger | `Snapshot` CRs | kopia data, by DEFAULT | Opt into cascading kopia data |
+| --- | --- | --- | --- | --- |
+| Single `Snapshot` | `kubectl delete snapshot <name>` | Removed once its finalizer clears | Honors *this* Snapshot's own `deletionPolicy` — `Delete` by default for `scheduled`/`manual` (see [Backups → deletionPolicy](backups.md#deletionpolicy--what-happens-to-the-snapshot)) | Set `deletionPolicy: Retain`/`Orphan` on the Snapshot, or `SnapshotPolicy.spec.defaultDeletionPolicy` |
+| Namespace | `kubectl delete namespace <ns>` | Finalizers released, CRs removed | **Retained** — this field, `onNamespaceDelete: Orphan` (default, above) | This field, `onNamespaceDelete: Delete` |
+| `SnapshotSchedule` | `kubectl delete snapshotschedule <name>` | GC'd via `ownerReference` once finalizers clear | **Retained**, rediscovered as `origin: discovered` — schedule `spec.deletion.onScheduleDelete: Retain` (default), which overrides even a produced Snapshot whose own `deletionPolicy` was `Delete` | Schedule `spec.deletion.onScheduleDelete: Delete` — see [Backups → what happens when the schedule is deleted](backups.md#what-happens-when-the-schedule-is-deleted) |
+
+Whichever axis triggers an actual `kopia snapshot delete` — an EXTERNAL deletion with effective `deletionPolicy: Delete`, as opposed to one of Kopiur's own retention/`failedJobsHistoryLimit` prunes — is additionally subject to the per-repository mass-deletion circuit breaker, next.
+
+## `deletionProtection` — the mass-deletion circuit breaker
+
+A single accidental or automated action — the wrong `SnapshotSchedule` deleted, a bulk namespace cleanup, a mis-scoped `kubectl delete snapshot -l ...` — can queue up far more "legitimate-looking" external Snapshot deletions than any one operator action should be able to erase at once (each is individually authorized: the CR's own `deletionPolicy` really is `Delete`). `deletionProtection` is a per-repository breaker against exactly that: it never slows a normal trickle of deletions, but a sudden wave is HELD until a human explicitly approves it.
+
+```yaml
+spec:
+    deletionProtection:
+        threshold: 25 # default 10; 0 disables the breaker
+```
+
+### What trips it
+
+Every reconcile, the operator counts this repository's pending **EXTERNAL, destructive** Snapshot deletions — `metadata.deletionTimestamp` set, effective `deletionPolicy: Delete`, NOT stamped by one of Kopiur's own prunes (below), and not yet acknowledged (below). At or above `threshold`, EVERY one of those deletions is HELD: the Snapshot's finalizer stays, no `kopia snapshot delete` runs, and the CR stays `phase: Deleting` until you act.
+
+### What HELD looks like
+
+- Each held `Snapshot` gets `DeletionHeld=True` (reason `MassDeletionBreaker`) and, on the transition into held, a `SnapshotDeletionHeld` Warning Event.
+- The repository (`Repository`/`ClusterRepository`) gets a `MassDeletionHeld=True` (reason `ThresholdExceeded`) condition, recomputed every reconcile from the live pending count.
+- The `Snapshot`'s condition/event message carries the exact `kubectl annotate` command to copy — you never have to construct it by hand:
+
+```console
+$ kubectl describe snapshot nightly-abc12 -n billing
+...
+Conditions:
+  Type          Status  Reason               Message
+  DeletionHeld  True    MassDeletionBreaker  this snapshot's deletion is HELD by the mass-deletion
+                                              breaker: 23 pending external destructive deletions for
+                                              Repository `nas-primary` are at/above its threshold of
+                                              10. No kopia data has been deleted and this Snapshot
+                                              keeps its finalizer. To APPROVE this wave (releases
+                                              every currently-held deletion for the repository), run:
+                                              kubectl -n billing annotate repository/nas-primary
+                                              kopiur.home-operations.com/allow-mass-deletion=
+                                              "2026-07-16T18:04:11Z" --overwrite. To release THIS
+                                              Snapshot alone WITHOUT deleting its kopia snapshot,
+                                              annotate it kopiur.home-operations.com/skip-snapshot-
+                                              cleanup: "true".
+```
+
+### Releasing the wave — copy the value, don't generate it
+
+Run the command the condition/event gave you, **verbatim**:
+
+```console
+$ kubectl -n billing annotate repository/nas-primary \
+    kopiur.home-operations.com/allow-mass-deletion="2026-07-16T18:04:11Z" --overwrite
+```
+
+(A `ClusterRepository` is cluster-scoped: the surfaced command omits `-n` and says `clusterrepository/<name>` instead.)
+
+The annotation's value is an RFC3339 **timestamp**, not a boolean — "I approve every deletion pending up to this instant." A held Snapshot releases iff its own `deletionTimestamp <= ` that value:
+
+- **Copy the value the operator surfaced**, from the condition or the event. It's the newest pending deletion's timestamp, chosen so this one `annotate` releases the WHOLE currently-held wave. A hand-generated value (e.g. from `date`) risks landing earlier than some pending deletions and releasing only part of the wave — the controller only ever echoes back the exact value that works, it does not compute one from an arbitrary input.
+- **A stale ack is inert against a LATER wave.** Re-applying the same value later (including one committed to Git) does not pre-approve a fresh wave that starts afterward — nothing requires removing the annotation once it has done its job.
+- **A future-dated value is clamped to now** — an ack can never pre-approve deletions that haven't happened yet (a clock-skew guard).
+- **An unparseable value is IGNORED** (fail-safe: the breaker stays armed) and raises an `InvalidMassDeletionAck` Warning Event flagging the annotation as unparseable RFC3339.
+
+### `threshold: 0` disables the breaker
+
+Set it when a repository legitimately churns through more external deletions than the default in normal operation (many tenants each pruning by hand, for example) and you accept the risk. There's no per-Snapshot opt-out from the breaker other than this repository-wide switch.
+
+### Kopiur's own prunes always bypass it
+
+GFS retention and `failedJobsHistoryLimit` pruning stamp the `Snapshot` they're about to delete with `kopiur.home-operations.com/pruned-by: retention` or `failed-history` **before** deleting it, and the finalizer reads that as the operator's OWN lifecycle action, never external — it is never held and never counted toward the threshold. This is deliberate: retention has to keep working, at its normal rate, even while a genuinely bulk EXTERNAL wave is being held for review. (A missing or unrecognized value on that annotation is treated as external — fail-safe.)
+
+### The namespace-teardown corner
+
+Opting a repository's [`onNamespaceDelete: Delete`](#onnamespacedelete--what-kubectl-delete-ns-does-to-snapshots) in makes namespace-deletion cascades an EXTERNAL destructive deletion exactly like any other — the breaker is deliberately owner/axis-independent, so a namespace teardown that would delete more than `threshold` snapshots is HELD too, same ack flow as above. The default `onNamespaceDelete: Orphan` path never calls `kopia snapshot delete` at all, so it never interacts with the breaker.
+
+### Escape hatches
+
+- **Release one Snapshot without deleting its kopia data**: annotate it `kopiur.home-operations.com/skip-snapshot-cleanup: "true"` — the same per-CR lever documented in [Backups → the escape hatch](backups.md#what-delete-needs-to-succeed); it overrides the breaker just like it overrides everything else. The kopia snapshot survives and is rediscovered as `origin: discovered` later.
+- **Release the whole wave**: the ack annotation above.
+
+A complete, apply-ready example combining a repository's `deletionProtection.threshold` with a schedule's `onScheduleDelete` cascade opt-in:
+
+```yaml
+--8<-- "deploy/examples/34-schedule-deletion-protection.yaml"
+```
+
+See also: [`kopiur_snapshot_deletions_held` / `_pending_external`](dev/observability.md) — the gauges behind an alert on a wave forming, and the batched execution of an actually-approved deletion wave in [Backups → how a deletion actually runs](backups.md#how-a-deletion-actually-runs--batched-not-one-job-per-snapshot).
 
 ## `mode` — ReadWrite or ReadOnly
 
@@ -509,6 +599,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `parameters.epoch.minDuration`                          | Lower it (e.g. `6h`) when index blobs stay in the thousands despite maintenance running. |
 | `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
+| `deletionProtection.threshold`                          | Mass-deletion breaker: HOLD external destructive Snapshot deletions at/above this count (default 10; `0` disables). |
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |
 | `suspend`                                              | Pause connect/bootstrap + maintenance.            |
 

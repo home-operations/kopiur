@@ -24,10 +24,13 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use kube::ResourceExt;
 use kube::runtime::reflector::Store;
 
+use kopiur_api::common::{RepositoryKind, RepositoryRef};
 use kopiur_api::{
     ClusterRepository, PhaseLabel, Repository, Restore, Snapshot, SnapshotPhase, SnapshotStats,
 };
 use kopiur_telemetry::MetricsProvider;
+
+use crate::consts::{DELETION_HELD_CONDITION, SNAPSHOT_CLEANUP_FINALIZER};
 
 /// Resident set size (RSS) of the current process in bytes, read from Linux
 /// `/proc/self/statm` (field 2 is the resident page count). Returns `None` off
@@ -67,6 +70,10 @@ pub struct Metrics {
     snapshots_completed: Counter<u64>,
     snapshot_deletion_failures: Counter<u64>,
     orphaned_snapshots: Counter<u64>,
+    snapshot_deletions: Counter<u64>,
+    snapshots_cascade_retained: Counter<u64>,
+    snapshot_delete_batch_jobs: Counter<u64>,
+    snapshot_delete_batch_members: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
     projected_secrets_swept: Counter<u64>,
     creds_secrets_reaped: Counter<u64>,
@@ -87,6 +94,79 @@ pub struct Metrics {
     // Restore + maintenance.
     restore_duration_seconds: Gauge<i64>,
     maintenance_reclaimed_bytes: Gauge<i64>,
+}
+
+/// Outcome of a `Snapshot`'s finalizer resolving its kopia snapshot lifecycle,
+/// as recorded by `kopiur_snapshot_deletions`. An exhaustive, closed set (the
+/// type-safety thesis): [`Metrics::inc_snapshot_deletion`] takes this enum,
+/// never a free string, so a new outcome can't silently mint an unbounded
+/// label value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotDeletionOutcome {
+    /// The kopia snapshot was deleted (single or batch Job succeeded).
+    Deleted,
+    /// The kopia snapshot was kept (`deletionPolicy: Retain`, or an operator
+    /// prune that resolved to `Retain`).
+    Retained,
+    /// The `Snapshot` CR was removed without touching the kopia snapshot
+    /// (`deletionPolicy: Orphan`, or the skip-snapshot-cleanup annotation).
+    Orphaned,
+    /// Retained specifically because the schedule-deletion cascade guard fired
+    /// (owning `SnapshotSchedule` gone/replaced, `onScheduleDelete: Retain`).
+    /// Prefer [`Metrics::inc_snapshot_cascade_retained`] over passing this
+    /// variant to `inc_snapshot_deletion` directly — it also bumps the
+    /// narrower `kopiur_snapshots_cascade_retained` counter in one place.
+    CascadeRetained,
+}
+
+impl SnapshotDeletionOutcome {
+    /// The `outcome` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnapshotDeletionOutcome::Deleted => "deleted",
+            SnapshotDeletionOutcome::Retained => "retained",
+            SnapshotDeletionOutcome::Orphaned => "orphaned",
+            SnapshotDeletionOutcome::CascadeRetained => "cascade_retained",
+        }
+    }
+}
+
+/// Whole-Job outcome recorded by `kopiur_snapshot_delete_batch_jobs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchJobOutcome {
+    /// Every member the Job targeted was deleted.
+    Succeeded,
+    /// At least one member failed (the Job's terminal `Failed` phase).
+    Failed,
+}
+
+impl BatchJobOutcome {
+    /// The `outcome` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BatchJobOutcome::Succeeded => "succeeded",
+            BatchJobOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// Per-member outcome recorded by `kopiur_snapshot_delete_batch_members`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchMemberOutcome {
+    /// This member's kopia snapshot was deleted.
+    Deleted,
+    /// This member's delete failed; the Job kept going for the rest.
+    Failed,
+}
+
+impl BatchMemberOutcome {
+    /// The `outcome` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BatchMemberOutcome::Deleted => "deleted",
+            BatchMemberOutcome::Failed => "failed",
+        }
+    }
 }
 
 impl Default for Metrics {
@@ -164,6 +244,40 @@ impl Metrics {
             .u64_counter("kopiur_orphaned_snapshots")
             .with_description(
                 "Total snapshots orphaned (Orphan policy or skip-snapshot-cleanup annotation).",
+            )
+            .build();
+        let snapshot_deletions = m
+            .u64_counter("kopiur_snapshot_deletions")
+            .with_description(
+                "Total Snapshot finalizer resolutions, by outcome \
+                 (deleted|retained|orphaned|cascade_retained) and namespace. Distinct from \
+                 kopiur_snapshot_deletion_failures_total, which counts kopia delete-call \
+                 FAILURES during finalizer handling, not resolutions — never sum the two.",
+            )
+            .build();
+        let snapshots_cascade_retained = m
+            .u64_counter("kopiur_snapshots_cascade_retained")
+            .with_description(
+                "Total Snapshots retained specifically by the schedule-deletion cascade guard \
+                 (onScheduleDelete: Retain when the owning SnapshotSchedule is gone/replaced). \
+                 A narrower, always-alongside view of \
+                 kopiur_snapshot_deletions{outcome=\"cascade_retained\"} — both are bumped \
+                 together by inc_snapshot_cascade_retained so the two series can't drift apart.",
+            )
+            .build();
+        let snapshot_delete_batch_jobs = m
+            .u64_counter("kopiur_snapshot_delete_batch_jobs")
+            .with_description(
+                "Total mass-deletion batch-delete mover Jobs, by outcome (succeeded|failed).",
+            )
+            .build();
+        let snapshot_delete_batch_members = m
+            .u64_counter("kopiur_snapshot_delete_batch_members")
+            .with_description(
+                "Total Snapshots resolved by a batch-delete Job, by member outcome \
+                 (deleted|failed). A single Job's members are counted independently — one \
+                 member's failure does not stop the others (kopiur_snapshot_delete_batch_jobs \
+                 records the whole-Job outcome separately).",
             )
             .build();
         let work_spec_cms_swept = m
@@ -284,6 +398,10 @@ impl Metrics {
             snapshots_completed,
             snapshot_deletion_failures,
             orphaned_snapshots,
+            snapshot_deletions,
+            snapshots_cascade_retained,
+            snapshot_delete_batch_jobs,
+            snapshot_delete_batch_members,
             work_spec_cms_swept,
             projected_secrets_swept,
             creds_secrets_reaped,
@@ -615,6 +733,58 @@ impl Metrics {
                 })
                 .build();
         }
+        // Mass-deletion breaker observability (M3 plumbing; M4 wires the
+        // enforcement itself). Deliberately cheap and store-only: counts any
+        // deleting Snapshot that still carries the cleanup finalizer, grouped
+        // by its `status.resolved.repository` pin (unpinned → the single
+        // "unknown"/"unknown" bucket, never a per-repo guess). This is
+        // COARSER than the breaker's own count — it does not exclude operator
+        // prunes and never re-runs `plan_deletion` (which needs the
+        // SnapshotSchedule store this callback doesn't have) — so it may read
+        // higher than the threshold-relevant count. These are observability
+        // gauges, not the enforcement path.
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshot_deletions_pending_external")
+                .with_description(
+                    "Snapshots being deleted (deletionTimestamp set) that still carry the \
+                     cleanup finalizer, by resolved repository (repo_kind/repo_name; unpinned \
+                     → repo_kind=repo_name=\"unknown\"). A coarser, cheaper approximation of \
+                     the mass-deletion breaker's own count: unlike the breaker this includes \
+                     operator prunes and does not re-run plan_deletion, so it may read higher \
+                     than the threshold-relevant count.",
+                )
+                .with_callback(move |o| {
+                    for s in snapshots.state() {
+                        if !counts_toward_deletion_gauge(&s) {
+                            continue;
+                        }
+                        o.observe(1, &repo_gauge_attrs(crate::snapshot::pinned_repository(&s)));
+                    }
+                })
+                .build();
+        }
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshot_deletions_held")
+                .with_description(
+                    "Snapshots currently HELD by the mass-deletion breaker (DeletionHeld=True \
+                     condition), by resolved repository (repo_kind/repo_name; unpinned → \
+                     repo_kind=repo_name=\"unknown\"). A subset of \
+                     kopiur_snapshot_deletions_pending_external.",
+                )
+                .with_callback(move |o| {
+                    for s in snapshots.state() {
+                        if !counts_toward_deletion_gauge(&s) || !deletion_held(&s) {
+                            continue;
+                        }
+                        o.observe(1, &repo_gauge_attrs(crate::snapshot::pinned_repository(&s)));
+                    }
+                })
+                .build();
+        }
     }
 
     // ---- backup business metrics -------------------------------------------
@@ -667,6 +837,43 @@ impl Metrics {
     pub fn inc_orphaned_snapshot(&self, ns: &str) {
         self.orphaned_snapshots
             .add(1, &[KeyValue::new("namespace", ns.to_string())]);
+    }
+
+    /// Count a `Snapshot` finalizer resolution in `namespace` with the given
+    /// [`SnapshotDeletionOutcome`]. For [`SnapshotDeletionOutcome::CascadeRetained`],
+    /// prefer [`Self::inc_snapshot_cascade_retained`], which calls this AND bumps
+    /// the narrower cascade counter in one place.
+    pub fn inc_snapshot_deletion(&self, ns: &str, outcome: SnapshotDeletionOutcome) {
+        self.snapshot_deletions.add(
+            1,
+            &[
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("outcome", outcome.as_str()),
+            ],
+        );
+    }
+
+    /// Record a `Snapshot` retained by the schedule-deletion cascade guard:
+    /// bumps BOTH `kopiur_snapshot_deletions{outcome="cascade_retained"}` and
+    /// the narrower `kopiur_snapshots_cascade_retained`, in the one place, so
+    /// the two series can never drift apart. Call this INSTEAD OF
+    /// `inc_snapshot_deletion(ns, SnapshotDeletionOutcome::CascadeRetained)`.
+    pub fn inc_snapshot_cascade_retained(&self, ns: &str) {
+        self.inc_snapshot_deletion(ns, SnapshotDeletionOutcome::CascadeRetained);
+        self.snapshots_cascade_retained
+            .add(1, &[KeyValue::new("namespace", ns.to_string())]);
+    }
+
+    /// Count one mass-deletion batch-delete Job reaching a terminal outcome.
+    pub fn inc_snapshot_delete_batch_job(&self, outcome: BatchJobOutcome) {
+        self.snapshot_delete_batch_jobs
+            .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
+    }
+
+    /// Count `n` batch-delete Job members resolving to `outcome`.
+    pub fn inc_snapshot_delete_batch_members(&self, outcome: BatchMemberOutcome, n: u64) {
+        self.snapshot_delete_batch_members
+            .add(n, &[KeyValue::new("outcome", outcome.as_str())]);
     }
 
     /// Count `n` orphaned work-spec ConfigMaps deleted by one sweep pass.
@@ -834,6 +1041,54 @@ fn phase_attrs(kind: &'static str, ns: &str, name: &str, phase: &'static str) ->
         KeyValue::new("namespace", ns.to_string()),
         KeyValue::new("name", name.to_string()),
         KeyValue::new("phase", phase),
+    ]
+}
+
+/// Whether a `Snapshot` counts toward the deletion-observability gauges
+/// (`kopiur_snapshot_deletions_pending_external`/`_held`): it is being deleted
+/// and still carries the cleanup finalizer. Deliberately NOT the
+/// mass-deletion breaker's own predicate, which additionally excludes
+/// operator prunes and needs the owning `SnapshotSchedule` — see the gauges'
+/// registration comment for why these diverge. Pure so the counting rule is
+/// unit-tested off-OTel.
+fn counts_toward_deletion_gauge(backup: &Snapshot) -> bool {
+    backup.metadata.deletion_timestamp.is_some()
+        && backup
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|x| x == SNAPSHOT_CLEANUP_FINALIZER))
+}
+
+/// Whether a `Snapshot`'s deletion is currently HELD by the mass-deletion
+/// breaker (`DeletionHeld=True`). Pure so it's unit-tested off-OTel.
+fn deletion_held(backup: &Snapshot) -> bool {
+    backup.status.as_ref().is_some_and(|s| {
+        s.conditions
+            .iter()
+            .any(|c| c.type_ == DELETION_HELD_CONDITION && c.status == "True")
+    })
+}
+
+/// `repo_kind`/`repo_name` attributes for the deletion-observability gauges:
+/// the pinned repository's kind/name, or the single conservative
+/// "unknown"/"unknown" bucket when unpinned — never a per-repo guess, and
+/// never every-repo double-counting. Pure so the label mapping is
+/// unit-tested off-OTel.
+fn repo_gauge_attrs(pinned: Option<&RepositoryRef>) -> [KeyValue; 2] {
+    let (kind, name) = match pinned {
+        Some(r) => (
+            match r.kind {
+                RepositoryKind::Repository => "Repository",
+                RepositoryKind::ClusterRepository => "ClusterRepository",
+            },
+            r.name.clone(),
+        ),
+        None => ("unknown", "unknown".to_string()),
+    };
+    [
+        KeyValue::new("repo_kind", kind),
+        KeyValue::new("repo_name", name),
     ]
 }
 
@@ -1687,6 +1942,154 @@ mod tests {
         assert_eq!(
             (out[1].namespace.as_str(), out[1].policy.as_str()),
             ("b-ns", "p2")
+        );
+    }
+
+    // --- mass-deletion protection plumbing (M3): outcome enums, gauge label
+    // mapping, and the deletion-observability counting rule ---
+
+    #[test]
+    fn snapshot_deletion_outcome_labels_are_exhaustive_and_stable() {
+        assert_eq!(SnapshotDeletionOutcome::Deleted.as_str(), "deleted");
+        assert_eq!(SnapshotDeletionOutcome::Retained.as_str(), "retained");
+        assert_eq!(SnapshotDeletionOutcome::Orphaned.as_str(), "orphaned");
+        assert_eq!(
+            SnapshotDeletionOutcome::CascadeRetained.as_str(),
+            "cascade_retained"
+        );
+    }
+
+    #[test]
+    fn batch_job_and_member_outcome_labels_are_stable() {
+        assert_eq!(BatchJobOutcome::Succeeded.as_str(), "succeeded");
+        assert_eq!(BatchJobOutcome::Failed.as_str(), "failed");
+        assert_eq!(BatchMemberOutcome::Deleted.as_str(), "deleted");
+        assert_eq!(BatchMemberOutcome::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn repo_gauge_attrs_falls_back_to_the_unknown_bucket_when_unpinned() {
+        use opentelemetry::Value;
+        let attrs = repo_gauge_attrs(None);
+        assert_eq!(attrs[0].value, Value::from("unknown"));
+        assert_eq!(attrs[1].value, Value::from("unknown"));
+    }
+
+    #[test]
+    fn repo_gauge_attrs_labels_by_the_pinned_repository_kind_and_name() {
+        use opentelemetry::Value;
+        let repo = RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: Some("team-a".into()),
+        };
+        let attrs = repo_gauge_attrs(Some(&repo));
+        assert_eq!(attrs[0].value, Value::from("Repository"));
+        assert_eq!(attrs[1].value, Value::from("nas".to_string()));
+
+        let crepo = RepositoryRef {
+            kind: RepositoryKind::ClusterRepository,
+            name: "shared".into(),
+            namespace: None,
+        };
+        let attrs = repo_gauge_attrs(Some(&crepo));
+        assert_eq!(attrs[0].value, Value::from("ClusterRepository"));
+        assert_eq!(attrs[1].value, Value::from("shared".to_string()));
+    }
+
+    /// A `Snapshot` mid-deletion: `deletionTimestamp` set, optionally carrying
+    /// the cleanup finalizer and/or a `DeletionHeld` condition.
+    fn deleting_snapshot(name: &str, with_finalizer: bool, held: bool) -> Snapshot {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+        let mut status = serde_json::json!({});
+        if held {
+            status["conditions"] = serde_json::json!([{
+                "type": "DeletionHeld",
+                "status": "True",
+                "reason": "MassDeletionBreaker",
+                "message": "held",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            }]);
+        }
+        let mut s = snapshot_cr("ns", name, None, status);
+        s.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+        if with_finalizer {
+            s.metadata.finalizers =
+                Some(vec![crate::consts::SNAPSHOT_CLEANUP_FINALIZER.to_string()]);
+        }
+        s
+    }
+
+    #[test]
+    fn counts_toward_deletion_gauge_requires_both_deletion_timestamp_and_finalizer() {
+        assert!(counts_toward_deletion_gauge(&deleting_snapshot(
+            "a", true, false
+        )));
+        // No deletionTimestamp: not deleting at all.
+        let mut not_deleting = deleting_snapshot("b", true, false);
+        not_deleting.metadata.deletion_timestamp = None;
+        assert!(!counts_toward_deletion_gauge(&not_deleting));
+        // Deleting but the finalizer already cleared: the deletion path is
+        // done, nothing pending.
+        assert!(!counts_toward_deletion_gauge(&deleting_snapshot(
+            "c", false, false
+        )));
+    }
+
+    #[test]
+    fn deletion_held_reads_only_a_true_deletion_held_condition() {
+        assert!(deletion_held(&deleting_snapshot("a", true, true)));
+        assert!(!deletion_held(&deleting_snapshot("b", true, false)));
+    }
+
+    #[test]
+    fn mass_deletion_metrics_register_and_export_under_kopiur_namespace() {
+        let m = Metrics::new();
+        m.inc_snapshot_deletion("ns", SnapshotDeletionOutcome::Deleted);
+        m.inc_snapshot_cascade_retained("ns");
+        m.inc_snapshot_delete_batch_job(BatchJobOutcome::Succeeded);
+        m.inc_snapshot_delete_batch_members(BatchMemberOutcome::Deleted, 3);
+
+        let (_, repos, crepos, restores) = empty_stores();
+        let snaps = make_store(vec![
+            // Held: counts toward both the pending and the held gauge.
+            deleting_snapshot("held-1", true, true),
+            // Pending but not held: counts toward the pending gauge only.
+            deleting_snapshot("pending-1", true, false),
+        ]);
+        let text = gather_with(
+            &m,
+            ResourceStores {
+                snapshots: snaps.0,
+                repositories: repos.0,
+                cluster_repositories: crepos.0,
+                restores: restores.0,
+            },
+        );
+        assert!(text.contains("kopiur_snapshot_deletions_total"), "{text}");
+        assert!(text.contains("outcome=\"deleted\""), "{text}");
+        assert!(
+            text.contains("kopiur_snapshots_cascade_retained_total"),
+            "{text}"
+        );
+        assert!(
+            text.contains("kopiur_snapshot_delete_batch_jobs_total"),
+            "{text}"
+        );
+        assert!(
+            text.contains("kopiur_snapshot_delete_batch_members_total"),
+            "{text}"
+        );
+        assert!(
+            text.contains("kopiur_snapshot_deletions_pending_external"),
+            "{text}"
+        );
+        assert!(text.contains("kopiur_snapshot_deletions_held"), "{text}");
+        // Unpinned Snapshots fall into the single unknown/unknown bucket.
+        assert!(
+            text.contains("repo_kind=\"unknown\"") && text.contains("repo_name=\"unknown\""),
+            "{text}"
         );
     }
 }

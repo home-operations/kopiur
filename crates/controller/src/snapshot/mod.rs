@@ -8,51 +8,64 @@
 //!    EXHAUSTIVE [`plan_deletion`] decision, execute its IO, then remove the
 //!    finalizer.
 //!
-//! [`plan_deletion`] is a pure function over `(DeletionPolicy, annotations)`
-//! returning a [`DeletionPlan`]. It is the single most important thing to get
-//! right and is exhaustively unit-tested — the `match` has **no** `_ =>` arm, so
-//! a new `DeletionPolicy` variant cannot compile until handled (SKILL thesis).
+//! [`plan_deletion`] is a pure function over [`DeletionFacts`] returning a
+//! [`DeletionPlan`]. It is the single most important thing to get right and is
+//! exhaustively unit-tested — every `match` over `DeletionPolicy`,
+//! `ScheduleDeletePolicy`, `NamespaceDeletePolicy`, `OwnerState`, and
+//! `BreakerState` has **no** `_ =>` arm, so a new variant of any of them cannot
+//! compile until handled (SKILL thesis).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
-use kube::api::DeleteParams;
+use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, Pod, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType};
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CredentialProjection, RepositoryRef};
+use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
 use kopiur_api::snapshot::SnapshotPhase;
-use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy};
+use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy, SnapshotSchedule};
+
+use crate::metrics::{BatchJobOutcome, BatchMemberOutcome, SnapshotDeletionOutcome};
 use kopiur_mover::workspec::{
-    MoverOptions, MoverWorkSpec, Operation, SnapshotDeleteOp, SnapshotPinOp, TargetRef,
+    MoverOptions, MoverWorkSpec, Operation, SnapshotDeleteBatchOp, SnapshotDeleteItem,
+    SnapshotPinOp, TargetRef,
 };
 
 use crate::config;
 use crate::consts::{
-    ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
-    CREDENTIALS_PROJECTED_REASON, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
-    HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
-    INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON,
+    ACKNOWLEDGE_MASS_DELETION_ACTION, ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION,
+    CREDENTIALS_AVAILABLE_CONDITION, CREDENTIALS_PROJECTED_REASON, DELETE_MEMBERS_ANNOTATION,
+    DELETE_REPO_LABEL, DELETION_HELD_CONDITION, ENABLE_SCHEDULE_CASCADE_ACTION, FIX_HOOK_ACTION,
+    FIX_SNAPSHOT_STACK_ACTION, HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON,
+    INHERIT_FALLBACK_REASON, INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON,
+    INVALID_MASS_DELETION_ACK_REASON, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    MASS_DELETION_ACKNOWLEDGED_REASON, MASS_DELETION_BREAKER_REASON,
     MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    ORIGIN_LABEL, PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-    SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
-    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON, SOURCE_STAGED_CONDITION,
-    SOURCE_STAGED_REASON,
+    OP_LABEL, OP_SNAPSHOT_DELETE_BATCH, PIN_WORKLOAD_RUN_AS_USER_ACTION,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON,
+    SNAPSHOT_INCOMPLETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
+    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 
+mod batch;
 mod build;
 mod plan;
 
+pub use batch::*;
 pub(crate) use build::*;
 pub use plan::*;
 
@@ -75,6 +88,11 @@ const TERMINAL_SNAPSHOT_STEADY_REQUEUE: Duration = Duration::from_secs(45 * 60);
 /// and unit-tested; this function wires those decisions to the cluster.
 #[tracing::instrument(skip(backup, ctx), fields(kind = "Snapshot", namespace = %backup.namespace().unwrap_or_default(), name = %backup.name_any()))]
 pub async fn reconcile(backup: Arc<Snapshot>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the Snapshot reflector completed its initial
+    // LIST (the applier gates reconciles on `store.wait_until_ready()`), so the
+    // mass-deletion breaker's per-repo pending count is safe to trust from here on.
+    // This is the RELIABLE synced signal — see `Context::mark_snapshot_synced`.
+    ctx.mark_snapshot_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&backup, &ctx).await;
     ctx.metrics
@@ -1511,8 +1529,341 @@ async fn fail_for_hook(
     Ok(Action::await_change())
 }
 
-/// Execute the deletion plan (the tested [`plan_deletion`] decision) against the
-/// cluster, then remove the finalizer when cleanup completes.
+/// The gathered facts + decided plan for [`handle_deletion`]. Splitting the
+/// branchy fact-gathering out of `handle_deletion` keeps that executor under the
+/// cognitive-complexity ratchet.
+enum DeletionOutcome {
+    /// The snapshot reflector store is unset or not yet synced while this CR is
+    /// external-destructive: requeue WITHOUT any destructive work and WITHOUT
+    /// stamping `DeletionHeld` — a transient startup state, not a breaker trip.
+    StoresNotSynced,
+    /// A decided plan (boxed — the resolved [`ResolvedRepository`] is large, and
+    /// the `StoresNotSynced` variant carries nothing).
+    Decided(Box<DeletionDecision>),
+}
+
+/// The decided deletion plan plus the executor inputs it needs. `resolved`
+/// carries the repository resolution (needed by [`DeletionPlan::DeleteSnapshot`]);
+/// `hold` the breaker context (present only when the plan is
+/// [`DeletionPlan::HoldSnapshotDeletion`]).
+struct DeletionDecision {
+    plan: DeletionPlan,
+    resolved: Option<Result<(RepositoryRef, ResolvedRepository)>>,
+    hold: Option<HoldContext>,
+}
+
+/// The context the [`DeletionPlan::HoldSnapshotDeletion`] executor needs to
+/// compose its actionable what/why/fix message.
+struct HoldContext {
+    repo_ref: RepositoryRef,
+    pending: usize,
+    threshold: u32,
+    /// The newest pending `deletionTimestamp` for the repo (RFC3339) — the value
+    /// to copy into the `allow-mass-deletion` ack to release the whole wave.
+    ack_value: String,
+}
+
+/// The store-gated mass-deletion breaker computation for one external-destructive
+/// CR.
+enum BreakerCompute {
+    /// Snapshot store unset or not synced → the caller requeues without work.
+    NotSynced,
+    /// Computed: the verdict plus the context to compose a Hold message.
+    Done {
+        state: BreakerState,
+        pending: usize,
+        threshold: u32,
+        ack_value: Option<String>,
+    },
+}
+
+/// Observed owner state of the deleting `Snapshot`'s `SnapshotSchedule` (M4: the
+/// real GET the M2 call site deferred). An operator prune makes the owner
+/// IRRELEVANT (`pruned_by` bypasses the cascade guard), so the GET is skipped and
+/// `Alive` returned — the guard never consults it, so any non-`GoneOrReplaced`
+/// value is correct. Otherwise the ownerRef is resolved via the schedule
+/// reflector store (only when populated AND synced — a store miss is a
+/// trustworthy 404 only then), falling back to a live `get_opt`, and classified
+/// by [`owner_state_from`] (404 / terminating / uid-mismatch ⇒ `GoneOrReplaced`).
+async fn resolve_owner_state(
+    ctx: &Context,
+    backup: &Snapshot,
+    namespace: &str,
+) -> Result<OwnerState> {
+    if pruned_by(backup.annotations()).is_some() {
+        return Ok(OwnerState::Alive);
+    }
+    let Some(owner) = schedule_owner_ref(backup) else {
+        return Ok(OwnerState::NoScheduleOwner);
+    };
+    use std::sync::atomic::Ordering;
+    if let Some(store) = ctx.schedule_store.get()
+        && ctx.schedule_synced.load(Ordering::Acquire)
+    {
+        let fetched = store.get(&ObjectRef::<SnapshotSchedule>::new(&owner.name).within(namespace));
+        return Ok(owner_state_from(fetched.as_deref(), owner));
+    }
+    let api: Api<SnapshotSchedule> = Api::namespaced(ctx.client.clone(), namespace);
+    let fetched = api.get_opt(&owner.name).await?;
+    Ok(owner_state_from(fetched.as_ref(), owner))
+}
+
+/// Build the `owner_lookup` for [`pending_members`] from the schedule reflector
+/// store. When the store is unset or not synced, EVERY CR resolves to `Alive` —
+/// a conservative OVER-count (cascade-guarded CRs that would otherwise be
+/// excluded stay counted), so the breaker trips EARLIER, the fail-safe direction.
+pub(crate) fn schedule_owner_lookup(ctx: &Context) -> impl Fn(&Snapshot) -> OwnerState {
+    use std::sync::atomic::Ordering;
+    let synced = ctx.schedule_synced.load(Ordering::Acquire);
+    let store = ctx.schedule_store.get().cloned();
+    move |backup: &Snapshot| {
+        let Some(owner) = schedule_owner_ref(backup) else {
+            return OwnerState::NoScheduleOwner;
+        };
+        match (&store, synced) {
+            (Some(store), true) => {
+                let ns = backup.namespace().unwrap_or_default();
+                let fetched =
+                    store.get(&ObjectRef::<SnapshotSchedule>::new(&owner.name).within(&ns));
+                owner_state_from(fetched.as_deref(), owner)
+            }
+            _ => OwnerState::Alive,
+        }
+    }
+}
+
+/// Fold the non-blocking `MassDeletionHeld` condition (ADR-0005 §6; mirrors
+/// `IndexBlobHealth` — alert-only, never flips `Ready`) into `existing` from the
+/// LIVE pending count for `repo_ref`, read from the shared `Snapshot` reflector
+/// store. Returns `existing` UNCHANGED when the store is unset or not synced —
+/// skip silently: the deletion path is the source of truth, this repo-side write
+/// is an alert-only mirror on the repo's own reconcile cadence. Shared by both
+/// repository kinds (the caller supplies its own `RepositoryRef` and raw ack).
+///
+/// A bad ack is NOT warned about here (the deletion path already publishes
+/// `InvalidMassDeletionAck`); it is simply treated as absent for the count.
+pub(crate) fn repo_mass_deletion_conditions(
+    ctx: &Context,
+    repo_ref: &RepositoryRef,
+    raw_ack: Option<&str>,
+    deletion_protection: Option<&kopiur_api::common::DeletionProtectionSpec>,
+    existing: &[Condition],
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    use std::sync::atomic::Ordering;
+    let present = ctx.snapshot_store.get().is_some();
+    let synced = ctx.snapshot_synced.load(Ordering::Acquire);
+    let Some(store) = ctx
+        .snapshot_store
+        .get()
+        .filter(|_| breaker_stores_ready(present, synced))
+    else {
+        return existing.to_vec();
+    };
+    let now = chrono::Utc::now();
+    let (ack, _invalid) = parse_mass_deletion_ack(raw_ack, now);
+    let threshold = kopiur_api::consts::effective_mass_deletion_threshold(deletion_protection);
+    let members = pending_members(
+        &store.state(),
+        &repo_key(repo_ref),
+        schedule_owner_lookup(ctx),
+    );
+    let unacked = unacked_breaker_count(&members, ack);
+    let newest = newest_pending_deletion(&members).map(|d| d.to_rfc3339());
+    let cond = repo_mass_deletion_condition(repo_ref, unacked, threshold, newest.as_deref());
+    io::upsert_condition(
+        existing,
+        crate::consts::MASS_DELETION_HELD_CONDITION,
+        cond.held,
+        cond.reason,
+        &cond.message,
+        generation,
+    )
+}
+
+/// The `allow-mass-deletion` `InvalidMassDeletionAck` Warning, published on the
+/// repository CR (the deletion path only holds a [`ResolvedRepository`], so the
+/// `ObjectReference` is rebuilt from its stable owner fields — no
+/// `resourceVersion`, so the Recorder aggregates repeats).
+async fn publish_invalid_ack_event(ctx: &Context, repo: &ResolvedRepository) {
+    let o = &repo.owner_ref;
+    let regarding = ObjectReference {
+        api_version: Some(o.api_version.clone()),
+        kind: Some(o.kind.clone()),
+        name: Some(o.name.clone()),
+        uid: Some(o.uid.clone()),
+        namespace: repo.repo_namespace.clone(),
+        ..Default::default()
+    };
+    io::publish_warning_event_on_ref(
+        ctx,
+        &regarding,
+        INVALID_MASS_DELETION_ACK_REASON,
+        ACKNOWLEDGE_MASS_DELETION_ACTION,
+        &format!(
+            "the `{}` annotation on this repository is not a valid RFC3339 timestamp; it is IGNORED \
+             (the mass-deletion breaker stays armed). Set it to an RFC3339 instant (e.g. the value \
+             the held Snapshots' events surface) to acknowledge a pending wave.",
+            crate::consts::ALLOW_MASS_DELETION_ANNOTATION
+        ),
+    )
+    .await;
+}
+
+/// Compute the mass-deletion breaker verdict for a deleting external-destructive
+/// CR, gated on the snapshot store being SYNCED (fail-safe: a cold cache is never
+/// read as "nothing pending"). Counts this repo's unacked external pending
+/// deletions ([`pending_members`] + [`unacked_breaker_count`]) and surfaces the
+/// newest pending `deletionTimestamp` for the ack command. An unparseable
+/// `allow-mass-deletion` ack is ignored (breaker NOT disarmed) and an
+/// `InvalidMassDeletionAck` Warning is published on the repository.
+async fn resolve_breaker(
+    ctx: &Context,
+    backup: &Snapshot,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+) -> BreakerCompute {
+    use std::sync::atomic::Ordering;
+    let present = ctx.snapshot_store.get().is_some();
+    let synced = ctx.snapshot_synced.load(Ordering::Acquire);
+    let Some(store) = ctx
+        .snapshot_store
+        .get()
+        .filter(|_| breaker_stores_ready(present, synced))
+    else {
+        return BreakerCompute::NotSynced;
+    };
+    let now = chrono::Utc::now();
+    let (ack, invalid) = parse_mass_deletion_ack(repo.mass_deletion_ack.as_deref(), now);
+    if invalid {
+        publish_invalid_ack_event(ctx, repo).await;
+    }
+    let threshold =
+        kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
+    let members = pending_members(
+        &store.state(),
+        &repo_key(repo_ref),
+        schedule_owner_lookup(ctx),
+    );
+    let pending = unacked_breaker_count(&members, ack);
+    let ack_value = newest_pending_deletion(&members).map(|d| d.to_rfc3339());
+    let deletion_ts = backup
+        .metadata
+        .deletion_timestamp
+        .as_ref()
+        .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0))
+        .unwrap_or(now);
+    let state = breaker_state(pending, threshold, deletion_ts, ack);
+    BreakerCompute::Done {
+        state,
+        pending,
+        threshold,
+        ack_value,
+    }
+}
+
+/// Assemble [`DeletionFacts`] and decide the [`DeletionPlan`] for
+/// [`handle_deletion`] with REAL facts (M4): the owning schedule's live state
+/// ([`resolve_owner_state`]) and this repository's mass-deletion breaker verdict
+/// ([`resolve_breaker`]). Kept in its own fn so `handle_deletion` stays a thin
+/// executor under the complexity ratchet.
+async fn gather_deletion_facts(
+    ctx: &Context,
+    backup: &Snapshot,
+    namespace: &str,
+    policy: DeletionPolicy,
+    ns_terminating: bool,
+) -> Result<DeletionOutcome> {
+    let owner = resolve_owner_state(ctx, backup, namespace).await?;
+    let cascade = effective_on_schedule_delete(backup.spec.on_schedule_delete);
+    let annotations = backup.annotations();
+    // Build `DeletionFacts` for a given `(breaker, ns_terminating, ns_policy)` —
+    // the other four fields are fixed for this CR (the `annotations` reference is
+    // `Copy`, so this closure is callable repeatedly).
+    let mk =
+        |breaker: BreakerState, ns_t: bool, ns_p: Option<NamespaceDeletePolicy>| DeletionFacts {
+            policy,
+            annotations,
+            owner,
+            cascade,
+            ns_terminating: ns_t,
+            ns_policy: ns_p,
+            breaker,
+        };
+
+    // Does the breaker apply to THIS deletion (external destructive Delete)?
+    // Evaluated in the stable `ns_terminating: false` form — a "is this CR
+    // breaker-relevant" predicate independent of namespace state.
+    let breaker_applies = counts_toward_breaker(mk(BreakerState::Allowed, false, None));
+    // Would a per-CR delete run? Gates resolving the repository (needed for the
+    // ns policy, to place/build the Job, and — new in M4 — the breaker repo_key).
+    let would_delete = matches!(
+        plan_deletion(mk(BreakerState::Allowed, false, None)),
+        DeletionPlan::DeleteSnapshot
+    );
+
+    let resolved = if ns_terminating || would_delete {
+        Some(resolve_repo_for_deletion(ctx, backup, namespace).await)
+    } else {
+        None
+    };
+    let ns_policy = resolved
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, repo)| repo.on_namespace_delete);
+
+    // Breaker: only for an external-destructive CR, and only once the repository
+    // resolved (its `repo_key` scopes the pending count). A repo that can no
+    // longer resolve leaves the breaker `Allowed` — the DeleteSnapshot executor
+    // requeues on the resolve error, so nothing is deleted (fail-safe).
+    let mut breaker = BreakerState::Allowed;
+    let mut breaker_ctx: Option<(usize, u32, Option<String>)> = None;
+    if breaker_applies
+        && let Some((repo_ref, repo)) = resolved.as_ref().and_then(|r| r.as_ref().ok())
+    {
+        match resolve_breaker(ctx, backup, repo_ref, repo).await {
+            BreakerCompute::NotSynced => return Ok(DeletionOutcome::StoresNotSynced),
+            BreakerCompute::Done {
+                state,
+                pending,
+                threshold,
+                ack_value,
+            } => {
+                breaker = state;
+                breaker_ctx = Some((pending, threshold, ack_value));
+            }
+        }
+    }
+
+    let plan = plan_deletion(mk(breaker, ns_terminating, ns_policy));
+    // A Hold plan carries the breaker context so its executor can compose the
+    // actionable message (`Hold ⟹ breaker_applies ⟹ resolved Ok ⟹ ctx Some`).
+    let hold = if plan == DeletionPlan::HoldSnapshotDeletion {
+        resolved
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .zip(breaker_ctx)
+            .map(
+                |((repo_ref, _), (pending, threshold, ack_value))| HoldContext {
+                    repo_ref: repo_ref.clone(),
+                    pending,
+                    threshold,
+                    ack_value: ack_value.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                },
+            )
+    } else {
+        None
+    };
+    Ok(DeletionOutcome::Decided(Box::new(DeletionDecision {
+        plan,
+        resolved,
+        hold,
+    })))
+}
+
+/// Execute the deletion plan (the tested [`plan_deletion`] decision, assembled
+/// by [`gather_deletion_facts`]) against the cluster, then remove the finalizer
+/// when cleanup completes.
 async fn handle_deletion(
     backup: &Snapshot,
     ctx: &Context,
@@ -1542,8 +1893,6 @@ async fn handle_deletion(
         io::cleanup_staged_source(&ctx.client, namespace, name).await?;
     }
 
-    let base_plan = plan_deletion(policy, backup.annotations());
-
     // Namespace-deletion cascade (ADR-0005 §5): if the owning namespace is being torn
     // down, the repository's `onNamespaceDelete` decides. Default `Orphan` keeps
     // off-site history (a `kubectl delete ns` must not be a data-loss event); only an
@@ -1554,70 +1903,39 @@ async fn handle_deletion(
         .await
         .unwrap_or(false);
 
-    // Resolve the repository once for the whole deletion path — preferring the
-    // ref pinned into `status.resolved.repository` over the live recipe, which
-    // the namespace reaper usually deletes (no finalizer) before this finalizer
-    // runs. Only needed when the cascade policy must be consulted or a delete
-    // Job must be built; Retain/Orphan of a lone CR stays IO-free.
-    let resolved = if ns_terminating || matches!(base_plan, DeletionPlan::DeleteSnapshot) {
-        Some(resolve_repo_for_deletion(ctx, backup, namespace).await)
-    } else {
-        None
-    };
-
-    let plan = if ns_terminating {
-        match resolved.as_ref() {
-            Some(Ok((_, repo))) => namespace_delete_plan(repo.on_namespace_delete, true, base_plan),
-            // The repository itself can no longer be resolved (already gone):
-            // fail safe to Orphan — never guess Delete with history at stake.
-            _ => DeletionPlan::OrphanSnapshot,
+    let (plan, resolved, hold) = match gather_deletion_facts(
+        ctx,
+        backup,
+        namespace,
+        policy,
+        ns_terminating,
+    )
+    .await?
+    {
+        DeletionOutcome::StoresNotSynced => {
+            tracing::info!(backup = %name, "snapshot store not synced yet; deferring deletion (no destructive work)");
+            return Ok(Action::requeue(Duration::from_secs(15)));
         }
-    } else {
-        base_plan
+        DeletionOutcome::Decided(d) => {
+            let DeletionDecision {
+                plan,
+                resolved,
+                hold,
+            } = *d;
+            (plan, resolved, hold)
+        }
     };
     tracing::info!(?plan, backup = %name, ns_terminating, "executing backup deletion plan");
 
     match plan {
         DeletionPlan::DeleteSnapshot => {
-            let snapshot_id = backup
-                .status
-                .as_ref()
-                .and_then(|s| s.snapshot.as_ref())
-                .map(|s| s.kopia_snapshot_id.clone());
-            match snapshot_id {
-                // No snapshot was ever recorded: nothing to delete in the repo.
-                None => {
-                    io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
-                    Ok(Action::await_change())
-                }
-                Some(id) => {
-                    let (repo_ref, repo) = match resolved {
-                        Some(r) => r?,
-                        // Unreachable by construction (plan=Delete implies the
-                        // resolution above ran); resolve again rather than panic.
-                        None => resolve_repo_for_deletion(ctx, backup, namespace).await?,
-                    };
-                    match delete_job_placement(
-                        ns_terminating,
-                        namespace,
-                        repo.repo_namespace.as_deref(),
-                        ctx.operator_namespace.as_deref(),
-                    ) {
-                        DeleteJobPlacement::RunIn(job_ns) => {
-                            delete_snapshot_via_job(
-                                backup, ctx, api, namespace, &job_ns, name, &id, &repo_ref, &repo,
-                            )
-                            .await
-                        }
-                        DeleteJobPlacement::OrphanFallback { reason } => {
-                            orphan_snapshot(backup, ctx, api, namespace, name, &reason).await
-                        }
-                    }
-                }
-            }
+            execute_delete_snapshot(backup, ctx, api, namespace, name, ns_terminating, resolved)
+                .await
         }
         DeletionPlan::RetainSnapshot => {
             io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+            ctx.metrics
+                .inc_snapshot_deletion(namespace, SnapshotDeletionOutcome::Retained);
             Ok(Action::await_change())
         }
         DeletionPlan::OrphanSnapshot => {
@@ -1634,7 +1952,180 @@ async fn handle_deletion(
             )
             .await
         }
+        DeletionPlan::RetainSnapshotOnScheduleDelete => {
+            retain_on_schedule_delete(ctx, api, backup, namespace, name).await
+        }
+        DeletionPlan::HoldSnapshotDeletion => hold_deletion(ctx, api, backup, name, hold).await,
     }
+}
+
+/// The [`DeletionPlan::DeleteSnapshot`] executor: no recorded kopia snapshot →
+/// just release the finalizer; otherwise resolve the repository and hand off to
+/// the per-repository BATCH delete dispatcher ([`drive_batch_deletion`]), which
+/// coalesces many members into one mover Job (or orphans, when no surviving
+/// namespace can host it). Extracted from `handle_deletion` to keep that
+/// dispatcher under the complexity ratchet.
+async fn execute_delete_snapshot(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    ns_terminating: bool,
+    resolved: Option<Result<(RepositoryRef, ResolvedRepository)>>,
+) -> Result<Action> {
+    let Some(id) = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .map(|s| s.kopia_snapshot_id.clone())
+    else {
+        // No snapshot was ever recorded: nothing to delete in the repo.
+        io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+        return Ok(Action::await_change());
+    };
+    let (repo_ref, repo) = match resolved {
+        Some(r) => r?,
+        // Unreachable by construction (plan=Delete implies the resolution ran);
+        // resolve again rather than panic.
+        None => resolve_repo_for_deletion(ctx, backup, namespace).await?,
+    };
+    drive_batch_deletion(
+        backup,
+        ctx,
+        api,
+        namespace,
+        name,
+        &id,
+        ns_terminating,
+        &repo_ref,
+        &repo,
+    )
+    .await
+}
+
+/// Executor for [`DeletionPlan::RetainSnapshotOnScheduleDelete`]: the cascade
+/// guard fired (owning `SnapshotSchedule` gone/replaced, `onScheduleDelete:
+/// Retain`, effective policy was `Delete`). Release the finalizer WITHOUT
+/// contacting the repository (same as `RetainSnapshot`), bump the
+/// cascade-retained counter (the SINGLE increment point for both counters), and
+/// emit ONE Warning event saying what happened, why, and how to opt into
+/// cascading deletes.
+async fn retain_on_schedule_delete(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    namespace: &str,
+    name: &str,
+) -> Result<Action> {
+    ctx.metrics.inc_snapshot_cascade_retained(namespace);
+    io::publish_warning_event(
+        ctx,
+        backup,
+        SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
+        ENABLE_SCHEDULE_CASCADE_ACTION,
+        &format!(
+            "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
+             is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
+             so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. \
+             The catalog will rediscover it as `origin: discovered` within the repository's catalog \
+             refresh interval. To cascade deletes when a schedule is removed, set the schedule's \
+             `spec.deletion.onScheduleDelete: Delete`."
+        ),
+    )
+    .await;
+    io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    Ok(Action::await_change())
+}
+
+/// Executor for [`DeletionPlan::HoldSnapshotDeletion`]: the mass-deletion breaker
+/// tripped. Do NO delete work and KEEP the finalizer. One status patch combines
+/// `phase: Deleting` with an upserted `DeletionHeld=True` condition (sourced LIVE
+/// to avoid clobbering a concurrent condition writer, written via
+/// `patch_status_if_changed` for hot-loop hygiene). The message carries the
+/// pending count vs. threshold, the repository, the EXACT ack command, and the
+/// per-CR escape hatch. The Warning event fires ONLY on the transition into held.
+/// Requeue on the long `Held` cadence; the repo ack re-enqueues this CR to drain.
+async fn hold_deletion(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    name: &str,
+    hold: Option<HoldContext>,
+) -> Result<Action> {
+    // Source conditions LIVE — the deletion path is a second condition writer, so
+    // building from the start-of-reconcile copy could clobber a concurrent write.
+    let Some(live) = io::live_conditions_source(api, name, backup).await else {
+        // 404: the CR is already gone — nothing to hold.
+        return Ok(Action::await_change());
+    };
+    let existing = live
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let message = match &hold {
+        Some(h) => mass_deletion_hold_message(&h.repo_ref, h.pending, h.threshold, &h.ack_value),
+        // Defensive: a Hold plan always carries context (see `gather_deletion_facts`).
+        None => "this snapshot's deletion is held by the mass-deletion breaker; acknowledge the \
+                 pending wave on the repository via the `allow-mass-deletion` annotation, or set \
+                 the per-Snapshot `skip-snapshot-cleanup` annotation to release it without deleting."
+            .to_string(),
+    };
+    // Transition-only event: fire only when the condition was not already True.
+    let emit = should_emit_held_event(&existing);
+    let conditions = io::upsert_condition(
+        &existing,
+        DELETION_HELD_CONDITION,
+        true,
+        MASS_DELETION_BREAKER_REASON,
+        &message,
+        backup.meta().generation,
+    );
+    let current = serde_json::to_value(&live.status).ok();
+    io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "phase": "Deleting", "conditions": conditions }),
+    )
+    .await?;
+    if emit {
+        io::publish_warning_event(
+            ctx,
+            backup,
+            SNAPSHOT_DELETION_HELD_REASON,
+            ACKNOWLEDGE_MASS_DELETION_ACTION,
+            &message,
+        )
+        .await;
+    }
+    Ok(Action::requeue(deletion_requeue(DeletionRequeue::Held)))
+}
+
+/// If the `Snapshot` currently carries `DeletionHeld=True`, return the conditions
+/// array with it flipped to `False`/`Acknowledged` — to fold into the SAME status
+/// patch that moves a previously-held deletion forward. `None` when it was never
+/// held, so the common (never-held) delete path adds no condition churn.
+fn cleared_held_conditions(backup: &Snapshot) -> Option<Vec<Condition>> {
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let held = existing
+        .iter()
+        .any(|c| c.type_ == DELETION_HELD_CONDITION && c.status == "True");
+    held.then(|| {
+        io::upsert_condition(
+            &existing,
+            DELETION_HELD_CONDITION,
+            false,
+            MASS_DELETION_ACKNOWLEDGED_REASON,
+            "the mass-deletion wave was acknowledged; deletion is proceeding",
+            backup.meta().generation,
+        )
+    })
 }
 
 /// Release the finalizer WITHOUT contacting the repository: record the orphan
@@ -1650,6 +2141,10 @@ async fn orphan_snapshot(
 ) -> Result<Action> {
     tracing::info!(backup = %name, note, "orphaning snapshot; releasing finalizer");
     ctx.metrics.inc_orphaned_snapshot(namespace);
+    // Also record it on the unified deletion-outcome counter (single increment
+    // point per outcome); the existing orphan gauge keeps its own site above.
+    ctx.metrics
+        .inc_snapshot_deletion(namespace, SnapshotDeletionOutcome::Orphaned);
     let _ = ctx
         .recorder
         .publish(
@@ -1695,35 +2190,6 @@ async fn resolve_repo_for_deletion(
     ))
 }
 
-/// The consumer projection opt-in for a SnapshotDelete mover. A cross-namespace
-/// cascade Job runs where the repository's canonical Secret lives, so it never
-/// needs projection — and honoring a (possibly still-live, mid-namespace-
-/// teardown) recipe's opt-in there would mint a copy owned by the repository
-/// CR, which can be cluster-scoped: an invalid ownerRef on a namespaced Secret
-/// is never GC'd, a permanent leak. Hardcoded off for the cascade.
-///
-/// For the same-namespace delete the **pin wins** over the live recipe, exactly as
-/// [`resolve_repo_for_deletion`] prefers `status.resolved.repository`: this path's job
-/// is to reproduce the conditions the run actually executed under, not to honor current
-/// intent. Reading the live recipe first would strand a `Snapshot` whose recipe merely
-/// *changed* — flip `credentialProjection.enabled` to false after a successful run and
-/// the delete Job would look for a namespace-local Secret that projection was supposed
-/// to supply, blocking the finalizer forever (#255, the same failure the pin exists to
-/// prevent, reached by a different route). Re-projecting against a revoked opt-in is
-/// cheap and bounded: one Secret owned by the `Snapshot`, GC'd the instant the finalizer
-/// clears — and the repository owner's `credentialProjection.allowed` remains a live gate
-/// that this cannot bypass.
-pub(crate) fn delete_projection_enabled(
-    cross_namespace: bool,
-    config: Option<&SnapshotPolicy>,
-    pinned: Option<&CredentialProjection>,
-) -> bool {
-    !cross_namespace
-        && pinned
-            .or_else(|| config.and_then(|c| c.spec.credential_projection.as_ref()))
-            .is_some_and(|p| p.enabled)
-}
-
 /// Append the deletion-path escape hatch to a credentials error message.
 ///
 /// `resolve_mover_creds`'s messages are shared by every mover, so they cannot name a
@@ -1746,114 +2212,616 @@ fn stuck_finalizer_hint(msg: &str, namespace: &str, name: &str) -> String {
     )
 }
 
-/// Drive a SnapshotDelete mover Job for the deletion path. Creates the Job if
-/// absent; on terminal success removes the finalizer; on failure records a
-/// Deleting phase, bumps the failure metric, and requeues.
+/// The per-repository BATCH delete dispatcher (mass-deletion protection), run by
+/// [`execute_delete_snapshot`] where the retired per-CR `{name}-delete` Job used
+/// to be created. One mover Job (`SnapshotDeleteBatch`, M1) deletes MANY members'
+/// kopia manifests over a single connect, gated by the pure decision layer
+/// ([`super::batch`]), CREATEd (never SSA-applied), and reaped explicitly.
 ///
-/// `job_ns` is where the Job runs (decided by [`delete_job_placement`]); it is
-/// the `Snapshot`'s own namespace except during the namespace-deletion cascade,
-/// where creating anything in the terminating namespace is rejected by the API
-/// server. Everything the Job needs is preferred from values pinned at run time
-/// (`status.snapshot.identity`, the resolved `repo`), so it works after the
-/// recipe is gone.
+/// Order (brief §1): honor any LEGACY per-CR delete Job (upgrade shim, §0);
+/// resolve placement (§1, orphan when nothing survivable can host the Job); gate
+/// on the snapshot store being synced (operator PRUNES flow here withOUT the
+/// breaker's own store gate, so the dispatcher needs its own fail-safe); LIST
+/// this repository's batch Jobs ONCE (§2), reap the drained/aged terminal ones,
+/// and classify THIS CR against that same list; if it is not yet a member, decide
+/// whether to fire a fresh wave (§3).
 #[allow(clippy::too_many_arguments)]
-async fn delete_snapshot_via_job(
+async fn drive_batch_deletion(
     backup: &Snapshot,
     ctx: &Context,
     api: &Api<Snapshot>,
     namespace: &str,
-    job_ns: &str,
     name: &str,
     snapshot_id: &str,
+    ns_terminating: bool,
     repo_ref: &RepositoryRef,
     repo: &ResolvedRepository,
 ) -> Result<Action> {
-    let cross_namespace = job_ns != namespace;
-    // A cross-namespace Job embeds the source namespace: two namespaces can each
-    // hold a `Snapshot` of the same name, and both cascades may target `job_ns`.
-    let job_name = if cross_namespace {
-        capped_name(&format!("{namespace}-{name}-delete"))
-    } else {
-        format!("{name}-delete")
-    };
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
-
-    if let Some(job) = job_api.get_opt(&job_name).await? {
-        match job_terminal_state(&job) {
-            Some(true) => {
-                io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
-                // A cross-namespace Job is not GC'd with the Snapshot (its owner
-                // is the longer-lived repository CR) — reap it and its work-spec
-                // ConfigMap now; best-effort, the owner ref is the backstop.
-                if cross_namespace {
-                    let _ = job_api.delete(&job_name, &DeleteParams::background()).await;
-                    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), job_ns);
-                    let _ = cm_api.delete(&job_name, &DeleteParams::default()).await;
-                }
-                tracing::info!(backup = %name, %snapshot_id, "snapshot deleted; finalizer removed");
-                return Ok(Action::await_change());
-            }
-            Some(false) => {
-                ctx.metrics.inc_snapshot_deletion_failure(namespace);
-                io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
-                tracing::warn!(backup = %name, "snapshot delete Job failed; backing off");
-                return Ok(Action::requeue(Duration::from_secs(60)));
-            }
-            None => return Ok(Action::requeue(Duration::from_secs(15))),
-        }
+    // §0 upgrade shim (runs BEFORE placement so a legacy Job is honored even when
+    // the batch placement would orphan): a pre-batch `{name}-delete` Job still
+    // owns this deletion.
+    if let Some(action) =
+        adopt_legacy_delete_job(backup, ctx, api, namespace, name, snapshot_id, repo).await?
+    {
+        return Ok(action);
     }
 
-    // Create the SnapshotDelete Job. The recipe is OPTIONAL here: identity is
-    // preferred from the value pinned at success time, and the repository was
-    // already resolved by the caller — so deletion (including the namespace
-    // cascade) still works when the SnapshotPolicy has already been deleted.
-    let config = resolve_recipe(ctx, backup, namespace)
-        .await
-        .ok()
-        .map(|(c, _)| c);
-    let identity = match pinned_mover_identity(backup) {
-        Some(identity) => identity,
-        None => {
-            let config = config.as_ref().ok_or_else(|| {
-                Error::MissingDependency(format!(
-                    "Snapshot {namespace}/{name} has no pinned identity \
-                     (status.snapshot.identity) and its SnapshotPolicy is gone; cannot build \
-                     the snapshot-delete Job — re-create the SnapshotPolicy, or use the \
-                     skip-snapshot-cleanup annotation to release the CR without deleting"
-                ))
-            })?;
-            resolve_identity_for(config, namespace, repo.identity_defaults.as_ref())?
+    // §1 placement: the repository's home namespace (or the operator namespace for
+    // a ClusterRepository); orphan when nothing survivable can host the Job.
+    let job_ns = match batch_job_placement(
+        repo.repo_namespace.as_deref(),
+        ctx.operator_namespace.as_deref(),
+        ns_terminating.then_some(namespace),
+    ) {
+        DeleteJobPlacement::RunIn(ns) => ns,
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            return orphan_snapshot(backup, ctx, api, namespace, name, &reason).await;
         }
     };
-    // In the Snapshot's own namespace the Job is owned by (and GC'd with) the
-    // Snapshot. A cross-namespace cascade Job cannot be (cross-namespace owner
-    // references are invalid) — the repository CR, which outlives the namespace,
-    // owns it instead.
-    let owner = if cross_namespace {
-        repo.owner_ref.clone()
-    } else {
-        io::owner_ref_for(backup, "Snapshot")?
+
+    // Fail-safe store gate: never fire (or reap against) an unsynced SNAPSHOT
+    // store — a cold cache must never read as "nothing pending". The breaker
+    // already defers external-destructive CRs, but PRUNES reach here un-gated, so
+    // the dispatcher repeats the check (same requeue as `StoresNotSynced`).
+    //
+    // NOTE (IMPORTANT-3): this gate INTENTIONALLY covers only the snapshot store,
+    // not the SCHEDULE store. The plan originally gated both, but a hard
+    // schedule-store gate here would defer EVERY deletion (prunes included) on a
+    // cluster that legitimately has zero SnapshotSchedules until the empty-cluster
+    // startup sync flips the flag. The refined design instead lets the FIRE set's
+    // `fire_eligible` narrow just the schedule-OWNED members while the schedule
+    // store is unsynced (`schedule_synced` → IMPORTANT-3a), so an unowned
+    // deletion is never blocked on the schedule store's readiness.
+    use std::sync::atomic::Ordering;
+    let present = ctx.snapshot_store.get().is_some();
+    let synced = ctx.snapshot_synced.load(Ordering::Acquire);
+    let Some(store) = ctx
+        .snapshot_store
+        .get()
+        .filter(|_| breaker_stores_ready(present, synced))
+    else {
+        tracing::info!(backup = %name, "snapshot store not synced yet; deferring batch deletion (no destructive work)");
+        return Ok(Action::requeue(Duration::from_secs(15)));
     };
-    // Resolve (and, when `spec.credentialProjection` is enabled, project) the mover's
-    // credential Secret(s) into the Job's namespace before building the Job. Errors
-    // propagate as MissingDependency (Transient) — this is the delete path, so we
-    // requeue rather than surface a CredentialsAvailable condition.
+
+    dispatch_batch_for_member(
+        backup,
+        ctx,
+        api,
+        namespace,
+        name,
+        snapshot_id,
+        &job_ns,
+        repo_ref,
+        repo,
+        store,
+    )
+    .await
+}
+
+/// §2/§3 of [`drive_batch_deletion`], split out to keep that entry point under the
+/// complexity ratchet: LIST this repository's batch Jobs ONCE, reap the drained/
+/// aged terminal ones, classify THIS CR against that SAME list, and act — release
+/// on a covered SUCCEEDED Job, back off on a FAILED one, poll a LIVE one, else
+/// decide whether to fire a fresh wave ([`fire_batch`]).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_batch_for_member(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    snapshot_id: &str,
+    job_ns: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+    store: &Store<Snapshot>,
+) -> Result<Action> {
+    let state = store.state();
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
+    let views = list_repo_batch_jobs(&job_api, repo_ref).await?;
+    // Reap the drained/aged terminal Jobs (the SINGLE whole-Job metric point),
+    // then classify THIS CR against the SAME list.
+    reap_batch_jobs(&job_api, ctx, &views, &finalizer_holding_uids(&state)).await;
+    let uid = backup.uid().unwrap_or_default();
+    match member_disposition(&uid, &views) {
+        MemberDisposition::LiveMember => {
+            Ok(Action::requeue(deletion_requeue(DeletionRequeue::LiveJob)))
+        }
+        MemberDisposition::SucceededMember => {
+            io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+            ctx.metrics
+                .inc_snapshot_deletion(namespace, SnapshotDeletionOutcome::Deleted);
+            ctx.metrics
+                .inc_snapshot_delete_batch_members(BatchMemberOutcome::Deleted, 1);
+            tracing::info!(backup = %name, %snapshot_id, "snapshot deleted by batch Job; finalizer removed");
+            Ok(Action::await_change())
+        }
+        MemberDisposition::FailedMember => {
+            ctx.metrics.inc_snapshot_deletion_failure(namespace);
+            io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
+            tracing::warn!(backup = %name, "batch delete Job failed for this member; backing off");
+            Ok(Action::requeue(deletion_requeue(
+                DeletionRequeue::JobFailed,
+            )))
+        }
+        // Not (yet) enrolled: decide whether to fire a fresh wave for this repo.
+        MemberDisposition::NotAMember { .. } => {
+            fire_batch(
+                backup, ctx, api, namespace, name, job_ns, repo_ref, repo, &state, &views,
+            )
+            .await
+        }
+    }
+}
+
+/// §0 upgrade shim: honor a legacy per-CR delete Job from a pre-batch operator.
+/// Checks BOTH placements the old [`delete_job_placement`] used — `{name}-delete`
+/// in the CR's own namespace (the common non-terminating case), then the capped
+/// cross-namespace `{ns}-{name}-delete` in the repository's home namespace (the
+/// namespace-deletion cascade). `Some(action)` means a legacy Job exists and this
+/// reconcile is fully handled by the shim; `None` hands over to the batch path.
+///
+/// TODO(one-release): one release after batching ships, remove this adoption
+/// shim AND the now-unused per-CR [`super::plan::delete_job_placement`] it stands
+/// in for — no operator that has run the batch dispatcher will ever create a
+/// `{name}-delete` Job again, so the shim only has to bridge a single in-place
+/// upgrade. (Tracked in the mass-deletion release notes; a real GH issue is filed
+/// at PR time.)
+async fn adopt_legacy_delete_job(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    snapshot_id: &str,
+    repo: &ResolvedRepository,
+) -> Result<Option<Action>> {
+    // Location 1: same-namespace `{name}-delete` (the common non-terminating placement).
+    if let Some(action) = try_legacy_delete_job(
+        backup,
+        ctx,
+        api,
+        namespace,
+        name,
+        snapshot_id,
+        namespace,
+        &format!("{name}-delete"),
+        false,
+    )
+    .await?
+    {
+        return Ok(Some(action));
+    }
+    // Location 2: cross-namespace cascade `{ns}-{name}-delete` (capped) in the
+    // repository's home namespace (namespaced Repository → its ns; ClusterRepository
+    // → the operator ns), only when that differs from the CR's own namespace.
+    let repo_home = repo
+        .repo_namespace
+        .as_deref()
+        .or(ctx.operator_namespace.as_deref());
+    if let Some(home) = repo_home.filter(|h| *h != namespace) {
+        let capped = capped_name(&format!("{namespace}-{name}-delete"));
+        if let Some(action) = try_legacy_delete_job(
+            backup,
+            ctx,
+            api,
+            namespace,
+            name,
+            snapshot_id,
+            home,
+            &capped,
+            true,
+        )
+        .await?
+        {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// GET one legacy delete Job by name in `job_ns` and honor its terminal state with
+/// the EXACT pre-batch semantics: succeeded → release the finalizer (+ reap a
+/// cross-namespace Job and its work-spec ConfigMap); failed → failure metric,
+/// phase `Deleting`, back off 60s; running → poll 15s. `None` when no such Job.
+#[allow(clippy::too_many_arguments)]
+async fn try_legacy_delete_job(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    snapshot_id: &str,
+    job_ns: &str,
+    job_name: &str,
+    cross_namespace: bool,
+) -> Result<Option<Action>> {
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
+    let Some(job) = job_api.get_opt(job_name).await? else {
+        return Ok(None);
+    };
+    let action = match job_terminal_state(&job) {
+        Some(true) => {
+            io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+            // A cross-namespace Job is not GC'd with the Snapshot (its owner is the
+            // longer-lived repository CR) — reap it and its work-spec ConfigMap now.
+            if cross_namespace {
+                let _ = job_api.delete(job_name, &DeleteParams::background()).await;
+                let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), job_ns);
+                let _ = cm_api.delete(job_name, &DeleteParams::default()).await;
+            }
+            ctx.metrics
+                .inc_snapshot_deletion(namespace, SnapshotDeletionOutcome::Deleted);
+            tracing::info!(backup = %name, %snapshot_id, "snapshot deleted by legacy delete Job; finalizer removed");
+            Action::await_change()
+        }
+        Some(false) => {
+            ctx.metrics.inc_snapshot_deletion_failure(namespace);
+            io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
+            tracing::warn!(backup = %name, "legacy snapshot delete Job failed; backing off");
+            Action::requeue(Duration::from_secs(60))
+        }
+        None => Action::requeue(Duration::from_secs(15)),
+    };
+    Ok(Some(action))
+}
+
+/// LIST this repository's batch delete Jobs in the placement namespace (label
+/// selector: managed-by + the batch op + the repo hash) and reduce each to a pure
+/// [`BatchJobView`] the classifiers operate on.
+async fn list_repo_batch_jobs(
+    job_api: &Api<Job>,
+    repo_ref: &RepositoryRef,
+) -> Result<Vec<BatchJobView>> {
+    let selector = format!(
+        "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{OP_LABEL}={OP_SNAPSHOT_DELETE_BATCH},{DELETE_REPO_LABEL}={}",
+        repo_label(repo_ref)
+    );
+    let jobs = job_api
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    Ok(jobs.iter().filter_map(batch_job_view).collect())
+}
+
+/// The member `Snapshot` UIDs a batch Job covers, parsed from its
+/// [`DELETE_MEMBERS_ANNOTATION`] (comma-joined). Empty ⇒ not a batch Job / no
+/// members. Shared with [`crate::sweep`]'s leak backstop.
+pub(crate) fn batch_job_members(job: &Job) -> Vec<String> {
+    job.annotations()
+        .get(DELETE_MEMBERS_ANNOTATION)
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reduce a batch delete `Job` to the pure [`BatchJobView`] the classifiers use.
+/// `None` when the Job carries no member annotation (not one of ours / malformed).
+fn batch_job_view(job: &Job) -> Option<BatchJobView> {
+    let members = batch_job_members(job);
+    if members.is_empty() {
+        return None;
+    }
+    let state = match job_terminal_state(job) {
+        None => BatchJobState::Live,
+        Some(true) => BatchJobState::Succeeded,
+        Some(false) => BatchJobState::Failed,
+    };
+    Some(BatchJobView {
+        name: job.name_any(),
+        members,
+        state,
+        terminal_at: job_terminal_at(job),
+    })
+}
+
+/// When a Job went terminal: its `completionTime` (success) else the `Failed`
+/// condition's transition time. `None` while running (or a status missing both) —
+/// [`reap_targets`] treats that as not-yet-old-enough.
+fn job_terminal_at(job: &Job) -> Option<chrono::DateTime<chrono::Utc>> {
+    let status = job.status.as_ref()?;
+    if let Some(ct) = status.completion_time.as_ref() {
+        return chrono::DateTime::from_timestamp(ct.0.as_second(), 0);
+    }
+    status
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Failed" && c.status == "True")
+        .and_then(|c| c.last_transition_time.as_ref())
+        .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0))
+}
+
+/// The UIDs of `Snapshot`s in the store still holding the cleanup finalizer — the
+/// "not yet drained" set gating a SUCCEEDED batch Job's reap.
+fn finalizer_holding_uids(snapshots: &[Arc<Snapshot>]) -> HashSet<String> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            s.finalizers()
+                .iter()
+                .any(|f| f == SNAPSHOT_CLEANUP_FINALIZER)
+        })
+        .filter_map(|s| s.uid())
+        .collect()
+}
+
+/// Delete the terminal batch Jobs eligible for reaping (pure [`reap_targets`]),
+/// bumping the whole-Job outcome metric at this single point. Best-effort per Job:
+/// a 404 (already reaped by a sibling reconcile) is silent, any other error logs
+/// and is retried next pass. Batch Jobs carry NO `ttlSecondsAfterFinished`, so a
+/// member reconcile can always observe the terminal Job before it is reaped here.
+async fn reap_batch_jobs(
+    job_api: &Api<Job>,
+    ctx: &Context,
+    views: &[BatchJobView],
+    holding: &HashSet<String>,
+) {
+    for target in reap_targets(views, holding, chrono::Utc::now(), FAILED_BATCH_REAP_AGE) {
+        match job_api
+            .delete(&target.name, &DeleteParams::background())
+            .await
+        {
+            Ok(_) => {
+                ctx.metrics.inc_snapshot_delete_batch_job(target.outcome);
+                // The FAILED per-member metric is emitted ONCE here (its members
+                // never drain their own finalizers, so they have no per-member
+                // site). A SUCCEEDED Job's members each emit `deleted` as they
+                // drain (`dispatch_batch_for_member`), so nothing is counted here
+                // for it. Exhaustive over the outcome so a new one must decide.
+                match target.outcome {
+                    BatchJobOutcome::Failed => ctx.metrics.inc_snapshot_delete_batch_members(
+                        BatchMemberOutcome::Failed,
+                        target.members as u64,
+                    ),
+                    BatchJobOutcome::Succeeded => {}
+                }
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => {
+                tracing::warn!(job = %target.name, error = %e, "batch delete Job reap failed (skipped)")
+            }
+        }
+    }
+}
+
+/// Resolve, once per DISTINCT member namespace, whether it is TERMINATING (the
+/// same `namespace_is_terminating` check the finalizer path uses for the self
+/// CR). Feeds the FIRE set's IMPORTANT-2 exclusion: an `onNamespaceDelete:
+/// Orphan` peer whose namespace is being torn down plans `OrphanSnapshot` on its
+/// OWN reconcile and must never be deleted by a peer's fire. Bounded — a batch is
+/// ≤200 members, and distinct namespaces are typically far fewer.
+///
+/// Fail-safe (fire-path = UNDER-fire): a namespace whose terminating-ness cannot
+/// be read is treated as terminating, so its `Orphan` peers are withheld and
+/// retried rather than deleted on a guess. (A 403 in a namespaced-scope install
+/// resolves to "not terminating" inside `namespace_is_terminating`, so this never
+/// wedges an install that legitimately cannot read Namespaces.)
+async fn terminating_member_namespaces(
+    ctx: &Context,
+    pending: &[PendingMember],
+) -> HashSet<String> {
+    let distinct: std::collections::BTreeSet<&str> =
+        pending.iter().map(|m| m.namespace.as_str()).collect();
+    let mut terminating = HashSet::new();
+    for ns in distinct {
+        if io::namespace_is_terminating(&ctx.client, ns)
+            .await
+            .unwrap_or(true)
+        {
+            terminating.insert(ns.to_string());
+        }
+    }
+    terminating
+}
+
+/// §3: this CR is not enrolled — pick the fireable set for its repository
+/// (`pending` minus the covered UIDs: members of LIVE jobs — the no-overlap
+/// invariant — plus members of SUCCEEDED jobs awaiting finalizer release, so a
+/// second wave never re-enrolls an already-deleted member; FAILED members stay
+/// fireable for retry), and either fire a wave (throttle permitting) or requeue.
+/// `state` is the store snapshot the classifier used, so the covered set
+/// matches the LIST exactly.
+#[allow(clippy::too_many_arguments)]
+async fn fire_batch(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    job_ns: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+    state: &[Arc<Snapshot>],
+    views: &[BatchJobView],
+) -> Result<Action> {
+    use std::sync::atomic::Ordering;
+    let key = repo_key(repo_ref);
+    // COUNTING set: maximally inclusive (over-count is fail-safe).
+    let pending = pending_members(state, &key, schedule_owner_lookup(ctx));
+    // FIRE set: maximally EXCLUSIVE (under-fire is fail-safe). Drop members the
+    // count deliberately over-includes — breaker-HELD externals (CRITICAL-1),
+    // ns-Orphan-destined peers (IMPORTANT-2), schedule-owned peers while the
+    // schedule store is unsynced (IMPORTANT-3a), and unpinned PEERS
+    // (IMPORTANT-4) — BEFORE the no-overlap exclusion. The ack is parsed exactly
+    // as the breaker does; its invalid-value warning is already published by
+    // `resolve_breaker` on the external-CR path, so it is not re-emitted here.
+    let now = chrono::Utc::now();
+    let (ack, _invalid) = parse_mass_deletion_ack(repo.mass_deletion_ack.as_deref(), now);
+    let threshold =
+        kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
+    let terminating = terminating_member_namespaces(ctx, &pending).await;
+    let self_uid = backup.uid().unwrap_or_default();
+    let eligible = fire_eligible(
+        pending,
+        &FireEligibility {
+            self_uid: &self_uid,
+            threshold,
+            ack,
+            on_namespace_delete: repo.on_namespace_delete,
+            terminating_namespaces: &terminating,
+            schedule_synced: ctx.schedule_synced.load(Ordering::Acquire),
+        },
+    );
+    let fireable = fireable_members(eligible, &covered_uids(views));
+    if fireable.is_empty() {
+        // This CR is not (yet) an eligible member — e.g. its own pending state has
+        // not propagated to the store, or every pending member is already in flight.
+        // Poll on the live-batch cadence; NEVER release the finalizer here (this
+        // CR's kopia delete has not happened).
+        return Ok(Action::requeue(deletion_requeue(DeletionRequeue::LiveJob)));
+    }
+    match batch_fire_decision(
+        &fireable,
+        chrono::Utc::now(),
+        BATCH_QUIET_WINDOW,
+        MAX_BATCH_MEMBERS,
+    ) {
+        BatchFire::Accumulate { retry_in } => Ok(Action::requeue(deletion_requeue(
+            DeletionRequeue::Accumulating(retry_in),
+        ))),
+        BatchFire::Fire(members) => match throttle_verdict(
+            throttle_live_count(ctx).await?,
+            ctx.max_concurrent_delete_jobs,
+        ) {
+            ThrottleVerdict::Wait => Ok(Action::requeue(deletion_requeue(
+                DeletionRequeue::Throttled,
+            ))),
+            ThrottleVerdict::Proceed => {
+                launch_batch_job(
+                    backup, ctx, api, namespace, name, job_ns, repo_ref, repo, &members,
+                )
+                .await
+            }
+        },
+    }
+}
+
+/// Count the LIVE batch delete Jobs across the whole watch scope — the throttle's
+/// cluster-wide concurrency input. Skipped entirely (returns 0) when UNCAPPED (the
+/// default), so a normal install never pays for the extra LIST.
+async fn throttle_live_count(ctx: &Context) -> Result<usize> {
+    if ctx.max_concurrent_delete_jobs.is_none() {
+        return Ok(0);
+    }
+    let selector =
+        format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{OP_LABEL}={OP_SNAPSHOT_DELETE_BATCH}");
+    let job_api: Api<Job> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
+    let jobs = job_api
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    Ok(jobs
+        .iter()
+        .filter(|j| job_terminal_state(j).is_none())
+        .count())
+}
+
+/// Build (§2) and CREATE the batch delete Job for `members`, then move THIS CR to
+/// `Deleting` (clearing a prior `DeletionHeld` in the same patch) and poll. A 409
+/// `AlreadyExists` means a sibling reconcile already CREATEd the same-named Job
+/// (deterministic member-set name) — NEVER SSA-force over it (that could rewrite a
+/// live Job's delete-members annotation); poll instead.
+#[allow(clippy::too_many_arguments)]
+async fn launch_batch_job(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    job_ns: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+    members: &[PendingMember],
+) -> Result<Action> {
+    let job_name = batch_job_name(repo_ref, members);
+    let job = build_batch_job(
+        ctx, job_ns, &job_name, repo_ref, repo, members, namespace, name,
+    )
+    .await?;
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), job_ns);
+    match job_api.create(&PostParams::default(), &job).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            return Ok(Action::requeue(deletion_requeue(DeletionRequeue::LiveJob)));
+        }
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    // Move THIS CR to Deleting; if it was HELD by the breaker (now proceeding on an
+    // acknowledged wave), clear `DeletionHeld=False` in the SAME patch.
+    let mut deleting = serde_json::json!({ "phase": "Deleting" });
+    if let Some(conds) = cleared_held_conditions(backup) {
+        deleting["conditions"] = serde_json::to_value(&conds).unwrap_or_default();
+    }
+    io::patch_status(api, name, deleting).await?;
+    tracing::info!(
+        backup = %name,
+        job = %job_name,
+        members = members.len(),
+        job_namespace = %job_ns,
+        "created SnapshotDeleteBatch Job"
+    );
+    Ok(Action::requeue(deletion_requeue(DeletionRequeue::LiveJob)))
+}
+
+/// §2 batch Job construction. Mirrors the retired per-CR delete Job's semantics
+/// N-at-a-time: pin-first repository resolution (done by the caller), projection
+/// HARDCODED OFF (the batch runs where the repository's canonical Secret already
+/// lives), the repository's `moverDefaults` inheritance, and RBAC minting — but
+/// with per-member items, NO `ttlSecondsAfterFinished` (explicit reaping), the
+/// sorted-UID members annotation, and an ownerRef ONLY for a namespaced
+/// `Repository` (a `ClusterRepository`'s cluster-scoped owner would be an
+/// un-GC'able ref on a namespaced Job — labels + the reaper stand in instead).
+///
+/// `src_namespace`/`src_name` are the TRIGGERING CR's coordinates, used only to
+/// enrich a credentials-resolution error with the stuck-finalizer escape hatch.
+#[allow(clippy::too_many_arguments)]
+async fn build_batch_job(
+    ctx: &Context,
+    job_ns: &str,
+    job_name: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+    members: &[PendingMember],
+    src_namespace: &str,
+    src_name: &str,
+) -> Result<Job> {
+    let items: Vec<SnapshotDeleteItem> = members
+        .iter()
+        .map(|m| SnapshotDeleteItem {
+            snapshot_id: m.snapshot_id.clone(),
+            anchor: m.anchor.clone(),
+        })
+        .collect();
+    // A ClusterRepository owner is cluster-scoped — the resulting ownerRef on a
+    // namespaced Job is invalid and never GC'd. Only a namespaced Repository owns
+    // its batch Job; the ownerRef is stripped below for a ClusterRepository.
+    let owner = repo.owner_ref.clone();
+    // Creds in the placement namespace with projection HARDCODED OFF (same
+    // rationale as the retired cross-namespace path): the batch runs at the
+    // repository's home, where its canonical Secret already lives, so no copy is
+    // needed — and projecting would mint one owned by a possibly cluster-scoped
+    // repository CR (an un-GC'able leak). Enrich a credentials error with the
+    // stuck-finalizer escape hatch, exactly as the retired path did.
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         job_ns,
-        &io::CredsPrefix::snapshot_delete(name),
+        &io::CredsPrefix::snapshot_delete_batch(job_name),
         &owner,
         repo,
-        delete_projection_enabled(cross_namespace, config.as_ref(), pinned_projection(backup)),
+        false,
         io::repo_kind_str(repo_ref.kind),
         &repo_ref.name,
     )
     .await
-    // Enrich, never reclassify: only MissingDependency carries an actionable
-    // credentials message, and every other variant passes through untouched.
     .map_err(|e| match e {
         Error::MissingDependency(m) => {
-            Error::MissingDependency(stuck_finalizer_hint(&m, namespace, name))
+            Error::MissingDependency(stuck_finalizer_hint(&m, src_namespace, src_name))
         }
         other => other,
     })?;
@@ -1863,57 +2831,42 @@ async fn delete_snapshot_via_job(
     let creds_secrets = io::plain_creds(creds.names);
     let work_spec = MoverWorkSpec {
         version: 1,
-        operation: Operation::SnapshotDelete(SnapshotDeleteOp {
-            snapshot_id: snapshot_id.to_string(),
-            // The recorded id can be stale (kopia rewrites the manifest id on
-            // pin); the mover re-resolves the live id by these anchors so a
-            // pinned snapshot isn't silently orphaned under deletionPolicy: Delete.
-            anchor: snapshot_anchor(backup),
-        }),
-        identity,
+        operation: Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp { items }),
+        // Identity only satisfies the work-spec SHAPE — a batch deletes by manifest
+        // id (+ per-item anchor), never by identity — so the FIRST member's pinned
+        // identity (its anchor) is a correct, representative value.
+        identity: batch_identity(members),
         repository: repository_connect(repo)?,
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
-            kind: "Snapshot".to_string(),
-            name: name.to_string(),
-            namespace: namespace.to_string(),
+            // The reporter is selected mover-side (log-only); no /status RBAC.
+            kind: "SnapshotDeleteBatch".to_string(),
+            name: job_name.to_string(),
+            namespace: job_ns.to_string(),
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        // A one-shot finalizer delete: kopia's default cache is fine.
         cache: Default::default(),
         throttle: Default::default(),
     };
-
-    // Recipe labels when it still exists; otherwise reconstruct from the
-    // Snapshot itself (origin + the policyRef name it was produced from).
-    let mut labels = match config.as_ref() {
-        Some(config) => run_labels(config, resolve_origin(backup)),
-        None => {
-            let mut labels = BTreeMap::new();
-            labels.insert(
-                ORIGIN_LABEL.to_string(),
-                origin_str(resolve_origin(backup)).to_string(),
-            );
-            if let Some(policy_ref) = backup.spec.policy_ref.as_ref() {
-                labels.insert(CONFIG_LABEL.to_string(), policy_ref.name.clone());
-            }
-            labels
-        }
-    };
-    labels.insert(
-        "kopiur.home-operations.com/op".to_string(),
-        "snapshot-delete".to_string(),
-    );
+    // Labels: managed-by (added by `build_job`) + the batch op + the repo hash (so
+    // the dispatcher can LIST one repository's batch Jobs). Annotation: the SORTED
+    // member UID set — the single source of truth for "which Snapshots".
+    let mut labels = BTreeMap::from([
+        (OP_LABEL.to_string(), OP_SNAPSHOT_DELETE_BATCH.to_string()),
+        (DELETE_REPO_LABEL.to_string(), repo_label(repo_ref)),
+    ]);
+    let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
+    uids.sort_unstable();
+    let annotations = BTreeMap::from([(DELETE_MEMBERS_ANNOTATION.to_string(), uids.join(","))]);
     let repo_volume =
         io::filesystem_repo_mount_source(&repo.backend).map(|source| VolumeMountSpec {
             source,
             mount_path: io::filesystem_repo_path(&repo.backend).unwrap_or_default(),
             read_only: false,
         });
-    // The finalizer delete-Job has no recipe `mover`, but still inherits the
-    // repository's moverDefaults (security context, placement) so it can reach a
-    // filesystem/NFS repo on a non-65532-owned directory (ADR-0004 §1).
+    // Inherit the repository's moverDefaults (security context, placement) so the
+    // batch can reach a filesystem/NFS repo on a non-65532-owned directory.
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
         None,
@@ -1923,11 +2876,11 @@ async fn delete_snapshot_via_job(
         None,
     );
     let limits = JobLimits {
-        ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
+        // NO TTL — reaping is EXPLICIT (the dispatcher + sweep own it), so a member
+        // reconcile can always observe the terminal Job.
+        ttl_seconds_after_finished: None,
         ..JobLimits::default()
     };
-    // Resolve the delete Job's run identity in its namespace before launching
-    // (its credential Secret(s) were resolved/projected above).
     let mover_identity = io::ensure_mover_identity(
         &ctx.client,
         job_ns,
@@ -1939,7 +2892,7 @@ async fn delete_snapshot_via_job(
     .await?;
     mover_identity.decorate_labels(&mut labels);
     let inputs = MoverJobInputs {
-        name: &job_name,
+        name: job_name,
         namespace: job_ns,
         owner,
         work_spec: &work_spec,
@@ -1959,17 +2912,31 @@ async fn delete_snapshot_via_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
-        annotations: Default::default(),
-        // A one-shot finalizer delete: an ephemeral emptyDir cache is fine.
+        annotations,
         cache_volume: Default::default(),
         scratch_volume: None,
         readiness_exec: None,
     };
-    let job = jobs::build_job(&inputs)?;
-    io::apply_mover_objects(&ctx.client, job_ns, &job_name, None, &job).await?;
-    io::patch_status(api, name, serde_json::json!({ "phase": "Deleting" })).await?;
-    tracing::info!(backup = %name, %snapshot_id, job_namespace = %job_ns, "created SnapshotDelete Job");
-    Ok(Action::requeue(Duration::from_secs(15)))
+    let mut job = jobs::build_job(&inputs)?;
+    // ClusterRepository: drop the cluster-scoped (un-GC'able) ownerRef; the Job is
+    // reaped by label + the explicit reaper instead.
+    if repo_ref.kind == RepositoryKind::ClusterRepository {
+        job.metadata.owner_references = None;
+    }
+    Ok(job)
+}
+
+/// The work-spec identity for a batch Job, taken from the FIRST member's pinned
+/// anchor (source path + recorded username/hostname). Shape-only: a batch deletes
+/// by manifest id, so this never drives a kopia connect — it satisfies the
+/// `MoverWorkSpec` shape with a real, representative identity.
+fn batch_identity(members: &[PendingMember]) -> kopiur_mover::workspec::ResolvedIdentity {
+    let anchor = members.first().map(|m| &m.anchor);
+    kopiur_mover::workspec::ResolvedIdentity {
+        username: anchor.and_then(|a| a.username.clone()).unwrap_or_default(),
+        hostname: anchor.and_then(|a| a.hostname.clone()).unwrap_or_default(),
+        source_path: anchor.map(|a| a.source_path.clone()).unwrap_or_default(),
+    }
 }
 
 /// Reconcile kopia's snapshot-pin state with `Snapshot.spec.pin` (ADR-0005 §13(c)),
@@ -2960,21 +3927,26 @@ async fn reap_backup_creds_once(
     Ok(true)
 }
 
-/// Backfill `status.resolved.credentialProjection` onto a `Snapshot` that ran before the
-/// pin existed (#255).
+/// Backfill `status.resolved.credentialProjection` and/or `status.resolved.repository`
+/// onto a `Snapshot` that ran before either pin existed.
 ///
-/// The pin is written at job-creation time (`resolved_run_status`), so every run from this
-/// version on carries it. A `Snapshot` that already succeeded under an older operator has
-/// none — and would strand its finalizer the moment its `SnapshotPolicy` is deleted. Every
+/// The credential-projection pin is written at job-creation time (`resolved_run_status`),
+/// so every run from that version on carries it; a `Snapshot` that already succeeded under
+/// an older operator has none and would strand its finalizer the moment its `SnapshotPolicy`
+/// is deleted (#255). The repository pin exists for a different consumer: the mass-deletion
+/// breaker counts pending destructive deletions PER REPOSITORY straight from the `Snapshot`
+/// store, keyed on this pin — a pre-#255 `Snapshot` without it would be invisible to that
+/// per-repo count and fall into the conservative unpinned ("unknown") bucket forever. Every
 /// `Snapshot` reconciles at least once on operator startup and lands here, so backfilling
 /// from this branch converts the whole existing fleet before any recipe can disappear.
 ///
-/// Cost: gated on the pin being absent AND a kopia snapshot existing, so it is one GET per
-/// legacy `Snapshot`, once — the patch makes the guard false forever after. The one case
-/// that re-GETs per steady-state pass is a legacy `Snapshot` whose recipe is ALREADY gone,
-/// a shrinking set that is by definition already stuck. That retry is deliberate rather
-/// than tolerated: re-creating the `SnapshotPolicy` is one of the documented remedies for
-/// that state, and re-checking makes it self-healing.
+/// Idempotent and independently gated per pin (`needs_projection`/`needs_repository`): a
+/// `Snapshot` needing only one is patched with only that key, and the guard for each is false
+/// forever after its first backfill. Cost: at most one `SnapshotPolicy` GET per legacy
+/// `Snapshot`, once. The one case that re-GETs per steady-state pass is a legacy `Snapshot`
+/// whose recipe is ALREADY gone — a shrinking, already-stuck set — and even then the
+/// repository pin is deliberately left unset (tolerated: the conservative unpinned bucket
+/// covers it) rather than blocking on a recipe that will never come back.
 async fn backfill_projection_pin(
     backup: &Snapshot,
     ctx: &Context,
@@ -2987,9 +3959,12 @@ async fn backfill_projection_pin(
         .as_ref()
         .and_then(|s| s.snapshot.as_ref())
         .is_some();
-    // Already pinned, or there is no kopia snapshot for a finalizer to delete — either
-    // way the deletion path never consults the pin.
-    if pinned_projection(backup).is_some() || !has_snapshot {
+    // Credential projection only matters once there is a kopia snapshot for a
+    // finalizer to delete; the repository pin has no such gate — it matters
+    // the moment the Snapshot exists, so the breaker can attribute it.
+    let needs_projection = pinned_projection(backup).is_none() && has_snapshot;
+    let needs_repository = plan::needs_repository_backfill(backup);
+    if !needs_projection && !needs_repository {
         return Ok(());
     }
     let Some(policy_ref) = backup.spec.policy_ref.as_ref() else {
@@ -3000,17 +3975,17 @@ async fn backfill_projection_pin(
     let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
         return Ok(());
     };
-    let pinned = plan::projection_to_pin(&config);
-    io::patch_status(
-        api,
-        name,
-        serde_json::json!({ "resolved": { "credentialProjection": pinned } }),
-    )
-    .await?;
+    let Some(body) =
+        plan::backfill_patch_body(&config, namespace, needs_projection, needs_repository)
+    else {
+        return Ok(());
+    };
+    io::patch_status(api, name, body).await?;
     tracing::info!(
         backup = %name,
-        enabled = pinned.enabled,
-        "backfilled the credential-projection pin onto a Snapshot that predates it"
+        needs_projection,
+        needs_repository,
+        "backfilled resolved pin(s) onto a Snapshot that predates them"
     );
     Ok(())
 }

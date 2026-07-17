@@ -1,4 +1,5 @@
 use super::*;
+use crate::common::ScheduleDeletePolicy;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{CopyMethod, Hook, SnapshotPolicySpec};
@@ -425,12 +426,33 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Origin) -> Vec<ValidationErr
     if let Err(e) = validate_backup_deletion_policy(origin, spec.deletion_policy) {
         errs.push(e);
     }
+    if let Err(e) = validate_backup_on_schedule_delete(origin, spec.on_schedule_delete) {
+        errs.push(e);
+    }
     if let Some(fp) = &spec.failure_policy
         && let Err(e) = validate_failure_policy(fp, "Snapshot")
     {
         errs.push(e);
     }
     errs
+}
+
+/// `origin: discovered` Snapshots carry an empty spec; a stamped cascade
+/// policy on one is meaningless (their owner is a repository, not a schedule)
+/// and forbidden, like a non-Retain deletionPolicy.
+pub fn validate_backup_on_schedule_delete(
+    origin: Origin,
+    value: Option<ScheduleDeletePolicy>,
+) -> ValidationResult {
+    if origin != Origin::Discovered {
+        return Ok(());
+    }
+    match value {
+        None => Ok(()),
+        Some(v) => Err(ValidationError::DiscoveredCannotSetOnScheduleDelete {
+            got: format!("{v:?}"),
+        }),
+    }
 }
 
 /// Exactly one of `policyRef` / `policySelector` is set on a `SnapshotSchedule`

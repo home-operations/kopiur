@@ -1,0 +1,119 @@
+# Example 34 — Opt into the schedule-deletion cascade + raise the mass-deletion
+# breaker threshold
+#
+# Two independent mass-deletion-protection knobs, shown together because they are
+# usually reached for at the same time when hardening a repository against bulk
+# accidental/automated Snapshot deletion:
+#
+# 1. SnapshotSchedule.spec.deletion.onScheduleDelete (default Retain; shown here
+#    as the opt-in Delete). What happens to a schedule's PRODUCED Snapshots' kopia
+#    data when the schedule ITSELF is deleted (or replaced) out from under them.
+#    Retain (the fail-safe default) keeps the kopia snapshots even if a produced
+#    Snapshot's own deletionPolicy was Delete — the CRs still go away (Kubernetes
+#    GC via their ownerReference), but the data survives and is rediscovered as
+#    `origin: discovered`. Delete here opts into the cascade: each produced
+#    Snapshot's own deletionPolicy applies exactly as if the schedule still
+#    existed. Either way, an actual `kopia snapshot delete` still passes through
+#    the breaker below.
+#
+# 2. Repository.spec.deletionProtection.threshold (default 10; shown here raised
+#    to 25 for a repository with legitimately higher external-deletion churn).
+#    The per-repository circuit breaker: at/above this many pending EXTERNAL
+#    destructive Snapshot deletions, kopiur HOLDS every one of them (finalizers
+#    wait, no kopia data is deleted) until acknowledged via the
+#    kopiur.home-operations.com/allow-mass-deletion annotation. `0` disables it.
+#    Kopiur's OWN retention/failed-history prunes always bypass this breaker.
+#
+# Field shapes verified against crates/api (externally-tagged backend:
+# `backend.s3`, not `backend: { kind: S3 }`).
+#
+# See docs/backups.md ("What happens when the schedule is deleted") and
+# docs/repositories.md ("deletionProtection").
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  # The mass-deletion circuit breaker for every Snapshot backed by this repository.
+  deletionProtection:
+    # Default is 10 — far above legitimate manual cleanup, far below a
+    # tooling-driven cascade. Raised here for a repository with a fleet of
+    # tenants that legitimately deletes more than 10 Snapshots externally in a
+    # burst (e.g. a bulk namespace cleanup during a migration). `0` disables the
+    # breaker entirely for this repository — only do that if something else
+    # already guards against bulk deletion.
+    threshold: 25
+  maintenance:
+    enabled: true
+    schedule:
+      quick: { cron: "0 */6 * * *", jitter: 30m }
+      full: { cron: "0 3 * * *", jitter: 1h }
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+---
+# --8<-- [start:schedule-deletion]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    cron: "H 2 * * *"
+    jitter: 30m
+  # Deletion semantics for the Snapshots THIS schedule produces.
+  deletion:
+    # Opt-in: once this SnapshotSchedule is gone (deleted, or deleted-and-
+    # recreated), each produced Snapshot's own deletionPolicy (default Delete
+    # for scheduled backups) still applies — its kopia snapshot really is
+    # deleted, subject to the repository's deletionProtection breaker above.
+    # Omit this block (or set onScheduleDelete: Retain explicitly) to keep the
+    # fail-safe default instead: a produced Snapshot whose schedule has
+    # vanished is downgraded to retain — no kopia data lost, rediscovered
+    # later as `origin: discovered`.
+    onScheduleDelete: Delete
+# --8<-- [end:schedule-deletion]

@@ -45,8 +45,11 @@ use kopiur_mover::status::{
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotPinOp, VerifyOp, VerifyTier, maintenance_restamp_target,
+    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, VerifyOp, VerifyTier,
+    maintenance_restamp_target,
 };
+#[cfg(test)]
+use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
 
 fn main() -> std::process::ExitCode {
     let cli = MoverCli::parse();
@@ -246,7 +249,17 @@ async fn run(cli: &MoverCli) -> Result<()> {
             _ => {
                 // A best-effort status reporter. If we cannot build a kube client
                 // (e.g. running outside a cluster), we log instead of failing.
-                let reporter = StatusReporter::try_new(&spec).await;
+                // SnapshotDeleteBatch's targetRef names the Job itself — nothing
+                // the controller owns — and the mover is deliberately NOT granted
+                // RBAC to PATCH it, so hand-select the log-only reporter for it:
+                // a PATCH must never even be attempted, not just best-effort
+                // degraded (this selection is hand-wired, not compiler-enforced —
+                // see `wants_log_only_reporter`).
+                let reporter = if wants_log_only_reporter(&spec.operation) {
+                    StatusReporter::log_only(spec.target_ref.clone())
+                } else {
+                    StatusReporter::try_new(&spec).await
+                };
                 match client.repository_connect(&connect, spec.cache).await {
                     Err(e) => {
                         terminal_failure(
@@ -304,6 +317,20 @@ async fn run(cli: &MoverCli) -> Result<()> {
     metrics.shutdown();
 
     result
+}
+
+/// Whether `run()`'s generic connect+execute path must hand-select the
+/// log-only status reporter instead of `StatusReporter::try_new`'s
+/// best-effort kube-client attempt. There is no compiler-enforced link
+/// between an [`Operation`] variant and its reporter (unlike the exhaustive
+/// `run_operation`/`kind_str` matches), so this hand-wired selection is
+/// pulled out to be unit-testable on its own.
+///
+/// Only [`Operation::SnapshotDeleteBatch`] wants this: its `targetRef` names
+/// the Job itself (nothing the controller owns), and the mover is
+/// deliberately not granted RBAC to PATCH it.
+fn wants_log_only_reporter(op: &Operation) -> bool {
+    matches!(op, Operation::SnapshotDeleteBatch(_))
 }
 
 /// Directory under the writable kopia-cache `emptyDir` where the mover stages
@@ -468,35 +495,15 @@ async fn run_operation(
             }
         }
         Operation::SnapshotDelete(op) => {
-            // Delete the recorded snapshot. Space reclamation (maintenance) is a
-            // separate concern owned by the Maintenance CRD, not the mover.
-            client
-                .snapshot_delete(&op.snapshot_id)
+            // Delete the recorded snapshot, self-healing a stale id via its
+            // anchor. Space reclamation (maintenance) is a separate concern
+            // owned by the Maintenance CRD, not the mover.
+            delete_one(client, &op.snapshot_id, &op.anchor)
                 .await
                 .map_err(kopia(KopiaOp::SnapshotDelete))?;
-            // The recorded id may be STALE (kopia rewrites the manifest id on pin):
-            // the delete above then hits the idempotent "no snapshots matched"
-            // no-op and the live pinned manifest would be ORPHANED under
-            // `deletionPolicy: Delete`. Re-resolve the live id by stable anchors
-            // and delete it too. No-op when the recorded id was already correct
-            // (the re-resolved id equals it / nothing matches).
-            if let Some(live) = resolve_live_id(client, &op.anchor).await
-                && live != op.snapshot_id
-            {
-                warn!(
-                    recorded = %op.snapshot_id,
-                    live = %live,
-                    "recorded snapshot id was stale (kopia rewrites the id on pin); \
-                     deleting the live manifest re-resolved from the snapshot's identity \
-                     to avoid orphaning it",
-                );
-                client
-                    .snapshot_delete(&live)
-                    .await
-                    .map_err(kopia(KopiaOp::SnapshotDelete))?;
-            }
             Ok(StatusUpdate::succeeded(chrono::Utc::now()))
         }
+        Operation::SnapshotDeleteBatch(op) => delete_batch(client, op).await,
         Operation::SnapshotPin(op) => {
             // Reconcile kopia's pin state with Snapshot.spec.pin (ADR-0005 §13(c))
             // so kopia's own maintenance/expire honors the pin on object stores.
@@ -784,6 +791,91 @@ async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Optio
         anchor.identity_filter(),
     )
     .map(|e| e.id.clone())
+}
+
+/// Whether [`delete_one`]'s stale-id self-heal may attempt re-resolution.
+/// Gated on the anchor's `start_time` alone — see [`delete_one`]'s doc for why
+/// a path(+identity)-only match is unsafe for a DELETE decision. Pulled out so
+/// the gate is unit-testable without spawning kopia.
+fn anchor_self_heal_allowed(anchor: &SnapshotAnchor) -> bool {
+    anchor.start_time.is_some()
+}
+
+/// Delete one snapshot by id, self-healing a stale recorded id via its stable
+/// anchor. Shared by the legacy single [`Operation::SnapshotDelete`] arm and
+/// the [`Operation::SnapshotDeleteBatch`] loop ([`delete_batch`]), so the
+/// self-heal logic — and its safety gate — lives in exactly one place.
+///
+/// kopia's [`KopiaClient::snapshot_delete`] is idempotent (a "no snapshots
+/// matched" miss is tolerated), so a delete-by-id call against a STALE id
+/// (kopia rewrites the manifest id on pin) silently no-ops — orphaning the
+/// live pinned manifest under `deletionPolicy: Delete`. When the gate below is
+/// open, the recorded id's live manifest is re-resolved from the snapshot's
+/// stable source path (+ identity, + start time) and deleted too.
+///
+/// **Anchor-safety gate (data-loss fix, adversarial review):** the self-heal
+/// is attempted ONLY when [`anchor_self_heal_allowed`] — i.e. the anchor
+/// carries a `start_time`. Without that disambiguator,
+/// [`crate::resolve::match_current_manifest`]'s path(+identity)-only fallback
+/// can uniquely match a NEWER, unrelated snapshot at the same source
+/// path/identity (e.g. the same identity's very next backup) — deleting data
+/// that was never targeted. When the gate is closed, only the recorded id is
+/// deleted; the self-heal is skipped and logged.
+async fn delete_one(
+    client: &KopiaClient,
+    snapshot_id: &str,
+    anchor: &SnapshotAnchor,
+) -> std::result::Result<(), KopiaError> {
+    client.snapshot_delete(snapshot_id).await?;
+    if !anchor_self_heal_allowed(anchor) {
+        if !anchor.source_path.is_empty() {
+            info!(
+                snapshot_id = %snapshot_id,
+                "anchor has no start_time; skipping the stale-id self-heal to avoid \
+                 deleting an unrelated snapshot that happens to share the source path \
+                 (data-loss gate)",
+            );
+        }
+        return Ok(());
+    }
+    if let Some(live) = resolve_live_id(client, anchor).await
+        && live != snapshot_id
+    {
+        warn!(
+            recorded = %snapshot_id,
+            live = %live,
+            "recorded snapshot id was stale (kopia rewrites the id on pin); \
+             deleting the live manifest re-resolved from the snapshot's identity \
+             to avoid orphaning it",
+        );
+        client.snapshot_delete(&live).await?;
+    }
+    Ok(())
+}
+
+/// Delete every [`SnapshotDeleteBatchOp`] member independently: attempt-all-
+/// then-fail, never short-circuited by an earlier member's failure. kopia's
+/// delete is idempotent, so every retry of the WHOLE batch monotonically
+/// shrinks the truly-remaining set — a transient repo blip mid-batch
+/// converges on the next Job retry instead of wedging on the first failure.
+/// Pulled out of [`run_operation`] so the attempt-all-then-fail ordering is
+/// unit-testable against a fake kopia binary without a full work spec /
+/// reporter.
+async fn delete_batch(client: &KopiaClient, op: &SnapshotDeleteBatchOp) -> Result<StatusUpdate> {
+    let mut failed = 0usize;
+    for item in &op.items {
+        if let Err(e) = delete_one(client, &item.snapshot_id, &item.anchor).await {
+            warn!(id = %item.snapshot_id, error = %e, "batch member delete failed; continuing");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        return Err(MoverError::BatchDeleteIncomplete {
+            failed,
+            total: op.items.len(),
+        });
+    }
+    Ok(StatusUpdate::succeeded(chrono::Utc::now()))
 }
 
 /// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
@@ -2000,5 +2092,214 @@ mod tests {
         assert!(session_ready(&marker));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- mass-deletion protection M1: SnapshotDeleteBatch ---
+
+    fn anchor_without_start_time(source_path: &str) -> SnapshotAnchor {
+        SnapshotAnchor {
+            source_path: source_path.into(),
+            start_time: None,
+            username: None,
+            hostname: None,
+        }
+    }
+
+    fn anchor_with_start_time(source_path: &str, start_time: &str) -> SnapshotAnchor {
+        SnapshotAnchor {
+            source_path: source_path.into(),
+            start_time: Some(start_time.into()),
+            username: None,
+            hostname: None,
+        }
+    }
+
+    #[test]
+    fn anchor_self_heal_gate_requires_start_time() {
+        // The data-loss fix: a path (or path+identity) alone is not enough to
+        // authorize a delete-path self-heal — only a start_time-bearing
+        // anchor may attempt re-resolution.
+        assert!(!anchor_self_heal_allowed(&anchor_without_start_time(
+            "/pvc/db"
+        )));
+        assert!(!anchor_self_heal_allowed(&SnapshotAnchor::default()));
+        assert!(anchor_self_heal_allowed(&anchor_with_start_time(
+            "/pvc/db",
+            "2026-06-19T05:54:19Z"
+        )));
+    }
+
+    #[test]
+    fn snapshot_delete_batch_selects_the_log_only_reporter() {
+        let batch = Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp { items: vec![] });
+        assert!(wants_log_only_reporter(&batch));
+    }
+
+    #[test]
+    fn other_operations_do_not_select_the_log_only_reporter() {
+        let delete = Operation::SnapshotDelete(SnapshotDeleteOp {
+            snapshot_id: "id".into(),
+            anchor: SnapshotAnchor::default(),
+        });
+        assert!(!wants_log_only_reporter(&delete));
+    }
+
+    // --- delete_one / delete_batch against a fake kopia binary ---
+    //
+    // Mirrors `crates/kopia/tests/fake_shim.rs`: a tiny shell script stands in
+    // for kopia so the self-heal gate and the attempt-all-then-fail loop are
+    // exercised through the real `KopiaClient` subprocess path with no real
+    // kopia binary.
+    #[cfg(unix)]
+    mod delete_shim_tests {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        struct Shim {
+            _dir: tempfile::TempDir,
+            path: PathBuf,
+        }
+
+        fn shim(script: &str) -> Shim {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("kopia-shim.sh");
+            std::fs::write(&path, script).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            Shim { _dir: dir, path }
+        }
+
+        fn client_for(shim: &Shim) -> KopiaClient {
+            KopiaClient::builder().binary(shim.path.clone()).build()
+        }
+
+        #[tokio::test]
+        async fn delete_one_skips_self_heal_when_anchor_has_no_start_time() {
+            // Regression (data-loss fix, adversarial review): an anchor with a
+            // source_path but NO start_time must never trigger the stale-id
+            // self-heal, even though the path-only fallback WOULD uniquely
+            // match another (unrelated, newer) snapshot at that path. The
+            // shim records whether `snapshot list` (the self-heal's
+            // re-resolution call) was ever invoked; it must NOT be.
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("list-called");
+            let s = shim(&format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"snapshot list"*)
+    touch "{marker}"
+    echo '[{{"id":"other","source":{{"host":"prod","userName":"mydb","path":"/pvc/db"}},"startTime":"2026-06-19T05:54:19Z","endTime":"2026-06-19T05:54:19Z"}}]'
+    exit 0 ;;
+  *"snapshot delete"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                marker = marker.display()
+            ));
+            let client = client_for(&s);
+            let anchor = anchor_without_start_time("/pvc/db");
+            delete_one(&client, "stale-id", &anchor)
+                .await
+                .expect("delete_one succeeds even with the gate closed");
+            assert!(
+                !marker.exists(),
+                "snapshot list must never be called when the anchor has no start_time"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_one_self_heals_when_anchor_has_start_time() {
+            // With a start_time anchor, the pre-existing self-heal behavior is
+            // preserved: a stale recorded id is healed to the live re-resolved
+            // manifest and that one is deleted too.
+            let s = shim(
+                r#"#!/bin/sh
+case "$*" in
+  *"snapshot list"*)
+    echo '[{"id":"live-id","source":{"host":"prod","userName":"mydb","path":"/pvc/db"},"startTime":"2026-06-19T05:54:19Z","endTime":"2026-06-19T05:54:19Z"}]'
+    exit 0 ;;
+  *"snapshot delete stale-id"*) exit 0 ;;
+  *"snapshot delete live-id"*) exit 0 ;;
+  *) echo "unexpected argv: $*" 1>&2; exit 9 ;;
+esac
+"#,
+            );
+            let client = client_for(&s);
+            let anchor = anchor_with_start_time("/pvc/db", "2026-06-19T05:54:19Z");
+            delete_one(&client, "stale-id", &anchor)
+                .await
+                .expect("delete_one self-heals the live manifest and succeeds");
+        }
+
+        #[tokio::test]
+        async fn delete_batch_attempts_every_member_even_after_an_earlier_failure() {
+            // attempt-all-then-fail: the first member's delete fails (a
+            // non-idempotent error, not the "already absent" no-op), but the
+            // second must still be attempted — proven by a marker file the
+            // shim only touches on the second member's argv.
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("good-id-deleted");
+            let s = shim(&format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"snapshot delete bad-id"*) echo "error deleting snapshots: access denied" 1>&2; exit 1 ;;
+  *"snapshot delete good-id"*) touch "{marker}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                marker = marker.display()
+            ));
+            let client = client_for(&s);
+            let op = SnapshotDeleteBatchOp {
+                items: vec![
+                    SnapshotDeleteItem {
+                        snapshot_id: "bad-id".into(),
+                        anchor: SnapshotAnchor::default(),
+                    },
+                    SnapshotDeleteItem {
+                        snapshot_id: "good-id".into(),
+                        anchor: SnapshotAnchor::default(),
+                    },
+                ],
+            };
+            let err = delete_batch(&client, &op)
+                .await
+                .expect_err("one member failed, so the batch is incomplete");
+            match err {
+                MoverError::BatchDeleteIncomplete { failed, total } => {
+                    assert_eq!(failed, 1);
+                    assert_eq!(total, 2);
+                }
+                other => panic!("expected BatchDeleteIncomplete, got {other:?}"),
+            }
+            assert!(
+                marker.exists(),
+                "the second member must still be attempted after the first failed"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_batch_reports_success_when_every_member_succeeds() {
+            let s = shim("#!/bin/sh\nexit 0\n");
+            let client = client_for(&s);
+            let op = SnapshotDeleteBatchOp {
+                items: vec![
+                    SnapshotDeleteItem {
+                        snapshot_id: "a".into(),
+                        anchor: SnapshotAnchor::default(),
+                    },
+                    SnapshotDeleteItem {
+                        snapshot_id: "b".into(),
+                        anchor: SnapshotAnchor::default(),
+                    },
+                ],
+            };
+            let update = delete_batch(&client, &op)
+                .await
+                .expect("every member succeeds");
+            assert_eq!(update.phase.as_deref(), Some("Succeeded"));
+        }
     }
 }

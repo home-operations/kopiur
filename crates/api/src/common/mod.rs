@@ -531,6 +531,54 @@ pub enum NamespaceDeletePolicy {
     Delete,
 }
 
+/// What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it
+/// produced (which Kubernetes GC cascade-deletes via their ownerReference).
+/// Default `Retain`: the CRs are removed but their kopia snapshots survive and
+/// the catalog rediscovers them as `origin: discovered`. `Delete` opts into the
+/// cascade: each Snapshot's own `deletionPolicy` applies.
+///
+/// Deliberately 2-variant (not reusing [`DeletionPolicy`]): an `Orphan` in
+/// cascade position would differ from `Retain` only in per-CR event/metric
+/// bookkeeping — an invalid state made unrepresentable. The guard's `Retain`
+/// is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot
+/// stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm
+/// (no per-CR "orphaned" event/metric for every produced Snapshot).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum ScheduleDeletePolicy {
+    /// Keep the kopia snapshots: a produced Snapshot whose effective
+    /// deletionPolicy is `Delete` is downgraded to retain when its owning
+    /// schedule is gone (the fail-safe default).
+    #[default]
+    Retain,
+    /// Cascade: each produced Snapshot's own `deletionPolicy` applies even when
+    /// the owning schedule is gone (subject to the mass-deletion breaker).
+    Delete,
+}
+
+/// Mass-deletion circuit breaker for this repository's Snapshots.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionProtectionSpec {
+    /// Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set,
+    /// effective deletionPolicy Delete, not operator-pruned) that trip the
+    /// breaker for this repository: at or above this, those deletions are HELD
+    /// (finalizers wait) until acknowledged via the
+    /// `kopiur.home-operations.com/allow-mass-deletion` annotation.
+    /// `0` disables the breaker. Default 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_mass_deletion_threshold")]
+    pub threshold: Option<u32>,
+}
+
+/// schemars default for [`DeletionProtectionSpec::threshold`] —
+/// [`DEFAULT_MASS_DELETION_THRESHOLD`](crate::consts::DEFAULT_MASS_DELETION_THRESHOLD)
+/// (`10`), matching `effective_mass_deletion_threshold`'s absent→CONST
+/// resolution. Returns the field's `Option` type so schemars 1 emits the
+/// schema `default:`.
+fn default_mass_deletion_threshold() -> Option<u32> {
+    Some(crate::consts::DEFAULT_MASS_DELETION_THRESHOLD)
+}
+
 /// Repository access mode; `ReadOnly` serves restores only (no backups, no maintenance).
 ///
 /// ```

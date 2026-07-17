@@ -636,6 +636,24 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              deletionProtection:
+                description: Mass-deletion circuit breaker for this repository's Snapshots.
+                nullable: true
+                properties:
+                  threshold:
+                    default: 10
+                    description: |-
+                      Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set,
+                      effective deletionPolicy Delete, not operator-pruned) that trip the
+                      breaker for this repository: at or above this, those deletions are HELD
+                      (finalizers wait) until acknowledged via the
+                      `kopiur.home-operations.com/allow-mass-deletion` annotation.
+                      `0` disables the breaker. Default 10.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               encryption:
                 description: Repository password (a Secret reference).
                 properties:
@@ -3522,6 +3540,24 @@ spec:
                     default: false
                     description: When `true`, the owner permits projecting this repository's credential Secret(s) into a consumer namespace.
                     type: boolean
+                type: object
+              deletionProtection:
+                description: Mass-deletion circuit breaker for this repository's Snapshots.
+                nullable: true
+                properties:
+                  threshold:
+                    default: 10
+                    description: |-
+                      Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set,
+                      effective deletionPolicy Delete, not operator-pruned) that trip the
+                      breaker for this repository: at or above this, those deletions are HELD
+                      (finalizers wait) until acknowledged via the
+                      `kopiur.home-operations.com/allow-mass-deletion` annotation.
+                      `0` disables the breaker. Default 10.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                 type: object
               encryption:
                 description: Repository password (a Secret reference that must carry an explicit `namespace`).
@@ -7109,6 +7145,25 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              onScheduleDelete:
+                description: |-
+                  What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it
+                  produced (which Kubernetes GC cascade-deletes via their ownerReference).
+                  Default `Retain`: the CRs are removed but their kopia snapshots survive and
+                  the catalog rediscovers them as `origin: discovered`. `Delete` opts into the
+                  cascade: each Snapshot's own `deletionPolicy` applies.
+
+                  Deliberately 2-variant (not reusing [`DeletionPolicy`]): an `Orphan` in
+                  cascade position would differ from `Retain` only in per-CR event/metric
+                  bookkeeping — an invalid state made unrepresentable. The guard's `Retain`
+                  is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot
+                  stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm
+                  (no per-CR "orphaned" event/metric for every produced Snapshot).
+                enum:
+                - Retain
+                - Delete
+                nullable: true
+                type: string
               pin:
                 description: Exempt this snapshot from GFS retention.
                 type: boolean
@@ -7509,6 +7564,21 @@ spec:
           spec:
             description: Cron schedule that fires `Snapshot` CRs from a `SnapshotPolicy`.
             properties:
+              deletion:
+                description: Deletion semantics for the Snapshots this schedule produced.
+                nullable: true
+                properties:
+                  onScheduleDelete:
+                    default: Retain
+                    description: |-
+                      Stamped onto every produced Snapshot at creation (`spec.onScheduleDelete`)
+                      and consulted by the Snapshot finalizer when the owning schedule is gone
+                      or replaced. Absent resolves to `Retain`.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
+                type: object
               failedJobsHistoryLimit:
                 default: 10
                 description: |-

@@ -68,6 +68,23 @@ pub async fn publish_warning_event<K>(
     }
 }
 
+/// Emit a `Warning` Event on an explicit [`ObjectReference`], for a referent the
+/// reconciler does not hold as a typed object — e.g. the deletion finalizer
+/// warning about a malformed `allow-mass-deletion` ack on the repository CR it
+/// only resolved a [`ResolvedRepository`](super::ResolvedRepository) for. The
+/// reference MUST omit `resourceVersion` (build it from stable fields) so the
+/// Recorder aggregates repeats into one series — see [`event_ref`]. Best-effort.
+pub async fn publish_warning_event_on_ref(
+    ctx: &Context,
+    regarding: &ObjectReference,
+    reason: &str,
+    action: &str,
+    message: &str,
+) {
+    let name = regarding.name.as_deref().unwrap_or("<unknown>").to_string();
+    publish_warning(ctx, regarding, &name, reason, action, message.to_string()).await;
+}
+
 /// Emit a `Warning` Event for a missing credentials Secret (see
 /// [`publish_warning_event`]).
 pub async fn publish_missing_creds_event<K>(ctx: &Context, obj: &K, message: &str)

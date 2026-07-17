@@ -27,6 +27,13 @@ pub enum Operation {
     /// Delete a snapshot from the repository (finalizer path, deletionPolicy:
     /// Delete).
     SnapshotDelete(SnapshotDeleteOp),
+    /// Delete MANY snapshots from the repository over one connect (mass-deletion
+    /// protection): one mover Job per repository, rather than one per `Snapshot`
+    /// CR, when a bulk deletion is approved. Each member is deleted independently
+    /// via the same self-healing logic as [`Operation::SnapshotDelete`] (the
+    /// mover's `delete_one`). Nothing emits this operation yet — it is wired by
+    /// a later milestone; adding it here is an upgrade-safe no-op.
+    SnapshotDeleteBatch(SnapshotDeleteBatchOp),
     /// Bootstrap a repository: connect (adopt an existing repo), or — when
     /// `autoCreate` and the backend is reachable with valid creds — create it,
     /// then report its identity + catalog back to the controller. The
@@ -73,6 +80,7 @@ impl Operation {
             Operation::Snapshot(_) => "Snapshot",
             Operation::Restore(_) => "Restore",
             Operation::SnapshotDelete(_) => "SnapshotDelete",
+            Operation::SnapshotDeleteBatch(_) => "SnapshotDeleteBatch",
             Operation::BootstrapRepository(_) => "BootstrapRepository",
             Operation::Maintenance(_) => "Maintenance",
             Operation::SnapshotPin(_) => "SnapshotPin",
@@ -533,6 +541,33 @@ pub struct SnapshotDeleteOp {
     /// snapshot lives under a different id. Without this the idempotent
     /// "no snapshots matched" path would silently ORPHAN the live snapshot under
     /// `deletionPolicy: Delete`. Empty ⇒ delete by id only (old behavior).
+    #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
+    pub anchor: SnapshotAnchor,
+}
+
+/// Payload for a per-repository batch snapshot-delete run (mass-deletion
+/// protection): one mover Job deletes MANY manifest ids over one connect,
+/// instead of one Job per `Snapshot` CR. Nothing emits this yet (a later
+/// milestone wires the controller dispatcher); this type landing is an
+/// upgrade-safe no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDeleteBatchOp {
+    /// Members, each with its own stale-id self-heal anchor.
+    pub items: Vec<SnapshotDeleteItem>,
+}
+
+/// One member of a [`SnapshotDeleteBatchOp`]: mirrors [`SnapshotDeleteOp`]'s
+/// `snapshot_id`/`anchor` shape exactly (same self-heal semantics, applied
+/// per-item instead of to a single delete).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDeleteItem {
+    /// The snapshot manifest id to delete.
+    pub snapshot_id: String,
+    /// Stable identity anchors for the snapshot, used to self-heal a stale
+    /// `snapshot_id` — see [`SnapshotDeleteOp::anchor`]. Empty ⇒ delete by id
+    /// only.
     #[serde(default, skip_serializing_if = "SnapshotAnchor::is_empty")]
     pub anchor: SnapshotAnchor,
 }

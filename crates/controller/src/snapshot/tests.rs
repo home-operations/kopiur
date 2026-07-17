@@ -1,5 +1,6 @@
 use super::*;
 use crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kopiur_api::common::NamespaceDeletePolicy;
 
 #[test]
@@ -239,66 +240,16 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
     )
 }
 
-// --- delete_projection_enabled (cascade never projects, #231) ------------
+// --- deletion-path credential helpers ------------------------------------
+//
+// The per-CR `delete_projection_enabled` gate is retired with the per-CR delete
+// Job (M5a): the per-repository batch delete runs at the repository's home
+// namespace, where its canonical Secret already lives, so it NEVER projects
+// (projection is hardcoded off). `stuck_finalizer_hint` survives — it enriches
+// the batch path's credential-resolution error with the escape hatch.
 
 fn projection(enabled: bool) -> kopiur_api::common::CredentialProjection {
     kopiur_api::common::CredentialProjection { enabled }
-}
-
-#[test]
-fn delete_projection_follows_the_recipe_when_nothing_is_pinned() {
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(delete_projection_enabled(false, Some(&policy), None));
-    policy.spec.credential_projection = None;
-    assert!(!delete_projection_enabled(false, Some(&policy), None));
-    assert!(
-        !delete_projection_enabled(false, None, None),
-        "no recipe and no pin: nothing says projection was ever in use"
-    );
-}
-
-#[test]
-fn delete_projection_honors_the_pin_after_the_recipe_is_gone() {
-    // #255: the recipe is the only place the opt-in lives, and a user may delete it
-    // before the Snapshot. Reading an absent recipe as "projection off" sent the
-    // delete Job looking for a namespace-local Secret that only projection supplies,
-    // stranding the cleanup finalizer forever.
-    assert!(delete_projection_enabled(
-        false,
-        None,
-        Some(&projection(true))
-    ));
-    assert!(!delete_projection_enabled(
-        false,
-        None,
-        Some(&projection(false))
-    ));
-}
-
-#[test]
-fn delete_projection_pin_wins_over_a_recipe_that_changed_after_the_run() {
-    // The pin records the conditions the run ACTUALLY executed under, and the delete
-    // path's job is to reproduce them — mirroring `resolve_repo_for_deletion`, which
-    // likewise prefers `status.resolved` over the live recipe. Letting the live value
-    // win would strand the finalizer identically to #255 whenever a recipe merely
-    // changed: the run projected, the recipe later said stop, and the delete Job would
-    // then demand a Secret nobody ever put in that namespace.
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(false));
-    assert!(delete_projection_enabled(
-        false,
-        Some(&policy),
-        Some(&projection(true))
-    ));
-    // ...and symmetrically: a run that did NOT project is not made to project by a
-    // recipe that opted in afterwards.
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(!delete_projection_enabled(
-        false,
-        Some(&policy),
-        Some(&projection(false))
-    ));
 }
 
 #[test]
@@ -322,22 +273,6 @@ fn stuck_finalizer_hint_names_the_escape_hatch_and_keeps_the_original_message() 
 }
 
 #[test]
-fn delete_projection_is_hard_off_for_the_cross_namespace_cascade() {
-    // Even a still-live recipe with the opt-in set must not project on the
-    // cascade path: the copy would be owned by the repository CR, which can be
-    // cluster-scoped — an invalid ownerRef on a namespaced Secret, never GC'd.
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(!delete_projection_enabled(true, Some(&policy), None));
-    // The pin must not reopen that hole either.
-    assert!(!delete_projection_enabled(
-        true,
-        Some(&policy),
-        Some(&projection(true))
-    ));
-}
-
-#[test]
 fn projection_to_pin_records_an_absent_opt_in_as_an_explicit_off() {
     // `None` on the pin means "this Snapshot predates the pin", which the delete path
     // resolves by falling back to the live recipe. A recipe that simply never opted in
@@ -348,6 +283,97 @@ fn projection_to_pin_records_an_absent_opt_in_as_an_explicit_off() {
     assert_eq!(super::plan::projection_to_pin(&policy), projection(false));
     policy.spec.credential_projection = Some(projection(true));
     assert_eq!(super::plan::projection_to_pin(&policy), projection(true));
+}
+
+// --- repository-ref backfill (mass-deletion breaker per-repo counting) ----
+
+/// A produced `Snapshot` (has `policyRef`), optionally already carrying a
+/// `status.resolved.repository` pin.
+fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>) -> Snapshot {
+    let mut backup = Snapshot::new(
+        "b1",
+        kopiur_api::snapshot::SnapshotSpec {
+            policy_ref: Some(kopiur_api::common::PolicyRef {
+                name: "pg".into(),
+                namespace: None,
+            }),
+            tags: None,
+            failure_policy: None,
+            deletion_policy: None,
+            on_schedule_delete: None,
+            pin: false,
+            description: None,
+        },
+    );
+    if let Some(repository) = pinned_repo {
+        backup.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            resolved: Some(kopiur_api::snapshot::ResolvedSnapshot {
+                repository: Some(repository),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    backup
+}
+
+#[test]
+fn needs_repository_backfill_when_pin_absent_but_recipe_reachable() {
+    use kopiur_api::common::{RepositoryKind, RepositoryRef};
+
+    assert!(super::plan::needs_repository_backfill(
+        &backup_with_policy_ref(None)
+    ));
+    let already_pinned = backup_with_policy_ref(Some(RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "r".into(),
+        namespace: Some("ns".into()),
+    }));
+    assert!(!super::plan::needs_repository_backfill(&already_pinned));
+}
+
+#[test]
+fn needs_repository_backfill_is_false_without_a_policy_ref() {
+    // Discovered/manual Snapshots have no recipe to pin from; they stay in the
+    // conservative unpinned bucket forever, by design — not a bug.
+    assert!(!super::plan::needs_repository_backfill(&dummy_backup()));
+}
+
+#[test]
+fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
+    let policy = sample_policy();
+    assert_eq!(
+        super::plan::backfill_patch_body(&policy, "ns", false, false),
+        None
+    );
+}
+
+#[test]
+fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
+    let policy = sample_policy();
+
+    // Only the repository pin needs backfilling: the body carries just that key.
+    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true)
+        .expect("repository backfill needed");
+    let resolved = repo_only["resolved"].as_object().expect("object");
+    assert!(!resolved.contains_key("credentialProjection"));
+    assert_eq!(resolved["repository"]["name"], "r");
+    // The pinned ref carries the fallback namespace ("ns") since the recipe's
+    // own repository ref and metadata both leave the namespace unset.
+    assert_eq!(resolved["repository"]["namespace"], "ns");
+
+    // Only the projection pin needs backfilling: the body carries just that key.
+    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false)
+        .expect("projection backfill needed");
+    let resolved = projection_only["resolved"].as_object().expect("object");
+    assert!(!resolved.contains_key("repository"));
+    assert_eq!(resolved["credentialProjection"]["enabled"], false);
+
+    // Both needed: both keys present.
+    let both = super::plan::backfill_patch_body(&policy, "ns", true, true).expect("both needed");
+    let resolved = both["resolved"].as_object().expect("object");
+    assert!(resolved.contains_key("credentialProjection"));
+    assert!(resolved.contains_key("repository"));
 }
 
 // backend_to_repository_connect's exhaustive every-variant test moved with
@@ -384,6 +410,8 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         mode: Default::default(),
         credential_projection_allowed: false,
         owner_ref: Default::default(),
+        deletion_protection: None,
+        mass_deletion_ack: None,
     }
 }
 
@@ -429,6 +457,7 @@ fn dummy_backup() -> Snapshot {
             tags: None,
             failure_policy: None,
             deletion_policy: None,
+            on_schedule_delete: None,
             pin: false,
             description: None,
         },
@@ -842,28 +871,71 @@ fn matches_snapshot_identity_excludes_different_path_same_identity() {
     assert!(!matches_snapshot_identity(&entry, &identity));
 }
 
-// --- plan_deletion: exhaustive over every DeletionPolicy ----------------
+// --- plan_deletion: the mass-deletion-protection decision table (M2) ----
+//
+// Decision order under test (see `plan_deletion`'s doc comment for the full
+// table): (1) skip-cleanup annotation, absolute; (2) namespace-terminating
+// cascade; (3) schedule cascade guard; (4) operator prune; (5)/(6) external
+// destructive/non-destructive with the mass-deletion breaker.
+
+use kopiur_api::common::ScheduleDeletePolicy;
+use kopiur_api::consts::PRUNED_BY_ANNOTATION;
+use kopiur_api::snapshot::PrunedBy;
+
+/// Base facts: external (live owner), live namespace, breaker allowed, policy
+/// Delete. Each test overrides only the fields it's exercising — keeps every
+/// call site legible, matching `DeletionFacts`'s own rationale.
+fn base_facts(annotations: &BTreeMap<String, String>) -> DeletionFacts<'_> {
+    DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        annotations,
+        owner: OwnerState::Alive,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: false,
+        ns_policy: None,
+        breaker: BreakerState::Allowed,
+    }
+}
+
+/// Annotations carrying a `pruned-by: <kind>` stamp.
+fn pruned(kind: PrunedBy) -> BTreeMap<String, String> {
+    ann(&[(PRUNED_BY_ANNOTATION, kind.annotation_value())])
+}
+
+// -- ported: the pre-M2 plan_deletion(policy, annotations) tests ---------
 
 #[test]
 fn delete_policy_plans_snapshot_delete() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::DeleteSnapshot
     );
 }
 
 #[test]
 fn retain_policy_plans_retain() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Retain, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Retain,
+            ..base_facts(&a)
+        }),
         DeletionPlan::RetainSnapshot
     );
 }
 
 #[test]
 fn orphan_policy_plans_orphan() {
+    let a = BTreeMap::new();
     assert_eq!(
-        plan_deletion(DeletionPolicy::Orphan, &BTreeMap::new()),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Orphan,
+            ..base_facts(&a)
+        }),
         DeletionPlan::OrphanSnapshot
     );
 }
@@ -874,7 +946,10 @@ fn skip_annotation_overrides_delete_to_orphan() {
     // contact a dead repository.
     let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &a),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::OrphanSnapshot
     );
 }
@@ -882,12 +957,19 @@ fn skip_annotation_overrides_delete_to_orphan() {
 #[test]
 fn skip_annotation_overrides_every_policy() {
     let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "")]);
-    for p in [
+    for policy in [
         DeletionPolicy::Delete,
         DeletionPolicy::Retain,
         DeletionPolicy::Orphan,
     ] {
-        assert_eq!(plan_deletion(p, &a), DeletionPlan::OrphanSnapshot);
+        assert_eq!(
+            plan_deletion(DeletionFacts {
+                policy,
+                ..base_facts(&a)
+            }),
+            DeletionPlan::OrphanSnapshot,
+            "{policy:?}"
+        );
     }
 }
 
@@ -895,64 +977,1041 @@ fn skip_annotation_overrides_every_policy() {
 fn unrelated_annotations_do_not_trigger_skip() {
     let a = ann(&[("kopiur.home-operations.com/other", "x")]);
     assert_eq!(
-        plan_deletion(DeletionPolicy::Delete, &a),
+        plan_deletion(DeletionFacts {
+            policy: DeletionPolicy::Delete,
+            ..base_facts(&a)
+        }),
         DeletionPlan::DeleteSnapshot
     );
 }
 
-// --- namespace_delete_plan (ADR-0005 §5 data-loss prevention) -----------
+// -- ported: the pre-M2 namespace_delete_plan tests ----------------------
 
 #[test]
 fn non_terminating_namespace_keeps_the_per_snapshot_plan() {
-    // A lone `kubectl delete snapshot` (namespace healthy) honors the Snapshot's
-    // own plan regardless of the repository's onNamespaceDelete policy.
-    for policy in [NamespaceDeletePolicy::Orphan, NamespaceDeletePolicy::Delete] {
-        for base in [
-            DeletionPlan::DeleteSnapshot,
-            DeletionPlan::RetainSnapshot,
-            DeletionPlan::OrphanSnapshot,
+    // A lone `kubectl delete snapshot` (namespace healthy) honors the
+    // Snapshot's own plan regardless of the repository's onNamespaceDelete
+    // policy (or whether it could even be resolved).
+    let a = BTreeMap::new();
+    for ns_policy in [
+        None,
+        Some(NamespaceDeletePolicy::Orphan),
+        Some(NamespaceDeletePolicy::Delete),
+    ] {
+        for (policy, expected) in [
+            (DeletionPolicy::Delete, DeletionPlan::DeleteSnapshot),
+            (DeletionPolicy::Retain, DeletionPlan::RetainSnapshot),
+            (DeletionPolicy::Orphan, DeletionPlan::OrphanSnapshot),
         ] {
-            assert_eq!(namespace_delete_plan(policy, false, base), base);
+            let plan = plan_deletion(DeletionFacts {
+                policy,
+                ns_terminating: false,
+                ns_policy,
+                ..base_facts(&a)
+            });
+            assert_eq!(plan, expected, "{policy:?}/{ns_policy:?}");
         }
     }
 }
 
+// -- named intent tests (approved semantics) -----------------------------
+
 #[test]
-fn terminating_namespace_orphan_policy_forces_orphan() {
-    // The fail-safe default: a deleted namespace must not run `kopia snapshot
-    // delete`, even when the Snapshot's own plan was DeleteSnapshot.
-    for base in [
-        DeletionPlan::DeleteSnapshot,
-        DeletionPlan::RetainSnapshot,
-        DeletionPlan::OrphanSnapshot,
+fn external_owner_gone_delete_downgrades_to_cascade_guard_retain() {
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn external_owner_exists_but_terminating_downgrades() {
+    // Foreground-cascade: the schedule still exists (same uid) but is itself
+    // terminating — GC hasn't reaped this Snapshot yet, but the schedule is
+    // as good as gone.
+    let owner_ref = schedule_owner_ref_fixture("sched-uid");
+    let sched = schedule_fixture("sched-uid", true);
+    let owner = owner_state_from(Some(&sched), &owner_ref);
+    assert_eq!(owner, OwnerState::GoneOrReplaced);
+
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn external_owner_uid_mismatch_downgrades() {
+    // kro-style delete+recreate: a same-name schedule exists but with a
+    // different uid, so the ownerRef points at a schedule that's really gone.
+    let owner_ref = schedule_owner_ref_fixture("old-uid");
+    let sched = schedule_fixture("new-uid", false);
+    let owner = owner_state_from(Some(&sched), &owner_ref);
+    assert_eq!(owner, OwnerState::GoneOrReplaced);
+
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn cascade_delete_opt_in_still_deletes_when_owner_gone() {
+    let a = BTreeMap::new();
+    let allowed = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Delete,
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // ...and still holdable: the opt-in cascade is still an external
+    // deletion, so the breaker applies to it exactly as it would without the
+    // cascade in play.
+    let held = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Delete,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn single_external_delete_with_live_schedule_unchanged() {
+    // Status quo: an Alive owner never puts the cascade guard in play, so a
+    // lone external delete plans exactly as it did pre-M2.
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::Alive,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn operator_pruned_bypasses_guard_and_breaker() {
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        let plan = plan_deletion(DeletionFacts {
+            owner: OwnerState::GoneOrReplaced, // would otherwise trigger the guard
+            cascade: ScheduleDeletePolicy::Retain, // would otherwise downgrade
+            breaker: BreakerState::Held,       // would otherwise hold
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::DeleteSnapshot, "{kind:?}");
+    }
+}
+
+#[test]
+fn unknown_pruned_by_value_treated_external() {
+    let a = ann(&[(PRUNED_BY_ANNOTATION, "garbage")]);
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    // Unrecognized value parses to None => external => the cascade guard
+    // applies exactly as if no pruned-by annotation were present at all.
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnScheduleDelete);
+}
+
+#[test]
+fn skip_cleanup_wins_even_over_held() {
+    let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
+    let plan = plan_deletion(DeletionFacts {
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
+#[test]
+fn ns_terminating_default_orphan_beats_cascade_guard() {
+    let a = BTreeMap::new();
+    let plan = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced, // would otherwise trigger the guard
+        cascade: ScheduleDeletePolicy::Delete, // would otherwise cascade-delete
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Orphan),
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
+#[test]
+fn ns_terminating_unresolved_repo_orphans() {
+    // Ports the pre-M2 fail-safe: when the repository can't be resolved while
+    // the namespace terminates, the caller passes `ns_policy: None`, and that
+    // must orphan regardless of the Snapshot's own policy.
+    let a = BTreeMap::new();
+    for policy in [
+        DeletionPolicy::Delete,
+        DeletionPolicy::Retain,
+        DeletionPolicy::Orphan,
     ] {
-        assert_eq!(
-            namespace_delete_plan(NamespaceDeletePolicy::Orphan, true, base),
-            DeletionPlan::OrphanSnapshot
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            ns_terminating: true,
+            ns_policy: None,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::OrphanSnapshot, "{policy:?}");
+    }
+}
+
+#[test]
+fn ns_terminating_delete_optin_bypasses_guard_but_not_breaker() {
+    let a = BTreeMap::new();
+    // Guard bypassed: owner gone + cascade Retain would normally downgrade to
+    // RetainSnapshotOnScheduleDelete, but ns_policy: Delete skips straight to
+    // the breaker check instead.
+    let allowed = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // Not the breaker: still holdable.
+    let held = plan_deletion(DeletionFacts {
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn breaker_never_holds_retain_or_orphan() {
+    let a = BTreeMap::new();
+    for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_ne!(plan, DeletionPlan::HoldSnapshotDeletion, "{policy:?}");
+    }
+}
+
+#[test]
+fn orphaned_ownerref_children_get_their_own_policy() {
+    // NoScheduleOwner: manual/discovered/`--cascade=orphan` children never
+    // consult the cascade guard, whatever `cascade` happens to carry.
+    let a = BTreeMap::new();
+    for (policy, expected) in [
+        (DeletionPolicy::Delete, DeletionPlan::DeleteSnapshot),
+        (DeletionPolicy::Retain, DeletionPlan::RetainSnapshot),
+        (DeletionPolicy::Orphan, DeletionPlan::OrphanSnapshot),
+    ] {
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            owner: OwnerState::NoScheduleOwner,
+            cascade: ScheduleDeletePolicy::Retain,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, expected, "{policy:?}");
+    }
+}
+
+// -- table test: every meaningful row of the decision matrix -------------
+
+/// One row of the decision matrix: the facts that matter for that row plus
+/// the expected [`DeletionPlan`]. `skip`/`pruned` build the annotations map;
+/// everything else maps 1:1 onto [`DeletionFacts`].
+struct Row {
+    policy: DeletionPolicy,
+    owner: OwnerState,
+    cascade: ScheduleDeletePolicy,
+    pruned: Option<PrunedBy>,
+    skip: bool,
+    ns_terminating: bool,
+    ns_policy: Option<NamespaceDeletePolicy>,
+    breaker: BreakerState,
+    expected: DeletionPlan,
+}
+
+#[test]
+fn plan_deletion_table_covers_every_meaningful_row() {
+    use DeletionPlan::*;
+    use DeletionPolicy as P;
+    use NamespaceDeletePolicy as NDP;
+    use OwnerState as O;
+    use ScheduleDeletePolicy as SDP;
+
+    let rows = [
+        // -- namespace terminating, ns_policy unresolved (None): always Orphan,
+        // whatever the per-CR policy.
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- namespace terminating, ns_policy Orphan (default): always Orphan.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Orphan),
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- namespace terminating, ns_policy Delete (opt-in cascade): bypasses
+        // the schedule cascade guard, but NOT the breaker/prune logic.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Held,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: true,
+            ns_policy: Some(NDP::Delete),
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner gone/replaced, external (no prune): cascade
+        // guard applies.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshotOnScheduleDelete,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Delete,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner gone/replaced, operator-pruned: guard bypassed.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::FailedHistory),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: Some(PrunedBy::Retention),
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, owner Alive: plain external, breaker gates Delete
+        // only.
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: OrphanSnapshot,
+        },
+        // -- live namespace, no schedule owner at all: same as Alive.
+        Row {
+            policy: P::Delete,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: DeleteSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: HoldSnapshotDeletion,
+        },
+        Row {
+            policy: P::Retain,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: RetainSnapshot,
+        },
+        Row {
+            policy: P::Orphan,
+            owner: O::NoScheduleOwner,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: false,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+        // -- skip-cleanup: absolute, beats everything else including Held and
+        // ns-terminating.
+        Row {
+            policy: P::Delete,
+            owner: O::GoneOrReplaced,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: true,
+            ns_terminating: false,
+            ns_policy: None,
+            breaker: BreakerState::Held,
+            expected: OrphanSnapshot,
+        },
+        Row {
+            policy: P::Delete,
+            owner: O::Alive,
+            cascade: SDP::Retain,
+            pruned: None,
+            skip: true,
+            ns_terminating: true,
+            ns_policy: None,
+            breaker: BreakerState::Allowed,
+            expected: OrphanSnapshot,
+        },
+    ];
+
+    for (i, row) in rows.iter().enumerate() {
+        let mut a = BTreeMap::new();
+        if let Some(p) = row.pruned {
+            a.insert(
+                PRUNED_BY_ANNOTATION.to_string(),
+                p.annotation_value().to_string(),
+            );
+        }
+        if row.skip {
+            a.insert(
+                SKIP_SNAPSHOT_CLEANUP_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
+        }
+        let plan = plan_deletion(DeletionFacts {
+            policy: row.policy,
+            annotations: &a,
+            owner: row.owner,
+            cascade: row.cascade,
+            ns_terminating: row.ns_terminating,
+            ns_policy: row.ns_policy,
+            breaker: row.breaker,
+        });
+        assert_eq!(plan, row.expected, "row {i}");
+    }
+}
+
+// -- schedule_owner_ref / owner_state_from --------------------------------
+
+fn schedule_owner_ref_fixture(uid: &str) -> OwnerReference {
+    OwnerReference {
+        api_version: crate::consts::API_VERSION.to_string(),
+        kind: "SnapshotSchedule".to_string(),
+        name: "nightly".to_string(),
+        uid: uid.to_string(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    }
+}
+
+fn schedule_fixture(uid: &str, terminating: bool) -> kopiur_api::SnapshotSchedule {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    let mut sched = kopiur_api::SnapshotSchedule::new(
+        "nightly",
+        kopiur_api::SnapshotScheduleSpec {
+            policy_ref: Some(kopiur_api::common::PolicyRef {
+                name: "pg".into(),
+                namespace: None,
+            }),
+            policy_selector: None,
+            schedule: kopiur_api::ScheduleSpec {
+                cron: "H 2 * * *".into(),
+                jitter: None,
+                timezone: None,
+                run_on_create: false,
+                suspend: false,
+                concurrency_policy: kopiur_api::ConcurrencyPolicy::Forbid,
+                starting_deadline_seconds: None,
+            },
+            failed_jobs_history_limit: None,
+            deletion: None,
+        },
+    );
+    sched.metadata.namespace = Some("media".into());
+    sched.metadata.uid = Some(uid.to_string());
+    if terminating {
+        sched.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    }
+    sched
+}
+
+#[test]
+fn owner_state_from_same_uid_live_is_alive() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    let sched = schedule_fixture("uid-1", false);
+    assert_eq!(owner_state_from(Some(&sched), &owner), OwnerState::Alive);
+}
+
+#[test]
+fn owner_state_from_404_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    assert_eq!(owner_state_from(None, &owner), OwnerState::GoneOrReplaced);
+}
+
+#[test]
+fn owner_state_from_terminating_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("uid-1");
+    let sched = schedule_fixture("uid-1", true);
+    assert_eq!(
+        owner_state_from(Some(&sched), &owner),
+        OwnerState::GoneOrReplaced
+    );
+}
+
+#[test]
+fn owner_state_from_uid_mismatch_is_gone_or_replaced() {
+    let owner = schedule_owner_ref_fixture("old-uid");
+    let sched = schedule_fixture("new-uid", false);
+    assert_eq!(
+        owner_state_from(Some(&sched), &owner),
+        OwnerState::GoneOrReplaced
+    );
+}
+
+#[test]
+fn schedule_owner_ref_finds_the_controller_ownerref() {
+    let mut backup = dummy_backup();
+    backup.metadata.owner_references = Some(vec![schedule_owner_ref_fixture("uid-1")]);
+    let found = schedule_owner_ref(&backup).expect("found");
+    assert_eq!(found.uid, "uid-1");
+    assert_eq!(found.kind, "SnapshotSchedule");
+}
+
+#[test]
+fn schedule_owner_ref_is_none_without_a_schedule_owner() {
+    // No ownerRef at all.
+    let backup = dummy_backup();
+    assert!(schedule_owner_ref(&backup).is_none());
+
+    // A foreign-kind ownerRef (e.g. a Repository) doesn't count.
+    let mut foreign = dummy_backup();
+    foreign.metadata.owner_references = Some(vec![OwnerReference {
+        api_version: crate::consts::API_VERSION.to_string(),
+        kind: "Repository".to_string(),
+        name: "nas".to_string(),
+        uid: "uid-1".to_string(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    }]);
+    assert!(schedule_owner_ref(&foreign).is_none());
+}
+
+// -- breaker_state / clamp_ack --------------------------------------------
+
+fn t(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs, 0).unwrap()
+}
+
+#[test]
+fn breaker_state_below_and_at_threshold() {
+    let now = t(1_700_000_000);
+    assert_eq!(breaker_state(4, 5, now, None), BreakerState::Allowed);
+    assert_eq!(breaker_state(5, 5, now, None), BreakerState::Held);
+}
+
+#[test]
+fn breaker_state_threshold_zero_disables() {
+    let now = t(1_700_000_000);
+    assert_eq!(
+        breaker_state(1_000_000, 0, now, None),
+        BreakerState::Allowed
+    );
+}
+
+#[test]
+fn breaker_state_ack_releases_at_or_before_deletion_timestamp_only() {
+    let ack = t(1_700_000_000);
+    let at_ack = t(1_700_000_000);
+    let before_ack = t(1_699_999_000);
+    let after_ack = t(1_700_000_001);
+    assert_eq!(
+        breaker_state(10, 5, at_ack, Some(ack)),
+        BreakerState::Allowed
+    );
+    assert_eq!(
+        breaker_state(10, 5, before_ack, Some(ack)),
+        BreakerState::Allowed
+    );
+    // Newer than the ack: stays held despite the ack existing.
+    assert_eq!(
+        breaker_state(10, 5, after_ack, Some(ack)),
+        BreakerState::Held
+    );
+}
+
+#[test]
+fn clamp_ack_pulls_future_acks_back_to_now() {
+    let now = t(1_700_000_000);
+    let future = t(1_700_001_000);
+    let past = t(1_699_000_000);
+    assert_eq!(clamp_ack(Some(future), now), Some(now));
+    assert_eq!(clamp_ack(Some(past), now), Some(past));
+    assert_eq!(clamp_ack(None, now), None);
+}
+
+// -- counts_toward_breaker -------------------------------------------------
+
+#[test]
+fn counts_toward_breaker_external_delete_is_true() {
+    let a = BTreeMap::new();
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_pruned_is_false() {
+    let a = pruned(PrunedBy::Retention);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_retain_and_orphan_are_false() {
+    let a = BTreeMap::new();
+    for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy,
+                ..base_facts(&a)
+            }),
+            "{policy:?}"
         );
     }
 }
 
 #[test]
-fn terminating_namespace_delete_policy_cascades_to_base_plan() {
-    // Opt-in cascade: with onNamespaceDelete=Delete, the per-Snapshot plan applies
-    // (so a produced Snapshot still runs the snapshot delete).
+fn counts_toward_breaker_skip_annotated_is_false() {
+    let a = ann(&[(SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true")]);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_cascade_retained_is_false() {
+    // The cascade-wave-does-not-inflate-count guarantee: an owner-gone Retain
+    // downgrade must not itself count as a pending destructive deletion.
+    let a = BTreeMap::new();
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    }));
+}
+
+// -- breaker_stores_ready / parse_mass_deletion_ack ------------------------
+
+#[test]
+fn breaker_stores_ready_requires_present_and_synced() {
+    // The store-unset path must behave IDENTICALLY to the not-yet-synced path:
+    // both are "can't count yet", never "nothing pending".
+    assert!(!breaker_stores_ready(false, false));
+    assert!(!breaker_stores_ready(false, true)); // unset, even if a flag says synced
+    assert!(!breaker_stores_ready(true, false)); // present but cold
+    assert!(breaker_stores_ready(true, true)); // the only trustworthy case
+}
+
+#[test]
+fn parse_mass_deletion_ack_absent_is_none_not_invalid() {
+    let now = chrono::Utc::now();
+    assert_eq!(parse_mass_deletion_ack(None, now), (None, false));
+}
+
+#[test]
+fn parse_mass_deletion_ack_parses_and_clamps_to_now() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    // A past value passes through; a future value is clamped back to now.
+    let (past, invalid) = parse_mass_deletion_ack(Some("2025-06-01T00:00:00Z"), now);
+    assert!(!invalid);
     assert_eq!(
-        namespace_delete_plan(
-            NamespaceDeletePolicy::Delete,
-            true,
-            DeletionPlan::DeleteSnapshot
-        ),
-        DeletionPlan::DeleteSnapshot
+        past,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        )
     );
-    // ...and a Retain/Orphan base is preserved unchanged.
+    let (future, invalid) = parse_mass_deletion_ack(Some("2027-06-01T00:00:00Z"), now);
+    assert!(!invalid);
+    assert_eq!(future, Some(now));
+}
+
+#[test]
+fn parse_mass_deletion_ack_unparseable_is_ignored_and_flagged() {
+    // Fail-safe: a garbage value never disarms the breaker (None) and signals the
+    // caller to warn (invalid = true).
+    let now = chrono::Utc::now();
     assert_eq!(
-        namespace_delete_plan(
-            NamespaceDeletePolicy::Delete,
-            true,
-            DeletionPlan::RetainSnapshot
-        ),
-        DeletionPlan::RetainSnapshot
+        parse_mass_deletion_ack(Some("not-a-date"), now),
+        (None, true)
+    );
+}
+
+// -- should_emit_held_event (transition-only) ------------------------------
+
+#[test]
+fn should_emit_held_event_only_on_transition_into_held() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+    let cond = |status: &str| Condition {
+        type_: crate::consts::DELETION_HELD_CONDITION.into(),
+        status: status.into(),
+        reason: crate::consts::MASS_DELETION_BREAKER_REASON.into(),
+        message: String::new(),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        observed_generation: None,
+    };
+    // No prior condition, or a prior `False`, → emit (this is the transition).
+    assert!(should_emit_held_event(&[]));
+    assert!(should_emit_held_event(&[cond("False")]));
+    // Already `True` → suppress (no re-emit while it stays held).
+    assert!(!should_emit_held_event(&[cond("True")]));
+}
+
+// -- mass_deletion_ack_command / hold message ------------------------------
+
+fn rref(kind: kopiur_api::common::RepositoryKind, name: &str, ns: Option<&str>) -> RepositoryRef {
+    RepositoryRef {
+        kind,
+        name: name.into(),
+        namespace: ns.map(Into::into),
+    }
+}
+
+#[test]
+fn ack_command_uses_namespaced_verb_for_a_repository() {
+    use kopiur_api::common::RepositoryKind;
+    let cmd = mass_deletion_ack_command(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        "2026-01-02T03:04:05Z",
+    );
+    assert_eq!(
+        cmd,
+        "kubectl -n backups annotate repository/nas \
+         kopiur.home-operations.com/allow-mass-deletion=\"2026-01-02T03:04:05Z\" --overwrite"
+    );
+}
+
+#[test]
+fn ack_command_uses_cluster_verb_and_no_namespace_for_a_cluster_repository() {
+    use kopiur_api::common::RepositoryKind;
+    let cmd = mass_deletion_ack_command(
+        &rref(RepositoryKind::ClusterRepository, "shared", None),
+        "2026-01-02T03:04:05Z",
+    );
+    assert_eq!(
+        cmd,
+        "kubectl annotate clusterrepository/shared \
+         kopiur.home-operations.com/allow-mass-deletion=\"2026-01-02T03:04:05Z\" --overwrite"
+    );
+}
+
+#[test]
+fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
+    use kopiur_api::common::RepositoryKind;
+    let msg = mass_deletion_hold_message(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        12,
+        10,
+        "2026-01-02T03:04:05Z",
+    );
+    assert!(msg.contains("12 pending"), "count: {msg}");
+    assert!(msg.contains("threshold of 10"), "threshold: {msg}");
+    assert!(msg.contains("Repository `nas`"), "repo: {msg}");
+    assert!(
+        msg.contains("kubectl -n backups annotate repository/nas"),
+        "ack command: {msg}"
+    );
+    assert!(msg.contains("2026-01-02T03:04:05Z"), "ack value: {msg}");
+    assert!(
+        msg.contains(SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
+        "escape hatch: {msg}"
+    );
+}
+
+// -- repo_mass_deletion_condition (repo-side, both kinds) ------------------
+
+#[test]
+fn repo_mass_deletion_condition_held_at_or_above_threshold() {
+    use kopiur_api::common::RepositoryKind;
+    let held = repo_mass_deletion_condition(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        10,
+        10,
+        Some("2026-01-02T03:04:05Z"),
+    );
+    assert!(held.held);
+    assert_eq!(
+        held.reason,
+        crate::consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON
+    );
+    assert!(
+        held.message
+            .contains("kubectl -n backups annotate repository/nas")
+    );
+}
+
+#[test]
+fn repo_mass_deletion_condition_clear_below_threshold_and_when_disabled() {
+    use kopiur_api::common::RepositoryKind;
+    let repo = rref(RepositoryKind::ClusterRepository, "shared", None);
+    let below = repo_mass_deletion_condition(&repo, 9, 10, None);
+    assert!(!below.held);
+    assert_eq!(
+        below.reason,
+        crate::consts::MASS_DELETION_BELOW_THRESHOLD_REASON
+    );
+    // threshold 0 disables the breaker: never held even with a huge count.
+    let disabled = repo_mass_deletion_condition(&repo, 1_000, 0, None);
+    assert!(!disabled.held);
+}
+
+// -- effective_on_schedule_delete ------------------------------------------
+
+#[test]
+fn effective_on_schedule_delete_none_is_retain() {
+    assert_eq!(
+        effective_on_schedule_delete(None),
+        ScheduleDeletePolicy::Retain
+    );
+    assert_eq!(
+        effective_on_schedule_delete(Some(ScheduleDeletePolicy::Delete)),
+        ScheduleDeletePolicy::Delete
     );
 }
 
@@ -1029,6 +2088,66 @@ fn terminating_operator_namespace_itself_orphans() {
                 reason.contains("kopiur-system"),
                 "names the namespace: {reason}"
             );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+// --- batch_job_placement (mirrors delete_job_placement, no per-Snapshot
+// namespace fallback — a batch always runs at the repository's home) --------
+
+#[test]
+fn batch_placement_runs_in_the_namespaced_repos_home_namespace() {
+    assert_eq!(
+        batch_job_placement(Some("storage"), Some("kopiur-system"), None),
+        DeleteJobPlacement::RunIn("storage".into())
+    );
+    // Terminating elsewhere doesn't matter.
+    assert_eq!(
+        batch_job_placement(Some("storage"), Some("kopiur-system"), Some("app")),
+        DeleteJobPlacement::RunIn("storage".into())
+    );
+}
+
+#[test]
+fn batch_placement_runs_in_the_operator_namespace_for_cluster_repo() {
+    assert_eq!(
+        batch_job_placement(None, Some("kopiur-system"), None),
+        DeleteJobPlacement::RunIn("kopiur-system".into())
+    );
+}
+
+#[test]
+fn batch_placement_orphans_when_repo_namespace_is_terminating() {
+    match batch_job_placement(Some("storage"), Some("kopiur-system"), Some("storage")) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(
+                reason.contains("kopia snapshot delete"),
+                "actionable: {reason}"
+            );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_placement_orphans_when_operator_namespace_is_terminating() {
+    match batch_job_placement(None, Some("kopiur-system"), Some("kopiur-system")) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(
+                reason.contains("kopiur-system"),
+                "names the namespace: {reason}"
+            );
+        }
+        other => panic!("expected OrphanFallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_placement_orphans_when_operator_namespace_unknown() {
+    match batch_job_placement(None, None, None) {
+        DeleteJobPlacement::OrphanFallback { reason } => {
+            assert!(reason.contains("KOPIUR_NAMESPACE"), "actionable: {reason}");
         }
         other => panic!("expected OrphanFallback, got {other:?}"),
     }

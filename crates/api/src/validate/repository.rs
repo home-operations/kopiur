@@ -419,7 +419,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None, parameters: None,
+/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None, parameters: None, deletion_protection: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.

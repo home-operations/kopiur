@@ -82,6 +82,20 @@ pub enum ValidationError {
         got: String,
     },
 
+    /// A `Snapshot` with `origin: discovered` set `spec.onScheduleDelete`. Discovered
+    /// snapshots carry an empty spec and their owner is a repository, not a
+    /// `SnapshotSchedule` — a stamped cascade policy on one is meaningless, so it is
+    /// forbidden, exactly like a non-`Retain` `deletionPolicy` ([`Self::DiscoveredMustRetain`]).
+    #[error(
+        "origin: discovered snapshots must not set onScheduleDelete (got {got:?}); a discovered \
+         snapshot has no owning SnapshotSchedule for this field to apply to. Remove \
+         spec.onScheduleDelete"
+    )]
+    DiscoveredCannotSetOnScheduleDelete {
+        /// The rejected `onScheduleDelete` value that was set.
+        got: String,
+    },
+
     /// A `Restore` with `source.identity` did not set `spec.repository`. Identity
     /// sources cannot derive a repository, so it is required (ADR §3.6/§4.6).
     #[error(

@@ -106,6 +106,78 @@ fixes only the resolved password *value* into the repo format, never the Secret
 name/key, so a rename with identical content must pass (locking it broke GitOps). See
 `validate::diff_immutable_repo_fields`.
 
+### Mass-deletion protection (cascade guard + breaker + batching)
+
+Three composable mechanisms guard against a bulk-deletion incident (ADR-0006) —
+spanning `Snapshot`, `SnapshotSchedule`, `Repository`/`ClusterRepository` — while
+keeping Kopiur's own retention pruning unaffected:
+
+- **`ScheduleDeletePolicy` is deliberately 2-variant** (`Retain`/`Delete`), not a reuse
+  of the 3-variant `DeletionPolicy` (`Delete`/`Retain`/`Orphan`). An `Orphan` in cascade
+  position would differ from `Retain` only in per-CR event/metric bookkeeping — a
+  per-CR "orphaned" event/metric fired for every produced Snapshot in the cascade, vs.
+  one quiet retain — a distinction with no operational value. Reusing `DeletionPolicy`
+  would make that non-difference representable and force every match arm to decide
+  what an `Orphan` cascade even means; the narrower enum makes it unrepresentable
+  instead.
+- **`pruned-by` distinguishes operator lifecycle from external deletion**, not
+  `DeletionPolicy` or any other spec field, because the SAME `deletionPolicy: Delete`
+  Snapshot must be handled differently depending on WHO is deleting it: Kopiur's own
+  GFS retention and `failedJobsHistoryLimit` pruning must keep working — unthrottled —
+  during an incident the breaker is actively holding, while an external actor deleting
+  the same shaped CR is exactly what the breaker exists to gate. The annotation is
+  stamped immediately before the operator's own delete call rather than inferred from
+  context, so the finalizer never has to guess; any missing or unrecognized value
+  defaults to EXTERNAL (fail-safe — a bug that fails to stamp it makes a Kopiur prune
+  look external, never the reverse).
+- **The mass-deletion ack is a VALUED timestamp, not a presence-only flag** (unlike
+  `allow-identity-change`, consumed once at a single admission instant). The breaker's
+  annotation is read on every reconcile of a live repository, so a presence-only ack —
+  set once to release a wave — would silently and *permanently* disarm the breaker the
+  moment anyone applied it, including a value left in Git. A timestamp instead answers
+  "I approve everything pending as of THIS instant": a later wave has later
+  `deletionTimestamp`s the same ack value doesn't cover, so the breaker re-arms for it
+  automatically without anyone removing the old annotation. This is also why a held
+  wave never auto-releases on its own — not when time passes, not when the pending
+  count later drops back below threshold by itself: nothing substitutes for an
+  explicit human ack: it is the only thing that ever clears a hold.
+- **Deletions execute as a per-repository BATCH, CREATEd (never SSA-applied), with NO
+  `ttlSecondsAfterFinished`.** One mover Job connects once and deletes every member's
+  kopia manifest, replacing an earlier one-Job-per-Snapshot design that let a single
+  cascade turn into hundreds of concurrent connects against one backend (the
+  motivating incident). `CREATE`, not `apply`, makes the deterministic
+  member-set-derived Job name double as a single-flight lock: a sibling reconcile's
+  `create` for the same member set 409s harmlessly against the Job already launched,
+  so two racing reconciles can never enroll a member twice. No TTL means the
+  dispatcher reaps a terminal batch Job EXPLICITLY, only once every member has
+  actually drained (a SUCCEEDED Job is deleted only once no covered member still
+  holds its cleanup finalizer) — an unconditional TTL could otherwise reap the Job
+  (and its `delete-members` audit trail) before a member's own reconcile observed the
+  success and released its finalizer.
+- **The delete-Job concurrency cap (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`) defaults to
+  UNCAPPED (`0`), an opt-in backstop, not the primary defense.** Batching itself — one
+  Job per repository per accumulation window rather than one per Snapshot — is what
+  keeps a bulk deletion from overwhelming a backend; an operator-wide concurrency cap
+  layered on top would let one slow or failing repository's batch Jobs
+  head-of-line-block every OTHER repository's deletions behind the same global limit —
+  exactly the blast-radius coupling a per-repository mechanism should avoid. The cap
+  exists for an operator who wants an extra global throttle on top, not as the
+  mechanism doing the real work.
+- **The pending COUNT is inclusive; the fire SET is exclusive** — two intentionally
+  opposite polarities over the same pending `Snapshot`s. The breaker counts a
+  maximally-inclusive set (an unpinned or possibly-cascade-guarded CR is
+  over-counted, never dropped) because over-counting only trips the breaker earlier —
+  the fail-safe direction for a count. The set a reconcile actually FIRES into a batch
+  delete Job is the opposite: maximally exclusive, because an over-included member
+  there is an irreversible `kopia snapshot delete`, so the fail-safe direction is
+  UNDER-fire + requeue. A breaker-exempt trigger (an operator prune, or an acked older
+  wave) therefore narrows its fire set past the count — dropping breaker-HELD
+  externals, `onNamespaceDelete: Orphan` members in a terminating namespace,
+  schedule-owned members while the schedule store is still cold, and unpinned PEERS
+  (whose manifest ids must not ride an unrelated repository's batch) — while every one
+  of those still counts toward the breaker. An excluded member is never lost: it
+  drains via its own reconcile's self-fire once it is genuinely eligible.
+
 ---
 
 ## Per-CRD notes
@@ -119,6 +191,8 @@ name/key, so a rename with identical content must pass (locking it broke GitOps)
   former `cacheDefaults` (now `moverDefaults.cache`).
 - **`onNamespaceDelete`** — **breaking** default change (ADR-0005 §5): default `Orphan`
   means `kubectl delete ns` no longer destroys snapshots. Materialized `default: Orphan`.
+- **`deletionProtection.threshold`** — the mass-deletion circuit breaker (ADR-0006);
+  default 10, `0` disables. See [Mass-deletion protection](#mass-deletion-protection-cascade-guard--breaker--batching) above.
 - **`mode`** — ADR-0005 §11; materialized `default: ReadWrite`.
 - **`health.indexBlobWarnThreshold`** — absent ⇒ `DEFAULT_INDEX_BLOB_WARN_THRESHOLD`
   (1000); `0` is the **disable sentinel** (not fall-back-to-default); negative rejected
@@ -185,6 +259,12 @@ name/key, so a rename with identical content must pass (locking it broke GitOps)
   pod restarts (quiesce/resume has side effects).
 - **`status.staged`** — the CSI staging objects are recorded once, reused across retries,
   reaped on the terminal transition, never double-created.
+- **`onScheduleDelete`** (`spec`) / **`pruned-by`** (annotation) — the mass-deletion
+  protection surface (ADR-0006): the stamped cascade policy the finalizer consults when
+  the owning schedule is gone, and the discriminator that tells the finalizer an
+  operator prune from an external deletion. See
+  [Mass-deletion protection](#mass-deletion-protection-cascade-guard--breaker--batching)
+  above.
 
 ### SnapshotSchedule
 
@@ -192,6 +272,11 @@ name/key, so a rename with identical content must pass (locking it broke GitOps)
   `policySelector` fans out to many policies in the namespace (mirrors `pvcSelector`).
 - **`failedJobsHistoryLimit`** — bounds *failed* child `Snapshot`s only. There is **no**
   `successfulJobsHistoryLimit`: retention is GFS-only (ADR-0003 §4.4).
+- **`deletion.onScheduleDelete`** — the schedule-cascade guard (ADR-0006), default
+  `Retain`. Propagated to existing produced `Snapshot`s on edit (skipping any child
+  already `Terminating`). See
+  [Mass-deletion protection](#mass-deletion-protection-cascade-guard--breaker--batching)
+  above.
 - **`schedule.{runOnCreate,concurrencyPolicy}`** — materialized OpenAPI defaults (see the
   pattern above); `Forbid` skips a firing rather than letting runs pile up.
 - **`status.lastSchedule.at`** — accepts the `scheduledAt` alias on the wire (serde

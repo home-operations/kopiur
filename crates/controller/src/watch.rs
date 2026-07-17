@@ -439,6 +439,82 @@ pub fn policy_to_schedules(
     })
 }
 
+// --- M4: repository -> DELETING Snapshots (mass-deletion ack drain) ----------
+
+/// Whether a `Snapshot` is terminating with our cleanup finalizer still present —
+/// the set the mass-deletion ack must re-evaluate when a repository's
+/// `allow-mass-deletion` annotation (or `deletionProtection`) changes.
+fn snapshot_awaiting_deletion(s: &Snapshot) -> bool {
+    s.metadata.deletion_timestamp.is_some()
+        && s.finalizers()
+            .iter()
+            .any(|f| f == crate::consts::SNAPSHOT_CLEANUP_FINALIZER)
+}
+
+/// Whether a deleting `Snapshot`'s `status.resolved.repository` pin targets the
+/// namespaced `Repository` `(repo_ns, repo_name)`. An UNPINNED Snapshot (pre-#255)
+/// matches EVERY repository — included conservatively: re-reconciling it is cheap
+/// and its finalizer simply re-evaluates (a no-op if it doesn't resolve here).
+fn deleting_snapshot_targets_repository(s: &Snapshot, repo_ns: &str, repo_name: &str) -> bool {
+    match s
+        .status
+        .as_ref()
+        .and_then(|st| st.resolved.as_ref())
+        .and_then(|r| r.repository.as_ref())
+    {
+        Some(pin) => {
+            matches!(pin.kind, RepositoryKind::Repository)
+                && pin.name == repo_name
+                && pin.namespace.as_deref() == Some(repo_ns)
+        }
+        None => true,
+    }
+}
+
+/// As [`deleting_snapshot_targets_repository`] but for a `ClusterRepository` pin
+/// (matched by name; namespace is meaningless). Unpinned ⇒ included.
+fn deleting_snapshot_targets_cluster(s: &Snapshot, name: &str) -> bool {
+    match s
+        .status
+        .as_ref()
+        .and_then(|st| st.resolved.as_ref())
+        .and_then(|r| r.repository.as_ref())
+    {
+        Some(pin) => matches!(pin.kind, RepositoryKind::ClusterRepository) && pin.name == name,
+        None => true,
+    }
+}
+
+/// DELETING Snapshots resolving to the changed namespaced `Repository`, so an
+/// `allow-mass-deletion` ack (or `deletionProtection` edit) re-reconciles the
+/// held Snapshots at once to drain them, instead of waiting out their long `Held`
+/// requeue. Matched by the `status.resolved.repository` pin; unpinned deleting
+/// Snapshots are included (conservative — the finalizer no-ops if it doesn't
+/// actually target this repo).
+pub fn repository_to_deleting_snapshots(
+    store: &Store<Snapshot>,
+    repo: &Repository,
+) -> Vec<ObjectRef<Snapshot>> {
+    let (Some(ns), name) = (repo.namespace(), repo.name_any()) else {
+        return Vec::new();
+    };
+    select(store, |s: &Snapshot| {
+        snapshot_awaiting_deletion(s) && deleting_snapshot_targets_repository(s, &ns, &name)
+    })
+}
+
+/// DELETING Snapshots resolving to the changed `ClusterRepository` (same ack-drain
+/// contract as [`repository_to_deleting_snapshots`]).
+pub fn cluster_repository_to_deleting_snapshots(
+    store: &Store<Snapshot>,
+    repo: &ClusterRepository,
+) -> Vec<ObjectRef<Snapshot>> {
+    let name = repo.name_any();
+    select(store, |s: &Snapshot| {
+        snapshot_awaiting_deletion(s) && deleting_snapshot_targets_cluster(s, &name)
+    })
+}
+
 // --- Namespace -> privileged-mover-blocked Snapshot / Restore ----------------
 
 /// Whether `conditions` carry a `MoverPermitted != True` entry — the marker a
@@ -563,6 +639,67 @@ mod tests {
         };
         assert!(!mover_blocked(&[unrelated]));
         assert!(!mover_blocked(&[]));
+    }
+
+    // --- M4: repository -> deleting Snapshots (ack drain) ----------------
+
+    fn snap(name: &str, deleting: bool, finalizer: bool, pin: Option<RepositoryRef>) -> Snapshot {
+        use kopiur_api::snapshot::{ResolvedSnapshot, SnapshotSpec, SnapshotStatus};
+        let mut s = Snapshot::new(
+            name,
+            SnapshotSpec {
+                policy_ref: None,
+                tags: None,
+                failure_policy: None,
+                deletion_policy: None,
+                on_schedule_delete: None,
+                pin: false,
+                description: None,
+            },
+        );
+        s.metadata.namespace = Some("media".into());
+        if finalizer {
+            s.metadata.finalizers =
+                Some(vec![crate::consts::SNAPSHOT_CLEANUP_FINALIZER.to_string()]);
+        }
+        if deleting {
+            s.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ));
+        }
+        s.status = Some(SnapshotStatus {
+            resolved: pin.map(|p| ResolvedSnapshot {
+                repository: Some(p),
+                sources: vec![],
+                credential_projection: None,
+            }),
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn deleting_snapshot_repo_match_pins_unpinned_and_excludes_non_deleting() {
+        let pinned_here = rref(RepositoryKind::Repository, "nas", Some("backups"));
+        // Pinned to this repo + deleting + finalizer → matched.
+        let s = snap("a", true, true, Some(pinned_here.clone()));
+        assert!(snapshot_awaiting_deletion(&s));
+        assert!(deleting_snapshot_targets_repository(&s, "backups", "nas"));
+        // Unpinned + deleting → included (conservative).
+        let s = snap("b", true, true, None);
+        assert!(deleting_snapshot_targets_repository(&s, "backups", "nas"));
+        // Pinned to a DIFFERENT repo → excluded.
+        let other = rref(RepositoryKind::Repository, "nas", Some("other-ns"));
+        let s = snap("c", true, true, Some(other));
+        assert!(!deleting_snapshot_targets_repository(&s, "backups", "nas"));
+        // Not deleting, or no finalizer → not an ack-drain candidate.
+        assert!(!snapshot_awaiting_deletion(&snap("d", false, true, None)));
+        assert!(!snapshot_awaiting_deletion(&snap("e", true, false, None)));
+        // A ClusterRepository pin never matches a namespaced Repository event.
+        let cpin = rref(RepositoryKind::ClusterRepository, "nas", None);
+        let s = snap("f", true, true, Some(cpin));
+        assert!(!deleting_snapshot_targets_repository(&s, "backups", "nas"));
     }
 
     #[test]

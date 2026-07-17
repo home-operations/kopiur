@@ -22,14 +22,16 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use kube::api::{DeleteParams, ListParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::reflector::ObjectRef;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::{
-    DeletionPolicy, PolicyRef, TimezoneAmbiguity, effective_timezone, resolve_tz,
+    DeletionPolicy, PolicyRef, ScheduleDeletePolicy, TimezoneAmbiguity, effective_timezone,
+    resolve_tz,
 };
-use kopiur_api::snapshot::SnapshotSpec;
+use kopiur_api::snapshot::{PrunedBy, SnapshotSpec};
 use kopiur_api::{
     ConcurrencyPolicy, ScheduleSpec, Snapshot, SnapshotPolicy, SnapshotSchedule, jitter, validate,
 };
@@ -333,6 +335,10 @@ fn schedule_ready_status(
 /// Reconcile a `SnapshotSchedule`.
 #[tracing::instrument(skip(schedule, ctx), fields(kind = "SnapshotSchedule", namespace = %schedule.namespace().unwrap_or_default(), name = %schedule.name_any()))]
 pub async fn reconcile(schedule: Arc<SnapshotSchedule>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the SnapshotSchedule reflector synced (the
+    // applier gates on `store.wait_until_ready()`), so the breaker's owner lookup
+    // (`schedule_owner_lookup`) can trust the store. See `Context::mark_schedule_synced`.
+    ctx.mark_schedule_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&schedule, &ctx).await;
     ctx.metrics
@@ -368,6 +374,17 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     .await
     {
         tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
+    }
+
+    // Propagate a `spec.deletion.onScheduleDelete` edit to existing produced
+    // children whose stamped cascade value has drifted (so an edit to Delete
+    // actually cascades already-created Snapshots, not just future ones).
+    // Best-effort — must not block firing the due backup.
+    let desired_cascade = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
+        schedule.spec.deletion.as_ref(),
+    );
+    if let Err(e) = propagate_cascade_stamp(ctx, &namespace, &sched_name, desired_cascade).await {
+        tracing::warn!(schedule = %sched_name, error = %e, "onScheduleDelete propagation errored; continuing to schedule");
     }
 
     let seed = schedule.uid().unwrap_or_else(|| schedule.name_any());
@@ -631,15 +648,68 @@ async fn prune_failed_history(
     let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
     let items = api.list(&lp).await?.items;
     for name in failed_snapshots_to_prune(&items, limit) {
-        match api.delete(&name, &DeleteParams::default()).await {
+        // Stamp `pruned-by: failed-history` THEN delete, so the finalizer treats
+        // this as an operator prune (bypassing the mass-deletion breaker), never
+        // an external deletion. `failed_snapshots_to_prune` already excludes
+        // terminating CRs, so there is no stamp-only partition here.
+        io::annotate_then_delete_snapshot(&api, &name, PrunedBy::FailedHistory).await?;
+        tracing::info!(schedule = %schedule, snapshot = %name, "pruned Failed Snapshot (failedJobsHistoryLimit)");
+    }
+    Ok(())
+}
+
+/// Propagate a `spec.deletion.onScheduleDelete` edit to this schedule's existing
+/// produced `Snapshot` children (labelled `SCHEDULE_LABEL`) whose stamped value
+/// has drifted from `desired` ([`children_needing_cascade_stamp`]). One targeted
+/// merge-patch per child under the controller field manager. Best-effort exactly
+/// like [`prune_failed_history`]: a per-child (or list) error is logged and the
+/// reconcile continues — propagation must never block firing the due backup.
+async fn propagate_cascade_stamp(
+    ctx: &Context,
+    namespace: &str,
+    schedule: &str,
+    desired: ScheduleDeletePolicy,
+) -> Result<()> {
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
+    let items = api.list(&lp).await?.items;
+    let value = serde_json::to_value(desired).unwrap_or(serde_json::Value::Null);
+    for name in children_needing_cascade_stamp(&items, desired) {
+        let patch = serde_json::json!({ "spec": { "onScheduleDelete": value } });
+        match api
+            .patch(
+                &name,
+                &PatchParams::apply(io::FIELD_MANAGER),
+                &Patch::Merge(&patch),
+            )
+            .await
+        {
             Ok(_) => {
-                tracing::info!(schedule = %schedule, snapshot = %name, "pruned Failed Snapshot (failedJobsHistoryLimit)")
+                tracing::info!(schedule = %schedule, snapshot = %name, ?desired, "propagated onScheduleDelete to child")
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-            Err(e) => return Err(Error::Kube(e)),
+            Err(e) => {
+                tracing::warn!(schedule = %schedule, snapshot = %name, error = %e, "propagating onScheduleDelete to child failed; continuing")
+            }
         }
     }
     Ok(())
+}
+
+/// The `Snapshot` at slot name `name` in `namespace`, for the
+/// fire-into-a-terminating-object guard ([`slot_fire_blocked_by_terminating`]).
+/// Prefers the shared `Snapshot` reflector store when it is populated AND synced
+/// (no per-fire GET); falls back to a live `get_opt` when the store is unset or
+/// not yet synced (a cold cache must never be read as "no twin").
+async fn slot_twin(ctx: &Context, namespace: &str, name: &str) -> Result<Option<Arc<Snapshot>>> {
+    use std::sync::atomic::Ordering;
+    if let Some(store) = ctx.snapshot_store.get()
+        && ctx.snapshot_synced.load(Ordering::Acquire)
+    {
+        return Ok(store.get(&ObjectRef::<Snapshot>::new(name).within(namespace)));
+    }
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    Ok(api.get_opt(name).await?.map(Arc::new))
 }
 
 /// Resolve the set of `SnapshotPolicy` targets a fire should create a `Snapshot`
@@ -761,20 +831,69 @@ async fn policy_repo_timezone_default(
 /// origin-aware `Delete` default when this field is `None`, so a never-resolved
 /// policy default silently became `Delete` regardless of what the recipe asked
 /// for. `None` here preserves that safe origin-aware default exactly.
+/// `on_schedule_delete` is the schedule's EFFECTIVE cascade policy
+/// (`effective_on_schedule_delete(spec.deletion.as_ref())`, absent → `Retain`),
+/// stamped EXPLICITLY onto every produced `Snapshot` so the deletion finalizer's
+/// cascade guard reads a concrete value rather than inferring one — a schedule
+/// edited to `Delete` after a run propagates to existing children via
+/// [`children_needing_cascade_stamp`].
 fn scheduled_backup_spec(
     policy_ref: &PolicyRef,
     default_deletion_policy: Option<DeletionPolicy>,
+    on_schedule_delete: ScheduleDeletePolicy,
 ) -> SnapshotSpec {
     SnapshotSpec {
         policy_ref: Some(policy_ref.clone()),
         tags: None,
         failure_policy: None,
         deletion_policy: default_deletion_policy,
+        // Always explicit for produced Snapshots (the cascade guard's input).
+        on_schedule_delete: Some(on_schedule_delete),
         pin: false,
         // Scheduled backups never carry a templated description (out of
         // scope for M4 — description is per-invocation only).
         description: None,
     }
+}
+
+/// **Pure.** Names of a schedule's produced `Snapshot` children whose stamped
+/// `spec.onScheduleDelete` must be re-stamped to `desired` (the schedule's
+/// current effective cascade policy) after a `spec.deletion.onScheduleDelete`
+/// edit. A child is selected iff it is NOT terminating AND its EFFECTIVE stamped
+/// value differs from `desired`:
+///
+/// - stamped == `desired` → skip (already correct).
+/// - stamped absent, `desired == Retain` → skip: an absent value already
+///   resolves to `Retain` ([`effective_on_schedule_delete`]), so stamping it
+///   would be pure status churn.
+/// - stamped absent, `desired == Delete` → select: the child needs the explicit
+///   `Delete` stamp so the cascade guard cascades.
+/// - stamped differs (e.g. `Retain` vs. desired `Delete`) → select.
+/// - terminating (deletionTimestamp set) → skip always: the child's finalizer is
+///   already running on the value it captured; re-stamping it now is pointless
+///   and races the delete.
+pub fn children_needing_cascade_stamp(
+    children: &[Snapshot],
+    desired: ScheduleDeletePolicy,
+) -> Vec<String> {
+    children
+        .iter()
+        .filter(|c| c.metadata.deletion_timestamp.is_none())
+        .filter(|c| {
+            crate::snapshot::effective_on_schedule_delete(c.spec.on_schedule_delete) != desired
+        })
+        .filter_map(|c| c.metadata.name.clone())
+        .collect()
+}
+
+/// **Pure.** Whether firing a slot must be SKIPPED because a `Snapshot` with the
+/// target slot name already exists AND is terminating (`deletionTimestamp` set).
+/// Re-firing would force-server-side-apply INTO that terminating object, silently
+/// re-adopting/re-owning a CR whose finalizer is mid-cleanup
+/// (fire-into-a-terminating-object). `None` (no such CR) ⇒ fire normally; the
+/// next slot re-fires with a fresh name.
+fn slot_fire_blocked_by_terminating(existing: Option<&Snapshot>) -> bool {
+    existing.is_some_and(|s| s.metadata.deletion_timestamp.is_some())
 }
 
 /// GET the target policy and return its `spec.defaultDeletionPolicy` (issue #238).
@@ -835,9 +954,22 @@ async fn create_scheduled_backup(
     // never firing with a wrong (destructive) default (mirrors target resolution).
     let default_deletion_policy =
         policy_default_deletion_policy(&ctx.client, policy_ref, namespace).await?;
+    // The schedule's effective cascade policy, stamped explicitly onto the child.
+    let on_schedule_delete = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
+        schedule.spec.deletion.as_ref(),
+    );
+    // Fire-into-a-terminating-object guard: if the target-slot Snapshot already
+    // exists AND is terminating, the force server-side apply below would silently
+    // re-adopt (re-own) the CR mid-cleanup. Skip this fire; the next slot re-fires
+    // with a fresh name. (Prefer the reflector store; live GET fallback.)
+    if slot_fire_blocked_by_terminating(slot_twin(ctx, namespace, backup_name).await?.as_deref()) {
+        tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, "target-slot Snapshot is terminating; skipping fire (next slot re-fires)");
+        return Ok(());
+    }
+
     let mut backup = Snapshot::new(
         backup_name,
-        scheduled_backup_spec(policy_ref, default_deletion_policy),
+        scheduled_backup_spec(policy_ref, default_deletion_policy, on_schedule_delete),
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
 
@@ -913,20 +1045,122 @@ mod tests {
             name: "test-pvc".into(),
             namespace: None,
         };
-        let retain = scheduled_backup_spec(&pref, Some(DeletionPolicy::Retain));
+        let retain = scheduled_backup_spec(
+            &pref,
+            Some(DeletionPolicy::Retain),
+            ScheduleDeletePolicy::Retain,
+        );
         assert_eq!(retain.deletion_policy, Some(DeletionPolicy::Retain));
         assert_eq!(
             retain.policy_ref.as_ref().map(|r| r.name.as_str()),
             Some("test-pvc")
         );
 
-        let orphan = scheduled_backup_spec(&pref, Some(DeletionPolicy::Orphan));
+        let orphan = scheduled_backup_spec(
+            &pref,
+            Some(DeletionPolicy::Orphan),
+            ScheduleDeletePolicy::Retain,
+        );
         assert_eq!(orphan.deletion_policy, Some(DeletionPolicy::Orphan));
 
         // An unset recipe default leaves the field None, so the webhook's
         // safe origin-aware Delete default still applies (no behavior change).
-        let unset = scheduled_backup_spec(&pref, None);
+        let unset = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain);
         assert_eq!(unset.deletion_policy, None);
+    }
+
+    #[test]
+    fn scheduled_backup_spec_stamps_on_schedule_delete() {
+        let pref = PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        };
+        // The cascade policy is stamped EXPLICITLY (never left None) so the
+        // finalizer's cascade guard reads a concrete value — both defaults.
+        let retain = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain);
+        assert_eq!(
+            retain.on_schedule_delete,
+            Some(ScheduleDeletePolicy::Retain)
+        );
+        let delete = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Delete);
+        assert_eq!(
+            delete.on_schedule_delete,
+            Some(ScheduleDeletePolicy::Delete)
+        );
+        // The existing deletionPolicy threading is unchanged by the new param.
+        let threaded = scheduled_backup_spec(
+            &pref,
+            Some(DeletionPolicy::Orphan),
+            ScheduleDeletePolicy::Delete,
+        );
+        assert_eq!(threaded.deletion_policy, Some(DeletionPolicy::Orphan));
+        assert_eq!(
+            threaded.on_schedule_delete,
+            Some(ScheduleDeletePolicy::Delete)
+        );
+    }
+
+    /// A produced-child fixture with an optional stamped cascade value and an
+    /// optional deletionTimestamp, shaped for `children_needing_cascade_stamp`.
+    fn child(name: &str, stamped: Option<ScheduleDeletePolicy>, terminating: bool) -> Snapshot {
+        let mut s = Snapshot::new(
+            name,
+            scheduled_backup_spec(
+                &PolicyRef {
+                    name: "pg".into(),
+                    namespace: None,
+                },
+                None,
+                stamped.unwrap_or(ScheduleDeletePolicy::Retain),
+            ),
+        );
+        // scheduled_backup_spec always stamps Some(_); model an ABSENT stamp
+        // (pre-upgrade child) by clearing it back to None when asked.
+        s.spec.on_schedule_delete = stamped;
+        s.metadata.namespace = Some("apps".into());
+        if terminating {
+            s.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ));
+        }
+        s
+    }
+
+    #[test]
+    fn children_needing_cascade_stamp_selects_only_the_drifted_live_children() {
+        let children = vec![
+            child("differs", Some(ScheduleDeletePolicy::Retain), false), // Retain vs Delete → select
+            child("matches", Some(ScheduleDeletePolicy::Delete), false), // already Delete → skip
+            child("absent", None, false), // absent vs Delete → select
+            child("terminating", Some(ScheduleDeletePolicy::Retain), true), // drifted but terminating → skip
+        ];
+        let selected = children_needing_cascade_stamp(&children, ScheduleDeletePolicy::Delete);
+        assert_eq!(selected, vec!["differs".to_string(), "absent".to_string()]);
+    }
+
+    #[test]
+    fn children_needing_cascade_stamp_skips_absent_when_desired_is_retain() {
+        // Absent already resolves to Retain — stamping it would be pure churn.
+        let children = vec![
+            child("absent", None, false),
+            child("already-retain", Some(ScheduleDeletePolicy::Retain), false),
+            child("drifted-delete", Some(ScheduleDeletePolicy::Delete), false), // Delete vs Retain → select
+        ];
+        let selected = children_needing_cascade_stamp(&children, ScheduleDeletePolicy::Retain);
+        assert_eq!(selected, vec!["drifted-delete".to_string()]);
+    }
+
+    #[test]
+    fn slot_fire_blocked_only_by_a_terminating_slot_twin() {
+        // No existing slot CR → fire.
+        assert!(!slot_fire_blocked_by_terminating(None));
+        // A live slot twin → fire (the server-side apply idempotently converges).
+        let live = child("slot", Some(ScheduleDeletePolicy::Retain), false);
+        assert!(!slot_fire_blocked_by_terminating(Some(&live)));
+        // A terminating slot twin → SKIP (never fire-into-a-terminating-object).
+        let terminating = child("slot", Some(ScheduleDeletePolicy::Retain), true);
+        assert!(slot_fire_blocked_by_terminating(Some(&terminating)));
     }
 
     /// The policy read must FAIL the fire rather than degrade to a destructive
@@ -1313,6 +1547,7 @@ mod tests {
                     tags: None,
                     failure_policy: None,
                     deletion_policy: None,
+                    on_schedule_delete: None,
                     pin: false,
                     description: None,
                 },
