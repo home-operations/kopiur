@@ -2564,9 +2564,12 @@ async fn reap_batch_jobs(
 }
 
 /// §3: this CR is not enrolled — pick the fireable set for its repository
-/// (`pending` minus the LIVE-Job in-flight UIDs — the no-overlap invariant), and
-/// either fire a wave (throttle permitting) or requeue. `state` is the store
-/// snapshot the classifier used, so the no-overlap set matches the LIST exactly.
+/// (`pending` minus the covered UIDs: members of LIVE jobs — the no-overlap
+/// invariant — plus members of SUCCEEDED jobs awaiting finalizer release, so a
+/// second wave never re-enrolls an already-deleted member; FAILED members stay
+/// fireable for retry), and either fire a wave (throttle permitting) or requeue.
+/// `state` is the store snapshot the classifier used, so the covered set
+/// matches the LIST exactly.
 #[allow(clippy::too_many_arguments)]
 async fn fire_batch(
     backup: &Snapshot,
