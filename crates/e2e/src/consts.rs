@@ -92,6 +92,13 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "massdel-cascade",
     "massdel-breaker",
     "massdel-prune",
+    // M5b batch-dispatcher scenarios (mass_deletion.rs scenarios 5-8): batch-of-1
+    // unification, no-overlap concurrency, throttle cap, and outage retry (the
+    // outage one flips its repo dir read-only at runtime, so it MUST be isolated).
+    "massdel-single",
+    "massdel-nooverlap",
+    "massdel-throttle",
+    "massdel-outage",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per

@@ -1,7 +1,8 @@
-//! e2e: mass-deletion protection — the schedule-cascade guard and the
-//! mass-deletion circuit breaker against a live operator (M4a wiring, M4b proof).
+//! e2e: mass-deletion protection — the schedule-cascade guard, the mass-deletion
+//! circuit breaker, AND the per-repository BATCH delete dispatcher against a live
+//! operator (M4a wiring, M4b proof, M5b batch-dispatcher proof).
 //!
-//! Three scenarios prove the feature end-to-end and guard the ORIGINAL INCIDENT
+//! Scenarios 1-3 prove the guard/breaker end-to-end and guard the ORIGINAL INCIDENT
 //! (a schedule delete cascading into ~600 kopia snapshot deletions):
 //!
 //! 1. `schedule_cascade_delete_leaves_kopia_intact_and_recatalogs` — THE incident's
@@ -19,10 +20,27 @@
 //!    even at an aggressive threshold: the excess CRs (and their kopia snapshots) are
 //!    pruned WITHOUT ever surfacing `DeletionHeld`.
 //!
-//! Deletion execution still uses the legacy per-CR `{name}-delete` Job (the batch
-//! dispatcher is M5). These tests assert OUTCOMES (CRs drained, kopia counts, absence
-//! of delete Jobs for a retained set, conditions/events) — never Job names as a
-//! success signal — so they stay green through the M5 dispatcher swap.
+//! Scenarios 5-8 (M5b) prove the M5a per-repository BATCH delete dispatcher, which
+//! replaced the per-CR `{name}-delete` Job with one repository-scoped
+//! `SnapshotDeleteBatch` mover Job per accumulation window. These LIST batch Jobs by
+//! the op label + managed-by and read the `delete-members` UID annotation to prove the
+//! wire behavior (batch-of-1 unification, no-overlap concurrency, the concurrency
+//! throttle, and outage retry) — not just the drained OUTCOME scenarios 1-3 assert:
+//!
+//! 5. `single_snapshot_delete_still_releases` — one manual delete makes exactly one
+//!    batch Job whose members are exactly that CR's UID; the CR drains, kopia -1.
+//! 6. `concurrent_batches_do_not_overlap` — two disjoint delete waves make two
+//!    disjoint batch Jobs (uncapped default allows concurrency); all drain, kopia -5.
+//! 7. `throttle_caps_concurrent_batch_jobs` — with `KOPIUR_MAX_CONCURRENT_DELETE_JOBS=1`
+//!    on the operator Deployment, at most one live batch Job exists at any instant;
+//!    both waves still drain. Restores the env (rollout wait) even on failure.
+//! 8. `batch_delete_retries_after_repo_outage` — with the repo backend broken (its dir
+//!    flipped read-only), the batch Job fails, is reaped, and refires (≥2 distinct Job
+//!    generations) while NO finalizer releases; restoring writability drains all + the
+//!    kopia snapshots are really deleted. Fail-safe under outage + convergence after.
+//!
+//! Scenarios 1-3 assert OUTCOMES (CRs drained, kopia counts, conditions/events); 5-8
+//! additionally assert the batch Job wire shape (op label, `delete-members`).
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
@@ -36,20 +54,43 @@ use std::time::{Duration, Instant};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, Resource, ResourceExt};
 
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::events::v1::Event as EventsV1;
 
 use kopiur_api::consts::{
-    ALLOW_MASS_DELETION_ANNOTATION, MASS_DELETION_HELD_CONDITION, ORIGIN_LABEL,
-    PRUNED_BY_ANNOTATION, REPOSITORY_UID_LABEL, SCHEDULE_LABEL,
+    ALLOW_MASS_DELETION_ANNOTATION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    MASS_DELETION_HELD_CONDITION, OP_LABEL, ORIGIN_LABEL, PRUNED_BY_ANNOTATION,
+    REPOSITORY_UID_LABEL, SCHEDULE_LABEL, SNAPSHOT_CLEANUP_FINALIZER,
 };
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy, SnapshotSchedule};
-use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
+use kopiur_e2e::{
+    E2E_NAMESPACE, Need, World, builders, consts as e2e_consts, default_timeout, poll_interval,
+    wait, wait_until,
+};
 
 use common::{
     cr, ensure_repo, observed_snapshot_count, repository_json, snapshot_json, snapshot_policy_json,
     status_json, wait_condition, wait_phase,
 };
+
+// --- Batch-dispatcher wire contract (M5a) -------------------------------------
+// The batch-delete Job's op-label VALUE and its member-UID annotation are defined in
+// the controller crate (`crate::consts::{OP_SNAPSHOT_DELETE_BATCH, DELETE_MEMBERS_ANNOTATION}`),
+// which the e2e crate does not depend on. Mirror them here as DELIBERATE literals — the
+// same pattern `common::WORK_SPEC_ENV` uses for the controller↔mover work-spec env: an
+// accidental rename in the controller must fail THIS suite at runtime (the label/annotation
+// are a wire contract these scenarios read). The label KEY (`OP_LABEL`), `MANAGED_BY_*`, and
+// `SNAPSHOT_CLEANUP_FINALIZER` are shared via `kopiur_api::consts` and imported above.
+const OP_SNAPSHOT_DELETE_BATCH: &str = "snapshot-delete-batch";
+const DELETE_MEMBERS_ANNOTATION: &str = "kopiur.home-operations.com/delete-members";
+/// The operator controller Deployment the chart installs (`<release>-controller`).
+const CONTROLLER_DEPLOYMENT: &str = "kopiur-controller";
+/// The controller container name in that Deployment (`deploy/helm/kopiur/templates/deployment.tpl`).
+const CONTROLLER_CONTAINER: &str = "controller";
+/// Env knob capping concurrent batch-delete Jobs (`crate::config::MAX_CONCURRENT_DELETE_JOBS_ENV`).
+const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_JOBS";
 
 // --- shared helpers ----------------------------------------------------------
 
@@ -115,6 +156,264 @@ fn schedule_json(name: &str, policy: &str, cron: &str) -> serde_json::Value {
             "schedule": { "cron": cron, "runOnCreate": true }
         }
     })
+}
+
+// --- Batch-dispatcher helpers (scenarios 5-8) ---------------------------------
+
+/// Terminal (or not) state of a batch delete Job, mirroring the controller's
+/// `job_terminal_state` (a `Complete`/`Failed`=True condition, else the succeeded
+/// count) so the tests classify a Job exactly as the dispatcher does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchJobState {
+    Live,
+    Succeeded,
+    Failed,
+}
+
+fn batch_job_state(job: &Job) -> BatchJobState {
+    let status = job.status.as_ref();
+    if let Some(conds) = status.and_then(|s| s.conditions.as_ref()) {
+        for c in conds {
+            if c.status == "True" && c.type_ == "Complete" {
+                return BatchJobState::Succeeded;
+            }
+            if c.status == "True" && c.type_ == "Failed" {
+                return BatchJobState::Failed;
+            }
+        }
+    }
+    if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
+        return BatchJobState::Succeeded;
+    }
+    BatchJobState::Live
+}
+
+/// The member `Snapshot` UIDs a batch Job covers, from its comma-joined
+/// `delete-members` annotation (the dispatcher's single source of truth).
+fn batch_members(job: &Job) -> BTreeSet<String> {
+    job.annotations()
+        .get(DELETE_MEMBERS_ANNOTATION)
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// LIST every kopiur-managed batch delete Job in the operator namespace (op label +
+/// managed-by). Scenarios narrow to "their" repository by member-UID intersection
+/// (each scenario has an isolated repo + its own snapshots), which is equivalent to
+/// the dispatcher's repo-hash label filter without reproducing the internal hash.
+async fn list_batch_jobs(jobs: &Api<Job>) -> Vec<Job> {
+    let selector =
+        format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{OP_LABEL}={OP_SNAPSHOT_DELETE_BATCH}");
+    jobs.list(&ListParams::default().labels(&selector))
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default()
+}
+
+/// The batch Jobs whose members are all within `mine` (this scenario's snapshot
+/// UIDs) — i.e. this repository's batch Jobs. A Job with any foreign member is
+/// skipped (belongs to another scenario), so a leftover from an earlier scenario
+/// can never be miscounted here.
+async fn my_batch_jobs(jobs: &Api<Job>, mine: &BTreeSet<String>) -> Vec<Job> {
+    list_batch_jobs(jobs)
+        .await
+        .into_iter()
+        .filter(|j| {
+            let m = batch_members(j);
+            !m.is_empty() && m.is_subset(mine)
+        })
+        .collect()
+}
+
+/// Poll until a kopiur batch Job whose members are EXACTLY `target` appears,
+/// returning it. Result-returning so a must-restore scenario can `?`-propagate.
+async fn find_batch_with_members(
+    jobs: &Api<Job>,
+    target: &BTreeSet<String>,
+) -> anyhow::Result<Job> {
+    wait_until(
+        &format!("batch Job with members {target:?} appears"),
+        default_timeout(),
+        poll_interval(),
+        || {
+            let jobs = jobs.clone();
+            let target = target.clone();
+            async move {
+                let js = list_batch_jobs(&jobs).await;
+                Ok(js.into_iter().find(|j| batch_members(j) == target))
+            }
+        },
+    )
+    .await
+}
+
+/// Panicking wrapper over [`find_batch_with_members`].
+async fn wait_batch_with_members(jobs: &Api<Job>, target: &BTreeSet<String>) -> Job {
+    find_batch_with_members(jobs, target)
+        .await
+        .expect("a batch Job with the target member set should appear")
+}
+
+/// A `Snapshot`'s `metadata.uid` (once created). Panics if absent — every persisted
+/// object has one.
+async fn snapshot_uid(backups: &Api<Snapshot>, name: &str) -> String {
+    backups
+        .get(name)
+        .await
+        .unwrap_or_else(|e| panic!("get Snapshot {name}: {e}"))
+        .uid()
+        .unwrap_or_else(|| panic!("Snapshot {name} must have a uid"))
+}
+
+/// Create `count` manual `Snapshot`s (origin manual, `deletionPolicy: Delete`) from
+/// `names`, wait each Succeeded, and return their UIDs as a set. Deletion of any of
+/// these flows through the batch dispatcher (policy `Delete` + a recorded kopia id).
+async fn seed_manual_snapshots(
+    backups: &Api<Snapshot>,
+    policy: &str,
+    names: &[&str],
+) -> BTreeSet<String> {
+    for n in names {
+        backups
+            .create(
+                &PostParams::default(),
+                &cr(snapshot_json(
+                    E2E_NAMESPACE,
+                    n,
+                    policy,
+                    serde_json::json!({ "deletionPolicy": "Delete" }),
+                )),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create manual Snapshot {n}: {e}"));
+    }
+    let mut uids = BTreeSet::new();
+    for n in names {
+        wait_phase(backups, n, "Succeeded")
+            .await
+            .unwrap_or_else(|e| panic!("manual Snapshot {n} should reach Succeeded: {e}"));
+        uids.insert(snapshot_uid(backups, n).await);
+    }
+    uids
+}
+
+/// Delete every named `Snapshot`, then wait until all of them show a
+/// `deletionTimestamp` via the API — a settle so a loaded box can't let a delete
+/// slip past a threshold/window check before it registers. Result-returning core so
+/// the throttle scenario (whose env mutation must be restored even on failure) can
+/// `?`-propagate instead of panicking past its restore.
+async fn delete_snapshots_and_settle(
+    backups: &Api<Snapshot>,
+    names: &[&str],
+) -> anyhow::Result<()> {
+    for n in names {
+        backups
+            .delete(n, &DeleteParams::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("delete Snapshot {n}: {e}"))?;
+    }
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    wait_until(
+        "all deleted Snapshots show a deletionTimestamp",
+        Duration::from_secs(60),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let names = names.clone();
+            async move {
+                for n in &names {
+                    match backups.get_opt(n).await? {
+                        // Already gone (drained faster than we polled) counts as settled.
+                        None => continue,
+                        Some(s) if s.meta().deletion_timestamp.is_some() => continue,
+                        Some(_) => return Ok(None),
+                    }
+                }
+                Ok(Some(()))
+            }
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Panicking wrapper over [`delete_snapshots_and_settle`] for the scenarios without a
+/// must-restore mutation window.
+async fn delete_and_settle(backups: &Api<Snapshot>, names: &[&str]) {
+    delete_snapshots_and_settle(backups, names)
+        .await
+        .expect("delete + settle deletionTimestamps");
+}
+
+/// Wait until all named `Snapshot`s are gone from the API (their finalizers
+/// released) within `timeout`.
+async fn wait_all_drained(backups: &Api<Snapshot>, names: &[&str], timeout: Duration) {
+    for n in names {
+        wait_until(
+            &format!("{n} drains (finalizer released)"),
+            timeout,
+            poll_interval(),
+            || async { Ok(backups.get_opt(n).await?.is_none().then_some(())) },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{n} must drain (batch delete releases its finalizer): {e}"));
+    }
+}
+
+/// Patch the operator controller Deployment's `KOPIUR_MAX_CONCURRENT_DELETE_JOBS`
+/// env to `value` (strategic-merge on the container by name, updating the env entry
+/// that the chart always renders) and wait for the rollout to complete, so the ONLY
+/// running controller pod is the one carrying the new value. `"0"` restores the
+/// chart default (uncapped). Mirrors `leader_election::scale_controller`'s
+/// Deployment-mutation style.
+async fn set_delete_job_cap(client: &Client, value: &str) -> anyhow::Result<()> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    api.patch(
+        CONTROLLER_DEPLOYMENT,
+        &PatchParams::default(),
+        &Patch::Strategic(serde_json::json!({
+            "spec": { "template": { "spec": { "containers": [
+                { "name": CONTROLLER_CONTAINER,
+                  "env": [ { "name": MAX_CONCURRENT_DELETE_JOBS_ENV, "value": value } ] }
+            ]}}}
+        })),
+    )
+    .await?;
+    wait::deployment_ready(client, E2E_NAMESPACE, CONTROLLER_DEPLOYMENT).await
+}
+
+/// Recursively chmod this scenario's isolated repo dir via a one-shot root busybox
+/// Pod (busybox's default uid 0 can chmod files the mover wrote as 65532). `0555`
+/// breaks all writes (the batch delete mover then fails EACCES, modelling a backend
+/// outage); `0777` restores writability. The Pod is deleted on completion.
+async fn chmod_repo(client: &Client, subpath: &str, mode: &str, tag: &str) -> anyhow::Result<()> {
+    let pvc = e2e_consts::isolated_repo_pvc(subpath);
+    let pod_name = format!("massdel-outage-chmod-{tag}");
+    let pod: Pod = builders::one_shot_pod(
+        E2E_NAMESPACE,
+        &pod_name,
+        &["chmod", "-R", mode, e2e_consts::ISOLATED_REPO_PATH],
+        &[(pvc.as_str(), e2e_consts::ISOLATED_REPO_PATH)],
+    );
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    // Clear any prior same-named chmod pod (restartPolicy Never pods don't self-clean).
+    let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
+    wait_until(
+        &format!("prior chmod pod {pod_name} gone"),
+        Duration::from_secs(60),
+        poll_interval(),
+        || async { Ok(pods.get_opt(&pod_name).await?.is_none().then_some(())) },
+    )
+    .await?;
+    pods.create(&PostParams::default(), &pod).await?;
+    wait::pod_succeeded(client, E2E_NAMESPACE, &pod_name).await?;
+    let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
+    Ok(())
 }
 
 // --- Scenario 1: schedule-cascade guard (the incident's regression guard) -----
@@ -494,13 +793,13 @@ async fn mass_deletion_breaker_holds_and_ack_drains() {
         "the three manual snapshots must all exist in kopia before the wave, got {kopia_before}"
     );
 
-    // Bulk-delete all three (no schedule involved — the owner-independent breaker path).
-    for n in NAMES {
-        backups
-            .delete(n, &DeleteParams::default())
-            .await
-            .unwrap_or_else(|e| panic!("delete Snapshot {n}: {e}"));
-    }
+    // Bulk-delete all three (no schedule involved — the owner-independent breaker
+    // path), then SETTLE: wait until all three carry a deletionTimestamp before
+    // asserting the hold. Without this, a loaded box can evaluate the breaker before
+    // every delete has registered in the store; if too few are pending it reads as
+    // sub-threshold and a deletion slips through un-held. The settle pins the full
+    // wave first so the assertions below see the real at/over-threshold state.
+    delete_and_settle(&backups, &NAMES).await;
 
     // (a) all three stay terminating with DeletionHeld=True / MassDeletionBreaker.
     for n in NAMES {
@@ -832,6 +1131,592 @@ async fn retention_prune_not_held_by_breaker() {
             .delete(&b.name_any(), &DeleteParams::default())
             .await;
     }
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 5: a single delete still flows through the BATCH dispatcher ------
+
+const SINGLE_SUBPATH: &str = "massdel-single";
+
+/// The batch dispatcher unifies EVERY delete onto the per-repository batch path — a
+/// batch of ONE is still one `SnapshotDeleteBatch` Job, not a per-CR `{name}-delete`
+/// Job. Deleting one manual `Succeeded` snapshot (deletionPolicy `Delete`, default
+/// threshold, so never held) must: (a) create exactly ONE batch Job whose
+/// `delete-members` is exactly this CR's UID; (b) drain the CR; (c) drop the kopia
+/// count by 1. Pins the batch-of-1 unification the M5a swap introduced.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn single_snapshot_delete_still_releases() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, SINGLE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-single-repo";
+    const POLICY: &str = "e2e-massdel-single-pol";
+    const SNAP: &str = "e2e-massdel-single-1";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                SINGLE_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                // keepLatest generous so no GFS prune races the manual deletes.
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    let uids = seed_manual_snapshots(&backups, POLICY, &[SNAP]).await;
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-single-verify-1", SINGLE_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 1,
+        "the single manual snapshot must exist in kopia before the delete, got {kopia_before}"
+    );
+
+    delete_and_settle(&backups, &[SNAP]).await;
+
+    // (a) exactly one batch Job for this repo, delete-members == exactly this UID.
+    let observed = wait_until(
+        "a batch delete Job appears for the single delete",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let jobs = jobs.clone();
+            let mine = uids.clone();
+            async move {
+                let js = my_batch_jobs(&jobs, &mine).await;
+                Ok((!js.is_empty()).then_some(js))
+            }
+        },
+    )
+    .await
+    .expect("the single delete must produce a batch Job (batch-of-1 unification)");
+    assert_eq!(
+        observed.len(),
+        1,
+        "a single delete must produce EXACTLY ONE batch Job, got {}: {:?}",
+        observed.len(),
+        observed.iter().map(|j| j.name_any()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        batch_members(&observed[0]),
+        uids,
+        "the batch Job's delete-members must be exactly the deleted CR's UID"
+    );
+
+    // (b) the CR drains.
+    wait_all_drained(&backups, &[SNAP], Duration::from_secs(180)).await;
+
+    // (c) kopia -1.
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-single-verify-2", SINGLE_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 1,
+        "the batch-of-1 delete must remove the kopia snapshot; before={kopia_before} after={kopia_after}"
+    );
+
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 6: concurrent batches do not overlap (uncapped default) ----------
+
+const NOOVERLAP_SUBPATH: &str = "massdel-nooverlap";
+
+/// Two disjoint delete waves make two disjoint batch Jobs — the no-overlap invariant
+/// under the default (uncapped) concurrency. FIVE manual `Succeeded` snapshots (repo
+/// threshold left DEFAULT 10 — five deletes stay below it, so nothing is held).
+/// Delete 3 → a batch Job with EXACTLY those 3 UIDs. While it is (ideally) live,
+/// delete the other 2 → a SECOND batch Job with EXACTLY those 2 UIDs, sharing NO
+/// member with the first. All 5 drain; kopia -5.
+///
+/// Timing note (brief §6): a filesystem batch delete can complete before the second
+/// wave is issued, so simultaneous LIVENESS is best-effort (logged). The HARD,
+/// timing-robust assertions are the per-wave member sets, their DISJOINTNESS (the
+/// no-overlap invariant), the two being SEPARATE Jobs, and total drain.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn concurrent_batches_do_not_overlap() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, NOOVERLAP_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-nooverlap-repo";
+    const POLICY: &str = "e2e-massdel-nooverlap-pol";
+    const NAMES: [&str; 5] = [
+        "e2e-massdel-noov-1",
+        "e2e-massdel-noov-2",
+        "e2e-massdel-noov-3",
+        "e2e-massdel-noov-4",
+        "e2e-massdel-noov-5",
+    ];
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                NOOVERLAP_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    seed_manual_snapshots(&backups, POLICY, &NAMES).await;
+    let a_names = &NAMES[..3];
+    let b_names = &NAMES[3..];
+    let mut set_a: BTreeSet<String> = BTreeSet::new();
+    for n in a_names {
+        set_a.insert(snapshot_uid(&backups, n).await);
+    }
+    let mut set_b: BTreeSet<String> = BTreeSet::new();
+    for n in b_names {
+        set_b.insert(snapshot_uid(&backups, n).await);
+    }
+    assert!(
+        set_a.is_disjoint(&set_b),
+        "the two waves must be disjoint snapshot sets by construction"
+    );
+
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-noov-verify-1", NOOVERLAP_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 5,
+        "five snapshots must exist before, got {kopia_before}"
+    );
+
+    // Wave 1: delete 3 → the batch Job with exactly those 3.
+    delete_and_settle(&backups, a_names).await;
+    let batch_a = wait_batch_with_members(&jobs, &set_a).await;
+    let a_live_at_capture = batch_job_state(&batch_a) == BatchJobState::Live;
+
+    // Wave 2: delete the other 2 → a SECOND, disjoint batch Job.
+    delete_and_settle(&backups, b_names).await;
+    let batch_b = wait_batch_with_members(&jobs, &set_b).await;
+    // Best-effort overlap observation: was wave-1's Job still live when wave-2's appeared?
+    let a_live_when_b_appeared = jobs
+        .get_opt(&batch_a.name_any())
+        .await
+        .ok()
+        .flatten()
+        .map(|j| batch_job_state(&j) == BatchJobState::Live)
+        .unwrap_or(false);
+
+    // HARD (timing-robust) assertions.
+    assert_eq!(
+        batch_members(&batch_a),
+        set_a,
+        "wave-1 batch Job must cover EXACTLY the 3 co-deleted UIDs"
+    );
+    assert_eq!(
+        batch_members(&batch_b),
+        set_b,
+        "wave-2 batch Job must cover EXACTLY the 2 co-deleted UIDs"
+    );
+    assert_ne!(
+        batch_a.name_any(),
+        batch_b.name_any(),
+        "the two waves must be SEPARATE batch Jobs (concurrency, not one merged Job)"
+    );
+    assert!(
+        batch_members(&batch_b).is_disjoint(&batch_members(&batch_a)),
+        "NO-OVERLAP: wave-2's batch must not re-enroll any wave-1 member"
+    );
+    eprintln!(
+        "[scenario6] no-overlap proven; wave-1 live when captured={a_live_at_capture}, \
+         wave-1 live when wave-2 appeared={a_live_when_b_appeared} \
+         (true = simultaneous concurrency observed; false = disjointness-only)"
+    );
+
+    // All 5 drain; kopia -5.
+    wait_all_drained(&backups, &NAMES, Duration::from_secs(300)).await;
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-noov-verify-2", NOOVERLAP_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 5,
+        "both waves must delete all 5 kopia snapshots; before={kopia_before} after={kopia_after}"
+    );
+
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 7: the concurrency throttle caps live batch Jobs -----------------
+
+const THROTTLE_SUBPATH: &str = "massdel-throttle";
+
+/// With `KOPIUR_MAX_CONCURRENT_DELETE_JOBS=1` on the operator Deployment, at most ONE
+/// live batch delete Job may exist cluster-wide at any instant — a second wave is
+/// throttled until the first goes terminal. Same shape as scenario 6 (3 then 2), but
+/// the load-bearing, timing-robust assertion is the INVARIANT (never two live at
+/// once), enforced by the cap regardless of how fast a batch runs; both waves still
+/// drain and delete their kopia snapshots.
+///
+/// Deployment mutation is done the `scale_controller` way (patch + rollout wait) and
+/// RESTORED (env back to `0` = uncapped + rollout wait) on EVERY exit, so no other
+/// binary in the same `--test-threads=1` run inherits the cap. The mutation window is
+/// entered only AFTER seeding (which uses panicking helpers); everything inside it
+/// `?`-propagates, so a failure never skips the restore. Returns `Result` for that.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn throttle_caps_concurrent_batch_jobs() -> anyhow::Result<()> {
+    let Some(world) = World::connect().await else {
+        return Ok(());
+    };
+    world.ensure(&[Need::Filesystem]).await?;
+    let client: Client = world.client().clone();
+    ensure_repo(&client, THROTTLE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-throttle-repo";
+    const POLICY: &str = "e2e-massdel-throttle-pol";
+    const NAMES: [&str; 5] = [
+        "e2e-massdel-thr-1",
+        "e2e-massdel-thr-2",
+        "e2e-massdel-thr-3",
+        "e2e-massdel-thr-4",
+        "e2e-massdel-thr-5",
+    ];
+
+    // Setup + seed while UNCAPPED (panicking helpers fine — no env mutation yet).
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                THROTTLE_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+    seed_manual_snapshots(&backups, POLICY, &NAMES).await;
+    let a_names = &NAMES[..3];
+    let b_names = &NAMES[3..];
+    let mut set_a: BTreeSet<String> = BTreeSet::new();
+    for n in a_names {
+        set_a.insert(snapshot_uid(&backups, n).await);
+    }
+    let mut set_b: BTreeSet<String> = BTreeSet::new();
+    for n in b_names {
+        set_b.insert(snapshot_uid(&backups, n).await);
+    }
+    let mine: BTreeSet<String> = set_a.union(&set_b).cloned().collect();
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-throttle-verify-1", THROTTLE_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 5,
+        "five snapshots must exist before, got {kopia_before}"
+    );
+
+    // Enter the mutation window: cap concurrent batch delete Jobs to 1. Guard the
+    // SET too: if the env patch applied but the rollout wait then errored, the env is
+    // already "1", so the restore below MUST still run — don't `?`-return here.
+    let set_result = set_delete_job_cap(&client, "1").await;
+
+    // Everything inside `?`-propagates so a failure still hits the restore below.
+    let body: anyhow::Result<()> = async {
+        // If the cap could not be set, exercise nothing under it (restore still runs).
+        if set_result.is_err() {
+            return Ok(());
+        }
+        // Wave 1: delete 3, wait for its batch Job to fire.
+        delete_snapshots_and_settle(&backups, a_names).await?;
+        find_batch_with_members(&jobs, &set_a).await?;
+        // Wave 2: delete the other 2 (would fire concurrently if uncapped).
+        delete_snapshots_and_settle(&backups, b_names).await?;
+
+        // Drive the drain, asserting the INVARIANT on every poll: at most one LIVE
+        // batch Job for this repo at any instant. Poll fast (1s) so a real >1 window
+        // (which would persist for a whole batch's lifetime) cannot slip through.
+        let mut saw_a = false;
+        let mut saw_b = false;
+        let deadline = Instant::now() + Duration::from_secs(360);
+        loop {
+            let js = my_batch_jobs(&jobs, &mine).await;
+            let live = js
+                .iter()
+                .filter(|j| batch_job_state(j) == BatchJobState::Live)
+                .count();
+            anyhow::ensure!(
+                live <= 1,
+                "throttle cap=1 violated: {live} live batch Jobs for one repo simultaneously"
+            );
+            for j in &js {
+                let m = batch_members(j);
+                if m == set_a {
+                    saw_a = true;
+                }
+                if m == set_b {
+                    saw_b = true;
+                }
+            }
+            let mut remaining = 0usize;
+            for n in NAMES {
+                if backups.get_opt(n).await?.is_some() {
+                    remaining += 1;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "throttled waves did not all drain within the deadline"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        anyhow::ensure!(saw_a, "wave-1 batch Job (setA) was never observed");
+        anyhow::ensure!(saw_b, "wave-2 batch Job (setB) was never observed");
+        Ok(())
+    }
+    .await;
+
+    // ALWAYS restore the cap to uncapped (chart default `0`) + rollout wait.
+    let restore = set_delete_job_cap(&client, "0").await;
+    // Best-effort cleanup regardless of outcome.
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+    // Propagate the cap-set failure first (the body was skipped in that case), then
+    // the body's failure, then any restore failure.
+    set_result?;
+    body?;
+    restore?;
+
+    // kopia -5 (verified after the window, uncapped again).
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-throttle-verify-2", THROTTLE_SUBPATH).await;
+    anyhow::ensure!(
+        kopia_after == kopia_before - 5,
+        "throttled waves must still delete all 5 kopia snapshots; before={kopia_before} after={kopia_after}"
+    );
+    Ok(())
+}
+
+// --- Scenario 8: batch delete retries after a repository outage -----------------
+
+const OUTAGE_SUBPATH: &str = "massdel-outage";
+
+/// Fail-safe under a backend outage + convergence after recovery. THREE manual
+/// `Succeeded` snapshots on an isolated filesystem repo; then the repo dir is flipped
+/// READ-ONLY (`chmod 0555` via a root helper Pod — the runtime analogue of the
+/// `/ro-repo` seed) so the batch delete mover fails EACCES on write. Deleting the CRs
+/// must: keep them terminating (finalizers HELD, no kopia data touched) while the
+/// batch Job fails, is reaped, and refires — observed as ≥2 distinct batch Job
+/// GENERATIONS (same member set, different Job UID; the deterministic name is reused).
+/// Restoring writability (`chmod 0777`) then drains all three and REALLY deletes the
+/// kopia snapshots (count -3).
+///
+/// The RO flip is confined to THIS scenario's isolated subpath, so a mid-scenario
+/// failure that leaves it read-only cannot affect any other scenario or test binary
+/// (fresh clusters reseed 0777).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn batch_delete_retries_after_repo_outage() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, OUTAGE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-outage-repo";
+    const POLICY: &str = "e2e-massdel-outage-pol";
+    const NAMES: [&str; 3] = [
+        "e2e-massdel-outage-1",
+        "e2e-massdel-outage-2",
+        "e2e-massdel-outage-3",
+    ];
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                OUTAGE_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    let uids = seed_manual_snapshots(&backups, POLICY, &NAMES).await;
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-outage-verify-1", OUTAGE_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 3,
+        "three snapshots must exist before the outage, got {kopia_before}"
+    );
+
+    // BREAK the backend: flip the repo dir read-only. The batch delete mover fails
+    // EACCES on write against it (like the `/ro-repo` terminal-failure seed).
+    chmod_repo(&client, OUTAGE_SUBPATH, "0555", "break")
+        .await
+        .expect("flip the isolated repo dir read-only");
+
+    delete_and_settle(&backups, &NAMES).await;
+
+    // Observe ≥2 distinct batch Job GENERATIONS (fail → reap → refire) while NO CR
+    // drains — every finalizer is held because no kopia delete can succeed.
+    let mut generations: BTreeSet<String> = BTreeSet::new();
+    let deadline = Instant::now() + Duration::from_secs(480);
+    loop {
+        for j in my_batch_jobs(&jobs, &uids).await {
+            if let Some(u) = j.uid() {
+                generations.insert(u);
+            }
+        }
+        for n in NAMES {
+            let s = backups
+                .get_opt(n)
+                .await
+                .expect("get Snapshot")
+                .unwrap_or_else(|| {
+                    panic!("{n} must NOT drain while the backend is broken (fail-safe)")
+                });
+            assert!(
+                s.meta().deletion_timestamp.is_some(),
+                "{n} must still be terminating while the backend is broken"
+            );
+            assert!(
+                s.finalizers()
+                    .iter()
+                    .any(|f| f == SNAPSHOT_CLEANUP_FINALIZER),
+                "{n} must still hold its cleanup finalizer while the backend is broken"
+            );
+        }
+        if generations.len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected ≥2 batch Job generations (fail→reap→refire) under outage; saw {}",
+            generations.len()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // RESTORE the backend: writability back. The next refired batch Job connects and
+    // deletes for real.
+    chmod_repo(&client, OUTAGE_SUBPATH, "0777", "heal")
+        .await
+        .expect("restore the isolated repo dir writability");
+
+    // Full drain + real kopia deletion after recovery.
+    wait_all_drained(&backups, &NAMES, Duration::from_secs(360)).await;
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-outage-verify-2", OUTAGE_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 3,
+        "the recovered batch must delete all 3 kopia snapshots; before={kopia_before} after={kopia_after}"
+    );
+
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
     let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }

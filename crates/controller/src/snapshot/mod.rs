@@ -2582,7 +2582,7 @@ async fn fire_batch(
 ) -> Result<Action> {
     let key = repo_key(repo_ref);
     let pending = pending_members(state, &key, schedule_owner_lookup(ctx));
-    let fireable = fireable_members(pending, &in_flight_uids(views));
+    let fireable = fireable_members(pending, &covered_uids(views));
     if fireable.is_empty() {
         // This CR is not (yet) an eligible member — e.g. its own pending state has
         // not propagated to the store, or every pending member is already in flight.

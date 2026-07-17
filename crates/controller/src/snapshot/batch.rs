@@ -232,17 +232,18 @@ pub const MAX_BATCH_MEMBERS: usize = 200;
 pub const BATCH_QUIET_WINDOW: Duration = Duration::from_secs(10);
 
 /// The subset of `pending` eligible for a NEW batch: excludes any UID already
-/// present in a live batch Job's membership (`in_flight`). THE NO-OVERLAP
-/// INVARIANT: a member is in at most one in-flight Job — this both prevents
-/// double-enrollment (an anchor-heal double-delete hazard) and gives the
-/// throttle real parallelism (wave 2 takes the NEXT [`MAX_BATCH_MEMBERS`]).
+/// `covered` by a non-FAILED batch Job ([`covered_uids`] — LIVE or SUCCEEDED). THE
+/// NO-OVERLAP INVARIANT: a member rides at most one non-terminal-failed batch — this
+/// prevents double-enrollment (an anchor-heal double-delete hazard for a LIVE job, a
+/// wasteful re-delete / oldest-first stall for a SUCCEEDED-but-draining one) and
+/// gives the throttle real parallelism (wave 2 takes the NEXT [`MAX_BATCH_MEMBERS`]).
 pub fn fireable_members(
     pending: Vec<PendingMember>,
-    in_flight_uids: &HashSet<String>,
+    covered_uids: &HashSet<String>,
 ) -> Vec<PendingMember> {
     pending
         .into_iter()
-        .filter(|m| !in_flight_uids.contains(&m.uid))
+        .filter(|m| !covered_uids.contains(&m.uid))
         .collect()
 }
 
@@ -446,13 +447,25 @@ pub fn member_disposition(this_uid: &str, jobs: &[BatchJobView]) -> MemberDispos
     }
 }
 
-/// The UIDs enrolled in a LIVE batch Job — the no-overlap exclusion set for
-/// [`fireable_members`]. Derived from the SAME LIST [`member_disposition`] reads,
-/// so a member classified `LiveMember` is exactly one whose UID is in flight here
-/// (the no-overlap invariant cannot see a stale, differently-derived set).
-pub fn in_flight_uids(jobs: &[BatchJobView]) -> HashSet<String> {
+/// The UIDs already covered by a NON-FAILED batch Job — LIVE (delete in flight) or
+/// SUCCEEDED (delete done; the member is merely awaiting its own reconcile to release
+/// its finalizer and drain) — the no-overlap exclusion set for [`fireable_members`].
+///
+/// Excluding SUCCEEDED-covered members too (not only LIVE) is load-bearing: such a
+/// member is STILL "pending" to [`pending_members`] (its finalizer is present) even
+/// though its kopia snapshot is already gone, so without this exclusion a fresh wave
+/// fired before it drains would RE-ENROLL it. That re-enrollment is a wasteful
+/// idempotent re-delete in the small case, and — once [`MAX_BATCH_MEMBERS`] truncates
+/// oldest-first — a throughput STALL in the large case: every new wave keeps
+/// re-selecting the oldest already-deleted members and 409s (or re-deletes) them
+/// instead of draining the backlog, serializing a mass deletion behind each wave's
+/// finalizer release. Mirrors [`member_disposition`]'s precedence (SUCCEEDED and LIVE
+/// both win over FAILED): a member is re-fireable only when its sole coverage is a
+/// FAILED job (or none), so a genuine retry is never blocked. Derived from the SAME
+/// LIST [`member_disposition`] reads, so the two can never disagree.
+pub fn covered_uids(jobs: &[BatchJobView]) -> HashSet<String> {
     jobs.iter()
-        .filter(|j| j.state == BatchJobState::Live)
+        .filter(|j| matches!(j.state, BatchJobState::Live | BatchJobState::Succeeded))
         .flat_map(|j| j.members.iter().cloned())
         .collect()
 }
@@ -822,10 +835,10 @@ mod tests {
     }
 
     #[test]
-    fn fireable_members_excludes_in_flight_uids() {
+    fn fireable_members_excludes_covered_uids() {
         let pending = vec![member("a", 1), member("b", 2), member("c", 3)];
-        let in_flight = HashSet::from(["b".to_string()]);
-        let fireable = fireable_members(pending, &in_flight);
+        let covered = HashSet::from(["b".to_string()]);
+        let fireable = fireable_members(pending, &covered);
         let uids: Vec<&str> = fireable.iter().map(|m| m.uid.as_str()).collect();
         assert_eq!(uids, vec!["a", "c"]);
     }
@@ -1150,20 +1163,50 @@ mod tests {
         );
     }
 
-    // --- in_flight_uids (no-overlap exclusion set) ---
+    // --- covered_uids (no-overlap exclusion set: LIVE ∪ SUCCEEDED, not FAILED) ---
 
     #[test]
-    fn in_flight_uids_unions_only_live_jobs() {
+    fn covered_uids_unions_live_and_succeeded_but_not_failed() {
         let jobs = vec![
             view("live1", &["a", "b"], BatchJobState::Live, None),
             view("live2", &["c"], BatchJobState::Live, None),
             view("done", &["d"], BatchJobState::Succeeded, Some(1)),
             view("failed", &["e"], BatchJobState::Failed, Some(1)),
         ];
-        let uids = in_flight_uids(&jobs);
-        assert_eq!(uids, HashSet::from(["a".into(), "b".into(), "c".into()]));
-        // The exclusion set feeds fireable_members: d/e (terminal) are NOT in flight.
-        assert!(!uids.contains("d") && !uids.contains("e"));
+        let uids = covered_uids(&jobs);
+        // LIVE (a,b,c) AND SUCCEEDED (d) are covered: a member whose kopia snapshot a
+        // succeeded batch already deleted must NOT be re-enrolled while it still holds
+        // its finalizer (the re-inclusion stall this exclusion set exists to prevent).
+        assert_eq!(
+            uids,
+            HashSet::from(["a".into(), "b".into(), "c".into(), "d".into()])
+        );
+        // A member whose ONLY coverage is a FAILED batch stays fireable — a genuine
+        // retry is never blocked (mirrors member_disposition's Succeeded/Live > Failed).
+        assert!(!uids.contains("e"));
+    }
+
+    #[test]
+    fn covered_uids_re_enrollment_guard_after_a_succeeded_wave() {
+        // Regression for the uncapped concurrent-wave re-inclusion (e2e scenario 6):
+        // wave-1 (a,b) SUCCEEDED but not yet drained; wave-2 (c,d) pending. The fireable
+        // set for wave-2 must be EXACTLY (c,d) — never re-including the drained-pending
+        // a,b — so wave-2's batch is disjoint from wave-1's, not (a,b,c,d).
+        let jobs = vec![view(
+            "wave1",
+            &["a", "b"],
+            BatchJobState::Succeeded,
+            Some(1),
+        )];
+        let pending = vec![
+            member("a", 1),
+            member("b", 2),
+            member("c", 3),
+            member("d", 4),
+        ];
+        let fireable = fireable_members(pending, &covered_uids(&jobs));
+        let uids: Vec<&str> = fireable.iter().map(|m| m.uid.as_str()).collect();
+        assert_eq!(uids, vec!["c", "d"]);
     }
 
     // --- reap_targets ---
