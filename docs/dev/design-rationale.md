@@ -163,6 +163,20 @@ keeping Kopiur's own retention pruning unaffected:
   exactly the blast-radius coupling a per-repository mechanism should avoid. The cap
   exists for an operator who wants an extra global throttle on top, not as the
   mechanism doing the real work.
+- **The pending COUNT is inclusive; the fire SET is exclusive** — two intentionally
+  opposite polarities over the same pending `Snapshot`s. The breaker counts a
+  maximally-inclusive set (an unpinned or possibly-cascade-guarded CR is
+  over-counted, never dropped) because over-counting only trips the breaker earlier —
+  the fail-safe direction for a count. The set a reconcile actually FIRES into a batch
+  delete Job is the opposite: maximally exclusive, because an over-included member
+  there is an irreversible `kopia snapshot delete`, so the fail-safe direction is
+  UNDER-fire + requeue. A breaker-exempt trigger (an operator prune, or an acked older
+  wave) therefore narrows its fire set past the count — dropping breaker-HELD
+  externals, `onNamespaceDelete: Orphan` members in a terminating namespace,
+  schedule-owned members while the schedule store is still cold, and unpinned PEERS
+  (whose manifest ids must not ride an unrelated repository's batch) — while every one
+  of those still counts toward the breaker. An excluded member is never lost: it
+  drains via its own reconcile's self-fire once it is genuinely eligible.
 
 ---
 

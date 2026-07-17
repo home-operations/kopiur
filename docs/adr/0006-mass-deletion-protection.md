@@ -144,6 +144,29 @@ the correct trade-off for a mechanism whose entire purpose is to never block
 legitimate low-volume churn — see `threshold: 0` (below) for repositories that
 need a different answer entirely.
 
+**Counting is inclusive; firing is exclusive (the load-bearing polarity).** The
+breaker's per-repository *pending count* is deliberately maximally INCLUSIVE — an
+unattributable (unpinned) or possibly-cascade-guarded `Snapshot` is over-counted
+rather than dropped, because over-counting only ever trips the breaker EARLIER,
+which is the fail-safe direction for a count. The set a reconcile actually *fires*
+into a batch delete Job is the polar opposite: maximally EXCLUSIVE, because an
+over-included member there is a real, irreversible `kopia snapshot delete`. This
+ADR originally blessed only the "over-count is fail-safe" half; the fire path
+inverts it. A breaker-exempt trigger (an operator prune — never held by design —
+or an acknowledged older wave) therefore filters the fire set down to members
+that are genuinely eligible *right now*, excluding: (a) breaker-HELD external
+deletions while the wave is at/above threshold (so a prune never drains a held
+wave's data without an ack), (b) members whose namespace is terminating under
+`onNamespaceDelete: Orphan` (they orphan on their own reconcile), (c)
+schedule-owned members while the `SnapshotSchedule` reflector store is still
+cold (its owner lookup would default to "alive" and mis-classify a
+cascade-retain child as fireable), and (d) unpinned PEER members (the count
+matches them to every repository, but their manifest ids must not ride an
+unrelated repository's batch — e.g. a replication target). An excluded member is
+never lost: it drains through its OWN reconcile's self-fire, or once the
+excluding condition clears. Fail-safe here is always UNDER-fire + requeue, never
+delete.
+
 ## Upgrade notes
 
 - **Pre-upgrade fleets are auto-protected.** `onScheduleDelete` absent resolves

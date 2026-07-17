@@ -623,10 +623,10 @@ The member list for a batch Job is fixed the moment it fires — annotating a `S
 
 Kopiur removes the usual reasons that fails:
 
-- **The recipe may already be gone.** The repository reference, the snapshot's kopia identity, and the [credential-projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) opt-in are all pinned into `status` when the run happens, so deleting the `SnapshotPolicy` first does not strand the `Snapshot`.
-- **The credentials get re-projected.** The copy made for the backup is reclaimed when that run ends, so the deletion Job projects a fresh, short-lived `<snapshot>-delete-creds-N` of its own, reclaimed the moment the finalizer clears.
+- **The recipe may already be gone.** The repository reference and the snapshot's kopia identity are pinned into `status` when the run happens, so deleting the `SnapshotPolicy` first does not strand the `Snapshot` — the batch delete re-resolves the repository from the pin, not the (possibly deleted) recipe.
+- **The delete runs where the credentials already live.** The batch delete Job runs in the repository's **own home namespace** — a namespaced `Repository`'s namespace, or the operator's namespace for a `ClusterRepository` — where the repository's canonical credential Secret already exists. It reads that Secret directly, with **no per-run credential copy** to project and reclaim (a simplification over the earlier per-Snapshot delete Job, which had to project a short-lived copy into each Snapshot's namespace).
 
-What it cannot survive is the **repository** itself going away, or its owner revoking `credentialProjection.allowed` — kopiur will not project against a withdrawn consent. If you hit that, or the bucket is simply gone, use the escape hatch below.
+What it cannot survive is the **repository** itself going away, or its owner revoking `credentialProjection.allowed` on a `ClusterRepository` — kopiur will not act against a withdrawn consent. If you hit that, or the bucket is simply gone, use the escape hatch below.
 
 /// tip | The escape hatch: release the CR without touching the snapshot
 
