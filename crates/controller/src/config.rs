@@ -182,7 +182,7 @@ pub const DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS: i64 = 3600;
 /// opt-in backstop for a resource-constrained cluster, not a load-bearing
 /// safety mechanism — a small default cap risks head-of-line blocking every
 /// OTHER repository's deletions behind one slow or failing one. Reachable via
-/// the chart's `controller.maxConcurrentDeleteJobs`.
+/// the chart's top-level `maxConcurrentDeleteJobs` value.
 pub const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_JOBS";
 
 /// Fallback (raw, `0`-sentinel) cap when [`MAX_CONCURRENT_DELETE_JOBS_ENV`] is
