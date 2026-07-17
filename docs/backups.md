@@ -582,6 +582,41 @@ A `Snapshot` CR **owns** its kopia snapshot via a finalizer. What happens to the
 
 Set it per-`Snapshot` (`spec.deletionPolicy`) or set the recipe-wide default with `SnapshotPolicy.spec.defaultDeletionPolicy`. This is also how retention pruning reclaims space: pruned `Snapshot` CRs use `Delete`, so the snapshots go with them.
 
+#### What happens when the schedule is deleted
+
+A scheduled `Snapshot`'s `deletionPolicy` says what happens when **that CR** is deleted — but a schedule's produced Snapshots outlive the schedule that made them (they're retained for their whole GFS window, long after the next cron slot). `SnapshotSchedule.spec.deletion.onScheduleDelete` governs what happens to those already-produced Snapshots' kopia data when the schedule **itself** is deleted (or deleted-and-recreated, or is `Terminating` under `--cascade=foreground`) out from under them:
+
+```yaml
+spec:
+    deletion:
+        onScheduleDelete: Delete # default: Retain
+```
+
+| Value                | What happens to a produced Snapshot whose own `deletionPolicy` is `Delete`, once its schedule is gone/replaced                                     |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Retain` _(default)_  | Downgraded to retain: the finalizer releases, **no** `kopia snapshot delete` runs, a `SnapshotRetainedOnScheduleDelete` Warning Event fires on the Snapshot, and the catalog rediscovers the kopia snapshot as `origin: discovered` (forced `Retain`) on its next scan. |
+| `Delete`              | Opt-in cascade: the Snapshot's own `deletionPolicy` applies exactly as if the schedule still existed — its kopia snapshot really is deleted, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) below. |
+
+This guard exists because Kubernetes' own ownerReference garbage collection deletes a schedule's produced `Snapshot` CRs the moment the schedule is deleted (or a GitOps tool replaces it), with no way for the CRs themselves to distinguish "my schedule is gone" from "someone deleted me directly" — and a schedule getting deleted (accidentally, by a flapping GitOps controller, or as part of a refactor) must never silently cascade into deleting a fleet's worth of backup history. `Retain` is the fail-safe default for exactly the same reason `onNamespaceDelete` defaults to `Orphan`.
+
+The guard only ever fires for **external** deletions — one of Kopiur's own retention/`failedJobsHistoryLimit` prunes always honors the Snapshot's real `deletionPolicy` regardless of the schedule's state (retention must keep working even if a schedule was just deleted). It also only fires while the schedule is genuinely gone/replaced: a live schedule deleting its own stale children (e.g. `failedJobsHistoryLimit` pruning) is an operator prune, not this path.
+
+Editing `spec.deletion.onScheduleDelete` on a **live** schedule propagates to its existing produced Snapshots (a best-effort patch on every reconcile, skipping any child already `Terminating`) — so flipping the knob doesn't only affect *future* firings, and you don't have to touch each child by hand.
+
+#### How a deletion actually runs — batched, not one Job per Snapshot
+
+Kopiur never spawns one mover Job per `Snapshot` being deleted. Deletions for the same repository are aggregated into ONE batch mover Job that connects once and deletes every member's kopia manifest — named `snapdel-*`, labeled `kopiur.home-operations.com/op=snapshot-delete-batch`. This is what keeps a legitimate bulk deletion (a GFS retention sweep, a namespace teardown, an acknowledged mass-deletion wave) from hammering the backend with hundreds of concurrent connects.
+
+Pending deletions for a repository accumulate for a short **quiet window** (~10 seconds) before the batch fires, so a burst arriving within that window rides one Job instead of several; a batch is also capped at 200 members per Job, so a very large wave fires across successive waves rather than one unbounded Job. A **single** deletion is simply a batch of one — it still waits out the quiet window, so expect up to ~10 seconds of added latency before an individual `Snapshot`'s finalizer clears, even outside any incident.
+
+An optional cluster-wide cap (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS` / the Helm chart's `controller.maxConcurrentDeleteJobs`, default **`0` = uncapped**) bounds how many batch Jobs may run at once across every repository; batching itself — not this cap — is the primary defense against overwhelming a backend, so leave it uncapped unless you have a specific reason to throttle concurrent deletes further.
+
+/// note | Post-fire, `skip-snapshot-cleanup` only releases the CR — it can't pull a Snapshot out of an in-flight batch
+
+The member list for a batch Job is fixed the moment it fires — annotating a `Snapshot` with `kopiur.home-operations.com/skip-snapshot-cleanup` (below) after its batch has already launched no longer prevents that Job from attempting its delete; it only makes THIS Snapshot's own finalizer release without waiting on the Job's outcome. Apply the annotation **before** the batch fires (within the quiet window) to keep a specific Snapshot's kopia data out of the wave entirely.
+
+///
+
 #### What `Delete` needs to succeed
 
 `Delete` is a promise the operator has to keep, so the CR stays `Terminating` until the kopia snapshot is actually gone — it will not drop the finalizer and silently leave the snapshot behind. To do that it needs to reach the repository, which means it needs the repository's **credentials** at deletion time, potentially long after the backup ran.
