@@ -42,6 +42,17 @@
 //! Scenarios 1-3 assert OUTCOMES (CRs drained, kopia counts, conditions/events); 5-8
 //! additionally assert the batch Job wire shape (op label, `delete-members`).
 //!
+//! Scenario 9 (the final-review flagship counterexample) proves the count-vs-fire
+//! polarity: a breaker-exempt operator PRUNE firing on a repository whose external wave
+//! is HELD must NOT sweep the held members into its own batch:
+//!
+//! 9. `held_wave_not_swept_by_concurrent_prune` — repo threshold 2, an aggressive
+//!    (`keepLatest: 1`) scheduled policy pruning continuously, and 3 HELD manual
+//!    externals on the SAME repo. While GFS prunes ≥2 scheduled snapshots (real batch
+//!    Jobs firing on the repo), the 3 held manuals must stay terminating + never drain,
+//!    then drain (kopia -3) only once acked — the fire set excludes held externals even
+//!    when a prune's batch is running.
+//!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
 #![cfg(all(unix, feature = "e2e"))]
@@ -1132,6 +1143,305 @@ async fn retention_prune_not_held_by_breaker() {
             .await;
     }
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 9: a HELD wave is not swept by a concurrent PRUNE's batch --------
+
+const HELDPRUNE_SUBPATH: &str = "massdel-heldprune";
+
+/// THE FINAL-REVIEW FLAGSHIP COUNTEREXAMPLE (CRITICAL-1). A breaker-exempt operator
+/// PRUNE (GFS retention) firing a batch delete Job on a repository must NOT enroll that
+/// repository's breaker-HELD external deletions — before the fire-set fix, the prune's
+/// oldest-first batch would sweep up the (older) held externals and delete their kopia
+/// data with no acknowledgement.
+///
+/// Construction on ONE repository (threshold 2):
+/// - an AGGRESSIVE scheduled policy (`keepLatest: 1`, `defaultDeletionPolicy: Delete`)
+///   whose GFS retention continuously prunes scheduled snapshots (breaker-exempt), and
+/// - 3 MANUAL externals (a separate `keepLatest: 20` policy so they are never
+///   GFS-pruned; label-scoped retention keeps the two policies' prune sets disjoint)
+///   bulk-deleted into a HELD wave.
+///
+/// While GFS prunes ≥2 scheduled snapshots (real `SnapshotDeleteBatch` Jobs firing on
+/// the repo), the 3 held manuals MUST stay terminating with `DeletionHeld=True` and
+/// never drain; only the `allow-mass-deletion` ack drains them, and only then does the
+/// kopia count drop by exactly 3. A manual draining before the ack is the regression.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn held_wave_not_swept_by_concurrent_prune() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, HELDPRUNE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-heldprune-repo";
+    const POLICY_MANUAL: &str = "e2e-massdel-heldprune-manual-pol";
+    const POLICY_SCHED: &str = "e2e-massdel-heldprune-sched-pol";
+    const SCHED: &str = "e2e-massdel-heldprune-sched";
+    // 3 manuals with threshold 2: even if the delete/settle race lets one slip through
+    // before it registers, ≥2 remain pending ⇒ the wave is reliably HELD (scenario 2's
+    // proven shape).
+    const MANUALS: [&str; 3] = [
+        "e2e-massdel-heldprune-m1",
+        "e2e-massdel-heldprune-m2",
+        "e2e-massdel-heldprune-m3",
+    ];
+
+    // threshold 2 → the 3 manual externals trip the breaker. Maintenance + catalog off:
+    // this scenario asserts the per-Snapshot DeletionHeld (written on the Snapshot's own
+    // reconcile), so no catalog refresh is needed, and less churn keeps the counts clean.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                HELDPRUNE_SUBPATH,
+                serde_json::json!({
+                    "deletionProtection": { "threshold": 2 },
+                    "maintenance": { "enabled": false }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository with a threshold-2 breaker");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+
+    // Manual policy: keepLatest 20 so the manuals are NEVER GFS-pruned (they must be the
+    // HELD external wave, not prune members).
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY_MANUAL,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create the manual SnapshotPolicy");
+    // Scheduled policy: keepLatest 1 + Delete so GFS prunes its snapshots aggressively —
+    // the continuous, breaker-EXEMPT prune pressure on the SAME repo.
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY_SCHED,
+                "Repository",
+                REPO,
+                serde_json::json!({ "defaultDeletionPolicy": "Delete", "retention": { "keepLatest": 1 } }),
+            )),
+        )
+        .await
+        .expect("create the scheduled SnapshotPolicy keeping 1");
+
+    schedules
+        .create(
+            &PostParams::default(),
+            &cr::<SnapshotSchedule>(schedule_json(SCHED, POLICY_SCHED, "* * * * *")),
+        )
+        .await
+        .expect("create SnapshotSchedule");
+
+    // keepLatest 1 + a live "* * * * *" schedule = CONTINUOUS breaker-EXEMPT prune
+    // pressure on the SAME repo: each slot produces a scheduled snapshot and GFS prunes
+    // the prior one via its OWN batch delete Job. The held wave must ride out that churn.
+    // keepLatest 1 never keeps >=3 scheduled snapshots at once, so the counterexample
+    // window below collects DISTINCT prune drains OVER TIME (exactly as scenario 3
+    // collects >=3 distinct produced names), NOT a simultaneous backlog.
+    let sched_selector = format!("{SCHEDULE_LABEL}={SCHED}");
+
+    // 3 manual Succeeded externals (deletionPolicy Delete), then bulk-delete into a HELD
+    // wave (threshold 2).
+    seed_manual_snapshots(&backups, POLICY_MANUAL, &MANUALS).await;
+    delete_and_settle(&backups, &MANUALS).await;
+    for n in MANUALS {
+        let cond = wait_condition(&backups, n, "DeletionHeld", "True")
+            .await
+            .unwrap_or_else(|e| panic!("{n} must be HELD by the mass-deletion breaker: {e}"));
+        assert_eq!(
+            cond.get("reason").and_then(|r| r.as_str()),
+            Some("MassDeletionBreaker"),
+            "{n} DeletionHeld reason must be MassDeletionBreaker: {cond}"
+        );
+    }
+    // The ack value the operator surfaces (newest pending external deletionTimestamp).
+    let held_msg = status_json(&backups, MANUALS[0])
+        .await
+        .get("conditions")
+        .and_then(|c| c.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("DeletionHeld"))
+        })
+        .and_then(|c| c.get("message").and_then(|m| m.as_str()))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let ack_value = parse_ack_value(&held_msg)
+        .unwrap_or_else(|| panic!("the held message must carry an ack value: {held_msg}"));
+
+    // THE COUNTEREXAMPLE WINDOW — the schedule stays LIVE, so prune batches keep firing
+    // on this repo. Poll until >=2 DISTINCT scheduled snapshots have drained (seen then
+    // gone — pruned + finalizer released), asserting on EVERY poll that all 3 held
+    // manuals remain terminating with DeletionHeld=True. A manual vanishing here is the
+    // regression: a prune batch swept a HELD external into itself and deleted its kopia
+    // data without an ack.
+    let mut seen_scheduled: BTreeSet<String> = BTreeSet::new();
+    let mut drained_scheduled: BTreeSet<String> = BTreeSet::new();
+    let window_deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        // (i) all held manuals must still be present, terminating, and DeletionHeld=True.
+        for n in MANUALS {
+            let s = backups.get_opt(n).await.expect("get held manual").unwrap_or_else(|| {
+                panic!(
+                    "HELD manual {n} DRAINED while never acked — a concurrent prune's batch swept \
+                     a breaker-held external into itself (the CRITICAL-1 regression)"
+                )
+            });
+            assert!(
+                s.meta().deletion_timestamp.is_some(),
+                "held manual {n} must still be terminating"
+            );
+            assert!(
+                snapshot_is_held(&s),
+                "held manual {n} must still carry DeletionHeld=True while the wave is unacked"
+            );
+        }
+        // (ii) track scheduled churn: names seen then gone = pruned+drained.
+        let current: BTreeSet<String> = backups
+            .list(&ListParams::default().labels(&sched_selector))
+            .await
+            .expect("list scheduled snapshots")
+            .items
+            .iter()
+            .map(|b| b.name_any())
+            .collect();
+        seen_scheduled.extend(current.iter().cloned());
+        for gone in seen_scheduled.difference(&current) {
+            drained_scheduled.insert(gone.clone());
+        }
+        if drained_scheduled.len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < window_deadline,
+            "expected >=2 scheduled prune drains (concurrent prune activity) while the wave was \
+             held; saw {drained_scheduled:?}"
+        );
+        tokio::time::sleep(poll_interval()).await;
+    }
+    eprintln!(
+        "[scenario9] concurrent prune proven: {} scheduled snapshots pruned+drained while the \
+         3-manual wave stayed HELD",
+        drained_scheduled.len()
+    );
+
+    // Freeze scheduled production so the kopia count is stable across the ack, then let
+    // GFS converge to keepLatest 1 — STILL asserting the manuals stay held throughout.
+    schedules
+        .patch(
+            SCHED,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({ "spec": { "schedule": { "suspend": true } } })),
+        )
+        .await
+        .expect("suspend the schedule to freeze the scheduled set");
+    let converge_deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        for n in MANUALS {
+            let s = backups
+                .get_opt(n)
+                .await
+                .expect("get held manual")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "HELD manual {n} DRAINED during convergence while never acked (CRITICAL-1)"
+                    )
+                });
+            assert!(
+                snapshot_is_held(&s),
+                "held manual {n} must still carry DeletionHeld=True during convergence"
+            );
+        }
+        let list = backups
+            .list(&ListParams::default().labels(&sched_selector))
+            .await
+            .expect("list scheduled snapshots")
+            .items;
+        let live = list
+            .iter()
+            .filter(|b| b.meta().deletion_timestamp.is_none())
+            .count();
+        if live <= 1 && list.len() <= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < converge_deadline,
+            "scheduled set should converge to keepLatest 1; still {} present",
+            list.len()
+        );
+        tokio::time::sleep(poll_interval()).await;
+    }
+
+    // Kopia count while HELD (schedule suspended + converged): must still include all 3
+    // held manuals' snapshots.
+    let kopia_held =
+        observed_snapshot_count(&client, "e2e-massdel-heldprune-verify-1", HELDPRUNE_SUBPATH).await;
+
+    // Acknowledge the wave → the 3 held manuals drain, and NOW their kopia data goes.
+    repos
+        .patch(
+            REPO,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "annotations": { ALLOW_MASS_DELETION_ANNOTATION: ack_value } }
+            })),
+        )
+        .await
+        .expect("acknowledge the mass-deletion wave");
+    wait_all_drained(&backups, &MANUALS, Duration::from_secs(180)).await;
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-heldprune-verify-2", HELDPRUNE_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_held - 3,
+        "the ack must delete EXACTLY the 3 held manuals' kopia snapshots (present throughout the \
+         prune window); held={kopia_held} after={kopia_after}"
+    );
+
+    // Cleanup: remaining scheduled CRs BEFORE the policies/repo (finalizers need the repo).
+    for b in backups
+        .list(&ListParams::default().labels(&sched_selector))
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default()
+    {
+        let _ = backups
+            .delete(&b.name_any(), &DeleteParams::default())
+            .await;
+    }
+    let _ = schedules.delete(SCHED, &DeleteParams::default()).await;
+    let _ = policies
+        .delete(POLICY_MANUAL, &DeleteParams::default())
+        .await;
+    let _ = policies
+        .delete(POLICY_SCHED, &DeleteParams::default())
+        .await;
     let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }
 

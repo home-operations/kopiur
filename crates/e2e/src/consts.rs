@@ -99,6 +99,9 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "massdel-nooverlap",
     "massdel-throttle",
     "massdel-outage",
+    // Final-review flagship counterexample (mass_deletion.rs scenario 9): a held
+    // external wave must not be swept into a concurrent breaker-exempt prune's batch.
+    "massdel-heldprune",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
