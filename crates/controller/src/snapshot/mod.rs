@@ -85,6 +85,11 @@ const TERMINAL_SNAPSHOT_STEADY_REQUEUE: Duration = Duration::from_secs(45 * 60);
 /// and unit-tested; this function wires those decisions to the cluster.
 #[tracing::instrument(skip(backup, ctx), fields(kind = "Snapshot", namespace = %backup.namespace().unwrap_or_default(), name = %backup.name_any()))]
 pub async fn reconcile(backup: Arc<Snapshot>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the Snapshot reflector completed its initial
+    // LIST (the applier gates reconciles on `store.wait_until_ready()`), so the
+    // mass-deletion breaker's per-repo pending count is safe to trust from here on.
+    // This is the RELIABLE synced signal — see `Context::mark_snapshot_synced`.
+    ctx.mark_snapshot_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&backup, &ctx).await;
     ctx.metrics

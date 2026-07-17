@@ -3,7 +3,6 @@
 //! watch-plumbing helpers ([`scoped_api`], [`referent_meta`]).
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
@@ -100,28 +99,27 @@ fn map_to_cluster_repository<K: kube::Resource>(obj: K) -> Option<ObjectRef<Clus
 /// stream itself. Consumers (M4/M5) MUST treat an unset cell, or one whose
 /// `synced` flag hasn't flipped, as fail-safe: requeue, never fire destructive
 /// work off a possibly-cold cache.
-fn publish_synced_store<K>(
+fn publish_store<K>(
     cell: &Arc<std::sync::OnceLock<kube::runtime::reflector::Store<K>>>,
-    synced: &Arc<std::sync::atomic::AtomicBool>,
     store: kube::runtime::reflector::Store<K>,
-    kind: &'static str,
 ) where
     K: kube::runtime::reflector::Lookup + Clone + Send + Sync + 'static,
     K::DynamicType: Eq + std::hash::Hash + Clone + Send + Sync,
 {
-    let reader = store.clone();
-    // Best-effort: a second call (there is only ever one per kind today) would
-    // find the cell already set and simply keep the first store handle.
+    // Only PUBLISH the handle so cross-controller reads (the mass-deletion breaker)
+    // can reach it — readiness is tracked SEPARATELY. We deliberately do NOT spawn a
+    // `store.wait_until_ready()` here: that is a second getter on the very
+    // `DelayedInit` the Controller's own applier already awaits
+    // (`delay_tasks_until(store.wait_until_ready())`), and kube-rs's `DelayedInit`
+    // multiplexes a single-waker oneshot behind a Mutex — the two getters race, the
+    // loser's waker is overwritten and it hangs FOREVER. When our getter lost, the
+    // `*_synced` flag never flipped and every external destructive deletion deferred
+    // (`StoresNotSynced`) indefinitely. Each controller now flips its own
+    // `*_synced` from its reconcile (`Context::mark_*_synced`) — a running reconcile
+    // is proof the reflector synced, with no getter contention.
+    // Best-effort: a second call (there is only ever one per kind) keeps the first
+    // handle.
     let _ = cell.set(store);
-    let synced = synced.clone();
-    tokio::spawn(async move {
-        if reader.wait_until_ready().await.is_ok() {
-            synced.store(true, Ordering::Release);
-            tracing::info!(kind, "informer cache synced");
-        } else {
-            tracing::warn!(kind, "informer store dropped before sync");
-        }
-    });
 }
 
 /// Spawn all eight controllers and join them. Split out so it can be driven
@@ -193,12 +191,7 @@ pub(crate) async fn spawn_all(
     let snapshot_ctx = ctx.clone();
     let snapshot_ctrl = Controller::new(snapshot_api, cfg.clone()).with_config(ctrl_cfg.clone());
     let snapshot_store = snapshot_ctrl.store();
-    publish_synced_store(
-        &ctx.snapshot_store,
-        &ctx.snapshot_synced,
-        snapshot_store.clone(),
-        "Snapshot",
-    );
+    publish_store(&ctx.snapshot_store, snapshot_store.clone());
     let mut snapshot_ctrl = snapshot_ctrl
         .owns_with(scoped_api::<Job>(&client, &scope), (), owned_cfg.clone())
         .owns_with(
@@ -265,12 +258,7 @@ pub(crate) async fn spawn_all(
     let sched_ctx = ctx.clone();
     let sched_ctrl = Controller::new(sched_api, cfg.clone()).with_config(ctrl_cfg.clone());
     let sched_store = sched_ctrl.store();
-    publish_synced_store(
-        &ctx.schedule_store,
-        &ctx.schedule_synced,
-        sched_store.clone(),
-        "SnapshotSchedule",
-    );
+    publish_store(&ctx.schedule_store, sched_store.clone());
     let mut sched_ctrl = sched_ctrl
         .owns(scoped_api::<Snapshot>(&client, &scope), cfg.clone())
         .watches(

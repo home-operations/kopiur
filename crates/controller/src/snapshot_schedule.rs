@@ -335,6 +335,10 @@ fn schedule_ready_status(
 /// Reconcile a `SnapshotSchedule`.
 #[tracing::instrument(skip(schedule, ctx), fields(kind = "SnapshotSchedule", namespace = %schedule.namespace().unwrap_or_default(), name = %schedule.name_any()))]
 pub async fn reconcile(schedule: Arc<SnapshotSchedule>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the SnapshotSchedule reflector synced (the
+    // applier gates on `store.wait_until_ready()`), so the breaker's owner lookup
+    // (`schedule_owner_lookup`) can trust the store. See `Context::mark_schedule_synced`.
+    ctx.mark_schedule_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&schedule, &ctx).await;
     ctx.metrics

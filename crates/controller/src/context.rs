@@ -202,6 +202,14 @@ pub struct Context {
     /// `true` once [`snapshot_store`](Self::snapshot_store) has completed its
     /// initial list (the reflector synced). Until then a cold/absent cache must
     /// never be read as "nothing pending" — see [`snapshot_store`](Self::snapshot_store).
+    ///
+    /// Flipped by [`mark_snapshot_synced`](Self::mark_snapshot_synced) from the
+    /// Snapshot reconcile — a running reconcile is proof the reflector synced (the
+    /// applier only dispatches after `store.wait_until_ready()`). This is the
+    /// RELIABLE signal: a dedicated `wait_until_ready()` getter on the same
+    /// `Controller::store()` races the applier's own getter on kube-rs's
+    /// single-waker `DelayedInit` and can hang forever — the bug that left every
+    /// external destructive deletion deferred (`StoresNotSynced`) indefinitely.
     pub snapshot_synced: Arc<AtomicBool>,
     /// Shared informer cache of all `SnapshotSchedule` CRs, reused from the
     /// `SnapshotSchedule` controller's own reflector. Same `OnceLock`
@@ -259,6 +267,24 @@ impl Context {
         }
     }
 
+    /// Mark the Snapshot informer synced. Called at the top of the Snapshot
+    /// reconcile: the Controller's applier only dispatches a reconcile AFTER the
+    /// Snapshot reflector's initial LIST completed
+    /// (`delay_tasks_until(store.wait_until_ready())`), so a running reconcile is
+    /// proof the store is warm — a reliable signal with NO contention on kube-rs's
+    /// single-waker `DelayedInit`. Idempotent + cheap (relaxed load, release store
+    /// only on the first flip). See [`snapshot_synced`](Self::snapshot_synced).
+    pub fn mark_snapshot_synced(&self) {
+        mark_synced(&self.snapshot_synced);
+    }
+
+    /// Mark the SnapshotSchedule informer synced, from the SnapshotSchedule
+    /// reconcile. Same reliable-signal rationale as
+    /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
+    pub fn mark_schedule_synced(&self) {
+        mark_synced(&self.schedule_synced);
+    }
+
     /// The `imagePullPolicy` to stamp on mover `Job` pods: the explicit
     /// configuration when set, else inferred from whether the mover image was
     /// pinned. Delegates to the pure, unit-tested
@@ -271,9 +297,43 @@ impl Context {
     }
 }
 
+/// Flip an informer-synced flag to `true` (idempotent). A relaxed load avoids the
+/// release store's write traffic on the (overwhelmingly common) already-synced
+/// path. Free fn so the load-then-store is asserted once in [`tests`].
+fn mark_synced(flag: &AtomicBool) {
+    if !flag.load(Ordering::Relaxed) {
+        flag.store(true, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- regression (#store-sync): the mass-deletion breaker gates destructive
+    // deletion on `*_synced`. It used to be flipped by a spawned
+    // `wait_until_ready()` getter on the same `Controller::store()` the applier
+    // already awaits — a second getter on kube-rs's single-waker `DelayedInit`
+    // that loses the waker race and hangs forever, so the flag never flipped and
+    // EVERY external destructive deletion deferred (`StoresNotSynced`) forever. It
+    // is now flipped from the reconcile (proof the reflector synced) via this
+    // idempotent helper. ---
+    #[test]
+    fn mark_synced_flips_false_to_true_and_is_idempotent() {
+        let flag = AtomicBool::new(false);
+        assert!(!flag.load(Ordering::Acquire));
+        mark_synced(&flag);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the first mark must flip false -> true (the reconcile-driven synced signal)"
+        );
+        // A second call keeps it true (and takes the cheap already-synced fast path).
+        mark_synced(&flag);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "mark_synced must be idempotent — stay true on repeat reconciles"
+        );
+    }
 
     // --- regression: the controller's in-process kopia inherited no writable
     // cache/log/config dir, so on a read-only rootfs with $HOME=/nonexistent
