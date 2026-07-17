@@ -106,8 +106,8 @@ deletion is a batch of one and still waits out the quiet window (documented
 deterministic member-set name is itself a single-flight lock) and carries no
 `ttlSecondsAfterFinished`; the dispatcher reaps a terminal batch Job explicitly,
 once every member has actually drained its own finalizer. An optional cluster-
-wide cap, `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` (Helm
-`controller.maxConcurrentDeleteJobs`), defaults to **uncapped** (`0`) — batching
+wide cap, `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` (Helm's top-level
+`maxConcurrentDeleteJobs` value), defaults to **uncapped** (`0`) — batching
 itself is the primary defense, and a global cap is an opt-in backstop, not
 Kopiur's answer to head-of-line blocking one repository's slow deletes behind
 every other repository's.

@@ -609,7 +609,7 @@ Kopiur never spawns one mover Job per `Snapshot` being deleted. Deletions for th
 
 Pending deletions for a repository accumulate for a short **quiet window** (~10 seconds) before the batch fires, so a burst arriving within that window rides one Job instead of several; a batch is also capped at 200 members per Job, so a very large wave fires across successive waves rather than one unbounded Job. A **single** deletion is simply a batch of one — it still waits out the quiet window, so expect up to ~10 seconds of added latency before an individual `Snapshot`'s finalizer clears, even outside any incident.
 
-An optional cluster-wide cap (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS` / the Helm chart's `controller.maxConcurrentDeleteJobs`, default **`0` = uncapped**) bounds how many batch Jobs may run at once across every repository; batching itself — not this cap — is the primary defense against overwhelming a backend, so leave it uncapped unless you have a specific reason to throttle concurrent deletes further.
+An optional cluster-wide cap (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS` / the Helm chart's top-level `maxConcurrentDeleteJobs` value, default **`0` = uncapped**) bounds how many batch Jobs may run at once across every repository; batching itself — not this cap — is the primary defense against overwhelming a backend, so leave it uncapped unless you have a specific reason to throttle concurrent deletes further.
 
 /// note | Post-fire, `skip-snapshot-cleanup` only releases the CR — it can't pull a Snapshot out of an in-flight batch
 

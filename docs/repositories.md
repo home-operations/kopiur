@@ -411,7 +411,7 @@ The annotation's value is an RFC3339 **timestamp**, not a boolean — "I approve
 - **Copy the value the operator surfaced**, from the condition or the event. It's the newest pending deletion's timestamp, chosen so this one `annotate` releases the WHOLE currently-held wave. A hand-generated value (e.g. from `date`) risks landing earlier than some pending deletions and releasing only part of the wave — the controller only ever echoes back the exact value that works, it does not compute one from an arbitrary input.
 - **A stale ack is inert against a LATER wave.** Re-applying the same value later (including one committed to Git) does not pre-approve a fresh wave that starts afterward — nothing requires removing the annotation once it has done its job.
 - **A future-dated value is clamped to now** — an ack can never pre-approve deletions that haven't happened yet (a clock-skew guard).
-- **An unparseable value is IGNORED** (fail-safe: the breaker stays armed) and raises an `InvalidMassDeletionAck` Warning Event naming the bad value.
+- **An unparseable value is IGNORED** (fail-safe: the breaker stays armed) and raises an `InvalidMassDeletionAck` Warning Event flagging the annotation as unparseable RFC3339.
 
 ### `threshold: 0` disables the breaker
 
