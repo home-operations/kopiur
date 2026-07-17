@@ -429,6 +429,7 @@ fn dummy_backup() -> Snapshot {
             tags: None,
             failure_policy: None,
             deletion_policy: None,
+            on_schedule_delete: None,
             pin: false,
             description: None,
         },

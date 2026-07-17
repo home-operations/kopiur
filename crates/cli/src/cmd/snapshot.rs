@@ -51,6 +51,8 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
             },
             failure_policy,
             deletion_policy: args.deletion_policy.map(Into::into),
+            // `snapshot now` creates a manual Snapshot with no owning schedule.
+            on_schedule_delete: None,
             pin: args.pin,
             description: args.description.clone(),
         },

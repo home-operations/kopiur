@@ -7,7 +7,8 @@
 //! - `discovered`— materialized by the catalog scan; spec is empty/absent.
 
 use crate::common::{
-    CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef, ResolvedIdentity,
+    CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef,
+    ResolvedIdentity, ScheduleDeletePolicy,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -44,6 +45,15 @@ pub struct SnapshotSpec {
     /// What happens to the kopia snapshot when this CR is deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_policy: Option<DeletionPolicy>,
+    /// What the schedule-deletion cascade does to this Snapshot: consulted by the
+    /// finalizer ONLY when the deletion is external (not an operator prune) and the
+    /// owning `SnapshotSchedule` is gone or replaced (ownerRef UID mismatch).
+    /// `Retain` downgrades an effective `Delete` so the kopia snapshot survives;
+    /// `Delete` lets the Snapshot's own `deletionPolicy` cascade. Stamped at
+    /// creation from the schedule's `spec.deletion.onScheduleDelete`; absent
+    /// (pre-upgrade Snapshots, manual/discovered Snapshots) resolves to `Retain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_schedule_delete: Option<ScheduleDeletePolicy>,
     /// Exempt this snapshot from GFS retention.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin: bool,
@@ -99,6 +109,36 @@ impl Origin {
             Self::Scheduled => "scheduled",
             Self::Manual => "manual",
             Self::Discovered => "discovered",
+        }
+    }
+}
+
+/// Which operator lifecycle removed a Snapshot (the `pruned-by` annotation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrunedBy {
+    /// GFS retention prune (`SnapshotPolicy.spec.retention`).
+    Retention,
+    /// `SnapshotSchedule.spec.failedJobsHistoryLimit` prune.
+    FailedHistory,
+}
+
+impl PrunedBy {
+    /// The stable annotation value stamped by the operator before it deletes a
+    /// `Snapshot` as part of its own lifecycle (see [`crate::consts::PRUNED_BY_ANNOTATION`]).
+    pub fn annotation_value(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::FailedHistory => "failed-history",
+        }
+    }
+
+    /// Strict parse: `None` for anything unrecognized (the finalizer must treat
+    /// that as an EXTERNAL deletion — never guess "operator").
+    pub fn parse(v: &str) -> Option<Self> {
+        match v {
+            "retention" => Some(Self::Retention),
+            "failed-history" => Some(Self::FailedHistory),
+            _ => None,
         }
     }
 }
@@ -548,6 +588,45 @@ deletionPolicy: Delete
         let p = DeletionPolicy::Retain;
         let _copy = p;
         assert_eq!(p, DeletionPolicy::Retain);
+    }
+
+    #[test]
+    fn on_schedule_delete_round_trips_and_absent_stays_absent() {
+        let yaml = r#"
+policyRef: { name: postgres-data }
+deletionPolicy: Delete
+onScheduleDelete: Delete
+"#;
+        let spec: SnapshotSpec = from_yaml(yaml);
+        assert_eq!(spec.on_schedule_delete, Some(ScheduleDeletePolicy::Delete));
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["onScheduleDelete"], "Delete");
+        let reparsed: SnapshotSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent stays absent (no schema default — the safety default lives in
+        // the controller resolver, not here).
+        let bare: SnapshotSpec = from_yaml("policyRef: { name: postgres-data }\n");
+        assert!(bare.on_schedule_delete.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("onScheduleDelete")
+                .is_none(),
+            "absent onScheduleDelete must be elided"
+        );
+    }
+
+    #[test]
+    fn pruned_by_parse_is_the_exact_inverse_of_annotation_value() {
+        for variant in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+            assert_eq!(
+                PrunedBy::parse(variant.annotation_value()),
+                Some(variant),
+                "{variant:?}"
+            );
+        }
+        assert_eq!(PrunedBy::parse("garbage"), None);
     }
 
     #[test]

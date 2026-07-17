@@ -78,6 +78,25 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              onScheduleDelete:
+                description: |-
+                  What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it
+                  produced (which Kubernetes GC cascade-deletes via their ownerReference).
+                  Default `Retain`: the CRs are removed but their kopia snapshots survive and
+                  the catalog rediscovers them as `origin: discovered`. `Delete` opts into the
+                  cascade: each Snapshot's own `deletionPolicy` applies.
+
+                  Deliberately 2-variant (not reusing [`DeletionPolicy`]): an `Orphan` in
+                  cascade position would differ from `Retain` only in per-CR event/metric
+                  bookkeeping — an invalid state made unrepresentable. The guard's `Retain`
+                  is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot
+                  stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm
+                  (no per-CR "orphaned" event/metric for every produced Snapshot).
+                enum:
+                - Retain
+                - Delete
+                nullable: true
+                type: string
               pin:
                 description: Exempt this snapshot from GFS retention.
                 type: boolean

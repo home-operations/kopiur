@@ -770,6 +770,9 @@ fn scheduled_backup_spec(
         tags: None,
         failure_policy: None,
         deletion_policy: default_deletion_policy,
+        // M0 only: no cascade stamping yet. M4 wires the real
+        // spec.deletion.onScheduleDelete -> produced Snapshot stamping.
+        on_schedule_delete: None,
         pin: false,
         // Scheduled backups never carry a templated description (out of
         // scope for M4 — description is per-invocation only).
@@ -1313,6 +1316,7 @@ mod tests {
                     tags: None,
                     failure_policy: None,
                     deletion_policy: None,
+                    on_schedule_delete: None,
                     pin: false,
                     description: None,
                 },

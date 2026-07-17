@@ -883,6 +883,9 @@ async fn materialize_discovered(
             failure_policy: None,
             // Forced Retain for discovered (webhook would reject otherwise).
             deletion_policy: Some(DeletionPolicy::Retain),
+            // Discovered snapshots have no owning schedule; the webhook rejects
+            // this field being set at all for origin: discovered.
+            on_schedule_delete: None,
             // Discovered snapshots are not pinned by the operator.
             pin: false,
             // Discovered snapshots never carry a templated description (out
@@ -1446,6 +1449,7 @@ mod tests {
                     tags: None,
                     failure_policy: None,
                     deletion_policy: None,
+                    on_schedule_delete: None,
                     pin: false,
                     description: None,
                 },

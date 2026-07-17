@@ -2,7 +2,7 @@ use super::*;
 use crate::cluster_repository::{AllowedNamespaces, ClusterRepositorySpec};
 use crate::common::{
     DeletionPolicy, FailurePolicy, Identity, RepositoryKind, RepositoryMode, RepositoryRef,
-    Retention,
+    Retention, ScheduleDeletePolicy,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::repository::{RepositoryHealthSpec, RepositorySpec};
@@ -1154,6 +1154,7 @@ fn repository_inline_retention_hook_passes_today() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
     };
     assert!(validate_repository_no_inline_retention(&spec).is_ok());
 }
@@ -1242,6 +1243,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         failure_policy: None,
         description: None,
         deletion_policy: Some(DeletionPolicy::Delete),
+        on_schedule_delete: None,
         pin: false,
     };
     let errs = validate_backup(&spec, Origin::Discovered);
@@ -1250,6 +1252,61 @@ fn backup_aggregate_rejects_discovered_delete() {
         errs[0],
         ValidationError::DiscoveredMustRetain { .. }
     ));
+}
+
+// --- validate_backup_on_schedule_delete ---
+
+#[test]
+fn discovered_on_schedule_delete_is_rejected_for_either_variant() {
+    for v in [ScheduleDeletePolicy::Retain, ScheduleDeletePolicy::Delete] {
+        let err = validate_backup_on_schedule_delete(Origin::Discovered, Some(v)).unwrap_err();
+        match &err {
+            ValidationError::DiscoveredCannotSetOnScheduleDelete { got } => {
+                assert_eq!(got, &format!("{v:?}"));
+            }
+            other => panic!("expected DiscoveredCannotSetOnScheduleDelete, got {other:?}"),
+        }
+        // The message names the field and the fix.
+        let msg = err.to_string();
+        assert!(msg.contains("onScheduleDelete"), "{msg}");
+        assert!(msg.contains("Remove spec.onScheduleDelete"), "{msg}");
+    }
+    // Absent is fine on a discovered Snapshot.
+    assert!(validate_backup_on_schedule_delete(Origin::Discovered, None).is_ok());
+}
+
+#[test]
+fn scheduled_and_manual_accept_on_schedule_delete() {
+    for origin in [Origin::Scheduled, Origin::Manual] {
+        for v in [
+            None,
+            Some(ScheduleDeletePolicy::Retain),
+            Some(ScheduleDeletePolicy::Delete),
+        ] {
+            assert!(
+                validate_backup_on_schedule_delete(origin, v).is_ok(),
+                "{origin:?} + {v:?} should be accepted"
+            );
+        }
+    }
+}
+
+#[test]
+fn backup_aggregate_rejects_discovered_on_schedule_delete() {
+    let spec = SnapshotSpec {
+        policy_ref: None,
+        tags: None,
+        failure_policy: None,
+        description: None,
+        deletion_policy: None,
+        on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
+        pin: false,
+    };
+    let errs = validate_backup(&spec, Origin::Discovered);
+    assert!(errs.iter().any(|e| matches!(
+        e,
+        ValidationError::DiscoveredCannotSetOnScheduleDelete { .. }
+    )));
 }
 
 #[test]
@@ -1272,6 +1329,7 @@ fn backup_schedule_aggregate_rejects_bad_cron() {
             starting_deadline_seconds: None,
         },
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     let errs = validate_backup_schedule(&spec);
     assert!(
@@ -1300,6 +1358,7 @@ fn backup_schedule_aggregate_rejects_bad_timezone() {
             starting_deadline_seconds: None,
         },
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     let errs = validate_backup_schedule(&spec);
     assert!(
@@ -1329,6 +1388,7 @@ fn backup_schedule_aggregate_rejects_bad_jitter() {
             starting_deadline_seconds: None,
         },
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     // Unparseable / overflowing jitter is rejected at admission rather than silently
     // degrading to no-jitter at reconcile.
@@ -1376,6 +1436,7 @@ fn schedule_requires_exactly_one_policy_target() {
         policy_selector: None,
         schedule: base_schedule(),
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     assert!(matches!(
         validate_schedule_policy_target(&neither),
@@ -1388,6 +1449,7 @@ fn schedule_requires_exactly_one_policy_target() {
         policy_selector: sel(),
         schedule: base_schedule(),
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     assert!(matches!(
         validate_schedule_policy_target(&both),
@@ -1400,12 +1462,14 @@ fn schedule_requires_exactly_one_policy_target() {
         policy_selector: None,
         schedule: base_schedule(),
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     let only_sel = SnapshotScheduleSpec {
         policy_ref: None,
         policy_selector: sel(),
         schedule: base_schedule(),
         failed_jobs_history_limit: None,
+        deletion: None,
     };
     assert!(validate_schedule_policy_target(&only_ref).is_ok());
     assert!(validate_schedule_policy_target(&only_sel).is_ok());
@@ -1447,6 +1511,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
     }
 }
 
@@ -1544,6 +1609,7 @@ fn cluster_repository_rejects_all_false() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
         credential_projection: None,
     };
     assert!(!validate_cluster_repository(&spec).is_empty());
@@ -1585,6 +1651,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);
@@ -1636,6 +1703,7 @@ fn repo_spec_create(
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
     }
 }
 
@@ -1696,6 +1764,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
         credential_projection: None,
     };
     assert!(
@@ -1794,6 +1863,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
         credential_projection: None,
     };
     let old = mk("FIXED-4M");
@@ -3616,6 +3686,7 @@ fn cluster_repository_rejects_bad_cluster_name() {
         suspend: false,
         health: None,
         parameters: None,
+        deletion_protection: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);

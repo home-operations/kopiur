@@ -87,6 +87,29 @@ pub const RUN_MODE_ANNOTATION: &str = "kopiur.home-operations.com/run-mode";
 pub const ALLOW_IDENTITY_CHANGE_ANNOTATION: &str =
     "kopiur.home-operations.com/allow-identity-change";
 
+/// Marks a `Snapshot` the OPERATOR is deleting as part of its own lifecycle,
+/// stamped immediately before the delete call. Values: `PrunedBy` annotation
+/// values (`retention`, `failed-history`). The Snapshot finalizer uses it to
+/// distinguish Kopiur's own prunes from external deletions (GC cascades,
+/// kubectl, third-party controllers); external destructive deletions are
+/// subject to the schedule-cascade guard and the mass-deletion breaker,
+/// operator prunes are not. Any unrecognized value is treated as EXTERNAL
+/// (fail-safe). Wire-visible: users and tooling may read it on terminating CRs.
+pub const PRUNED_BY_ANNOTATION: &str = "kopiur.home-operations.com/pruned-by";
+
+/// Acknowledges a mass-deletion wave on a `Repository`/`ClusterRepository`.
+/// Value: an RFC3339 timestamp. A HELD external deletion is released iff its
+/// Snapshot's `metadata.deletionTimestamp` <= this value — "I approve what is
+/// pending NOW". Deliberately VALUED (unlike the presence-only
+/// allow-identity-change ack, consumed at a single admission instant): this
+/// annotation is read continuously by the controller, so a presence-only ack
+/// left behind (or committed to Git) would disarm the breaker forever. With
+/// the timestamp, a stale ack is inert against any LATER wave, nothing ever
+/// needs to remove it, and the operator never edits user metadata. The
+/// controller clamps the effective value to <= its own now (clock-skew guard);
+/// an unparseable value is ignored (Warning event on the repository).
+pub const ALLOW_MASS_DELETION_ANNOTATION: &str = "kopiur.home-operations.com/allow-mass-deletion";
+
 /// The API version string for kopiur CRDs (used in mover `TargetRef`s and
 /// `kubectl -o name`-style output).
 pub const API_VERSION: &str = "kopiur.home-operations.com/v1alpha1";
@@ -191,6 +214,22 @@ pub fn effective_failed_jobs_history_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
 }
 
+/// Default `spec.deletionProtection.threshold` (0 disables). 10 pending
+/// external destructive deletions is far above legitimate manual cleanup but
+/// far below a tooling-driven cascade (the motivating incident was ~600).
+pub const DEFAULT_MASS_DELETION_THRESHOLD: u32 = 10;
+
+/// The effective mass-deletion breaker threshold: `deletionProtection.threshold`
+/// when set, else [`DEFAULT_MASS_DELETION_THRESHOLD`]. `Some(0)` disables the breaker.
+pub fn effective_mass_deletion_threshold(p: Option<&crate::common::DeletionProtectionSpec>) -> u32 {
+    p.and_then(|d| d.threshold)
+        .unwrap_or(DEFAULT_MASS_DELETION_THRESHOLD)
+}
+
+/// `Repository`/`ClusterRepository` condition: pending external destructive
+/// deletions for this repository are at/above the breaker threshold and held.
+pub const MASS_DELETION_HELD_CONDITION: &str = "MassDeletionHeld";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +258,8 @@ mod tests {
             RUN_REQUESTED_ANNOTATION,
             RUN_MODE_ANNOTATION,
             ALLOW_IDENTITY_CHANGE_ANNOTATION,
+            PRUNED_BY_ANNOTATION,
+            ALLOW_MASS_DELETION_ANNOTATION,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");
         }

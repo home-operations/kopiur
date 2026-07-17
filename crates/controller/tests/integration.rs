@@ -96,6 +96,7 @@ fn sample_repository(name: &str) -> Repository {
             suspend: false,
             health: None,
             parameters: None,
+            deletion_protection: None,
             server: None,
         },
     )
@@ -190,6 +191,7 @@ async fn backup_gets_finalizer_and_delete_path_removes_cr() {
             tags: None,
             failure_policy: None,
             deletion_policy: Some(kopiur_api::DeletionPolicy::Orphan),
+            on_schedule_delete: None,
             pin: false,
             description: None,
         },

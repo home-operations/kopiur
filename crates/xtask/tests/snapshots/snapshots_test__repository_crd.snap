@@ -639,6 +639,24 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              deletionProtection:
+                description: Mass-deletion circuit breaker for this repository's Snapshots.
+                nullable: true
+                properties:
+                  threshold:
+                    default: 10
+                    description: |-
+                      Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set,
+                      effective deletionPolicy Delete, not operator-pruned) that trip the
+                      breaker for this repository: at or above this, those deletions are HELD
+                      (finalizers wait) until acknowledged via the
+                      `kopiur.home-operations.com/allow-mass-deletion` annotation.
+                      `0` disables the breaker. Default 10.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               encryption:
                 description: Repository password (a Secret reference).
                 properties:

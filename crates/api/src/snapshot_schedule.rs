@@ -59,6 +59,37 @@ pub struct SnapshotScheduleSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_failed_jobs_history_limit")]
     pub failed_jobs_history_limit: Option<u32>,
+    /// Deletion semantics for the Snapshots this schedule produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<ScheduleDeletionSpec>,
+}
+
+/// Deletion semantics for a schedule's produced `Snapshot`s (sub-object per
+/// docs/dev/api-conventions.md §4 so future deletion knobs slot in without
+/// API breakage).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleDeletionSpec {
+    /// Stamped onto every produced Snapshot at creation (`spec.onScheduleDelete`)
+    /// and consulted by the Snapshot finalizer when the owning schedule is gone
+    /// or replaced. Absent resolves to `Retain`.
+    #[serde(default = "default_on_schedule_delete")]
+    #[schemars(default = "default_on_schedule_delete")]
+    pub on_schedule_delete: crate::common::ScheduleDeletePolicy,
+}
+
+fn default_on_schedule_delete() -> crate::common::ScheduleDeletePolicy {
+    crate::common::ScheduleDeletePolicy::Retain
+}
+
+/// The effective cascade policy for a schedule: `spec.deletion.onScheduleDelete`
+/// when the sub-object is present, else `Retain`. (A default nested under an
+/// ABSENT optional sub-object does not materialize server-side — every read
+/// goes through this resolver.)
+pub fn effective_on_schedule_delete(
+    deletion: Option<&ScheduleDeletionSpec>,
+) -> crate::common::ScheduleDeletePolicy {
+    deletion.map(|d| d.on_schedule_delete).unwrap_or_default()
 }
 
 /// schemars default for [`SnapshotScheduleSpec::failed_jobs_history_limit`] —
@@ -221,6 +252,79 @@ mod tests {
         assert_eq!(
             crate::consts::effective_failed_jobs_history_limit(None),
             crate::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT
+        );
+    }
+
+    #[test]
+    fn schedule_deletion_on_schedule_delete_schema_default_is_retain() {
+        // Mirrors failed_jobs_history_limit_schema_default_matches_the_constant:
+        // a context-free default is safe to server-side-materialize because
+        // effective_on_schedule_delete maps an absent sub-object to the same value.
+        let crd = SnapshotSchedule::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["properties"]["deletion"]["properties"]["onScheduleDelete"]["default"],
+            serde_json::json!("Retain")
+        );
+        assert_eq!(
+            effective_on_schedule_delete(None),
+            crate::common::ScheduleDeletePolicy::Retain
+        );
+    }
+
+    #[test]
+    fn schedule_deletion_round_trips_and_absent_stays_none() {
+        use crate::common::ScheduleDeletePolicy;
+
+        let spec: SnapshotScheduleSpec = from_yaml(
+            "policyRef: { name: pg }\nschedule: { cron: \"H 2 * * *\" }\ndeletion: { onScheduleDelete: Delete }\n",
+        );
+        assert_eq!(
+            spec.deletion.as_ref().map(|d| d.on_schedule_delete),
+            Some(ScheduleDeletePolicy::Delete)
+        );
+        assert_eq!(
+            effective_on_schedule_delete(spec.deletion.as_ref()),
+            ScheduleDeletePolicy::Delete
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["deletion"]["onScheduleDelete"], "Delete");
+        let reparsed: SnapshotScheduleSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec, reparsed);
+
+        // Absent sub-object stays None (not materialized to Retain client-side).
+        let bare: SnapshotScheduleSpec =
+            from_yaml("policyRef: { name: pg }\nschedule: { cron: \"H 2 * * *\" }\n");
+        assert!(bare.deletion.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("deletion")
+                .is_none(),
+            "absent deletion must be elided"
+        );
+        assert_eq!(
+            effective_on_schedule_delete(bare.deletion.as_ref()),
+            ScheduleDeletePolicy::Retain
+        );
+    }
+
+    #[test]
+    fn schedule_delete_policy_serializes_to_expected_strings() {
+        use crate::common::ScheduleDeletePolicy;
+
+        assert_eq!(
+            serde_json::to_value(ScheduleDeletePolicy::Retain).unwrap(),
+            "Retain"
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleDeletePolicy::Delete).unwrap(),
+            "Delete"
+        );
+        assert_eq!(
+            ScheduleDeletePolicy::default(),
+            ScheduleDeletePolicy::Retain
         );
     }
 
