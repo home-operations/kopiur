@@ -181,10 +181,14 @@ pub struct Context {
     /// 403 that wedges the reconcile.
     pub watch_scope: crate::config::WatchScope,
     /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
-    /// every repository (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`, default
-    /// [`crate::config::DEFAULT_MAX_CONCURRENT_DELETE_JOBS`]). Consulted by the
+    /// every repository (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`). `None` (the
+    /// default) means UNCAPPED — batching (one Job per repository per
+    /// accumulation window) is the primary protection against overwhelming
+    /// the backend; a cap is an opt-in backstop for a resource-constrained
+    /// cluster, and a small default risks head-of-line-blocking every OTHER
+    /// repository's deletions behind one slow/failing one. Consulted by the
     /// batch dispatcher's throttle (`crate::snapshot::throttle_verdict`).
-    pub max_concurrent_delete_jobs: usize,
+    pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
     /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
     /// controller's own reflector (`Controller::store()`). `OnceLock` because
     /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
@@ -229,7 +233,7 @@ impl Context {
         maintenance_synced: Arc<AtomicBool>,
         operator_namespace: Option<String>,
         watch_scope: crate::config::WatchScope,
-        max_concurrent_delete_jobs: usize,
+        max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
     ) -> Self {
         Context {
             client,

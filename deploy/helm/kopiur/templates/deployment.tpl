@@ -89,7 +89,9 @@ spec:
               value: "true"
             {{- end }}
             # Cap on concurrently running Snapshot-delete BATCH mover Jobs,
-            # across every repository (mass-deletion protection).
+            # across every repository (mass-deletion protection). 0 = uncapped
+            # (default) — batching is the primary protection; this is an
+            # opt-in backstop.
             - name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
               value: {{ .Values.maxConcurrentDeleteJobs | quote }}
             # Bind address for the HTTP server (/metrics, /healthz, /readyz),

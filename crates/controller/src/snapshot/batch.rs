@@ -10,6 +10,7 @@
 //! decision surface is unit-tested without a cluster.
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -271,12 +272,19 @@ pub enum ThrottleVerdict {
     Wait,
 }
 
-/// `cap` bounds concurrent live batch delete Jobs cluster-wide.
-pub fn throttle_verdict(live_batch_jobs: usize, cap: usize) -> ThrottleVerdict {
-    if live_batch_jobs >= cap {
-        ThrottleVerdict::Wait
-    } else {
-        ThrottleVerdict::Proceed
+/// `cap` bounds concurrent live batch delete Jobs cluster-wide
+/// (`Context::max_concurrent_delete_jobs`). `None` (the default,
+/// `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` unset or `0`) means UNCAPPED: batching
+/// (one Job per repository per accumulation window, not one per `Snapshot`)
+/// is the primary defense against overwhelming the backend, so an
+/// operator-wide concurrency cap is only an opt-in backstop — always
+/// `Proceed` when it's off, so a slow/failing repository can never
+/// head-of-line-block every other repository's deletions behind it.
+pub fn throttle_verdict(live_batch_jobs: usize, cap: Option<NonZeroUsize>) -> ThrottleVerdict {
+    match cap {
+        None => ThrottleVerdict::Proceed,
+        Some(cap) if live_batch_jobs >= cap.get() => ThrottleVerdict::Wait,
+        Some(_) => ThrottleVerdict::Proceed,
     }
 }
 
@@ -702,8 +710,17 @@ mod tests {
 
     #[test]
     fn throttle_verdict_below_and_at_cap() {
-        assert_eq!(throttle_verdict(2, 3), ThrottleVerdict::Proceed);
-        assert_eq!(throttle_verdict(3, 3), ThrottleVerdict::Wait);
+        let cap = NonZeroUsize::new(3);
+        assert_eq!(throttle_verdict(2, cap), ThrottleVerdict::Proceed);
+        assert_eq!(throttle_verdict(3, cap), ThrottleVerdict::Wait);
+    }
+
+    #[test]
+    fn throttle_verdict_uncapped_always_proceeds() {
+        // `None` (the default) means uncapped: no live count, however large,
+        // ever throttles — batching itself is the primary protection.
+        assert_eq!(throttle_verdict(0, None), ThrottleVerdict::Proceed);
+        assert_eq!(throttle_verdict(1_000_000, None), ThrottleVerdict::Proceed);
     }
 
     // --- deletion_requeue -------------------------------------------------

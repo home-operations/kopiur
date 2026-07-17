@@ -110,16 +110,18 @@ workerThreads: 2
 streamingLists: true
 # @schema
 # type: integer
-# minimum: 1
+# minimum: 0
 # @schema
-# -- Cap on concurrently running Snapshot-delete BATCH mover Jobs, across every
-# repository (mass-deletion protection). Bounds how much delete traffic a
-# mass-deletion wave (or an incident's retroactive prune) can put on the
-# backend at once; it does NOT bound how many Snapshots one batch Job deletes,
-# nor does it gate whether a deletion is allowed at all — that's
-# deletionProtection.threshold on the Repository/ClusterRepository. Must be
-# >= 1: a zero cap would wedge every deletion cluster-wide.
-maxConcurrentDeleteJobs: 2
+# -- 0 = uncapped (default); set to bound concurrent snapshot-delete batch
+# Jobs across repositories (mass-deletion protection). Batching itself is the
+# primary protection — one Job per repository per accumulation window, not
+# one per Snapshot — so this cap is an opt-in backstop for a
+# resource-constrained cluster, not a load-bearing safety mechanism: a small
+# cap risks head-of-line-blocking every OTHER repository's deletions behind
+# one slow/failing one. It does NOT bound how many Snapshots one batch Job
+# deletes, nor does it gate whether a deletion is allowed at all — that's
+# deletionProtection.threshold on the Repository/ClusterRepository.
+maxConcurrentDeleteJobs: 0
 # -- Extra CLI args appended to the controller container.
 extraArgs: []
 # -- Extra environment variables for the controller container.
