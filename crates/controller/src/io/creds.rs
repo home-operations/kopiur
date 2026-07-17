@@ -152,10 +152,12 @@ impl CredsPrefix {
     pub fn snapshot_pin(cr: &str) -> Self {
         Self(format!("{cr}-pin"))
     }
-    /// Deletion mover of a `Snapshot` (same-namespace placement only — the
-    /// cross-namespace cascade never projects, see `delete_snapshot_via_job`).
-    pub fn snapshot_delete(cr: &str) -> Self {
-        Self(format!("{cr}-delete"))
+    /// Per-repository BATCH deletion mover (mass-deletion protection). Named after
+    /// the batch Job, not any one member: the batch runs at the repository's home
+    /// namespace with projection HARDCODED OFF, so no per-CR credential copy is
+    /// ever minted — this prefix only names/reaps a hypothetical leftover.
+    pub fn snapshot_delete_batch(job: &str) -> Self {
+        Self(job.to_string())
     }
     /// Maintenance mover of a `Maintenance` CR. Shared by cron quick/full and
     /// manual runs: the per-CR single-flight gate means no concurrent writers,
@@ -993,7 +995,7 @@ mod tests {
             CredsPrefix::snapshot_backup("app").secret_name(0),
             CredsPrefix::restore("app").secret_name(0),
             CredsPrefix::snapshot_pin("app").secret_name(0),
-            CredsPrefix::snapshot_delete("app").secret_name(0),
+            CredsPrefix::snapshot_delete_batch("app-batch").secret_name(0),
             CredsPrefix::maintenance("app").secret_name(0),
             CredsPrefix::verification("app").secret_name(0),
             CredsPrefix::replication("app").secret_name(0),

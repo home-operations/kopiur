@@ -85,8 +85,8 @@ fn deletion_timestamp_utc(backup: &Snapshot) -> Option<chrono::DateTime<chrono::
 }
 
 /// The `SnapshotAnchor` self-heal identity for a `Snapshot`, built from its
-/// pinned `status.snapshot`/`status.timing` (mirrors
-/// [`super::plan::pinned_mover_identity`]'s source fields).
+/// pinned `status.snapshot`/`status.timing` (the same source fields
+/// [`super::build::snapshot_anchor`] reads).
 fn anchor_for(backup: &Snapshot) -> SnapshotAnchor {
     let snap = backup.status.as_ref().and_then(|s| s.snapshot.as_ref());
     let timing = backup.status.as_ref().and_then(|s| s.timing.as_ref());
@@ -284,7 +284,15 @@ pub fn batch_fire_decision(
 
 fn oldest_first_truncated(fireable: &[PendingMember], max: usize) -> Vec<PendingMember> {
     let mut sorted: Vec<PendingMember> = fireable.to_vec();
-    sorted.sort_by_key(|m| m.deletion_timestamp);
+    // UID tiebreak on equal `deletionTimestamp`s: two Snapshots deleted in the
+    // same wall-clock second must truncate the SAME way on every reconcile, or
+    // the deterministic batch name (`batch_job_name`) would flap between waves
+    // and defeat the 409 single-flight dedup.
+    sorted.sort_by(|a, b| {
+        a.deletion_timestamp
+            .cmp(&b.deletion_timestamp)
+            .then_with(|| a.uid.cmp(&b.uid))
+    });
     sorted.truncate(max);
     sorted
 }
@@ -294,7 +302,16 @@ fn oldest_first_truncated(fireable: &[PendingMember], max: usize) -> Vec<Pending
 /// [`crate::naming::capped_name`] cap+hash — its internal hash is 64-bit
 /// FNV-1a, avoiding the 32-bit `short_hash` collision risk for a set-identity
 /// name. DNS-63 safe by construction (`capped_name`'s own invariant).
+///
+/// PRECONDITION: `members` is non-empty. The only caller passes a
+/// [`BatchFire::Fire`] payload, which [`batch_fire_decision`] only ever produces
+/// non-empty — an empty set would collapse to a repo-only name SHARED across
+/// waves, breaking single-flight.
 pub fn batch_job_name(repo: &RepositoryRef, members: &[PendingMember]) -> String {
+    debug_assert!(
+        !members.is_empty(),
+        "batch_job_name requires a non-empty member set (Fire is non-empty by construction)"
+    );
     let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
     uids.sort_unstable();
     let full = format!("snapdel-{}-{}", repo_label(repo), uids.join("-"));
@@ -351,6 +368,155 @@ pub fn deletion_requeue(r: DeletionRequeue) -> Duration {
         DeletionRequeue::Held => Duration::from_secs(300),
         DeletionRequeue::Accumulating(d) => d,
     }
+}
+
+// --- Batch Job classification (the dispatcher's pure decision layer, M5a) ---
+
+/// The terminal (or not) state of a batch delete Job, distilled from its
+/// Kubernetes `status` by [`super::batch_job_view`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchJobState {
+    /// Not yet terminal (pending or running).
+    Live,
+    /// Completed successfully — every targeted member was deleted.
+    Succeeded,
+    /// Terminal failure — at least one member's delete failed.
+    Failed,
+}
+
+/// A batch delete Job reduced to exactly what the pure classifiers need: its
+/// name, the member `Snapshot` UIDs it covers (from
+/// [`crate::consts::DELETE_MEMBERS_ANNOTATION`]), its terminal state, and when it
+/// went terminal (for the failed-Job reap age). Built by [`super::batch_job_view`]
+/// from a live `Job`, so every classifier here is unit-tested without a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchJobView {
+    /// The Job's `metadata.name`.
+    pub name: String,
+    /// The member `Snapshot` UIDs (the annotation's comma-joined set).
+    pub members: Vec<String>,
+    /// Terminal state.
+    pub state: BatchJobState,
+    /// When it went terminal — completion time (success) or the `Failed`
+    /// condition's transition time. `None` while `Live` (or a malformed status).
+    pub terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What a deleting `Snapshot` should do this reconcile, decided purely from the
+/// batch Jobs covering (or not) its UID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberDisposition {
+    /// A LIVE batch Job covers this UID — poll it.
+    LiveMember,
+    /// A SUCCEEDED batch Job covers this UID — its kopia snapshot is deleted;
+    /// release the finalizer.
+    SucceededMember,
+    /// A FAILED batch Job covers this UID — record the failure and back off.
+    FailedMember,
+    /// No batch Job covers this UID. `live_batch_exists` is `true` when SOME live
+    /// batch Job exists for the repository (this CR just isn't a member) — the
+    /// dispatcher then polls rather than tight-looping when it cannot yet fire.
+    NotAMember {
+        /// Whether any live batch Job exists for this repository.
+        live_batch_exists: bool,
+    },
+}
+
+/// Classify a deleting `Snapshot` (by `this_uid`) against the batch Jobs LISTed
+/// for its repository. Precedence is fail-safe: SUCCEEDED (delete confirmed) wins
+/// over LIVE (retry in flight) wins over FAILED (needs another wave), so the
+/// finalizer is released ONLY on a confirmed success, and a live retry is
+/// preferred to reporting failure. A UID in no Job is `NotAMember`, carrying
+/// whether any live batch exists for the repo.
+pub fn member_disposition(this_uid: &str, jobs: &[BatchJobView]) -> MemberDisposition {
+    let covering = |state: BatchJobState| {
+        jobs.iter()
+            .any(|j| j.state == state && j.members.iter().any(|u| u == this_uid))
+    };
+    if covering(BatchJobState::Succeeded) {
+        MemberDisposition::SucceededMember
+    } else if covering(BatchJobState::Live) {
+        MemberDisposition::LiveMember
+    } else if covering(BatchJobState::Failed) {
+        MemberDisposition::FailedMember
+    } else {
+        MemberDisposition::NotAMember {
+            live_batch_exists: jobs.iter().any(|j| j.state == BatchJobState::Live),
+        }
+    }
+}
+
+/// The UIDs enrolled in a LIVE batch Job — the no-overlap exclusion set for
+/// [`fireable_members`]. Derived from the SAME LIST [`member_disposition`] reads,
+/// so a member classified `LiveMember` is exactly one whose UID is in flight here
+/// (the no-overlap invariant cannot see a stale, differently-derived set).
+pub fn in_flight_uids(jobs: &[BatchJobView]) -> HashSet<String> {
+    jobs.iter()
+        .filter(|j| j.state == BatchJobState::Live)
+        .flat_map(|j| j.members.iter().cloned())
+        .collect()
+}
+
+/// A terminal batch Job the dispatcher should reap, and which whole-Job outcome
+/// metric to record at the (single) reap point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapTarget {
+    /// The Job to delete.
+    pub name: String,
+    /// The metric to bump — the ONLY place a whole-Job outcome is counted.
+    pub outcome: crate::metrics::BatchJobOutcome,
+}
+
+/// A failed batch Job is reaped once it has been terminal this long — a bounded
+/// back-off before its members re-fire a fresh wave, matching
+/// [`deletion_requeue`]`(`[`DeletionRequeue::JobFailed`]`)`.
+pub const FAILED_BATCH_REAP_AGE: Duration = Duration::from_secs(60);
+
+/// Select the terminal batch Jobs eligible to be reaped NOW (batch Jobs carry no
+/// `ttlSecondsAfterFinished` — reaping is explicit):
+///
+/// - a SUCCEEDED Job once NONE of its members still hold the cleanup finalizer
+///   (`finalizer_holding`, from the snapshot store) — every member has drained,
+///   so deleting the Job cannot strand a member that has not yet observed the
+///   success (its own reconcile releases its finalizer off the SUCCEEDED Job
+///   first, and the store reflects that before this fires);
+/// - a FAILED Job once it has been terminal for `failed_min_age`
+///   ([`FAILED_BATCH_REAP_AGE`]) — a bounded back-off before its still-held
+///   members re-fire (kopia delete is idempotent, so the retry is safe).
+///
+/// LIVE Jobs are never reaped. A `None`/future-dated `terminal_at` (missing or
+/// clock-skewed status) is treated as not-yet-old-enough — fail-safe: the sweep
+/// backstop reaps a genuinely-leaked timestamp-less Job later.
+pub fn reap_targets(
+    jobs: &[BatchJobView],
+    finalizer_holding: &HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+    failed_min_age: Duration,
+) -> Vec<ReapTarget> {
+    jobs.iter()
+        .filter_map(|j| match j.state {
+            BatchJobState::Live => None,
+            BatchJobState::Succeeded => j
+                .members
+                .iter()
+                .all(|u| !finalizer_holding.contains(u))
+                .then(|| ReapTarget {
+                    name: j.name.clone(),
+                    outcome: crate::metrics::BatchJobOutcome::Succeeded,
+                }),
+            BatchJobState::Failed => j
+                .terminal_at
+                .is_some_and(|t| {
+                    now.signed_duration_since(t)
+                        .to_std()
+                        .is_ok_and(|age| age >= failed_min_age)
+                })
+                .then(|| ReapTarget {
+                    name: j.name.clone(),
+                    outcome: crate::metrics::BatchJobOutcome::Failed,
+                }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -846,5 +1012,212 @@ mod tests {
             deletion_requeue(DeletionRequeue::Accumulating(Duration::from_secs(7))),
             Duration::from_secs(7)
         );
+    }
+
+    // --- oldest_first_truncated UID tiebreak (deterministic wave membership) ---
+
+    #[test]
+    fn oldest_first_truncated_breaks_equal_timestamps_by_uid() {
+        // Three members deleted in the SAME second; truncate to 2. The tiebreak
+        // must select the two lexicographically-smallest UIDs, deterministically,
+        // regardless of input order — otherwise the batch NAME flaps between waves.
+        let now = 100;
+        let a = vec![
+            member("uid-c", now),
+            member("uid-a", now),
+            member("uid-b", now),
+        ];
+        let b = vec![
+            member("uid-b", now),
+            member("uid-c", now),
+            member("uid-a", now),
+        ];
+        let ta_v = oldest_first_truncated(&a, 2);
+        let tb_v = oldest_first_truncated(&b, 2);
+        let ta: Vec<&str> = ta_v.iter().map(|m| m.uid.as_str()).collect();
+        let tb: Vec<&str> = tb_v.iter().map(|m| m.uid.as_str()).collect();
+        assert_eq!(ta, vec!["uid-a", "uid-b"]);
+        assert_eq!(ta, tb, "same set, different order => identical truncation");
+    }
+
+    // --- batch_job_name non-empty precondition ---
+
+    #[test]
+    #[should_panic(expected = "non-empty member set")]
+    fn batch_job_name_debug_asserts_non_empty() {
+        let r = repo(RepositoryKind::Repository, Some("backups"), "nas");
+        let _ = batch_job_name(&r, &[]);
+    }
+
+    // --- member_disposition matrix ---
+
+    use crate::metrics::BatchJobOutcome;
+
+    fn view(
+        name: &str,
+        members: &[&str],
+        state: BatchJobState,
+        terminal_secs: Option<i64>,
+    ) -> BatchJobView {
+        BatchJobView {
+            name: name.into(),
+            members: members.iter().map(|s| s.to_string()).collect(),
+            state,
+            terminal_at: terminal_secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
+        }
+    }
+
+    #[test]
+    fn member_of_a_live_job_is_live() {
+        let jobs = vec![view("j1", &["a", "b"], BatchJobState::Live, None)];
+        assert_eq!(
+            member_disposition("a", &jobs),
+            MemberDisposition::LiveMember
+        );
+    }
+
+    #[test]
+    fn member_of_a_succeeded_job_is_succeeded() {
+        let jobs = vec![view("j1", &["a", "b"], BatchJobState::Succeeded, Some(1))];
+        assert_eq!(
+            member_disposition("b", &jobs),
+            MemberDisposition::SucceededMember
+        );
+    }
+
+    #[test]
+    fn member_of_a_failed_job_is_failed() {
+        let jobs = vec![view("j1", &["a"], BatchJobState::Failed, Some(1))];
+        assert_eq!(
+            member_disposition("a", &jobs),
+            MemberDisposition::FailedMember
+        );
+    }
+
+    #[test]
+    fn succeeded_wins_over_live_and_failed_for_the_same_uid() {
+        // A UID that appears in an old FAILED job, a retry LIVE job, AND a SUCCEEDED
+        // job must classify as SUCCEEDED (delete confirmed — release the finalizer),
+        // never re-report failure or wait.
+        let jobs = vec![
+            view("old-failed", &["a"], BatchJobState::Failed, Some(1)),
+            view("retry-live", &["a"], BatchJobState::Live, None),
+            view("done", &["a"], BatchJobState::Succeeded, Some(2)),
+        ];
+        assert_eq!(
+            member_disposition("a", &jobs),
+            MemberDisposition::SucceededMember
+        );
+    }
+
+    #[test]
+    fn live_wins_over_failed_for_the_same_uid() {
+        // In a FAILED (old) + LIVE (retry) overlap, prefer waiting on the retry.
+        let jobs = vec![
+            view("old-failed", &["a"], BatchJobState::Failed, Some(1)),
+            view("retry-live", &["a"], BatchJobState::Live, None),
+        ];
+        assert_eq!(
+            member_disposition("a", &jobs),
+            MemberDisposition::LiveMember
+        );
+    }
+
+    #[test]
+    fn non_member_reports_whether_a_live_repo_batch_exists() {
+        // A live batch exists for the repo, this CR is not in it.
+        let jobs = vec![view("j1", &["x", "y"], BatchJobState::Live, None)];
+        assert_eq!(
+            member_disposition("me", &jobs),
+            MemberDisposition::NotAMember {
+                live_batch_exists: true
+            }
+        );
+        // Only terminal jobs for others: no live batch.
+        let jobs = vec![view("j1", &["x"], BatchJobState::Succeeded, Some(1))];
+        assert_eq!(
+            member_disposition("me", &jobs),
+            MemberDisposition::NotAMember {
+                live_batch_exists: false
+            }
+        );
+        // No jobs at all.
+        assert_eq!(
+            member_disposition("me", &[]),
+            MemberDisposition::NotAMember {
+                live_batch_exists: false
+            }
+        );
+    }
+
+    // --- in_flight_uids (no-overlap exclusion set) ---
+
+    #[test]
+    fn in_flight_uids_unions_only_live_jobs() {
+        let jobs = vec![
+            view("live1", &["a", "b"], BatchJobState::Live, None),
+            view("live2", &["c"], BatchJobState::Live, None),
+            view("done", &["d"], BatchJobState::Succeeded, Some(1)),
+            view("failed", &["e"], BatchJobState::Failed, Some(1)),
+        ];
+        let uids = in_flight_uids(&jobs);
+        assert_eq!(uids, HashSet::from(["a".into(), "b".into(), "c".into()]));
+        // The exclusion set feeds fireable_members: d/e (terminal) are NOT in flight.
+        assert!(!uids.contains("d") && !uids.contains("e"));
+    }
+
+    // --- reap_targets ---
+
+    fn holding(uids: &[&str]) -> HashSet<String> {
+        uids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn succeeded_job_reaped_only_once_all_members_drained() {
+        let now = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        let jobs = vec![view("done", &["a", "b"], BatchJobState::Succeeded, Some(1))];
+        // A member still holding the finalizer spares the Job (not yet drained).
+        assert!(reap_targets(&jobs, &holding(&["b"]), now, FAILED_BATCH_REAP_AGE).is_empty());
+        // All members drained => reap with the Succeeded outcome (single count point).
+        let reaped = reap_targets(&jobs, &holding(&[]), now, FAILED_BATCH_REAP_AGE);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].name, "done");
+        assert_eq!(reaped[0].outcome, BatchJobOutcome::Succeeded);
+    }
+
+    #[test]
+    fn failed_job_reaped_only_after_the_back_off() {
+        let terminal = 1000;
+        let jobs = vec![view(
+            "failed",
+            &["a"],
+            BatchJobState::Failed,
+            Some(terminal),
+        )];
+        // Members still hold the finalizer (delete failed) — irrelevant to a failed
+        // reap; only age gates it.
+        let holding = holding(&["a"]);
+        // 59s old: too young.
+        let young = chrono::DateTime::from_timestamp(terminal + 59, 0).unwrap();
+        assert!(reap_targets(&jobs, &holding, young, FAILED_BATCH_REAP_AGE).is_empty());
+        // 60s old: reap with the Failed outcome.
+        let old = chrono::DateTime::from_timestamp(terminal + 60, 0).unwrap();
+        let reaped = reap_targets(&jobs, &holding, old, FAILED_BATCH_REAP_AGE);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].outcome, BatchJobOutcome::Failed);
+    }
+
+    #[test]
+    fn live_job_is_never_reaped_and_skewed_timestamps_are_safe() {
+        let now = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        // A live job is never a reap target, whatever the finalizer set.
+        let live = vec![view("live", &["a"], BatchJobState::Live, None)];
+        assert!(reap_targets(&live, &holding(&[]), now, FAILED_BATCH_REAP_AGE).is_empty());
+        // A failed job with a FUTURE terminal_at (clock skew) is not-yet-old-enough.
+        let future = vec![view("failed", &["a"], BatchJobState::Failed, Some(5000))];
+        assert!(reap_targets(&future, &holding(&[]), now, FAILED_BATCH_REAP_AGE).is_empty());
+        // A failed job with no terminal_at is spared (the sweep backstop gets it).
+        let no_ts = vec![view("failed", &["a"], BatchJobState::Failed, None)];
+        assert!(reap_targets(&no_ts, &holding(&[]), now, FAILED_BATCH_REAP_AGE).is_empty());
     }
 }

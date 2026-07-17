@@ -275,14 +275,14 @@ impl Context {
     /// single-waker `DelayedInit`. Idempotent + cheap (relaxed load, release store
     /// only on the first flip). See [`snapshot_synced`](Self::snapshot_synced).
     pub fn mark_snapshot_synced(&self) {
-        mark_synced(&self.snapshot_synced);
+        mark_synced(&self.snapshot_synced, "Snapshot");
     }
 
     /// Mark the SnapshotSchedule informer synced, from the SnapshotSchedule
     /// reconcile. Same reliable-signal rationale as
     /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
     pub fn mark_schedule_synced(&self) {
-        mark_synced(&self.schedule_synced);
+        mark_synced(&self.schedule_synced, "SnapshotSchedule");
     }
 
     /// The `imagePullPolicy` to stamp on mover `Job` pods: the explicit
@@ -297,12 +297,16 @@ impl Context {
     }
 }
 
-/// Flip an informer-synced flag to `true` (idempotent). A relaxed load avoids the
-/// release store's write traffic on the (overwhelmingly common) already-synced
-/// path. Free fn so the load-then-store is asserted once in [`tests`].
-fn mark_synced(flag: &AtomicBool) {
-    if !flag.load(Ordering::Relaxed) {
-        flag.store(true, Ordering::Release);
+/// Flip an informer-synced flag to `true` (idempotent), logging ONCE on the first
+/// flip (`kind` names the informer — the old `publish_synced_store` log line was
+/// lost when the flip moved into the reconcile). A relaxed load avoids the release
+/// store's write traffic on the (overwhelmingly common) already-synced path; the
+/// `swap` behind it fires the log for exactly the one caller that flips
+/// `false → true` (its return value is the prior state). Free fn so the
+/// load-then-swap is asserted once in [`tests`].
+fn mark_synced(flag: &AtomicBool, kind: &str) {
+    if !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::Release) {
+        tracing::info!(kind, "informer cache synced");
     }
 }
 
@@ -322,13 +326,13 @@ mod tests {
     fn mark_synced_flips_false_to_true_and_is_idempotent() {
         let flag = AtomicBool::new(false);
         assert!(!flag.load(Ordering::Acquire));
-        mark_synced(&flag);
+        mark_synced(&flag, "Snapshot");
         assert!(
             flag.load(Ordering::Acquire),
             "the first mark must flip false -> true (the reconcile-driven synced signal)"
         );
         // A second call keeps it true (and takes the cheap already-synced fast path).
-        mark_synced(&flag);
+        mark_synced(&flag, "Snapshot");
         assert!(
             flag.load(Ordering::Acquire),
             "mark_synced must be idempotent — stay true on repeat reconciles"

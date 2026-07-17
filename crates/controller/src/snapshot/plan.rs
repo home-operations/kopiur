@@ -14,7 +14,7 @@ use kopiur_api::common::{
 use kopiur_api::consts::PRUNED_BY_ANNOTATION;
 use kopiur_api::snapshot::{PrunedBy, SnapshotPhase};
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy, SnapshotSchedule};
-use kopiur_mover::workspec::{MoverWorkSpec, ResolvedIdentity as MoverIdentity};
+use kopiur_mover::workspec::MoverWorkSpec;
 use kube::{Resource, ResourceExt};
 
 use crate::consts::{API_VERSION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION};
@@ -706,23 +706,6 @@ pub(super) fn backfill_patch_body(
         );
     }
     Some(serde_json::json!({ "resolved": resolved }))
-}
-
-/// The mover identity pinned into `status.snapshot.identity` when the snapshot
-/// succeeded — the identity the snapshot was actually recorded under. The
-/// deletion path prefers it over re-deriving from a recipe that may since have
-/// been edited or deleted (ADR §4.2: identity is resolved once, never
-/// re-rendered).
-pub(super) fn pinned_mover_identity(backup: &Snapshot) -> Option<MoverIdentity> {
-    let id = &backup.status.as_ref()?.snapshot.as_ref()?.identity;
-    Some(MoverIdentity {
-        username: id.username.clone(),
-        hostname: id.hostname.clone(),
-        source_path: id
-            .source_path
-            .clone()
-            .unwrap_or_else(|| "/data".to_string()),
-    })
 }
 
 /// Map a `Snapshot` phase to its kstatus [`io::ReadyOutcome`] (ADR-0005 §2), so

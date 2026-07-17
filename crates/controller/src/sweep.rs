@@ -104,7 +104,8 @@ use kopiur_mover::bootstrap::RESULT_CONFIGMAP_KEY;
 use crate::config;
 use crate::consts::{
     COMPONENT_LABEL, CREDS_COMPONENT, CREDS_SCOPE_CR, CREDS_SCOPE_LABEL, MANAGED_BY_LABEL,
-    MANAGED_BY_VALUE, PROJECTED_AT_ANNOTATION, PROJECTED_FROM_ANNOTATION,
+    MANAGED_BY_VALUE, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH, PROJECTED_AT_ANNOTATION,
+    PROJECTED_FROM_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER,
 };
 use crate::controllers::scoped_api;
 use crate::error::Result;
@@ -332,6 +333,94 @@ fn terminal_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
         .collect()
 }
 
+// --- Batch delete-Job leak backstop (mass-deletion protection, M5a) ---------
+//
+// The batch dispatcher reaps its own terminal Jobs (succeeded once every member
+// drained, failed after a back-off), but batch Jobs carry NO
+// `ttlSecondsAfterFinished` — so a controller crash mid-reap, or a Job whose
+// members all drained without a subsequent reconcile of the reaping CR, can
+// leak a terminal Job forever. This backstop reaps the truly-orphaned ones. It
+// is NOT the accounting path: the dispatcher owns the `kopiur_snapshot_delete_batch_jobs`
+// counter (single increment at its reap), so this pass increments nothing and
+// only logs — double-counting a Job the dispatcher already counted would corrupt
+// the outcome series.
+
+/// The UIDs of `Snapshot`s (from the sweep's OWN list) still holding the cleanup
+/// finalizer — the "delete still pending" set that SPARES a batch Job. Because the
+/// sweep LISTs Snapshots directly (a complete read, not the possibly-cold reflector
+/// store the dispatcher guards), the set is always trustworthy here; a failed list
+/// aborts the whole pass upstream, never reaping on an empty read.
+pub fn finalizer_holding_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            s.finalizers()
+                .iter()
+                .any(|f| f == SNAPSHOT_CLEANUP_FINALIZER)
+        })
+        .filter_map(|s| s.uid())
+        .collect()
+}
+
+/// Select the LEAKED terminal batch delete Jobs out of `jobs`: a Job is a
+/// candidate only when ALL of these hold —
+///
+/// 1. labelled `managed-by=kopiur` AND the batch op (`op=snapshot-delete-batch`),
+/// 2. TERMINAL ([`crate::snapshot::job_terminal_state`] `is_some`),
+/// 3. older than `min_age_secs`, and
+/// 4. NONE of its member UIDs ([`crate::snapshot::batch_job_members`]) still hold
+///    the cleanup finalizer (`finalizer_holding`) — i.e. every member drained, so
+///    the Job's work is fully consumed and it can only be a leak.
+///
+/// Guard 4 is the real protection: a still-held member means that member's delete
+/// is pending (a succeeded Job not yet observed, or a failed Job about to re-fire),
+/// so the sweep never races an in-flight retry. `now_unix` is the injected clock,
+/// mirroring [`sweep_candidates`].
+pub fn batch_job_sweep_candidates<'a>(
+    jobs: &'a [Job],
+    finalizer_holding: &HashSet<String>,
+    min_age_secs: i64,
+    now_unix: i64,
+) -> Vec<&'a Job> {
+    jobs.iter()
+        .filter(|j| is_leaked_batch_job(j, finalizer_holding, min_age_secs, now_unix))
+        .collect()
+}
+
+/// Whether ONE Job is a leaked terminal batch delete Job (see
+/// [`batch_job_sweep_candidates`]). Early returns keep each guard readable.
+fn is_leaked_batch_job(
+    job: &Job,
+    finalizer_holding: &HashSet<String>,
+    min_age_secs: i64,
+    now_unix: i64,
+) -> bool {
+    let labels = job.metadata.labels.as_ref();
+    let has =
+        |key: &str, val: &str| labels.is_some_and(|l| l.get(key).map(String::as_str) == Some(val));
+    if !has(MANAGED_BY_LABEL, MANAGED_BY_VALUE) || !has(OP_LABEL, OP_SNAPSHOT_DELETE_BATCH) {
+        return false;
+    }
+    // Only terminal Jobs leak; a live batch is the dispatcher's to poll.
+    if crate::snapshot::job_terminal_state(job).is_none() {
+        return false;
+    }
+    let members = crate::snapshot::batch_job_members(job);
+    // A member still holding the finalizer means its delete is still pending —
+    // never reap the Job out from under an in-flight (or retrying) member.
+    if members.iter().any(|u| finalizer_holding.contains(u)) {
+        return false;
+    }
+    let age_secs = job
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| now_unix - t.0.as_second())
+        // No creationTimestamp (only hand-built test objects) → treat as new.
+        .unwrap_or(0);
+    age_secs >= min_age_secs
+}
+
 /// The Secret names a Job's pods load via `envFrom` (containers and
 /// initContainers). Pure so the extraction is unit-testable.
 pub fn job_env_from_secret_names(job: &Job) -> Vec<String> {
@@ -430,6 +519,9 @@ pub struct SweepOutcome {
     pub projected_secrets: usize,
     /// Stable per-CR copies whose owning `Snapshot` had finished (#240).
     pub terminal_creds_secrets: usize,
+    /// Leaked TERMINAL batch delete Jobs whose members all drained (M5a). Logged,
+    /// never metered — the dispatcher owns the batch-Job outcome counter.
+    pub batch_jobs: usize,
     /// Projected credential Secrets alive at classification time, BEFORE this
     /// pass's deletes. Backs the `kopiur_projected_secrets` gauge — the population
     /// signal that was missing, and the reason this leak ran for weeks unseen: a
@@ -499,6 +591,7 @@ pub async fn run_sweep(
         })
         .collect();
     let terminal = terminal_snapshot_uids(&snapshots);
+    let finalizer_holding = finalizer_holding_snapshot_uids(&snapshots);
     let now = chrono::Utc::now().timestamp();
 
     Ok(SweepOutcome {
@@ -520,7 +613,37 @@ pub async fn run_sweep(
             "finished-Snapshot",
         )
         .await,
+        batch_jobs: delete_batch_job_victims(
+            client,
+            batch_job_sweep_candidates(&jobs, &finalizer_holding, min_age_secs, now),
+        )
+        .await,
     })
+}
+
+/// Delete the leaked terminal batch delete Jobs (background propagation, so their
+/// pods go too), tolerating a 404. Per-item failures warn and skip; NO metric —
+/// the dispatcher is the accounting path (module doc).
+async fn delete_batch_job_victims(client: &kube::Client, victims: Vec<&Job>) -> usize {
+    let mut deleted = 0;
+    for job in victims {
+        let ns = job.namespace().unwrap_or_default();
+        let name = job.name_any();
+        let api: Api<Job> = Api::namespaced(client.clone(), &ns);
+        match api.delete(&name, &DeleteParams::background()).await {
+            Ok(_) => {
+                deleted += 1;
+                tracing::info!(job = %name, namespace = %ns,
+                    "reaped leaked terminal batch delete Job (members all drained)");
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => {
+                tracing::warn!(job = %name, namespace = %ns, error = %e,
+                    "leaked batch delete Job reap failed (skipped)");
+            }
+        }
+    }
+    deleted
 }
 
 /// Delete the classified work-spec ConfigMap orphans; returns the count
@@ -634,6 +757,15 @@ pub fn spawn_sweep(
                         tracing::info!(
                             deleted = outcome.terminal_creds_secrets,
                             "reaped projected credential Secrets of finished Snapshots"
+                        );
+                    }
+                    // Leak backstop only — NOT metered (the dispatcher owns the
+                    // batch-Job outcome counter; a second increment here would
+                    // double-count). Log so a persistent leak is still visible.
+                    if outcome.batch_jobs > 0 {
+                        tracing::info!(
+                            deleted = outcome.batch_jobs,
+                            "reaped leaked terminal batch delete Jobs (dispatcher backstop)"
                         );
                     }
                     // The population gauge, not just the deltas: a rising gauge is
@@ -1156,5 +1288,143 @@ mod tests {
         // but the kernel re-checks so it is safe against an unfiltered list.
         let cms = vec![cm("media", "user-cm", 2 * HOUR, &[WORK_SPEC_FILE], false)];
         assert!(sweep_candidates(&cms, &HashSet::new(), HOUR, NOW).is_empty());
+    }
+
+    // --- batch delete-Job leak backstop (M5a) --------------------------------
+
+    use crate::consts::{DELETE_MEMBERS_ANNOTATION, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH};
+    use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+
+    /// A batch delete Job in `kopiur-system` created `age_secs` ago covering
+    /// `members` (the annotation), in `terminal` state (`None` = live). Labelled as
+    /// the dispatcher labels it unless `managed`/`op` are toggled by mutation.
+    fn batch_job(name: &str, members: &[&str], age_secs: i64, terminal: Option<bool>) -> Job {
+        let labels = BTreeMap::from([
+            (MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string()),
+            (OP_LABEL.to_string(), OP_SNAPSHOT_DELETE_BATCH.to_string()),
+        ]);
+        let annotations =
+            BTreeMap::from([(DELETE_MEMBERS_ANNOTATION.to_string(), members.join(","))]);
+        let status = terminal.map(|ok| JobStatus {
+            conditions: Some(vec![JobCondition {
+                type_: if ok {
+                    "Complete".into()
+                } else {
+                    "Failed".into()
+                },
+                status: "True".into(),
+                ..Default::default()
+            }]),
+            succeeded: ok.then_some(1),
+            ..Default::default()
+        });
+        Job {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("kopiur-system".to_string()),
+                labels: Some(labels),
+                annotations: Some(annotations),
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_second(NOW - age_secs).unwrap(),
+                )),
+                ..Default::default()
+            },
+            spec: None,
+            status,
+        }
+    }
+
+    fn job_names(picked: &[&Job]) -> Vec<String> {
+        picked.iter().map(|j| j.name_any()).collect()
+    }
+
+    #[test]
+    fn old_terminal_batch_job_with_all_members_drained_is_swept() {
+        let jobs = vec![batch_job("snapdel-x", &["a", "b"], 2 * HOUR, Some(true))];
+        // No member holds the finalizer => every member drained => leak.
+        let picked = batch_job_sweep_candidates(&jobs, &HashSet::new(), HOUR, NOW);
+        assert_eq!(job_names(&picked), vec!["snapdel-x"]);
+    }
+
+    #[test]
+    fn a_member_still_holding_the_finalizer_spares_the_batch_job() {
+        // The delete is still pending for member `b` — never reap the Job out from
+        // under it (a succeeded Job not yet observed, or a failed Job about to re-fire).
+        let jobs = vec![batch_job("snapdel-x", &["a", "b"], 2 * HOUR, Some(true))];
+        let holding: HashSet<String> = ["b".to_string()].into();
+        assert!(batch_job_sweep_candidates(&jobs, &holding, HOUR, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_live_batch_job_is_never_swept() {
+        // A live batch is the dispatcher's to poll, whatever the finalizer set.
+        let jobs = vec![batch_job("snapdel-live", &["a"], 2 * HOUR, None)];
+        assert!(batch_job_sweep_candidates(&jobs, &HashSet::new(), HOUR, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_young_terminal_batch_job_is_skipped_until_min_age() {
+        let jobs = vec![batch_job("snapdel-fresh", &["a"], HOUR - 1, Some(true))];
+        assert!(batch_job_sweep_candidates(&jobs, &HashSet::new(), HOUR, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_failed_batch_job_fully_drained_is_a_leak_too() {
+        // A failed Job whose members all eventually succeeded elsewhere (drained) is
+        // pure leakage — the backstop reaps it just like a succeeded one.
+        let jobs = vec![batch_job("snapdel-failed", &["a"], 2 * HOUR, Some(false))];
+        assert_eq!(
+            job_names(&batch_job_sweep_candidates(
+                &jobs,
+                &HashSet::new(),
+                HOUR,
+                NOW
+            )),
+            vec!["snapdel-failed"]
+        );
+    }
+
+    #[test]
+    fn a_non_batch_or_unmanaged_job_is_never_swept() {
+        // Missing the op label (a different kopiur Job).
+        let mut not_batch = batch_job("restore-x", &["a"], 2 * HOUR, Some(true));
+        not_batch.metadata.labels.as_mut().unwrap().remove(OP_LABEL);
+        assert!(batch_job_sweep_candidates(&[not_batch], &HashSet::new(), HOUR, NOW).is_empty());
+        // Missing managed-by (defense in depth against an unfiltered list).
+        let mut unmanaged = batch_job("snapdel-y", &["a"], 2 * HOUR, Some(true));
+        unmanaged
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(MANAGED_BY_LABEL);
+        assert!(batch_job_sweep_candidates(&[unmanaged], &HashSet::new(), HOUR, NOW).is_empty());
+    }
+
+    #[test]
+    fn finalizer_holding_snapshot_uids_selects_only_finalizer_bearers() {
+        use kopiur_api::snapshot::SnapshotSpec;
+        let mk = |name: &str, uid: &str, has_finalizer: bool| {
+            let mut s = Snapshot::new(
+                name,
+                SnapshotSpec {
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            s.metadata.uid = Some(uid.to_string());
+            if has_finalizer {
+                s.metadata.finalizers = Some(vec![SNAPSHOT_CLEANUP_FINALIZER.to_string()]);
+            }
+            s
+        };
+        let snaps = vec![mk("a", "uid-a", true), mk("b", "uid-b", false)];
+        let holding = finalizer_holding_snapshot_uids(&snaps);
+        assert_eq!(holding, HashSet::from(["uid-a".to_string()]));
     }
 }

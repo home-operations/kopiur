@@ -240,66 +240,16 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
     )
 }
 
-// --- delete_projection_enabled (cascade never projects, #231) ------------
+// --- deletion-path credential helpers ------------------------------------
+//
+// The per-CR `delete_projection_enabled` gate is retired with the per-CR delete
+// Job (M5a): the per-repository batch delete runs at the repository's home
+// namespace, where its canonical Secret already lives, so it NEVER projects
+// (projection is hardcoded off). `stuck_finalizer_hint` survives — it enriches
+// the batch path's credential-resolution error with the escape hatch.
 
 fn projection(enabled: bool) -> kopiur_api::common::CredentialProjection {
     kopiur_api::common::CredentialProjection { enabled }
-}
-
-#[test]
-fn delete_projection_follows_the_recipe_when_nothing_is_pinned() {
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(delete_projection_enabled(false, Some(&policy), None));
-    policy.spec.credential_projection = None;
-    assert!(!delete_projection_enabled(false, Some(&policy), None));
-    assert!(
-        !delete_projection_enabled(false, None, None),
-        "no recipe and no pin: nothing says projection was ever in use"
-    );
-}
-
-#[test]
-fn delete_projection_honors_the_pin_after_the_recipe_is_gone() {
-    // #255: the recipe is the only place the opt-in lives, and a user may delete it
-    // before the Snapshot. Reading an absent recipe as "projection off" sent the
-    // delete Job looking for a namespace-local Secret that only projection supplies,
-    // stranding the cleanup finalizer forever.
-    assert!(delete_projection_enabled(
-        false,
-        None,
-        Some(&projection(true))
-    ));
-    assert!(!delete_projection_enabled(
-        false,
-        None,
-        Some(&projection(false))
-    ));
-}
-
-#[test]
-fn delete_projection_pin_wins_over_a_recipe_that_changed_after_the_run() {
-    // The pin records the conditions the run ACTUALLY executed under, and the delete
-    // path's job is to reproduce them — mirroring `resolve_repo_for_deletion`, which
-    // likewise prefers `status.resolved` over the live recipe. Letting the live value
-    // win would strand the finalizer identically to #255 whenever a recipe merely
-    // changed: the run projected, the recipe later said stop, and the delete Job would
-    // then demand a Secret nobody ever put in that namespace.
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(false));
-    assert!(delete_projection_enabled(
-        false,
-        Some(&policy),
-        Some(&projection(true))
-    ));
-    // ...and symmetrically: a run that did NOT project is not made to project by a
-    // recipe that opted in afterwards.
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(!delete_projection_enabled(
-        false,
-        Some(&policy),
-        Some(&projection(false))
-    ));
 }
 
 #[test]
@@ -320,22 +270,6 @@ fn stuck_finalizer_hint_names_the_escape_hatch_and_keeps_the_original_message() 
     assert!(msg.contains("team-a/nightly-1"));
     // The user must know the kopia snapshot survives the escape hatch.
     assert!(msg.contains("WITHOUT deleting the kopia snapshot"));
-}
-
-#[test]
-fn delete_projection_is_hard_off_for_the_cross_namespace_cascade() {
-    // Even a still-live recipe with the opt-in set must not project on the
-    // cascade path: the copy would be owned by the repository CR, which can be
-    // cluster-scoped — an invalid ownerRef on a namespaced Secret, never GC'd.
-    let mut policy = sample_policy();
-    policy.spec.credential_projection = Some(projection(true));
-    assert!(!delete_projection_enabled(true, Some(&policy), None));
-    // The pin must not reopen that hole either.
-    assert!(!delete_projection_enabled(
-        true,
-        Some(&policy),
-        Some(&projection(true))
-    ));
 }
 
 #[test]
