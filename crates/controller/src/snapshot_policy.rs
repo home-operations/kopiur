@@ -14,12 +14,13 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use kube::api::{DeleteParams, ListParams};
+use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::Retention;
 use kopiur_api::retention::{SnapshotLike, select_kept};
+use kopiur_api::snapshot::PrunedBy;
 use kopiur_api::{Snapshot, SnapshotPolicy, validate};
 
 use crate::consts::CONFIG_LABEL;
@@ -87,6 +88,44 @@ pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
 pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String> {
     let views: Vec<SnapshotRetentionView> = backups.iter().filter_map(retention_view).collect();
     select_kept(&views, policy).delete
+}
+
+/// **Pure.** Split the GFS-`selected` deletion set against the LIVE objects into
+/// `(to_delete, to_stamp_only)`:
+///
+/// - `to_delete`: selected AND NOT terminating — the normal prune: stamp
+///   `pruned-by: retention` then delete.
+/// - `to_stamp_only`: selected AND terminating AND MISSING a valid `pruned-by`
+///   annotation — an old-operator prune wave that was `kubectl delete`d before
+///   this code stamped a discriminator. Stamp the annotation ONLY (no delete —
+///   it is already terminating) so its finalizer reclassifies as a prune and
+///   DRAINS without a human ack, instead of being held as an external deletion.
+/// - A selected + terminating CR that ALREADY carries a valid `pruned-by` is in
+///   NEITHER set (nothing to do — it is already draining correctly).
+///
+/// A selected name absent from `backups` (already gone) is skipped.
+pub fn partition_retention_prune(
+    backups: &[Snapshot],
+    selected: &[String],
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &Snapshot> = backups
+        .iter()
+        .filter_map(|b| b.metadata.name.as_deref().map(|n| (n, b)))
+        .collect();
+    let mut to_delete = Vec::new();
+    let mut to_stamp_only = Vec::new();
+    for name in selected {
+        let Some(b) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        if b.metadata.deletion_timestamp.is_none() {
+            to_delete.push(name.clone());
+        } else if crate::snapshot::pruned_by(b.annotations()).is_none() {
+            to_stamp_only.push(name.clone());
+        }
+    }
+    (to_delete, to_stamp_only)
 }
 
 /// Count the most-recent run of consecutive `Failed` backups before the latest
@@ -261,18 +300,28 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         .set_snapshots_live(&namespace, &name, backups.len() as i64);
 
     if let Some(retention) = config.spec.retention.as_ref() {
-        let to_delete = backups_to_delete(&backups, retention);
-        let dp = DeleteParams::default();
+        let selected = backups_to_delete(&backups, retention);
+        // Split the selected set: normal (live) prunes get stamp-then-delete;
+        // an ALREADY-terminating selected CR that lacks a valid pruned-by
+        // annotation (an old-operator prune straddling this upgrade) is
+        // reclassified by stamping the annotation only, so its finalizer drains
+        // as a prune rather than being held as an external mass deletion.
+        let (to_delete, to_stamp_only) = partition_retention_prune(&backups, &selected);
         for cr_name in &to_delete {
-            match backup_api.delete(cr_name, &dp).await {
-                Ok(_) => {
-                    tracing::info!(config = %name, backup = %cr_name, "pruned backup (GFS retention)")
-                }
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-                Err(e) => return Err(Error::Kube(e)),
-            }
+            // Stamp `pruned-by: retention` THEN delete, so the finalizer bypasses
+            // the mass-deletion breaker + cascade guard (this is an operator prune,
+            // never an external deletion). 404-tolerant + idempotent internally.
+            io::annotate_then_delete_snapshot(&backup_api, cr_name, PrunedBy::Retention).await?;
+            tracing::info!(config = %name, backup = %cr_name, "pruned backup (GFS retention)");
         }
-        let active = backups.len().saturating_sub(to_delete.len());
+        for cr_name in &to_stamp_only {
+            io::stamp_pruned_by(&backup_api, cr_name, PrunedBy::Retention).await?;
+            tracing::info!(config = %name, backup = %cr_name, "reclassified an in-flight retention prune (pruned-by stamp only)");
+        }
+        // `active` = live snapshots that survive GFS (all selected are being
+        // removed one way or another, so subtract the full selected set — the
+        // same count the pre-partition code reported).
+        let active = backups.len().saturating_sub(selected.len());
         // Only stamp `lastPruneAt`/`lastPruneDeleted` when a prune actually
         // happened. Writing `now()` on every reconcile made the status differ each
         // pass → resourceVersion bump → watch event → self-triggered reconcile (the
@@ -504,7 +553,7 @@ mod tests {
     use kopiur_api::common::ResolvedIdentity;
     use kopiur_api::snapshot::{SnapshotInfo, SnapshotSpec, SnapshotStatus, SnapshotTiming};
     use kopiur_api::{Origin, SnapshotPhase};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn at(y: i32, mo: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, 2, 0, 0).single().unwrap()
@@ -620,6 +669,44 @@ mod tests {
             del,
             ["d23".to_string(), "d22".to_string()].into_iter().collect()
         );
+    }
+
+    /// Mark a Snapshot terminating, optionally with a valid `pruned-by` stamp.
+    fn terminating(mut b: Snapshot, pruned: bool) -> Snapshot {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        b.metadata.deletion_timestamp = Some(Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+        ));
+        if pruned {
+            let mut ann = BTreeMap::new();
+            ann.insert(
+                kopiur_api::consts::PRUNED_BY_ANNOTATION.to_string(),
+                PrunedBy::Retention.annotation_value().to_string(),
+            );
+            b.metadata.annotations = Some(ann);
+        }
+        b
+    }
+
+    #[test]
+    fn partition_retention_prune_splits_live_delete_from_terminating_stamp() {
+        let backups = vec![
+            succeeded_backup("live", at(2026, 5, 22)),
+            terminating(succeeded_backup("term-unstamped", at(2026, 5, 21)), false),
+            terminating(succeeded_backup("term-stamped", at(2026, 5, 20)), true),
+        ];
+        let selected = vec![
+            "live".to_string(),
+            "term-unstamped".to_string(),
+            "term-stamped".to_string(),
+            "already-gone".to_string(), // selected but not in the live set → skip
+        ];
+        let (to_delete, to_stamp_only) = partition_retention_prune(&backups, &selected);
+        // Live selected → normal stamp-then-delete.
+        assert_eq!(to_delete, vec!["live".to_string()]);
+        // Terminating + no pruned-by → stamp only (reclassify draining prune).
+        assert_eq!(to_stamp_only, vec!["term-unstamped".to_string()]);
+        // Terminating + already stamped, and the absent one, are in neither set.
     }
 
     #[test]

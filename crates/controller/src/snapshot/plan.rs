@@ -305,6 +305,158 @@ pub fn breaker_state(
     }
 }
 
+/// Whether the mass-deletion breaker's per-repo pending count can be trusted
+/// this reconcile. **Fail-safe:** a snapshot reflector store that is unset
+/// (`store_present == false`, the `OnceLock` not yet populated at startup) OR
+/// not yet synced (`synced == false`, the initial LIST still in flight) must
+/// NOT be read as "nothing pending" — the caller requeues instead of computing
+/// a count. The two paths behave IDENTICALLY: an absent store and an unsynced
+/// store are both "we can't count yet", never "the count is zero".
+pub fn breaker_stores_ready(store_present: bool, synced: bool) -> bool {
+    store_present && synced
+}
+
+/// Parse + clock-skew-clamp the repository's raw `allow-mass-deletion`
+/// annotation for the breaker. Returns `(clamped_ack, invalid)`:
+///
+/// - An absent annotation → `(None, false)`: no ack, nothing to warn about.
+/// - A parseable RFC3339 value → `(Some(min(value, now)), false)`: clamped via
+///   [`clamp_ack`] so a future-dated ack can't pre-approve deletions that
+///   haven't happened yet.
+/// - An unparseable non-empty value → `(None, true)`: the ack is IGNORED
+///   (fail-safe — a malformed value never disarms the breaker) and `invalid`
+///   signals the caller to publish the `InvalidMassDeletionAck` warning.
+pub fn parse_mass_deletion_ack(
+    raw: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<chrono::DateTime<chrono::Utc>>, bool) {
+    match raw {
+        None => (None, false),
+        Some(v) => match chrono::DateTime::parse_from_rfc3339(v) {
+            Ok(dt) => (clamp_ack(Some(dt.with_timezone(&chrono::Utc)), now), false),
+            Err(_) => (None, true),
+        },
+    }
+}
+
+/// Whether the `SnapshotDeletionHeld` Warning event should fire this pass: only
+/// on the TRANSITION into held, i.e. the `Snapshot`'s existing
+/// [`DELETION_HELD_CONDITION`](crate::consts::DELETION_HELD_CONDITION) is not
+/// already `True`. Sourcing `existing` from the freshly re-read conditions
+/// (`live_conditions_source`) makes this a real transition detector, so a CR
+/// that stays held across requeues emits exactly one event (the Recorder's own
+/// aggregation is a backstop, not the primary guard).
+pub fn should_emit_held_event(
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    !existing
+        .iter()
+        .any(|c| c.type_ == crate::consts::DELETION_HELD_CONDITION && c.status == "True")
+}
+
+/// The exact `kubectl` command that acknowledges this repository's pending
+/// mass-deletion wave, ready to copy from an event/condition message.
+/// `ack_value` is the newest pending `deletionTimestamp` for the repo
+/// (RFC3339): acknowledging up to it releases every currently-held deletion. The
+/// verb/selector is `repository/<name>` (with `-n <ns>`) for a namespaced
+/// [`RepositoryKind::Repository`] and `clusterrepository/<name>` (cluster-scoped,
+/// no namespace) for a [`RepositoryKind::ClusterRepository`] — exhaustive over
+/// the kind so a new repository kind forces a decision here.
+pub fn mass_deletion_ack_command(repo: &RepositoryRef, ack_value: &str) -> String {
+    let ann = crate::consts::ALLOW_MASS_DELETION_ANNOTATION;
+    match repo.kind {
+        RepositoryKind::Repository => {
+            let ns = repo.namespace.as_deref().unwrap_or_default();
+            format!(
+                "kubectl -n {ns} annotate repository/{} {ann}=\"{ack_value}\" --overwrite",
+                repo.name
+            )
+        }
+        RepositoryKind::ClusterRepository => format!(
+            "kubectl annotate clusterrepository/{} {ann}=\"{ack_value}\" --overwrite",
+            repo.name
+        ),
+    }
+}
+
+/// The `DeletionHeld=True` condition/event message for a `Snapshot` whose
+/// deletion the mass-deletion breaker is holding. Carries what/why/fix: the
+/// pending count vs. threshold, the target repository, the EXACT ack command
+/// (with the copy-ready value), and the per-CR `skip-snapshot-cleanup` escape
+/// hatch. Pure so the surfaced ack value and command are unit-asserted.
+pub fn mass_deletion_hold_message(
+    repo: &RepositoryRef,
+    pending: usize,
+    threshold: u32,
+    ack_value: &str,
+) -> String {
+    let kind = match repo.kind {
+        RepositoryKind::Repository => "Repository",
+        RepositoryKind::ClusterRepository => "ClusterRepository",
+    };
+    format!(
+        "this snapshot's deletion is HELD by the mass-deletion breaker: {pending} pending external \
+         destructive deletions for {kind} `{}` are at/above its threshold of {threshold}. No kopia \
+         data has been deleted and this Snapshot keeps its finalizer. To APPROVE this wave (releases \
+         every currently-held deletion for the repository), run: {}. To release THIS Snapshot alone \
+         WITHOUT deleting its kopia snapshot, annotate it \
+         `{}: \"true\"`.",
+        repo.name,
+        mass_deletion_ack_command(repo, ack_value),
+        SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    )
+}
+
+/// The `MassDeletionHeld` condition a `Repository`/`ClusterRepository` reconcile
+/// upserts (ADR-0005 §6, mirroring `IndexBlobHealth`: non-blocking, alert-only —
+/// never flips `Ready`). Pure so the counts→(status/reason/message) mapping is
+/// unit-tested for both kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoMassDeletionCondition {
+    /// `True` when the breaker is tripping for this repo (held), else `False`.
+    pub held: bool,
+    /// `ThresholdExceeded` when held, else `BelowThreshold`.
+    pub reason: &'static str,
+    /// Human message (counts + ack command when held).
+    pub message: String,
+}
+
+/// Decide the repository's [`RepoMassDeletionCondition`] from its unacked pending
+/// count and threshold. Held iff `threshold > 0 && unacked_pending >= threshold`
+/// — identical to when [`breaker_state`] would hold each of those deletions.
+/// `ack_value` is the newest pending `deletionTimestamp` (RFC3339), surfaced in
+/// the held message's ack command; a missing one degrades to `<newest-pending>`
+/// placeholder text (never happens while held — a held repo has pending members).
+pub fn repo_mass_deletion_condition(
+    repo: &RepositoryRef,
+    unacked_pending: usize,
+    threshold: u32,
+    ack_value: Option<&str>,
+) -> RepoMassDeletionCondition {
+    if threshold > 0 && unacked_pending >= threshold as usize {
+        let value = ack_value.unwrap_or("<newest-pending-deletionTimestamp>");
+        RepoMassDeletionCondition {
+            held: true,
+            reason: crate::consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
+            message: format!(
+                "{unacked_pending} pending external destructive Snapshot deletions for this \
+                 repository are at/above the breaker threshold of {threshold}; their finalizers are \
+                 HELD until acknowledged. Run: {}.",
+                mass_deletion_ack_command(repo, value)
+            ),
+        }
+    } else {
+        RepoMassDeletionCondition {
+            held: false,
+            reason: crate::consts::MASS_DELETION_BELOW_THRESHOLD_REASON,
+            message: format!(
+                "pending external destructive Snapshot deletions for this repository \
+                 ({unacked_pending}) are below the breaker threshold ({threshold})"
+            ),
+        }
+    }
+}
+
 /// Effective cascade policy for a `Snapshot`: the stamped value, else `Retain`
 /// (covers pre-upgrade + manual + discovered — all safe).
 pub fn effective_on_schedule_delete(stamped: Option<ScheduleDeletePolicy>) -> ScheduleDeletePolicy {

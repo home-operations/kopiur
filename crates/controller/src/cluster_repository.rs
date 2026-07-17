@@ -24,7 +24,7 @@ use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind};
+use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind, RepositoryRef};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{ClusterRepository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -117,6 +117,45 @@ fn cluster_conditions(repo: &ClusterRepository) -> Vec<Condition> {
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
+}
+
+/// This `ClusterRepository` as a [`RepositoryRef`] (cluster-scoped: no namespace),
+/// matching how consumers pin it, so the mass-deletion condition's `repo_key`
+/// lines up with the deletion path's per-repo count.
+fn cluster_repository_ref(repo: &ClusterRepository) -> RepositoryRef {
+    RepositoryRef {
+        kind: RepositoryKind::ClusterRepository,
+        name: repo.name_any(),
+        namespace: None,
+    }
+}
+
+/// The raw `allow-mass-deletion` annotation value on this `ClusterRepository`.
+fn mass_deletion_ack_raw(repo: &ClusterRepository) -> Option<&str> {
+    repo.metadata
+        .annotations
+        .as_ref()?
+        .get(crate::consts::ALLOW_MASS_DELETION_ANNOTATION)
+        .map(String::as_str)
+}
+
+/// Fold the non-blocking `MassDeletionHeld` condition into `conditions` from the
+/// live Snapshot store (ADR-0005 §6; shared
+/// [`crate::snapshot::repo_mass_deletion_conditions`]). Unchanged when the store
+/// is unset/unsynced.
+fn fold_mass_deletion(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    conditions: &[Condition],
+) -> Vec<Condition> {
+    crate::snapshot::repo_mass_deletion_conditions(
+        ctx,
+        &cluster_repository_ref(repo),
+        mass_deletion_ack_raw(repo),
+        repo.spec.deletion_protection.as_ref(),
+        conditions,
+        repo.metadata.generation,
+    )
 }
 
 /// Which namespace a cluster-scoped repository reads its credential `Secret` from (and
@@ -437,6 +476,8 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
+            // Non-blocking MassDeletionHeld condition from the live Snapshot store.
+            let existing = fold_mass_deletion(ctx, repo, &existing);
             let conditions = io::set_ready(
                 &existing,
                 repo.metadata.generation,
@@ -885,6 +926,21 @@ async fn bootstrap_cluster_via_mover(
         // resurrect it and drop those conditions.
         let fresh = api.get_opt(name).await?;
         let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+        // Non-blocking MassDeletionHeld condition on the steady-state cadence (the
+        // ack-drain watch also lands here on an annotation edit). Own guarded
+        // write from the FRESH conditions (no clobber, skipped when unchanged);
+        // ensure_maintenance then builds on the folded array.
+        let conditions = fold_mass_deletion(ctx, repo, &conditions);
+        let current = fresh
+            .as_ref()
+            .and_then(|f| serde_json::to_value(&f.status).ok());
+        io::patch_status_if_changed(
+            api,
+            name,
+            current.as_ref(),
+            serde_json::json!({ "conditions": conditions }),
+        )
+        .await?;
         ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
@@ -1282,6 +1338,9 @@ async fn finalize_cluster_bootstrap(
             pinned_unique_id = Some(pinned.to_string());
         }
     }
+    // Non-blocking MassDeletionHeld condition from the live Snapshot store,
+    // folded into the conditions array before the kstatus set_ready.
+    let conditions = fold_mass_deletion(ctx, repo, &conditions);
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and

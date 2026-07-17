@@ -228,6 +228,28 @@ pub(crate) async fn spawn_all(
             },
         );
     }
+    // Mass-deletion ack drain: when a Repository's `allow-mass-deletion` annotation
+    // (or `deletionProtection`) changes, re-reconcile the DELETING Snapshots that
+    // resolve to it so a held deletion proceeds at once, instead of waiting out its
+    // long `Held` requeue. ClusterRepository is cluster-scoped, so its watch is
+    // registered only in cluster scope (like the other kind-conditional watches).
+    let mut snapshot_ctrl =
+        snapshot_ctrl.watches(scoped_api::<Repository>(&client, &scope), cfg.clone(), {
+            let store = snapshot_store.clone();
+            move |r: Repository| watch::repository_to_deleting_snapshots(&store, &r)
+        });
+    if cluster_wide {
+        snapshot_ctrl = snapshot_ctrl.watches(
+            Api::<ClusterRepository>::all(client.clone()),
+            cfg.clone(),
+            {
+                let store = snapshot_store.clone();
+                move |r: ClusterRepository| {
+                    watch::cluster_repository_to_deleting_snapshots(&store, &r)
+                }
+            },
+        );
+    }
     let snapshot_ctrl = snapshot_ctrl
         .run(snapshot::reconcile, snapshot::error_policy, snapshot_ctx)
         .for_each(|res| async move {

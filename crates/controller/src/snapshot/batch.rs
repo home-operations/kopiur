@@ -186,6 +186,44 @@ fn pending_member_for(
     })
 }
 
+/// Count the mass-deletion BREAKER-relevant members among `pending`: EXTERNAL
+/// (not operator-pruned — [`PendingMember::external`]) AND unacknowledged
+/// (`deletion_timestamp` strictly after the clamped `ack`, or `ack` absent).
+/// This is exactly the `unacked_pending_for_repo` argument
+/// [`super::plan::breaker_state`] expects — every member here already passed
+/// `pending_members`' plan-would-`DeleteSnapshot` filter, so an external one is
+/// precisely a [`super::plan::counts_toward_breaker`] deletion.
+///
+/// Operator prunes are excluded (they ride the same batch Job but must never
+/// trip the breaker — retention has to keep working during an incident). An
+/// acknowledged deletion (`<= ack`) is excluded because the operator has already
+/// approved that wave. Fail-safe: an unparseable ack arrives here as `None`
+/// (nothing acknowledged), so a bad ack never shrinks this count.
+pub fn unacked_breaker_count(
+    pending: &[PendingMember],
+    ack: Option<chrono::DateTime<chrono::Utc>>,
+) -> usize {
+    pending
+        .iter()
+        .filter(|m| m.external && ack.is_none_or(|a| m.deletion_timestamp > a))
+        .count()
+}
+
+/// The newest `deletion_timestamp` among the EXTERNAL (breaker-relevant) members
+/// — the value to surface in the `allow-mass-deletion` ack command, since
+/// acknowledging up to it releases every currently-held external deletion for
+/// this repository ("I approve what is pending NOW"). `None` when there are no
+/// external members (nothing to acknowledge). Operator prunes are excluded: they
+/// are never held, so they must not push the surfaced ack value later than the
+/// held set requires.
+pub fn newest_pending_deletion(pending: &[PendingMember]) -> Option<chrono::DateTime<chrono::Utc>> {
+    pending
+        .iter()
+        .filter(|m| m.external)
+        .map(|m| m.deletion_timestamp)
+        .max()
+}
+
 /// Cap on members in a single batch delete Job (a huge batch has to be
 /// broken into waves for throttling and Job-size sanity).
 pub const MAX_BATCH_MEMBERS: usize = 200;
@@ -724,6 +762,67 @@ mod tests {
     }
 
     // --- deletion_requeue -------------------------------------------------
+
+    // --- unacked_breaker_count / newest_pending_deletion -----------------
+
+    /// A pending member with an explicit external flag and deletion time.
+    fn member_ext(uid: &str, secs: i64, external: bool) -> PendingMember {
+        PendingMember {
+            external,
+            ..member(uid, secs)
+        }
+    }
+
+    #[test]
+    fn unacked_breaker_count_excludes_operator_prunes() {
+        // Two external + one operator-pruned (external: false), no ack.
+        let pending = vec![
+            member_ext("a", 1, true),
+            member_ext("b", 2, true),
+            member_ext("c", 3, false),
+        ];
+        assert_eq!(unacked_breaker_count(&pending, None), 2);
+    }
+
+    #[test]
+    fn unacked_breaker_count_excludes_acknowledged() {
+        // deletionTimestamps at 100/200/300; ack at 200 releases 100 and 200
+        // (`<= ack`), leaving only the 300 one unacked.
+        let pending = vec![
+            member_ext("a", 100, true),
+            member_ext("b", 200, true),
+            member_ext("c", 300, true),
+        ];
+        let ack = chrono::DateTime::from_timestamp(200, 0);
+        assert_eq!(unacked_breaker_count(&pending, ack), 1);
+    }
+
+    #[test]
+    fn unacked_breaker_count_absent_ack_counts_all_external() {
+        let pending = vec![member_ext("a", 100, true), member_ext("b", 200, true)];
+        assert_eq!(unacked_breaker_count(&pending, None), 2);
+    }
+
+    #[test]
+    fn newest_pending_deletion_is_the_max_external_timestamp() {
+        // The operator-pruned (later) member must NOT win — only external ones count.
+        let pending = vec![
+            member_ext("a", 100, true),
+            member_ext("b", 300, true),
+            member_ext("c", 999, false),
+        ];
+        assert_eq!(
+            newest_pending_deletion(&pending),
+            chrono::DateTime::from_timestamp(300, 0)
+        );
+    }
+
+    #[test]
+    fn newest_pending_deletion_none_without_external_members() {
+        let pending = vec![member_ext("c", 100, false)];
+        assert_eq!(newest_pending_deletion(&pending), None);
+        assert_eq!(newest_pending_deletion(&[]), None);
+    }
 
     #[test]
     fn deletion_requeue_mapping() {

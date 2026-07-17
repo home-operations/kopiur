@@ -1899,6 +1899,174 @@ fn counts_toward_breaker_cascade_retained_is_false() {
     }));
 }
 
+// -- breaker_stores_ready / parse_mass_deletion_ack ------------------------
+
+#[test]
+fn breaker_stores_ready_requires_present_and_synced() {
+    // The store-unset path must behave IDENTICALLY to the not-yet-synced path:
+    // both are "can't count yet", never "nothing pending".
+    assert!(!breaker_stores_ready(false, false));
+    assert!(!breaker_stores_ready(false, true)); // unset, even if a flag says synced
+    assert!(!breaker_stores_ready(true, false)); // present but cold
+    assert!(breaker_stores_ready(true, true)); // the only trustworthy case
+}
+
+#[test]
+fn parse_mass_deletion_ack_absent_is_none_not_invalid() {
+    let now = chrono::Utc::now();
+    assert_eq!(parse_mass_deletion_ack(None, now), (None, false));
+}
+
+#[test]
+fn parse_mass_deletion_ack_parses_and_clamps_to_now() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    // A past value passes through; a future value is clamped back to now.
+    let (past, invalid) = parse_mass_deletion_ack(Some("2025-06-01T00:00:00Z"), now);
+    assert!(!invalid);
+    assert_eq!(
+        past,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        )
+    );
+    let (future, invalid) = parse_mass_deletion_ack(Some("2027-06-01T00:00:00Z"), now);
+    assert!(!invalid);
+    assert_eq!(future, Some(now));
+}
+
+#[test]
+fn parse_mass_deletion_ack_unparseable_is_ignored_and_flagged() {
+    // Fail-safe: a garbage value never disarms the breaker (None) and signals the
+    // caller to warn (invalid = true).
+    let now = chrono::Utc::now();
+    assert_eq!(
+        parse_mass_deletion_ack(Some("not-a-date"), now),
+        (None, true)
+    );
+}
+
+// -- should_emit_held_event (transition-only) ------------------------------
+
+#[test]
+fn should_emit_held_event_only_on_transition_into_held() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+    let cond = |status: &str| Condition {
+        type_: crate::consts::DELETION_HELD_CONDITION.into(),
+        status: status.into(),
+        reason: crate::consts::MASS_DELETION_BREAKER_REASON.into(),
+        message: String::new(),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        observed_generation: None,
+    };
+    // No prior condition, or a prior `False`, → emit (this is the transition).
+    assert!(should_emit_held_event(&[]));
+    assert!(should_emit_held_event(&[cond("False")]));
+    // Already `True` → suppress (no re-emit while it stays held).
+    assert!(!should_emit_held_event(&[cond("True")]));
+}
+
+// -- mass_deletion_ack_command / hold message ------------------------------
+
+fn rref(kind: kopiur_api::common::RepositoryKind, name: &str, ns: Option<&str>) -> RepositoryRef {
+    RepositoryRef {
+        kind,
+        name: name.into(),
+        namespace: ns.map(Into::into),
+    }
+}
+
+#[test]
+fn ack_command_uses_namespaced_verb_for_a_repository() {
+    use kopiur_api::common::RepositoryKind;
+    let cmd = mass_deletion_ack_command(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        "2026-01-02T03:04:05Z",
+    );
+    assert_eq!(
+        cmd,
+        "kubectl -n backups annotate repository/nas \
+         kopiur.home-operations.com/allow-mass-deletion=\"2026-01-02T03:04:05Z\" --overwrite"
+    );
+}
+
+#[test]
+fn ack_command_uses_cluster_verb_and_no_namespace_for_a_cluster_repository() {
+    use kopiur_api::common::RepositoryKind;
+    let cmd = mass_deletion_ack_command(
+        &rref(RepositoryKind::ClusterRepository, "shared", None),
+        "2026-01-02T03:04:05Z",
+    );
+    assert_eq!(
+        cmd,
+        "kubectl annotate clusterrepository/shared \
+         kopiur.home-operations.com/allow-mass-deletion=\"2026-01-02T03:04:05Z\" --overwrite"
+    );
+}
+
+#[test]
+fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
+    use kopiur_api::common::RepositoryKind;
+    let msg = mass_deletion_hold_message(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        12,
+        10,
+        "2026-01-02T03:04:05Z",
+    );
+    assert!(msg.contains("12 pending"), "count: {msg}");
+    assert!(msg.contains("threshold of 10"), "threshold: {msg}");
+    assert!(msg.contains("Repository `nas`"), "repo: {msg}");
+    assert!(
+        msg.contains("kubectl -n backups annotate repository/nas"),
+        "ack command: {msg}"
+    );
+    assert!(msg.contains("2026-01-02T03:04:05Z"), "ack value: {msg}");
+    assert!(
+        msg.contains(SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
+        "escape hatch: {msg}"
+    );
+}
+
+// -- repo_mass_deletion_condition (repo-side, both kinds) ------------------
+
+#[test]
+fn repo_mass_deletion_condition_held_at_or_above_threshold() {
+    use kopiur_api::common::RepositoryKind;
+    let held = repo_mass_deletion_condition(
+        &rref(RepositoryKind::Repository, "nas", Some("backups")),
+        10,
+        10,
+        Some("2026-01-02T03:04:05Z"),
+    );
+    assert!(held.held);
+    assert_eq!(
+        held.reason,
+        crate::consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON
+    );
+    assert!(
+        held.message
+            .contains("kubectl -n backups annotate repository/nas")
+    );
+}
+
+#[test]
+fn repo_mass_deletion_condition_clear_below_threshold_and_when_disabled() {
+    use kopiur_api::common::RepositoryKind;
+    let repo = rref(RepositoryKind::ClusterRepository, "shared", None);
+    let below = repo_mass_deletion_condition(&repo, 9, 10, None);
+    assert!(!below.held);
+    assert_eq!(
+        below.reason,
+        crate::consts::MASS_DELETION_BELOW_THRESHOLD_REASON
+    );
+    // threshold 0 disables the breaker: never held even with a huge count.
+    let disabled = repo_mass_deletion_condition(&repo, 1_000, 0, None);
+    assert!(!disabled.held);
+}
+
 // -- effective_on_schedule_delete ------------------------------------------
 
 #[test]

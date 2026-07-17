@@ -8,11 +8,11 @@
 
 pub use kopiur_api::consts::{
     ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, CONFIG_LABEL, INDEX_BLOB_HEALTH_CONDITION,
-    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OP_LABEL, OP_RESTORE,
-    OP_RESTORE_TARGET, ORIGIN_LABEL, READY_CONDITION, RECONCILING_CONDITION, REPOSITORY_UID_LABEL,
-    RUN_MODE_ANNOTATION, RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL,
-    STALLED_CONDITION,
+    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    MASS_DELETION_HELD_CONDITION, OP_LABEL, OP_RESTORE, OP_RESTORE_TARGET, ORIGIN_LABEL,
+    READY_CONDITION, RECONCILING_CONDITION, REPOSITORY_UID_LABEL, RUN_MODE_ANNOTATION,
+    RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL, STALLED_CONDITION,
 };
 
 /// `Snapshot` condition recording whether its repository accepts writes (§11). Set
@@ -523,3 +523,23 @@ pub const SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON: &str = "SnapshotRetainedO
 /// as an RFC3339 timestamp — the ack is ignored (fail-safe) rather than
 /// silently disarming the breaker.
 pub const INVALID_MASS_DELETION_ACK_REASON: &str = "InvalidMassDeletionAck";
+
+/// `reason` for [`MASS_DELETION_HELD_CONDITION`] = `True` on a
+/// `Repository`/`ClusterRepository`: pending external destructive deletions for
+/// this repository are at/above its breaker threshold.
+pub const MASS_DELETION_THRESHOLD_EXCEEDED_REASON: &str = "ThresholdExceeded";
+/// `reason` for [`MASS_DELETION_HELD_CONDITION`] = `False`: pending external
+/// destructive deletions are below the breaker threshold (or the breaker is off).
+pub const MASS_DELETION_BELOW_THRESHOLD_REASON: &str = "BelowThreshold";
+/// `reason` stamped on a `Snapshot`'s [`DELETION_HELD_CONDITION`] = `False` when a
+/// previously-held deletion proceeds because the wave was acknowledged (or the
+/// breaker fell back below threshold).
+pub const MASS_DELETION_ACKNOWLEDGED_REASON: &str = "Acknowledged";
+
+/// Event `action` (remediation hint) for the mass-deletion breaker's Warning
+/// events (`SnapshotDeletionHeld`, `MassDeletionHeld`, `InvalidMassDeletionAck`):
+/// approve the wave via the `allow-mass-deletion` annotation.
+pub const ACKNOWLEDGE_MASS_DELETION_ACTION: &str = "AcknowledgeMassDeletion";
+/// Event `action` for `SnapshotRetainedOnScheduleDelete`: opt into cascading
+/// deletes by setting the schedule's `spec.deletion.onScheduleDelete: Delete`.
+pub const ENABLE_SCHEDULE_CASCADE_ACTION: &str = "EnableScheduleCascade";

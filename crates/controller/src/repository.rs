@@ -22,7 +22,7 @@ use kube::runtime::controller::Action;
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind};
+use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind, RepositoryRef};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{Repository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -477,6 +477,9 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             {
                 status_patch["lastReverifyAt"] = serde_json::Value::String(token.to_string());
             }
+            // Non-blocking MassDeletionHeld condition from the live Snapshot store
+            // (mirrors IndexBlobHealth), folded into the same conditions array.
+            let conditions = fold_mass_deletion(ctx, repo, &conditions);
             // Always publish the kstatus Ready conditions for the healthy bare-path
             // repo (issue #245), layered on any conditions built above — even when
             // no index-blob count was read, so a resume clears the suspend branch's
@@ -606,6 +609,45 @@ fn repo_conditions(
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
+}
+
+/// This `Repository` as a [`RepositoryRef`], matching how consumers PIN it
+/// (`pinned_repository_ref`: own namespace populated), so the mass-deletion
+/// condition's `repo_key` lines up with the deletion path's per-repo count.
+fn repository_ref(repo: &Repository) -> RepositoryRef {
+    RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: repo.name_any(),
+        namespace: repo.namespace(),
+    }
+}
+
+/// The raw `allow-mass-deletion` annotation value on this `Repository`, if any.
+fn mass_deletion_ack_raw(repo: &Repository) -> Option<&str> {
+    repo.metadata
+        .annotations
+        .as_ref()?
+        .get(crate::consts::ALLOW_MASS_DELETION_ANNOTATION)
+        .map(String::as_str)
+}
+
+/// Fold the non-blocking `MassDeletionHeld` condition into `conditions` from the
+/// live Snapshot store (ADR-0005 §6; delegates to the shared
+/// [`crate::snapshot::repo_mass_deletion_conditions`]). Returns `conditions`
+/// unchanged when the store is unset/unsynced.
+fn fold_mass_deletion(
+    ctx: &Context,
+    repo: &Repository,
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    crate::snapshot::repo_mass_deletion_conditions(
+        ctx,
+        &repository_ref(repo),
+        mass_deletion_ack_raw(repo),
+        repo.spec.deletion_protection.as_ref(),
+        conditions,
+        repo.metadata.generation,
+    )
 }
 
 /// Project this `Repository`'s `spec.maintenance` into its managed `Maintenance` CR and
@@ -810,6 +852,22 @@ async fn bootstrap_via_mover(
         // resurrect it and drop those conditions.
         let fresh = api.get_opt(name).await?;
         let conditions = fresh.as_ref().map(repo_conditions).unwrap_or_default();
+        // Non-blocking MassDeletionHeld condition on the repo's steady-state
+        // cadence (the ack-drain watch also lands here on an annotation edit).
+        // Own guarded write, sourced from the FRESH conditions so it carries all
+        // of them (no clobber) and is skipped when unchanged; ensure_maintenance
+        // then builds on the folded array.
+        let conditions = fold_mass_deletion(ctx, repo, &conditions);
+        let current = fresh
+            .as_ref()
+            .and_then(|f| serde_json::to_value(&f.status).ok());
+        io::patch_status_if_changed(
+            api,
+            name,
+            current.as_ref(),
+            serde_json::json!({ "conditions": conditions }),
+        )
+        .await?;
         ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
@@ -1303,6 +1361,10 @@ async fn finalize_bootstrap(
             status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
         }
     }
+    // Non-blocking MassDeletionHeld condition from the live Snapshot store
+    // (mirrors IndexBlobHealth), folded into the same conditions array before the
+    // kstatus set_ready so the merge-patch replace carries it too.
+    let conditions = fold_mass_deletion(ctx, repo, &conditions);
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and
