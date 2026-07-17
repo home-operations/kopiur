@@ -27,7 +27,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 use k8s_openapi::api::core::v1::Secret;
 
 use kopiur_api::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION;
-use kopiur_api::{ClusterRepository, Repository, RepositoryReplication, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Repository, RepositoryReplication, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
 
 /// Names the chart renders for release "kopiur" (the e2e release).
@@ -473,6 +473,88 @@ async fn setting_cluster_on_repo_with_history_requires_acknowledgment() {
 
     let _ = policies.delete(policy, &DeleteParams::default()).await;
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+}
+
+/// A `Snapshot` carrying the `origin: discovered` label AND `spec.onScheduleDelete`
+/// — structurally valid (both fields are optional in the CRD), but the shared
+/// `validate_backup` validator the webhook runs rejects it: a discovered snapshot has
+/// no owning `SnapshotSchedule` for a cascade policy to apply to (mirrors the
+/// discovered-must-Retain rule). deletionPolicy is set to Retain so the rejection can
+/// ONLY be the onScheduleDelete rule, not the deletionPolicy one.
+fn discovered_snapshot_with_on_schedule_delete(name: &str) -> Snapshot {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": {
+            "name": name,
+            "namespace": E2E_NAMESPACE,
+            "labels": { "kopiur.home-operations.com/origin": "discovered" }
+        },
+        "spec": { "deletionPolicy": "Retain", "onScheduleDelete": "Retain" }
+    }))
+    .expect("Snapshot JSON deserializes")
+}
+
+/// A MANUAL `Snapshot` (no origin marker → origin `manual`) that sets
+/// `spec.onScheduleDelete`. The field is inert for a manual snapshot but NOT
+/// forbidden, so admission accepts it — the positive counterpart proving the
+/// rejection above is origin-scoped, not a blanket ban on the field.
+fn manual_snapshot_with_on_schedule_delete(name: &str) -> Snapshot {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": { "policyRef": { "name": "any" }, "deletionPolicy": "Delete", "onScheduleDelete": "Retain" }
+    }))
+    .expect("Snapshot JSON deserializes")
+}
+
+/// The mass-deletion cascade validator through the REAL admission webhook: a
+/// `origin: discovered` Snapshot setting `spec.onScheduleDelete` is DENIED (the new
+/// `DiscoveredCannotSetOnScheduleDelete` rule), while a manual Snapshot setting the
+/// same field is ACCEPTED. A unit test on `validate_backup` alone can't prove the
+/// deployed webhook enforces this against a live API server.
+#[tokio::test]
+#[ignore = "requires a kind cluster with the operator installed (mise //crates/e2e:test)"]
+async fn discovered_snapshot_on_schedule_delete_is_rejected_but_manual_is_accepted() {
+    let Some(world) = World::connect().await else {
+        return; // no cluster: graceful no-op
+    };
+    let client = world.client().clone();
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // 1. discovered + onScheduleDelete → DENIED, and the message names the field.
+    let bad = "webhook-discovered-osd";
+    let _ = backups.delete(bad, &DeleteParams::default()).await;
+    let err = backups
+        .create(
+            &PostParams::default(),
+            &discovered_snapshot_with_on_schedule_delete(bad),
+        )
+        .await
+        .expect_err("a discovered Snapshot setting onScheduleDelete must be DENIED");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
+        "rejection should come from the admission webhook, got: {msg}"
+    );
+    assert!(
+        msg.contains("onScheduleDelete"),
+        "the deny message must name onScheduleDelete, got: {msg}"
+    );
+    let _ = backups.delete(bad, &DeleteParams::default()).await;
+
+    // 2. manual + onScheduleDelete → ACCEPTED (the field is inert but allowed).
+    let ok = "webhook-manual-osd";
+    let _ = backups.delete(ok, &DeleteParams::default()).await;
+    backups
+        .create(
+            &PostParams::default(),
+            &manual_snapshot_with_on_schedule_delete(ok),
+        )
+        .await
+        .expect("a manual Snapshot may set onScheduleDelete (the field is origin-scoped)");
+    let _ = backups.delete(ok, &DeleteParams::default()).await;
 }
 
 /// True when every webhook in the ValidatingWebhookConfiguration carries a

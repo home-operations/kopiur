@@ -86,6 +86,12 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "staging-timeout",
     "staging-override",
     "staging-mismatch",
+    // Mass-deletion protection scenarios (crates/e2e/tests/mass_deletion.rs). Each
+    // needs its OWN kopia repository so snapshot counts (schedule-cascade retain,
+    // breaker hold/drain, retention-prune) never leak between scenarios.
+    "massdel-cascade",
+    "massdel-breaker",
+    "massdel-prune",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
