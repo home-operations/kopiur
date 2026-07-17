@@ -241,18 +241,84 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
 
 // --- delete_projection_enabled (cascade never projects, #231) ------------
 
+fn projection(enabled: bool) -> kopiur_api::common::CredentialProjection {
+    kopiur_api::common::CredentialProjection { enabled }
+}
+
 #[test]
-fn delete_projection_follows_the_recipe_in_the_snapshots_own_namespace() {
+fn delete_projection_follows_the_recipe_when_nothing_is_pinned() {
     let mut policy = sample_policy();
-    policy.spec.credential_projection =
-        Some(kopiur_api::common::CredentialProjection { enabled: true });
-    assert!(delete_projection_enabled(false, Some(&policy)));
+    policy.spec.credential_projection = Some(projection(true));
+    assert!(delete_projection_enabled(false, Some(&policy), None));
     policy.spec.credential_projection = None;
-    assert!(!delete_projection_enabled(false, Some(&policy)));
+    assert!(!delete_projection_enabled(false, Some(&policy), None));
     assert!(
-        !delete_projection_enabled(false, None),
-        "gone recipe defaults off"
+        !delete_projection_enabled(false, None, None),
+        "no recipe and no pin: nothing says projection was ever in use"
     );
+}
+
+#[test]
+fn delete_projection_honors_the_pin_after_the_recipe_is_gone() {
+    // #255: the recipe is the only place the opt-in lives, and a user may delete it
+    // before the Snapshot. Reading an absent recipe as "projection off" sent the
+    // delete Job looking for a namespace-local Secret that only projection supplies,
+    // stranding the cleanup finalizer forever.
+    assert!(delete_projection_enabled(
+        false,
+        None,
+        Some(&projection(true))
+    ));
+    assert!(!delete_projection_enabled(
+        false,
+        None,
+        Some(&projection(false))
+    ));
+}
+
+#[test]
+fn delete_projection_pin_wins_over_a_recipe_that_changed_after_the_run() {
+    // The pin records the conditions the run ACTUALLY executed under, and the delete
+    // path's job is to reproduce them — mirroring `resolve_repo_for_deletion`, which
+    // likewise prefers `status.resolved` over the live recipe. Letting the live value
+    // win would strand the finalizer identically to #255 whenever a recipe merely
+    // changed: the run projected, the recipe later said stop, and the delete Job would
+    // then demand a Secret nobody ever put in that namespace.
+    let mut policy = sample_policy();
+    policy.spec.credential_projection = Some(projection(false));
+    assert!(delete_projection_enabled(
+        false,
+        Some(&policy),
+        Some(&projection(true))
+    ));
+    // ...and symmetrically: a run that did NOT project is not made to project by a
+    // recipe that opted in afterwards.
+    policy.spec.credential_projection = Some(projection(true));
+    assert!(!delete_projection_enabled(
+        false,
+        Some(&policy),
+        Some(&projection(false))
+    ));
+}
+
+#[test]
+fn stuck_finalizer_hint_names_the_escape_hatch_and_keeps_the_original_message() {
+    // The shared creds messages cannot mention a Snapshot-only remedy, so the delete
+    // path adds it. This is the ONLY way out when the repository owner revokes
+    // `credentialProjection.allowed` — the live gate no pin can (or should) reopen.
+    let msg = super::stuck_finalizer_hint(
+        "credentials Secret `repo-pw` does not exist in namespace `team-a`.",
+        "team-a",
+        "nightly-1",
+    );
+    assert!(
+        msg.starts_with("credentials Secret `repo-pw` does not exist in namespace `team-a`."),
+        "the underlying cause must survive verbatim: {msg}"
+    );
+    assert!(msg.contains(crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION));
+    assert!(msg.contains("team-a/nightly-1"));
+    // The user must know the kopia snapshot survives the escape hatch.
+    assert!(msg.contains("WITHOUT deleting the kopia snapshot"));
 }
 
 #[test]
@@ -261,9 +327,27 @@ fn delete_projection_is_hard_off_for_the_cross_namespace_cascade() {
     // cascade path: the copy would be owned by the repository CR, which can be
     // cluster-scoped — an invalid ownerRef on a namespaced Secret, never GC'd.
     let mut policy = sample_policy();
-    policy.spec.credential_projection =
-        Some(kopiur_api::common::CredentialProjection { enabled: true });
-    assert!(!delete_projection_enabled(true, Some(&policy)));
+    policy.spec.credential_projection = Some(projection(true));
+    assert!(!delete_projection_enabled(true, Some(&policy), None));
+    // The pin must not reopen that hole either.
+    assert!(!delete_projection_enabled(
+        true,
+        Some(&policy),
+        Some(&projection(true))
+    ));
+}
+
+#[test]
+fn projection_to_pin_records_an_absent_opt_in_as_an_explicit_off() {
+    // `None` on the pin means "this Snapshot predates the pin", which the delete path
+    // resolves by falling back to the live recipe. A recipe that simply never opted in
+    // must therefore pin `enabled: false` rather than `None` — otherwise the backfill
+    // guard never goes false and re-reads the recipe on every steady-state pass.
+    let mut policy = sample_policy();
+    policy.spec.credential_projection = None;
+    assert_eq!(super::plan::projection_to_pin(&policy), projection(false));
+    policy.spec.credential_projection = Some(projection(true));
+    assert_eq!(super::plan::projection_to_pin(&policy), projection(true));
 }
 
 // backend_to_repository_connect's exhaustive every-variant test moved with
@@ -367,6 +451,7 @@ fn build_backup_run_maps_nfs_source_to_inline_nfs_mount() {
             }),
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -384,7 +469,10 @@ fn build_backup_run_maps_nfs_source_to_inline_nfs_mount() {
         }
     );
     assert_eq!(src.mount_path, "/mnt/eros/Media");
-    assert!(src.read_only, "a backup source is mounted read-only");
+    assert!(
+        src.read_only,
+        "a backup source is mounted read-only unless the recipe opts out"
+    );
     // kopia records the export path as the snapshot source path.
     match ws.operation {
         Operation::Snapshot(op) => assert_eq!(op.source_path, "/mnt/eros/Media"),
@@ -409,6 +497,7 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
             }),
             source_path_override: Some("/data".into()),
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -420,6 +509,63 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
         Operation::Snapshot(op) => assert_eq!(op.source_path, "/data"),
         other => panic!("expected a Snapshot operation, got {other:?}"),
     }
+}
+
+#[test]
+fn build_backup_run_honors_source_read_only_false() {
+    // #254: kopia only reads the source, so read-only is the default — but the kubelet
+    // skips its recursive fsGroup chgrp on a read-only mount, which makes a mover's
+    // fsGroup/fsGroupChangePolicy silently inert. `readOnly: false` re-enables it.
+    use crate::jobs::MountSource;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let cfg = config_with_source(
+        "data",
+        Source {
+            pvc: Some(PvcSource {
+                name: "app-data".into(),
+            }),
+            read_only: Some(false),
+            ..Default::default()
+        },
+    );
+    let repo = resolved_s3_repo();
+    let (_ws, source_volume, _repo, _creds) =
+        build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "data").unwrap();
+    let src = source_volume.expect("a PVC source mount");
+    assert_eq!(
+        src.source,
+        MountSource::Pvc {
+            claim_name: "app-data".into()
+        }
+    );
+    assert!(
+        !src.read_only,
+        "readOnly: false must reach the mount — one VolumeMountSpec.read_only drives BOTH \
+         the PVC volume source's readOnly and the container volumeMount's readOnly, and \
+         fsGroup needs both"
+    );
+}
+
+#[test]
+fn build_backup_run_defaults_an_unset_source_read_only_to_true() {
+    // The CRD advertises `default: true` for sources[].readOnly. That schema default is
+    // only honest because this resolver maps absent to exactly the same value — the
+    // apiserver does not default a field whose parent object the user omitted.
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let cfg = config_with_source(
+        "data",
+        Source {
+            pvc: Some(PvcSource {
+                name: "app-data".into(),
+            }),
+            read_only: None,
+            ..Default::default()
+        },
+    );
+    let repo = resolved_s3_repo();
+    let (_ws, source_volume, _repo, _creds) =
+        build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "data").unwrap();
+    assert!(source_volume.expect("a PVC source mount").read_only);
 }
 
 #[test]
@@ -443,6 +589,7 @@ fn build_backup_run_remaps_nfs_pseudo_root_source_off_container_rootfs() {
             }),
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -485,6 +632,7 @@ fn build_backup_run_maps_pvc_source_to_pvc_mount() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -523,6 +671,7 @@ fn build_backup_run_renders_ns_dot_cluster_hostname_for_a_namespaced_repo_with_c
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "billing", "pg").unwrap();
@@ -547,6 +696,7 @@ fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() 
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     cfg.spec.error_handling = Some(ErrorHandling {
@@ -590,6 +740,7 @@ fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() 
                 nfs: None,
                 source_path_override: None,
                 source_path_strategy: None,
+                ..Default::default()
             },
         ),
         &repo,
@@ -621,6 +772,7 @@ fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();
@@ -933,6 +1085,7 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
             nfs: None,
             source_path_override: None,
             source_path_strategy: None,
+            ..Default::default()
         },
     );
     let repo = resolved_s3_repo();

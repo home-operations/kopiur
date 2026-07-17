@@ -33,6 +33,31 @@ pub fn parse_go_duration(s: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Render a [`Duration`] back to a Go-style duration string, using the largest unit that
+/// divides it exactly (`21600s` → `"6h"`, `1200s` → `"20m"`, else `"{n}s"`).
+///
+/// Round-trips through [`parse_go_duration`] by construction — it emits only the
+/// single-unit grammar that function accepts. Two callers need it:
+///
+/// - **kopia argv.** Durations that reach a kopia CLI flag must never be the user's raw
+///   text. kopia's `time.ParseDuration` REJECTS a bare number (`--epoch-min-duration=3600`
+///   → `time: missing unit in duration "3600"`) while `parse_go_duration` happily accepts
+///   one — so passing the string through would admit at the webhook and crash in the mover,
+///   breaking this module's stated contract. Parse, then render, and the mismatch is gone.
+/// - **Status mirrors.** kopia reports durations as `time.Duration` nanoseconds; rendering
+///   them through here is what makes `status` comparable to `spec` and stable across
+///   reconciles (no `"24h"` vs `"24h0m0s"` ambiguity).
+pub fn render_go_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs != 0 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs != 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Resolve an optional policy timeout string to an effective deadline duration,
 /// with the semantics every `*.timeout` field shares (`spec.preflight.timeout`,
 /// `spec.staging.timeout`): absent ⇒ `default`; parsed-zero (`0`/`0s`) ⇒ `None`
@@ -85,6 +110,49 @@ mod tests {
         assert_eq!(
             parse_go_duration(&u64::MAX.to_string()),
             Some(Duration::from_secs(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn render_go_duration_picks_the_largest_exact_unit() {
+        assert_eq!(render_go_duration(Duration::from_secs(21600)), "6h");
+        assert_eq!(render_go_duration(Duration::from_secs(86400)), "24h");
+        assert_eq!(render_go_duration(Duration::from_secs(1200)), "20m");
+        assert_eq!(render_go_duration(Duration::from_secs(45)), "45s");
+        // Not evenly divisible → fall back to seconds rather than lose precision.
+        assert_eq!(render_go_duration(Duration::from_secs(5400)), "90m");
+        assert_eq!(render_go_duration(Duration::from_secs(3661)), "3661s");
+        // Zero must not divide into "0h".
+        assert_eq!(render_go_duration(Duration::ZERO), "0s");
+        // Sub-second precision is not representable in this grammar; truncation is
+        // acceptable because every CRD field using it is coarse (minutes and up).
+        assert_eq!(render_go_duration(Duration::from_millis(1500)), "1s");
+    }
+
+    #[test]
+    fn render_go_duration_round_trips_through_parse() {
+        for secs in [0u64, 1, 45, 59, 60, 90, 1200, 3600, 5400, 21600, 86400] {
+            let d = Duration::from_secs(secs);
+            assert_eq!(
+                parse_go_duration(&render_go_duration(d)),
+                Some(d),
+                "render must emit only what parse accepts ({secs}s)"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_is_what_makes_a_bare_number_safe_for_kopias_cli() {
+        // kopia's time.ParseDuration REJECTS a bare number: `--epoch-min-duration=3600`
+        // fails with `time: missing unit in duration "3600"`. parse_go_duration accepts
+        // it, so passing user text straight to kopia would admit at the webhook and die
+        // in the mover. Rendering always emits a unit — that is the whole point.
+        let d = parse_go_duration("3600").expect("kopiur accepts a bare second count");
+        let rendered = render_go_duration(d);
+        assert_eq!(rendered, "1h");
+        assert!(
+            rendered.ends_with(['h', 'm', 's']),
+            "a rendered duration must always carry a unit for kopia: {rendered}"
         );
     }
 }

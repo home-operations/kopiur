@@ -929,6 +929,7 @@ async fn bootstrap_cluster_via_mover(
         read_only,
         maintenance_enabled,
         foreign_maintenance,
+        repo.spec.parameters.as_ref(),
     );
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
@@ -1094,6 +1095,7 @@ fn cluster_bootstrap_work_spec(
     read_only: bool,
     maintenance_enabled: bool,
     foreign_maintenance: bool,
+    parameters: Option<&kopiur_api::repository::RepositoryParameters>,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
@@ -1116,6 +1118,12 @@ fn cluster_bootstrap_work_spec(
             // see `crate::catalog`).
             scan_catalog: true,
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
+            // MUTABLE parameters (#258), re-applied on drift on every bootstrap — the
+            // opposite of create_options. Empty for a ReadOnly repository: `set-parameters`
+            // rewrites the format blob and kopia hard-errors on a read-only connection.
+            // Shares `epoch_parameters_for` with the Repository twin so the gate has one
+            // definition rather than two that can drift apart.
+            epoch_parameters: crate::repository::epoch_parameters_for(read_only, parameters),
             // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
             // every connect-to-existing when stale (`maintenance_restamp_target`);
             // `None` means neither ever happens — see the doc above.
@@ -1309,6 +1317,25 @@ async fn finalize_cluster_bootstrap(
         "storageStats": storage_stats,
         "conditions": conditions,
     });
+    // Mirror the epoch parameters the repository actually reports (#258). The apply is
+    // best-effort in the mover, so this is what keeps it honest: a `spec.parameters.epoch`
+    // that failed to land stays visible here as drift from spec, rather than as silence.
+    if let Some(epoch) = &result.epoch {
+        status_patch["parameters"] = serde_json::json!({ "epoch": epoch });
+    }
+    // The apply is best-effort (see the mover), so a failure leaves the repository Ready
+    // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —
+    // the whole point of #258 is that a user set a value expecting it to take effect.
+    if let Some(err) = &result.epoch_error {
+        io::publish_warning_event(
+            ctx,
+            repo,
+            health::EPOCH_PARAMETERS_NOT_APPLIED_REASON,
+            health::FIX_EPOCH_PARAMETERS_ACTION,
+            err,
+        )
+        .await;
+    }
     if !health_status.is_null() {
         status_patch["health"] = health_status;
     }
@@ -1608,6 +1635,7 @@ mod tests {
                 read_only,
                 enabled,
                 foreign_m,
+                None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op,

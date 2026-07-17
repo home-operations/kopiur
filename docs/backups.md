@@ -122,6 +122,18 @@ sources:
 
 The operator mounts the export read-only into the backup mover and kopia snapshots it. By default kopia records the export `path` as the snapshot `sourcePath`; override it with `sourcePathOverride`. An NFS source works with **any** repository backend.
 
+#### `readOnly` — the source mount
+
+Sources are mounted **read-only** (`readOnly: true`, the default) — kopia only ever reads them. There is exactly one reason to change that: the kubelet applies `fsGroup` by *rewriting* the volume's group ownership, and it **skips that rewrite entirely on a read-only mount**, so a mover's `fsGroup` has no effect on the source. If you need `fsGroup` to make the source readable, set `readOnly: false`:
+
+```yaml
+sources:
+    - pvc: { name: postgres-data }
+      readOnly: false # let the kubelet apply the mover's fsGroup
+```
+
+Under `copyMethod: Snapshot`/`Clone` this rewrites the throwaway staged PVC and never touches your data. Under `copyMethod: Direct` it rewrites your **live** volume and requires an explicit `acknowledgeLiveMutation: true`; on an `nfs` source it is rejected outright (the kubelet never applies `fsGroup` to in-tree NFS, so it could not work). The full treatment, including the hazards: [Copy methods → making `fsGroup` apply to the source](copy-methods.md#making-fsgroup-apply-to-the-source).
+
 /// warning | Multi-PVC defaults to a consistent group
 
 When a selector matches several PVCs, `groupBy` defaults to `VolumeGroupSnapshot` — one consistent point-in-time snapshot across all of them. You must set `groupBy: None` _explicitly_ to accept independent per-PVC snapshots; there is no silent fallback, because an inconsistent multi-volume backup is a data-integrity hazard.
@@ -569,6 +581,29 @@ A `Snapshot` CR **owns** its kopia snapshot via a finalizer. What happens to the
 | `Orphan` | CR is removed **without contacting the repository** — escape hatch for "the bucket is already gone". | —                                                                          |
 
 Set it per-`Snapshot` (`spec.deletionPolicy`) or set the recipe-wide default with `SnapshotPolicy.spec.defaultDeletionPolicy`. This is also how retention pruning reclaims space: pruned `Snapshot` CRs use `Delete`, so the snapshots go with them.
+
+#### What `Delete` needs to succeed
+
+`Delete` is a promise the operator has to keep, so the CR stays `Terminating` until the kopia snapshot is actually gone — it will not drop the finalizer and silently leave the snapshot behind. To do that it needs to reach the repository, which means it needs the repository's **credentials** at deletion time, potentially long after the backup ran.
+
+Kopiur removes the usual reasons that fails:
+
+- **The recipe may already be gone.** The repository reference, the snapshot's kopia identity, and the [credential-projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) opt-in are all pinned into `status` when the run happens, so deleting the `SnapshotPolicy` first does not strand the `Snapshot`.
+- **The credentials get re-projected.** The copy made for the backup is reclaimed when that run ends, so the deletion Job projects a fresh, short-lived `<snapshot>-delete-creds-N` of its own, reclaimed the moment the finalizer clears.
+
+What it cannot survive is the **repository** itself going away, or its owner revoking `credentialProjection.allowed` — kopiur will not project against a withdrawn consent. If you hit that, or the bucket is simply gone, use the escape hatch below.
+
+/// tip | The escape hatch: release the CR without touching the snapshot
+
+Annotate the `Snapshot` with `kopiur.home-operations.com/skip-snapshot-cleanup` and the finalizer drops immediately, **without** contacting the repository. It overrides everything, including `Delete`:
+
+```console
+$ kubectl annotate snapshot nightly-1 kopiur.home-operations.com/skip-snapshot-cleanup=true
+```
+
+The kopia snapshot **survives** in the repository — the catalog can rediscover it as an `origin: discovered` `Snapshot` later. This is the "the bucket is gone / the repo is unreachable / just let me delete this CR" lever, and it is presence-only (the value is ignored). Reach for it only when the deletion genuinely cannot proceed; the whole point of `Delete` is that it doesn't leave orphans behind. Same effect as `deletionPolicy: Orphan`, but applied to a CR you already created.
+
+///
 
 ### `pin` — exempt a snapshot from retention
 

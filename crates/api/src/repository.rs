@@ -101,6 +101,9 @@ pub struct RepositorySpec {
     /// Repository health thresholds (tunes the index-blob-count warning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthSpec>,
+    /// Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<RepositoryParameters>,
 }
 
 /// Tuning for the one-shot bootstrap Job, shared by `Repository` and
@@ -117,6 +120,120 @@ pub struct BootstrapSpec {
     /// shape parity but is not honored by the bootstrap Job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
+}
+
+/// Mutable kopia repository parameters (`kopia repository set-parameters`), shared by
+/// `Repository` and `ClusterRepository`.
+///
+/// Deliberately NOT part of `spec.create` ([`crate::common::CreateBehavior`]): that block's
+/// whole contract is create-time-fixed-and-immutable, enforced by CEL and the webhook, and
+/// these are mutable on a live repository — re-applying them to an existing repo is the
+/// entire point.
+///
+/// Every field is optional with no kopiur-side default: **absent means "don't touch it"**,
+/// so declaring nothing here changes nothing about how a repository behaves. Note the
+/// consequence for GitOps — *removing* a value you previously set does not restore kopia's
+/// default, it leaves the repository at whatever you last applied. Set it back explicitly.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryParameters {
+    /// Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
+    /// blobs get compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<EpochParameters>,
+}
+
+/// kopia epoch-manager parameters. Absent fields are left at whatever the repository
+/// already has (kopia's defaults, noted per field).
+///
+/// An epoch may only advance once it is **older than `minDuration`** AND has accumulated
+/// `advanceOnCount` blobs or `advanceOnSizeMB` of index data. `minDuration` is a floor, so
+/// kopia's 24h default means a busy fleet — say 17 hourly policies at ~60 index blobs/hour
+/// — is forced to ~1700 blobs before an epoch may close, and kopia only compacts two epochs
+/// behind. The repository then permanently carries thousands of uncompacted index blobs,
+/// tripping `IndexBlobHealth` and slowing every mover's connect. Lowering `minDuration` is
+/// the lever for that (#258).
+///
+/// `cleanupSafetyMargin` is deliberately **observable but not settable**: its job is to stop
+/// kopia deleting index blobs a concurrent writer still needs, and there is no safe generic
+/// advice for lowering it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochParameters {
+    /// Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
+    /// (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_duration: Option<String>,
+    /// How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_frequency: Option<String>,
+    /// Index blobs in an epoch that trigger an advance, once older than `minDuration`
+    /// (kopia default `20`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance_on_count: Option<i64>,
+    /// Total index size in an epoch that triggers an advance, once older than `minDuration`
+    /// (kopia default `10` MiB).
+    ///
+    /// Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
+    /// (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
+    /// kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760
+    /// bytes — even though kopia's own log renders the result as "MB". That ambiguity is
+    /// this field's main hazard; the API surface should not reproduce it.
+    #[serde(
+        default,
+        rename = "advanceOnSizeMiB",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub advance_on_size_mb: Option<i64>,
+    /// Epochs between full index checkpoints (kopia default `7`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_frequency: Option<i64>,
+    /// Parallelism for epoch cleanup deletions (kopia default `4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_parallelism: Option<i64>,
+}
+
+/// The epoch parameters the repository ACTUALLY reports, mirrored into `status` from
+/// `kopia repository status` at the last bootstrap.
+///
+/// A separate type from [`EpochParameters`] rather than a reuse, for three reasons: the CRD
+/// spec type cannot hold kopia's full output (it omits `enabled` and `cleanupSafetyMargin`);
+/// `Option` would mean opposite things in the two positions (spec `None` = "don't touch",
+/// status `None` = "kopia didn't report it"); and non-`Option` fields encode "observed means
+/// complete" in the type. Same reasoning as [`StorageStats`] being its own type.
+///
+/// This is what makes the apply honest: it is best-effort, so a failed apply stays visible
+/// here as drift from `spec` instead of silently doing nothing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedEpochParameters {
+    /// Whether kopia's epoch manager is enabled on this repository at all.
+    pub enabled: bool,
+    /// Observed minimum epoch age, as a Go-style duration.
+    pub min_duration: String,
+    /// Observed epoch-state refresh frequency, as a Go-style duration.
+    pub refresh_frequency: String,
+    /// Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis;
+    /// not settable through `spec.parameters`.
+    pub cleanup_safety_margin: String,
+    /// Observed index-blob count that triggers an epoch advance.
+    pub advance_on_count: i64,
+    /// Observed total index size (MiB) that triggers an epoch advance.
+    #[serde(rename = "advanceOnSizeMiB")]
+    pub advance_on_size_mb: i64,
+    /// Observed epochs between full index checkpoints.
+    pub checkpoint_frequency: i64,
+    /// Observed epoch-cleanup delete parallelism.
+    pub delete_parallelism: i64,
+}
+
+/// Observed kopia repository parameters, mirrored into `status`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedRepositoryParameters {
+    /// The epoch parameters the repository reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<ObservedEpochParameters>,
 }
 
 /// Repository health thresholds, shared by `Repository` and `ClusterRepository`.
@@ -325,6 +442,10 @@ pub struct RepositoryStatus {
     /// Backend health-probe state (`spec.health.probe`), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthStatus>,
+    /// The kopia repository parameters actually observed at the last bootstrap. Compare
+    /// against `spec.parameters` to see whether a declared value landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<ObservedRepositoryParameters>,
     /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,

@@ -1,0 +1,78 @@
+# Example 31 — make fsGroup apply to the backup source (sources[].readOnly: false)
+#
+# WHY THIS EXISTS: fsGroup is not a passive permission grant. The kubelet implements
+# it by walking the volume and rewriting it — chgrp every file to the group, chmod
+# g+rw, setgid on directories. And the kubelet SKIPS that walk entirely on a
+# read-only mount. Kopiur mounts backup sources read-only by default (kopia only
+# reads them), so mover.podSecurityContext.fsGroup / fsGroupChangePolicy are
+# silently INERT on the source no matter what you set them to.
+#
+# That bites when the mover must run as a specific uid:gid for reasons of its own —
+# here, a filesystem repository on an NFS export with no ID squashing, which only
+# accepts writes from 1000:1000 — while the source PVC's files are owned by someone
+# else. Set readOnly: false and the kubelet does the walk, normalizing group
+# ownership so the mover can read.
+#
+# WHAT GETS REWRITTEN depends entirely on copyMethod:
+#
+#   Snapshot / Clone  ->  the temporary STAGED PVC. Deleted when the run ends.
+#                         Your volume is never touched. (This example.)
+#   Direct            ->  your LIVE production volume, permanently, while the app
+#                         runs. Requires acknowledgeLiveMutation: true — see
+#                         example 32.
+#
+# So pair readOnly: false with a staged copyMethod whenever your storage supports
+# it; that is the combination with no downside.
+#
+# NOT SUPPORTED on an `nfs:` SOURCE: the kubelet never applies fsGroup to in-tree
+# NFS volumes, so readOnly: false cannot achieve anything there and is rejected at
+# admission. (The NFS below is the REPOSITORY, not the source.) Nor with
+# staging.accessModes: [ReadOnlyMany] — a read-only stage cannot be mounted rw.
+#
+# See docs/copy-methods.md#making-fsgroup-apply-to-the-source
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas
+  namespace: media
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      nfs:
+        server: nas.internal
+        path: /export/kopia
+  encryption:
+    passwordSecretRef:
+      name: kopia-repo
+      key: KOPIA_PASSWORD
+  moverDefaults:
+    # The export is not ID-squashed, so every kopia process touching it must be
+    # 1000:1000 or the repository writes are refused.
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+    podSecurityContext:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: photos
+  namespace: media
+spec:
+  repository:
+    name: nas
+  # The stage is what readOnly: false rewrites — a throwaway PVC, not your data.
+  copyMethod: Snapshot
+  sources:
+    - pvc:
+        name: photos-data
+      # Without this, the mount is read-only, the kubelet skips the fsGroup walk,
+      # and the mover (uid 1000) cannot read files owned by the app's uid.
+      readOnly: false
+  retention:
+    keepDaily: 7
+    keepWeekly: 4

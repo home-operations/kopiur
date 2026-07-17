@@ -408,6 +408,54 @@ pub struct ContentFormat {
     /// Repository format version.
     #[serde(default)]
     pub version: u32,
+    /// Epoch-manager parameters, when the repository uses the epoch index (format v2+).
+    /// Absent on older formats, hence `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_parameters: Option<EpochParameters>,
+}
+
+/// kopia's epoch-manager parameters, as reported inside
+/// `repository status --json` → `contentFormat.epochParameters`.
+///
+/// **This block does not follow the `rename_all = "camelCase"` convention the rest of this
+/// module uses** — kopia serializes the Go struct's field names verbatim, so the keys are
+/// PascalCase with no consistent rule between them (`MinEpochDuration` vs
+/// `EpochRefreshFrequency` vs `FullCheckpointFrequency` vs `DeleteParallelism`). Hence the
+/// explicit per-field renames; `crates/kopia/tests/fixtures/repository_status.json` carries
+/// real kopia 0.23 output and pins the shape.
+///
+/// Units are Go-native and not what the flag names suggest:
+/// - durations are `time.Duration` **nanoseconds** (as [`MaintenanceCadence::interval`] is);
+/// - `EpochAdvanceOnTotalSizeBytesThreshold` is **bytes**, and the `--epoch-advance-on-size-mb`
+///   flag that sets it means **MiB** — `7` yields `7340032` (7 × 1048576), even though kopia's
+///   own log line renders it as "7.3 MB".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochParameters {
+    /// Whether the epoch manager is enabled on this repository.
+    #[serde(rename = "Enabled", default)]
+    pub enabled: bool,
+    /// Minimum epoch age before it may advance, in nanoseconds (kopia default 24h).
+    #[serde(rename = "MinEpochDuration", default)]
+    pub min_epoch_duration_ns: i64,
+    /// How often clients re-read epoch state, in nanoseconds (kopia default 20m).
+    #[serde(rename = "EpochRefreshFrequency", default)]
+    pub epoch_refresh_frequency_ns: i64,
+    /// Grace window protecting index blobs a concurrent writer may still need, in
+    /// nanoseconds (kopia default 4h).
+    #[serde(rename = "CleanupSafetyMargin", default)]
+    pub cleanup_safety_margin_ns: i64,
+    /// Index-blob count that triggers an epoch advance (kopia default 20).
+    #[serde(rename = "EpochAdvanceOnCountThreshold", default)]
+    pub advance_on_count: i64,
+    /// Total index size in **bytes** that triggers an epoch advance (kopia default 10 MiB).
+    #[serde(rename = "EpochAdvanceOnTotalSizeBytesThreshold", default)]
+    pub advance_on_total_size_bytes: i64,
+    /// Epochs between full index checkpoints (kopia default 7).
+    #[serde(rename = "FullCheckpointFrequency", default)]
+    pub checkpoint_frequency: i64,
+    /// Parallelism for epoch-cleanup deletions (kopia default 4).
+    #[serde(rename = "DeleteParallelism", default)]
+    pub delete_parallelism: i64,
 }
 
 /// Result of `kopia repository status --json`.

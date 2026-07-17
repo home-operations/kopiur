@@ -73,7 +73,7 @@ pub use snapshot_schedule::{
 };
 
 // Shared logic re-exports.
-pub use duration::{parse_go_duration, resolve_timeout};
+pub use duration::{parse_go_duration, render_go_duration, resolve_timeout};
 pub use error::{ValidationError, ValidationResult};
 pub use identity::{
     HostClass, IdentityInputs, classify_hostname, identity_string, resolve_identity,

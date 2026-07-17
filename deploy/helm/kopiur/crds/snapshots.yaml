@@ -256,6 +256,23 @@ spec:
                 description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true
                 properties:
+                  credentialProjection:
+                    description: |-
+                      The recipe's `spec.credentialProjection` as it stood for this run.
+
+                      The deletion path re-projects the mover's credentials, but the opt-in lives on the
+                      `SnapshotPolicy` — which a user may delete first. Pinning it here lets the finalizer
+                      honor the opt-in that was actually in force, instead of reading an absent recipe as
+                      "projection off" and blocking on a Secret that was never meant to be namespace-local
+                      (#255). Absent only on a `Snapshot` that predates the pin or never ran; a run always
+                      writes it, including `enabled: false`, so absent stays distinguishable from off.
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: false
+                        description: Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default.
+                        type: boolean
+                    type: object
                   repository:
                     description: The repository this run targeted, frozen at run time.
                     nullable: true

@@ -44,6 +44,13 @@ pub(super) fn build_backup_run(
         .first()
         .ok_or_else(|| Error::Invariant("SnapshotPolicy has no sources".into()))?;
 
+    // Read-only unless the recipe opts out. kopia only reads the source, so the mount
+    // is read-only by default; `readOnly: false` exists solely so the kubelet will
+    // apply `fsGroup` (it skips its recursive chgrp on a read-only mount). Admission
+    // rejects the combinations where that cannot work or would rewrite live data
+    // unacknowledged — see `validate_source`/`validate_backup_config`.
+    let read_only = kopiur_api::snapshot_policy::source_read_only(source);
+
     // The mover snapshots whatever is mounted at `source_path`, so the mount path
     // and the kopia source path are the same. PVC: `/pvc/<name>` by default; NFS:
     // the export path by default; either overridable by `sourcePathOverride`.
@@ -55,7 +62,7 @@ pub(super) fn build_backup_run(
                 .unwrap_or_else(|| format!("/pvc/{}", pvc.name));
             (
                 path.clone(),
-                VolumeMountSpec::pvc(pvc.name.clone(), path, true),
+                VolumeMountSpec::pvc(pvc.name.clone(), path, read_only),
             )
         }
         (None, Some(nfs)) => {
@@ -75,7 +82,7 @@ pub(super) fn build_backup_run(
             };
             (
                 mount_path.clone(),
-                VolumeMountSpec::nfs(nfs.server.clone(), nfs.path.clone(), mount_path, true),
+                VolumeMountSpec::nfs(nfs.server.clone(), nfs.path.clone(), mount_path, read_only),
             )
         }
         // `pvcSelector` (multi-PVC) and the mutually-exclusive cases are rejected

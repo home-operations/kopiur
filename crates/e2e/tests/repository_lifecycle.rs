@@ -1359,3 +1359,179 @@ async fn too_many_index_blobs_warns_without_blocking_ready() {
         .await;
     let _ = repos.delete(repo, &DeleteParams::default()).await;
 }
+
+/// **Repository parameters (#258).** `spec.parameters.epoch.minDuration` reaches the kopia
+/// repository and is mirrored back into `status.parameters.epoch`; editing it re-applies.
+///
+/// The reported dead end was structural: kopia cannot compact an index blob until its epoch
+/// closes, an epoch cannot close before `MinEpochDuration` (24h by default) however many
+/// blobs pile up, and compaction then trails two epochs behind. A busy fleet is therefore
+/// pinned at thousands of uncompacted blobs by the gate alone, and no maintenance schedule
+/// can help — the only fix was an out-of-band `kopia repository set-parameters`, invisible
+/// to GitOps and silently reverted by a re-bootstrap.
+///
+/// Why e2e: the units here are where this breaks, and none of them are checkable in a unit
+/// test. kopia takes Go duration strings and REJECTS a bare number, reports back
+/// nanoseconds under Go-PascalCase keys, and means MiB when its flag says `-mb`. Only a real
+/// kopia can confirm the round trip actually closes.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn repository_epoch_parameters_apply_and_mirror_into_status() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_repo(&client, "epochparams").await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repo = "e2e-epoch-repo";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                repo,
+                "epochparams",
+                // 6h is the reporter's fix: a quarter of kopia's 24h gate, so epochs close
+                // (and blobs become compactable) four times as often.
+                serde_json::json!({ "parameters": { "epoch": { "minDuration": "6h" } } }),
+            )),
+        )
+        .await
+        .expect("create Repository with spec.parameters.epoch");
+    wait_phase(&repos, repo, "Ready")
+        .await
+        .expect("a repository declaring epoch parameters must still bootstrap to Ready");
+
+    // The declared value LANDED — this is the assertion the whole feature exists for.
+    let epoch = wait_until(
+        "status.parameters.epoch mirrored",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repos, repo).await;
+            Ok(s.get("parameters").and_then(|p| p.get("epoch")).cloned())
+        },
+    )
+    .await
+    .expect("the bootstrap must mirror the repository's observed epoch parameters");
+
+    assert_eq!(
+        epoch.get("minDuration").and_then(|v| v.as_str()),
+        Some("6h"),
+        "spec.parameters.epoch.minDuration must reach kopia and be reported back — kopia \
+         stores it as 21600000000000ns, so this also proves the ns→Go-duration render \
+         round-trips: {epoch:#}"
+    );
+    // Untouched parameters keep kopia's defaults: `absent` means "don't touch", never
+    // "reset to something kopiur thinks is right".
+    assert_eq!(
+        epoch.get("refreshFrequency").and_then(|v| v.as_str()),
+        Some("20m"),
+        "an undeclared parameter must be left at kopia's default: {epoch:#}"
+    );
+    assert_eq!(
+        epoch.get("advanceOnSizeMiB").and_then(|v| v.as_i64()),
+        Some(10),
+        "kopia reports 10485760 BYTES here; a MiB conversion (÷1048576) yields 10, a MB one \
+         (÷1e6) yields ~10.49 and would make the drift check re-apply forever: {epoch:#}"
+    );
+    assert_eq!(
+        epoch.get("cleanupSafetyMargin").and_then(|v| v.as_str()),
+        Some("4h"),
+        "observed-but-not-settable parameters are still reported: {epoch:#}"
+    );
+
+    // An edit re-applies: the generation bump recycles the bootstrap Job, which re-reads,
+    // sees drift, and calls set-parameters again. This is what makes the setting GitOps-
+    // owned rather than a one-shot at create time — the property the out-of-band workaround
+    // could never have.
+    repos
+        .patch(
+            repo,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "spec": { "parameters": { "epoch": { "minDuration": "12h" } } }
+            })),
+        )
+        .await
+        .expect("patch minDuration to 12h");
+    wait_until(
+        "status.parameters.epoch.minDuration re-applied as 12h",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repos, repo).await;
+            let got = s
+                .get("parameters")
+                .and_then(|p| p.get("epoch"))
+                .and_then(|e| e.get("minDuration"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Ok((got.as_deref() == Some("12h")).then_some(()))
+        },
+    )
+    .await
+    .expect(
+        "editing spec.parameters.epoch must re-apply to the live repository — a value that \
+         only landed at create time would be silently reverted by any re-bootstrap, which is \
+         exactly why the out-of-band set-parameters workaround was unusable",
+    );
+
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
+}
+
+/// A repository that declares NO `spec.parameters` must be left entirely alone: kopia's
+/// defaults intact, and no `set-parameters` call at all. That call rewrites the format blob
+/// and invalidates every other kopia client's cached copy of it, so the inert case has to be
+/// genuinely inert — not "applies the same values back".
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn a_repository_without_parameters_keeps_kopias_defaults() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    // Its OWN repo, not the one the test above MUTATES: an isolated hostPath dir is
+    // one kopia repository, so sharing `epochparams` would let that test's
+    // minDuration: 6h leak in here and this assertion would depend on test ORDER.
+    ensure_repo(&client, "epochparams-default").await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repo = "e2e-epoch-default-repo";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                repo,
+                "epochparams-default",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Repository with no spec.parameters");
+    wait_phase(&repos, repo, "Ready")
+        .await
+        .expect("Repository should bootstrap to Ready");
+
+    let epoch = wait_until(
+        "status.parameters.epoch mirrored",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repos, repo).await;
+            Ok(s.get("parameters").and_then(|p| p.get("epoch")).cloned())
+        },
+    )
+    .await
+    .expect("the observed parameters are mirrored even when none are declared");
+
+    assert_eq!(
+        epoch.get("minDuration").and_then(|v| v.as_str()),
+        Some("24h"),
+        "kopia's own default must be untouched when nothing is declared: {epoch:#}"
+    );
+
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
+}

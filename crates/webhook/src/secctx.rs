@@ -2,9 +2,10 @@
 //! surface (at `kubectl apply`). Non-blocking and fail-open: the authoritative checks are the
 //! reconcile-time condition and the mover's runtime readability preflight.
 //!
-//! The webhook sees only the *recipe* securityContext, so it warns only when the recipe
-//! **explicitly pins** a `runAsUser` — otherwise the mover UID is undetermined and we stay
-//! silent. We warn only on a near-certain `LikelyIncompatible` verdict.
+//! The webhook sees only the *recipe* securityContext (resolved over the hardened base, so
+//! the mover's default `fsGroup` is accounted for — it always has one), and warns only when
+//! the recipe **explicitly pins** a `runAsUser` — otherwise the mover UID is undetermined
+//! and we stay silent. We warn only on a near-certain `LikelyIncompatible` verdict.
 //!
 //! Two things it is blind to, both of which can only make a warning WRONG, never missing:
 //!
@@ -34,10 +35,43 @@ fn pinned_mover_identity(mover: Option<&MoverSpec>) -> Option<secctx_compat::Mov
     if m.inherit_security_context_from.is_some() {
         return None;
     }
-    let sc = m.security_context.as_ref()?;
-    // Only when the recipe pins a UID (container or pod) — else the resolved UID is unknown.
-    let id = secctx_compat::mover_identity(sc, m.pod_security_context.as_ref());
+    // Resolve the hardened base into the recipe rather than reading the raw spec: the
+    // mover ALWAYS runs with `fsGroup: 65532` (hardened_pod_security_context) even when a
+    // recipe pins nothing but `runAsUser`, so the raw spec reports no fsGroup for a mover
+    // that certainly has one. That mattered little while fsGroup only softened a group
+    // comparison; with a writable source (#254) it decides the verdict outright, and the
+    // raw view would warn `LikelyIncompatible` for exactly the configuration the flag
+    // exists to enable — while the controller, which resolves properly, says
+    // `FsGroupMayApply`. Two layers contradicting each other is worse than either.
+    //
+    // `defaults: None` keeps this hardened ⊂ recipe: the repository's `moverDefaults` is
+    // still invisible here (see the module docs), so this is strictly closer to runtime,
+    // not equal to it. Fail-open still applies.
+    let resolved = kopiur_api::common::resolve_mover(
+        None,
+        m.security_context.as_ref(),
+        m.pod_security_context.as_ref(),
+        None,
+        None,
+        None,
+    );
+    let id = secctx_compat::mover_identity(
+        &resolved.security_context,
+        resolved.pod_security_context.as_ref(),
+    );
+    // Only when the recipe pins a UID (container or pod) — else the resolved UID is
+    // unknown. The hardened base sets `runAsNonRoot` but NOT `runAsUser`, so a recipe that
+    // pins no UID still resolves to `None` here and stays silent, as before.
     id.uid.map(|_| id)
+}
+
+/// One checkable backup source: the PVC to assess, and how the mover will mount it.
+struct ClaimMount<'a> {
+    /// The `source.pvc` name to look for consuming pods of.
+    claim: &'a str,
+    /// The source's effective `readOnly`. A read-write mount lets the kubelet apply the
+    /// mover's `fsGroup` to the tree, which changes the verdict (see `assess_read_compat`).
+    read_only: bool,
 }
 
 /// Best-effort admission warnings for a backup config's `source.pvc` entries. Fails open:
@@ -55,9 +89,17 @@ pub async fn backup_warnings(
         return Vec::new();
     };
     // Only PVC sources can be checked at admission (pvcSelector is dynamic; NFS has no pod).
-    let claims: Vec<&str> = sources
+    // Each carries its own mount mode: `readOnly` is per-source, and it decides whether
+    // the mover's fsGroup can reach the tree at all — a bare bool in a tuple here would
+    // be unreadable at the use site 20 lines down.
+    let claims: Vec<ClaimMount<'_>> = sources
         .iter()
-        .filter_map(|s| s.pvc.as_ref().map(|p| p.name.as_str()))
+        .filter_map(|s| {
+            s.pvc.as_ref().map(|p| ClaimMount {
+                claim: p.name.as_str(),
+                read_only: kopiur_api::snapshot_policy::source_read_only(s),
+            })
+        })
         .collect();
     if claims.is_empty() {
         return Vec::new();
@@ -71,11 +113,11 @@ pub async fn backup_warnings(
     };
 
     let mut warnings = Vec::new();
-    for claim in claims {
+    for ClaimMount { claim, read_only } in claims {
         // `workload_identities` mounts-the-claim + excludes kopiur mover pods (shared core).
         let identities = secctx_compat::workload_identities(&pods, claim);
         if let MoverReadCompat::LikelyIncompatible { .. } =
-            secctx_compat::assess_read_compat(&mover_id, &identities)
+            secctx_compat::assess_read_compat(&mover_id, &identities, read_only)
         {
             warnings.push(format!(
                 "securityContext: the mover's UID likely cannot read the source PVC `{claim}` \
@@ -169,6 +211,53 @@ mod tests {
         assert_eq!(
             pinned_mover_identity(Some(&pinned)).and_then(|i| i.uid),
             Some(65532)
+        );
+    }
+
+    /// #254: the mover ALWAYS gets `fsGroup: 65532` from the hardened base, so a recipe
+    /// that pins only `runAsUser` still has one — the raw spec just cannot see it. Reading
+    /// the raw spec made admission warn `LikelyIncompatible` for the very configuration
+    /// `readOnly: false` exists to enable, while the controller (which resolves properly)
+    /// said `FsGroupMayApply`.
+    #[test]
+    fn the_admission_identity_carries_the_hardened_default_fs_group() {
+        let uid_only = MoverSpec {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(1000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = pinned_mover_identity(Some(&uid_only)).expect("a pinned UID yields an identity");
+        assert_eq!(id.uid, Some(1000));
+        assert_eq!(
+            id.fs_group,
+            Some(65532),
+            "the resolved mover runs with the hardened fsGroup even though the recipe \
+             never mentions one — the raw spec reports None and contradicts the controller"
+        );
+        assert!(
+            id.groups.contains(&65532),
+            "and it lands in the process group set too"
+        );
+    }
+
+    /// The resolve must NOT start warning about every default policy: the hardened base
+    /// sets `runAsNonRoot` but pins no `runAsUser`, so an unpinned recipe still resolves to
+    /// no UID and stays silent.
+    #[test]
+    fn resolving_does_not_invent_a_uid_for_an_unpinned_recipe() {
+        assert!(pinned_mover_identity(Some(&MoverSpec::default())).is_none());
+        let psc_only = MoverSpec {
+            pod_security_context: Some(PodSecurityContext {
+                fs_group: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            pinned_mover_identity(Some(&psc_only)).is_none(),
+            "an fsGroup alone must not make the mover's UID knowable"
         );
     }
 }

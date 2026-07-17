@@ -104,7 +104,11 @@ pub struct SnapshotPolicySpec {
 // than `[...].filter(x,x).size()==1`: the apiserver estimates per-item CEL cost ×
 // `maxItems`, and a list-construction + lambda `filter` blows the budget on the
 // repeating `sources` list. The sum form is a cheap constant per item.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+// `Default` is derived purely for construction ergonomics: `Source` is built as an
+// exhaustive struct literal in ~20 places, and every added field would otherwise have
+// to be spelled out at each one. An all-`None` `Source` is not a valid spec (the CEL
+// rule above demands exactly one of pvc/pvcSelector/nfs) and admission rejects it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) == 1",
     "message": "exactly one of pvc, pvcSelector, nfs"
@@ -117,9 +121,34 @@ pub struct Source {
     /// Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_selector: Option<PvcSelector>,
-    /// An inline NFS export to back up directly, mounted read-only. Mutually exclusive with `pvc`/`pvcSelector`.
+    /// An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs: Option<NfsVolume>,
+    /// Mount the source read-only (default `true`; kopia only ever reads it).
+    ///
+    /// Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
+    /// `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it
+    /// skips that walk entirely on a read-only mount, which is why a mover
+    /// `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under
+    /// `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and
+    /// never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume,
+    /// which requires `acknowledgeLiveMutation`.
+    ///
+    /// Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to
+    /// in-tree NFS volumes at all, so a read-write mount would grant nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_source_read_only")]
+    pub read_only: Option<bool>,
+    /// Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet
+    /// recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it
+    /// group-writable — permanently, while the workload is running. Required for that
+    /// combination alone.
+    ///
+    /// Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to
+    /// carry, and rejecting a stale one would make switching `copyMethod` between
+    /// `Direct` and `Snapshot`/`Clone` a two-step edit in both directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledge_live_mutation: Option<bool>,
     /// What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
@@ -229,7 +258,7 @@ pub enum CopyMethod {
     /// Point-in-time CSI volume snapshot (the default; requires the CSI snapshot stack + a `VolumeSnapshotClass`).
     #[default]
     Snapshot,
-    /// CSI volume clone of the source, mounted read-only (opt-in; requires a cloning-capable CSI driver).
+    /// CSI volume clone of the source (opt-in; requires a cloning-capable CSI driver). Mounted per `sources[].readOnly` — read-only by default.
     Clone,
     /// Read the live PVC directly with no intermediate snapshot/clone (opt-in; works on any storage, no CSI required).
     Direct,
@@ -265,8 +294,9 @@ pub struct StagingSpec {
     pub storage_class_name: Option<String>,
     /// Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes.
     /// `[ReadOnlyMany]` pairs with snapshot-backed read-only classes (e.g. CephFS
-    /// `backingSnapshot`); the mover always mounts the staged PVC read-only
-    /// regardless of the mode.
+    /// `backingSnapshot`); the mover mounts the staged PVC read-only to match, and
+    /// rejects it at admission if a source sets `readOnly: false` (a read-only stage
+    /// cannot be mounted read-write).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_modes: Vec<PvcAccessMode>,
 }
@@ -306,6 +336,44 @@ pub enum SourcePathStrategy {
 /// Returns the field's `Option` type so schemars emits the schema `default:`.
 fn default_source_path_strategy() -> Option<SourcePathStrategy> {
     Some(SourcePathStrategy::PvcName)
+}
+
+/// schemars default for `Source::read_only` — a backup source is read-only unless the
+/// user asks otherwise. Returns the field's `Option` type so schemars emits the schema
+/// `default: true` for `kubectl explain`. Paired with `source_read_only()`, which
+/// resolves absent to exactly this value at the mount site — the pairing is what makes
+/// a schema default safe to advertise (see `Repository`'s health defaults).
+fn default_source_read_only() -> Option<bool> {
+    Some(true)
+}
+
+/// Whether a source is mounted read-only. THE resolver for `Source::read_only`'s
+/// absent case, so the CRD's advertised `default: true` and the mount agree by
+/// construction rather than by coincidence.
+pub fn source_read_only(source: &Source) -> bool {
+    source.read_only.unwrap_or(true)
+}
+
+/// Whether this source's mount lets the kubelet rewrite the **live** workload volume:
+/// a writable mount with no staging in front of it.
+///
+/// `copyMethod: Snapshot`/`Clone` interpose a throwaway staged PVC, so the kubelet's
+/// recursive `fsGroup` chgrp lands on a copy that is deleted when the run ends. Only
+/// `Direct` mounts the workload's own PVC, where that same walk permanently rewrites
+/// group ownership on production data. Pure, and the single definition of the hazard.
+///
+/// An `nfs` source is excluded, and not merely because [`validate_source`] rejects a
+/// writable one anyway: the kubelet does not apply `fsGroup` to in-tree NFS volumes at
+/// all, so no walk ever happens and this predicate's premise is simply false there.
+/// Answering `true` would also make admission emit two errors for one mistake, the
+/// second of them advice — "set `acknowledgeLiveMutation`" — that could never make the
+/// configuration valid.
+///
+/// [`validate_source`]: crate::validate::validate_source
+pub fn source_mutates_live_volume(copy_method: CopyMethod, source: &Source) -> bool {
+    matches!(copy_method, CopyMethod::Direct)
+        && !source_read_only(source)
+        && (source.pvc.is_some() || source.pvc_selector.is_some())
 }
 
 /// schemars default for `PvcSnapshotPolicy::default_deletion_policy` — `Delete`,

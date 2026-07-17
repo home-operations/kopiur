@@ -1,0 +1,84 @@
+# Example 33 — tune kopia's epoch parameters (spec.parameters.epoch)
+#
+# THE SYMPTOM: `IndexBlobHealth=False` / `TooManyIndexBlobs`, thousands of index
+# blobs that never go down however often maintenance runs, and mover connects that
+# take tens of seconds because every one of them reads those blobs.
+#
+# THE CAUSE, if maintenance is demonstrably running: kopia cannot compact an index
+# blob until its EPOCH closes. An epoch may only close once it is older than
+# MinEpochDuration — 24h by default — no matter how many blobs accumulate inside it.
+# Compaction then trails two epochs behind. So a fleet producing ~60 index blobs an
+# hour is held at ~1700 blobs per epoch and carries 1700–3400 uncompacted blobs
+# permanently. No maintenance schedule can fix that: compaction pace is not the
+# bottleneck, the 24h advance gate is.
+#
+# THE FIX: lower minDuration so epochs close (and blobs become compactable) sooner.
+# 6h is a reasonable starting point for a busy repository.
+#
+# WHY THIS IS A CR FIELD: `kopia repository set-parameters --epoch-min-duration=6h`
+# run by hand works — the value persists in the format blob and movers pick it up on
+# connect — but it is invisible to GitOps, survives in no manifest, and a repository
+# re-bootstrap silently reverts it. Declared here, kopiur re-applies it whenever it
+# drifts.
+#
+# ABSENT MEANS "DON'T TOUCH". Every field below is optional and kopiur has no
+# defaults of its own: omit one and kopia's current value is left exactly as it is.
+# The flip side is that REMOVING a value you previously set does not restore kopia's
+# default — it leaves the repository at whatever you last applied. Set it back
+# explicitly if you want the default again.
+#
+# NOTE: applying these rewrites the repository's format blob, which invalidates every
+# other kopia client's cached copy (they re-read within ~15 minutes on their own).
+# kopiur therefore only calls set-parameters when the declared values actually differ
+# from what the repository reports — a converged spec costs nothing.
+#
+# NOT AVAILABLE on a `mode: ReadOnly` repository: set-parameters is a repository-wide
+# write and kopia refuses it on a read-only connection, so declaring it there is
+# rejected at admission. In a multi-cluster layout, declare the parameters on the
+# cluster that owns the repository — they are a property of the repository, not of
+# each consumer.
+#
+# See docs/repository-health.md
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: primary
+  namespace: backups
+spec:
+  backend:
+    s3:
+      bucket: kopia-backups
+      endpoint: s3.example.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: s3-creds
+  encryption:
+    passwordSecretRef:
+      name: kopia-repo
+      key: KOPIA_PASSWORD
+  parameters:
+    epoch:
+      # The gate. kopia's default is 24h; an epoch cannot close before this,
+      # regardless of how many index blobs it holds.
+      minDuration: 6h
+      # The rest are shown for reference — omit them unless you have a reason.
+      # Each comment is kopia's default, which is what you get by leaving it out.
+      #
+      # refreshFrequency: 20m    # how often clients re-read epoch state
+      # advanceOnCount: 20       # index blobs that trigger an advance (once past minDuration)
+      # advanceOnSizeMiB: 10     # index size that triggers an advance (MEBIbytes: 10 = 10485760 bytes,
+      #                          #   despite kopia's own log rendering it as "10 MB")
+      # checkpointFrequency: 7   # epochs between full index checkpoints
+      # deleteParallelism: 4     # parallelism for epoch cleanup deletions
+  # Observe the result under `status.parameters.epoch`:
+  #
+  #   kubectl get repository primary -n backups -o jsonpath='{.status.parameters.epoch}'
+  #
+  # It reports what the REPOSITORY says, not what you declared, so a value that
+  # failed to apply shows up as a mismatch rather than as silence.
+  #
+  # `cleanupSafetyMargin` appears there too but is deliberately not settable: it is
+  # the grace window that stops kopia deleting index blobs a concurrent writer still
+  # needs, and there is no safe generic advice for lowering it.

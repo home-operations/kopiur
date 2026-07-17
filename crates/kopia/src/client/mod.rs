@@ -714,6 +714,68 @@ impl ThrottleArgs {
     }
 }
 
+/// Flags for `kopia repository set-parameters`. Modeled on [`ThrottleArgs`]: an all-`None`
+/// builder whose caller skips the invocation entirely when nothing is set.
+///
+/// Durations are pre-rendered **strings** with a unit, not numbers — kopia's
+/// `time.ParseDuration` rejects a bare number (`--epoch-min-duration=3600` →
+/// `time: missing unit in duration "3600"`), so the caller must render them
+/// (`kopiur_api::render_go_duration`) rather than pass user text through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetParametersArgs {
+    /// `--epoch-min-duration` (e.g. `"6h"`).
+    pub epoch_min_duration: Option<String>,
+    /// `--epoch-refresh-frequency` (e.g. `"20m"`).
+    pub epoch_refresh_frequency: Option<String>,
+    /// `--epoch-advance-on-count`.
+    pub epoch_advance_on_count: Option<i64>,
+    /// `--epoch-advance-on-size-mb`. **MiB**, despite the flag name — kopia multiplies by
+    /// 1048576.
+    pub epoch_advance_on_size_mb: Option<i64>,
+    /// `--epoch-checkpoint-frequency`.
+    pub epoch_checkpoint_frequency: Option<i64>,
+    /// `--epoch-delete-parallelism`.
+    pub epoch_delete_parallelism: Option<i64>,
+}
+
+impl SetParametersArgs {
+    /// The flags for the set parameters, in a stable order. Empty when nothing is set (the
+    /// caller then skips the `set-parameters` invocation).
+    pub fn args(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        if let Some(v) = &self.epoch_min_duration {
+            a.push("--epoch-min-duration".into());
+            a.push(v.clone());
+        }
+        if let Some(v) = &self.epoch_refresh_frequency {
+            a.push("--epoch-refresh-frequency".into());
+            a.push(v.clone());
+        }
+        if let Some(v) = self.epoch_advance_on_count {
+            a.push("--epoch-advance-on-count".into());
+            a.push(v.to_string());
+        }
+        if let Some(v) = self.epoch_advance_on_size_mb {
+            a.push("--epoch-advance-on-size-mb".into());
+            a.push(v.to_string());
+        }
+        if let Some(v) = self.epoch_checkpoint_frequency {
+            a.push("--epoch-checkpoint-frequency".into());
+            a.push(v.to_string());
+        }
+        if let Some(v) = self.epoch_delete_parallelism {
+            a.push("--epoch-delete-parallelism".into());
+            a.push(v.to_string());
+        }
+        a
+    }
+
+    /// Whether no parameters are set (so `set-parameters` is skipped).
+    pub fn is_empty(&self) -> bool {
+        self.args().is_empty()
+    }
+}
+
 /// UI authentication mode for `kopia server start`. Controller-agnostic mirror of
 /// the api crate's `ServerAuth` (this crate has no kube dependency).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1131,6 +1193,34 @@ impl KopiaClient {
             return Ok(());
         }
         let mut args = vec!["repository".into(), "throttle".into(), "set".into()];
+        args.extend(flags);
+        self.run_ok(&args).await.map(|_| ())
+    }
+
+    /// Rewrite mutable repository parameters on the CONNECTED repository
+    /// (`kopia repository set-parameters [flags]`), issue #258. No-op when nothing is set.
+    ///
+    /// Two properties the caller must respect:
+    ///
+    /// - **Never on a read-only connection.** kopia hard-errors (`unable to write blobcfg
+    ///   blob: PutBlob() failed for "kopia.blobcfg": storage is read-only`), so a
+    ///   `mode: ReadOnly` repository must not reach here.
+    /// - **This invalidates every other client's cached format blob.** kopia says so itself
+    ///   ("you must disconnect and re-connect all other Kopia clients") and drops the local
+    ///   `kopia.repository`/`kopia.blobcfg` cache. Other clients re-read within
+    ///   `formatBlobCacheDuration` (15m) on their own, but this is why the caller applies
+    ///   only on observed drift rather than unconditionally.
+    ///
+    /// Needs no maintenance ownership/lease.
+    pub async fn repository_set_parameters(
+        &self,
+        params: &SetParametersArgs,
+    ) -> Result<(), KopiaError> {
+        let flags = params.args();
+        if flags.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["repository".into(), "set-parameters".into()];
         args.extend(flags);
         self.run_ok(&args).await.map(|_| ())
     }

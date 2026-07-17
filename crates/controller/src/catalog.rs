@@ -1496,6 +1496,7 @@ mod tests {
                         namespace: None,
                     }),
                     sources: vec![],
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -1530,6 +1531,7 @@ mod tests {
                         namespace: None,
                     }),
                     sources: vec![],
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

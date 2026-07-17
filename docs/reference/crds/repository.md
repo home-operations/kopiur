@@ -95,6 +95,35 @@ degrading-but-still-usable repository.
   compacting fast enough). Absent uses the built-in default (1000). `0` disables the
   warning entirely; a negative value is rejected by the admission webhook.
 
+### `parameters`
+
+Mutable kopia repository parameters, re-applied whenever they drift from what the
+repository reports. Distinct from [`create`](#create), whose knobs are fixed at
+creation and immutable afterwards — these describe a live repository and are the
+point of `kopia repository set-parameters`.
+
+`parameters.epoch` tunes the epoch manager. kopia cannot compact an index blob until
+its epoch closes, and an epoch cannot close before `minDuration` regardless of how
+many blobs it holds — so on a busy repository this gate, not the maintenance
+schedule, is what pins the index-blob count high.
+
+- `epoch.minDuration` — minimum epoch age before it may advance (kopia default `24h`).
+  A Go-style duration. **The gate**; lower it (e.g. `6h`) when blobs stay high despite
+  maintenance running.
+- `epoch.refreshFrequency` — how often clients re-read epoch state (kopia default `20m`).
+- `epoch.advanceOnCount` — index blobs that trigger an advance once past `minDuration`
+  (kopia default `20`).
+- `epoch.advanceOnSizeMiB` — index size that triggers an advance (kopia default `10`).
+  **Mebibytes**: `10` is 10485760 bytes, even though kopia's own log renders it as "MB".
+- `epoch.checkpointFrequency` — epochs between full index checkpoints (kopia default `7`).
+- `epoch.deleteParallelism` — parallelism for epoch cleanup deletions (kopia default `4`).
+
+Every field is optional and kopiur supplies no defaults of its own: **absent leaves
+kopia's current value untouched**, and removing a value you previously set does not
+restore kopia's default. Rejected at admission on a `mode: ReadOnly` repository —
+`set-parameters` is a repository-wide write kopia refuses on a read-only connection.
+See [Maintenance → index-blob health](../../maintenance.md#index-blob-health).
+
 ## `status`
 
 ### `storageStats`
@@ -108,6 +137,20 @@ Aggregate repository storage figures from the last catalog scan:
   kopia compacts these during maintenance; an unbounded climb means maintenance
   isn't keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the
   `IndexBlobHealth` warning. Also surfaced as the `IndexBlobs` print column.
+
+### `parameters`
+
+The kopia repository parameters actually **observed** at the last bootstrap — what the
+repository reports, not what `spec.parameters` asked for, so a declared value that
+failed to apply shows up here as a mismatch rather than as silence.
+
+`parameters.epoch` mirrors the full epoch set (`enabled`, `minDuration`,
+`refreshFrequency`, `cleanupSafetyMargin`, `advanceOnCount`, `advanceOnSizeMiB`,
+`checkpointFrequency`, `deleteParallelism`), with durations rendered in the same
+Go-style grammar `spec` uses so the two are directly comparable.
+
+`cleanupSafetyMargin` appears here but is deliberately **not** settable: it is the grace
+window that stops kopia deleting index blobs a concurrent writer still needs.
 
 ### `catalog`
 

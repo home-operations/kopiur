@@ -25,7 +25,7 @@ use kube::runtime::events::{Event, EventType};
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::RepositoryRef;
+use kopiur_api::common::{CredentialProjection, RepositoryRef};
 use kopiur_api::snapshot::SnapshotPhase;
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy};
 use kopiur_mover::workspec::{
@@ -41,8 +41,9 @@ use crate::consts::{
     MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
     ORIGIN_LABEL, PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
-    SECURITY_CONTEXT_INHERITED_CONDITION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON,
-    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
+    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_INCOMPLETE_REASON, SOURCE_STAGED_CONDITION,
+    SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -238,6 +239,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // Job is not terminal yet, the owned-Job watch and the steady-state
             // requeue below both bring us back.
             reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await?;
+            // A Snapshot that succeeded under an older operator carries no projection
+            // pin, so its finalizer would strand once the recipe is deleted (#255).
+            // This branch is the one every terminal Snapshot passes through on startup.
+            backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
             // §13(c): spec.pin stays live after the mover Job is gone.
             return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
         }
@@ -326,6 +331,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await? {
                 return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
             }
+            // `Failed` does NOT imply "no kopia snapshot to delete": a run can create the
+            // snapshot, stamp Succeeded + status.snapshot, and only then fail its
+            // afterSnapshot hook — `patch_hook_failure` merge-patches phase/conditions and
+            // leaves status.snapshot intact. Such a Snapshot still owns real repository
+            // data behind a `Delete` finalizer, so it needs the projection pin exactly as
+            // much as a Succeeded one. Self-gated, and a no-op when there is no snapshot.
+            backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
             return Ok(Action::await_change());
         }
         RunDecision::Wait => return Ok(Action::await_change()),
@@ -931,6 +943,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             &namespace,
             backup,
             claim,
+            // The mount the assessment must reason about — already decided, so this
+            // costs nothing to thread (`readOnly: false` changes what fsGroup means).
+            source_volume.as_ref().is_none_or(|v| v.read_only),
             &resolved_mover.security_context,
             resolved_mover.pod_security_context.as_ref(),
             mover_security.unfiltered_pods.as_deref(),
@@ -1106,6 +1121,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         io::StagingOutcome::Ready(staged) => {
             // Mount the staged PVC in place of the live source — same mount path and
             // kopia source path, so the snapshot's recorded identity is unchanged.
+            // `read_only` carries over deliberately: `readOnly: false` (#254) asks the
+            // kubelet to apply fsGroup to whatever the mover mounts, and under a staged
+            // copyMethod that IS the staged PVC. Dropping it here would silently disable
+            // the flag for Snapshot/Clone — the very copyMethods where it is safe.
             if let Some(mount) = source_volume.as_mut() {
                 *mount = VolumeMountSpec::pvc(
                     staged.pvc_name.clone(),
@@ -1681,16 +1700,50 @@ async fn resolve_repo_for_deletion(
 /// needs projection — and honoring a (possibly still-live, mid-namespace-
 /// teardown) recipe's opt-in there would mint a copy owned by the repository
 /// CR, which can be cluster-scoped: an invalid ownerRef on a namespaced Secret
-/// is never GC'd, a permanent leak. Hardcoded off for the cascade; the
-/// same-namespace delete follows the recipe (absent recipe defaults to off).
+/// is never GC'd, a permanent leak. Hardcoded off for the cascade.
+///
+/// For the same-namespace delete the **pin wins** over the live recipe, exactly as
+/// [`resolve_repo_for_deletion`] prefers `status.resolved.repository`: this path's job
+/// is to reproduce the conditions the run actually executed under, not to honor current
+/// intent. Reading the live recipe first would strand a `Snapshot` whose recipe merely
+/// *changed* — flip `credentialProjection.enabled` to false after a successful run and
+/// the delete Job would look for a namespace-local Secret that projection was supposed
+/// to supply, blocking the finalizer forever (#255, the same failure the pin exists to
+/// prevent, reached by a different route). Re-projecting against a revoked opt-in is
+/// cheap and bounded: one Secret owned by the `Snapshot`, GC'd the instant the finalizer
+/// clears — and the repository owner's `credentialProjection.allowed` remains a live gate
+/// that this cannot bypass.
 pub(crate) fn delete_projection_enabled(
     cross_namespace: bool,
     config: Option<&SnapshotPolicy>,
+    pinned: Option<&CredentialProjection>,
 ) -> bool {
     !cross_namespace
-        && config
-            .and_then(|c| c.spec.credential_projection.as_ref())
+        && pinned
+            .or_else(|| config.and_then(|c| c.spec.credential_projection.as_ref()))
             .is_some_and(|p| p.enabled)
+}
+
+/// Append the deletion-path escape hatch to a credentials error message.
+///
+/// `resolve_mover_creds`'s messages are shared by every mover, so they cannot name a
+/// remedy that exists only for a `Snapshot`'s finalizer. Here they can — and must: on
+/// this path a credential error does not merely fail a run, it blocks the CR from being
+/// deleted at all, and the user is owed the way out (#255).
+///
+/// This covers the residue the pin deliberately does not: `credentialProjection.allowed`
+/// is resolved from the LIVE repository, so an owner who revokes it — or deletes the
+/// `ClusterRepository` outright — still denies projection, correctly. Honoring a revoked
+/// consent on the strength of a stale pin would be worse than a stuck finalizer; naming
+/// the escape hatch is the right answer instead.
+fn stuck_finalizer_hint(msg: &str, namespace: &str, name: &str) -> String {
+    format!(
+        "{msg} Until this resolves, Snapshot `{namespace}/{name}` stays terminating: \
+         `deletionPolicy: Delete` holds the `{SNAPSHOT_CLEANUP_FINALIZER}` finalizer until the \
+         kopia snapshot is deleted. To release the CR WITHOUT deleting the kopia snapshot — it \
+         stays in the repository and the catalog can rediscover it — annotate the Snapshot \
+         `{SKIP_SNAPSHOT_CLEANUP_ANNOTATION}: \"true\"`."
+    )
 }
 
 /// Drive a SnapshotDelete mover Job for the deletion path. Creates the Job if
@@ -1791,11 +1844,19 @@ async fn delete_snapshot_via_job(
         &io::CredsPrefix::snapshot_delete(name),
         &owner,
         repo,
-        delete_projection_enabled(cross_namespace, config.as_ref()),
+        delete_projection_enabled(cross_namespace, config.as_ref(), pinned_projection(backup)),
         io::repo_kind_str(repo_ref.kind),
         &repo_ref.name,
     )
-    .await?;
+    .await
+    // Enrich, never reclassify: only MissingDependency carries an actionable
+    // credentials message, and every other variant passes through untouched.
+    .map_err(|e| match e {
+        Error::MissingDependency(m) => {
+            Error::MissingDependency(stuck_finalizer_hint(&m, namespace, name))
+        }
+        other => other,
+    })?;
     if creds.projected > 0 {
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
@@ -2402,10 +2463,12 @@ async fn resolve_recipe(
 /// listing again (the `pvcConsumer` resolver's). It MUST be unfiltered: `workload_identities`
 /// needs every pod mounting the claim, and a narrowed writer set can flip a mismatch to a false
 /// `Compatible`. `None` → list here, as every other caller does.
+#[allow(clippy::too_many_arguments)]
 async fn assess_backup_security_context(
     namespace: &str,
     backup: &Snapshot,
     claim: &str,
+    source_read_only: bool,
     sc: &k8s_openapi::api::core::v1::SecurityContext,
     psc: Option<&k8s_openapi::api::core::v1::PodSecurityContext>,
     listed_pods: Option<&[Pod]>,
@@ -2434,7 +2497,7 @@ async fn assess_backup_security_context(
     let mover = kopiur_api::secctx_compat::mover_identity(sc, psc);
     let identities = kopiur_api::secctx_compat::workload_identities(pods, claim);
     if let kopiur_api::secctx_compat::MoverReadCompat::Compatible { basis } =
-        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities)
+        kopiur_api::secctx_compat::assess_read_compat(&mover, &identities, source_read_only)
     {
         // Name the basis and the actual UID: a bare "compatible" is what let the old
         // "by construction" claim hide the fact that nothing had been checked.
@@ -2895,6 +2958,61 @@ async fn reap_backup_creds_once(
     )
     .await?;
     Ok(true)
+}
+
+/// Backfill `status.resolved.credentialProjection` onto a `Snapshot` that ran before the
+/// pin existed (#255).
+///
+/// The pin is written at job-creation time (`resolved_run_status`), so every run from this
+/// version on carries it. A `Snapshot` that already succeeded under an older operator has
+/// none — and would strand its finalizer the moment its `SnapshotPolicy` is deleted. Every
+/// `Snapshot` reconciles at least once on operator startup and lands here, so backfilling
+/// from this branch converts the whole existing fleet before any recipe can disappear.
+///
+/// Cost: gated on the pin being absent AND a kopia snapshot existing, so it is one GET per
+/// legacy `Snapshot`, once — the patch makes the guard false forever after. The one case
+/// that re-GETs per steady-state pass is a legacy `Snapshot` whose recipe is ALREADY gone,
+/// a shrinking set that is by definition already stuck. That retry is deliberate rather
+/// than tolerated: re-creating the `SnapshotPolicy` is one of the documented remedies for
+/// that state, and re-checking makes it self-healing.
+async fn backfill_projection_pin(
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let has_snapshot = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .is_some();
+    // Already pinned, or there is no kopia snapshot for a finalizer to delete — either
+    // way the deletion path never consults the pin.
+    if pinned_projection(backup).is_some() || !has_snapshot {
+        return Ok(());
+    }
+    let Some(policy_ref) = backup.spec.policy_ref.as_ref() else {
+        return Ok(());
+    };
+    let cfg_ns = policy_ref.namespace.as_deref().unwrap_or(namespace);
+    let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
+    let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
+        return Ok(());
+    };
+    let pinned = plan::projection_to_pin(&config);
+    io::patch_status(
+        api,
+        name,
+        serde_json::json!({ "resolved": { "credentialProjection": pinned } }),
+    )
+    .await?;
+    tracing::info!(
+        backup = %name,
+        enabled = pinned.enabled,
+        "backfilled the credential-projection pin onto a Snapshot that predates it"
+    );
+    Ok(())
 }
 
 /// What the running-Job staged-PVC bind watchdog observed.

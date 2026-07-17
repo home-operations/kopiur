@@ -83,6 +83,6 @@ The CSI staging objects the run created when the source was captured via `copyMe
 | `observedGeneration` | `metadata.generation` last reconciled, for staleness detection. |
 | `timing` | `startTime`, `endTime`, `durationSeconds` of the run. |
 | `job` | The mover Job (`name`, `attempts`) backing a scheduled/manual run; absent for discovered. |
-| `resolved` | Frozen recipe values pinned at run time — the `repository` targeted and the concrete `sources` (PVCs + kopia paths) backed up. |
+| `resolved` | Frozen recipe values pinned at run time — the `repository` targeted, the concrete `sources` (PVCs + kopia paths) backed up, and the `credentialProjection` opt-in that was in force. These exist so the cleanup finalizer keeps working after the `SnapshotPolicy` is deleted: it needs to reach the repository to delete the kopia snapshot, and the recipe is where all three normally live. Absent `credentialProjection` means the run predates the pin, not that projection was off. |
 | `pinned` | The observed kopia-side pin state: `true` if pinned, `false` if unpinned, absent before any pin reconcile. |
 | `hooks` | Completion timestamps so each hook list (`beforeSnapshot`/`afterSnapshot`) runs exactly once per Snapshot. |

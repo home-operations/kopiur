@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
+use kopiur_api::common::{
+    CredentialProjection, NamespaceDeletePolicy, RepositoryKind, RepositoryRef,
+};
 use kopiur_api::snapshot::SnapshotPhase;
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy};
 use kopiur_mover::workspec::{MoverWorkSpec, ResolvedIdentity as MoverIdentity};
@@ -196,7 +198,35 @@ pub fn resolved_run_status(
             pvc,
             source_path: Some(work_spec.identity.source_path.clone()),
         }],
+        credential_projection: Some(projection_to_pin(config)),
     }
+}
+
+/// The recipe's credential-projection opt-in, normalized for freezing into
+/// `status.resolved` (#255). An absent `spec.credentialProjection` yields an explicit
+/// `enabled: false` rather than `None`: the deletion path reads `None` as "this run
+/// predates the pin", so a recipe that never opted in must not be indistinguishable
+/// from one that was never recorded — otherwise the backfill could never converge and
+/// would re-read the recipe on every steady-state pass, forever.
+pub fn projection_to_pin(config: &SnapshotPolicy) -> CredentialProjection {
+    config
+        .spec
+        .credential_projection
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The credential-projection opt-in pinned into `status.resolved` at run time.
+/// `None` means the `Snapshot` predates the pin (or never ran) — NOT that projection
+/// was off; conflating the two is the bug the pin exists to fix (#255).
+pub(super) fn pinned_projection(backup: &Snapshot) -> Option<&CredentialProjection> {
+    backup
+        .status
+        .as_ref()?
+        .resolved
+        .as_ref()?
+        .credential_projection
+        .as_ref()
 }
 
 /// The mover identity pinned into `status.snapshot.identity` when the snapshot

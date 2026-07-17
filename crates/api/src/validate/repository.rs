@@ -126,6 +126,94 @@ pub fn validate_backup_deletion_policy(
     }
 }
 
+/// `spec.parameters` is well-formed and applicable (#258). Shared by both repository
+/// kinds via `context`, exactly like [`validate_repository_health`].
+///
+/// Two classes of rule:
+///
+/// - **Grammar.** Every duration must parse, and every count must be positive. The
+///   grammar check matters more here than elsewhere: these are the first CRD durations
+///   that reach a kopia CLI, and this module's contract is that a value the webhook
+///   admits never fails at reconcile time.
+/// - **Applicability.** A `mode: ReadOnly` repository can never apply them — kopia
+///   hard-errors `set-parameters` on a read-only connection — so declaring them there is
+///   a configuration mistake. Reject it rather than silently ignore the block, matching
+///   how `volumeSnapshotClassName` + an NFS source is handled.
+pub fn validate_repository_parameters(
+    parameters: Option<&crate::repository::RepositoryParameters>,
+    mode: crate::common::RepositoryMode,
+    context: &str,
+) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    let Some(epoch) = parameters.and_then(|p| p.epoch.as_ref()) else {
+        return errs;
+    };
+    if !mode.allows_writes() {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: format!("{context} spec.parameters.epoch"),
+            reason: "a ReadOnly repository cannot apply repository parameters: \
+                     `kopia repository set-parameters` rewrites the repository-global format \
+                     blob and fails outright on a read-only connection. Remove \
+                     spec.parameters, or set mode: ReadWrite on the cluster that owns this \
+                     repository (in a multi-cluster layout, declare the parameters there — \
+                     they are a property of the repository, not of each consumer)"
+                .to_string(),
+        });
+    }
+    let mut duration = |field: &str, raw: &Option<String>| {
+        let Some(raw) = raw.as_deref() else { return };
+        let field = format!("{context} spec.parameters.epoch.{field}");
+        match crate::duration::parse_go_duration(raw) {
+            None => errs.push(ValidationError::InvalidFieldValue {
+                field,
+                reason: format!(
+                    "{raw:?} is not a valid duration. Use a Go-style duration with a single \
+                     unit, like 6h, 90m, or 30s; omit the field to leave kopia's current \
+                     value untouched"
+                ),
+            }),
+            // kopia stores these as a Go `time.Duration` — an i64 NANOSECOND count, so it
+            // tops out near 292 years, and `parse_go_duration` happily accepts far more
+            // than that (`"999999999999999999"` is a valid bare-seconds value). Bound it
+            // here rather than let the drift comparator's `as i64` wrap it to a negative
+            // number, and to keep this module's contract: a value the webhook admits must
+            // never fail at reconcile time.
+            Some(d) if i64::try_from(d.as_nanos()).is_err() => {
+                errs.push(ValidationError::InvalidFieldValue {
+                    field,
+                    reason: format!(
+                        "{raw:?} is too large: kopia stores epoch durations as a 64-bit \
+                         nanosecond count, so the maximum is roughly 292 years. Use a \
+                         realistic epoch duration (hours, e.g. 6h)"
+                    ),
+                });
+            }
+            Some(_) => {}
+        }
+    };
+    duration("minDuration", &epoch.min_duration);
+    duration("refreshFrequency", &epoch.refresh_frequency);
+
+    let mut positive = |field: &str, v: Option<i64>| {
+        if let Some(v) = v
+            && v <= 0
+        {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: format!("{context} spec.parameters.epoch.{field}"),
+                reason: format!(
+                    "must be > 0 (got {v}); omit the field to leave kopia's current value \
+                     untouched"
+                ),
+            });
+        }
+    };
+    positive("advanceOnCount", epoch.advance_on_count);
+    positive("advanceOnSizeMiB", epoch.advance_on_size_mb);
+    positive("checkpointFrequency", epoch.checkpoint_frequency);
+    positive("deleteParallelism", epoch.delete_parallelism);
+    errs
+}
+
 /// `spec.health` rules shared by `Repository` and `ClusterRepository`
 /// (ADR-0005 §13). The index-blob warning threshold must be non-negative: a
 /// negative count is nonsensical, and `0` is the documented sentinel that
@@ -331,7 +419,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None,
+/// #         bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None, parameters: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -408,6 +496,11 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Some(server) = &spec.server {
         errs.extend(validate_server(server, spec.mode));
     }
+    errs.extend(validate_repository_parameters(
+        spec.parameters.as_ref(),
+        spec.mode,
+        "Repository",
+    ));
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "Repository") {
         errs.push(e);
     }
@@ -885,6 +978,11 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
         }
         errs.extend(validate_server(&server.server, spec.mode));
     }
+    errs.extend(validate_repository_parameters(
+        spec.parameters.as_ref(),
+        spec.mode,
+        "ClusterRepository",
+    ));
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "ClusterRepository") {
         errs.push(e);
     }

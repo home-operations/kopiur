@@ -1045,10 +1045,86 @@ async fn run_bootstrap(
         }
     }
 
-    let unique_id = match client.repository_status().await {
-        Ok(s) => Some(s.unique_id_hex),
+    // One status read serves both the unique id and the epoch-parameter reconcile below —
+    // it already sits after the create/connect and after the maintenance-owner block, which
+    // is exactly where the mutable parameters can be applied.
+    let mut status = match client.repository_status().await {
+        Ok(s) => s,
         Err(e) => return BootstrapResult::failed(&e),
     };
+    let unique_id = Some(status.unique_id_hex.clone());
+
+    let mut epoch_error: Option<String> = None;
+    // Reconcile mutable repository parameters (#258). Applies on the connect-to-existing
+    // branch as much as on a create — that is the point: `spec.parameters.epoch` is a
+    // declaration about a LIVE repository, and the generation-bump re-bootstrap is what
+    // delivers an edit to it.
+    //
+    // Best-effort, exactly like the maintenance-owner stamp above: a bad parameter must not
+    // fail the bootstrap and take an otherwise-healthy repository to `Failed`. The apply
+    // stays visible either way — `status.parameters.epoch` mirrors what the repository
+    // actually reports, so a failed apply shows up as drift from `spec` rather than as
+    // silence.
+    //
+    // Only on drift. `set-parameters` rewrites the format blob and invalidates every other
+    // kopia client's cached copy of it ("you must disconnect and re-connect all other Kopia
+    // clients"), so an unconditional apply would churn the whole fleet on every bootstrap.
+    if op.read_only {
+        // Defense in depth: admission rejects `mode: ReadOnly` + `spec.parameters`, and the
+        // controller does not send them — but `set-parameters` HARD-ERRORS on a read-only
+        // connection (`storage is read-only`), so never risk it.
+        if !op.epoch_parameters.is_empty() {
+            warn!("skipping repository set-parameters: this repository is connected read-only");
+        }
+    } else if let Some(args) = kopiur_mover::workspec::epoch_drift(
+        &op.epoch_parameters,
+        status.content_format.epoch_parameters.as_ref(),
+    ) {
+        match client.repository_set_parameters(&args).await {
+            Ok(()) => {
+                info!(
+                    flags = ?args.args(),
+                    "applied kopia repository set-parameters (spec.parameters drifted)"
+                );
+                // Re-read so the mirror reports what LANDED, not the pre-apply observation
+                // — otherwise status would show drift immediately after converging. Only
+                // on the drift path, so the steady state still costs one status call.
+                match client.repository_status().await {
+                    Ok(s) => status = s,
+                    Err(e) => warn!(
+                        class = %e.class(),
+                        "set-parameters applied but re-reading status failed; \
+                         status.parameters will lag until the next bootstrap"
+                    ),
+                }
+            }
+            Err(e) => {
+                // Best-effort, like the maintenance-owner restamp above: a bad parameter
+                // must not take an otherwise healthy repository to `Failed`. But it must
+                // not be silent either — carry the reason back so the controller can raise
+                // a Warning event, rather than leaving only this log line and a
+                // status.parameters that quietly disagrees with spec.
+                warn!(
+                    class = %e.class(),
+                    "could not apply repository set-parameters; continuing bootstrap — \
+                     status.parameters.epoch will show the drift"
+                );
+                epoch_error = Some(format!(
+                    "kopia repository set-parameters failed ({}): {}. spec.parameters.epoch \
+                     was NOT applied — status.parameters.epoch reports what the repository \
+                     actually has. The bootstrap re-runs on the next spec change; edit \
+                     spec.parameters.epoch to retry.",
+                    e.class(),
+                    e
+                ));
+            }
+        }
+    }
+    let observed_epoch = status
+        .content_format
+        .epoch_parameters
+        .as_ref()
+        .map(kopiur_mover::workspec::observed_epoch);
 
     // Always list to report an authoritative snapshot count (unaffected by either
     // the foreign-suffix prefilter or the cap below); return the entries for
@@ -1104,6 +1180,7 @@ async fn run_bootstrap(
         foreign_suffix_dropped,
         index_blob_count,
     )
+    .with_epoch(observed_epoch, epoch_error)
 }
 
 /// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning

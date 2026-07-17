@@ -884,8 +884,20 @@ spec:
                 items:
                   description: A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
                   properties:
+                    acknowledgeLiveMutation:
+                      description: |-
+                        Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet
+                        recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it
+                        group-writable — permanently, while the workload is running. Required for that
+                        combination alone.
+
+                        Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to
+                        carry, and rejecting a stale one would make switching `copyMethod` between
+                        `Direct` and `Snapshot`/`Clone` a two-step edit in both directions.
+                      nullable: true
+                      type: boolean
                     nfs:
-                      description: An inline NFS export to back up directly, mounted read-only. Mutually exclusive with `pvc`/`pvcSelector`.
+                      description: An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
                       nullable: true
                       properties:
                         path:
@@ -954,6 +966,23 @@ spec:
                               type: array
                           type: object
                       type: object
+                    readOnly:
+                      default: true
+                      description: |-
+                        Mount the source read-only (default `true`; kopia only ever reads it).
+
+                        Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
+                        `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it
+                        skips that walk entirely on a read-only mount, which is why a mover
+                        `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under
+                        `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and
+                        never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume,
+                        which requires `acknowledgeLiveMutation`.
+
+                        Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to
+                        in-tree NFS volumes at all, so a read-write mount would grant nothing.
+                      nullable: true
+                      type: boolean
                     sourcePathOverride:
                       description: What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
                       maxLength: 4096
@@ -986,8 +1015,9 @@ spec:
                     description: |-
                       Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes.
                       `[ReadOnlyMany]` pairs with snapshot-backed read-only classes (e.g. CephFS
-                      `backingSnapshot`); the mover always mounts the staged PVC read-only
-                      regardless of the mode.
+                      `backingSnapshot`); the mover mounts the staged PVC read-only to match, and
+                      rejects it at admission if a source sets `readOnly: false` (a read-only stage
+                      cannot be mounted read-write).
                     items:
                       description: A Kubernetes PersistentVolumeClaim access mode.
                       enum:

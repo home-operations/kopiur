@@ -112,3 +112,63 @@ fn all_examples_match_crd_field_shapes() {
         "expected to validate >=20 kopiur.home-operations.com docs, got {kopia_docs}"
     );
 }
+
+/// The new #254/#258 examples do not merely PARSE — their optional keys survive the
+/// round trip.
+///
+/// kopiur's API types deliberately do not set `deny_unknown_fields`, so a misspelled
+/// optional key (`advanceOnSizeMB` where the field is `advanceOnSizeMiB`) deserializes
+/// perfectly and is silently DROPPED. Every other check in this file would stay green
+/// while the example documented a field that does nothing. Re-serializing and looking for
+/// the value is the only way to catch that.
+#[test]
+fn new_optional_example_keys_survive_the_round_trip() {
+    let dir = examples_dir();
+    let rt = |file: &str, kind: &str| -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap();
+        for doc in text.split("\n---") {
+            let Ok(v) = serde_yaml::from_str::<serde_json::Value>(doc) else {
+                continue;
+            };
+            if v.get("kind").and_then(|k| k.as_str()) != Some(kind) {
+                continue;
+            }
+            let spec = v.get("spec").expect("doc has a spec").clone();
+            return match kind {
+                "SnapshotPolicy" => serde_json::to_value(
+                    serde_json::from_value::<SnapshotPolicySpec>(spec).unwrap(),
+                )
+                .unwrap(),
+                "Repository" => {
+                    serde_json::to_value(serde_json::from_value::<RepositorySpec>(spec).unwrap())
+                        .unwrap()
+                }
+                other => panic!("unhandled kind {other}"),
+            };
+        }
+        panic!("{file}: no {kind} document");
+    };
+
+    // #254: readOnly must round-trip as false, not vanish.
+    let p = rt("31-source-fsgroup-normalize.yaml", "SnapshotPolicy");
+    assert_eq!(
+        p["sources"][0]["readOnly"],
+        serde_json::json!(false),
+        "sources[].readOnly must survive: {p}"
+    );
+    let p = rt("32-source-writable-direct.yaml", "SnapshotPolicy");
+    assert_eq!(p["sources"][0]["readOnly"], serde_json::json!(false));
+    assert_eq!(
+        p["sources"][0]["acknowledgeLiveMutation"],
+        serde_json::json!(true),
+        "the acknowledgement must survive, or the example documents a no-op: {p}"
+    );
+
+    // #258: the epoch block must survive.
+    let r = rt("33-repository-epoch-parameters.yaml", "Repository");
+    assert_eq!(
+        r["parameters"]["epoch"]["minDuration"],
+        serde_json::json!("6h"),
+        "spec.parameters.epoch.minDuration must survive: {r}"
+    );
+}

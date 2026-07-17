@@ -2131,6 +2131,58 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              parameters:
+                description: Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
+                nullable: true
+                properties:
+                  epoch:
+                    description: |-
+                      Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
+                      blobs get compacted.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: |-
+                          Index blobs in an epoch that trigger an advance, once older than `minDuration`
+                          (kopia default `20`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: |-
+                          Total index size in an epoch that triggers an advance, once older than `minDuration`
+                          (kopia default `10` MiB).
+
+                          Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
+                          (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
+                          kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760
+                          bytes — even though kopia's own log renders the result as "MB". That ambiguity is
+                          this field's main hazard; the API surface should not reproduce it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      checkpointFrequency:
+                        description: Epochs between full index checkpoints (kopia default `7`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      deleteParallelism:
+                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      minDuration:
+                        description: |-
+                          Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
+                          (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+                        nullable: true
+                        type: string
+                      refreshFrequency:
+                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
               scheduleDefaults:
                 description: |-
                   Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
@@ -2618,6 +2670,57 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              parameters:
+                description: |-
+                  The kopia repository parameters actually observed at the last bootstrap. Compare
+                  against `spec.parameters` to see whether a declared value landed.
+                nullable: true
+                properties:
+                  epoch:
+                    description: The epoch parameters the repository reports.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: Observed index-blob count that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      checkpointFrequency:
+                        description: Observed epochs between full index checkpoints.
+                        format: int64
+                        type: integer
+                      cleanupSafetyMargin:
+                        description: |-
+                          Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis;
+                          not settable through `spec.parameters`.
+                        type: string
+                      deleteParallelism:
+                        description: Observed epoch-cleanup delete parallelism.
+                        format: int64
+                        type: integer
+                      enabled:
+                        description: Whether kopia's epoch manager is enabled on this repository at all.
+                        type: boolean
+                      minDuration:
+                        description: Observed minimum epoch age, as a Go-style duration.
+                        type: string
+                      refreshFrequency:
+                        description: Observed epoch-state refresh frequency, as a Go-style duration.
+                        type: string
+                    required:
+                    - advanceOnCount
+                    - advanceOnSizeMiB
+                    - checkpointFrequency
+                    - cleanupSafetyMargin
+                    - deleteParallelism
+                    - enabled
+                    - minDuration
+                    - refreshFrequency
+                    type: object
+                type: object
               phase:
                 description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:
@@ -4907,6 +5010,58 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              parameters:
+                description: Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
+                nullable: true
+                properties:
+                  epoch:
+                    description: |-
+                      Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
+                      blobs get compacted.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: |-
+                          Index blobs in an epoch that trigger an advance, once older than `minDuration`
+                          (kopia default `20`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: |-
+                          Total index size in an epoch that triggers an advance, once older than `minDuration`
+                          (kopia default `10` MiB).
+
+                          Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
+                          (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
+                          kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760
+                          bytes — even though kopia's own log renders the result as "MB". That ambiguity is
+                          this field's main hazard; the API surface should not reproduce it.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      checkpointFrequency:
+                        description: Epochs between full index checkpoints (kopia default `7`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      deleteParallelism:
+                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      minDuration:
+                        description: |-
+                          Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
+                          (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+                        nullable: true
+                        type: string
+                      refreshFrequency:
+                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
               scheduleDefaults:
                 description: |-
                   Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
@@ -5405,6 +5560,57 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              parameters:
+                description: |-
+                  The kopia repository parameters actually observed at the last bootstrap. Compare
+                  against `spec.parameters` to see whether a declared value landed.
+                nullable: true
+                properties:
+                  epoch:
+                    description: The epoch parameters the repository reports.
+                    nullable: true
+                    properties:
+                      advanceOnCount:
+                        description: Observed index-blob count that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      advanceOnSizeMiB:
+                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        format: int64
+                        type: integer
+                      checkpointFrequency:
+                        description: Observed epochs between full index checkpoints.
+                        format: int64
+                        type: integer
+                      cleanupSafetyMargin:
+                        description: |-
+                          Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis;
+                          not settable through `spec.parameters`.
+                        type: string
+                      deleteParallelism:
+                        description: Observed epoch-cleanup delete parallelism.
+                        format: int64
+                        type: integer
+                      enabled:
+                        description: Whether kopia's epoch manager is enabled on this repository at all.
+                        type: boolean
+                      minDuration:
+                        description: Observed minimum epoch age, as a Go-style duration.
+                        type: string
+                      refreshFrequency:
+                        description: Observed epoch-state refresh frequency, as a Go-style duration.
+                        type: string
+                    required:
+                    - advanceOnCount
+                    - advanceOnSizeMiB
+                    - checkpointFrequency
+                    - cleanupSafetyMargin
+                    - deleteParallelism
+                    - enabled
+                    - minDuration
+                    - refreshFrequency
+                    type: object
+                type: object
               phase:
                 description: Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
                 enum:
@@ -6394,8 +6600,20 @@ spec:
                 items:
                   description: A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
                   properties:
+                    acknowledgeLiveMutation:
+                      description: |-
+                        Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet
+                        recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it
+                        group-writable — permanently, while the workload is running. Required for that
+                        combination alone.
+
+                        Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to
+                        carry, and rejecting a stale one would make switching `copyMethod` between
+                        `Direct` and `Snapshot`/`Clone` a two-step edit in both directions.
+                      nullable: true
+                      type: boolean
                     nfs:
-                      description: An inline NFS export to back up directly, mounted read-only. Mutually exclusive with `pvc`/`pvcSelector`.
+                      description: An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
                       nullable: true
                       properties:
                         path:
@@ -6464,6 +6682,23 @@ spec:
                               type: array
                           type: object
                       type: object
+                    readOnly:
+                      default: true
+                      description: |-
+                        Mount the source read-only (default `true`; kopia only ever reads it).
+
+                        Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
+                        `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it
+                        skips that walk entirely on a read-only mount, which is why a mover
+                        `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under
+                        `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and
+                        never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume,
+                        which requires `acknowledgeLiveMutation`.
+
+                        Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to
+                        in-tree NFS volumes at all, so a read-write mount would grant nothing.
+                      nullable: true
+                      type: boolean
                     sourcePathOverride:
                       description: What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
                       maxLength: 4096
@@ -6496,8 +6731,9 @@ spec:
                     description: |-
                       Access modes for the staged PVC. Empty ⇒ copy the source PVC's modes.
                       `[ReadOnlyMany]` pairs with snapshot-backed read-only classes (e.g. CephFS
-                      `backingSnapshot`); the mover always mounts the staged PVC read-only
-                      regardless of the mode.
+                      `backingSnapshot`); the mover mounts the staged PVC read-only to match, and
+                      rejects it at admission if a source sets `readOnly: false` (a read-only stage
+                      cannot be mounted read-write).
                     items:
                       description: A Kubernetes PersistentVolumeClaim access mode.
                       enum:
@@ -7054,6 +7290,23 @@ spec:
                 description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true
                 properties:
+                  credentialProjection:
+                    description: |-
+                      The recipe's `spec.credentialProjection` as it stood for this run.
+
+                      The deletion path re-projects the mover's credentials, but the opt-in lives on the
+                      `SnapshotPolicy` — which a user may delete first. Pinning it here lets the finalizer
+                      honor the opt-in that was actually in force, instead of reading an absent recipe as
+                      "projection off" and blocking on a Secret that was never meant to be namespace-local
+                      (#255). Absent only on a `Snapshot` that predates the pin or never ran; a run always
+                      writes it, including `enabled: false`, so absent stays distinguishable from off.
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: false
+                        description: Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default.
+                        type: boolean
+                    type: object
                   repository:
                     description: The repository this run targeted, frozen at run time.
                     nullable: true

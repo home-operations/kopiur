@@ -13,8 +13,8 @@ use crate::common::{
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::repository::{
-    BootstrapSpec, CatalogStatus, RepositoryHealthSpec, RepositoryHealthStatus, RepositoryPhase,
-    StorageStats,
+    BootstrapSpec, CatalogStatus, ObservedRepositoryParameters, RepositoryHealthSpec,
+    RepositoryHealthStatus, RepositoryParameters, RepositoryPhase, StorageStats,
 };
 use crate::server::{ClusterServerSpec, ServerStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
@@ -104,6 +104,9 @@ pub struct ClusterRepositorySpec {
     /// Repository health thresholds (tunes the index-blob-count warning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthSpec>,
+    /// Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<RepositoryParameters>,
 }
 
 /// The repository-owner side of credential projection on a `ClusterRepository`.
@@ -184,6 +187,10 @@ pub struct ClusterRepositoryStatus {
     /// Backend health-probe state (`spec.health.probe`), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<RepositoryHealthStatus>,
+    /// The kopia repository parameters actually observed at the last bootstrap. Compare
+    /// against `spec.parameters` to see whether a declared value landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<ObservedRepositoryParameters>,
     /// Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,

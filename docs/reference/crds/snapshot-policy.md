@@ -40,6 +40,22 @@ Per-source fields:
   source path is derived: `PvcName` (default) uses the name alone;
   `PvcNamespacedName` uses `<namespace>/<name>` to disambiguate same-named PVCs
   across namespaces.
+- `readOnly` — mount the source read-only (default `true`; kopia only reads it).
+  Set `false` **only** to make `fsGroup` apply: the kubelet implements `fsGroup`
+  by recursively rewriting the volume's group ownership, and skips that rewrite
+  entirely on a read-only mount, so a mover's `fsGroup`/`fsGroupChangePolicy` is
+  otherwise inert here. Rejected at admission on an `nfs` source (the kubelet
+  never applies `fsGroup` to in-tree NFS volumes, so it cannot help) and when
+  `staging.accessModes` is `[ReadOnlyMany]` (a read-only stage cannot be mounted
+  read-write).
+- `acknowledgeLiveMutation` — required with `copyMethod: Direct` + `readOnly:
+  false`, the one combination that reaches the **live** volume: the kubelet will
+  recursively chgrp your running application's files to the mover's `fsGroup`
+  (`65532` by default) and make them group-writable, permanently. Under
+  `Snapshot`/`Clone` the rewrite lands on a throwaway staged PVC and no
+  acknowledgement is needed. Ignored where it is not needed, so switching
+  `copyMethod` is never a two-step edit. See
+  [Copy methods](../../copy-methods.md#making-fsgroup-apply-to-the-source).
 
 ### `copyMethod`
 
@@ -47,8 +63,9 @@ How the source volume is captured before kopia reads it. `Snapshot` (the
 default) takes a point-in-time CSI volume snapshot, giving a crash-consistent
 capture decoupled from the app's node; it needs the CSI snapshot stack and a
 `VolumeSnapshotClass` for the source's driver. `Clone` takes a CSI volume
-clone, mounted read-only, for drivers that support cloning but not
-snapshotting. `Direct` reads the live PVC with no intermediate snapshot or
+clone, for drivers that support cloning but not snapshotting. Both stages are
+mounted per `sources[].readOnly` — read-only by default. `Direct` reads the live
+PVC with no intermediate snapshot or
 clone — it works on **any** storage with no CSI snapshot stack required, but
 gives no point-in-time guarantee (the mover co-locates on the volume's node
 for RWO); set it explicitly for non-CSI/static sources or clusters without the
@@ -75,8 +92,9 @@ mover:
   read-only mount instead of a minutes-long full subvolume clone.
 - `accessModes` — access modes for the staged PVC (absent ⇒ copy the source's);
   a closed enum of the four Kubernetes modes. `[ReadOnlyMany]` pairs with
-  snapshot-backed read-only classes; the mover always mounts the stage
-  read-only regardless.
+  snapshot-backed read-only classes. The mover mounts the stage read-only
+  unless a source sets `readOnly: false`, which `[ReadOnlyMany]` is rejected
+  with (a read-only stage cannot be mounted read-write).
 
 The two overrides need a staged PVC to act on, so they are **rejected at
 admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources. See

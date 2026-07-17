@@ -1225,3 +1225,67 @@ fn server_start_args_always_insecure() {
         assert!(server_start_args(&spec).iter().any(|a| a == "--insecure"));
     }
 }
+
+#[test]
+fn set_parameters_args_render_every_epoch_flag_in_a_stable_order() {
+    let opts = SetParametersArgs {
+        epoch_min_duration: Some("6h".into()),
+        epoch_refresh_frequency: Some("20m".into()),
+        epoch_advance_on_count: Some(20),
+        epoch_advance_on_size_mb: Some(10),
+        epoch_checkpoint_frequency: Some(7),
+        epoch_delete_parallelism: Some(4),
+    };
+    assert_eq!(
+        opts.args(),
+        vec![
+            "--epoch-min-duration",
+            "6h",
+            "--epoch-refresh-frequency",
+            "20m",
+            "--epoch-advance-on-count",
+            "20",
+            "--epoch-advance-on-size-mb",
+            "10",
+            "--epoch-checkpoint-frequency",
+            "7",
+            "--epoch-delete-parallelism",
+            "4"
+        ]
+    );
+    // Nothing set ⇒ no flags, and `repository_set_parameters` then skips the whole
+    // invocation. That is what keeps a repository that never mentions spec.parameters
+    // completely untouched by this feature.
+    assert!(SetParametersArgs::default().args().is_empty());
+    assert!(SetParametersArgs::default().is_empty());
+}
+
+#[test]
+fn set_parameters_emits_only_the_flags_that_are_set() {
+    // The drift comparator sends ONLY the parameters that actually differ, so a partial
+    // set must not smuggle defaults in for the rest.
+    let opts = SetParametersArgs {
+        epoch_min_duration: Some("6h".into()),
+        ..Default::default()
+    };
+    assert_eq!(opts.args(), vec!["--epoch-min-duration", "6h"]);
+}
+
+#[test]
+fn set_parameters_durations_always_carry_a_unit() {
+    // kopia's time.ParseDuration REJECTS a bare number: `--epoch-min-duration=3600` fails
+    // with `time: missing unit in duration "3600"`. Durations reach this builder
+    // pre-rendered (kopiur_api::render_go_duration) precisely so that cannot happen —
+    // this pins the contract at the boundary where it would otherwise be violated.
+    let opts = SetParametersArgs {
+        epoch_min_duration: Some("6h".into()),
+        epoch_refresh_frequency: Some("20m".into()),
+        ..Default::default()
+    };
+    for v in opts.args().iter().filter(|a| !a.starts_with("--")) {
+        assert!(
+            v.ends_with(['h', 'm', 's']),
+            "a duration passed to kopia must carry a unit, got {v:?}"
+        );
+    }
+}

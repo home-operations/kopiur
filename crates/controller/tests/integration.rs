@@ -95,6 +95,7 @@ fn sample_repository(name: &str) -> Repository {
             mode: Default::default(),
             suspend: false,
             health: None,
+            parameters: None,
             server: None,
         },
     )
@@ -119,6 +120,7 @@ fn sample_backup_config(name: &str) -> SnapshotPolicy {
                 nfs: None,
                 source_path_override: None,
                 source_path_strategy: None,
+                ..Default::default()
             }],
             copy_method: Default::default(),
             volume_snapshot_class_name: None,
