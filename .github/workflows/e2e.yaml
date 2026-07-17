@@ -17,11 +17,13 @@ on:
       - main
     paths-ignore:
       - "**.md"
+      - ".release-please-manifest.json"
   push:
     branches:
       - main
     paths-ignore:
       - "**.md"
+      - ".release-please-manifest.json"
       # The release workflow's krew step pushes plugins/kopiur.yaml to main with
       # the bot app token, which (unlike GITHUB_TOKEN) retriggers workflows —
       # ignore it so a release doesn't re-run this workflow for a manifest bump.
@@ -33,7 +35,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
