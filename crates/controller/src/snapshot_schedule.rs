@@ -896,11 +896,23 @@ fn slot_fire_blocked_by_terminating(existing: Option<&Snapshot>) -> bool {
     existing.is_some_and(|s| s.metadata.deletion_timestamp.is_some())
 }
 
+/// **Pure.** Whether `policy` is safe to fire a scheduled `Snapshot` against —
+/// it must not be mid-deletion. A `SnapshotPolicy` carrying a
+/// `metadata.deletionTimestamp` is treated EXACTLY like an absent one by
+/// [`policy_default_deletion_policy`]: firing into it would create a
+/// `Snapshot` after the policy's own deletion-cascade finalizer
+/// ([`crate::snapshot_policy::plan_policy_cascade`]) may already have LISTed
+/// its children, stranding a child the cascade never accounts for.
+fn policy_usable(policy: &SnapshotPolicy) -> bool {
+    policy.metadata.deletion_timestamp.is_none()
+}
+
 /// GET the target policy and return its `spec.defaultDeletionPolicy` (issue #238).
 /// Honors a cross-namespace `policyRef.namespace` exactly like
 /// [`policy_repo_timezone_default`], and — like it — returns an **error** rather
-/// than a value on a read failure or a missing policy, so the caller skips/retries
-/// the fire instead of firing with a wrong default.
+/// than a value on a read failure, a missing policy, or a TERMINATING policy
+/// ([`policy_usable`]), so the caller skips/retries the fire instead of firing
+/// with a wrong default or into a policy that is cascading its own children away.
 ///
 /// This must NOT degrade to `None` on a transient GET failure: `None` reaches the
 /// mutating webhook, which stamps the origin default `Delete`, so an apiserver blip
@@ -910,6 +922,10 @@ fn slot_fire_blocked_by_terminating(existing: Option<&Snapshot>) -> bool {
 /// safer than persisting the wrong retention semantics. A genuine `None` here means
 /// the policy exists but sets no default — then the webhook `Delete` default is
 /// correct — never "we couldn't read it."
+///
+/// Known residual (not eliminated here): a TOCTOU window between this check and
+/// the apply in [`create_scheduled_backup`] — the policy could start terminating
+/// in between, and a late-fired child dangles, bounded by `failedJobsHistoryLimit`.
 async fn policy_default_deletion_policy(
     client: &kube::Client,
     policy_ref: &PolicyRef,
@@ -920,6 +936,12 @@ async fn policy_default_deletion_policy(
     let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
         Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
     })?;
+    if !policy_usable(&policy) {
+        return Err(Error::MissingDependency(format!(
+            "SnapshotPolicy {policy_ns}/{} is being deleted",
+            policy_ref.name
+        )));
+    }
     Ok(policy.spec.default_deletion_policy)
 }
 
@@ -1228,6 +1250,78 @@ mod tests {
                 "a missing policy must be MissingDependency, got {r:?}"
             );
         }
+
+        #[tokio::test]
+        async fn terminating_policy_is_missing_dependency() {
+            // A policy mid-deletion must be treated EXACTLY like an absent one —
+            // never fire a Snapshot into a recipe whose own deletion cascade may
+            // already have LISTed (and so will never account for) this child.
+            let body = serde_json::json!({
+                "apiVersion": kopiur_api::consts::API_VERSION,
+                "kind": "SnapshotPolicy",
+                "metadata": {
+                    "name": "test-pvc",
+                    "namespace": "default",
+                    "deletionTimestamp": "2024-01-01T00:00:00Z",
+                },
+                "spec": { "repository": { "name": "repo" } },
+            });
+            let client = mock_client(StatusCode::OK, body);
+            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            assert!(
+                matches!(r, Err(Error::MissingDependency(_))),
+                "a terminating policy must be MissingDependency, got {r:?}"
+            );
+        }
+    }
+
+    /// A minimal `SnapshotPolicy` fixture with an optional deletionTimestamp,
+    /// for [`policy_usable`].
+    fn policy_fixture(terminating: bool) -> SnapshotPolicy {
+        let mut p = SnapshotPolicy::new(
+            "pg",
+            kopiur_api::SnapshotPolicySpec {
+                repository: kopiur_api::common::RepositoryRef {
+                    kind: Default::default(),
+                    name: "repo".into(),
+                    namespace: None,
+                },
+                identity: None,
+                sources: vec![],
+                copy_method: Default::default(),
+                volume_snapshot_class_name: None,
+                staging: None,
+                group_by: None,
+                retention: None,
+                default_deletion_policy: None,
+                compression: None,
+                files: None,
+                extra_args: vec![],
+                error_handling: None,
+                upload: None,
+                verification: None,
+                preflight: None,
+                suspend: false,
+                hooks: None,
+                mover: None,
+                credential_projection: None,
+                deletion: None,
+                adoption: None,
+            },
+        );
+        if terminating {
+            p.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ));
+        }
+        p
+    }
+
+    #[test]
+    fn policy_usable_true_when_live_false_when_terminating() {
+        assert!(policy_usable(&policy_fixture(false)));
+        assert!(!policy_usable(&policy_fixture(true)));
     }
 
     #[test]

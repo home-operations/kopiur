@@ -455,6 +455,12 @@ pub const CHECK_WEBHOOK_CONFIGURATION_ACTION: &str = "CheckWebhookConfiguration"
 pub const WEBHOOK_CERT_NOT_AFTER_ANNOTATION: &str =
     "kopiur.home-operations.com/webhook-cert-not-after";
 
+/// Finalizer on a `SnapshotPolicy`, driving the deletion cascade onto its
+/// `Snapshot` children (`spec.deletion.onPolicyDelete`,
+/// [`crate::snapshot_policy::plan_policy_cascade`]) before the CR is removed.
+/// Controller-only — the webhook never stamps it.
+pub const POLICY_CLEANUP_FINALIZER: &str = "kopiur.home-operations.com/policy-cleanup";
+
 // --- kopia web-UI server (spec.server) -------------------------------------
 
 /// Finalizer on a `ClusterRepository` whose server children (Deployment/Service/

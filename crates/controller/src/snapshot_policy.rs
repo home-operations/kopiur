@@ -23,10 +23,11 @@ use kopiur_api::retention::{SnapshotLike, select_kept};
 use kopiur_api::snapshot::PrunedBy;
 use kopiur_api::{Origin, Snapshot, SnapshotPolicy, validate};
 
-use crate::consts::CONFIG_LABEL;
+use crate::consts::{CONFIG_LABEL, POLICY_CLEANUP_FINALIZER};
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io;
+use crate::metrics::PolicyCascadeMode;
 
 /// A minimal view of a `Snapshot` for retention selection: its CR name (the id
 /// used in delete decisions) and its snapshot end time (the GFS bucketing key).
@@ -129,8 +130,9 @@ pub fn partition_retention_prune(
 }
 
 /// The plan for cascading a `SnapshotPolicy` deletion onto the `Snapshot` CRs
-/// carrying its config label (wired to the policy finalizer in M3; nothing
-/// calls this yet). **Pure** — no IO, no repository contact of its own.
+/// carrying its config label, executed by [`handle_policy_deletion`] (the
+/// [`POLICY_CLEANUP_FINALIZER`](crate::consts::POLICY_CLEANUP_FINALIZER) body).
+/// **Pure** — no IO, no repository contact of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyCascadePlan {
     /// `PolicyDeletePolicy::Retain`, live children: stamp `pruned-by:
@@ -221,6 +223,164 @@ fn classify_policy_cascade_child(
     }
 }
 
+/// Cap on combined cascade actions ([`PolicyCascadePlan::stamp_and_delete`] +
+/// [`PolicyCascadePlan::stamp_only`] + [`PolicyCascadePlan::delete_only`])
+/// executed by [`handle_policy_deletion`] in a single reconcile pass, so a
+/// policy with a very large child population can't balloon one reconcile's
+/// IO. Each pass re-LISTs and re-plans, so remaining work is simply picked up
+/// on the next pass.
+const POLICY_CASCADE_BATCH: usize = 50;
+
+/// One pass's execution slice of a [`PolicyCascadePlan`]: which prefix of each
+/// set to act on, in preference order (`stamp_and_delete`, then `stamp_only`,
+/// then `delete_only`), capped at `cap` combined actions. **Pure** — split out
+/// so the batching/ordering itself is unit-tested without a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PolicyCascadeBatch<'a> {
+    stamp_and_delete: &'a [String],
+    stamp_only: &'a [String],
+    delete_only: &'a [String],
+}
+
+/// **Pure.** See [`PolicyCascadeBatch`].
+fn slice_policy_cascade_batch(plan: &PolicyCascadePlan, cap: usize) -> PolicyCascadeBatch<'_> {
+    let sd_take = plan.stamp_and_delete.len().min(cap);
+    let so_take = plan.stamp_only.len().min(cap - sd_take);
+    let do_take = plan.delete_only.len().min(cap - sd_take - so_take);
+    PolicyCascadeBatch {
+        stamp_and_delete: &plan.stamp_and_delete[..sd_take],
+        stamp_only: &plan.stamp_only[..so_take],
+        delete_only: &plan.delete_only[..do_take],
+    }
+}
+
+/// Thin IO: execute one pass's [`slice_policy_cascade_batch`] over `plan`
+/// (capped at [`POLICY_CASCADE_BATCH`]). Every step is idempotent and
+/// 404-tolerant, so a crash mid-pass simply re-runs safely on the next
+/// reconcile. Each set's action is its own tiny helper (complexity ratchet:
+/// keeps this orchestrator a flat sequence of calls).
+async fn execute_policy_cascade_pass(
+    ctx: &Context,
+    backup_api: &Api<Snapshot>,
+    namespace: &str,
+    plan: &PolicyCascadePlan,
+) -> Result<()> {
+    let batch = slice_policy_cascade_batch(plan, POLICY_CASCADE_BATCH);
+    execute_stamp_and_delete(ctx, backup_api, namespace, batch.stamp_and_delete).await?;
+    execute_stamp_only(backup_api, namespace, batch.stamp_only).await?;
+    execute_delete_only(ctx, backup_api, namespace, batch.delete_only).await?;
+    Ok(())
+}
+
+/// `PolicyCascadeBatch::stamp_and_delete` half of [`execute_policy_cascade_pass`]:
+/// stamp `pruned-by: policy-cascade` then delete (Retain mode).
+async fn execute_stamp_and_delete(
+    ctx: &Context,
+    backup_api: &Api<Snapshot>,
+    namespace: &str,
+    names: &[String],
+) -> Result<()> {
+    for cr_name in names {
+        io::annotate_then_delete_snapshot(backup_api, cr_name, PrunedBy::PolicyCascade).await?;
+        ctx.metrics
+            .inc_policy_cascade_children_deleted(namespace, PolicyCascadeMode::Retain);
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: stamped pruned-by then deleted (Retain mode)");
+    }
+    Ok(())
+}
+
+/// `PolicyCascadeBatch::stamp_only` half of [`execute_policy_cascade_pass`]:
+/// reclassify an in-flight terminating child (no delete — it is already
+/// terminating). Not counted by `kopiur_policy_cascade_children_deleted` (see
+/// its description) since nothing is deleted here.
+async fn execute_stamp_only(
+    backup_api: &Api<Snapshot>,
+    namespace: &str,
+    names: &[String],
+) -> Result<()> {
+    for cr_name in names {
+        io::stamp_pruned_by(backup_api, cr_name, PrunedBy::PolicyCascade).await?;
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: reclassified an in-flight terminating child (stamp only)");
+    }
+    Ok(())
+}
+
+/// `PolicyCascadeBatch::delete_only` half of [`execute_policy_cascade_pass`]:
+/// a bare unstamped delete (Delete mode, external classification).
+async fn execute_delete_only(
+    ctx: &Context,
+    backup_api: &Api<Snapshot>,
+    namespace: &str,
+    names: &[String],
+) -> Result<()> {
+    for cr_name in names {
+        io::delete_snapshot(backup_api, cr_name).await?;
+        ctx.metrics
+            .inc_policy_cascade_children_deleted(namespace, PolicyCascadeMode::Delete);
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: bare deleted (Delete mode, external classification)");
+    }
+    Ok(())
+}
+
+/// Drive the `SnapshotPolicy` deletion-cascade finalizer body: LIST this
+/// policy's `Snapshot` children (by [`CONFIG_LABEL`]), plan the cascade via
+/// [`plan_policy_cascade`], execute one pass ([`execute_policy_cascade_pass`]),
+/// and release the finalizer once a pass's plan is **entirely empty** (no
+/// `stamp_and_delete`, `stamp_only`, or `delete_only` work at all).
+///
+/// A plan whose ONLY work is `stamp_only` still executes-then-requeues rather
+/// than releasing in the same pass: the next pass re-LISTs, observes those
+/// children now stamped (so `classify_policy_cascade_child`'s `(terminating,
+/// Retain)` arm no longer selects them — a valid `pruned-by` stamp is already
+/// present), and its plan is then genuinely empty, releasing at that point.
+/// This costs at most one extra ~2s pass and is what keeps a breaker-held
+/// terminating child from EVER wedging finalizer removal — M2's planner
+/// already guarantees such a child produces no `stamp_and_delete`/`delete_only`
+/// work, so this never waits on a mass-deletion ack that will never come once
+/// the policy itself is gone.
+async fn handle_policy_deletion(
+    ctx: &Context,
+    api: &Api<SnapshotPolicy>,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+) -> Result<Action> {
+    // Nothing to clean up if our finalizer isn't present (e.g. a CR created
+    // and deleted before this version's finalizer was ever stamped).
+    if !config
+        .finalizers()
+        .iter()
+        .any(|f| f == POLICY_CLEANUP_FINALIZER)
+    {
+        return Ok(Action::await_change());
+    }
+
+    let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
+    let children = backup_api.list(&lp).await?.items;
+    let mode =
+        kopiur_api::snapshot_policy::effective_on_policy_delete(config.spec.deletion.as_ref());
+    let plan = plan_policy_cascade(&children, mode);
+
+    if plan.stamp_and_delete.is_empty() && plan.stamp_only.is_empty() && plan.delete_only.is_empty()
+    {
+        io::remove_finalizer(api, config, POLICY_CLEANUP_FINALIZER).await?;
+        tracing::info!(policy = %name, ?mode, "policy deletion cascade complete; finalizer released");
+        return Ok(Action::await_change());
+    }
+
+    tracing::info!(
+        policy = %name,
+        ?mode,
+        stamp_and_delete = plan.stamp_and_delete.len(),
+        stamp_only = plan.stamp_only.len(),
+        delete_only = plan.delete_only.len(),
+        "policy deletion cascade: executing pass"
+    );
+    execute_policy_cascade_pass(ctx, &backup_api, namespace, &plan).await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(2)))
+}
+
 /// Count the most-recent run of consecutive `Failed` backups before the latest
 /// `Succeeded` one (the `kopiur_snapshot_consecutive_failures` gauge). Only
 /// terminal backups (Succeeded/Failed) count; ordering is by `endTime` (falling
@@ -280,6 +440,30 @@ pub async fn reconcile(config: Arc<SnapshotPolicy>, ctx: Arc<Context>) -> Result
     result
 }
 
+/// `reconcile_inner`'s deletion/finalizer front-matter, extracted to a single
+/// call (complexity ratchet: `reconcile_inner` only gains calls). `Some(action)`
+/// means the caller must return it immediately without reconciling further;
+/// `None` means the policy is live and finalized — proceed as normal.
+async fn handle_policy_lifecycle(
+    ctx: &Context,
+    api: &Api<SnapshotPolicy>,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<Action>> {
+    if config.metadata.deletion_timestamp.is_some() {
+        return Ok(Some(
+            handle_policy_deletion(ctx, api, config, namespace, name).await?,
+        ));
+    }
+    // Ensure the cleanup finalizer before anything else runs, so the deletion
+    // branch above is guaranteed to observe it later.
+    if io::ensure_finalizer(api, config, POLICY_CLEANUP_FINALIZER).await? {
+        return Ok(Some(Action::requeue(std::time::Duration::from_secs(1))));
+    }
+    Ok(None)
+}
+
 async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_backup_config(&config.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -292,6 +476,14 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     let name = config.name_any();
     let generation = config.metadata.generation;
     let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), &namespace);
+
+    // Deletion trumps suspend: a suspended policy that is deleted still
+    // cascades onto its Snapshot children, so this is checked BEFORE the
+    // suspend branch below.
+    if let Some(action) = handle_policy_lifecycle(ctx, &api, config, &namespace, &name).await? {
+        return Ok(action);
+    }
+
     let existing = config
         .status
         .as_ref()
@@ -802,7 +994,7 @@ mod tests {
         // Terminating + already stamped, and the absent one, are in neither set.
     }
 
-    // -- plan_policy_cascade (M2 — pure decision layer; wired to a finalizer in M3) --
+    // -- plan_policy_cascade (pure decision layer; executed by the M3 finalizer) --
 
     /// A `Succeeded` Snapshot with the given `origin` (status-first, matching
     /// `resolve_origin`'s precedence).
@@ -916,6 +1108,68 @@ mod tests {
         assert_eq!(retain_plan.stamp_only, vec!["held-unstamped".to_string()]);
         let delete_plan = plan_policy_cascade(&children, PolicyDeletePolicy::Delete);
         assert!(delete_plan.stamp_only.is_empty());
+    }
+
+    // -- slice_policy_cascade_batch (M3 — the per-pass execution slice) --
+
+    fn names(prefix: &str, ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| format!("{prefix}{id}")).collect()
+    }
+
+    #[test]
+    fn slice_policy_cascade_batch_takes_everything_when_cap_covers_the_whole_plan() {
+        let plan = PolicyCascadePlan {
+            stamp_and_delete: names("sd", &["1", "2"]),
+            stamp_only: names("so", &["1", "2"]),
+            delete_only: names("do", &["1", "2"]),
+        };
+        let batch = slice_policy_cascade_batch(&plan, 50);
+        assert_eq!(batch.stamp_and_delete, plan.stamp_and_delete.as_slice());
+        assert_eq!(batch.stamp_only, plan.stamp_only.as_slice());
+        assert_eq!(batch.delete_only, plan.delete_only.as_slice());
+    }
+
+    #[test]
+    fn slice_policy_cascade_batch_prefers_stamp_and_delete_then_stamp_only_then_delete_only() {
+        let plan = PolicyCascadePlan {
+            stamp_and_delete: names("sd", &["1", "2"]),
+            stamp_only: names("so", &["1", "2"]),
+            delete_only: names("do", &["1", "2"]),
+        };
+        // Cap smaller than stamp_and_delete alone → only a truncated prefix of
+        // stamp_and_delete; stamp_only/delete_only get nothing this pass.
+        let tight = slice_policy_cascade_batch(&plan, 1);
+        assert_eq!(tight.stamp_and_delete, &["sd1".to_string()]);
+        assert!(tight.stamp_only.is_empty());
+        assert!(tight.delete_only.is_empty());
+
+        // Cap exactly covers stamp_and_delete plus part of stamp_only.
+        let mid = slice_policy_cascade_batch(&plan, 3);
+        assert_eq!(mid.stamp_and_delete, plan.stamp_and_delete.as_slice());
+        assert_eq!(mid.stamp_only, &["so1".to_string()]);
+        assert!(mid.delete_only.is_empty());
+
+        // Cap covers everything but the last delete_only entry.
+        let almost_all = slice_policy_cascade_batch(&plan, 5);
+        assert_eq!(
+            almost_all.stamp_and_delete,
+            plan.stamp_and_delete.as_slice()
+        );
+        assert_eq!(almost_all.stamp_only, plan.stamp_only.as_slice());
+        assert_eq!(almost_all.delete_only, &["do1".to_string()]);
+    }
+
+    #[test]
+    fn slice_policy_cascade_batch_zero_cap_takes_nothing() {
+        let plan = PolicyCascadePlan {
+            stamp_and_delete: names("sd", &["1"]),
+            stamp_only: names("so", &["1"]),
+            delete_only: names("do", &["1"]),
+        };
+        let batch = slice_policy_cascade_batch(&plan, 0);
+        assert!(batch.stamp_and_delete.is_empty());
+        assert!(batch.stamp_only.is_empty());
+        assert!(batch.delete_only.is_empty());
     }
 
     #[test]

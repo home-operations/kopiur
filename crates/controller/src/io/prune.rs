@@ -57,3 +57,19 @@ pub async fn annotate_then_delete_snapshot(
         Err(e) => Err(Error::Kube(e)),
     }
 }
+
+/// Bare UNSTAMPED delete of `name` — no `pruned-by` annotation. Used for the
+/// `SnapshotPolicy` deletion cascade's `delete_only` set
+/// ([`crate::snapshot_policy::PolicyCascadePlan`]): those children must
+/// classify as an EXTERNAL deletion (indistinguishable from a `kubectl
+/// delete`) so the per-repository mass-deletion breaker gates them — stamping
+/// here would launder an externally-classified deletion past the breaker.
+/// 404-tolerant and idempotent, mirroring [`annotate_then_delete_snapshot`]'s
+/// delete half.
+pub async fn delete_snapshot(api: &Api<Snapshot>, name: &str) -> Result<()> {
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(Error::Kube(e)),
+    }
+}

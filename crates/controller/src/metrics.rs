@@ -73,6 +73,7 @@ pub struct Metrics {
     snapshot_deletions: Counter<u64>,
     snapshots_cascade_retained: Counter<u64>,
     snapshots_policy_cascade_retained: Counter<u64>,
+    policy_cascade_children_deleted: Counter<u64>,
     snapshot_delete_batch_jobs: Counter<u64>,
     snapshot_delete_batch_members: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
@@ -136,6 +137,31 @@ impl SnapshotDeletionOutcome {
             SnapshotDeletionOutcome::Orphaned => "orphaned",
             SnapshotDeletionOutcome::CascadeRetained => "cascade_retained",
             SnapshotDeletionOutcome::PolicyCascadeRetained => "policy_cascade_retained",
+        }
+    }
+}
+
+/// The `mode` label value for `kopiur_policy_cascade_children_deleted`: which
+/// `SnapshotPolicy` deletion-cascade mode ([`kopiur_api::common::PolicyDeletePolicy`])
+/// produced this action. Kept controller-local (mirroring
+/// [`SnapshotDeletionOutcome`]) so the metric label is a closed set independent
+/// of the API enum's wire representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCascadeMode {
+    /// `PolicyDeletePolicy::Retain`: the child was stamped `pruned-by:
+    /// policy-cascade` then deleted (its kopia snapshot is never touched).
+    Retain,
+    /// `PolicyDeletePolicy::Delete`: the child was bare-deleted, unstamped,
+    /// classifying as an ordinary external deletion.
+    Delete,
+}
+
+impl PolicyCascadeMode {
+    /// The `mode` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyCascadeMode::Retain => "retain",
+            PolicyCascadeMode::Delete => "delete",
         }
     }
 }
@@ -286,6 +312,18 @@ impl Metrics {
                  drift apart.",
             )
             .build();
+        let policy_cascade_children_deleted = m
+            .u64_counter("kopiur_policy_cascade_children_deleted")
+            .with_description(
+                "Total Snapshot children acted on by a SnapshotPolicy deletion-cascade \
+                 finalizer, by mode: retain = stamped pruned-by: policy-cascade then \
+                 deleted (the kopia snapshot itself is never touched); delete = a bare \
+                 unstamped delete, classifying as an ordinary external deletion subject \
+                 to the per-repository mass-deletion breaker. A terminating child merely \
+                 reclassified by a stamp-only pass is NOT counted here — its eventual \
+                 resolution is already covered by kopiur_snapshots_policy_cascade_retained.",
+            )
+            .build();
         let snapshot_delete_batch_jobs = m
             .u64_counter("kopiur_snapshot_delete_batch_jobs")
             .with_description(
@@ -422,6 +460,7 @@ impl Metrics {
             snapshot_deletions,
             snapshots_cascade_retained,
             snapshots_policy_cascade_retained,
+            policy_cascade_children_deleted,
             snapshot_delete_batch_jobs,
             snapshot_delete_batch_members,
             work_spec_cms_swept,
@@ -895,6 +934,20 @@ impl Metrics {
         self.inc_snapshot_deletion(ns, SnapshotDeletionOutcome::PolicyCascadeRetained);
         self.snapshots_policy_cascade_retained
             .add(1, &[KeyValue::new("namespace", ns.to_string())]);
+    }
+
+    /// Count one `Snapshot` child acted on by the `SnapshotPolicy`
+    /// deletion-cascade finalizer in `namespace`, under `mode`
+    /// (`stamp_and_delete` under Retain, bare `delete_only` under Delete —
+    /// NOT the non-blocking `stamp_only` reclassification).
+    pub fn inc_policy_cascade_children_deleted(&self, ns: &str, mode: PolicyCascadeMode) {
+        self.policy_cascade_children_deleted.add(
+            1,
+            &[
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("mode", mode.as_str()),
+            ],
+        );
     }
 
     /// Count one mass-deletion batch-delete Job reaching a terminal outcome.
