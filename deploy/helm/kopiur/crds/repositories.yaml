@@ -2629,6 +2629,15 @@ spec:
                     description: RFC 3339 timestamp of the last catalog refresh.
                     nullable: true
                     type: string
+                  scanRequestAttemptAt:
+                    description: |-
+                      RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF
+                      a pending `catalog-scan-requested-at` token (i.e. the token arm was the
+                      reason the attempt fired). Used only to rate-limit token-driven attempts
+                      on a Ready-but-unreachable repository — it is never compared against the
+                      token for retirement (that's `scanRequestHonored`, by equality).
+                    nullable: true
+                    type: string
                   scanRequestHonored:
                     description: |-
                       The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at`

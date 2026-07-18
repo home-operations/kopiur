@@ -66,6 +66,18 @@
 //! repository's status is byte-stable between refreshes (the status-churn rule).
 //! Object-store repositories re-list by recycling their finished bootstrap Job
 //! ([`bootstrap_recycle_due`]); bare-path filesystem repositories re-list in-process.
+//!
+//! A third, **on-demand** mechanism (M4) sits alongside the two above: the policy
+//! reconciler (M6) stamps `kopiur.home-operations.com/catalog-scan-requested-at`
+//! (an opaque RFC3339 token) on the `Repository`/`ClusterRepository` when adopting
+//! a delete-then-recreated repository, so its discovered snapshots materialize
+//! immediately rather than waiting for a spec change or the periodic-refresh
+//! timer. [`scan_requested_due`] decides whether a pending token should fire —
+//! retired by TOKEN EQUALITY against `status.catalog.scanRequestHonored` (never a
+//! `lastRefreshAt` comparison, which would let an unrelated periodic/generation
+//! scan silently "honor" a request it started before the request even existed),
+//! and rate-limited via `status.catalog.scanRequestAttemptAt` so a pending token
+//! against an unreachable backend cannot recreate bootstrap Jobs forever.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -124,6 +136,53 @@ pub fn reverify_due(token: Option<&str>, honored: Option<&str>, phase_ready: boo
     phase_ready && token.is_some() && token != honored
 }
 
+/// Whether a pending `catalog-scan-requested-at` token (stamped by the policy
+/// reconciler, M6, when adopting a delete-then-recreated repository) should force
+/// a catalog scan/bootstrap NOW, bypassing the refresh timer — the on-demand
+/// counterpart to [`refresh_due`]. Retirement is by TOKEN EQUALITY against
+/// `honored` (`status.catalog.scanRequestHonored`), deliberately NOT a comparison
+/// against `last_refresh_at`: a periodic- or generation-driven scan that happens
+/// to complete after the token was written must not look like it honored a
+/// request it started before the request even existed.
+///
+/// True iff ALL of:
+/// 1. `token` is present and non-empty.
+/// 2. `token != honored` (still pending).
+/// 3. Rate limit: `attempt_at` is `None`, OR `attempt_at` sorts lexicographically
+///    before `token` (a NEWER token than the last attempt re-arms immediately —
+///    RFC3339 timestamps sort chronologically), OR the previous attempt for THIS
+///    token is stale (`now - parse(attempt_at) >= retry_interval`: one retry per
+///    interval). An unparseable `attempt_at` is treated as absent (fail open —
+///    this code is the only writer of that field, so a parse failure means
+///    "never attempted", not "malformed forever").
+pub fn scan_requested_due(
+    token: Option<&str>,
+    honored: Option<&str>,
+    attempt_at: Option<&str>,
+    retry_interval: std::time::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    if Some(token) == honored {
+        return false;
+    }
+    let Some(attempt_at) = attempt_at else {
+        return true;
+    };
+    if attempt_at < token {
+        return true;
+    }
+    let Ok(attempt) = DateTime::parse_from_rfc3339(attempt_at) else {
+        return true;
+    };
+    let Ok(interval) = chrono::Duration::from_std(retry_interval) else {
+        return true;
+    };
+    attempt.with_timezone(&Utc) + interval <= now
+}
+
 /// Whether a `Snapshot` should (re)write the reverify-request annotation. Rate
 /// limited via the existing timestamp (shared across `Snapshot`s) so a wave of
 /// failures forces at most one re-probe per `min_interval`. Absent/unparseable ⇒ yes.
@@ -163,6 +222,7 @@ pub fn reconcile_interval(catalog: Option<&CatalogBounds>) -> std::time::Duratio
 /// and either the catalog refresh is due or the spec changed since the result
 /// was taken (`generation != observedGeneration` — a re-pointed backend must
 /// re-bootstrap, not keep reporting the old repository's identity).
+#[allow(clippy::too_many_arguments)]
 pub fn bootstrap_recycle_due(
     phase_is_ready: bool,
     generation: Option<i64>,
@@ -170,6 +230,10 @@ pub fn bootstrap_recycle_due(
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
     periodic_enabled: bool,
+    scan_requested_token: Option<&str>,
+    scan_requested_honored: Option<&str>,
+    scan_requested_attempt_at: Option<&str>,
+    scan_requested_retry_interval: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
     if !phase_is_ready {
@@ -180,25 +244,46 @@ pub fn bootstrap_recycle_due(
     }
     // The timed refresh arm only fires when periodic refresh is opted in; otherwise a
     // succeeded bootstrap is never recycled on a timer (one-time bootstrap semantics).
-    periodic_enabled && refresh_due(last_refresh_at, interval, now)
+    // The token arm (`scan_requested_due`) fires regardless of `periodic_enabled` — an
+    // on-demand request must not depend on an opt-in feature the user may not have set.
+    (periodic_enabled && refresh_due(last_refresh_at, interval, now))
+        || scan_requested_due(
+            scan_requested_token,
+            scan_requested_honored,
+            scan_requested_attempt_at,
+            scan_requested_retry_interval,
+            now,
+        )
 }
 
 /// `true` when a fresh repository listing should actually be SCANNED into the
 /// catalog (materialize/expire discovered rows): the timed refresh is due, OR
-/// the spec changed since the last reconciled generation. The generation arm is
-/// load-bearing for `catalog.retain` edits: a tightened `perIdentity` recycles
-/// the bootstrap Job for a fresh listing ([`bootstrap_recycle_due`]'s own
-/// generation arm), but gating the scan on `refresh_due` alone then threw that
-/// fresh result away — the over-cap rows only expired at the NEXT timed
-/// refresh (up to `refreshInterval` later), not on the spec change that asked
-/// for it. The caller passes the PRE-reconcile `status.observedGeneration`
-/// (the cached object), so the scan runs exactly once per spec change.
+/// the spec changed since the last reconciled generation, OR a
+/// `catalog-scan-requested-at` token is pending ([`scan_requested_due`]). The
+/// generation arm is load-bearing for `catalog.retain` edits: a tightened
+/// `perIdentity` recycles the bootstrap Job for a fresh listing
+/// ([`bootstrap_recycle_due`]'s own generation arm), but gating the scan on
+/// `refresh_due` alone then threw that fresh result away — the over-cap rows
+/// only expired at the NEXT timed refresh (up to `refreshInterval` later), not
+/// on the spec change that asked for it. The caller passes the PRE-reconcile
+/// `status.observedGeneration` (the cached object), so the scan runs exactly
+/// once per spec change. `scan_requested_token`/`_honored`/`_attempt_at` are the
+/// live annotation + status fields (`None` behaves byte-identically to before
+/// this arm existed); `scan_requested_retry_interval` is
+/// [`kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`], NOT the caller's
+/// `interval` (the token backoff cadence is fixed, independent of the user's
+/// configured `catalog.refreshInterval`).
+#[allow(clippy::too_many_arguments)]
 pub fn scan_due(
     generation: Option<i64>,
     observed_generation: Option<i64>,
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
     periodic_enabled: bool,
+    scan_requested_token: Option<&str>,
+    scan_requested_honored: Option<&str>,
+    scan_requested_attempt_at: Option<&str>,
+    scan_requested_retry_interval: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
     if generation != observed_generation {
@@ -206,7 +291,14 @@ pub fn scan_due(
     }
     // The initial scan runs on the generation arm above (first reconcile, spec change);
     // the timed re-scan only fires when periodic refresh is opted in.
-    periodic_enabled && refresh_due(last_refresh_at, interval, now)
+    (periodic_enabled && refresh_due(last_refresh_at, interval, now))
+        || scan_requested_due(
+            scan_requested_token,
+            scan_requested_honored,
+            scan_requested_attempt_at,
+            scan_requested_retry_interval,
+            now,
+        )
 }
 
 /// `true` when the *no-Job* path may (re-)create the bootstrap Job. The finished
@@ -224,6 +316,7 @@ pub fn scan_due(
 /// created). Unlike re-running *succeeded* work this converges, and the
 /// in-process filesystem path's stricter `terminal_gate_holds` hard-stop keys
 /// on a credential `resourceVersion` the mover path does not pin (yet).
+#[allow(clippy::too_many_arguments)]
 pub fn bootstrap_create_due(
     phase_is_ready: bool,
     generation: Option<i64>,
@@ -231,6 +324,10 @@ pub fn bootstrap_create_due(
     last_refresh_at: Option<&str>,
     interval: std::time::Duration,
     periodic_enabled: bool,
+    scan_requested_token: Option<&str>,
+    scan_requested_honored: Option<&str>,
+    scan_requested_attempt_at: Option<&str>,
+    scan_requested_retry_interval: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
     if !phase_is_ready {
@@ -243,6 +340,10 @@ pub fn bootstrap_create_due(
         last_refresh_at,
         interval,
         periodic_enabled,
+        scan_requested_token,
+        scan_requested_honored,
+        scan_requested_attempt_at,
+        scan_requested_retry_interval,
         now,
     )
 }
@@ -1258,6 +1359,10 @@ mod tests {
             None,
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + spec changed → recycle even when fresh — independent of the
@@ -1269,6 +1374,10 @@ mod tests {
             Some(&fresh),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + same generation + fresh → keep the finished Job.
@@ -1279,6 +1388,10 @@ mod tests {
             Some(&fresh),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + same generation + stale + periodic ON → recycle for a fresh listing.
@@ -1289,6 +1402,10 @@ mod tests {
             Some(&stale),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + same generation + stale + periodic OFF (default) → do NOT recycle
@@ -1300,6 +1417,45 @@ mod tests {
             Some(&stale),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    // Regression: with no scan-request token (M4), every arm above is byte-identical
+    // to pre-M4 behavior — this pins that `None` truly is a no-op, not just "usually".
+    #[test]
+    fn bootstrap_recycle_due_with_no_token_is_unchanged() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let fresh = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&fresh),
+            interval,
+            true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&fresh),
+            interval,
+            false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
     }
@@ -1322,6 +1478,10 @@ mod tests {
             Some(&fresh),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Settled generation + fresh stamp → byte-stable, no scan (the
@@ -1332,6 +1492,10 @@ mod tests {
             Some(&fresh),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Settled generation + stale stamp + periodic ON → the timed refresh fires.
@@ -1342,6 +1506,10 @@ mod tests {
             Some(&stale),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Settled generation + stale stamp + periodic OFF (default) → no timed re-scan.
@@ -1351,11 +1519,47 @@ mod tests {
             Some(&stale),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Never scanned + periodic OFF → still no timed scan (the initial scan runs on
         // the generation arm, not this timer).
-        assert!(!scan_due(Some(1), Some(1), None, interval, false, now));
+        assert!(!scan_due(
+            Some(1),
+            Some(1),
+            None,
+            interval,
+            false,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    // Regression: with no scan-request token (M4), `scan_due` is byte-identical to
+    // pre-M4 behavior.
+    #[test]
+    fn scan_due_with_no_token_is_unchanged() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let stale = (now - chrono::Duration::minutes(61)).to_rfc3339();
+        assert!(!scan_due(
+            Some(3),
+            Some(3),
+            Some(&stale),
+            interval,
+            false,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
     }
 
     // Regression guard for the TTL-reap loop: when the kube TTL controller
@@ -1377,6 +1581,10 @@ mod tests {
             None,
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + same generation + fresh scan → HOLD: the reaped Job must not
@@ -1388,6 +1596,10 @@ mod tests {
             Some(&fresh),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + refresh due + periodic ON → re-create for a fresh listing.
@@ -1398,6 +1610,10 @@ mod tests {
             Some(&stale),
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + refresh due + periodic OFF (default) → HOLD: no timed re-create.
@@ -1408,6 +1624,10 @@ mod tests {
             Some(&stale),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready + spec changed → re-create even when fresh (independent of the flag).
@@ -1418,6 +1638,10 @@ mod tests {
             Some(&fresh),
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
             now
         ));
         // Ready but never stamped + periodic ON → defensive re-run.
@@ -1428,6 +1652,102 @@ mod tests {
             None,
             interval,
             true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    // Regression: with no scan-request token (M4), `bootstrap_create_due` is
+    // byte-identical to pre-M4 behavior.
+    #[test]
+    fn bootstrap_create_due_with_no_token_is_unchanged() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let fresh = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        assert!(!bootstrap_create_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&fresh),
+            interval,
+            true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    #[test]
+    fn scan_requested_due_matrix() {
+        let now = Utc::now();
+        let retry = std::time::Duration::from_secs(3600);
+        let token = "2026-06-01T00:00:00Z";
+
+        // No token at all → never due.
+        assert!(!scan_requested_due(None, None, None, retry, now));
+        // Empty-string token (defensive; annotation value should never actually be
+        // empty, but the predicate must not treat it as pending) → never due.
+        assert!(!scan_requested_due(Some(""), None, None, retry, now));
+        // Token present, never honored, never attempted → due.
+        assert!(scan_requested_due(Some(token), None, None, retry, now));
+        // Token equals the last honored token → retired, not due.
+        assert!(!scan_requested_due(
+            Some(token),
+            Some(token),
+            None,
+            retry,
+            now
+        ));
+        // Token differs from an OLDER honored token → still due (a fresh request
+        // after a prior one was honored).
+        assert!(scan_requested_due(
+            Some(token),
+            Some("2026-05-01T00:00:00Z"),
+            None,
+            retry,
+            now
+        ));
+
+        // Attempt lexicographically OLDER than the token (a stale attempt predating
+        // this request, e.g. from a prior token) → re-arm immediately, due.
+        assert!(scan_requested_due(
+            Some(token),
+            None,
+            Some("2026-05-01T00:00:00Z"),
+            retry,
+            now
+        ));
+        // Attempt NEWER than the token and still fresh (within retry_interval) →
+        // rate-limited, not due.
+        let fresh_attempt = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        assert!(!scan_requested_due(
+            Some(token),
+            None,
+            Some(&fresh_attempt),
+            retry,
+            now
+        ));
+        // Attempt NEWER than the token but stale (>= retry_interval old) → one retry
+        // per interval, due again.
+        let stale_attempt = (now - chrono::Duration::minutes(61)).to_rfc3339();
+        assert!(scan_requested_due(
+            Some(token),
+            None,
+            Some(&stale_attempt),
+            retry,
+            now
+        ));
+        // Unparseable attempt → fail open, due.
+        assert!(scan_requested_due(
+            Some(token),
+            None,
+            Some("not-a-time"),
+            retry,
             now
         ));
     }

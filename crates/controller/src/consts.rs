@@ -90,6 +90,18 @@ pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replic
 /// `status.lastReverifyAt`; rate-limited so a wave of failures forces one re-probe.
 pub const REVERIFY_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/reverify-requested-at";
 
+/// Annotation stamped on a `Repository`/`ClusterRepository` (writer: the policy
+/// reconciler, M6) to REQUEST an on-demand catalog scan — e.g. after adopting a
+/// delete-then-recreated repository, so its discovered snapshots materialize
+/// immediately instead of waiting for the next spec change or (opt-in) periodic
+/// refresh. The RFC3339 timestamp VALUE is an opaque token: honored once via
+/// `status.catalog.scanRequestHonored` (equality, never a `lastRefreshAt`
+/// comparison — see [`crate::catalog::scan_requested_due`]), and rate-limited via
+/// `status.catalog.scanRequestAttemptAt` so a pending token against an
+/// unreachable backend cannot recreate bootstrap Jobs on every reconcile.
+pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
+    "kopiur.home-operations.com/catalog-scan-requested-at";
+
 /// Condition reason when a `Maintenance` (managed or external) covers the repo.
 pub const MAINTENANCE_CONFIGURED_REASON: &str = "MaintenanceConfigured";
 /// `action` for the maintenance-configuration check Event.

@@ -528,6 +528,13 @@ pub struct CatalogStatus {
     /// started before the annotation was set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_request_honored: Option<String>,
+    /// RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF
+    /// a pending `catalog-scan-requested-at` token (i.e. the token arm was the
+    /// reason the attempt fired). Used only to rate-limit token-driven attempts
+    /// on a Ready-but-unreachable repository — it is never compared against the
+    /// token for retirement (that's `scanRequestHonored`, by equality).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_request_attempt_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -820,6 +827,32 @@ health:
                 .get("scanRequestHonored")
                 .is_none(),
             "absent scanRequestHonored must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_status_scan_request_attempt_at_roundtrips() {
+        let status: CatalogStatus = from_yaml(
+            "lastRefreshAt: 2026-06-01T00:00:00Z\nscanRequestAttemptAt: 2026-06-01T00:05:00Z\n",
+        );
+        assert_eq!(
+            status.scan_request_attempt_at.as_deref(),
+            Some("2026-06-01T00:05:00Z")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["scanRequestAttemptAt"], "2026-06-01T00:05:00Z");
+        let back: CatalogStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+
+        // Absent stays None and is elided.
+        let bare: CatalogStatus = from_yaml("{}\n");
+        assert!(bare.scan_request_attempt_at.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("scanRequestAttemptAt")
+                .is_none(),
+            "absent scanRequestAttemptAt must be elided"
         );
     }
 

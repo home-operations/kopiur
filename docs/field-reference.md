@@ -615,6 +615,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
+| `scanRequestAttemptAt` | string | — | RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF a pending `catalog-scan-requested-at` token (i.e. the token arm was the reason the attempt fired). Used only to rate-limit token-driven attempts on a Ready-but-unreachable repository — it is never compared against the token for retirement (that's `scanRequestHonored`, by equality). |
 | `scanRequestHonored` | string | — | The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at` annotation last honored by a completed catalog scan. Compared by **equality** against the live annotation to decide whether a requested on-demand scan is still pending — deliberately NOT a timestamp comparison against `lastRefreshAt` (a periodic refresh completing after the request was made would otherwise look like it honored the request even though it started before the annotation was set). |
 
 #### `status.conditions[]` { #repository-status-conditions }
@@ -1301,6 +1302,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
+| `scanRequestAttemptAt` | string | — | RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF a pending `catalog-scan-requested-at` token (i.e. the token arm was the reason the attempt fired). Used only to rate-limit token-driven attempts on a Ready-but-unreachable repository — it is never compared against the token for retirement (that's `scanRequestHonored`, by equality). |
 | `scanRequestHonored` | string | — | The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at` annotation last honored by a completed catalog scan. Compared by **equality** against the live annotation to decide whether a requested on-demand scan is still pending — deliberately NOT a timestamp comparison against `lastRefreshAt` (a periodic refresh completing after the request was made would otherwise look like it honored the request even though it started before the annotation was set). |
 
 #### `status.conditions[]` { #clusterrepository-status-conditions }
