@@ -428,8 +428,27 @@ fn config_label_op(meta: &ObjectMeta, value: &str) -> PatchOperation {
     }
 }
 
-/// Resolve a `Snapshot`'s origin from the `kopiur.home-operations.com/origin` label (canonical) or
-/// `status.origin`, defaulting to `manual` for user-created backups with no marker.
+/// Resolve a `Snapshot`'s origin from `status.origin` (canonical) or the
+/// `kopiur.home-operations.com/origin` label (CREATE-time fallback, before any
+/// status has ever been written), defaulting to `manual` for user-created
+/// backups with no marker. Mirrors the controller's `resolve_origin`
+/// (`crates/controller/src/snapshot/plan.rs`) — status-first, NOT label-first.
+///
+/// This ordering is load-bearing with adoption in play (M1+): the label lives on
+/// `metadata`, which a user can edit freely, while `status` is a subresource only
+/// the controller can write. A label-first resolution would let a user flip a
+/// `discovered` row's label to `adopted` and unlock `deletionPolicy: Delete` at
+/// admission while the controller still treats the row as `discovered` (forced
+/// `Retain`) — an admitted spec the controller's own reconcile invariants
+/// disagree with. Status-first closes that gap.
+///
+/// Audit-verified safe for the cases that predate this flip: at CREATE,
+/// `status.origin` is always absent (a brand-new object has no status yet), so
+/// the label fallback preserves every existing admission default exactly.
+/// Already-`discovered` rows carry `status.origin` (stamped by the catalog scan),
+/// so they were never depending on the label winning. `produced` (scheduled/
+/// manual) rows get `status.origin` written shortly after creation and their
+/// admission-time defaulting never depended on which arm won either.
 fn backup_origin(meta: &ObjectMeta, data: &Value) -> Origin {
     let from_label = meta
         .labels
@@ -440,7 +459,7 @@ fn backup_origin(meta: &ObjectMeta, data: &Value) -> Origin {
         .get("status")
         .and_then(|s| s.get("origin"))
         .and_then(|v| v.as_str());
-    match from_label.or(from_status) {
+    match from_status.or(from_label) {
         Some("discovered") => Origin::Discovered,
         Some("scheduled") => Origin::Scheduled,
         Some("adopted") => Origin::Adopted,

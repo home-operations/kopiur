@@ -428,6 +428,92 @@ mod tests {
         );
     }
 
+    // --- backup_origin: status-first resolution (M4) ---------------------------
+    //
+    // `backup_origin` flipped from label-first to status-first to match the
+    // controller's `resolve_origin` (crates/controller/src/snapshot/plan.rs).
+    // These pin the status arm winning at UPDATE, the label surviving as the
+    // CREATE-time fallback, and — the actual hardening — a label flip NOT
+    // overriding an existing `status.origin` (the "origin-flip attack").
+
+    #[tokio::test]
+    async fn adopted_status_update_with_delete_is_admitted() {
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "adopted" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(
+            v["response"]["allowed"], true,
+            "adopted rows may carry any deletionPolicy: {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_status_update_with_delete_is_denied() {
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "discovered" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], false);
+        let msg = v["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("Retain"), "msg was: {msg}");
+    }
+
+    #[tokio::test]
+    async fn label_flip_to_adopted_does_not_override_discovered_status() {
+        // The origin-flip attack this hardening closes: a user cannot unlock
+        // `deletionPolicy: Delete` on a catalog-discovered row by editing the
+        // metadata LABEL — only the controller-owned `status.origin` (which still
+        // says `discovered`) governs. Label-first would have admitted this.
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "discovered" });
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "adopted" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(
+            v["response"]["allowed"], false,
+            "status-first must win over a flipped label: {v:?}"
+        );
+        let msg = v["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("Retain"), "msg was: {msg}");
+    }
+
+    #[tokio::test]
+    async fn create_with_only_the_discovered_label_still_resolves_discovered() {
+        // No `status` at all on CREATE (a brand-new object never has one yet) — the
+        // label fallback must still resolve `discovered` and default `Retain`,
+        // byte-identical to pre-M4 behavior.
+        let mut body = review_body("Snapshot", "billing", "u", json!({}));
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "discovered" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        let has_retain = patch
+            .iter()
+            .any(|op| op["path"] == "/spec/deletionPolicy" && op["value"] == "Retain");
+        assert!(
+            has_retain,
+            "expected Retain default via the label fallback: {patch:?}"
+        );
+    }
+
     #[tokio::test]
     async fn restore_identity_without_repository_denied() {
         let spec = json!({
