@@ -72,12 +72,28 @@
 //! (an opaque RFC3339 token) on the `Repository`/`ClusterRepository` when adopting
 //! a delete-then-recreated repository, so its discovered snapshots materialize
 //! immediately rather than waiting for a spec change or the periodic-refresh
-//! timer. [`scan_requested_due`] decides whether a pending token should fire —
-//! retired by TOKEN EQUALITY against `status.catalog.scanRequestHonored` (never a
-//! `lastRefreshAt` comparison, which would let an unrelated periodic/generation
-//! scan silently "honor" a request it started before the request even existed),
-//! and rate-limited via `status.catalog.scanRequestAttemptAt` so a pending token
-//! against an unreachable backend cannot recreate bootstrap Jobs forever.
+//! timer. Retirement is by TOKEN EQUALITY against `status.catalog.scanRequestHonored`
+//! (never a `lastRefreshAt` comparison, which would let an unrelated periodic/
+//! generation scan silently "honor" a request it started before the request even
+//! existed). The predicate is deliberately split in two, because a pending token
+//! feeds two DIFFERENT decisions that must not share a rate limit:
+//!
+//! - [`scan_requested_pending`] — pure equality retirement, no rate limit. Used
+//!   by [`scan_due`] to decide whether an ALREADY-COMPLETED bootstrap/listing
+//!   should be materialized into the catalog now.
+//! - [`scan_requested_due`] — [`scan_requested_pending`] plus a rate limit via
+//!   `status.catalog.scanRequestAttemptAt`. Used by [`bootstrap_recycle_due`]/
+//!   [`bootstrap_create_due`] to decide whether a NEW bootstrap Job may be
+//!   LAUNCHED, so a pending token against an unreachable backend cannot recreate
+//!   Jobs forever.
+//!
+//! Conflating the two (gating `scan_due` on the same rate-limited predicate that
+//! gates the launch) wedges the request forever: `bootstrap_create_due` stamps
+//! `scanRequestAttemptAt` the instant it launches a Job for a pending token, and
+//! the finalize pass that scans that Job's result runs moments later — so it
+//! would always see its own fresh stamp and refuse to scan, repeating
+//! recycle→create→succeed→no-scan on every retry interval without ever honoring
+//! the request.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -145,16 +161,45 @@ pub fn reverify_due(token: Option<&str>, honored: Option<&str>, phase_ready: boo
 /// to complete after the token was written must not look like it honored a
 /// request it started before the request even existed.
 ///
-/// True iff ALL of:
-/// 1. `token` is present and non-empty.
-/// 2. `token != honored` (still pending).
-/// 3. Rate limit: `attempt_at` is `None`, OR `attempt_at` sorts lexicographically
-///    before `token` (a NEWER token than the last attempt re-arms immediately —
-///    RFC3339 timestamps sort chronologically), OR the previous attempt for THIS
-///    token is stale (`now - parse(attempt_at) >= retry_interval`: one retry per
-///    interval). An unparseable `attempt_at` is treated as absent (fail open —
-///    this code is the only writer of that field, so a parse failure means
-///    "never attempted", not "malformed forever").
+/// Whether a `catalog-scan-requested-at` token is still PENDING: present,
+/// non-empty, and not yet retired by TOKEN EQUALITY against `honored`
+/// (`status.catalog.scanRequestHonored`). Pure equality retirement — NO rate
+/// limit.
+///
+/// This is the predicate [`scan_due`]'s token arm uses (deliberately NOT
+/// [`scan_requested_due`]): `scan_due` decides whether an ALREADY-COMPLETED
+/// bootstrap/listing gets materialized into the catalog, and that decision
+/// must never be gated on the launch-side attempt stamp. [`bootstrap_recycle_due`]/
+/// [`bootstrap_create_due`] write `scanRequestAttemptAt` the moment they launch a
+/// Job for a pending token; if `scan_due`'s finalize-time check reused that same
+/// rate-limited predicate, it would see its OWN just-written, still-fresh stamp
+/// and refuse to scan — wedging the request forever behind a
+/// recycle→create→succeed→no-scan loop that repeats every retry interval without
+/// ever honoring it. Retirement still happens exactly once: [`scan`] writes
+/// `scanRequestHonored` in the SAME pass that scans, so the next reconcile's
+/// `token != honored` check is immediately false.
+pub fn scan_requested_pending(token: Option<&str>, honored: Option<&str>) -> bool {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    Some(token) != honored
+}
+
+/// Whether a pending scan-request token should be allowed to LAUNCH a new
+/// bootstrap/scan attempt NOW — [`scan_requested_pending`] plus a rate limit on
+/// top. Used only by [`bootstrap_recycle_due`]/[`bootstrap_create_due`] (which
+/// decide whether to recreate a bootstrap Job against a possibly-unreachable
+/// backend); [`scan_due`] uses the un-rate-limited [`scan_requested_pending`]
+/// instead — see its doc for why conflating the two wedges the token forever.
+///
+/// True iff [`scan_requested_pending`] AND the rate limit allows a launch now:
+/// `attempt_at` is `None`, OR `attempt_at` sorts lexicographically before
+/// `token` (a NEWER token than the last attempt re-arms immediately — RFC3339
+/// timestamps sort chronologically), OR the previous attempt for THIS token is
+/// stale (`now - parse(attempt_at) >= retry_interval`: one retry per interval).
+/// An unparseable `attempt_at` is treated as absent (fail open — this code is
+/// the only writer of that field, so a parse failure means "never attempted",
+/// not "malformed forever").
 pub fn scan_requested_due(
     token: Option<&str>,
     honored: Option<&str>,
@@ -162,12 +207,12 @@ pub fn scan_requested_due(
     retry_interval: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return false;
-    };
-    if Some(token) == honored {
+    if !scan_requested_pending(token, honored) {
         return false;
     }
+    // `scan_requested_pending` returning `true` guarantees `token` is `Some`
+    // and non-empty.
+    let token = token.unwrap_or_default();
     let Some(attempt_at) = attempt_at else {
         return true;
     };
@@ -244,8 +289,13 @@ pub fn bootstrap_recycle_due(
     }
     // The timed refresh arm only fires when periodic refresh is opted in; otherwise a
     // succeeded bootstrap is never recycled on a timer (one-time bootstrap semantics).
-    // The token arm (`scan_requested_due`) fires regardless of `periodic_enabled` — an
-    // on-demand request must not depend on an opt-in feature the user may not have set.
+    // The token arm uses the RATE-LIMITED `scan_requested_due` (not
+    // `scan_requested_pending`): this predicate decides whether to recycle a
+    // finished Job so a NEW one gets launched, and a pending token against an
+    // unreachable backend must not do that on every reconcile — see
+    // `scan_requested_pending`'s doc for the full rationale of the split. Fires
+    // regardless of `periodic_enabled` — an on-demand request must not depend on
+    // an opt-in feature the user may not have set.
     (periodic_enabled && refresh_due(last_refresh_at, interval, now))
         || scan_requested_due(
             scan_requested_token,
@@ -259,20 +309,24 @@ pub fn bootstrap_recycle_due(
 /// `true` when a fresh repository listing should actually be SCANNED into the
 /// catalog (materialize/expire discovered rows): the timed refresh is due, OR
 /// the spec changed since the last reconciled generation, OR a
-/// `catalog-scan-requested-at` token is pending ([`scan_requested_due`]). The
-/// generation arm is load-bearing for `catalog.retain` edits: a tightened
+/// `catalog-scan-requested-at` token is pending ([`scan_requested_pending`]).
+/// The generation arm is load-bearing for `catalog.retain` edits: a tightened
 /// `perIdentity` recycles the bootstrap Job for a fresh listing
 /// ([`bootstrap_recycle_due`]'s own generation arm), but gating the scan on
 /// `refresh_due` alone then threw that fresh result away — the over-cap rows
 /// only expired at the NEXT timed refresh (up to `refreshInterval` later), not
 /// on the spec change that asked for it. The caller passes the PRE-reconcile
 /// `status.observedGeneration` (the cached object), so the scan runs exactly
-/// once per spec change. `scan_requested_token`/`_honored`/`_attempt_at` are the
-/// live annotation + status fields (`None` behaves byte-identically to before
-/// this arm existed); `scan_requested_retry_interval` is
-/// [`kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL`], NOT the caller's
-/// `interval` (the token backoff cadence is fixed, independent of the user's
-/// configured `catalog.refreshInterval`).
+/// once per spec change. `scan_requested_token`/`_honored` are the live
+/// annotation + status fields (`None` behaves byte-identically to before this
+/// arm existed).
+///
+/// Deliberately [`scan_requested_pending`] (equality-retirement only, NO rate
+/// limit), NOT [`scan_requested_due`]: this predicate gates scanning a listing
+/// that ALREADY EXISTS (in-process, or from an already-succeeded bootstrap
+/// Job), not launching new work against a possibly-unreachable backend — see
+/// [`scan_requested_pending`]'s doc for why reusing the rate-limited predicate
+/// here would wedge every pending token behind the launch-side attempt stamp.
 #[allow(clippy::too_many_arguments)]
 pub fn scan_due(
     generation: Option<i64>,
@@ -282,8 +336,6 @@ pub fn scan_due(
     periodic_enabled: bool,
     scan_requested_token: Option<&str>,
     scan_requested_honored: Option<&str>,
-    scan_requested_attempt_at: Option<&str>,
-    scan_requested_retry_interval: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
     if generation != observed_generation {
@@ -292,13 +344,7 @@ pub fn scan_due(
     // The initial scan runs on the generation arm above (first reconcile, spec change);
     // the timed re-scan only fires when periodic refresh is opted in.
     (periodic_enabled && refresh_due(last_refresh_at, interval, now))
-        || scan_requested_due(
-            scan_requested_token,
-            scan_requested_honored,
-            scan_requested_attempt_at,
-            scan_requested_retry_interval,
-            now,
-        )
+        || scan_requested_pending(scan_requested_token, scan_requested_honored)
 }
 
 /// `true` when the *no-Job* path may (re-)create the bootstrap Job. The finished
@@ -1480,8 +1526,6 @@ mod tests {
             false,
             None,
             None,
-            None,
-            interval,
             now
         ));
         // Settled generation + fresh stamp → byte-stable, no scan (the
@@ -1494,8 +1538,6 @@ mod tests {
             true,
             None,
             None,
-            None,
-            interval,
             now
         ));
         // Settled generation + stale stamp + periodic ON → the timed refresh fires.
@@ -1508,8 +1550,6 @@ mod tests {
             true,
             None,
             None,
-            None,
-            interval,
             now
         ));
         // Settled generation + stale stamp + periodic OFF (default) → no timed re-scan.
@@ -1521,8 +1561,6 @@ mod tests {
             false,
             None,
             None,
-            None,
-            interval,
             now
         ));
         // Never scanned + periodic OFF → still no timed scan (the initial scan runs on
@@ -1535,8 +1573,6 @@ mod tests {
             false,
             None,
             None,
-            None,
-            interval,
             now
         ));
     }
@@ -1556,7 +1592,107 @@ mod tests {
             false,
             None,
             None,
+            now
+        ));
+    }
+
+    // Unit matrix for `scan_requested_pending`: pure equality retirement, no
+    // rate limit (Part C of the M4-review fix brief).
+    #[test]
+    fn scan_requested_pending_matrix() {
+        // No token → never pending.
+        assert!(!scan_requested_pending(None, None));
+        // Empty-string token (defensive) → never pending.
+        assert!(!scan_requested_pending(Some(""), None));
+        // Token present, never honored → pending.
+        assert!(scan_requested_pending(Some("t1"), None));
+        // Token equals the last honored token → retired, not pending.
+        assert!(!scan_requested_pending(Some("t1"), Some("t1")));
+        // Token differs from the last honored token (a fresh request after a
+        // prior one was honored) → pending.
+        assert!(scan_requested_pending(Some("t2"), Some("t1")));
+    }
+
+    // Critical regression for the M4 review defect: `scan_due`'s token arm used
+    // to delegate to the RATE-LIMITED `scan_requested_due`, so the finalize pass
+    // scanning a just-succeeded, token-driven bootstrap Job would see the very
+    // `scanRequestAttemptAt` stamp that launched it — still fresh — and refuse to
+    // scan. That wedged every pending token behind an infinite
+    // recycle→create→succeed→no-scan loop (bounded churn, unbounded duration;
+    // `scanRequestHonored` never written). This must fail on the pre-fix `scan_due`
+    // (which took `attempt_at`/`retry_interval` and OR'd in `scan_requested_due`).
+    #[test]
+    fn scan_due_fires_on_pending_token_even_when_the_launch_side_rate_limit_would_hold() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let token = "2026-06-01T00:00:00Z";
+        let fresh_attempt = (now - chrono::Duration::minutes(1)).to_rfc3339();
+
+        // Sanity: the LAUNCH-side rate-limited predicate correctly holds here —
+        // this is exactly what must keep protecting an unreachable repo from Job
+        // churn (traced in `bootstrap_recycle_due`/`bootstrap_create_due` below).
+        assert!(!scan_requested_due(
+            Some(token),
             None,
+            Some(&fresh_attempt),
+            interval,
+            now
+        ));
+        // But `scan_due` — deciding whether to materialize an ALREADY-COMPLETED
+        // listing — must fire anyway: the token is still pending, and this
+        // predicate is not the launch gate.
+        assert!(scan_due(
+            Some(2),
+            Some(2),
+            None,
+            interval,
+            false,
+            Some(token),
+            None,
+            now
+        ));
+    }
+
+    // The launch-side predicates must keep the rate limit intact: a pending
+    // token with a fresh attempt stamp does NOT relaunch a bootstrap Job (the
+    // guard against churning Jobs against an unreachable repository).
+    #[test]
+    fn bootstrap_recycle_due_holds_on_pending_token_with_fresh_attempt() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let token = "2026-06-01T00:00:00Z";
+        let fresh_attempt = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            None,
+            interval,
+            false,
+            Some(token),
+            None,
+            Some(&fresh_attempt),
+            interval,
+            now
+        ));
+    }
+
+    #[test]
+    fn bootstrap_create_due_holds_on_pending_token_with_fresh_attempt() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(3600);
+        let token = "2026-06-01T00:00:00Z";
+        let fresh_attempt = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(!bootstrap_create_due(
+            true,
+            Some(2),
+            Some(2),
+            None,
+            interval,
+            false,
+            Some(token),
+            None,
+            Some(&fresh_attempt),
             interval,
             now
         ));

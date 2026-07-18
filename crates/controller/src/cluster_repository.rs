@@ -532,8 +532,6 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                 cluster_scan_requested_token(repo),
                 cluster_scan_requested_honored(repo),
-                cluster_scan_requested_attempt_at(repo),
-                kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
                 chrono::Utc::now(),
             ) {
                 let listing = client.snapshot_list(None).await?;
@@ -1502,8 +1500,6 @@ async fn finalize_cluster_bootstrap(
         CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
         cluster_scan_requested_token(repo),
         cluster_scan_requested_honored(repo),
-        cluster_scan_requested_attempt_at(repo),
-        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
         chrono::Utc::now(),
     ) {
         run_cluster_catalog_scan(
