@@ -1,6 +1,7 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+pub mod adoption;
 pub mod cache;
 pub mod catalog;
 pub mod cluster_repository;

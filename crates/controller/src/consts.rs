@@ -102,6 +102,20 @@ pub const REVERIFY_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/reve
 pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
     "kopiur.home-operations.com/catalog-scan-requested-at";
 
+/// Normal Event reason on a `SnapshotPolicy` when auto-adoption re-attached one
+/// or more discovered snapshots into it (M6). The note names the count, the
+/// resolved identity, that the rows are now GFS-governed, and both opt-outs.
+pub const SNAPSHOTS_ADOPTED_REASON: &str = "SnapshotsAdopted";
+/// Event `action` (guidance) for [`SNAPSHOTS_ADOPTED_REASON`]: how to opt out of
+/// automatic adoption.
+pub const REVIEW_ADOPTION_ACTION: &str = "ReviewAdoption";
+/// Normal Event reason on a `SnapshotPolicy` when it stamped an on-demand
+/// catalog-scan request ([`CATALOG_SCAN_REQUESTED_ANNOTATION`]) on its
+/// repository so newly-recreated snapshots materialize for adoption (M6).
+pub const ADOPTION_SCAN_REQUESTED_REASON: &str = "AdoptionScanRequested";
+/// Event `action` (guidance) for [`ADOPTION_SCAN_REQUESTED_REASON`].
+pub const AWAIT_CATALOG_SCAN_ACTION: &str = "AwaitCatalogScan";
+
 /// Condition reason when a `Maintenance` (managed or external) covers the repo.
 pub const MAINTENANCE_CONFIGURED_REASON: &str = "MaintenanceConfigured";
 /// `action` for the maintenance-configuration check Event.

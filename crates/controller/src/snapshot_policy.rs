@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use kube::api::ListParams;
+use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
@@ -642,6 +642,25 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         .await?;
     }
 
+    // §5 (M6): auto-adopt discovered snapshots whose resolved identity matches
+    // this recipe. Runs AFTER the retention block (inv. 6) and consumes a
+    // SEPARATE cluster-wide LIST — the retention pass above already acted on the
+    // `backups` LIST taken before adoption, so one reconcile never both adopts
+    // and prunes the same rows (the newly-adopted rows are first seen by the
+    // NEXT pass's retention). `Some(requeue)` after a wave / scan request.
+    let adoption_requeue = run_adoption(
+        ctx,
+        &api,
+        config,
+        &namespace,
+        &name,
+        &repo,
+        &resolved,
+        &backups,
+        current.as_ref(),
+    )
+    .await?;
+
     // Final status: Ready (the policy is reconciled and its repo is Ready), the
     // observedGeneration, and the §3 lastSuccessfulSnapshot. Only set the timestamp
     // when known so we never thrash it with null.
@@ -724,12 +743,299 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // requeue on the shorter of the steady cadence and the verify cadence so a due
     // verification fires on time.
     let steady = std::time::Duration::from_secs(300);
-    match crate::verification::verify_step(config, ctx, &repo, &namespace, has_successful_snapshot)
-        .await?
+    let base = match crate::verification::verify_step(
+        config,
+        ctx,
+        &repo,
+        &namespace,
+        has_successful_snapshot,
+    )
+    .await?
     {
-        Some(verify_requeue) => Ok(Action::requeue(steady.min(verify_requeue))),
-        None => Ok(Action::requeue(steady)),
+        Some(verify_requeue) => steady.min(verify_requeue),
+        None => steady,
+    };
+    // A fresh adoption wave / scan request pulls the next reconcile in sooner
+    // (belt — the policy/repository watches usually re-trigger before this).
+    let requeue = match adoption_requeue {
+        Some(a) => base.min(a),
+        None => base,
+    };
+    Ok(Action::requeue(requeue))
+}
+
+/// Run one auto-adoption pass for a live `SnapshotPolicy` (M6, fixes #210),
+/// AFTER the retention block (inv. 6). `reconcile_inner` only gains the call.
+///
+/// Returns `Some(requeue)` when this pass adopted rows OR stamped an on-demand
+/// catalog-scan request (a belt requeue so the wave settles promptly); `None`
+/// means nothing happened — fall through to the normal steady-state return.
+///
+/// `backups` is the retention pass's `CONFIG_LABEL` child LIST, reused here to
+/// derive this policy's own kopia ids + whether it has any history (never
+/// re-LISTed). The discovered candidates come from a SEPARATE cluster-wide LIST.
+#[allow(clippy::too_many_arguments)]
+async fn run_adoption(
+    ctx: &Context,
+    api: &Api<SnapshotPolicy>,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+    repo: &io::ResolvedRepository,
+    resolved: &kopiur_api::snapshot_policy::ResolvedPolicy,
+    backups: &[Snapshot],
+    current: Option<&serde_json::Value>,
+) -> Result<Option<std::time::Duration>> {
+    use kopiur_api::common::{SnapshotAdoption, effective_adoption};
+
+    // 1. Gate: only when the effective adoption policy (policy → repo → default)
+    //    is Adopt. An unresolved identity (nothing to match against) is inert.
+    if effective_adoption(config.spec.adoption, repo.catalog.as_ref()) != SnapshotAdoption::Adopt {
+        return Ok(None);
     }
+    let Some(policy_identity) = resolved.identity.as_ref() else {
+        return Ok(None);
+    };
+
+    // 2. LIST discovered candidates cluster-wide (inv. 1), scoped to THIS repo.
+    let repo_uid = repo.owner_ref.uid.as_str();
+    let candidates = list_adoption_candidates(ctx, repo_uid).await?;
+
+    // 3. Own kopia ids + history from the retention child LIST (no re-LIST).
+    let (own_ids, has_history) = own_snapshot_ids_and_history(backups);
+    let scan_requested_identity = config
+        .status
+        .as_ref()
+        .and_then(|s| s.adoption.as_ref())
+        .and_then(|a| a.scan_requested_identity.as_deref());
+    let repo_cluster = repo
+        .identity_defaults
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref());
+
+    // 4. Plan (pure).
+    let plan = crate::adoption::plan_adoption(
+        SnapshotAdoption::Adopt,
+        policy_identity,
+        repo_cluster,
+        candidates,
+        &own_ids,
+        has_history,
+        scan_requested_identity,
+    );
+
+    // 5. Execute adoptions (inv. 4: create → ensure-status → delete discovered).
+    let adopted = execute_adoptions(ctx, config, namespace, repo_uid, &plan.adopt).await?;
+
+    // A single token for this pass: stamped on the repository AND recorded in
+    // `status.adoption` so the two agree.
+    let now = Utc::now().to_rfc3339();
+    let identity_str = kopiur_api::identity_string(policy_identity);
+
+    // 6. On-demand catalog-scan request (stamp + Normal event).
+    if plan.request_scan {
+        io::request_catalog_scan(&ctx.client, &config.spec.repository, namespace, &now).await?;
+        io::publish_normal_event(
+            ctx,
+            config,
+            crate::consts::ADOPTION_SCAN_REQUESTED_REASON,
+            crate::consts::AWAIT_CATALOG_SCAN_ACTION,
+            &format!(
+                "requested an on-demand catalog scan on repository {} so newly-recreated \
+                 snapshots matching identity {identity_str} materialize for adoption",
+                config.spec.repository.name
+            ),
+        )
+        .await;
+    }
+
+    // 7. Adoption-wave observability (metric + Normal event).
+    if adopted > 0 {
+        ctx.metrics.inc_snapshots_adopted(namespace, name, adopted);
+        io::publish_normal_event(
+            ctx,
+            config,
+            crate::consts::SNAPSHOTS_ADOPTED_REASON,
+            crate::consts::REVIEW_ADOPTION_ACTION,
+            &crate::adoption::adoption_event_message(adopted, &identity_str),
+        )
+        .await;
+        tracing::info!(policy = %name, adopted, identity = %identity_str, "auto-adopted discovered snapshots");
+    }
+
+    // 8. `status.adoption` summary (guarded, prior-carrying — only touched when
+    //    there is activity, so a steady-state pass writes nothing).
+    if adopted > 0 || plan.request_scan {
+        write_adoption_status(
+            api,
+            name,
+            current,
+            config,
+            adopted,
+            plan.request_scan,
+            &now,
+            &identity_str,
+        )
+        .await?;
+        return Ok(Some(std::time::Duration::from_secs(30)));
+    }
+    Ok(None)
+}
+
+/// LIST this repository's discovered rows cluster-wide (inv. 1) via the install
+/// scope, selected by `origin: discovered` + the repository UID, and distill
+/// them into [`crate::adoption::AdoptionCandidate`]s.
+async fn list_adoption_candidates(
+    ctx: &Context,
+    repo_uid: &str,
+) -> Result<Vec<crate::adoption::AdoptionCandidate>> {
+    let api: Api<Snapshot> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
+    let lp = ListParams::default().labels(&format!(
+        "{}={},{}={repo_uid}",
+        crate::consts::ORIGIN_LABEL,
+        Origin::Discovered.label_value(),
+        crate::consts::REPOSITORY_UID_LABEL,
+    ));
+    let rows = api.list(&lp).await?.items;
+    Ok(crate::adoption::adoption_candidates(repo_uid, &rows))
+}
+
+/// **Pure.** From this policy's `CONFIG_LABEL` children: the set of kopia ids
+/// they already carry (so an adopted row is never re-adopted), and whether the
+/// policy has any HISTORY — a retention-visible (`Succeeded`) row or an already-
+/// `Adopted` row. "No history" is what lets a brand-new / recreated policy ask
+/// for exactly one on-demand scan.
+fn own_snapshot_ids_and_history(
+    backups: &[Snapshot],
+) -> (std::collections::BTreeSet<String>, bool) {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut has_history = false;
+    for b in backups {
+        if let Some(info) = b
+            .status
+            .as_ref()
+            .and_then(|s| s.snapshot.as_ref())
+            .filter(|i| !i.kopia_snapshot_id.is_empty())
+        {
+            ids.insert(info.kopia_snapshot_id.clone());
+        }
+        if retention_view(b).is_some() || crate::snapshot::resolve_origin(b) == Origin::Adopted {
+            has_history = true;
+        }
+    }
+    (ids, has_history)
+}
+
+/// Execute the planned adoptions in order, returning how many succeeded. Each is
+/// idempotent and 404/409-tolerant ([`adopt_one`]), so a crash mid-pass re-runs
+/// safely next reconcile.
+async fn execute_adoptions(
+    ctx: &Context,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    repo_uid: &str,
+    adopt: &[crate::adoption::AdoptionCandidate],
+) -> Result<u64> {
+    let mut count = 0u64;
+    for candidate in adopt {
+        adopt_one(ctx, config, namespace, repo_uid, candidate).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Adopt one discovered row (inv. 4): CREATE the adopted row FIRST in the
+/// POLICY's namespace, ENSURE its status, THEN delete the discovered row in ITS
+/// OWN namespace. On create-409 (a prior wave already created it) DO NOT
+/// early-return — fall through to re-ensure the status so a crash between create
+/// and status-patch is healed. Every step is 404/409-tolerant.
+async fn adopt_one(
+    ctx: &Context,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    repo_uid: &str,
+    candidate: &crate::adoption::AdoptionCandidate,
+) -> Result<()> {
+    let (adopted, status) = crate::adoption::build_adopted_snapshot(config, repo_uid, candidate);
+    let cr_name = adopted.name_any();
+    let policy_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+
+    match policy_api.create(&PostParams::default(), &adopted).await {
+        Ok(_) => {}
+        // Already exists (a prior wave crashed after create) — ensure status, do
+        // NOT early-return.
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    io::patch_status(&policy_api, &cr_name, serde_json::to_value(&status)?).await?;
+
+    // Delete the discovered row in ITS OWN namespace, 404-tolerant.
+    let disc_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &candidate.namespace);
+    match disc_api
+        .delete(&candidate.name, &DeleteParams::default())
+        .await
+    {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+        Err(e) => return Err(Error::Kube(e)),
+    }
+    tracing::info!(
+        policy = %config.name_any(),
+        adopted = %cr_name,
+        discovered = %candidate.name,
+        "adopted a discovered snapshot"
+    );
+    Ok(())
+}
+
+/// Merge-patch `status.adoption` with the pass's summary, carrying prior values
+/// forward for the fields this pass did not touch so [`io::patch_status_if_changed`]
+/// stays a no-op in steady state.
+#[allow(clippy::too_many_arguments)]
+async fn write_adoption_status(
+    api: &Api<SnapshotPolicy>,
+    name: &str,
+    current: Option<&serde_json::Value>,
+    config: &SnapshotPolicy,
+    adopted: u64,
+    request_scan: bool,
+    now: &str,
+    identity: &str,
+) -> Result<()> {
+    use kopiur_api::snapshot_policy::AdoptionSummary;
+    let prior = config.status.as_ref().and_then(|s| s.adoption.as_ref());
+    let prior_total = prior.and_then(|a| a.total_adopted).unwrap_or(0);
+    let summary = AdoptionSummary {
+        last_adoption_at: if adopted > 0 {
+            Some(now.to_string())
+        } else {
+            prior.and_then(|a| a.last_adoption_at.clone())
+        },
+        last_adopted_count: if adopted > 0 {
+            Some(adopted as u32)
+        } else {
+            prior.and_then(|a| a.last_adopted_count)
+        },
+        total_adopted: Some(prior_total + adopted),
+        scan_requested_at: if request_scan {
+            Some(now.to_string())
+        } else {
+            prior.and_then(|a| a.scan_requested_at.clone())
+        },
+        scan_requested_identity: if request_scan {
+            Some(identity.to_string())
+        } else {
+            prior.and_then(|a| a.scan_requested_identity.clone())
+        },
+    };
+    io::patch_status_if_changed(
+        api,
+        name,
+        current,
+        serde_json::json!({ "adoption": summary }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The RFC3339 `endTime` of the most recent `Succeeded` `Snapshot` produced by

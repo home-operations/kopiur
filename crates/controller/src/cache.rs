@@ -163,6 +163,7 @@ mod tests {
             owner_ref: Default::default(),
             deletion_protection: None,
             mass_deletion_ack: None,
+            catalog: None,
         }
     }
 

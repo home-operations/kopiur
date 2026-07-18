@@ -81,6 +81,7 @@ pub struct Metrics {
     creds_secrets_reaped: Counter<u64>,
     projected_secrets_live: Gauge<i64>,
     snapshots_live: Gauge<i64>,
+    snapshots_adopted: Counter<u64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
@@ -379,6 +380,16 @@ impl Metrics {
                  deliberate safe default) and this is the only thing that will tell you so.",
             )
             .build();
+        let snapshots_adopted = m
+            .u64_counter("kopiur_snapshots_adopted")
+            .with_description(
+                "Total discovered Snapshots auto-adopted into an identity-matching \
+                 SnapshotPolicy (status.origin flipped to Adopted), by namespace and policy. \
+                 Adopted rows are then GFS-governed and eventually pruned by the policy's \
+                 spec.retention — opt out with spec.adoption: Ignore on the policy or \
+                 spec.catalog.adoption: Ignore on the repository.",
+            )
+            .build();
         let schedule_backups_created = m
             .u64_counter("kopiur_schedule_snapshots_created")
             .with_description("Total Snapshot CRs created by a SnapshotSchedule.")
@@ -468,6 +479,7 @@ impl Metrics {
             creds_secrets_reaped,
             projected_secrets_live,
             snapshots_live,
+            snapshots_adopted,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
@@ -996,6 +1008,19 @@ impl Metrics {
     /// Count a Snapshot CR created by a SnapshotSchedule.
     pub fn inc_schedule_backup_created(&self, ns: &str, name: &str) {
         self.schedule_backups_created.add(1, &ns_name(ns, name));
+    }
+
+    /// Count `n` discovered Snapshots auto-adopted into a `SnapshotPolicy`
+    /// (labels: `namespace`, `policy`). Called once per adoption wave with the
+    /// wave's count.
+    pub fn inc_snapshots_adopted(&self, ns: &str, policy: &str, n: u64) {
+        self.snapshots_adopted.add(
+            n,
+            &[
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("policy", policy.to_string()),
+            ],
+        );
     }
 
     /// Count a backup refused by policy. `reason` is the same machine-readable

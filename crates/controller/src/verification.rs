@@ -1079,6 +1079,7 @@ mod tests {
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
             mass_deletion_ack: None,
+            catalog: None,
         }
     }
 
