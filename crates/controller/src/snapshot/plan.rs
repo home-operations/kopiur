@@ -832,6 +832,17 @@ pub(super) fn should_run_preflight(phase: Option<SnapshotPhase>) -> bool {
     matches!(phase, None | Some(SnapshotPhase::Pending))
 }
 
+/// Whether a terminal steady-state pin arm (`pin_discovered_row`/
+/// `pin_adopted_row` in [`super`]) needs to patch status this reconcile: the
+/// observed phase hasn't already converged to the arm's `target` (`Discovered`
+/// for a discovered row, `Succeeded` for an adopted one). Pure + shared, so the
+/// "only pin when unset/divergent" idempotence both arms rely on — never
+/// re-patching (and so never re-generating kstatus conditions/timestamps) once
+/// pinned — is unit-tested without a cluster (M5).
+pub(super) fn needs_terminal_pin(observed: Option<SnapshotPhase>, target: SnapshotPhase) -> bool {
+    observed != Some(target)
+}
+
 /// Whether the preflight deadline has passed: `preflight_since + timeout <= now`.
 /// `timeout == None` ⇒ indefinite (never expires); `preflight_since == None` (the
 /// failure just started this reconcile) ⇒ not expired. Pure / clock-injected.

@@ -119,6 +119,61 @@ fn snapshot_stalled(backup: &Snapshot) -> bool {
     })
 }
 
+/// `Origin::Discovered` steady-state pin: catalog rows, not runs — never spawn a
+/// Job. Pins the `Discovered` phase (with kstatus Ready, ADR-0005 §2) and
+/// `status.origin` if unset, then stops. Extracted from `reconcile_inner`'s
+/// `match origin` (pure refactor of existing behavior — no semantic change) to
+/// keep the match legible under the complexity ratchet.
+async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    if needs_terminal_pin(
+        backup.status.as_ref().and_then(|s| s.phase),
+        SnapshotPhase::Discovered,
+    ) {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Discovered,
+            "Discovered",
+            "catalog-materialized snapshot",
+        );
+        status["origin"] = serde_json::json!("discovered");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
+/// `Origin::Adopted` steady-state pin: a row the catalog scan / auto-adoption
+/// re-attached to a live `SnapshotPolicy` without the operator itself producing
+/// the underlying kopia snapshot. It is retention-visible HISTORY — like
+/// `Discovered`, it must never enter the backup-run machinery — but unlike a
+/// plain `Discovered` row it IS retention-governed (ADR: adopted rows are
+/// managed like any produced backup), so it pins `phase: Succeeded`, not
+/// `Discovered`. Mirrors [`pin_discovered_row`]'s idempotent guard: the status
+/// patch (phase + terminal kstatus Ready + `status.origin`) only fires when the
+/// phase hasn't already converged, so a repeat reconcile is a no-op.
+///
+/// Belt-and-braces: an adopted row is normally stamped with the
+/// snapshot-cleanup finalizer by the mutating webhook at admission (same as
+/// every other `Snapshot`), but this arm returns before `reconcile_inner`'s main
+/// `ensure_finalizer` call below, so self-heal it here too — a no-op cluster
+/// call when the finalizer is already present.
+async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    io::ensure_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    if needs_terminal_pin(
+        backup.status.as_ref().and_then(|s| s.phase),
+        SnapshotPhase::Succeeded,
+    ) {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Succeeded,
+            "Adopted",
+            "adopted snapshot: retention-visible history re-attached to a SnapshotPolicy",
+        );
+        status["origin"] = serde_json::json!("adopted");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
 async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let origin = resolve_origin(backup);
     let policy = effective_deletion_policy(backup.spec.deletion_policy, origin);
@@ -132,20 +187,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         return handle_deletion(backup, ctx, &api, &namespace, &name, policy).await;
     }
 
-    // Discovered backups are catalog rows, not runs: never spawn a Job. Pin the
-    // Discovered phase (with kstatus Ready, ADR-0005 §2) if unset and stop.
-    if origin == Origin::Discovered {
-        if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Discovered) {
-            let mut status = snapshot_ready_status(
-                backup,
-                SnapshotPhase::Discovered,
-                "Discovered",
-                "catalog-materialized snapshot",
-            );
-            status["origin"] = serde_json::json!("discovered");
-            io::patch_status(&api, &name, status).await?;
-        }
-        return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
+    // Exhaustive over `Origin` (ADR §5.5): `Discovered` and `Adopted` rows are
+    // catalog history, not runs, and must return BEFORE any of the backup-run
+    // machinery below (`run_decision`, post-hooks, staged reap, pin jobs) —
+    // `Scheduled`/`Manual` are the only origins that ever mint a mover Job, so
+    // they fall through to it.
+    match origin {
+        Origin::Discovered => return pin_discovered_row(backup, &api, &name).await,
+        Origin::Adopted => return pin_adopted_row(backup, &api, &name).await,
+        Origin::Scheduled | Origin::Manual => {}
     }
 
     // Ensure the snapshot-cleanup finalizer before doing any work that creates a

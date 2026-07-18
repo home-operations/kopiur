@@ -1340,6 +1340,84 @@ fn orphaned_ownerref_children_get_their_own_policy() {
     }
 }
 
+// -- Adopted origin: deletion planning (M5) -------------------------------
+//
+// `Origin::Adopted` rows run through `plan_deletion` exactly like a produced
+// (Scheduled/Manual) row once `effective_deletion_policy` has resolved their
+// policy — unlike Discovered, they are NOT forced to Retain. These lock that
+// in end-to-end: `effective_deletion_policy(_, Origin::Adopted)` feeding
+// `plan_deletion`/`counts_toward_breaker`.
+
+#[test]
+fn adopted_external_delete_with_no_schedule_owner_deletes() {
+    // Adopted rows are NOT forced-Retain like Discovered: an external delete
+    // with no schedule owner and the breaker allowed deletes exactly like a
+    // produced row's would.
+    let a = BTreeMap::new();
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+    assert_eq!(policy, DeletionPolicy::Delete);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn adopted_external_delete_counts_toward_and_is_held_by_the_breaker() {
+    // Adopted external deletes count toward the per-repo mass-deletion breaker
+    // exactly like produced ones — the breaker doesn't special-case origin.
+    let a = BTreeMap::new();
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        ..base_facts(&a)
+    }));
+
+    // Over threshold + unacked ⇒ held, never silently deleted.
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn adopted_retention_prune_deletes_never_held() {
+    // Retention is the whole point of adoption: an operator retention prune on
+    // an adopted row deletes even with the breaker Held (operator prunes always
+    // bypass the breaker, same as any produced row).
+    let a = pruned(PrunedBy::Retention);
+    let policy = effective_deletion_policy(Some(DeletionPolicy::Delete), Origin::Adopted);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn adopted_policy_cascade_prune_retains_kopia_data() {
+    // A SnapshotPolicy-deletion cascade keeps kopia data even for an adopted
+    // row: the loud downgrade (RetainSnapshotOnPolicyDelete) fires for Adopted
+    // exactly as it does for a produced row under an effective Delete policy.
+    let a = pruned(PrunedBy::PolicyCascade);
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnPolicyDelete);
+}
+
 // -- table test: every meaningful row of the decision matrix -------------
 
 /// One row of the decision matrix: the facts that matter for that row plus
@@ -2430,6 +2508,116 @@ fn produced_honors_explicit_spec_policy() {
         effective_deletion_policy(Some(DeletionPolicy::Retain), Origin::Scheduled),
         DeletionPolicy::Retain
     );
+}
+
+#[test]
+fn adopted_defaults_to_delete_like_produced_not_retain() {
+    // M5: an adopted row is managed like any produced backup (Scheduled/Manual),
+    // NOT forced to Retain like Discovered — retention is the whole point of
+    // adoption, so the default must be Delete when the spec leaves it unset.
+    assert_eq!(
+        effective_deletion_policy(None, Origin::Adopted),
+        DeletionPolicy::Delete
+    );
+    assert_eq!(
+        effective_deletion_policy(Some(DeletionPolicy::Orphan), Origin::Adopted),
+        DeletionPolicy::Orphan
+    );
+}
+
+// --- resolve_origin: status-first precedence over the origin label (M5) ----
+
+/// A bare `Snapshot` with `status.origin`/the origin label set as given, for
+/// exercising [`resolve_origin`]'s precedence. `None`/`None` mirrors a raw
+/// `kubectl create` (no status yet, no label stamped).
+fn backup_with_origin(status_origin: Option<Origin>, label: Option<&str>) -> Snapshot {
+    let mut backup = dummy_backup();
+    if let Some(o) = status_origin {
+        backup.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            origin: Some(o),
+            ..Default::default()
+        });
+    }
+    if let Some(l) = label {
+        backup
+            .labels_mut()
+            .insert(crate::consts::ORIGIN_LABEL.to_string(), l.to_string());
+    }
+    backup
+}
+
+#[test]
+fn resolve_origin_defaults_to_manual_with_no_status_or_label() {
+    assert_eq!(
+        resolve_origin(&backup_with_origin(None, None)),
+        Origin::Manual
+    );
+}
+
+#[test]
+fn resolve_origin_status_wins_over_a_conflicting_label() {
+    // status.origin is canonical: a stale/mismatched `discovered` label (e.g.
+    // from before an M6 adoption re-stamped status) must never demote an
+    // already-adopted row back to Discovered.
+    let backup = backup_with_origin(Some(Origin::Adopted), Some("discovered"));
+    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+}
+
+#[test]
+fn resolve_origin_reads_adopted_from_the_label_when_status_is_unset() {
+    // Label-only adoption (status not yet stamped, e.g. mid-reconcile) still
+    // resolves to Adopted — the label is the fallback, not just Discovered's.
+    let backup = backup_with_origin(None, Some("adopted"));
+    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+}
+
+// --- needs_terminal_pin: shared idempotence gate for the Discovered/Adopted
+// steady-state pin arms (M5) -------------------------------------------------
+//
+// `reconcile_inner`'s `pin_discovered_row`/`pin_adopted_row` are thin async IO
+// wrappers around a `snapshot_ready_status` patch; the one piece of actual
+// decision logic they contain — whether a patch is needed at all this pass —
+// is this pure predicate, extracted so the "only pin when unset/divergent,
+// never re-patch once converged" idempotence is unit-tested without a cluster.
+// The wrapper functions' IO (the patch calls, `ensure_finalizer`, the terminal
+// requeue) is exercised live by the M8 e2e suite, not here.
+
+#[test]
+fn needs_terminal_pin_true_when_phase_unset() {
+    assert!(super::plan::needs_terminal_pin(
+        None,
+        SnapshotPhase::Discovered
+    ));
+    assert!(super::plan::needs_terminal_pin(
+        None,
+        SnapshotPhase::Succeeded
+    ));
+}
+
+#[test]
+fn needs_terminal_pin_true_when_phase_diverges_from_target() {
+    assert!(super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Pending),
+        SnapshotPhase::Succeeded
+    ));
+    assert!(super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Succeeded),
+        SnapshotPhase::Discovered
+    ));
+}
+
+#[test]
+fn needs_terminal_pin_false_once_converged() {
+    // The idempotence both `pin_discovered_row` and `pin_adopted_row` rely on:
+    // once the observed phase matches the arm's own target, no further patch.
+    assert!(!super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Discovered),
+        SnapshotPhase::Discovered
+    ));
+    assert!(!super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Succeeded),
+        SnapshotPhase::Succeeded
+    ));
 }
 
 fn job_with_status(status: Option<k8s_openapi::api::batch::v1::JobStatus>) -> Job {
