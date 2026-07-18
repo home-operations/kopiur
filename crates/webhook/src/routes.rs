@@ -296,6 +296,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_backup_create_stamps_config_label_alongside_other_defaults() {
+        // A raw-`kubectl apply`'d manual Snapshot with `policyRef` (no ORIGIN_LABEL,
+        // no pre-existing config label) must get CONFIG_LABEL stamped on CREATE,
+        // alongside the existing finalizer/deletionPolicy defaults.
+        let body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        let has_label = patch.iter().any(|op| {
+            op["op"] == "add"
+                && op["path"] == "/metadata/labels"
+                && op["value"]["kopiur.home-operations.com/config"] == "nightly"
+        });
+        let has_dp = patch.iter().any(|op| {
+            op["op"] == "add" && op["path"] == "/spec/deletionPolicy" && op["value"] == "Delete"
+        });
+        let has_fin = patch.iter().any(|op| {
+            op["op"] == "add"
+                && op["path"] == "/metadata/finalizers"
+                && op["value"][0] == "kopiur.home-operations.com/snapshot-cleanup"
+        });
+        assert!(has_label, "expected config label stamp: {patch:?}");
+        assert!(has_dp, "expected Delete default: {patch:?}");
+        assert!(has_fin, "expected finalizer add: {patch:?}");
+    }
+
+    #[tokio::test]
+    async fn manual_backup_update_does_not_stamp_config_label() {
+        // CONFIG_LABEL stamping is CREATE-only by design (no controller-side
+        // backfill of pre-existing CRs — see `handlers::config_label_stamp`).
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        // The origin-aware deletionPolicy default applies regardless of operation,
+        // so the patch is non-empty — proving this isn't a vacuous check.
+        assert!(
+            patch.iter().any(|op| op["path"] == "/spec/deletionPolicy"),
+            "expected a non-empty patch to make this a meaningful assertion: {patch:?}"
+        );
+        let touches_labels = patch.iter().any(|op| {
+            op["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("/metadata/labels"))
+        });
+        assert!(
+            !touches_labels,
+            "UPDATE must not stamp the config label: {patch:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_backup_is_not_refinalized() {
         // Regression: the mutating webhook re-added the snapshot-cleanup finalizer
         // on EVERY admission, including the UPDATE the controller issues to REMOVE

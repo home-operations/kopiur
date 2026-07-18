@@ -16,7 +16,7 @@
 use kopiur_api as api;
 
 use api::cluster_repository::ClusterRepositorySpec;
-use api::common::{DeletionPolicy, RepositoryKind, RepositoryRef};
+use api::common::{DeletionPolicy, PolicyRef, RepositoryKind, RepositoryRef};
 use api::error::ValidationError;
 use api::maintenance::MaintenanceSpec;
 use api::repository::RepositorySpec;
@@ -34,6 +34,7 @@ use kube::Client;
 use kube::core::DynamicObject;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// The finalizer that ties a kopia snapshot's lifecycle to its `Snapshot` CR (ADR §4.5).
 /// Single definition shared with the controller via `kopiur-api` so the two can't drift.
@@ -337,7 +338,92 @@ fn handle_snapshot(
     // Every Snapshot carries the snapshot-cleanup finalizer (ADR §4.5).
     ensure_finalizer_ops(&obj.metadata, &mut ops);
 
+    // Stamp CONFIG_LABEL on CREATE only. Today the label is stamped by the schedule
+    // controller and by the CLI's `snapshot now` — but a raw-`kubectl apply`'d manual
+    // Snapshot with `spec.policyRef` never gets it, making it invisible to GFS
+    // retention, the policy fan-out watch, and the SnapshotPolicy deletion cascade
+    // (all of which select a policy's children by this label). Deliberately no
+    // controller-side backfill of pre-existing CRs: retro-labeling would make a
+    // previously-immortal raw-applied manual Snapshot GFS-prunable — silent data loss.
+    if req.operation == Operation::Create
+        && let Some(value) = config_label_stamp(
+            origin,
+            spec.policy_ref.as_ref(),
+            obj.metadata
+                .namespace
+                .as_deref()
+                .or(req.namespace.as_deref())
+                .unwrap_or_default(),
+            obj.metadata.labels.as_ref(),
+        )
+    {
+        ops.push(config_label_op(&obj.metadata, &value));
+    }
+
     with_patch(resp, ops)
+}
+
+/// Decide whether a `Snapshot` referencing a `SnapshotPolicy` should have
+/// `CONFIG_LABEL` stamped on it, and the value to stamp. Pure (no IO), so it
+/// unit-tests without a cluster.
+///
+/// Fires only when ALL hold:
+/// - `origin` is `Manual` or `Scheduled` — never `Discovered`: a catalog-materialized
+///   Snapshot never ran through a policy, so a `policyRef` on one (if any) doesn't
+///   earn the label.
+/// - `policy_ref` is present with a nonempty name.
+/// - The ref targets the Snapshot's OWN namespace (absent/empty `namespace`, or equal
+///   to `cr_namespace`). The stamped label value is a bare policy name with no
+///   namespace component, so a cross-namespace ref must not mint a label that
+///   collides with a same-named LOCAL policy.
+/// - The label isn't already present, regardless of its value (idempotent: never
+///   overwrite an existing value).
+fn config_label_stamp(
+    origin: Origin,
+    policy_ref: Option<&PolicyRef>,
+    cr_namespace: &str,
+    existing_labels: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    match origin {
+        Origin::Discovered => return None,
+        Origin::Manual | Origin::Scheduled => {}
+    }
+
+    let policy_ref = policy_ref?;
+    if policy_ref.name.is_empty() {
+        return None;
+    }
+
+    if let Some(ns) = policy_ref.namespace.as_deref()
+        && !ns.is_empty()
+        && ns != cr_namespace
+    {
+        return None;
+    }
+
+    if existing_labels.is_some_and(|labels| labels.contains_key(api::consts::CONFIG_LABEL)) {
+        return None;
+    }
+
+    Some(policy_ref.name.clone())
+}
+
+/// Build the JSON-patch op that stamps `CONFIG_LABEL = value` on a `Snapshot`,
+/// mirroring `set_spec_field`'s absent-parent handling: if `metadata.labels` is
+/// absent, add the whole map; otherwise add just the key (an RFC 6902 `add` on an
+/// existing map sets/creates that one member without clobbering siblings). Only
+/// called once `config_label_stamp` has already confirmed the key is absent.
+fn config_label_op(meta: &ObjectMeta, value: &str) -> PatchOperation {
+    match &meta.labels {
+        None => PatchOperation::Add(AddOperation {
+            path: PointerBuf::from_tokens(["metadata", "labels"]),
+            value: json!({ api::consts::CONFIG_LABEL: value }),
+        }),
+        Some(_) => PatchOperation::Add(AddOperation {
+            path: PointerBuf::from_tokens(["metadata", "labels", api::consts::CONFIG_LABEL]),
+            value: json!(value),
+        }),
+    }
 }
 
 /// Resolve a `Snapshot`'s origin from the `kopiur.home-operations.com/origin` label (canonical) or
@@ -772,6 +858,132 @@ fn set_spec_field(data: &Value, field: &str, value: Value) -> PatchOperation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- config_label_stamp (pure) ---------------------------------------------
+
+    fn policy_ref(name: &str, namespace: Option<&str>) -> PolicyRef {
+        PolicyRef {
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
+        }
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn manual_same_ns_ref_with_no_labels_map_stamps() {
+        let r = policy_ref("nightly", None);
+        assert_eq!(
+            config_label_stamp(Origin::Manual, Some(&r), "billing", None),
+            Some("nightly".to_string())
+        );
+    }
+
+    #[test]
+    fn manual_ref_with_existing_labels_map_missing_key_stamps() {
+        let r = policy_ref("nightly", None);
+        let existing = labels(&[("some-other", "label")]);
+        assert_eq!(
+            config_label_stamp(Origin::Manual, Some(&r), "billing", Some(&existing)),
+            Some("nightly".to_string())
+        );
+    }
+
+    #[test]
+    fn label_already_present_is_a_no_op_regardless_of_value() {
+        let r = policy_ref("nightly", None);
+        let existing = labels(&[(api::consts::CONFIG_LABEL, "some-other-policy")]);
+        assert_eq!(
+            config_label_stamp(Origin::Manual, Some(&r), "billing", Some(&existing)),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_cross_namespace_ref_is_a_no_op() {
+        let r = policy_ref("nightly", Some("other-ns"));
+        assert_eq!(
+            config_label_stamp(Origin::Manual, Some(&r), "billing", None),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_same_namespace_ref_still_stamps() {
+        let r = policy_ref("nightly", Some("billing"));
+        assert_eq!(
+            config_label_stamp(Origin::Manual, Some(&r), "billing", None),
+            Some("nightly".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_policy_ref_is_a_no_op() {
+        assert_eq!(
+            config_label_stamp(Origin::Manual, None, "billing", None),
+            None
+        );
+    }
+
+    #[test]
+    fn discovered_origin_is_a_no_op_even_with_a_ref() {
+        let r = policy_ref("nightly", None);
+        assert_eq!(
+            config_label_stamp(Origin::Discovered, Some(&r), "billing", None),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_origin_with_ref_stamps_same_as_manual() {
+        // Harmless idempotent parity with the schedule controller, which already
+        // stamps this label itself — this codepath is a no-op there in practice.
+        let r = policy_ref("nightly", None);
+        assert_eq!(
+            config_label_stamp(Origin::Scheduled, Some(&r), "billing", None),
+            Some("nightly".to_string())
+        );
+    }
+
+    // --- config_label_op (ops-building) -----------------------------------------
+
+    fn add_op(op: PatchOperation) -> AddOperation {
+        match op {
+            PatchOperation::Add(add) => add,
+            other => panic!("expected an Add op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_label_op_creates_the_labels_map_when_absent() {
+        let meta = ObjectMeta::default();
+        let op = add_op(config_label_op(&meta, "nightly"));
+        assert_eq!(op.path.to_string(), "/metadata/labels");
+        assert_eq!(
+            op.value,
+            json!({ "kopiur.home-operations.com/config": "nightly" })
+        );
+    }
+
+    #[test]
+    fn config_label_op_adds_just_the_key_when_the_map_already_exists() {
+        let meta = ObjectMeta {
+            labels: Some(labels(&[("some-other", "label")])),
+            ..Default::default()
+        };
+        let op = add_op(config_label_op(&meta, "nightly"));
+        // The slash in the label key must be RFC 6901 ("~1") escaped.
+        assert_eq!(
+            op.path.to_string(),
+            "/metadata/labels/kopiur.home-operations.com~1config"
+        );
+        assert_eq!(op.value, json!("nightly"));
+    }
 
     /// Build a CREATE `AdmissionRequest` for the given kind/spec, the way the API
     /// server would. No cluster needed — Repository/ClusterRepository validation is
