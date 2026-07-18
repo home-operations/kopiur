@@ -18,10 +18,10 @@ use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::Retention;
+use kopiur_api::common::{PolicyDeletePolicy, Retention};
 use kopiur_api::retention::{SnapshotLike, select_kept};
 use kopiur_api::snapshot::PrunedBy;
-use kopiur_api::{Snapshot, SnapshotPolicy, validate};
+use kopiur_api::{Origin, Snapshot, SnapshotPolicy, validate};
 
 use crate::consts::CONFIG_LABEL;
 use crate::context::Context;
@@ -126,6 +126,99 @@ pub fn partition_retention_prune(
         }
     }
     (to_delete, to_stamp_only)
+}
+
+/// The plan for cascading a `SnapshotPolicy` deletion onto the `Snapshot` CRs
+/// carrying its config label (wired to the policy finalizer in M3; nothing
+/// calls this yet). **Pure** — no IO, no repository contact of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyCascadePlan {
+    /// `PolicyDeletePolicy::Retain`, live children: stamp `pruned-by:
+    /// policy-cascade` then delete the CR (the kopia snapshot is NEVER
+    /// touched — the stamp is what routes the Snapshot finalizer to
+    /// [`crate::snapshot::DeletionPlan::RetainSnapshotOnPolicyDelete`] instead
+    /// of a real repository delete, even when the Snapshot's own
+    /// `deletionPolicy` is `Delete`).
+    pub stamp_and_delete: Vec<String>,
+    /// `PolicyDeletePolicy::Retain`, terminating children with NO valid
+    /// `pruned-by` stamp: an in-flight external (or breaker-held) deletion,
+    /// reclassified into a quiet retain drain by stamping the annotation ONLY
+    /// (already terminating — there is nothing left to delete). This is the
+    /// finalizer-release guarantee: a breaker-held terminating child must
+    /// resolve to "no work" here, or the M3 policy finalizer would wedge
+    /// forever waiting on a mass-deletion ack that will never come once the
+    /// policy itself is gone.
+    pub stamp_only: Vec<String>,
+    /// `PolicyDeletePolicy::Delete`, live children: a bare UNSTAMPED delete —
+    /// each child's own `deletionPolicy` applies as an ordinary EXTERNAL
+    /// deletion, subject to the per-repository mass-deletion breaker. NEVER
+    /// stamped: stamping here would launder an external-classified deletion
+    /// past the breaker.
+    pub delete_only: Vec<String>,
+}
+
+/// **Pure.** Decide how a `SnapshotPolicy` deletion cascades onto its
+/// `children` `Snapshot` CRs under the policy's effective `mode`
+/// ([`kopiur_api::snapshot_policy::effective_on_policy_delete`]).
+///
+/// Rules, in order:
+/// 1. **Origin filter** (exhaustive over [`Origin`], status-first via
+///    [`crate::snapshot::resolve_origin`]): `Discovered` is NEVER included in
+///    any set — a hand-labeled discovered CR must not churn just because a
+///    policy it merely resembles was deleted. `Adopted | Scheduled | Manual`
+///    are cascaded — all three are operator-managed rows.
+/// 2. **Terminating exclusion**: only a child with
+///    `metadata.deletionTimestamp.is_none()` (live) may enter
+///    `stamp_and_delete` or `delete_only`. A terminating child is handled by
+///    `stamp_only` (Retain mode, unstamped) or left alone entirely (every
+///    other case) — never re-deleted.
+/// 3. **Exhaustive match on `(terminating, mode)`** (2×2, no catch-all):
+///    - `(live, Retain)` → `stamp_and_delete`.
+///    - `(live, Delete)` → `delete_only`.
+///    - `(terminating, Retain)` → `stamp_only` iff no valid `pruned-by` stamp
+///      is already present (an already-stamped terminating child is already
+///      draining correctly — nothing to do).
+///    - `(terminating, Delete)` → nothing (already terminating; `Delete` mode
+///      never stamps).
+pub fn plan_policy_cascade(children: &[Snapshot], mode: PolicyDeletePolicy) -> PolicyCascadePlan {
+    let mut plan = PolicyCascadePlan::default();
+    for child in children {
+        if cascade_eligible(child) {
+            classify_policy_cascade_child(child, mode, &mut plan);
+        }
+    }
+    plan
+}
+
+/// Step 1 of [`plan_policy_cascade`]: exhaustive over [`Origin`]. Only
+/// `Discovered` is excluded — the operator did not create that kopia
+/// snapshot and must never churn it on a policy's say-so.
+fn cascade_eligible(child: &Snapshot) -> bool {
+    match crate::snapshot::resolve_origin(child) {
+        Origin::Discovered => false,
+        Origin::Adopted | Origin::Scheduled | Origin::Manual => true,
+    }
+}
+
+/// Steps 2-3 of [`plan_policy_cascade`]: exhaustive over `(terminating,
+/// mode)` for one already-eligible child.
+fn classify_policy_cascade_child(
+    child: &Snapshot,
+    mode: PolicyDeletePolicy,
+    plan: &mut PolicyCascadePlan,
+) {
+    let name = child.name_any();
+    let terminating = child.metadata.deletion_timestamp.is_some();
+    match (terminating, mode) {
+        (false, PolicyDeletePolicy::Retain) => plan.stamp_and_delete.push(name),
+        (false, PolicyDeletePolicy::Delete) => plan.delete_only.push(name),
+        (true, PolicyDeletePolicy::Retain) => {
+            if crate::snapshot::pruned_by(child.annotations()).is_none() {
+                plan.stamp_only.push(name);
+            }
+        }
+        (true, PolicyDeletePolicy::Delete) => {}
+    }
 }
 
 /// Count the most-recent run of consecutive `Failed` backups before the latest
@@ -707,6 +800,122 @@ mod tests {
         // Terminating + no pruned-by → stamp only (reclassify draining prune).
         assert_eq!(to_stamp_only, vec!["term-unstamped".to_string()]);
         // Terminating + already stamped, and the absent one, are in neither set.
+    }
+
+    // -- plan_policy_cascade (M2 — pure decision layer; wired to a finalizer in M3) --
+
+    /// A `Succeeded` Snapshot with the given `origin` (status-first, matching
+    /// `resolve_origin`'s precedence).
+    fn backup_with_origin(name: &str, origin: Origin) -> Snapshot {
+        let mut b = succeeded_backup(name, at(2026, 5, 24));
+        if let Some(s) = b.status.as_mut() {
+            s.origin = Some(origin);
+        }
+        b
+    }
+
+    #[test]
+    fn plan_policy_cascade_retain_mode_mixed_population() {
+        let children = vec![
+            backup_with_origin("live-produced", Origin::Scheduled),
+            backup_with_origin("live-adopted", Origin::Adopted),
+            backup_with_origin("live-discovered", Origin::Discovered),
+            terminating(backup_with_origin("term-unstamped", Origin::Manual), false),
+            terminating(backup_with_origin("term-stamped", Origin::Scheduled), true),
+        ];
+        let plan = plan_policy_cascade(&children, PolicyDeletePolicy::Retain);
+        let stamp_and_delete: BTreeSet<String> = plan.stamp_and_delete.into_iter().collect();
+        assert_eq!(
+            stamp_and_delete,
+            ["live-produced".to_string(), "live-adopted".to_string()]
+                .into_iter()
+                .collect(),
+            "discovered is excluded; adopted is cascaded like produced"
+        );
+        assert_eq!(plan.stamp_only, vec!["term-unstamped".to_string()]);
+        assert!(
+            plan.delete_only.is_empty(),
+            "Retain mode never bare-deletes"
+        );
+    }
+
+    #[test]
+    fn plan_policy_cascade_delete_mode_mixed_population() {
+        let children = vec![
+            backup_with_origin("live-produced", Origin::Scheduled),
+            backup_with_origin("live-adopted", Origin::Adopted),
+            backup_with_origin("live-discovered", Origin::Discovered),
+            terminating(backup_with_origin("term-unstamped", Origin::Manual), false),
+            terminating(backup_with_origin("term-stamped", Origin::Scheduled), true),
+        ];
+        let plan = plan_policy_cascade(&children, PolicyDeletePolicy::Delete);
+        let delete_only: BTreeSet<String> = plan.delete_only.into_iter().collect();
+        assert_eq!(
+            delete_only,
+            ["live-produced".to_string(), "live-adopted".to_string()]
+                .into_iter()
+                .collect(),
+            "discovered is excluded; adopted is cascaded like produced, bare-unstamped"
+        );
+        assert!(plan.stamp_and_delete.is_empty(), "Delete mode never stamps");
+        assert!(
+            plan.stamp_only.is_empty(),
+            "Delete mode never touches terminating children"
+        );
+    }
+
+    #[test]
+    fn plan_policy_cascade_excludes_discovered_from_every_set_live_and_terminating() {
+        // Defensive: a hand-labeled discovered CR must not churn just because a
+        // policy it merely resembles was deleted — neither live nor terminating.
+        let children = vec![
+            backup_with_origin("live-discovered", Origin::Discovered),
+            terminating(
+                backup_with_origin("term-discovered", Origin::Discovered),
+                false,
+            ),
+        ];
+        for mode in [PolicyDeletePolicy::Retain, PolicyDeletePolicy::Delete] {
+            let plan = plan_policy_cascade(&children, mode);
+            assert!(plan.stamp_and_delete.is_empty(), "{mode:?}");
+            assert!(plan.stamp_only.is_empty(), "{mode:?}");
+            assert!(plan.delete_only.is_empty(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn plan_policy_cascade_empty_input_is_empty_plan() {
+        for mode in [PolicyDeletePolicy::Retain, PolicyDeletePolicy::Delete] {
+            let plan = plan_policy_cascade(&[], mode);
+            assert_eq!(plan, PolicyCascadePlan::default(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn plan_policy_cascade_only_terminating_children_yields_no_live_work_in_either_mode() {
+        // The release-condition guarantee: a population of ONLY breaker-held
+        // terminating children must yield empty stamp_and_delete AND empty
+        // delete_only in BOTH modes, or the M3 finalizer would wait forever on
+        // a mass-deletion ack that can never come once the policy is gone.
+        let children = vec![
+            terminating(
+                backup_with_origin("held-unstamped", Origin::Scheduled),
+                false,
+            ),
+            terminating(backup_with_origin("held-stamped", Origin::Adopted), true),
+        ];
+        for mode in [PolicyDeletePolicy::Retain, PolicyDeletePolicy::Delete] {
+            let plan = plan_policy_cascade(&children, mode);
+            assert!(plan.stamp_and_delete.is_empty(), "{mode:?}");
+            assert!(plan.delete_only.is_empty(), "{mode:?}");
+        }
+        // Retain mode still performs its documented non-blocking side effect
+        // (stamping the unstamped one so its finalizer drains quietly); Delete
+        // mode touches nothing in this population at all.
+        let retain_plan = plan_policy_cascade(&children, PolicyDeletePolicy::Retain);
+        assert_eq!(retain_plan.stamp_only, vec!["held-unstamped".to_string()]);
+        let delete_plan = plan_policy_cascade(&children, PolicyDeletePolicy::Delete);
+        assert!(delete_plan.stamp_only.is_empty());
     }
 
     #[test]

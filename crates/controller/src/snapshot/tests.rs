@@ -1117,6 +1117,111 @@ fn operator_pruned_bypasses_guard_and_breaker() {
     }
 }
 
+// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 3×3 matrix (M2) --
+
+#[test]
+fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
+    let cases = [
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Delete,
+            DeletionPlan::DeleteSnapshot,
+        ),
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Delete,
+            DeletionPlan::DeleteSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        // The loud downgrade: a policy-cascade prune under an effective
+        // `Delete` policy NEVER contacts the repository.
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Delete,
+            DeletionPlan::RetainSnapshotOnPolicyDelete,
+        ),
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+    ];
+    for (kind, policy, expected) in cases {
+        let a = pruned(kind);
+        // Every operator prune bypasses BOTH the schedule cascade guard and
+        // the breaker — set both to what would otherwise divert the
+        // decision, so this test also proves the prune path short-circuits
+        // them for every kind, not just Retention/FailedHistory.
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            owner: OwnerState::GoneOrReplaced,
+            cascade: ScheduleDeletePolicy::Retain,
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, expected, "{kind:?}/{policy:?}");
+    }
+}
+
+#[test]
+fn policy_cascade_stamp_bypasses_schedule_cascade_guard_not_just_the_breaker() {
+    // A composite of the two "bypass" mechanisms: a policy-cascade stamp
+    // must resolve via the prune path (RetainSnapshotOnPolicyDelete), NOT
+    // the schedule cascade guard, even when the owner is gone/replaced and
+    // the schedule cascade is set to Retain (which would otherwise produce
+    // the DIFFERENT plan RetainSnapshotOnScheduleDelete).
+    let a = pruned(PrunedBy::PolicyCascade);
+    let plan = plan_deletion(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnPolicyDelete);
+}
+
+#[test]
+fn skip_cleanup_annotation_wins_over_a_policy_cascade_stamp() {
+    // Decision step 1 (skip-cleanup) is absolute — it wins even over an
+    // operator prune stamp.
+    let a = ann(&[
+        (
+            PRUNED_BY_ANNOTATION,
+            PrunedBy::PolicyCascade.annotation_value(),
+        ),
+        (SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true"),
+    ]);
+    let plan = plan_deletion(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
 #[test]
 fn unknown_pruned_by_value_treated_external() {
     let a = ann(&[(PRUNED_BY_ANNOTATION, "garbage")]);
@@ -1837,6 +1942,19 @@ fn counts_toward_breaker_cascade_retained_is_false() {
     }));
 }
 
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_false() {
+    // Locks the new PrunedBy::PolicyCascade variant into the existing
+    // early-return short-circuit (any valid pruned-by stamp never counts
+    // toward the breaker) — the M3 finalizer must never see this stamp
+    // inflate a repository's pending count.
+    let a = pruned(PrunedBy::PolicyCascade);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
 // -- breaker_stores_ready / parse_mass_deletion_ack ------------------------
 
 #[test]
@@ -1965,6 +2083,47 @@ fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
     assert!(
         msg.contains(SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
         "escape hatch: {msg}"
+    );
+}
+
+// -- policy_cascade_retained_message (RetainSnapshotOnPolicyDelete executor) --
+
+#[test]
+fn policy_cascade_retained_message_names_cr_retained_state_and_opt_in() {
+    let msg = policy_cascade_retained_message("backups", "nightly-1", true);
+    assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
+    assert!(
+        msg.contains("RETAINED in the repository"),
+        "states retained: {msg}"
+    );
+    assert!(
+        msg.contains("rediscoverable/adoptable"),
+        "states rediscoverable: {msg}"
+    );
+    assert!(
+        msg.contains("spec.deletion.onPolicyDelete: Delete"),
+        "names the opt-in: {msg}"
+    );
+}
+
+#[test]
+fn policy_cascade_retained_message_cancelled_mid_flight_names_no_completed_snapshot() {
+    // A live child cascaded before its mover Job ever finished: there is no
+    // kopia snapshot to "retain" — the message must say so, not lie about a
+    // snapshot that never existed.
+    let msg = policy_cascade_retained_message("backups", "nightly-2", false);
+    assert!(
+        msg.contains("never completed") && msg.contains("cancelled mid-flight"),
+        "states not-completed: {msg}"
+    );
+    assert!(!msg.contains("RETAINED in the repository"), "{msg}");
+    assert!(
+        msg.contains("rediscoverable/adoptable"),
+        "still states rediscoverable: {msg}"
+    );
+    assert!(
+        msg.contains("spec.deletion.onPolicyDelete: Delete"),
+        "still names the opt-in: {msg}"
     );
 }
 

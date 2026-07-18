@@ -516,6 +516,10 @@ pub const SNAPSHOT_DELETION_HELD_REASON: &str = "SnapshotDeletionHeld";
 /// guard (`onScheduleDelete: Retain` with a gone/replaced owning
 /// `SnapshotSchedule`).
 pub const SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON: &str = "SnapshotRetainedOnScheduleDelete";
+/// Event reason when a `Snapshot` is retained by the policy-deletion cascade
+/// (`pruned-by: policy-cascade`, stamped when the owning `SnapshotPolicy` is
+/// gone and `onPolicyDelete: Retain`).
+pub const SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON: &str = "SnapshotRetainedOnPolicyDelete";
 /// Event reason when [`ALLOW_MASS_DELETION_ANNOTATION`]'s value fails to parse
 /// as an RFC3339 timestamp — the ack is ignored (fail-safe) rather than
 /// silently disarming the breaker.
@@ -540,3 +544,6 @@ pub const ACKNOWLEDGE_MASS_DELETION_ACTION: &str = "AcknowledgeMassDeletion";
 /// Event `action` for `SnapshotRetainedOnScheduleDelete`: opt into cascading
 /// deletes by setting the schedule's `spec.deletion.onScheduleDelete: Delete`.
 pub const ENABLE_SCHEDULE_CASCADE_ACTION: &str = "EnableScheduleCascade";
+/// Event `action` for `SnapshotRetainedOnPolicyDelete`: opt into cascading
+/// deletes by setting the policy's `spec.deletion.onPolicyDelete: Delete`.
+pub const ENABLE_POLICY_CASCADE_ACTION: &str = "EnablePolicyCascade";

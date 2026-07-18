@@ -72,6 +72,7 @@ pub struct Metrics {
     orphaned_snapshots: Counter<u64>,
     snapshot_deletions: Counter<u64>,
     snapshots_cascade_retained: Counter<u64>,
+    snapshots_policy_cascade_retained: Counter<u64>,
     snapshot_delete_batch_jobs: Counter<u64>,
     snapshot_delete_batch_members: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
@@ -117,6 +118,13 @@ pub enum SnapshotDeletionOutcome {
     /// variant to `inc_snapshot_deletion` directly — it also bumps the
     /// narrower `kopiur_snapshots_cascade_retained` counter in one place.
     CascadeRetained,
+    /// Retained specifically because the policy-deletion cascade fired
+    /// (`pruned-by: policy-cascade` with the Snapshot's own effective
+    /// `deletionPolicy: Delete`). Prefer
+    /// [`Metrics::inc_snapshot_policy_cascade_retained`] over passing this
+    /// variant to `inc_snapshot_deletion` directly — it also bumps the
+    /// narrower `kopiur_snapshots_policy_cascade_retained` counter in one place.
+    PolicyCascadeRetained,
 }
 
 impl SnapshotDeletionOutcome {
@@ -127,6 +135,7 @@ impl SnapshotDeletionOutcome {
             SnapshotDeletionOutcome::Retained => "retained",
             SnapshotDeletionOutcome::Orphaned => "orphaned",
             SnapshotDeletionOutcome::CascadeRetained => "cascade_retained",
+            SnapshotDeletionOutcome::PolicyCascadeRetained => "policy_cascade_retained",
         }
     }
 }
@@ -249,8 +258,8 @@ impl Metrics {
         let snapshot_deletions = m
             .u64_counter("kopiur_snapshot_deletions")
             .with_description(
-                "Total Snapshot finalizer resolutions, by outcome \
-                 (deleted|retained|orphaned|cascade_retained) and namespace. Distinct from \
+                "Total Snapshot finalizer resolutions, by outcome (deleted|retained|orphaned| \
+                 cascade_retained|policy_cascade_retained) and namespace. Distinct from \
                  kopiur_snapshot_deletion_failures_total, which counts kopia delete-call \
                  FAILURES during finalizer handling, not resolutions — never sum the two.",
             )
@@ -263,6 +272,18 @@ impl Metrics {
                  A narrower, always-alongside view of \
                  kopiur_snapshot_deletions{outcome=\"cascade_retained\"} — both are bumped \
                  together by inc_snapshot_cascade_retained so the two series can't drift apart.",
+            )
+            .build();
+        let snapshots_policy_cascade_retained = m
+            .u64_counter("kopiur_snapshots_policy_cascade_retained")
+            .with_description(
+                "Total Snapshots retained specifically by the policy-deletion cascade \
+                 (pruned-by: policy-cascade with the Snapshot's own effective deletionPolicy: \
+                 Delete, when the owning SnapshotPolicy is gone and onPolicyDelete: Retain). A \
+                 narrower, always-alongside view of \
+                 kopiur_snapshot_deletions{outcome=\"policy_cascade_retained\"} — both are \
+                 bumped together by inc_snapshot_policy_cascade_retained so the two series can't \
+                 drift apart.",
             )
             .build();
         let snapshot_delete_batch_jobs = m
@@ -400,6 +421,7 @@ impl Metrics {
             orphaned_snapshots,
             snapshot_deletions,
             snapshots_cascade_retained,
+            snapshots_policy_cascade_retained,
             snapshot_delete_batch_jobs,
             snapshot_delete_batch_members,
             work_spec_cms_swept,
@@ -861,6 +883,17 @@ impl Metrics {
     pub fn inc_snapshot_cascade_retained(&self, ns: &str) {
         self.inc_snapshot_deletion(ns, SnapshotDeletionOutcome::CascadeRetained);
         self.snapshots_cascade_retained
+            .add(1, &[KeyValue::new("namespace", ns.to_string())]);
+    }
+
+    /// Record a `Snapshot` retained by the policy-deletion cascade: bumps BOTH
+    /// `kopiur_snapshot_deletions{outcome="policy_cascade_retained"}` and the
+    /// narrower `kopiur_snapshots_policy_cascade_retained`, in the one place,
+    /// so the two series can never drift apart. Call this INSTEAD OF
+    /// `inc_snapshot_deletion(ns, SnapshotDeletionOutcome::PolicyCascadeRetained)`.
+    pub fn inc_snapshot_policy_cascade_retained(&self, ns: &str) {
+        self.inc_snapshot_deletion(ns, SnapshotDeletionOutcome::PolicyCascadeRetained);
+        self.snapshots_policy_cascade_retained
             .add(1, &[KeyValue::new("namespace", ns.to_string())]);
     }
 
@@ -2048,6 +2081,7 @@ mod tests {
         let m = Metrics::new();
         m.inc_snapshot_deletion("ns", SnapshotDeletionOutcome::Deleted);
         m.inc_snapshot_cascade_retained("ns");
+        m.inc_snapshot_policy_cascade_retained("ns");
         m.inc_snapshot_delete_batch_job(BatchJobOutcome::Succeeded);
         m.inc_snapshot_delete_batch_members(BatchMemberOutcome::Deleted, 3);
 
@@ -2071,6 +2105,10 @@ mod tests {
         assert!(text.contains("outcome=\"deleted\""), "{text}");
         assert!(
             text.contains("kopiur_snapshots_cascade_retained_total"),
+            "{text}"
+        );
+        assert!(
+            text.contains("kopiur_snapshots_policy_cascade_retained_total"),
             "{text}"
         );
         assert!(

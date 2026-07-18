@@ -43,17 +43,18 @@ use crate::config;
 use crate::consts::{
     ACKNOWLEDGE_MASS_DELETION_ACTION, ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION,
     CREDENTIALS_AVAILABLE_CONDITION, CREDENTIALS_PROJECTED_REASON, DELETE_MEMBERS_ANNOTATION,
-    DELETE_REPO_LABEL, DELETION_HELD_CONDITION, ENABLE_SCHEDULE_CASCADE_ACTION, FIX_HOOK_ACTION,
-    FIX_SNAPSHOT_STACK_ACTION, HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON,
-    INHERIT_FALLBACK_REASON, INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON,
-    INVALID_MASS_DELETION_ACK_REASON, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    MASS_DELETION_ACKNOWLEDGED_REASON, MASS_DELETION_BREAKER_REASON,
-    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    OP_LABEL, OP_SNAPSHOT_DELETE_BATCH, PIN_WORKLOAD_RUN_AS_USER_ACTION,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON,
-    SNAPSHOT_INCOMPLETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
+    DELETE_REPO_LABEL, DELETION_HELD_CONDITION, ENABLE_POLICY_CASCADE_ACTION,
+    ENABLE_SCHEDULE_CASCADE_ACTION, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
+    HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
+    INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON, INVALID_MASS_DELETION_ACK_REASON,
+    MANAGED_BY_LABEL, MANAGED_BY_VALUE, MASS_DELETION_ACKNOWLEDGED_REASON,
+    MASS_DELETION_BREAKER_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH,
+    PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
+    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON, SNAPSHOT_INCOMPLETE_REASON,
+    SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
     SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
@@ -1903,30 +1904,38 @@ async fn handle_deletion(
         .await
         .unwrap_or(false);
 
-    let (plan, resolved, hold) = match gather_deletion_facts(
-        ctx,
-        backup,
-        namespace,
-        policy,
-        ns_terminating,
-    )
-    .await?
+    let decision = match gather_deletion_facts(ctx, backup, namespace, policy, ns_terminating)
+        .await?
     {
         DeletionOutcome::StoresNotSynced => {
             tracing::info!(backup = %name, "snapshot store not synced yet; deferring deletion (no destructive work)");
             return Ok(Action::requeue(Duration::from_secs(15)));
         }
-        DeletionOutcome::Decided(d) => {
-            let DeletionDecision {
-                plan,
-                resolved,
-                hold,
-            } = *d;
-            (plan, resolved, hold)
-        }
+        DeletionOutcome::Decided(d) => *d,
     };
-    tracing::info!(?plan, backup = %name, ns_terminating, "executing backup deletion plan");
+    tracing::info!(plan = ?decision.plan, backup = %name, ns_terminating, "executing backup deletion plan");
 
+    execute_deletion_plan(decision, backup, ctx, api, namespace, name, ns_terminating).await
+}
+
+/// Dispatch the tested [`plan_deletion`] decision to its executor. Extracted
+/// from [`handle_deletion`] to keep that function under the
+/// cognitive-complexity ratchet — every arm here is pure dispatch (no new
+/// decision logic; the decision itself is `plan_deletion`'s job).
+async fn execute_deletion_plan(
+    decision: DeletionDecision,
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    ns_terminating: bool,
+) -> Result<Action> {
+    let DeletionDecision {
+        plan,
+        resolved,
+        hold,
+    } = decision;
     match plan {
         DeletionPlan::DeleteSnapshot => {
             execute_delete_snapshot(backup, ctx, api, namespace, name, ns_terminating, resolved)
@@ -1954,6 +1963,9 @@ async fn handle_deletion(
         }
         DeletionPlan::RetainSnapshotOnScheduleDelete => {
             retain_on_schedule_delete(ctx, api, backup, namespace, name).await
+        }
+        DeletionPlan::RetainSnapshotOnPolicyDelete => {
+            retain_on_policy_delete(ctx, api, backup, namespace, name).await
         }
         DeletionPlan::HoldSnapshotDeletion => hold_deletion(ctx, api, backup, name, hold).await,
     }
@@ -2032,6 +2044,39 @@ async fn retain_on_schedule_delete(
              refresh interval. To cascade deletes when a schedule is removed, set the schedule's \
              `spec.deletion.onScheduleDelete: Delete`."
         ),
+    )
+    .await;
+    io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    Ok(Action::await_change())
+}
+
+/// Executor for [`DeletionPlan::RetainSnapshotOnPolicyDelete`]: this Snapshot
+/// carries a `policy-cascade` prune stamp (its owning `SnapshotPolicy` was
+/// deleted under `onPolicyDelete: Retain`) and its own effective
+/// `deletionPolicy` is `Delete`. Release the finalizer WITHOUT contacting the
+/// repository (same as `RetainSnapshot`), bump the policy-cascade-retained
+/// counter (the SINGLE increment point for both counters), and emit ONE
+/// Warning event saying what happened, why, and how to opt into cascading
+/// deletes. Mirrors [`retain_on_schedule_delete`] exactly in shape.
+async fn retain_on_policy_delete(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    namespace: &str,
+    name: &str,
+) -> Result<Action> {
+    ctx.metrics.inc_snapshot_policy_cascade_retained(namespace);
+    let snapshot_recorded = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .is_some();
+    io::publish_warning_event(
+        ctx,
+        backup,
+        SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON,
+        ENABLE_POLICY_CASCADE_ACTION,
+        &policy_cascade_retained_message(namespace, name, snapshot_recorded),
     )
     .await;
     io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;

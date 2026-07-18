@@ -41,6 +41,15 @@ pub enum DeletionPlan {
     /// `SnapshotRetainedOnScheduleDelete` + cascade-retained counter — loud
     /// but not an orphan-metric storm. (Executor lands in M4.)
     RetainSnapshotOnScheduleDelete,
+    /// A `SnapshotPolicy`-deletion cascade prune (`pruned-by: policy-cascade`,
+    /// stamped by the `SnapshotPolicy` finalizer under `onPolicyDelete: Retain`
+    /// — M3) whose Snapshot's own effective `deletionPolicy` is `Delete`. The
+    /// whole point of the `policy-cascade` stamp is to NEVER contact the
+    /// repository, so this is the loud downgrade: same executor shape as
+    /// `RetainSnapshot` (release finalizer, no repo contact) PLUS a Warning
+    /// event `SnapshotRetainedOnPolicyDelete` + a policy-cascade-retained
+    /// counter — loud but not an orphan-metric storm.
+    RetainSnapshotOnPolicyDelete,
     /// Mass-deletion breaker: do NO delete work, keep the finalizer, phase
     /// Deleting + `DeletionHeld=True` condition, requeue long. Drained by the
     /// repo ack annotation. (Executor lands in M4.)
@@ -128,8 +137,8 @@ pub fn pruned_by(annotations: &BTreeMap<String, String>) -> Option<PrunedBy> {
 ///    - cascade `Retain` && policy `Orphan` → `OrphanSnapshot`
 ///    - cascade `Delete` → fall through (opt-in cascade; still external ⇒
 ///      breaker applies).
-/// 4. Operator prune (`pruned_by == Some(_)`): match policy exhaustively —
-///    Delete→DeleteSnapshot, Retain→RetainSnapshot, Orphan→OrphanSnapshot.
+/// 4. Operator prune (`pruned_by == Some(_)`): match `(prune kind, policy)`
+///    exhaustively via [`plan_prune`] — see its doc for the full 3×3 table.
 ///    NEVER held (retention must keep working during an incident; its rate is
 ///    bounded elsewhere).
 /// 5. External destructive (policy Delete): breaker Held →
@@ -200,18 +209,42 @@ fn plan_cascade_guard(
 /// gates `Delete`).
 fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
     match pruned_by(f.annotations) {
-        Some(_) => plan_prune(f.policy),
+        Some(p) => plan_prune(p, f.policy),
         None => plan_external(f.policy, f.breaker),
     }
 }
 
 /// Step 4: operator prune. NEVER held — retention/history-limit pruning must
 /// keep working during an incident; its own rate is bounded elsewhere.
-fn plan_prune(policy: DeletionPolicy) -> DeletionPlan {
-    match policy {
-        DeletionPolicy::Delete => DeletionPlan::DeleteSnapshot,
-        DeletionPolicy::Retain => DeletionPlan::RetainSnapshot,
-        DeletionPolicy::Orphan => DeletionPlan::OrphanSnapshot,
+///
+/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 3×3
+/// match, no catch-all): a new variant of either enum fails to compile until
+/// every cell is decided (ADR §5.5).
+///
+/// | [`PrunedBy`] \\ [`DeletionPolicy`] | `Delete` | `Retain` | `Orphan` |
+/// |---|---|---|---|
+/// | `Retention` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `FailedHistory` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `PolicyCascade` | [`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete) | `RetainSnapshot` | `OrphanSnapshot` |
+///
+/// The `PolicyCascade`/`Delete` cell is the one loud downgrade: a policy
+/// cascade prune under `onPolicyDelete: Retain` never contacts the
+/// repository, even though the Snapshot's own effective policy asked for
+/// `Delete` — that is the entire reason the finalizer stamps `policy-cascade`
+/// instead of leaving the annotation absent.
+fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
+    match (pruned, policy) {
+        (PrunedBy::Retention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
+        (PrunedBy::Retention, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::Retention, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        (PrunedBy::PolicyCascade, DeletionPolicy::Delete) => {
+            DeletionPlan::RetainSnapshotOnPolicyDelete
+        }
+        (PrunedBy::PolicyCascade, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::PolicyCascade, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
     }
 }
 
@@ -404,6 +437,34 @@ pub fn mass_deletion_hold_message(
         repo.name,
         mass_deletion_ack_command(repo, ack_value),
         SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    )
+}
+
+/// The `SnapshotRetainedOnPolicyDelete` Warning event message for
+/// [`DeletionPlan::RetainSnapshotOnPolicyDelete`]'s executor. Names the CR,
+/// states what became of the kopia snapshot — retained in the repository, or
+/// (`snapshot_recorded == false`) never completed at all because the run was
+/// cancelled mid-flight before any kopia snapshot existed — that it (or any
+/// future one matching the same identity) will be rediscoverable/adoptable,
+/// and the opt-in for users who wanted the cascade to actually delete
+/// kopia-side data. Pure so both phrasings are unit-tested.
+pub fn policy_cascade_retained_message(
+    namespace: &str,
+    name: &str,
+    snapshot_recorded: bool,
+) -> String {
+    let outcome = if snapshot_recorded {
+        "its kopia snapshot was RETAINED in the repository, not deleted"
+    } else {
+        "the kopia snapshot for this run was never completed (the run was cancelled mid-flight), \
+         so there was nothing in the repository to delete"
+    };
+    format!(
+        "Snapshot `{namespace}/{name}` was released, not deleted: its owning SnapshotPolicy is gone \
+         and the policy's `onPolicyDelete` is `Retain` (the safe default), so {outcome}. Any kopia \
+         snapshot it did create remains rediscoverable/adoptable by a future SnapshotPolicy with a \
+         matching identity (catalog scan / auto-adoption). To cascade deletes when a SnapshotPolicy is \
+         removed, set the policy's `spec.deletion.onPolicyDelete: Delete`."
     )
 }
 
