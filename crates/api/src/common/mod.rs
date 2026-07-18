@@ -555,6 +555,37 @@ pub enum ScheduleDeletePolicy {
     Delete,
 }
 
+/// What the deletion of a `SnapshotPolicy` does to the `Snapshot` CRs carrying
+/// its config label (the recipe's produced/adopted rows — NOT its kopia
+/// snapshot history in the abstract, which is exactly what `Retain` preserves).
+/// Default `Retain`: the CRs are removed but every kopia snapshot survives
+/// (rediscoverable/adoptable by a future `SnapshotPolicy`, including this one
+/// re-created). `Delete` opts into the cascade: each CR's own `deletionPolicy`
+/// applies, as EXTERNAL deletions subject to the per-repository mass-deletion
+/// breaker (`deletionProtection.threshold`).
+///
+/// Deliberately 2-variant (not reusing [`DeletionPolicy`]), mirroring
+/// [`ScheduleDeletePolicy`]: an `Orphan` in cascade position would differ from
+/// `Retain` only in per-CR event/metric bookkeeping — an invalid state made
+/// unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s
+/// semantics (CR removed, kopia snapshot stays, catalog rediscovers it),
+/// deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric
+/// for every one of a deleted policy's Snapshots). Not [`ScheduleDeletePolicy`]
+/// itself: that type's doc contract is schedule-specific (its `Delete` arm talks
+/// about a *schedule* being gone/replaced), and a `SnapshotPolicy` deletion is a
+/// distinct trigger with its own semantics worth documenting on its own type.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum PolicyDeletePolicy {
+    /// Keep the kopia snapshots: a Snapshot whose effective deletionPolicy is
+    /// `Delete` is downgraded to retain when its owning `SnapshotPolicy` is gone
+    /// (the fail-safe default).
+    #[default]
+    Retain,
+    /// Cascade: each Snapshot's own `deletionPolicy` applies even though the
+    /// owning `SnapshotPolicy` is gone (subject to the mass-deletion breaker).
+    Delete,
+}
+
 /// Mass-deletion circuit breaker for this repository's Snapshots.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]

@@ -1048,6 +1048,8 @@ mod tests {
                 hooks: None,
                 mover: None,
                 credential_projection: None,
+                deletion: None,
+                adoption: None,
             },
         )
     }

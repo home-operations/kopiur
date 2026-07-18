@@ -867,7 +867,10 @@ pub fn effective_deletion_policy(
     match origin {
         // Discovered snapshots are never ours to delete — forced Retain.
         Origin::Discovered => DeletionPolicy::Retain,
-        Origin::Scheduled | Origin::Manual => spec_policy.unwrap_or(DeletionPolicy::Delete),
+        // Adopted rows are managed like any produced backup: same fallback default.
+        Origin::Scheduled | Origin::Manual | Origin::Adopted => {
+            spec_policy.unwrap_or(DeletionPolicy::Delete)
+        }
     }
 }
 
@@ -913,6 +916,7 @@ pub fn resolve_origin(b: &Snapshot) -> Origin {
     {
         Some("scheduled") => Origin::Scheduled,
         Some("discovered") => Origin::Discovered,
+        Some("adopted") => Origin::Adopted,
         _ => Origin::Manual,
     }
 }

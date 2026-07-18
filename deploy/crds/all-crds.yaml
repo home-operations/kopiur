@@ -541,6 +541,18 @@ spec:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
                 properties:
+                  adoption:
+                    description: |-
+                      Whether a discovered snapshot whose resolved identity matches a live
+                      `SnapshotPolicy` is automatically adopted — re-attached (stamped with that
+                      policy's config label, `status.origin` flipped to `Adopted`) so GFS
+                      retention governs it and eventually prunes it, instead of it sitting in the
+                      catalog forever as an immortal `discovered` row.
+                    enum:
+                    - Adopt
+                    - Ignore
+                    nullable: true
+                    type: string
                   fallbackNamespace:
                     description: Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
                     nullable: true
@@ -2617,6 +2629,17 @@ spec:
                     description: RFC 3339 timestamp of the last catalog refresh.
                     nullable: true
                     type: string
+                  scanRequestHonored:
+                    description: |-
+                      The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at`
+                      annotation last honored by a completed catalog scan. Compared by
+                      **equality** against the live annotation to decide whether a requested
+                      on-demand scan is still pending — deliberately NOT a timestamp comparison
+                      against `lastRefreshAt` (a periodic refresh completing after the request
+                      was made would otherwise look like it honored the request even though it
+                      started before the annotation was set).
+                    nullable: true
+                    type: string
                 type: object
               conditions:
                 description: Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
@@ -3437,6 +3460,18 @@ spec:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
                 properties:
+                  adoption:
+                    description: |-
+                      Whether a discovered snapshot whose resolved identity matches a live
+                      `SnapshotPolicy` is automatically adopted — re-attached (stamped with that
+                      policy's config label, `status.origin` flipped to `Adopted`) so GFS
+                      retention governs it and eventually prunes it, instead of it sitting in the
+                      catalog forever as an immortal `discovered` row.
+                    enum:
+                    - Adopt
+                    - Ignore
+                    nullable: true
+                    type: string
                   fallbackNamespace:
                     description: Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
                     nullable: true
@@ -5525,6 +5560,17 @@ spec:
                     description: RFC 3339 timestamp of the last catalog refresh.
                     nullable: true
                     type: string
+                  scanRequestHonored:
+                    description: |-
+                      The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at`
+                      annotation last honored by a completed catalog scan. Compared by
+                      **equality** against the live annotation to decide whether a requested
+                      on-demand scan is still pending — deliberately NOT a timestamp comparison
+                      against `lastRefreshAt` (a periodic refresh completing after the request
+                      was made would otherwise look like it honored the request even though it
+                      started before the annotation was set).
+                    nullable: true
+                    type: string
                 type: object
               conditions:
                 description: Standard Kubernetes conditions (e.g. `Connected`, `MaintenanceOwned`).
@@ -5791,6 +5837,18 @@ spec:
           spec:
             description: 'What to back up: sources, identity, retention, policy, hooks.'
             properties:
+              adoption:
+                description: |-
+                  Whether a discovered snapshot whose resolved identity matches a live
+                  `SnapshotPolicy` is automatically adopted — re-attached (stamped with that
+                  policy's config label, `status.origin` flipped to `Adopted`) so GFS
+                  retention governs it and eventually prunes it, instead of it sitting in the
+                  catalog forever as an immortal `discovered` row.
+                enum:
+                - Adopt
+                - Ignore
+                nullable: true
+                type: string
               compression:
                 description: Compression algorithm + per-extension opt-outs.
                 nullable: true
@@ -5833,6 +5891,20 @@ spec:
                 - Orphan
                 nullable: true
                 type: string
+              deletion:
+                description: Deletion semantics for the `Snapshot` CRs carrying this recipe's config label.
+                nullable: true
+                properties:
+                  onPolicyDelete:
+                    default: Retain
+                    description: |-
+                      Consulted by the Snapshot finalizer when the deletion is external and the
+                      owning `SnapshotPolicy` is gone. Absent resolves to `Retain`.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
+                type: object
               errorHandling:
                 description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
                 nullable: true
@@ -6956,6 +7028,40 @@ spec:
             description: Observed state of a `SnapshotPolicy`.
             nullable: true
             properties:
+              adoption:
+                description: Summary of automatic adoption of discovered snapshots into this recipe.
+                nullable: true
+                properties:
+                  lastAdoptedCount:
+                    description: Number of discovered `Snapshot` CRs adopted by the last adoption pass.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  lastAdoptionAt:
+                    description: RFC3339 timestamp of the last adoption pass that adopted at least one snapshot.
+                    nullable: true
+                    type: string
+                  scanRequestedAt:
+                    description: |-
+                      RFC3339 token echoing an in-flight on-demand adoption scan request for
+                      this policy's identity; cleared once honored.
+                    nullable: true
+                    type: string
+                  scanRequestedIdentity:
+                    description: |-
+                      The resolved kopia identity the requested scan was scoped to, pinned at
+                      request time so a later identity-changing edit can't retarget an
+                      in-flight scan.
+                    nullable: true
+                    type: string
+                  totalAdopted:
+                    description: Running total of `Snapshot` CRs ever adopted into this recipe.
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               conditions:
                 description: Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
                 items:
@@ -7315,6 +7421,7 @@ spec:
                 - scheduled
                 - manual
                 - discovered
+                - adopted
                 nullable: true
                 type: string
               phase:

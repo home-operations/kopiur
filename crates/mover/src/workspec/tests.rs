@@ -965,6 +965,8 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
         hooks: None,
         mover: None,
         credential_projection: None,
+        deletion: None,
+        adoption: None,
     };
     let p = PolicyArgsSpec::from_policy(&spec);
     assert_eq!(p.compression.as_deref(), Some("zstd"));
@@ -1036,6 +1038,8 @@ fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
         hooks: None,
         mover: None,
         credential_projection: None,
+        deletion: None,
+        adoption: None,
     }
 }
 

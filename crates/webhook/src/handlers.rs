@@ -326,7 +326,7 @@ fn handle_snapshot(
     if spec.deletion_policy.is_none() {
         let default = match origin {
             Origin::Discovered => DeletionPolicy::Retain,
-            Origin::Scheduled | Origin::Manual => DeletionPolicy::Delete,
+            Origin::Scheduled | Origin::Manual | Origin::Adopted => DeletionPolicy::Delete,
         };
         ops.push(set_spec_field(
             &obj.data,
@@ -368,9 +368,11 @@ fn handle_snapshot(
 /// unit-tests without a cluster.
 ///
 /// Fires only when ALL hold:
-/// - `origin` is `Manual` or `Scheduled` — never `Discovered`: a catalog-materialized
-///   Snapshot never ran through a policy, so a `policyRef` on one (if any) doesn't
-///   earn the label.
+/// - `origin` is `Manual`, `Scheduled`, or `Adopted` — never `Discovered`: a
+///   catalog-materialized Snapshot never ran through a policy, so a `policyRef`
+///   on one (if any) doesn't earn the label. `Adopted` is the managed-row
+///   exception: it was deliberately re-attached to a `SnapshotPolicy`, so it
+///   earns the label exactly like a produced Snapshot.
 /// - `policy_ref` is present with a nonempty name.
 /// - The ref targets the Snapshot's OWN namespace (absent/empty `namespace`, or equal
 ///   to `cr_namespace`). The stamped label value is a bare policy name with no
@@ -386,7 +388,7 @@ fn config_label_stamp(
 ) -> Option<String> {
     match origin {
         Origin::Discovered => return None,
-        Origin::Manual | Origin::Scheduled => {}
+        Origin::Manual | Origin::Scheduled | Origin::Adopted => {}
     }
 
     let policy_ref = policy_ref?;
@@ -441,6 +443,7 @@ fn backup_origin(meta: &ObjectMeta, data: &Value) -> Origin {
     match from_label.or(from_status) {
         Some("discovered") => Origin::Discovered,
         Some("scheduled") => Origin::Scheduled,
+        Some("adopted") => Origin::Adopted,
         // A user `kubectl create`-ing a Snapshot with no origin marker is manual.
         _ => Origin::Manual,
     }

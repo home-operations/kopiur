@@ -107,22 +107,26 @@ pub fn validate_consumer_against_cluster_repo(
 /// A `Snapshot`'s `deletionPolicy` is legal for its origin (ADR §4.5).
 ///
 /// `origin: discovered` forces `Retain`: `None` (defaults to `Retain`) and an
-/// explicit `Retain` pass; `Delete`/`Orphan` are rejected. Other origins accept any
-/// policy.
+/// explicit `Retain` pass; `Delete`/`Orphan` are rejected. `discovered`'s
+/// underlying kopia snapshot was never created by the operator, so it must
+/// never be the thing that deletes it. `adopted` is the one exception: an
+/// adopted row was deliberately re-attached to a `SnapshotPolicy` precisely so
+/// GFS retention (and any `deletionPolicy`) governs it like a produced backup —
+/// any policy is allowed. `scheduled`/`manual` are unchanged (any policy).
 pub fn validate_backup_deletion_policy(
     origin: crate::snapshot::Origin,
     policy: Option<crate::common::DeletionPolicy>,
 ) -> ValidationResult {
     use crate::common::DeletionPolicy;
     use crate::snapshot::Origin;
-    if origin != Origin::Discovered {
-        return Ok(());
-    }
-    match policy {
-        None | Some(DeletionPolicy::Retain) => Ok(()),
-        Some(other) => Err(ValidationError::DiscoveredMustRetain {
-            got: format!("{other:?}"),
-        }),
+    match origin {
+        Origin::Discovered => match policy {
+            None | Some(DeletionPolicy::Retain) => Ok(()),
+            Some(other) => Err(ValidationError::DiscoveredMustRetain {
+                got: format!("{other:?}"),
+            }),
+        },
+        Origin::Adopted | Origin::Scheduled | Origin::Manual => Ok(()),
     }
 }
 

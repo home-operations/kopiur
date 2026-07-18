@@ -439,19 +439,22 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Origin) -> Vec<ValidationErr
 
 /// `origin: discovered` Snapshots carry an empty spec; a stamped cascade
 /// policy on one is meaningless (their owner is a repository, not a schedule)
-/// and forbidden, like a non-Retain deletionPolicy.
+/// and forbidden, like a non-Retain deletionPolicy. `origin: adopted` is
+/// forbidden for the same reason: an adopted row's owner is the
+/// `SnapshotPolicy` it was re-attached to, never a `SnapshotSchedule`.
 pub fn validate_backup_on_schedule_delete(
     origin: Origin,
     value: Option<ScheduleDeletePolicy>,
 ) -> ValidationResult {
-    if origin != Origin::Discovered {
-        return Ok(());
-    }
-    match value {
-        None => Ok(()),
-        Some(v) => Err(ValidationError::DiscoveredCannotSetOnScheduleDelete {
-            got: format!("{v:?}"),
-        }),
+    match origin {
+        Origin::Discovered | Origin::Adopted => match value {
+            None => Ok(()),
+            Some(v) => Err(ValidationError::DiscoveredCannotSetOnScheduleDelete {
+                origin: origin.label_value(),
+                got: format!("{v:?}"),
+            }),
+        },
+        Origin::Scheduled | Origin::Manual => Ok(()),
     }
 }
 

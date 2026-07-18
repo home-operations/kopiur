@@ -236,6 +236,8 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
             hooks: None,
             mover: None,
             credential_projection: None,
+            deletion: None,
+            adoption: None,
         },
     )
 }
@@ -445,6 +447,8 @@ fn config_with_source(name: &str, source: kopiur_api::snapshot_policy::Source) -
             hooks: None,
             mover: None,
             credential_projection: None,
+            deletion: None,
+            adoption: None,
         },
     )
 }

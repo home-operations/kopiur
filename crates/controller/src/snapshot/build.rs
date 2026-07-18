@@ -320,6 +320,7 @@ pub(super) fn origin_str(origin: Origin) -> &'static str {
         Origin::Scheduled => "scheduled",
         Origin::Manual => "manual",
         Origin::Discovered => "discovered",
+        Origin::Adopted => "adopted",
     }
 }
 

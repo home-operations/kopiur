@@ -80,6 +80,12 @@ pub enum Origin {
     Manual,
     /// Materialized by the catalog scan for a snapshot kopiur didn't produce.
     Discovered,
+    /// A `discovered` snapshot whose resolved identity matched a live
+    /// `SnapshotPolicy` and was automatically (or explicitly) re-attached to
+    /// it: it now carries that policy's config label and is retention-governed
+    /// like any produced row, even though the operator did not create the
+    /// underlying kopia snapshot.
+    Adopted,
 }
 
 /// Lifecycle phase of a `Snapshot`.
@@ -109,6 +115,7 @@ impl Origin {
             Self::Scheduled => "scheduled",
             Self::Manual => "manual",
             Self::Discovered => "discovered",
+            Self::Adopted => "adopted",
         }
     }
 }
@@ -120,6 +127,9 @@ pub enum PrunedBy {
     Retention,
     /// `SnapshotSchedule.spec.failedJobsHistoryLimit` prune.
     FailedHistory,
+    /// Policy-deletion cascade under `onPolicyDelete: Retain` — release the
+    /// CR, never contact the repository.
+    PolicyCascade,
 }
 
 impl PrunedBy {
@@ -129,6 +139,7 @@ impl PrunedBy {
         match self {
             Self::Retention => "retention",
             Self::FailedHistory => "failed-history",
+            Self::PolicyCascade => "policy-cascade",
         }
     }
 
@@ -138,6 +149,7 @@ impl PrunedBy {
         match v {
             "retention" => Some(Self::Retention),
             "failed-history" => Some(Self::FailedHistory),
+            "policy-cascade" => Some(Self::PolicyCascade),
             _ => None,
         }
     }
@@ -430,7 +442,12 @@ mod tests {
 
     #[test]
     fn origin_label_value_matches_the_serde_encoding() {
-        for origin in [Origin::Scheduled, Origin::Manual, Origin::Discovered] {
+        for origin in [
+            Origin::Scheduled,
+            Origin::Manual,
+            Origin::Discovered,
+            Origin::Adopted,
+        ] {
             assert_eq!(
                 serde_json::to_value(origin).unwrap(),
                 origin.label_value(),
@@ -619,7 +636,11 @@ onScheduleDelete: Delete
 
     #[test]
     fn pruned_by_parse_is_the_exact_inverse_of_annotation_value() {
-        for variant in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        for variant in [
+            PrunedBy::Retention,
+            PrunedBy::FailedHistory,
+            PrunedBy::PolicyCascade,
+        ] {
             assert_eq!(
                 PrunedBy::parse(variant.annotation_value()),
                 Some(variant),
@@ -640,6 +661,7 @@ onScheduleDelete: Delete
             serde_json::to_value(Origin::Discovered).unwrap(),
             "discovered"
         );
+        assert_eq!(serde_json::to_value(Origin::Adopted).unwrap(), "adopted");
         assert_eq!(
             serde_json::to_value(SnapshotPhase::Succeeded).unwrap(),
             "Succeeded"

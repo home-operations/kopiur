@@ -410,19 +410,21 @@ impl ScanOwner<'_> {
     }
 }
 
-/// The kopia snapshot ids of scheduled/manual `Snapshot` CRs that resolve to
-/// this repository CR (via `status.resolved.repository` or the owner reference —
+/// The kopia snapshot ids of scheduled/manual/adopted `Snapshot` CRs that resolve
+/// to this repository CR (via `status.resolved.repository` or the owner reference —
 /// the same derivation `Restore` and the kubectl plugin use). These are this
-/// cluster's *produced* snapshots: a rescan must never duplicate them as
-/// discovered rows. Origin uses [`crate::snapshot::resolve_origin`]'s precedence
-/// (status, then label, default manual) — NOT the label alone, because a bare
-/// `kubectl create` manual Snapshot may never carry the origin label. Pure.
+/// cluster's *produced* (or adopted-into-managed) snapshots: a rescan must never
+/// duplicate them as discovered rows. Origin uses
+/// [`crate::snapshot::resolve_origin`]'s precedence (status, then label, default
+/// manual) — NOT the label alone, because a bare `kubectl create` manual Snapshot
+/// may never carry the origin label. Pure.
 pub fn produced_ids_for(owner: ScanOwner<'_>, snapshots: &[Snapshot]) -> BTreeSet<String> {
     use kopiur_api::Origin;
     snapshots
         .iter()
         .filter(|s| match crate::snapshot::resolve_origin(s) {
-            Origin::Scheduled | Origin::Manual => true,
+            // Adopted ids must never re-materialize as discovered rows either.
+            Origin::Scheduled | Origin::Manual | Origin::Adopted => true,
             Origin::Discovered => false,
         })
         .filter(|s| {

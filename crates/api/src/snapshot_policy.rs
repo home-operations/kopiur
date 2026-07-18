@@ -97,6 +97,42 @@ pub struct SnapshotPolicySpec {
     /// Opt-in credential-Secret projection into each backup mover's namespace (default off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<CredentialProjection>,
+    /// Deletion semantics for the `Snapshot` CRs carrying this recipe's config label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<PolicyDeletionSpec>,
+    /// Per-policy override of automatic adoption for discovered snapshots whose
+    /// resolved identity matches this recipe; absent inherits the repository's
+    /// `catalog.adoption` (see [`effective_adoption`](crate::common::effective_adoption)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<crate::common::SnapshotAdoption>,
+}
+
+/// Deletion semantics for the `Snapshot`s carrying a `SnapshotPolicy`'s config
+/// label (sub-object per docs/dev/api-conventions.md §4 so future deletion
+/// knobs slot in without API breakage). Mirrors `SnapshotSchedule`'s
+/// [`ScheduleDeletionSpec`](crate::snapshot_schedule::ScheduleDeletionSpec).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyDeletionSpec {
+    /// Consulted by the Snapshot finalizer when the deletion is external and the
+    /// owning `SnapshotPolicy` is gone. Absent resolves to `Retain`.
+    #[serde(default = "default_on_policy_delete")]
+    #[schemars(default = "default_on_policy_delete")]
+    pub on_policy_delete: crate::common::PolicyDeletePolicy,
+}
+
+fn default_on_policy_delete() -> crate::common::PolicyDeletePolicy {
+    crate::common::PolicyDeletePolicy::Retain
+}
+
+/// The effective cascade policy for a `SnapshotPolicy`: `spec.deletion.onPolicyDelete`
+/// when the sub-object is present, else `Retain`. (A default nested under an
+/// ABSENT optional sub-object does not materialize server-side — every read
+/// goes through this resolver.)
+pub fn effective_on_policy_delete(
+    deletion: Option<&PolicyDeletionSpec>,
+) -> crate::common::PolicyDeletePolicy {
+    deletion.map(|d| d.on_policy_delete).unwrap_or_default()
 }
 
 /// A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
@@ -643,6 +679,9 @@ pub struct SnapshotPolicyStatus {
     /// Summary of GFS retention pruning against this config's `Snapshot` CRs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionSummary>,
+    /// Summary of automatic adoption of discovered snapshots into this recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<AdoptionSummary>,
     /// RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
@@ -691,6 +730,34 @@ pub struct RetentionSummary {
     /// Number of `Snapshot` CRs deleted by the last prune pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prune_deleted: Option<i64>,
+}
+
+/// Summary of the most recent automatic adoption pass for a `SnapshotPolicy` —
+/// discovered snapshots whose resolved identity matched this recipe and were
+/// re-attached (see `Origin::Adopted`), plus an on-demand re-scan request/ack
+/// pair mirroring the repository-level `catalog-scan-requested-at` annotation
+/// contract.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptionSummary {
+    /// RFC3339 timestamp of the last adoption pass that adopted at least one snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_adoption_at: Option<String>,
+    /// Number of discovered `Snapshot` CRs adopted by the last adoption pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_adopted_count: Option<u32>,
+    /// Running total of `Snapshot` CRs ever adopted into this recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_adopted: Option<u64>,
+    /// RFC3339 token echoing an in-flight on-demand adoption scan request for
+    /// this policy's identity; cleared once honored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_requested_at: Option<String>,
+    /// The resolved kopia identity the requested scan was scoped to, pinned at
+    /// request time so a later identity-changing edit can't retarget an
+    /// in-flight scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_requested_identity: Option<String>,
 }
 
 #[cfg(test)]
@@ -1466,5 +1533,171 @@ preflight:
         );
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["lastSuccessfulSnapshot"], "2026-06-09T02:00:00Z");
+    }
+
+    // --- policy-deletion cascade (spec.deletion.onPolicyDelete) --------------
+
+    #[test]
+    fn policy_deletion_on_policy_delete_schema_default_is_retain() {
+        // Mirrors snapshot_schedule's schedule_deletion_on_schedule_delete_schema_default_is_retain:
+        // context-free default, safe to server-side-materialize because
+        // effective_on_policy_delete maps an absent sub-object to the same value.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["properties"]["deletion"]["properties"]["onPolicyDelete"]["default"],
+            serde_json::json!("Retain")
+        );
+        assert_eq!(
+            effective_on_policy_delete(None),
+            crate::common::PolicyDeletePolicy::Retain
+        );
+    }
+
+    #[test]
+    fn policy_deletion_round_trips_and_absent_stays_none() {
+        use crate::common::PolicyDeletePolicy;
+
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             deletion: { onPolicyDelete: Delete }\n",
+        );
+        assert_eq!(
+            spec.deletion.as_ref().map(|d| d.on_policy_delete),
+            Some(PolicyDeletePolicy::Delete)
+        );
+        assert_eq!(
+            effective_on_policy_delete(spec.deletion.as_ref()),
+            PolicyDeletePolicy::Delete
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["deletion"]["onPolicyDelete"], "Delete");
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec, reparsed);
+
+        // Absent sub-object stays None (not materialized to Retain client-side).
+        let bare: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(bare.deletion.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("deletion")
+                .is_none(),
+            "absent deletion must be elided"
+        );
+        assert_eq!(
+            effective_on_policy_delete(bare.deletion.as_ref()),
+            PolicyDeletePolicy::Retain
+        );
+    }
+
+    #[test]
+    fn policy_deletion_unknown_on_policy_delete_value_is_rejected() {
+        let value: serde_json::Value =
+            serde_yaml::from_str("deletion:\n  onPolicyDelete: Orphan\n").unwrap();
+        assert!(serde_json::from_value::<SnapshotPolicySpec>(value).is_err());
+    }
+
+    #[test]
+    fn policy_delete_policy_serializes_to_expected_strings() {
+        use crate::common::PolicyDeletePolicy;
+
+        assert_eq!(
+            serde_json::to_value(PolicyDeletePolicy::Retain).unwrap(),
+            "Retain"
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyDeletePolicy::Delete).unwrap(),
+            "Delete"
+        );
+        assert_eq!(PolicyDeletePolicy::default(), PolicyDeletePolicy::Retain);
+    }
+
+    // --- adoption (spec.adoption + status.adoption) --------------------------
+
+    #[test]
+    fn policy_adoption_round_trips_and_absent_stays_none() {
+        use crate::common::SnapshotAdoption;
+
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\n\
+             sources: [ { pvc: { name: d } } ]\n\
+             adoption: Ignore\n",
+        );
+        assert_eq!(spec.adoption, Some(SnapshotAdoption::Ignore));
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["adoption"], "Ignore");
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec, reparsed);
+
+        let bare: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(bare.adoption.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("adoption")
+                .is_none(),
+            "absent adoption must be elided"
+        );
+    }
+
+    #[test]
+    fn policy_adoption_schema_carries_no_default() {
+        // §4a: the effective default (`Adopt`) is context-dependent (a policy ->
+        // repo -> constant inheritance chain), so no schemars `default` is
+        // emitted for THIS field — the reference stays `—`.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let prop = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["adoption"];
+        assert!(
+            prop.get("default").is_none(),
+            "spec.adoption must NOT carry a schema default: {prop}"
+        );
+        assert_eq!(prop["enum"].as_array().map(|a| a.len()), Some(2), "{prop}");
+    }
+
+    #[test]
+    fn adoption_summary_status_roundtrips() {
+        let status: SnapshotPolicyStatus = from_yaml(
+            "adoption:\n  \
+             lastAdoptionAt: 2026-06-09T02:00:00Z\n  \
+             lastAdoptedCount: 3\n  \
+             totalAdopted: 42\n  \
+             scanRequestedAt: 2026-06-10T00:00:00Z\n  \
+             scanRequestedIdentity: postgres@billing\n",
+        );
+        let a = status.adoption.as_ref().expect("adoption");
+        assert_eq!(a.last_adoption_at.as_deref(), Some("2026-06-09T02:00:00Z"));
+        assert_eq!(a.last_adopted_count, Some(3));
+        assert_eq!(a.total_adopted, Some(42));
+        assert_eq!(a.scan_requested_at.as_deref(), Some("2026-06-10T00:00:00Z"));
+        assert_eq!(
+            a.scan_requested_identity.as_deref(),
+            Some("postgres@billing")
+        );
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["adoption"]["lastAdoptedCount"], 3);
+        assert_eq!(json["adoption"]["totalAdopted"], 42);
+        let reparsed: SnapshotPolicyStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Absent ⇒ None, elided.
+        let bare: SnapshotPolicyStatus = from_yaml("{}\n");
+        assert!(bare.adoption.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("adoption")
+                .is_none(),
+            "absent adoption summary must be elided"
+        );
     }
 }

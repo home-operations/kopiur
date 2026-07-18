@@ -167,6 +167,21 @@ fn produced_origins_accept_any_policy() {
     }
 }
 
+#[test]
+fn adopted_accepts_any_policy() {
+    // Unlike `discovered`, an adopted row was deliberately re-attached to a
+    // SnapshotPolicy so it is managed like a produced backup — any deletionPolicy
+    // (including None/Delete/Orphan) is legal.
+    for p in [
+        None,
+        Some(DeletionPolicy::Delete),
+        Some(DeletionPolicy::Retain),
+        Some(DeletionPolicy::Orphan),
+    ] {
+        assert!(validate_backup_deletion_policy(Origin::Adopted, p).is_ok());
+    }
+}
+
 // --- validate_source ---
 
 #[test]
@@ -1184,6 +1199,8 @@ fn backup_config_aggregate_collects_multiple_errors() {
         hooks: None,
         mover: None,
         credential_projection: None,
+        deletion: None,
+        adoption: None,
     };
     let errs = validate_backup_config(&spec);
     // Both: ClusterRepo namespace forbidden + missing sources.
@@ -1231,6 +1248,8 @@ fn backup_config_valid_spec_has_no_errors() {
         hooks: None,
         mover: None,
         credential_projection: None,
+        deletion: None,
+        adoption: None,
     };
     assert!(validate_backup_config(&spec).is_empty());
 }
@@ -1257,22 +1276,26 @@ fn backup_aggregate_rejects_discovered_delete() {
 // --- validate_backup_on_schedule_delete ---
 
 #[test]
-fn discovered_on_schedule_delete_is_rejected_for_either_variant() {
-    for v in [ScheduleDeletePolicy::Retain, ScheduleDeletePolicy::Delete] {
-        let err = validate_backup_on_schedule_delete(Origin::Discovered, Some(v)).unwrap_err();
-        match &err {
-            ValidationError::DiscoveredCannotSetOnScheduleDelete { got } => {
-                assert_eq!(got, &format!("{v:?}"));
+fn discovered_and_adopted_on_schedule_delete_is_rejected_for_either_variant() {
+    for origin in [Origin::Discovered, Origin::Adopted] {
+        for v in [ScheduleDeletePolicy::Retain, ScheduleDeletePolicy::Delete] {
+            let err = validate_backup_on_schedule_delete(origin, Some(v)).unwrap_err();
+            match &err {
+                ValidationError::DiscoveredCannotSetOnScheduleDelete { origin: o, got } => {
+                    assert_eq!(*o, origin.label_value());
+                    assert_eq!(got, &format!("{v:?}"));
+                }
+                other => panic!("expected DiscoveredCannotSetOnScheduleDelete, got {other:?}"),
             }
-            other => panic!("expected DiscoveredCannotSetOnScheduleDelete, got {other:?}"),
+            // The message names the origin, the field, and the fix.
+            let msg = err.to_string();
+            assert!(msg.contains(origin.label_value()), "{msg}");
+            assert!(msg.contains("onScheduleDelete"), "{msg}");
+            assert!(msg.contains("Remove spec.onScheduleDelete"), "{msg}");
         }
-        // The message names the field and the fix.
-        let msg = err.to_string();
-        assert!(msg.contains("onScheduleDelete"), "{msg}");
-        assert!(msg.contains("Remove spec.onScheduleDelete"), "{msg}");
+        // Absent is fine.
+        assert!(validate_backup_on_schedule_delete(origin, None).is_ok());
     }
-    // Absent is fine on a discovered Snapshot.
-    assert!(validate_backup_on_schedule_delete(Origin::Discovered, None).is_ok());
 }
 
 #[test]
