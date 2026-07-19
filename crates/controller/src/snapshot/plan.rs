@@ -938,6 +938,24 @@ pub(super) fn needs_terminal_pin(observed: Option<SnapshotPhase>, target: Snapsh
     observed != Some(target)
 }
 
+/// Whether an `Adopted`-resolving row carries CONTROLLER-WRITTEN provenance —
+/// `status.snapshot`, the kopia id `adopt_one`'s create→status-patch flow records.
+/// [`super::pin_adopted_row`] pins `phase: Succeeded` ONLY when this holds: a
+/// user-applied BARE `origin: adopted` label (which `resolve_origin` still resolves
+/// to `Adopted` via its label fallback) has no `status.snapshot`, and pinning it
+/// would mint a phantom `Succeeded` row that enters GFS retention and sets
+/// `has_history`. Pure + shared with the retention-side provenance guards so the
+/// "only a real adopted row is Succeeded/history" rule is unit-tested without a
+/// cluster. The genuine adopt flow converges within a pass, so an interim row is
+/// only transiently phase-less.
+pub(super) fn adopted_row_has_provenance(backup: &Snapshot) -> bool {
+    backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .is_some()
+}
+
 /// Whether the preflight deadline has passed: `preflight_since + timeout <= now`.
 /// `timeout == None` ⇒ indefinite (never expires); `preflight_since == None` (the
 /// failure just started this reconcile) ⇒ not expired. Pure / clock-injected.

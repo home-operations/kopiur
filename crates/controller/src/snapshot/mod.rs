@@ -158,10 +158,23 @@ async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) 
 /// call when the finalizer is already present.
 async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
     io::ensure_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
-    if needs_terminal_pin(
-        backup.status.as_ref().and_then(|s| s.phase),
-        SnapshotPhase::Succeeded,
-    ) {
+    // PROVENANCE GATE: pin `Succeeded`/terminal-kstatus ONLY for a
+    // CONTROLLER-WRITTEN adopted row — one whose `status.snapshot` was set by
+    // `adopt_one`'s create→status-patch flow. A user-applied BARE `origin: adopted`
+    // label with no `status.snapshot` resolves `Adopted` (via the label fallback in
+    // `resolve_origin`) but must stay PHASE-LESS: a phantom `Succeeded` row would
+    // enter `retention_view` (creationTimestamp fallback), claim a GFS bucket, and
+    // displace a REAL snapshot into the breaker-exempt retention delete set — and it
+    // would set `has_history`, suppressing a recreated policy's on-demand scan. The
+    // genuine adopt flow converges within a pass (create → status patch → next
+    // reconcile pins), so an interim row is only transiently phase-less and invisible
+    // to retention.
+    if plan::adopted_row_has_provenance(backup)
+        && needs_terminal_pin(
+            backup.status.as_ref().and_then(|s| s.phase),
+            SnapshotPhase::Succeeded,
+        )
+    {
         let mut status = snapshot_ready_status(
             backup,
             SnapshotPhase::Succeeded,

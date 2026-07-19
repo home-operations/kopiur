@@ -2786,6 +2786,42 @@ fn needs_terminal_pin_false_once_converged() {
     ));
 }
 
+#[test]
+fn adopted_row_has_provenance_gates_the_succeeded_pin() {
+    use kopiur_api::common::ResolvedIdentity;
+    use kopiur_api::snapshot::{SnapshotInfo, SnapshotStatus};
+    // I1: a user-applied BARE `origin: adopted` label with NO `status.snapshot`
+    // resolves `Adopted` (label fallback) but carries NO controller-written
+    // provenance — `pin_adopted_row` must NOT pin it `Succeeded`. A phantom
+    // Succeeded row would enter GFS retention (displacing a real snapshot) and set
+    // `has_history` (suppressing a recreated policy's scan). On HEAD
+    // `pin_adopted_row` pinned ANY Adopted-resolving row.
+    let forged = backup_with_origin(None, Some("adopted"));
+    assert_eq!(resolve_origin(&forged), Origin::Adopted);
+    assert!(
+        !super::plan::adopted_row_has_provenance(&forged),
+        "a bare origin:adopted label carries no provenance"
+    );
+    // A genuine adopted row (adopt_one wrote `status.snapshot`) IS pinned.
+    let mut genuine = dummy_backup();
+    genuine.status = Some(SnapshotStatus {
+        origin: Some(Origin::Adopted),
+        snapshot: Some(SnapshotInfo {
+            kopia_snapshot_id: "k-abc".into(),
+            identity: ResolvedIdentity {
+                username: "u".into(),
+                hostname: "h".into(),
+                source_path: Some("/d".into()),
+            },
+        }),
+        ..Default::default()
+    });
+    assert!(
+        super::plan::adopted_row_has_provenance(&genuine),
+        "a controller-written adopted row carries provenance"
+    );
+}
+
 fn job_with_status(status: Option<k8s_openapi::api::batch::v1::JobStatus>) -> Job {
     Job {
         status,

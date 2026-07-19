@@ -63,6 +63,14 @@ pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
     if status.phase != Some(SnapshotPhase::Succeeded) {
         return None;
     }
+    // PROVENANCE (defense in depth): a `Succeeded` row only participates in GFS
+    // when it carries CONTROLLER-WRITTEN provenance (`status.snapshot`, the kopia
+    // id the operator produced or adopted). This closes the phantom-Succeeded
+    // displacement even if a phase were ever pinned without one — a forged bare
+    // `origin: adopted` label whose creationTimestamp fallback would otherwise
+    // claim a GFS bucket and displace a real snapshot into the retention delete
+    // set. Every genuine produced/adopted row has `status.snapshot`.
+    status.snapshot.as_ref()?;
     let end_time = status
         .timing
         .as_ref()
@@ -919,7 +927,19 @@ fn own_snapshot_ids_and_history(
         {
             ids.insert(info.kopia_snapshot_id.clone());
         }
-        if retention_view(b).is_some() || crate::snapshot::resolve_origin(b) == Origin::Adopted {
+        // The `Adopted` arm requires the SAME controller-written provenance
+        // (`status.snapshot`) as `retention_view` — a forged bare `origin: adopted`
+        // label with no status must NOT count as history, or it would suppress a
+        // recreated policy's one on-demand scan. (`retention_view` already requires
+        // provenance, so a genuine adopted row that has converged to `Succeeded` is
+        // caught by the first arm; this arm additionally counts an interim
+        // controller-written adopted row before its phase pins.)
+        let adopted_with_provenance = crate::snapshot::resolve_origin(b) == Origin::Adopted
+            && b.status
+                .as_ref()
+                .and_then(|s| s.snapshot.as_ref())
+                .is_some();
+        if retention_view(b).is_some() || adopted_with_provenance {
             has_history = true;
         }
     }
@@ -944,11 +964,31 @@ async fn execute_adoptions(
     Ok(count)
 }
 
+/// **Pure.** Whether the object found at the adopted row's name on a create-409
+/// is really THIS candidate's adopted row (a prior wave that crashed before the
+/// status patch), and not a name-collision STRANGER. Requires the matching
+/// `SNAPSHOT_ID_LABEL` AND a catalog origin label (`adopted`/`discovered`). On a
+/// mismatch [`adopt_one`] skips the status patch (and the discovered-row delete)
+/// rather than clobber a stranger's status.
+fn adopted_row_matches_candidate(existing: &Snapshot, snapshot_id: &str) -> bool {
+    let labels = existing.labels();
+    let id_matches = labels
+        .get(crate::consts::SNAPSHOT_ID_LABEL)
+        .map(String::as_str)
+        == Some(snapshot_id);
+    let origin = labels.get(crate::consts::ORIGIN_LABEL).map(String::as_str);
+    let origin_is_catalog = origin == Some(Origin::Adopted.label_value())
+        || origin == Some(Origin::Discovered.label_value());
+    id_matches && origin_is_catalog
+}
+
 /// Adopt one discovered row (inv. 4): CREATE the adopted row FIRST in the
 /// POLICY's namespace, ENSURE its status, THEN delete the discovered row in ITS
 /// OWN namespace. On create-409 (a prior wave already created it) DO NOT
 /// early-return — fall through to re-ensure the status so a crash between create
-/// and status-patch is healed. Every step is 404/409-tolerant.
+/// and status-patch is healed, but FIRST verify the occupant is really this
+/// candidate's adopted row ([`adopted_row_matches_candidate`]): a name-collision
+/// stranger must never have its status overwritten. Every step is 404/409-tolerant.
 async fn adopt_one(
     ctx: &Context,
     config: &SnapshotPolicy,
@@ -962,9 +1002,25 @@ async fn adopt_one(
 
     match policy_api.create(&PostParams::default(), &adopted).await {
         Ok(_) => {}
-        // Already exists (a prior wave crashed after create) — ensure status, do
-        // NOT early-return.
-        Err(kube::Error::Api(ae)) if ae.code == 409 => {}
+        // Already exists (a prior wave crashed after create) — verify it is really
+        // OUR adopted row before re-ensuring status; do NOT early-return on the
+        // happy path.
+        Err(kube::Error::Api(ae)) if ae.code == 409 => match policy_api.get_opt(&cr_name).await? {
+            Some(existing) if adopted_row_matches_candidate(&existing, &candidate.snapshot_id) => {}
+            Some(_) => {
+                tracing::warn!(
+                    policy = %config.name_any(),
+                    adopted = %cr_name,
+                    discovered = %candidate.name,
+                    "adopted-row name is occupied by an object that is not this candidate's \
+                     adopted row (label mismatch); skipping to avoid overwriting a stranger's status"
+                );
+                return Ok(());
+            }
+            // 409 then vanished (a concurrent delete): nothing to adopt this pass,
+            // re-planned on the next reconcile.
+            None => return Ok(()),
+        },
         Err(e) => return Err(Error::Kube(e)),
     }
     io::patch_status(&policy_api, &cr_name, serde_json::to_value(&status)?).await?;
@@ -1260,6 +1316,108 @@ mod tests {
             del,
             ["d23".to_string(), "d22".to_string()].into_iter().collect()
         );
+    }
+
+    // -- I1: provenance gates on adopted / retention rows ---------------------
+
+    #[test]
+    fn retention_view_requires_controller_written_provenance() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        // A Succeeded row with NO status.snapshot must NOT participate in GFS. This
+        // is the exact shape a HEAD `pin_adopted_row` would mint for a forged
+        // `origin: adopted` label: phase pinned Succeeded, no provenance. Its
+        // creationTimestamp fallback would otherwise claim a GFS bucket and displace
+        // a real snapshot into the (breaker-exempt) retention delete set.
+        let mut phantom = succeeded_backup("phantom", at(2026, 5, 24));
+        let s = phantom.status.as_mut().unwrap();
+        s.snapshot = None; // strip controller-written provenance
+        s.timing = None; // force the creationTimestamp fallback path
+        phantom.metadata.creation_timestamp = Some(Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+        ));
+        assert!(
+            retention_view(&phantom).is_none(),
+            "a Succeeded row without status.snapshot never enters GFS (HEAD returned \
+             Some via the creationTimestamp fallback)"
+        );
+        // A genuine produced/adopted row (status.snapshot present) still enters GFS.
+        assert!(retention_view(&succeeded_backup("real", at(2026, 5, 24))).is_some());
+    }
+
+    #[test]
+    fn has_history_requires_provenance_for_a_bare_adopted_label() {
+        // A forged BARE `origin: adopted` label row (no status at all) must NOT
+        // count as history — counting it would suppress a delete-then-recreated
+        // policy's one on-demand catalog scan. On HEAD the `origin == Adopted` arm
+        // set has_history from the label alone.
+        let mut forged = succeeded_backup("forged", at(2026, 5, 24));
+        forged.status = None; // bare row: label only, no controller-written status
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            crate::consts::ORIGIN_LABEL.to_string(),
+            Origin::Adopted.label_value().to_string(),
+        );
+        forged.metadata.labels = Some(labels);
+        assert_eq!(crate::snapshot::resolve_origin(&forged), Origin::Adopted);
+        let (_ids, has_history) = own_snapshot_ids_and_history(&[forged]);
+        assert!(
+            !has_history,
+            "a bare origin:adopted label with no status.snapshot is not history"
+        );
+
+        // A genuine adopted row (status.snapshot present) DOES count as history.
+        let (_ids, has_history) =
+            own_snapshot_ids_and_history(&[backup_with_origin("genuine", Origin::Adopted)]);
+        assert!(has_history, "a controller-written adopted row is history");
+    }
+
+    #[test]
+    fn adopted_row_matches_candidate_guards_name_collision_strangers() {
+        let row = |id: Option<&str>, origin: Option<&str>| {
+            let mut b = Snapshot::new(
+                "occupant",
+                SnapshotSpec {
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            let mut labels = BTreeMap::new();
+            if let Some(id) = id {
+                labels.insert(crate::consts::SNAPSHOT_ID_LABEL.to_string(), id.to_string());
+            }
+            if let Some(o) = origin {
+                labels.insert(crate::consts::ORIGIN_LABEL.to_string(), o.to_string());
+            }
+            b.metadata.labels = Some(labels);
+            b
+        };
+        // Our adopted row (a prior wave's crash-before-status-patch) → matches.
+        assert!(adopted_row_matches_candidate(
+            &row(Some("abc"), Some("adopted")),
+            "abc"
+        ));
+        // A discovered-origin occupant at the name is also a catalog row → matched.
+        assert!(adopted_row_matches_candidate(
+            &row(Some("abc"), Some("discovered")),
+            "abc"
+        ));
+        // Wrong snapshot id → stranger (name collision on the first-16 id prefix).
+        assert!(!adopted_row_matches_candidate(
+            &row(Some("xyz"), Some("adopted")),
+            "abc"
+        ));
+        // Non-catalog origin (a produced snapshot) → stranger.
+        assert!(!adopted_row_matches_candidate(
+            &row(Some("abc"), Some("scheduled")),
+            "abc"
+        ));
+        // Missing labels entirely → stranger.
+        assert!(!adopted_row_matches_candidate(&row(None, None), "abc"));
     }
 
     /// Mark a Snapshot terminating, optionally with a valid `pruned-by` stamp.
