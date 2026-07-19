@@ -1,0 +1,100 @@
+# Example 35 — SnapshotPolicy.spec.deletion.onPolicyDelete: what happens to a
+# recipe's Snapshots when the SnapshotPolicy itself is deleted
+#
+# A SnapshotPolicy owns a policy-cleanup finalizer that cascades onto every
+# Snapshot CR carrying its config label (kopiur.home-operations.com/config)
+# the moment the SnapshotPolicy is deleted. spec.deletion.onPolicyDelete picks
+# the mode:
+#
+# - Retain (the default — shown below): every child CR is stamped
+#   `pruned-by: policy-cascade` and removed, but NO kopia snapshot is ever
+#   deleted, even for a child whose own deletionPolicy was Delete (a
+#   SnapshotRetainedOnPolicyDelete Warning Event fires on each one, naming
+#   why). The kopia data survives in the repository, is rediscovered as
+#   `origin: discovered` on the next catalog scan, and — since adoption
+#   defaults on — is automatically re-attached the moment a SnapshotPolicy
+#   with a matching identity exists again (including this same policy,
+#   re-created; see example 36).
+#
+# - Delete (opt-in, commented out below): each child CR is deleted UNSTAMPED,
+#   so its own deletionPolicy applies exactly like any other external
+#   deletion — a Delete child's kopia snapshot really is removed. That still
+#   passes through the repository's mass-deletion breaker
+#   (spec.deletionProtection.threshold, default 10): deleting a whole
+#   recipe's worth of Snapshots at once is exactly the bulk-deletion pattern
+#   the breaker exists to catch, so a large policy will likely trip it and
+#   need the kopiur.home-operations.com/allow-mass-deletion ack before the
+#   held deletions proceed (see example 34 / docs/repositories.md
+#   "deletionProtection").
+#
+# Field shapes verified against crates/api (externally-tagged backend:
+# `backend.s3`, not `backend: { kind: S3 }`).
+#
+# See docs/backups.md ("What happens when the policy is deleted") and
+# docs/scenarios/adopt-existing-repo.md ("Delete a policy, then recreate it").
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  # The mass-deletion circuit breaker every Delete-mode cascade below still
+  # passes through — see the Delete variant's comments further down.
+  deletionProtection:
+    threshold: 10 # default; `0` disables it
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  # Deletion semantics for the Snapshots THIS policy's config label governs.
+  deletion:
+    # Fail-safe default (shown explicitly here — omitting `deletion`
+    # entirely, or the whole block, resolves to the same thing): deleting
+    # this SnapshotPolicy removes its Snapshot CRs but keeps every kopia
+    # snapshot in the repository. Nothing is lost — see the header comment.
+    onPolicyDelete: Retain
+
+    # Opt-in cascade instead: uncomment to make deleting this SnapshotPolicy
+    # really delete its Snapshots' kopia data too (each child's own
+    # deletionPolicy applies as an ordinary external deletion, subject to
+    # the repository's deletionProtection breaker above).
+    # onPolicyDelete: Delete

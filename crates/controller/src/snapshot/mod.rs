@@ -2086,14 +2086,7 @@ async fn retain_on_schedule_delete(
         backup,
         SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
         ENABLE_SCHEDULE_CASCADE_ACTION,
-        &format!(
-            "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
-             is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
-             so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. \
-             The catalog will rediscover it as `origin: discovered` within the repository's catalog \
-             refresh interval. To cascade deletes when a schedule is removed, set the schedule's \
-             `spec.deletion.onScheduleDelete: Delete`."
-        ),
+        &schedule_cascade_retained_message(namespace, name),
     )
     .await;
     io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;

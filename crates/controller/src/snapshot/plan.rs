@@ -440,6 +440,28 @@ pub fn mass_deletion_hold_message(
     )
 }
 
+/// The `SnapshotRetainedOnScheduleDelete` Warning event message for
+/// [`DeletionPlan::RetainSnapshotOnScheduleDelete`]'s executor. Names the CR,
+/// states that the kopia snapshot was kept, and says how it comes back:
+/// rediscovered on the *next catalog scan* (not a promise of "within the
+/// refresh interval" — `periodicRefresh` is off by default, so nothing runs on
+/// a timer unless the user turned it on; the real triggers are a bootstrap, a
+/// spec change, or a recreated policy's automatic scan request), then
+/// auto-adopted by default once a matching `SnapshotPolicy` exists. Pure so
+/// the wording is unit-tested.
+pub fn schedule_cascade_retained_message(namespace: &str, name: &str) -> String {
+    format!(
+        "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
+         is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
+         so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. It \
+         will be rediscovered as `origin: discovered` on the next catalog scan (e.g. a bootstrap, \
+         a spec change, or a recreated policy's automatic scan request — not necessarily on a \
+         timer, since periodic refresh is off by default) and auto-adopted by default once a \
+         SnapshotPolicy with a matching identity exists. To cascade deletes when a schedule is \
+         removed, set the schedule's `spec.deletion.onScheduleDelete: Delete`."
+    )
+}
+
 /// The `SnapshotRetainedOnPolicyDelete` Warning event message for
 /// [`DeletionPlan::RetainSnapshotOnPolicyDelete`]'s executor. Names the CR,
 /// states what became of the kopia snapshot — retained in the repository, or

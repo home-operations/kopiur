@@ -103,8 +103,88 @@ adopt-smoke-test   Completed   45s
 A `Ready` repo, an `OWNED` maintenance lease, and a `Completed` smoke-test restore
 mean the repository is fully adopted.
 
+## Delete a policy, then recreate it
+
+Adoption isn't only for a repository you're onboarding for the first time — it's
+also how Kopiur heals itself after **you** delete a `SnapshotPolicy` and bring it
+back. This is the scenario end-to-end, continuing from the `postgres-data`
+recipe above once it's been backing up for a while:
+
+```mermaid
+flowchart LR
+  DEL[Delete SnapshotSchedule + SnapshotPolicy] --> CLEAN[Snapshot CRs removed<br/>kopia data kept, Retain]
+  CLEAN --> REAPPLY[kubectl apply the SAME SnapshotPolicy]
+  REAPPLY --> SCAN[No history yet -> requests<br/>an on-demand catalog scan]
+  SCAN --> DISC[Repository re-scans -><br/>origin=discovered rows]
+  DISC --> ADOPT[Exact identity match -><br/>origin=adopted, config-labeled]
+  ADOPT --> RET[GFS retention resumes]
+```
+
+1. **Delete the schedule, then the policy** (or let a GitOps prune remove both at
+   once — either order drains to the same outcome; see
+   [Backups → Retain-wins-ties](../backups.md#what-happens-when-the-policy-is-deleted)).
+   With the default `onPolicyDelete: Retain`, the `policy-cleanup` finalizer
+   removes every `Snapshot` CR carrying the policy's config label — but **every
+   kopia snapshot stays in the repository**. Nothing is deleted kopia-side.
+
+   ```console
+   $ kubectl delete snapshotschedule postgres-data-nightly -n billing
+   $ kubectl delete snapshotpolicy postgres-data -n billing
+   ```
+
+2. **Re-apply the same `SnapshotPolicy`** (same name, same `identity`/sources —
+   shown below). A freshly-created policy has no
+   `Snapshot` CRs carrying its config label yet — no history. Its first
+   reconcile finds nothing to adopt (the old snapshots haven't been rediscovered
+   yet) and, because it has no history and hasn't already asked for this exact
+   identity, requests an **on-demand catalog scan** on the repository instead of
+   waiting for a spec change or the (off-by-default) periodic-refresh timer. An
+   `AdoptionScanRequested` Normal Event fires on the `SnapshotPolicy` naming the
+   identity it's waiting on.
+3. **The repository honors the scan request** and re-lists the backend, which
+   re-materializes the kept kopia snapshots as `origin: discovered` rows —
+   exactly like the very first adoption above, just triggered on demand instead
+   of by the initial bootstrap.
+4. **The policy adopts them on its next reconcile**: it matches discovered rows
+   by **exact structured identity** — `username` AND `hostname` AND
+   `sourcePath` must ALL match its own resolved identity, never a
+   partial/fuzzy match — creates an `origin: adopted` `Snapshot` CR (carrying
+   the config label) for each one, and removes the matching discovered rows. A
+   `SnapshotsAdopted` Normal Event fires naming the count and identity.
+5. **Retention resumes.** Adopted rows are GFS-governed exactly like produced
+   ones — `spec.retention` starts pruning them the moment they age out of the
+   window. If you recreated the policy with a **narrower** retention window
+   than before, expect some of the just-adopted history to be pruned on the
+   very next reconcile — that's [by design](../backups.md#retention--how-long-backups-are-kept-gfs),
+   not a bug (see [Troubleshooting](../troubleshooting.md#my-old-snapshots-were-pruned-after-i-recreated-a-policy)
+   if this surprises you).
+
+```yaml
+--8<-- "deploy/examples/36-policy-recreate-adoption.yaml"
+```
+
+/// note | Opting out, and the one case adoption never touches
+
+Automatic adoption is on by default at both levels — turn it off with
+`SnapshotPolicy.spec.adoption: Ignore` (this recipe only) or
+`Repository`/`ClusterRepository` `spec.catalog.adoption: Ignore` (every policy
+against this repository); the per-policy field wins when both are set. Either
+way, `origin: discovered` rows keep accumulating and are never auto-attached —
+you restore from them directly instead (as in the section above).
+
+On a repository **shared across clusters** (`identityDefaults.cluster` set),
+adoption never crosses cluster boundaries: a discovered row whose hostname
+classifies as another cluster's is refused even on an otherwise-exact identity
+match — the same [foreign-snapshot rule](../repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters)
+that keeps two clusters' maintenance leases from fighting also keeps one
+cluster from silently absorbing another's backup history.
+
+///
+
 ## See also
 
 - [Restores → discovered snapshots](../restores.md#restoring-a-snapshot-kopiur-didnt-create) and [example 07](../examples.md#example-07--restore-a-discovered-backup) — the two ways to restore foreign snapshots.
 - [Maintenance](../maintenance.md) and [example 08](../examples.md#example-08--maintenance) — ownership leases and takeover policy in full.
 - [Backups → identity](../backups.md#identity--what-kopia-records-usernamehostnamepath) — matching the foreign writer's identity.
+- [Backups → What happens when the policy is deleted](../backups.md#what-happens-when-the-policy-is-deleted) — the `onPolicyDelete` cascade this scenario relies on.
+- [Repositories → The catalog](../repositories.md#the-catalog--discovered-snapshots) — the `catalog.adoption` knob and scan-request mechanics in full.

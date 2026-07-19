@@ -179,6 +179,10 @@ If you set `retention:` but leave every bucket unset or `0`, GFS would prune **e
 kopia's `snapshot create` normally applies its own retention after every backup, and with nothing configured it falls back to kopia's defaults (`keepLatest: 10`, etc.) — values a wide `retention:` window above would blow right past, deleting backups behind Kopiur's back. Kopiur pins kopia's own retention to effectively-infinite on every identity it manages, so `retention:` above is the only thing that ever deletes a backup.
 ///
 
+/// note | Adopted rows are governed exactly like produced ones
+A discovered snapshot that gets [auto-adopted](repositories.md#the-catalog--discovered-snapshots) into a `SnapshotPolicy` (`origin: adopted`) carries `status.phase: Succeeded` from the moment it's created, so it is immediately visible to this same GFS window — that's the entire point of adoption: instead of sitting in the catalog forever as an immortal `discovered` row, it now ages out and gets pruned like any snapshot the policy produced itself. A `pin: true` carried over from the discovered row stays exempt, same as any pinned produced backup.
+///
+
 ### How many `Snapshot` CRs will I have?
 
 Kopiur keeps **one `Snapshot` CR per retained snapshot per source** — the CR _is_ the backup's lifecycle handle (finalizer + `deletionPolicy`), so the live CR count equals the retained snapshot count **by design**. It is set by _retention_, not by how often you schedule: a faster schedule fills the GFS window sooner but never exceeds it. Three independent populations add up:
@@ -602,6 +606,51 @@ This guard exists because Kubernetes' own ownerReference garbage collection dele
 The guard only ever fires for **external** deletions — one of Kopiur's own retention/`failedJobsHistoryLimit` prunes always honors the Snapshot's real `deletionPolicy` regardless of the schedule's state (retention must keep working even if a schedule was just deleted). It also only fires while the schedule is genuinely gone/replaced: a live schedule deleting its own stale children (e.g. `failedJobsHistoryLimit` pruning) is an operator prune, not this path.
 
 Editing `spec.deletion.onScheduleDelete` on a **live** schedule propagates to its existing produced Snapshots (a best-effort patch on every reconcile, skipping any child already `Terminating`) — so flipping the knob doesn't only affect *future* firings, and you don't have to touch each child by hand.
+
+#### What happens when the policy is deleted
+
+`SnapshotPolicy.spec.deletion.onPolicyDelete` is the recipe-level counterpart to the schedule guard above — what happens to a **recipe's** `Snapshot` CRs (the ones carrying its config label, `kopiur.home-operations.com/config`) when the `SnapshotPolicy` itself is deleted. A `policy-cleanup` finalizer on the `SnapshotPolicy` drives the cascade before the CR is actually removed:
+
+```yaml
+spec:
+    deletion:
+        onPolicyDelete: Delete # default: Retain
+```
+
+| Value                | What happens to the policy's `Snapshot` CRs once the `SnapshotPolicy` is deleted                                                                                                                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Retain` _(default)_  | Every CR is stamped `pruned-by: policy-cascade` and removed — but **every kopia snapshot stays in the repository**. A `SnapshotRetainedOnPolicyDelete` Warning Event fires on each one whose own `deletionPolicy` was `Delete` (the loud downgrade). Nothing is lost: the data is rediscovered as `origin: discovered` on the next catalog scan, and — since adoption defaults on — automatically re-attached the moment a `SnapshotPolicy` with a matching identity exists (including this same policy, re-created). |
+| `Delete`              | Opt-in cascade: each CR is deleted **unstamped**, so its own `deletionPolicy` applies exactly like any other external deletion — `Delete` really does call `kopia snapshot delete`, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) (the `allow-mass-deletion` ack) below. |
+
+/// warning | Behavior change: previously-dangling CRs are now cleaned up
+
+Before this cascade existed, deleting a `SnapshotPolicy` left its `Snapshot` CRs behind with no owner — they just sat there (still retention-governed by nothing, since the recipe that pruned them was gone). Now `Retain` (the default) actively **removes** those CRs the moment the policy goes, while still keeping every kopia snapshot in the repository. If you relied on the old dangling-CR behavior to keep the CRs themselves around after deleting a policy, that no longer happens — the data survives, the CRs don't.
+
+///
+
+Two things make `Retain` a genuinely safe default rather than a "kopia data now, CRs later" half-measure:
+
+- **Retain-wins-ties.** If a `SnapshotSchedule` and its `SnapshotPolicy` are deleted **at once** (a GitOps prune removing a whole recipe bundle), the policy-cascade's `pruned-by: policy-cascade` stamp bypasses the schedule-deletion cascade guard above — the pair always drains to `Retain`'s CR-removed/kopia-kept outcome, never a race between the two guards. A `Snapshot` that was `Running` at the time is **cancelled**: its CR (and the mover Job it owns) is deleted mid-run, so no kopia snapshot manifest for that run ever exists to retain — any content the interrupted run had already uploaded is unreferenced and reclaimed by the repository's ordinary [full maintenance](maintenance.md) garbage collection, the same as any other interrupted kopia backup.
+- **Discovered rows are never touched.** The cascade only ever acts on `Adopted`/`Scheduled`/`Manual` children — an `origin: discovered` `Snapshot` never churns just because a policy it resembles (even one you hand-labeled it with) was deleted.
+
+Escape hatches, same as the schedule cascade:
+
+- **`kopiur.home-operations.com/skip-snapshot-cleanup`** on an individual `Snapshot` releases just that CR without contacting the repository, overriding the cascade entirely — same lever as [above](#what-delete-needs-to-succeed).
+- **Removing the config label** (`kopiur.home-operations.com/config`) from a `Snapshot` detaches it from the policy before you delete the policy — the cascade lists children by that label, so an unlabeled CR is simply invisible to it (and to retention).
+
+/// note | A manually-applied `Snapshot` only joins retention/cascade if it carries the config label
+
+The mutating webhook stamps the config label automatically on any **new** `Manual`/`Scheduled` `Snapshot` that names a `policyRef` at CREATE time. A `Snapshot` `kubectl apply`'d **before** this behavior shipped keeps today's behavior unchanged — it stays outside GFS retention and outside the deletion cascade, because Kopiur deliberately does not retro-label pre-existing CRs (turning a previously-immortal raw-applied Snapshot GFS-prunable behind your back would be a silent-data-loss footgun). Add the label yourself (`kopiur.home-operations.com/config: <policy-name>`) to opt an old CR in.
+
+///
+
+Both modes, side by side:
+
+```yaml
+--8<-- "deploy/examples/35-policy-deletion-cascade.yaml"
+```
+
+See [Adopt an existing repo → Delete a policy, then recreate it](scenarios/adopt-existing-repo.md#delete-a-policy-then-recreate-it) for the full delete→recreate→adopt walkthrough.
 
 #### How a deletion actually runs — batched, not one Job per Snapshot
 

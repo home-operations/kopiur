@@ -2165,6 +2165,41 @@ fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
     );
 }
 
+// -- schedule_cascade_retained_message (RetainSnapshotOnScheduleDelete executor) --
+
+#[test]
+fn schedule_cascade_retained_message_names_cr_and_opt_in() {
+    let msg = schedule_cascade_retained_message("backups", "nightly-1");
+    assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
+    assert!(msg.contains("RETAINED"), "states retained: {msg}");
+    assert!(
+        msg.contains("spec.deletion.onScheduleDelete: Delete"),
+        "names the opt-in: {msg}"
+    );
+}
+
+#[test]
+fn schedule_cascade_retained_message_does_not_promise_a_refresh_interval() {
+    // Regression: the message used to promise rediscovery "within the
+    // repository's catalog refresh interval", which is misleading now that
+    // periodicRefresh defaults off — nothing runs on a timer unless the user
+    // opted in. The real triggers are a catalog scan (bootstrap, spec change,
+    // or a recreated policy's scan request), followed by default auto-adoption.
+    let msg = schedule_cascade_retained_message("backups", "nightly-1");
+    assert!(
+        !msg.contains("within the repository's catalog refresh interval"),
+        "must not promise a timer-driven refresh: {msg}"
+    );
+    assert!(
+        msg.contains("next catalog scan"),
+        "names the real trigger: {msg}"
+    );
+    assert!(
+        msg.contains("auto-adopted"),
+        "states the post-rediscovery outcome: {msg}"
+    );
+}
+
 // -- policy_cascade_retained_message (RetainSnapshotOnPolicyDelete executor) --
 
 #[test]
