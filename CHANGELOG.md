@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.8.0](https://github.com/home-operations/kopiur/compare/0.7.5...0.8.0) (2026-07-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* SnapshotPolicy deletion cascade + auto-adoption of discovered snapshots ([#272](https://github.com/home-operations/kopiur/issues/272))
+
+### Features
+
+* **deps:** update rust crate tokio (1.52.4 → 1.53.0) ([#264](https://github.com/home-operations/kopiur/issues/264)) ([6cab0c6](https://github.com/home-operations/kopiur/commit/6cab0c6d5ce56a1bae48a2b593ca7e57983dcec8))
+* mass-deletion protection (cascade guard, per-repo breaker, batched deletes) ([#265](https://github.com/home-operations/kopiur/issues/265)) ([038ea6d](https://github.com/home-operations/kopiur/commit/038ea6d5685b2e8959b29314456332a40e7f5b64))
+* SnapshotPolicy deletion cascade + auto-adoption of discovered snapshots ([#272](https://github.com/home-operations/kopiur/issues/272)) ([9da8c26](https://github.com/home-operations/kopiur/commit/9da8c2649f5ac5553de89121ae4e76e75d151880))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate anyhow (1.0.103 → 1.0.104) ([#269](https://github.com/home-operations/kopiur/issues/269)) ([4d81496](https://github.com/home-operations/kopiur/commit/4d8149640ee59ec1676208920af4b257f5bea090))
+* **deps:** update rust crate clap (4.6.1 → 4.6.2) ([#257](https://github.com/home-operations/kopiur/issues/257)) ([c238df1](https://github.com/home-operations/kopiur/commit/c238df13d1ac93158804875d9a1d98717395b382))
+* **deps:** update rust crate futures (0.3.32 → 0.3.33) ([#268](https://github.com/home-operations/kopiur/issues/268)) ([926b52d](https://github.com/home-operations/kopiur/commit/926b52d3421ed39db8485252d3b6cea1bd8c0244))
+* **deps:** update rust crate serde (1.0.228 → 1.0.229) ([#270](https://github.com/home-operations/kopiur/issues/270)) ([5fbd713](https://github.com/home-operations/kopiur/commit/5fbd71341c2fdd6a53bd6e3d8da4fbf1150a3caa))
+* **deps:** update rust crate thiserror (2.0.18 → 2.0.19) ([#271](https://github.com/home-operations/kopiur/issues/271)) ([d83730f](https://github.com/home-operations/kopiur/commit/d83730f55aa805713cc50e60e77fbef1ae0be256))
+* **deps:** update rust crate tokio (1.52.3 → 1.52.4) ([#261](https://github.com/home-operations/kopiur/issues/261)) ([accf6ae](https://github.com/home-operations/kopiur/commit/accf6ae98a37561ee1f4a8053acbe1f8d1d013db))
+* writable backup source ([#254](https://github.com/home-operations/kopiur/issues/254)), stuck deletion finalizer ([#255](https://github.com/home-operations/kopiur/issues/255)), kopia epoch parameters ([#258](https://github.com/home-operations/kopiur/issues/258)) ([#263](https://github.com/home-operations/kopiur/issues/263)) ([94f9a15](https://github.com/home-operations/kopiur/commit/94f9a155ee2ffdbd5abd31b16393edd697faf6c4))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.7.5 manifest ([16d7390](https://github.com/home-operations/kopiur/commit/16d7390a5b188c647837c65ab7cd58ef2497de61))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.28 → 0.11.29) ([#256](https://github.com/home-operations/kopiur/issues/256)) ([f822335](https://github.com/home-operations/kopiur/commit/f822335ce16ed43e226a2868087a3592e726295d))
+* **mise:** Update tool cosign (3.1.1 → 3.1.2) ([#267](https://github.com/home-operations/kopiur/issues/267)) ([649ba2e](https://github.com/home-operations/kopiur/commit/649ba2e59fe124f65c269f7e5cf6d4aebd452ac2))
+
 ## [0.7.5](https://github.com/home-operations/kopiur/compare/0.7.4...0.7.5) (2026-07-16)
 
 
