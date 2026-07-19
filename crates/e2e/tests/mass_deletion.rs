@@ -2168,29 +2168,38 @@ async fn policy_cascade_delete_cleans_crs_keeps_kopia() {
     wait_phase(&backups, SEED_SNAP, "Succeeded")
         .await
         .expect("seed Snapshot should Succeed");
-    backups
-        .delete(SEED_SNAP, &DeleteParams::default())
+    // Retire the SEED POLICY (Retain cascade keeps the child's kopia snapshot) BEFORE
+    // the snapshot re-catalogs. This is load-bearing: a LIVE identity-matching policy
+    // would AUTO-ADOPT the re-cataloged snapshot (flipping it out of `discovered`), so
+    // the seed policy must be gone first for the seed to persist as the untouched
+    // `discovered` control. A terminating policy never runs the adoption path.
+    policies
+        .delete(SEED_POL, &DeleteParams::default())
         .await
-        .expect("delete the seed Snapshot CR (Retain ⇒ kopia kept ⇒ rediscovered)");
+        .expect("delete the seed SnapshotPolicy (Retain cascade ⇒ kopia kept ⇒ rediscovered)");
     let seed_row = wait_until(
-        "the seed snapshot re-catalogs as a discovered row",
+        "the seed snapshot re-catalogs as a discovered row once the seed policy is retired",
         default_timeout(),
         poll_interval(),
         || {
             let backups = backups.clone();
+            let policies = policies.clone();
             let repo_uid = repo_uid.clone();
             async move {
+                // Only accept the discovered row once SEED_POL is fully gone, so no
+                // live matcher can adopt it out from under this control.
+                if policies.get_opt(SEED_POL).await?.is_some() {
+                    return Ok(None);
+                }
                 let rows = repo_discovered_rows(&backups, &repo_uid).await;
                 Ok(rows.into_iter().next())
             }
         },
     )
     .await
-    .expect("the seed snapshot must re-catalog as a discovered row");
+    .expect("the seed snapshot must re-catalog as a discovered row (no live policy to adopt it)");
     let seed_disc_name = seed_row.name_any();
     let seed_uid = seed_row.uid().expect("seed discovered row uid");
-    // Retire the seed policy so nothing live matches the seed identity.
-    let _ = policies.delete(SEED_POL, &DeleteParams::default()).await;
 
     // Schedule-produced child.
     schedules
