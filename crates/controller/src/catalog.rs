@@ -152,15 +152,6 @@ pub fn reverify_due(token: Option<&str>, honored: Option<&str>, phase_ready: boo
     phase_ready && token.is_some() && token != honored
 }
 
-/// Whether a pending `catalog-scan-requested-at` token (stamped by the policy
-/// reconciler, M6, when adopting a delete-then-recreated repository) should force
-/// a catalog scan/bootstrap NOW, bypassing the refresh timer — the on-demand
-/// counterpart to [`refresh_due`]. Retirement is by TOKEN EQUALITY against
-/// `honored` (`status.catalog.scanRequestHonored`), deliberately NOT a comparison
-/// against `last_refresh_at`: a periodic- or generation-driven scan that happens
-/// to complete after the token was written must not look like it honored a
-/// request it started before the request even existed.
-///
 /// Whether a `catalog-scan-requested-at` token is still PENDING: present,
 /// non-empty, and not yet retired by TOKEN EQUALITY against `honored`
 /// (`status.catalog.scanRequestHonored`). Pure equality retirement — NO rate
