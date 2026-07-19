@@ -140,6 +140,8 @@ fn sample_backup_config(name: &str) -> SnapshotPolicy {
             hooks: None,
             mover: None,
             credential_projection: None,
+            deletion: None,
+            adoption: None,
         },
     )
 }

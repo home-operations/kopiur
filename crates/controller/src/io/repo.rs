@@ -6,8 +6,9 @@ use kube::runtime::reflector::Store;
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{
-    DeletionProtectionSpec, Encryption, IdentityDefaults, MoverDefaults, NamespaceDeletePolicy,
-    PhaseLabel, RepositoryKind, RepositoryMode, RepositoryRef, ScheduleDefaults,
+    CatalogBounds, DeletionProtectionSpec, Encryption, IdentityDefaults, MoverDefaults,
+    NamespaceDeletePolicy, PhaseLabel, RepositoryKind, RepositoryMode, RepositoryRef,
+    ScheduleDefaults,
 };
 use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
 use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
@@ -102,6 +103,15 @@ pub struct ResolvedRepository {
     /// malformed value loudly rather than silently disarming the breaker) is
     /// the consumer's job (M4's breaker evaluation), not this resolver's.
     pub mass_deletion_ack: Option<String>,
+    /// The repository's `spec.catalog` bounds (`CatalogBounds`), cloned verbatim
+    /// from either repo kind. Carries `catalog.adoption`, the middle link of the
+    /// policy → repo → constant adoption-policy chain the `SnapshotPolicy`
+    /// reconciler resolves via
+    /// [`kopiur_api::common::effective_adoption`](kopiur_api::common::effective_adoption)
+    /// before running auto-adoption (M6). `None` → no catalog config, so
+    /// adoption falls through to the policy's own `spec.adoption` (else the
+    /// default).
+    pub catalog: Option<CatalogBounds>,
 }
 
 /// Which API a [`RepositoryRef`] resolves against, derived purely from `kind`.
@@ -204,6 +214,7 @@ pub async fn resolve_repository_ref(
                 owner_ref,
                 deletion_protection: repo.spec.deletion_protection,
                 mass_deletion_ack,
+                catalog: repo.spec.catalog,
             })
         }
         RepoLookup::Cluster { name } => {
@@ -231,6 +242,7 @@ pub async fn resolve_repository_ref(
                 owner_ref,
                 deletion_protection: repo.spec.deletion_protection,
                 mass_deletion_ack,
+                catalog: repo.spec.catalog,
             })
         }
     }
@@ -498,6 +510,44 @@ pub async fn request_repository_reverify(
         }
     }
     Ok(())
+}
+
+/// Stamp the on-demand catalog-scan-request annotation
+/// ([`crate::consts::CATALOG_SCAN_REQUESTED_ANNOTATION`]) with `token` (an opaque
+/// RFC3339 timestamp) on the referenced `Repository`/`ClusterRepository`, so its
+/// discovered snapshots re-materialize now instead of waiting for the next spec
+/// change or periodic refresh (M6 auto-adoption). Mirrors the reverify-annotation
+/// idiom ([`request_repository_reverify`]) but carries no rate limit of its own —
+/// the policy reconciler already gates *when* it stamps (per-identity, once, or on
+/// an actual adoption wave). 404-tolerant: a repository deleted out from under the
+/// policy is a no-op, not an error.
+pub async fn request_catalog_scan(
+    client: &kube::Client,
+    repo_ref: &RepositoryRef,
+    default_ns: &str,
+    token: &str,
+) -> Result<()> {
+    let key = crate::consts::CATALOG_SCAN_REQUESTED_ANNOTATION;
+    let body = Patch::Merge(serde_json::json!({
+        "metadata": { "annotations": { key: token } }
+    }));
+    let pp = PatchParams::apply(super::apply::FIELD_MANAGER);
+    let outcome = match repo_lookup(repo_ref, default_ns) {
+        RepoLookup::Namespaced { namespace, name } => {
+            let api: Api<Repository> = Api::namespaced(client.clone(), &namespace);
+            api.patch(&name, &pp, &body).await.map(|_| ())
+        }
+        RepoLookup::Cluster { name } => {
+            let api: Api<ClusterRepository> = Api::all(client.clone());
+            api.patch(&name, &pp, &body).await.map(|_| ())
+        }
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        // The repository was deleted out from under the policy — a no-op.
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(Error::Kube(e)),
+    }
 }
 
 /// Whether the named `Namespace` is being torn down — its `deletionTimestamp` is

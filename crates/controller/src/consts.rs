@@ -90,6 +90,32 @@ pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replic
 /// `status.lastReverifyAt`; rate-limited so a wave of failures forces one re-probe.
 pub const REVERIFY_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/reverify-requested-at";
 
+/// Annotation stamped on a `Repository`/`ClusterRepository` (writer: the policy
+/// reconciler, M6) to REQUEST an on-demand catalog scan — e.g. after adopting a
+/// delete-then-recreated repository, so its discovered snapshots materialize
+/// immediately instead of waiting for the next spec change or (opt-in) periodic
+/// refresh. The RFC3339 timestamp VALUE is an opaque token: honored once via
+/// `status.catalog.scanRequestHonored` (equality, never a `lastRefreshAt`
+/// comparison — see [`crate::catalog::scan_requested_due`]), and rate-limited via
+/// `status.catalog.scanRequestAttemptAt` so a pending token against an
+/// unreachable backend cannot recreate bootstrap Jobs on every reconcile.
+pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
+    "kopiur.home-operations.com/catalog-scan-requested-at";
+
+/// Normal Event reason on a `SnapshotPolicy` when auto-adoption re-attached one
+/// or more discovered snapshots into it (M6). The note names the count, the
+/// resolved identity, that the rows are now GFS-governed, and both opt-outs.
+pub const SNAPSHOTS_ADOPTED_REASON: &str = "SnapshotsAdopted";
+/// Event `action` (guidance) for [`SNAPSHOTS_ADOPTED_REASON`]: how to opt out of
+/// automatic adoption.
+pub const REVIEW_ADOPTION_ACTION: &str = "ReviewAdoption";
+/// Normal Event reason on a `SnapshotPolicy` when it stamped an on-demand
+/// catalog-scan request ([`CATALOG_SCAN_REQUESTED_ANNOTATION`]) on its
+/// repository so newly-recreated snapshots materialize for adoption (M6).
+pub const ADOPTION_SCAN_REQUESTED_REASON: &str = "AdoptionScanRequested";
+/// Event `action` (guidance) for [`ADOPTION_SCAN_REQUESTED_REASON`].
+pub const AWAIT_CATALOG_SCAN_ACTION: &str = "AwaitCatalogScan";
+
 /// Condition reason when a `Maintenance` (managed or external) covers the repo.
 pub const MAINTENANCE_CONFIGURED_REASON: &str = "MaintenanceConfigured";
 /// `action` for the maintenance-configuration check Event.
@@ -455,6 +481,12 @@ pub const CHECK_WEBHOOK_CONFIGURATION_ACTION: &str = "CheckWebhookConfiguration"
 pub const WEBHOOK_CERT_NOT_AFTER_ANNOTATION: &str =
     "kopiur.home-operations.com/webhook-cert-not-after";
 
+/// Finalizer on a `SnapshotPolicy`, driving the deletion cascade onto its
+/// `Snapshot` children (`spec.deletion.onPolicyDelete`,
+/// [`crate::snapshot_policy::plan_policy_cascade`]) before the CR is removed.
+/// Controller-only — the webhook never stamps it.
+pub const POLICY_CLEANUP_FINALIZER: &str = "kopiur.home-operations.com/policy-cleanup";
+
 // --- kopia web-UI server (spec.server) -------------------------------------
 
 /// Finalizer on a `ClusterRepository` whose server children (Deployment/Service/
@@ -516,6 +548,10 @@ pub const SNAPSHOT_DELETION_HELD_REASON: &str = "SnapshotDeletionHeld";
 /// guard (`onScheduleDelete: Retain` with a gone/replaced owning
 /// `SnapshotSchedule`).
 pub const SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON: &str = "SnapshotRetainedOnScheduleDelete";
+/// Event reason when a `Snapshot` is retained by the policy-deletion cascade
+/// (`pruned-by: policy-cascade`, stamped when the owning `SnapshotPolicy` is
+/// gone and `onPolicyDelete: Retain`).
+pub const SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON: &str = "SnapshotRetainedOnPolicyDelete";
 /// Event reason when [`ALLOW_MASS_DELETION_ANNOTATION`]'s value fails to parse
 /// as an RFC3339 timestamp — the ack is ignored (fail-safe) rather than
 /// silently disarming the breaker.
@@ -540,3 +576,6 @@ pub const ACKNOWLEDGE_MASS_DELETION_ACTION: &str = "AcknowledgeMassDeletion";
 /// Event `action` for `SnapshotRetainedOnScheduleDelete`: opt into cascading
 /// deletes by setting the schedule's `spec.deletion.onScheduleDelete: Delete`.
 pub const ENABLE_SCHEDULE_CASCADE_ACTION: &str = "EnableScheduleCascade";
+/// Event `action` for `SnapshotRetainedOnPolicyDelete`: opt into cascading
+/// deletes by setting the policy's `spec.deletion.onPolicyDelete: Delete`.
+pub const ENABLE_POLICY_CASCADE_ACTION: &str = "EnablePolicyCascade";

@@ -43,17 +43,18 @@ use crate::config;
 use crate::consts::{
     ACKNOWLEDGE_MASS_DELETION_ACTION, ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION,
     CREDENTIALS_AVAILABLE_CONDITION, CREDENTIALS_PROJECTED_REASON, DELETE_MEMBERS_ANNOTATION,
-    DELETE_REPO_LABEL, DELETION_HELD_CONDITION, ENABLE_SCHEDULE_CASCADE_ACTION, FIX_HOOK_ACTION,
-    FIX_SNAPSHOT_STACK_ACTION, HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON,
-    INHERIT_FALLBACK_REASON, INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON,
-    INVALID_MASS_DELETION_ACK_REASON, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    MASS_DELETION_ACKNOWLEDGED_REASON, MASS_DELETION_BREAKER_REASON,
-    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION,
-    OP_LABEL, OP_SNAPSHOT_DELETE_BATCH, PIN_WORKLOAD_RUN_AS_USER_ACTION,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON,
-    SNAPSHOT_INCOMPLETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
+    DELETE_REPO_LABEL, DELETION_HELD_CONDITION, ENABLE_POLICY_CASCADE_ACTION,
+    ENABLE_SCHEDULE_CASCADE_ACTION, FIX_HOOK_ACTION, FIX_SNAPSHOT_STACK_ACTION,
+    HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
+    INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON, INVALID_MASS_DELETION_ACK_REASON,
+    MANAGED_BY_LABEL, MANAGED_BY_VALUE, MASS_DELETION_ACKNOWLEDGED_REASON,
+    MASS_DELETION_BREAKER_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH,
+    PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
+    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON, SNAPSHOT_INCOMPLETE_REASON,
+    SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
     SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
@@ -118,6 +119,74 @@ fn snapshot_stalled(backup: &Snapshot) -> bool {
     })
 }
 
+/// `Origin::Discovered` steady-state pin: catalog rows, not runs — never spawn a
+/// Job. Pins the `Discovered` phase (with kstatus Ready, ADR-0005 §2) and
+/// `status.origin` if unset, then stops. Extracted from `reconcile_inner`'s
+/// `match origin` (pure refactor of existing behavior — no semantic change) to
+/// keep the match legible under the complexity ratchet.
+async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    if needs_terminal_pin(
+        backup.status.as_ref().and_then(|s| s.phase),
+        SnapshotPhase::Discovered,
+    ) {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Discovered,
+            "Discovered",
+            "catalog-materialized snapshot",
+        );
+        status["origin"] = serde_json::json!("discovered");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
+/// `Origin::Adopted` steady-state pin: a row the catalog scan / auto-adoption
+/// re-attached to a live `SnapshotPolicy` without the operator itself producing
+/// the underlying kopia snapshot. It is retention-visible HISTORY — like
+/// `Discovered`, it must never enter the backup-run machinery — but unlike a
+/// plain `Discovered` row it IS retention-governed (ADR: adopted rows are
+/// managed like any produced backup), so it pins `phase: Succeeded`, not
+/// `Discovered`. Mirrors [`pin_discovered_row`]'s idempotent guard: the status
+/// patch (phase + terminal kstatus Ready + `status.origin`) only fires when the
+/// phase hasn't already converged, so a repeat reconcile is a no-op.
+///
+/// Belt-and-braces: an adopted row is normally stamped with the
+/// snapshot-cleanup finalizer by the mutating webhook at admission (same as
+/// every other `Snapshot`), but this arm returns before `reconcile_inner`'s main
+/// `ensure_finalizer` call below, so self-heal it here too — a no-op cluster
+/// call when the finalizer is already present.
+async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    io::ensure_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    // PROVENANCE GATE: pin `Succeeded`/terminal-kstatus ONLY for a
+    // CONTROLLER-WRITTEN adopted row — one whose `status.snapshot` was set by
+    // `adopt_one`'s create→status-patch flow. A user-applied BARE `origin: adopted`
+    // label with no `status.snapshot` resolves `Adopted` (via the label fallback in
+    // `resolve_origin`) but must stay PHASE-LESS: a phantom `Succeeded` row would
+    // enter `retention_view` (creationTimestamp fallback), claim a GFS bucket, and
+    // displace a REAL snapshot into the breaker-exempt retention delete set — and it
+    // would set `has_history`, suppressing a recreated policy's on-demand scan. The
+    // genuine adopt flow converges within a pass (create → status patch → next
+    // reconcile pins), so an interim row is only transiently phase-less and invisible
+    // to retention.
+    if plan::adopted_row_has_provenance(backup)
+        && needs_terminal_pin(
+            backup.status.as_ref().and_then(|s| s.phase),
+            SnapshotPhase::Succeeded,
+        )
+    {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Succeeded,
+            "Adopted",
+            "adopted snapshot: retention-visible history re-attached to a SnapshotPolicy",
+        );
+        status["origin"] = serde_json::json!("adopted");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
 async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let origin = resolve_origin(backup);
     let policy = effective_deletion_policy(backup.spec.deletion_policy, origin);
@@ -131,20 +200,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         return handle_deletion(backup, ctx, &api, &namespace, &name, policy).await;
     }
 
-    // Discovered backups are catalog rows, not runs: never spawn a Job. Pin the
-    // Discovered phase (with kstatus Ready, ADR-0005 §2) if unset and stop.
-    if origin == Origin::Discovered {
-        if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Discovered) {
-            let mut status = snapshot_ready_status(
-                backup,
-                SnapshotPhase::Discovered,
-                "Discovered",
-                "catalog-materialized snapshot",
-            );
-            status["origin"] = serde_json::json!("discovered");
-            io::patch_status(&api, &name, status).await?;
-        }
-        return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
+    // Exhaustive over `Origin` (ADR §5.5): `Discovered` and `Adopted` rows are
+    // catalog history, not runs, and must return BEFORE any of the backup-run
+    // machinery below (`run_decision`, post-hooks, staged reap, pin jobs) —
+    // `Scheduled`/`Manual` are the only origins that ever mint a mover Job, so
+    // they fall through to it.
+    match origin {
+        Origin::Discovered => return pin_discovered_row(backup, &api, &name).await,
+        Origin::Adopted => return pin_adopted_row(backup, &api, &name).await,
+        Origin::Scheduled | Origin::Manual => {}
     }
 
     // Ensure the snapshot-cleanup finalizer before doing any work that creates a
@@ -1642,11 +1706,24 @@ pub(crate) fn schedule_owner_lookup(ctx: &Context) -> impl Fn(&Snapshot) -> Owne
 ///
 /// A bad ack is NOT warned about here (the deletion path already publishes
 /// `InvalidMassDeletionAck`); it is simply treated as absent for the count.
-pub(crate) fn repo_mass_deletion_conditions(
+///
+/// `on_namespace_delete` is the repository's cascade policy: the count is
+/// evaluated in each member's real `(ns_terminating, ns_policy)` form (resolving
+/// terminating state over the pending-delete candidates — only CONFIRMED-terminating
+/// namespaces count as terminating here), so this alert-only mirror agrees with the
+/// authoritative deletion-path breaker even during a namespace teardown — a
+/// `policy-cascade`-stamped child that flips to a destructive external delete under
+/// `onNamespaceDelete: Delete` is counted here too. Conversely, a terminating-ns
+/// member whose real plan is `OrphanSnapshot` (`onNamespaceDelete: Orphan`) is NOT
+/// counted toward the breaker — the mirror softens correctly during Orphan
+/// teardowns. The candidate set is bounded by the CRs actually being deleted, so the
+/// namespace reads are near-zero in steady state.
+pub(crate) async fn repo_mass_deletion_conditions(
     ctx: &Context,
     repo_ref: &RepositoryRef,
     raw_ack: Option<&str>,
     deletion_protection: Option<&kopiur_api::common::DeletionProtectionSpec>,
+    on_namespace_delete: NamespaceDeletePolicy,
     existing: &[Condition],
     generation: Option<i64>,
 ) -> Vec<Condition> {
@@ -1663,10 +1740,19 @@ pub(crate) fn repo_mass_deletion_conditions(
     let now = chrono::Utc::now();
     let (ack, _invalid) = parse_mass_deletion_ack(raw_ack, now);
     let threshold = kopiur_api::consts::effective_mass_deletion_threshold(deletion_protection);
+    let state = store.state();
+    let key = repo_key(repo_ref);
+    // Only CONFIRMED-terminating namespaces feed the count-as-terminating plan
+    // evaluation; an unreadable namespace must not flip a retain child into a
+    // counted destructive delete (C1).
+    let terminating =
+        resolve_terminating_namespaces(ctx, &pending_candidate_namespaces(&state, &key)).await;
     let members = pending_members(
-        &store.state(),
-        &repo_key(repo_ref),
+        &state,
+        &key,
         schedule_owner_lookup(ctx),
+        &terminating.confirmed,
+        on_namespace_delete,
     );
     let unacked = unacked_breaker_count(&members, ack);
     let newest = newest_pending_deletion(&members).map(|d| d.to_rfc3339());
@@ -1740,10 +1826,23 @@ async fn resolve_breaker(
     }
     let threshold =
         kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
+    let state = store.state();
+    let key = repo_key(repo_ref);
+    // Count in the REAL `(ns_terminating, ns_policy)` form so an external
+    // destructive delete that only arises under an `onNamespaceDelete: Delete`
+    // namespace teardown (a `policy-cascade`-stamped child) is counted — and thus
+    // can HOLD the wave — exactly like an unstamped external child. Only
+    // CONFIRMED-terminating namespaces count as terminating; an unreadable one
+    // stays retain-form for plan/count (C1), matching the self-CR path's
+    // `unwrap_or(false)`.
+    let terminating =
+        resolve_terminating_namespaces(ctx, &pending_candidate_namespaces(&state, &key)).await;
     let members = pending_members(
-        &store.state(),
-        &repo_key(repo_ref),
+        &state,
+        &key,
         schedule_owner_lookup(ctx),
+        &terminating.confirmed,
+        repo.on_namespace_delete,
     );
     let pending = unacked_breaker_count(&members, ack);
     let ack_value = newest_pending_deletion(&members).map(|d| d.to_rfc3339());
@@ -1791,12 +1890,11 @@ async fn gather_deletion_facts(
             breaker,
         };
 
-    // Does the breaker apply to THIS deletion (external destructive Delete)?
-    // Evaluated in the stable `ns_terminating: false` form — a "is this CR
-    // breaker-relevant" predicate independent of namespace state.
-    let breaker_applies = counts_toward_breaker(mk(BreakerState::Allowed, false, None));
-    // Would a per-CR delete run? Gates resolving the repository (needed for the
-    // ns policy, to place/build the Job, and — new in M4 — the breaker repo_key).
+    // Would a per-CR delete run in the live-namespace form? Gates resolving the
+    // repository (needed for the ns policy, to place/build the Job, and the
+    // breaker repo_key). The repository is ALSO always resolved while the
+    // namespace terminates (below), so `ns_policy` is available whenever the real
+    // `(ns_terminating, ns_policy)` form needs it.
     let would_delete = matches!(
         plan_deletion(mk(BreakerState::Allowed, false, None)),
         DeletionPlan::DeleteSnapshot
@@ -1811,6 +1909,17 @@ async fn gather_deletion_facts(
         .as_ref()
         .and_then(|r| r.as_ref().ok())
         .map(|(_, repo)| repo.on_namespace_delete);
+
+    // Does the breaker apply to THIS deletion (external destructive Delete)?
+    // Computed in the REAL `(ns_terminating, ns_policy)` form — NOT the stable
+    // `false` form — so an external destructive delete that only arises under a
+    // namespace teardown with `onNamespaceDelete: Delete` (e.g. a
+    // `policy-cascade`-stamped child whose namespace a human deleted with the
+    // explicit opt-in) counts toward / is held by the breaker exactly like an
+    // unstamped external child. In the live-namespace case `ns_terminating` is
+    // false and `plan_deletion` ignores `ns_policy`, so this equals the old form.
+    let breaker_applies =
+        counts_toward_breaker(mk(BreakerState::Allowed, ns_terminating, ns_policy));
 
     // Breaker: only for an external-destructive CR, and only once the repository
     // resolved (its `repo_key` scopes the pending count). A repo that can no
@@ -1897,36 +2006,49 @@ async fn handle_deletion(
     // down, the repository's `onNamespaceDelete` decides. Default `Orphan` keeps
     // off-site history (a `kubectl delete ns` must not be a data-loss event); only an
     // explicit `Delete` cascades to the per-Snapshot plan. On a transient read error
-    // fall back to the per-Snapshot plan: a single delete still works, and the
-    // namespace-cascade case re-evaluates on the next pass once the read succeeds.
+    // fall back to the per-Snapshot plan (`unwrap_or(false)` = NOT terminating): a
+    // single delete still works, and the namespace-cascade case re-evaluates on the
+    // next pass once the read succeeds. This is the SAME direction the peer-driven
+    // batch path takes for an unreadable namespace ([`resolve_terminating_namespaces`]
+    // routes `Err` into `unreadable`, which never counts as terminating for
+    // plan/count) — so an unreadable namespace never turns a Retain into a delete on
+    // either path.
     let ns_terminating = io::namespace_is_terminating(&ctx.client, namespace)
         .await
         .unwrap_or(false);
 
-    let (plan, resolved, hold) = match gather_deletion_facts(
-        ctx,
-        backup,
-        namespace,
-        policy,
-        ns_terminating,
-    )
-    .await?
+    let decision = match gather_deletion_facts(ctx, backup, namespace, policy, ns_terminating)
+        .await?
     {
         DeletionOutcome::StoresNotSynced => {
             tracing::info!(backup = %name, "snapshot store not synced yet; deferring deletion (no destructive work)");
             return Ok(Action::requeue(Duration::from_secs(15)));
         }
-        DeletionOutcome::Decided(d) => {
-            let DeletionDecision {
-                plan,
-                resolved,
-                hold,
-            } = *d;
-            (plan, resolved, hold)
-        }
+        DeletionOutcome::Decided(d) => *d,
     };
-    tracing::info!(?plan, backup = %name, ns_terminating, "executing backup deletion plan");
+    tracing::info!(plan = ?decision.plan, backup = %name, ns_terminating, "executing backup deletion plan");
 
+    execute_deletion_plan(decision, backup, ctx, api, namespace, name, ns_terminating).await
+}
+
+/// Dispatch the tested [`plan_deletion`] decision to its executor. Extracted
+/// from [`handle_deletion`] to keep that function under the
+/// cognitive-complexity ratchet — every arm here is pure dispatch (no new
+/// decision logic; the decision itself is `plan_deletion`'s job).
+async fn execute_deletion_plan(
+    decision: DeletionDecision,
+    backup: &Snapshot,
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    ns_terminating: bool,
+) -> Result<Action> {
+    let DeletionDecision {
+        plan,
+        resolved,
+        hold,
+    } = decision;
     match plan {
         DeletionPlan::DeleteSnapshot => {
             execute_delete_snapshot(backup, ctx, api, namespace, name, ns_terminating, resolved)
@@ -1954,6 +2076,9 @@ async fn handle_deletion(
         }
         DeletionPlan::RetainSnapshotOnScheduleDelete => {
             retain_on_schedule_delete(ctx, api, backup, namespace, name).await
+        }
+        DeletionPlan::RetainSnapshotOnPolicyDelete => {
+            retain_on_policy_delete(ctx, api, backup, namespace, name).await
         }
         DeletionPlan::HoldSnapshotDeletion => hold_deletion(ctx, api, backup, name, hold).await,
     }
@@ -2024,14 +2149,40 @@ async fn retain_on_schedule_delete(
         backup,
         SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
         ENABLE_SCHEDULE_CASCADE_ACTION,
-        &format!(
-            "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
-             is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
-             so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. \
-             The catalog will rediscover it as `origin: discovered` within the repository's catalog \
-             refresh interval. To cascade deletes when a schedule is removed, set the schedule's \
-             `spec.deletion.onScheduleDelete: Delete`."
-        ),
+        &schedule_cascade_retained_message(namespace, name),
+    )
+    .await;
+    io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    Ok(Action::await_change())
+}
+
+/// Executor for [`DeletionPlan::RetainSnapshotOnPolicyDelete`]: this Snapshot
+/// carries a `policy-cascade` prune stamp (its owning `SnapshotPolicy` was
+/// deleted under `onPolicyDelete: Retain`) and its own effective
+/// `deletionPolicy` is `Delete`. Release the finalizer WITHOUT contacting the
+/// repository (same as `RetainSnapshot`), bump the policy-cascade-retained
+/// counter (the SINGLE increment point for both counters), and emit ONE
+/// Warning event saying what happened, why, and how to opt into cascading
+/// deletes. Mirrors [`retain_on_schedule_delete`] exactly in shape.
+async fn retain_on_policy_delete(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    namespace: &str,
+    name: &str,
+) -> Result<Action> {
+    ctx.metrics.inc_snapshot_policy_cascade_retained(namespace);
+    let snapshot_recorded = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .is_some();
+    io::publish_warning_event(
+        ctx,
+        backup,
+        SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON,
+        ENABLE_POLICY_CASCADE_ACTION,
+        &policy_cascade_retained_message(namespace, name, snapshot_recorded),
     )
     .await;
     io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
@@ -2590,34 +2741,80 @@ async fn reap_batch_jobs(
     }
 }
 
-/// Resolve, once per DISTINCT member namespace, whether it is TERMINATING (the
-/// same `namespace_is_terminating` check the finalizer path uses for the self
-/// CR). Feeds the FIRE set's IMPORTANT-2 exclusion: an `onNamespaceDelete:
-/// Orphan` peer whose namespace is being torn down plans `OrphanSnapshot` on its
-/// OWN reconcile and must never be deleted by a peer's fire. Bounded — a batch is
-/// ≤200 members, and distinct namespaces are typically far fewer.
+/// Resolving pending-delete candidate namespaces' terminating state, split by
+/// READ CONFIDENCE so the plan/count path and the FIRE path treat an UNREADABLE
+/// namespace differently — they must (see the field docs).
+struct TerminatingNamespaces {
+    /// Namespaces a successful GET proved TERMINATING (`Ok(true)`). ONLY these
+    /// feed plan evaluation ([`batch::pending_members`]) and breaker
+    /// counting-as-terminating: an unreadable namespace must NOT flip a
+    /// retain-destined draining child into a destructive `DeleteSnapshot` member
+    /// in a namespace that is NOT being deleted. This keeps the peer-driven batch
+    /// path symmetric with the finalizer's self-CR path, which resolves the same
+    /// read to NOT-terminating (`unwrap_or(false)`).
+    confirmed: HashSet<String>,
+    /// Namespaces whose terminating-ness could NOT be read (`Err`). EXCLUDED from
+    /// plan evaluation / counting-as-terminating (a retain-cascade child keeps
+    /// retain semantics), but folded into the FIRE path's ns-Orphan exclusion (via
+    /// [`Self::orphan_exclusion`]) AND excluded from the FIRE set OUTRIGHT: a peer
+    /// whose namespace we cannot confirm terminating is never deleted on the
+    /// assumption that it is — its own self-fire (authoritative LIVE resolution)
+    /// drains it. Counting such a member toward the breaker is still fine
+    /// (over-count is fail-safe).
+    unreadable: HashSet<String>,
+}
+
+impl TerminatingNamespaces {
+    /// `confirmed ∪ unreadable` — the set fed to the FIRE path's ns-Orphan
+    /// exclusion ([`batch::FireEligibility::terminating_namespaces`]): an
+    /// `onNamespaceDelete: Orphan` peer whose namespace is terminating OR unreadable
+    /// plans `OrphanSnapshot` on its OWN reconcile and must never be deleted by a
+    /// peer's fire.
+    fn orphan_exclusion(&self) -> HashSet<String> {
+        self.confirmed.union(&self.unreadable).cloned().collect()
+    }
+}
+
+/// Resolve, once per DISTINCT namespace, whether it is TERMINATING (the same
+/// `namespace_is_terminating` check the finalizer path uses for the self CR),
+/// splitting the result into CONFIRMED-terminating (`Ok(true)`) and UNREADABLE
+/// (`Err`) sets. `namespaces` are the pending-delete CANDIDATE namespaces
+/// ([`batch::pending_candidate_namespaces`]), resolved BEFORE the counting set is
+/// built so each member's plan is evaluated in its real `(ns_terminating,
+/// ns_policy)` form. Bounded — a candidate must carry a `deletionTimestamp`, so
+/// this is the set of CRs actually being deleted for the repo, not the whole store.
 ///
-/// Fail-safe (fire-path = UNDER-fire): a namespace whose terminating-ness cannot
-/// be read is treated as terminating, so its `Orphan` peers are withheld and
-/// retried rather than deleted on a guess. (A 403 in a namespaced-scope install
-/// resolves to "not terminating" inside `namespace_is_terminating`, so this never
-/// wedges an install that legitimately cannot read Namespaces.)
-async fn terminating_member_namespaces(
+/// The Err direction is NOT treated as terminating for plan/count (that would let
+/// a transient read error flip a retain-destined child into a destructive external
+/// delete under `onNamespaceDelete: Delete` — deleting data Retain promised to keep
+/// in a namespace that is NOT being deleted). Instead, an unreadable namespace is
+/// (a) excluded from plan/count-as-terminating — matching the self-CR path's
+/// `unwrap_or(false)` — while still (b) protecting its `Orphan` peers on the fire
+/// path (via [`TerminatingNamespaces::orphan_exclusion`]) and (c) withheld from the
+/// FIRE set outright. (A 403 in a namespaced-scope install resolves to `Ok(false)`
+/// — "not terminating" — inside `namespace_is_terminating`, so it lands in NEITHER
+/// set and never wedges an install that legitimately cannot read Namespaces.)
+async fn resolve_terminating_namespaces(
     ctx: &Context,
-    pending: &[PendingMember],
-) -> HashSet<String> {
-    let distinct: std::collections::BTreeSet<&str> =
-        pending.iter().map(|m| m.namespace.as_str()).collect();
-    let mut terminating = HashSet::new();
-    for ns in distinct {
-        if io::namespace_is_terminating(&ctx.client, ns)
-            .await
-            .unwrap_or(true)
-        {
-            terminating.insert(ns.to_string());
+    namespaces: &std::collections::BTreeSet<String>,
+) -> TerminatingNamespaces {
+    let mut confirmed = HashSet::new();
+    let mut unreadable = HashSet::new();
+    for ns in namespaces {
+        match io::namespace_is_terminating(&ctx.client, ns).await {
+            Ok(true) => {
+                confirmed.insert(ns.clone());
+            }
+            Ok(false) => {}
+            Err(_) => {
+                unreadable.insert(ns.clone());
+            }
         }
     }
-    terminating
+    TerminatingNamespaces {
+        confirmed,
+        unreadable,
+    }
 }
 
 /// §3: this CR is not enrolled — pick the fireable set for its repository
@@ -2642,21 +2839,46 @@ async fn fire_batch(
 ) -> Result<Action> {
     use std::sync::atomic::Ordering;
     let key = repo_key(repo_ref);
-    // COUNTING set: maximally inclusive (over-count is fail-safe).
-    let pending = pending_members(state, &key, schedule_owner_lookup(ctx));
+    // Resolve which candidate namespaces are terminating BEFORE building the
+    // counting set, so each member's plan is evaluated in its real
+    // `(ns_terminating, ns_policy)` form. The resolution splits into CONFIRMED
+    // (`Ok(true)`) and UNREADABLE (`Err`): ONLY confirmed feeds the plan/count (a
+    // retain-cascade member — a `policy-cascade` stamp, or a schedule-cascade
+    // Retain — flips to a destructive external delete under `onNamespaceDelete:
+    // Delete` only when its namespace is CONFIRMED terminating, so it must then be
+    // counted AND become fireable, exactly like an unstamped external child). An
+    // unreadable namespace stays retain-form here (C1) — it must not flip a retain
+    // child into a destructive delete in a namespace that is NOT being deleted.
+    let terminating =
+        resolve_terminating_namespaces(ctx, &pending_candidate_namespaces(state, &key)).await;
+    // COUNTING set: maximally inclusive (over-count is fail-safe). Confirmed-only
+    // for the plan; an unstamped external member in an UNREADABLE namespace still
+    // lands here (its plan is `DeleteSnapshot` regardless of ns state) and counts
+    // toward the breaker — over-count stays safe.
+    let pending = pending_members(
+        state,
+        &key,
+        schedule_owner_lookup(ctx),
+        &terminating.confirmed,
+        repo.on_namespace_delete,
+    );
     // FIRE set: maximally EXCLUSIVE (under-fire is fail-safe). Drop members the
     // count deliberately over-includes — breaker-HELD externals (CRITICAL-1),
-    // ns-Orphan-destined peers (IMPORTANT-2), schedule-owned peers while the
-    // schedule store is unsynced (IMPORTANT-3a), and unpinned PEERS
-    // (IMPORTANT-4) — BEFORE the no-overlap exclusion. The ack is parsed exactly
-    // as the breaker does; its invalid-value warning is already published by
-    // `resolve_breaker` on the external-CR path, so it is not re-emitted here.
+    // ns-Orphan-destined peers (IMPORTANT-2) plus any UNREADABLE-namespace peer
+    // outright, schedule-owned peers while the schedule store is unsynced
+    // (IMPORTANT-3a), and unpinned PEERS (IMPORTANT-4) — BEFORE the no-overlap
+    // exclusion. The ns-Orphan exclusion sees `confirmed ∪ unreadable` (an Orphan
+    // peer in a terminating-or-unreadable namespace is withheld); the unreadable
+    // set additionally withholds ANY peer there, whatever the policy. The ack is
+    // parsed exactly as the breaker does; its invalid-value warning is already
+    // published by `resolve_breaker` on the external-CR path, so it is not
+    // re-emitted here.
     let now = chrono::Utc::now();
     let (ack, _invalid) = parse_mass_deletion_ack(repo.mass_deletion_ack.as_deref(), now);
     let threshold =
         kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
-    let terminating = terminating_member_namespaces(ctx, &pending).await;
     let self_uid = backup.uid().unwrap_or_default();
+    let orphan_exclusion = terminating.orphan_exclusion();
     let eligible = fire_eligible(
         pending,
         &FireEligibility {
@@ -2664,7 +2886,8 @@ async fn fire_batch(
             threshold,
             ack,
             on_namespace_delete: repo.on_namespace_delete,
-            terminating_namespaces: &terminating,
+            terminating_namespaces: &orphan_exclusion,
+            unreadable_namespaces: &terminating.unreadable,
             schedule_synced: ctx.schedule_synced.load(Ordering::Acquire),
         },
     );

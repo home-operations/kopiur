@@ -9,7 +9,7 @@
 //! to name/where to run it — all pure and clock-injected, so the whole
 //! decision surface is unit-tested without a cluster.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,9 +20,9 @@ use kopiur_mover::workspec::SnapshotAnchor;
 use kube::{Resource, ResourceExt};
 
 use super::plan::{
-    BreakerState, DeletionFacts, DeletionPlan, OwnerState, effective_deletion_policy,
-    effective_on_schedule_delete, pinned_repository, plan_deletion, pruned_by, resolve_origin,
-    schedule_owner_ref,
+    BreakerState, DeletionFacts, DeletionPlan, OwnerState, breaker_relevant,
+    effective_deletion_policy, effective_on_schedule_delete, pinned_repository, plan_deletion,
+    pruned_by, resolve_origin, schedule_owner_ref,
 };
 
 /// Stable per-repo key from the `status.resolved.repository` pin:
@@ -66,12 +66,16 @@ pub struct PendingMember {
     pub snapshot_id: String,
     /// Stale-id self-heal anchor (mirrors `SnapshotDeleteOp::anchor`).
     pub anchor: SnapshotAnchor,
-    /// No valid pruned-by annotation. An operator prune's own plan (with the
-    /// breaker allowed) is ALSO `DeleteSnapshot`, so it IS eligible for the
-    /// same batch Job as an external deletion (dispatch is identical either
-    /// way) — this flag exists so the breaker-count logic downstream
-    /// ([`super::plan::counts_toward_breaker`], stricter than this filter)
-    /// can tell the two apart without re-deriving pruned-by itself.
+    /// Breaker-RELEVANT ([`super::plan::breaker_relevant`]): this member is a
+    /// destructive external delete that counts toward / can be held by the
+    /// mass-deletion breaker, NOT an exempt operator prune. Unstamped and
+    /// `policy-cascade` (which only reaches the counting set as a destructive
+    /// delete under an `onNamespaceDelete: Delete` teardown) are external;
+    /// `retention`/`failed-history` prunes are not. All ride the same batch Job
+    /// (dispatch is identical); this flag lets the count/held-set/ack-value logic
+    /// tell them apart without re-deriving pruned-by, and shares its exhaustive
+    /// classification with [`super::plan::counts_toward_breaker`] so they never
+    /// disagree on which stamps are exempt.
     pub external: bool,
     /// The CR's `metadata.deletionTimestamp`, converted to `chrono`.
     pub deletion_timestamp: chrono::DateTime<chrono::Utc>,
@@ -133,6 +137,43 @@ fn repo_matches(backup: &Snapshot, key: &str) -> bool {
     }
 }
 
+/// Distinct namespaces of the pending delete CANDIDATES for `key` — every CR
+/// with a `deletionTimestamp`, our finalizer, a matching repo pin, and a recorded
+/// snapshot id, BEFORE the plan filter. The caller resolves terminating-namespace
+/// state over these and feeds it to [`pending_members`], so each member's plan is
+/// evaluated in its real `(ns_terminating, ns_policy)` form. This is a SUPERSET of
+/// the final member namespaces (a retain-cascade member whose plan flips to a
+/// destructive external delete under `onNamespaceDelete: Delete` is dropped by the
+/// `ns_terminating: false` plan check but its namespace is retained here), so no
+/// would-flip member's namespace is missed. A candidate must have a
+/// `deletionTimestamp` — so this is bounded by the CRs actually being deleted, not
+/// the whole store.
+pub fn pending_candidate_namespaces(snapshots: &[Arc<Snapshot>], key: &str) -> BTreeSet<String> {
+    snapshots
+        .iter()
+        .filter(|s| is_pending_candidate(s, key))
+        .filter_map(|s| s.namespace())
+        .collect()
+}
+
+/// The candidate gate shared by [`pending_candidate_namespaces`] and
+/// [`pending_member_for`]: pending (`deletionTimestamp`), our finalizer present,
+/// repo pin matches `key`, and a recorded kopia snapshot id. Everything but the
+/// plan classification (which is what the namespace-terminating state feeds).
+fn is_pending_candidate(backup: &Snapshot, key: &str) -> bool {
+    deletion_timestamp_utc(backup).is_some()
+        && backup
+            .finalizers()
+            .iter()
+            .any(|f| f == crate::consts::SNAPSHOT_CLEANUP_FINALIZER)
+        && repo_matches(backup, key)
+        && backup
+            .status
+            .as_ref()
+            .and_then(|s| s.snapshot.as_ref())
+            .is_some()
+}
+
 /// Filter a Store snapshot list to the pending destructive set for `key`:
 /// `deletionTimestamp` set + our finalizer still present + plan-would-be
 /// `DeleteSnapshot` (re-run [`plan_deletion`] with `breaker = Allowed`; this
@@ -142,14 +183,26 @@ fn repo_matches(backup: &Snapshot, key: &str) -> bool {
 /// `status.snapshot.kopiaSnapshotID` present + repo match (see
 /// [`repo_matches`]). `owner_lookup` supplies the owner state for each
 /// candidate (the caller's schedule Store lookup).
+///
+/// Each member's plan is evaluated in its REAL `(ns_terminating, ns_policy)`
+/// form: `terminating` is the set of member namespaces observed terminating
+/// (resolved by the caller over [`pending_candidate_namespaces`]), and `ns_policy`
+/// is the repository's `onNamespaceDelete`. This is what makes a retain-cascade
+/// member (a `policy-cascade` stamp, or a schedule-cascade Retain) that flips to a
+/// destructive external delete under an `onNamespaceDelete: Delete` namespace
+/// teardown COUNT toward the breaker and become fireable — exactly like an
+/// unstamped external child. A non-terminating member's plan ignores `ns_policy`,
+/// so it is classified identically to the old `ns_terminating: false` form.
 pub fn pending_members(
     snapshots: &[Arc<Snapshot>],
     key: &str,
     owner_lookup: impl Fn(&Snapshot) -> OwnerState,
+    terminating: &HashSet<String>,
+    ns_policy: NamespaceDeletePolicy,
 ) -> Vec<PendingMember> {
     snapshots
         .iter()
-        .filter_map(|s| pending_member_for(s, key, &owner_lookup))
+        .filter_map(|s| pending_member_for(s, key, &owner_lookup, terminating, ns_policy))
         .collect()
 }
 
@@ -157,6 +210,8 @@ fn pending_member_for(
     backup: &Snapshot,
     key: &str,
     owner_lookup: &impl Fn(&Snapshot) -> OwnerState,
+    terminating: &HashSet<String>,
+    ns_policy: NamespaceDeletePolicy,
 ) -> Option<PendingMember> {
     let deletion_timestamp = deletion_timestamp_utc(backup)?;
     if !backup
@@ -176,14 +231,15 @@ fn pending_member_for(
         .as_ref()?
         .kopia_snapshot_id
         .clone();
+    let namespace = backup.namespace()?;
 
     let facts = DeletionFacts {
         policy: effective_deletion_policy(backup.spec.deletion_policy, resolve_origin(backup)),
         annotations: backup.annotations(),
         owner: owner_lookup(backup),
         cascade: effective_on_schedule_delete(backup.spec.on_schedule_delete),
-        ns_terminating: false,
-        ns_policy: None,
+        ns_terminating: terminating.contains(&namespace),
+        ns_policy: Some(ns_policy),
         breaker: BreakerState::Allowed,
     };
     if !matches!(plan_deletion(facts), DeletionPlan::DeleteSnapshot) {
@@ -191,12 +247,12 @@ fn pending_member_for(
     }
 
     Some(PendingMember {
-        namespace: backup.namespace()?,
+        namespace,
         name: backup.name_any(),
         uid: backup.uid()?,
         snapshot_id,
         anchor: anchor_for(backup),
-        external: pruned_by(backup.annotations()).is_none(),
+        external: breaker_relevant(pruned_by(backup.annotations())),
         deletion_timestamp,
         pinned: pinned_repository(backup).is_some(),
         schedule_owned: schedule_owner_ref(backup).is_some(),
@@ -273,10 +329,23 @@ pub struct FireEligibility<'a> {
     /// The repository's namespace-deletion cascade policy — a terminating-
     /// namespace peer is fireable ONLY under `Delete`.
     pub on_namespace_delete: NamespaceDeletePolicy,
-    /// The member namespaces observed TERMINATING at fire time (resolved once
-    /// per distinct namespace by the caller). A namespace whose terminating-ness
-    /// could not be read is treated as terminating here — fail-safe UNDER-fire.
+    /// The member namespaces excluded from an `Orphan` peer's fire: `confirmed`
+    /// terminating ∪ `unreadable` (resolved once per distinct namespace by the
+    /// caller). An `onNamespaceDelete: Orphan` peer whose namespace is terminating
+    /// OR unreadable plans `OrphanSnapshot` on its OWN reconcile and must never be
+    /// deleted by a peer's fire, so both go here ([`fire_namespace_ok`]).
     pub terminating_namespaces: &'a HashSet<String>,
+    /// The member namespaces whose terminating-ness could NOT be read at fire time
+    /// (a `namespace_is_terminating` GET erred). A peer in such a namespace is
+    /// EXCLUDED from the FIRE set OUTRIGHT ([`fire_namespace_readable_ok`]),
+    /// regardless of `on_namespace_delete`: we cannot confirm the namespace is
+    /// terminating, so we must not delete a peer on the assumption that it is (its
+    /// own self-fire, whose LIVE namespace read resolves to NOT-terminating via
+    /// `unwrap_or(false)`, drains it correctly). Such a member is still COUNTED
+    /// toward the breaker (over-count is fail-safe). This set is a subset of
+    /// `terminating_namespaces`, so an `Orphan` peer is withheld by that exclusion
+    /// as well — belt-and-braces.
+    pub unreadable_namespaces: &'a HashSet<String>,
     /// Whether the `SnapshotSchedule` reflector store is synced. While `false`,
     /// a schedule-owned EXTERNAL peer is excluded (its owner state would default
     /// to `Alive`, disabling the cascade guard).
@@ -294,7 +363,10 @@ pub struct FireEligibility<'a> {
 ///   held wave's kopia data without an ack.
 /// - IMPORTANT-2: a peer whose namespace is terminating is excluded unless the
 ///   repository's `onNamespaceDelete` is `Delete` (an `Orphan`-destined member
-///   plans `OrphanSnapshot` on its own reconcile — never delete it here).
+///   plans `OrphanSnapshot` on its own reconcile — never delete it here). A peer
+///   whose namespace was UNREADABLE at fire time is excluded outright, whatever
+///   the policy — an unconfirmed terminating state must never authorize a peer's
+///   destructive delete ([`fire_namespace_readable_ok`]).
 /// - IMPORTANT-3a: while the schedule store is unsynced, a schedule-owned
 ///   EXTERNAL peer is excluded (cascade-retain-destined children would look
 ///   fireable when the owner lookup defaults to `Alive`).
@@ -315,6 +387,7 @@ pub fn fire_eligible(pending: Vec<PendingMember>, cx: &FireEligibility<'_>) -> V
             m.uid == cx.self_uid
                 || (fire_pin_ok(m)
                     && fire_schedule_ok(m, cx.schedule_synced)
+                    && fire_namespace_readable_ok(m, cx.unreadable_namespaces)
                     && fire_namespace_ok(m, cx.terminating_namespaces, cx.on_namespace_delete)
                     && fire_breaker_ok(m, breaker_tripping, cx.ack))
         })
@@ -333,6 +406,16 @@ fn fire_pin_ok(m: &PendingMember) -> bool {
 /// even during the store's startup window.
 fn fire_schedule_ok(m: &PendingMember, schedule_synced: bool) -> bool {
     schedule_synced || !m.external || !m.schedule_owned
+}
+
+/// IMPORTANT-2 (readable half): a peer whose namespace could NOT be read as
+/// terminating at fire time is NEVER fireable by a peer — we cannot confirm the
+/// namespace is being torn down, so a destructive delete must not ride an
+/// unconfirmed assumption (its own self-fire, whose LIVE read fails to
+/// NOT-terminating, drains it). Independent of `onNamespaceDelete`: an unreadable
+/// namespace is withheld under `Delete` too (unlike a CONFIRMED-terminating one).
+fn fire_namespace_readable_ok(m: &PendingMember, unreadable: &HashSet<String>) -> bool {
+    !unreadable.contains(&m.namespace)
 }
 
 /// IMPORTANT-2: a terminating-namespace peer is fireable only under
@@ -861,7 +944,13 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        let members = pending_members(&[s], KEY, alive);
+        let members = pending_members(
+            &[s],
+            KEY,
+            alive,
+            &HashSet::new(),
+            NamespaceDeletePolicy::Delete,
+        );
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].name, "a");
         assert_eq!(members[0].snapshot_id, "k-a");
@@ -894,7 +983,13 @@ mod tests {
             controller: Some(true),
             ..Default::default()
         }]);
-        let members = pending_members(&[Arc::new(backup)], KEY, alive);
+        let members = pending_members(
+            &[Arc::new(backup)],
+            KEY,
+            alive,
+            &HashSet::new(),
+            NamespaceDeletePolicy::Delete,
+        );
         assert_eq!(members.len(), 1);
         assert!(
             members[0].schedule_owned,
@@ -914,7 +1009,16 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -929,7 +1033,16 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -944,7 +1057,16 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -959,7 +1081,16 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -981,7 +1112,13 @@ mod tests {
             true,
             Some(repo_ref()),
         ));
-        let members = pending_members(&[s], KEY, alive);
+        let members = pending_members(
+            &[s],
+            KEY,
+            alive,
+            &HashSet::new(),
+            NamespaceDeletePolicy::Delete,
+        );
         assert_eq!(members.len(), 1);
         assert!(!members[0].external);
     }
@@ -998,7 +1135,16 @@ mod tests {
             false,
             Some(repo_ref()),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1014,7 +1160,16 @@ mod tests {
             true,
             Some(other),
         ));
-        assert!(pending_members(&[s], KEY, alive).is_empty());
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1030,16 +1185,200 @@ mod tests {
             true,
             None,
         ));
-        let matched = pending_members(&[Arc::clone(&s)], KEY, alive);
+        let matched = pending_members(
+            &[Arc::clone(&s)],
+            KEY,
+            alive,
+            &HashSet::new(),
+            NamespaceDeletePolicy::Delete,
+        );
         assert_eq!(matched.len(), 1);
         assert!(
             !matched[0].pinned,
             "an unpinned CR is `pinned: false` — the FIRE set excludes it as a peer"
         );
         assert_eq!(
-            pending_members(&[s], "clusterrepository:other", alive).len(),
+            pending_members(
+                &[s],
+                "clusterrepository:other",
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .len(),
             1
         );
+    }
+
+    /// Overwrite a fixture's `pruned-by` stamp with `policy-cascade` (the
+    /// `member_fixture` `pruned` flag only stamps `retention`).
+    fn stamp_policy_cascade(backup: &mut Snapshot) {
+        use kopiur_api::consts::PRUNED_BY_ANNOTATION;
+        use kopiur_api::snapshot::PrunedBy;
+        backup
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                PRUNED_BY_ANNOTATION.to_string(),
+                PrunedBy::PolicyCascade.annotation_value().to_string(),
+            );
+    }
+
+    fn terminating_media() -> HashSet<String> {
+        HashSet::from(["media".to_string()])
+    }
+
+    #[test]
+    fn pending_members_includes_policy_cascade_child_under_ns_teardown_delete() {
+        // The PR #272 gap: a `policy-cascade`-stamped child in a TERMINATING
+        // namespace under `onNamespaceDelete: Delete` is an external destructive
+        // delete (plan_ns_delete → plan_external), so the counting set MUST include
+        // it — both so the breaker counts it AND so `fire_batch`'s self-uid bypass
+        // can fire it. On HEAD (`ns_terminating: false` hardcoded) its plan was
+        // RetainSnapshotOnPolicyDelete → EXCLUDED → never counted, never deleted.
+        let mut backup = member_fixture(
+            "pc",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        stamp_policy_cascade(&mut backup);
+        let s = Arc::new(backup);
+
+        let members = pending_members(
+            &[Arc::clone(&s)],
+            KEY,
+            alive,
+            &terminating_media(),
+            NamespaceDeletePolicy::Delete,
+        );
+        assert_eq!(members.len(), 1, "counted under ns-teardown Delete");
+        assert!(
+            members[0].external,
+            "a policy-cascade teardown delete is breaker-RELEVANT (external), so \
+             unacked_breaker_count/fire_breaker_ok can hold it like any external child"
+        );
+
+        // Live namespace → quiet retain → excluded (steady-state behavior kept).
+        assert!(
+            pending_members(
+                &[Arc::clone(&s)],
+                KEY,
+                alive,
+                &HashSet::new(),
+                NamespaceDeletePolicy::Delete
+            )
+            .is_empty(),
+            "a policy-cascade child in a live namespace stays quiet-retained, not counted"
+        );
+
+        // Terminating but ns policy Orphan → OrphanSnapshot → excluded.
+        assert!(
+            pending_members(
+                &[s],
+                KEY,
+                alive,
+                &terminating_media(),
+                NamespaceDeletePolicy::Orphan
+            )
+            .is_empty(),
+            "under Orphan the terminating child is orphaned, never a destructive delete"
+        );
+    }
+
+    #[test]
+    fn pending_members_unreadable_namespace_keeps_retain_cascade_child_quiet() {
+        // C1 (plan half): a namespace whose terminating-ness could NOT be read is
+        // resolved into the `unreadable` set — NOT `confirmed` — and `pending_members`
+        // is fed ONLY the confirmed set. So a `policy-cascade` retain child in an
+        // unreadable namespace is evaluated in NON-terminating form and stays quiet-
+        // retained (never a counted/fireable destructive delete), exactly as the
+        // finalizer's self-CR path resolves the same unreadable read
+        // (`unwrap_or(false)`). On HEAD (Err→terminating merged into ONE set) it would
+        // have been counted AND become fireable under `onNamespaceDelete: Delete`.
+        let mut backup = member_fixture(
+            "pc",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        stamp_policy_cascade(&mut backup);
+        let s = Arc::new(backup);
+        // The child's namespace ("media") is UNREADABLE → absent from the confirmed
+        // set fed to pending_members.
+        let confirmed = HashSet::new();
+        assert!(
+            pending_members(&[s], KEY, alive, &confirmed, NamespaceDeletePolicy::Delete).is_empty(),
+            "a policy-cascade child in an unreadable namespace stays retain (not counted, not fireable)"
+        );
+    }
+
+    #[test]
+    fn pending_members_retention_prune_stays_non_external_under_ns_teardown_delete() {
+        // A genuine operator prune keeps `external: false` even in a terminating
+        // namespace under Delete — it rides the batch Job but must never trip the
+        // breaker (retention keeps working during an incident).
+        let s = Arc::new(member_fixture(
+            "ret",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            true, // pruned → retention stamp
+            true,
+            Some(repo_ref()),
+        ));
+        let members = pending_members(
+            &[s],
+            KEY,
+            alive,
+            &terminating_media(),
+            NamespaceDeletePolicy::Delete,
+        );
+        assert_eq!(members.len(), 1);
+        assert!(!members[0].external, "retention prune is breaker-exempt");
+    }
+
+    #[test]
+    fn pending_candidate_namespaces_covers_would_flip_retain_cascade_members() {
+        // The candidate set must include the namespace of a `policy-cascade` child
+        // whose live-form plan is a RETAIN (dropped by the plan filter) — otherwise
+        // its namespace's terminating-ness is never resolved and it can never flip
+        // to a counted/fireable delete. A candidate needs only a deletionTimestamp +
+        // finalizer + repo match + snapshot id, NOT a destructive plan.
+        let mut cascade = member_fixture(
+            "pc",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        stamp_policy_cascade(&mut cascade);
+        // A non-deleting CR is NOT a candidate (bounds the namespace reads).
+        let live = member_fixture(
+            "live",
+            false,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        let nss = pending_candidate_namespaces(&[Arc::new(cascade), Arc::new(live)], KEY);
+        assert_eq!(nss, BTreeSet::from(["media".to_string()]));
     }
 
     // --- fireable_members --------------------------------------------------
@@ -1096,9 +1435,17 @@ mod tests {
         }
     }
 
+    /// A shared empty `HashSet<String>` with `'static` lifetime, for the
+    /// `unreadable_namespaces` default in [`fire_cx`] (a fn can't return a borrow
+    /// of a set it creates locally).
+    fn empty_ns_set() -> &'static HashSet<String> {
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
     /// A `FireEligibility` with benign defaults: no breaker (threshold 0), no
-    /// ack, `Delete` ns policy, nothing terminating, schedule synced. Each test
-    /// perturbs exactly the axis it exercises.
+    /// ack, `Delete` ns policy, nothing terminating, nothing unreadable, schedule
+    /// synced. Each test perturbs exactly the axis it exercises.
     fn fire_cx<'a>(self_uid: &'a str, terminating: &'a HashSet<String>) -> FireEligibility<'a> {
         FireEligibility {
             self_uid,
@@ -1106,6 +1453,7 @@ mod tests {
             ack: None,
             on_namespace_delete: NamespaceDeletePolicy::Delete,
             terminating_namespaces: terminating,
+            unreadable_namespaces: empty_ns_set(),
             schedule_synced: true,
         }
     }
@@ -1238,6 +1586,72 @@ mod tests {
             ..fire_cx("self", &terminating)
         };
         assert_eq!(fire_eligible(pending(), &delete).len(), 3);
+    }
+
+    #[test]
+    fn fire_eligible_excludes_unreadable_namespace_peer_even_under_delete() {
+        // C1: a peer whose namespace could NOT be read (an `Err` from
+        // `namespace_is_terminating`) is EXCLUDED from the fire set even under
+        // `onNamespaceDelete: Delete` — an unconfirmed terminating state must never
+        // authorize a peer's destructive delete. HEAD merged `Err` into the single
+        // `terminating` set, so under `Delete` such a peer WOULD have fired and
+        // deleted retain-promised kopia data in a namespace that is NOT terminating.
+        // The triggering self bypasses the exclusion (its finalizer path resolved
+        // authoritatively); a CONFIRMED-terminating peer under Delete still fires.
+        let unreadable: HashSet<String> = HashSet::from(["unreadable".to_string()]);
+        // The caller feeds `confirmed ∪ unreadable` as `terminating_namespaces`
+        // (here a separate CONFIRMED-terminating namespace "dying" joins the union).
+        let all: HashSet<String> = ["unreadable".to_string(), "dying".to_string()]
+            .into_iter()
+            .collect();
+        let cx = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Delete,
+            unreadable_namespaces: &unreadable,
+            ..fire_cx("self", &all)
+        };
+        let pending = vec![
+            fmember("self", "unreadable", 100, true, true, false), // trigger in unreadable ns
+            fmember("unreadable-peer", "unreadable", 100, true, true, false),
+            fmember("confirmed-peer", "dying", 100, true, true, false), // confirmed-terminating
+            fmember("live-peer", "live", 100, true, true, false),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["confirmed-peer", "live-peer", "self"],
+            "the unreadable-namespace PEER is withheld; self bypass + confirmed-terminating \
+             (Delete) + live peers fire"
+        );
+    }
+
+    #[test]
+    fn fire_eligible_excludes_unreadable_namespace_orphan_peer() {
+        // C1 (pre-existing protection preserved): an `Orphan` peer whose namespace
+        // is unreadable is still excluded from fire. Both the readable check AND the
+        // ns-Orphan exclusion (unreadable ∈ the `confirmed ∪ unreadable` union)
+        // withhold it — belt-and-braces.
+        let unreadable: HashSet<String> = HashSet::from(["unreadable".to_string()]);
+        let all: HashSet<String> = unreadable.clone();
+        let cx = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Orphan,
+            unreadable_namespaces: &unreadable,
+            ..fire_cx("self", &all)
+        };
+        let pending = vec![
+            fmember("self", "live", 100, true, true, false),
+            fmember(
+                "unreadable-orphan-peer",
+                "unreadable",
+                100,
+                true,
+                true,
+                false,
+            ),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["self"],
+            "an Orphan peer in an unreadable namespace stays withheld"
+        );
     }
 
     #[test]

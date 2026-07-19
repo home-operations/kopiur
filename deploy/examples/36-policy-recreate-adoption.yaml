@@ -1,0 +1,115 @@
+# Example 36 — Recreating a deleted SnapshotPolicy: catalog.adoption + the
+# automatic delete -> recreate -> adopt -> retention-resumes flow
+#
+# Pairs with example 35 (SnapshotPolicy.spec.deletion.onPolicyDelete: Retain,
+# the default): after that cascade removes a policy's Snapshot CRs but keeps
+# every kopia snapshot in the repository, re-applying THIS SAME manifest is
+# how the history comes back and retention resumes pruning it. Step by step:
+#
+# 1. `kubectl delete snapshotschedule postgres-data-nightly` then
+#    `kubectl delete snapshotpolicy postgres-data` (or a GitOps prune removing
+#    both at once — see docs/backups.md "Retain-wins-ties"). The policy's
+#    Snapshot CRs are cleaned up; every kopia snapshot survives, un-cataloged.
+# 2. `kubectl apply -f` this file again (a genuinely fresh SnapshotPolicy has
+#    no Snapshot CRs carrying its config label — no history yet). Its first
+#    reconcile finds zero adoption candidates for its resolved identity
+#    (nothing has been rediscovered yet) and, because it has no history and
+#    hasn't already asked for this identity, requests an on-demand catalog
+#    scan on the repository (an AdoptionScanRequested Normal Event fires on
+#    the SnapshotPolicy) instead of waiting for a spec change or the
+#    (off-by-default) periodicRefresh timer.
+# 3. The repository reconciler honors that request and re-scans, which
+#    re-materializes the kept kopia snapshots as `origin: discovered` rows
+#    (status.catalog.scanRequestHonored advances to match the request).
+# 4. The SnapshotPolicy's next reconcile sees those discovered rows, matches
+#    them by EXACT identity (username + hostname + sourcePath — never a
+#    fuzzy/partial match), and adopts them: a SnapshotsAdopted Normal Event
+#    fires, each becomes an `origin: adopted` Snapshot CR carrying this
+#    policy's config label, and the matching `origin: discovered` rows are
+#    removed (recreate-then-delete, never a re-label, so a crash mid-wave
+#    just re-runs next pass).
+# 5. Adopted rows are now GFS-governed exactly like produced ones — the SAME
+#    spec.retention below prunes them once they age out of the window. This
+#    is by design, not a bug: see docs/backups.md "Retention" and
+#    "troubleshooting.md" if backups you didn't expect to lose disappear
+#    right after a recreate.
+#
+# On a repository SHARED by many namespaces/policies, this scan-request is
+# bounded: many policies recreated at once each stamp the SAME repository
+# annotation, but the repository only ever needs to run ONE scan to satisfy
+# all of them (a fresh scan re-materializes everything at once) — it is not
+# one scan per policy.
+#
+# Field shapes verified against crates/api (externally-tagged backend:
+# `backend.s3`, not `backend: { kind: S3 }`).
+#
+# See docs/repositories.md ("The catalog — discovered snapshots"),
+# docs/backups.md ("What happens when the policy is deleted"), and
+# docs/scenarios/adopt-existing-repo.md ("Delete a policy, then recreate it").
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  catalog:
+    # Whether a discovered snapshot whose identity matches a live
+    # SnapshotPolicy is automatically re-attached to it. Adopt is the
+    # effective default even with this whole `catalog` block omitted; shown
+    # explicitly here since it's the field this example is about. A
+    # per-policy `spec.adoption` (see the SnapshotPolicy below) overrides
+    # this per-repository setting.
+    adoption: Adopt # Adopt (default) | Ignore
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  # GFS retention — applies identically to produced AND adopted Snapshots.
+  # Recreating this policy and letting adoption run is only useful if this
+  # window is wide enough to actually keep the history you're recovering.
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  # Per-policy override of automatic adoption for discovered snapshots whose
+  # resolved identity matches THIS recipe. Absent (the normal case) inherits
+  # the repository's `catalog.adoption` above. Set explicitly here only if
+  # this one recipe should behave differently from its repository's default
+  # — e.g. a policy you deliberately want to start a fresh lineage under
+  # rather than re-absorb a foreign/prior history:
+  # adoption: Ignore

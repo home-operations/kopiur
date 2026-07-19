@@ -1048,6 +1048,8 @@ mod tests {
                 hooks: None,
                 mover: None,
                 credential_projection: None,
+                deletion: None,
+                adoption: None,
             },
         )
     }
@@ -1077,6 +1079,7 @@ mod tests {
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
             mass_deletion_ack: None,
+            catalog: None,
         }
     }
 

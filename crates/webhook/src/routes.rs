@@ -296,6 +296,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_backup_create_stamps_config_label_alongside_other_defaults() {
+        // A raw-`kubectl apply`'d manual Snapshot with `policyRef` (no ORIGIN_LABEL,
+        // no pre-existing config label) must get CONFIG_LABEL stamped on CREATE,
+        // alongside the existing finalizer/deletionPolicy defaults.
+        let body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        let has_label = patch.iter().any(|op| {
+            op["op"] == "add"
+                && op["path"] == "/metadata/labels"
+                && op["value"]["kopiur.home-operations.com/config"] == "nightly"
+        });
+        let has_dp = patch.iter().any(|op| {
+            op["op"] == "add" && op["path"] == "/spec/deletionPolicy" && op["value"] == "Delete"
+        });
+        let has_fin = patch.iter().any(|op| {
+            op["op"] == "add"
+                && op["path"] == "/metadata/finalizers"
+                && op["value"][0] == "kopiur.home-operations.com/snapshot-cleanup"
+        });
+        assert!(has_label, "expected config label stamp: {patch:?}");
+        assert!(has_dp, "expected Delete default: {patch:?}");
+        assert!(has_fin, "expected finalizer add: {patch:?}");
+    }
+
+    #[tokio::test]
+    async fn manual_backup_update_does_not_stamp_config_label() {
+        // CONFIG_LABEL stamping is CREATE-only by design (no controller-side
+        // backfill of pre-existing CRs — see `handlers::config_label_stamp`).
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        // The origin-aware deletionPolicy default applies regardless of operation,
+        // so the patch is non-empty — proving this isn't a vacuous check.
+        assert!(
+            patch.iter().any(|op| op["path"] == "/spec/deletionPolicy"),
+            "expected a non-empty patch to make this a meaningful assertion: {patch:?}"
+        );
+        let touches_labels = patch.iter().any(|op| {
+            op["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("/metadata/labels"))
+        });
+        assert!(
+            !touches_labels,
+            "UPDATE must not stamp the config label: {patch:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_backup_is_not_refinalized() {
         // Regression: the mutating webhook re-added the snapshot-cleanup finalizer
         // on EVERY admission, including the UPDATE the controller issues to REMOVE
@@ -362,6 +425,92 @@ mod tests {
         assert!(
             has_retain,
             "expected Retain default for discovered: {patch:?}"
+        );
+    }
+
+    // --- backup_origin: status-first resolution (M4) ---------------------------
+    //
+    // `backup_origin` flipped from label-first to status-first to match the
+    // controller's `resolve_origin` (crates/controller/src/snapshot/plan.rs).
+    // These pin the status arm winning at UPDATE, the label surviving as the
+    // CREATE-time fallback, and — the actual hardening — a label flip NOT
+    // overriding an existing `status.origin` (the "origin-flip attack").
+
+    #[tokio::test]
+    async fn adopted_status_update_with_delete_is_admitted() {
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "adopted" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(
+            v["response"]["allowed"], true,
+            "adopted rows may carry any deletionPolicy: {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_status_update_with_delete_is_denied() {
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "discovered" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], false);
+        let msg = v["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("Retain"), "msg was: {msg}");
+    }
+
+    #[tokio::test]
+    async fn label_flip_to_adopted_does_not_override_discovered_status() {
+        // The origin-flip attack this hardening closes: a user cannot unlock
+        // `deletionPolicy: Delete` on a catalog-discovered row by editing the
+        // metadata LABEL — only the controller-owned `status.origin` (which still
+        // says `discovered`) governs. Label-first would have admitted this.
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "deletionPolicy": "Delete" }),
+        );
+        body["request"]["operation"] = json!("UPDATE");
+        body["request"]["object"]["status"] = json!({ "origin": "discovered" });
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "adopted" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(
+            v["response"]["allowed"], false,
+            "status-first must win over a flipped label: {v:?}"
+        );
+        let msg = v["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("Retain"), "msg was: {msg}");
+    }
+
+    #[tokio::test]
+    async fn create_with_only_the_discovered_label_still_resolves_discovered() {
+        // No `status` at all on CREATE (a brand-new object never has one yet) — the
+        // label fallback must still resolve `discovered` and default `Retain`,
+        // byte-identical to pre-M4 behavior.
+        let mut body = review_body("Snapshot", "billing", "u", json!({}));
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "discovered" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true);
+        let patch = decode_patch(&v);
+        let has_retain = patch
+            .iter()
+            .any(|op| op["path"] == "/spec/deletionPolicy" && op["value"] == "Retain");
+        assert!(
+            has_retain,
+            "expected Retain default via the label fallback: {patch:?}"
         );
     }
 

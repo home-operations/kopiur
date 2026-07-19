@@ -124,6 +124,20 @@ pub enum ForeignSnapshots {
     Fallback,
 }
 
+/// Whether a discovered snapshot whose resolved identity matches a live
+/// `SnapshotPolicy` is automatically adopted — re-attached (stamped with that
+/// policy's config label, `status.origin` flipped to `Adopted`) so GFS
+/// retention governs it and eventually prunes it, instead of it sitting in the
+/// catalog forever as an immortal `discovered` row.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum SnapshotAdoption {
+    /// Automatically adopt an identity-matching discovered snapshot (the default).
+    #[default]
+    Adopt,
+    /// Leave identity-matching discovered snapshots alone; they stay `discovered`.
+    Ignore,
+}
+
 /// Bounds on materialization of `origin: discovered` `Snapshot` CRs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +168,14 @@ pub struct CatalogBounds {
     /// configured fallback collector off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreign_snapshots: Option<ForeignSnapshots>,
+    /// Whether a discovered snapshot matching a live `SnapshotPolicy`'s resolved
+    /// identity is automatically adopted. Per-policy `SnapshotPolicySpec.adoption`
+    /// overrides this when set; absent here resolves to
+    /// [`SnapshotAdoption::Adopt`] (see [`effective_adoption`]). NOT context-free
+    /// (it is the middle link of a policy → repo → constant inheritance chain),
+    /// so this field carries no schema default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<SnapshotAdoption>,
 }
 
 impl CatalogBounds {
@@ -185,6 +207,20 @@ impl CatalogBounds {
             .and_then(|c| c.foreign_snapshots)
             .unwrap_or_default()
     }
+}
+
+/// The effective adoption policy for a `SnapshotPolicy`: its own
+/// `spec.adoption` wins; else the target repository's `catalog.adoption`; else
+/// [`SnapshotAdoption::Adopt`]. Neither link is context-free (the repository
+/// link resolves per-repo, the policy link per-policy), so neither field
+/// carries a schema default — every read goes through this resolver.
+pub fn effective_adoption(
+    policy: Option<SnapshotAdoption>,
+    repo_catalog: Option<&CatalogBounds>,
+) -> SnapshotAdoption {
+    policy
+        .or_else(|| repo_catalog.and_then(|c| c.adoption))
+        .unwrap_or_default()
 }
 
 /// schemars default for [`CatalogBounds::refresh_interval`] — the string form of
@@ -254,6 +290,69 @@ mod tests {
         );
         // Unknown variant rejected.
         assert!(serde_json::from_value::<ForeignSnapshots>(serde_json::json!("Delete")).is_err());
+    }
+
+    #[test]
+    fn snapshot_adoption_serializes_to_bare_pascal_case_strings() {
+        // Same wire encoding as ForeignSnapshots/NamespaceDeletePolicy — bare
+        // PascalCase unit-variant strings.
+        assert_eq!(
+            serde_json::to_value(SnapshotAdoption::Adopt).unwrap(),
+            "Adopt"
+        );
+        assert_eq!(
+            serde_json::to_value(SnapshotAdoption::Ignore).unwrap(),
+            "Ignore"
+        );
+        assert_eq!(SnapshotAdoption::default(), SnapshotAdoption::Adopt);
+        assert_eq!(
+            serde_json::from_value::<SnapshotAdoption>(serde_json::json!("Adopt")).unwrap(),
+            SnapshotAdoption::Adopt
+        );
+        assert_eq!(
+            serde_json::from_value::<SnapshotAdoption>(serde_json::json!("Ignore")).unwrap(),
+            SnapshotAdoption::Ignore
+        );
+        // Unknown variant rejected.
+        assert!(serde_json::from_value::<SnapshotAdoption>(serde_json::json!("Fallback")).is_err());
+    }
+
+    #[test]
+    fn effective_adoption_precedence_matrix() {
+        let repo_adopt = CatalogBounds {
+            adoption: Some(SnapshotAdoption::Adopt),
+            ..Default::default()
+        };
+        let repo_ignore = CatalogBounds {
+            adoption: Some(SnapshotAdoption::Ignore),
+            ..Default::default()
+        };
+        let repo_unset = CatalogBounds::default();
+
+        // Policy wins over repo, either direction.
+        assert_eq!(
+            effective_adoption(Some(SnapshotAdoption::Ignore), Some(&repo_adopt)),
+            SnapshotAdoption::Ignore
+        );
+        assert_eq!(
+            effective_adoption(Some(SnapshotAdoption::Adopt), Some(&repo_ignore)),
+            SnapshotAdoption::Adopt
+        );
+        // Policy absent ⇒ repo value.
+        assert_eq!(
+            effective_adoption(None, Some(&repo_ignore)),
+            SnapshotAdoption::Ignore
+        );
+        assert_eq!(
+            effective_adoption(None, Some(&repo_adopt)),
+            SnapshotAdoption::Adopt
+        );
+        // Both absent (or repo catalog present but field unset) ⇒ Adopt.
+        assert_eq!(effective_adoption(None, None), SnapshotAdoption::Adopt);
+        assert_eq!(
+            effective_adoption(None, Some(&repo_unset)),
+            SnapshotAdoption::Adopt
+        );
     }
 
     #[test]

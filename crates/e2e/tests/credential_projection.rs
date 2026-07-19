@@ -534,14 +534,20 @@ async fn projected_copies_do_not_accumulate_across_runs() {
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
 }
 
-/// **The stuck-finalizer guard (#255).** Delete the `SnapshotPolicy` BEFORE the
-/// `Snapshot` it produced, and a `deletionPolicy: Delete` Snapshot must still finish
-/// deleting.
+/// **The stuck-finalizer guard (#255), now via the policy-cascade Delete mode.** Delete
+/// the `SnapshotPolicy` and let its `onPolicyDelete: Delete` cascade remove the child,
+/// and a `deletionPolicy: Delete` Snapshot must still finish deleting its kopia snapshot
+/// with the recipe already gone.
 ///
-/// This is the ordering every other scenario in this file avoids: they delete the
-/// Snapshot first, then the policy, which keeps the recipe alive for exactly as long as
-/// the delete path needs it. Nothing forces a user to be so considerate. Once the run
-/// succeeds its projected copy is reaped, so the delete Job must re-project — and the
+/// On this branch a config-labeled child is owned by the policy-deletion cascade, so the
+/// old flow (delete the policy, then explicitly delete the Snapshot) no longer applies:
+/// under the default `onPolicyDelete: Retain` the cascade would quiet-RELEASE the child
+/// without a kopia delete (a different guarantee). Setting `onPolicyDelete: Delete` makes
+/// the cascade issue an UNSTAMPED external delete for the child — the same external
+/// deletion a bare `kubectl delete snapshot` would, but triggered BY the policy's own
+/// removal — so this one scenario exercises BOTH #255 and the cascade Delete path
+/// end-to-end. Nothing forces a user to delete the Snapshot before the policy. Once the
+/// run succeeds its projected copy is reaped, so the delete Job must re-project — and the
 /// opt-in that authorizes that lives ONLY on the recipe. Reading an absent recipe as
 /// "projection off" sent the delete Job hunting for the ClusterRepository's canonical
 /// Secret name in the workload namespace, which projection exists precisely because
@@ -581,13 +587,16 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
         .await
         .expect("ClusterRepository should bootstrap to Ready");
 
+    // onPolicyDelete: Delete — deleting the policy issues an UNSTAMPED external delete
+    // for the config-labeled child (not the default quiet-retain cascade), so the child's
+    // finalizer runs the real kopia delete with the recipe gone: the #255 property, now
+    // reached through the cascade's Delete mode.
+    let mut cfg_spec = backup_config_json(PROJECTION_NS, cfg, crepo, true);
+    cfg_spec["spec"]["deletion"] = serde_json::json!({ "onPolicyDelete": "Delete" });
     configs
-        .create(
-            &PostParams::default(),
-            &cr(backup_config_json(PROJECTION_NS, cfg, crepo, true)),
-        )
+        .create(&PostParams::default(), &cr(cfg_spec))
         .await
-        .expect("create projection-on SnapshotPolicy");
+        .expect("create projection-on SnapshotPolicy with onPolicyDelete: Delete");
     // deletionPolicy: Delete is what arms the cleanup finalizer — the whole point.
     let mut backup_spec = backup_json(PROJECTION_NS, backup, cfg);
     backup_spec["spec"]["deletionPolicy"] = serde_json::json!("Delete");
@@ -630,11 +639,12 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
     .await
     .expect("the projected copy must be reaped once the run is terminal");
 
-    // The reporter's ordering: recipe first...
+    // Delete ONLY the recipe. Its `onPolicyDelete: Delete` cascade issues an unstamped
+    // external delete for the config-labeled child — the test never touches the Snapshot.
     configs
         .delete(cfg, &DeleteParams::default())
         .await
-        .expect("delete the SnapshotPolicy BEFORE the Snapshot");
+        .expect("delete the SnapshotPolicy (its Delete cascade removes the child)");
     wait_until(
         &format!("SnapshotPolicy {cfg} gone"),
         default_timeout(),
@@ -642,16 +652,16 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
         || async { Ok(configs.get_opt(cfg).await?.is_none().then_some(())) },
     )
     .await
-    .expect("the SnapshotPolicy should delete cleanly");
+    .expect("the SnapshotPolicy should delete cleanly once its cascade drains");
 
-    // ...then the Snapshot, which must re-project creds against the pinned opt-in,
-    // run its delete Job, and release the finalizer.
-    backups
-        .delete(backup, &DeleteParams::default())
-        .await
-        .expect("delete Snapshot");
+    // The child is removed by the cascade, with the recipe already gone: it must
+    // re-project creds against the PINNED opt-in, run its delete Job, and release the
+    // finalizer. A released `snapshot-cleanup` finalizer (CR gone) is the kopia-side
+    // proof — a `deletionPolicy: Delete` external deletion under the breaker threshold
+    // resolves to DeleteSnapshot, so the finalizer only clears once the real kopia
+    // snapshot delete succeeded (an orphan/retain would never contact the repo).
     wait_until(
-        &format!("{backup} removed after the cleanup finalizer ran"),
+        &format!("{backup} removed by the onPolicyDelete cascade"),
         default_timeout(),
         poll_interval(),
         || async { Ok(backups.get_opt(backup).await?.is_none().then_some(())) },
@@ -661,7 +671,9 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
         "the Snapshot must finish deleting with its SnapshotPolicy already gone — before \
          #255 it hung on kopiur.home-operations.com/snapshot-cleanup forever, because the \
          delete path read the absent recipe as 'projection off' and then demanded a \
-         namespace-local Secret that projection was the only thing supplying",
+         namespace-local Secret that projection was the only thing supplying. Here the \
+         cascade's Delete mode is what issues the external delete, so this also covers the \
+         policy-cascade Delete path end-to-end",
     );
 
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;

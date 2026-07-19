@@ -493,6 +493,43 @@ catalog:
     }
 
     #[test]
+    fn catalog_adoption_round_trips_on_cluster_repository() {
+        use crate::common::SnapshotAdoption;
+
+        let yaml = r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }
+allowedNamespaces: { all: true }
+catalog:
+  adoption: Ignore
+"#;
+        let spec: ClusterRepositorySpec = from_yaml(yaml);
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.adoption),
+            Some(SnapshotAdoption::Ignore)
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["catalog"]["adoption"], "Ignore");
+        let reparsed: ClusterRepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent stays None and is elided.
+        let bare: ClusterRepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+             allowedNamespaces: { all: true }\n\
+             catalog: {}\n",
+        );
+        assert!(bare.catalog.as_ref().unwrap().adoption.is_none());
+        assert!(
+            serde_json::to_value(&bare).unwrap()["catalog"]
+                .get("adoption")
+                .is_none(),
+            "absent catalog.adoption must be elided"
+        );
+    }
+
+    #[test]
     fn catalog_foreign_snapshots_unknown_variant_is_rejected() {
         let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
         assert!(serde_json::from_value::<crate::common::CatalogBounds>(value).is_err());

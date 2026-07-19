@@ -519,6 +519,22 @@ pub struct CatalogStatus {
     /// current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreign_snapshot_count: Option<i64>,
+    /// The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at`
+    /// annotation last honored by a completed catalog scan. Compared by
+    /// **equality** against the live annotation to decide whether a requested
+    /// on-demand scan is still pending — deliberately NOT a timestamp comparison
+    /// against `lastRefreshAt` (a periodic refresh completing after the request
+    /// was made would otherwise look like it honored the request even though it
+    /// started before the annotation was set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_request_honored: Option<String>,
+    /// RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF
+    /// a pending `catalog-scan-requested-at` token (i.e. the token arm was the
+    /// reason the attempt fired). Used only to rate-limit token-driven attempts
+    /// on a Ready-but-unreachable repository — it is never compared against the
+    /// token for retirement (that's `scanRequestHonored`, by equality).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_request_attempt_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -789,6 +805,58 @@ health:
     }
 
     #[test]
+    fn catalog_status_scan_request_honored_roundtrips() {
+        let status: CatalogStatus = from_yaml(
+            "lastRefreshAt: 2026-06-01T00:00:00Z\nscanRequestHonored: 2026-06-01T00:00:00Z\n",
+        );
+        assert_eq!(
+            status.scan_request_honored.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["scanRequestHonored"], "2026-06-01T00:00:00Z");
+        let back: CatalogStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+
+        // Absent stays None and is elided.
+        let bare: CatalogStatus = from_yaml("{}\n");
+        assert!(bare.scan_request_honored.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("scanRequestHonored")
+                .is_none(),
+            "absent scanRequestHonored must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_status_scan_request_attempt_at_roundtrips() {
+        let status: CatalogStatus = from_yaml(
+            "lastRefreshAt: 2026-06-01T00:00:00Z\nscanRequestAttemptAt: 2026-06-01T00:05:00Z\n",
+        );
+        assert_eq!(
+            status.scan_request_attempt_at.as_deref(),
+            Some("2026-06-01T00:05:00Z")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["scanRequestAttemptAt"], "2026-06-01T00:05:00Z");
+        let back: CatalogStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+
+        // Absent stays None and is elided.
+        let bare: CatalogStatus = from_yaml("{}\n");
+        assert!(bare.scan_request_attempt_at.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("scanRequestAttemptAt")
+                .is_none(),
+            "absent scanRequestAttemptAt must be elided"
+        );
+    }
+
+    #[test]
     fn repository_crd_exposes_index_blobs_print_column() {
         let crd = Repository::crd();
         let json = serde_json::to_value(&crd).unwrap();
@@ -1035,6 +1103,48 @@ health:
                 .get("foreignSnapshots")
                 .is_none(),
             "absent catalog.foreignSnapshots must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_adoption_round_trips_on_repository() {
+        use crate::common::SnapshotAdoption;
+
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             catalog:\n  adoption: Ignore\n",
+        );
+        assert_eq!(
+            spec.catalog.as_ref().and_then(|c| c.adoption),
+            Some(SnapshotAdoption::Ignore)
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["catalog"]["adoption"], "Ignore");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent stays None and is elided; no schema default (context-dependent).
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             catalog: {}\n",
+        );
+        assert!(bare.catalog.as_ref().unwrap().adoption.is_none());
+        assert!(
+            serde_json::to_value(&bare).unwrap()["catalog"]
+                .get("adoption")
+                .is_none(),
+            "absent catalog.adoption must be elided"
+        );
+
+        let crd = Repository::crd();
+        let crd_json = serde_json::to_value(&crd).unwrap();
+        let prop = &crd_json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["catalog"]["properties"]["adoption"];
+        assert!(
+            prop.get("default").is_none(),
+            "catalog.adoption must NOT carry a schema default: {prop}"
         );
     }
 }

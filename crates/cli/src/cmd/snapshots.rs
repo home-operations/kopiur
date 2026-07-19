@@ -134,6 +134,7 @@ fn origin_cell(origin: Option<Origin>) -> String {
         Some(Origin::Scheduled) => "scheduled".into(),
         Some(Origin::Manual) => "manual".into(),
         Some(Origin::Discovered) => "discovered".into(),
+        Some(Origin::Adopted) => "adopted".into(),
         None => EMPTY_CELL.into(),
     }
 }

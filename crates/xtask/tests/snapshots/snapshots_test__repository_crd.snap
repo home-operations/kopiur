@@ -1,5 +1,6 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
+assertion_line: 24
 expression: "body(&artifacts, \"repositories\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -544,6 +545,18 @@ spec:
                 description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
                 nullable: true
                 properties:
+                  adoption:
+                    description: |-
+                      Whether a discovered snapshot whose resolved identity matches a live
+                      `SnapshotPolicy` is automatically adopted — re-attached (stamped with that
+                      policy's config label, `status.origin` flipped to `Adopted`) so GFS
+                      retention governs it and eventually prunes it, instead of it sitting in the
+                      catalog forever as an immortal `discovered` row.
+                    enum:
+                    - Adopt
+                    - Ignore
+                    nullable: true
+                    type: string
                   fallbackNamespace:
                     description: Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only).
                     nullable: true
@@ -2618,6 +2631,26 @@ spec:
                     type: integer
                   lastRefreshAt:
                     description: RFC 3339 timestamp of the last catalog refresh.
+                    nullable: true
+                    type: string
+                  scanRequestAttemptAt:
+                    description: |-
+                      RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF
+                      a pending `catalog-scan-requested-at` token (i.e. the token arm was the
+                      reason the attempt fired). Used only to rate-limit token-driven attempts
+                      on a Ready-but-unreachable repository — it is never compared against the
+                      token for retirement (that's `scanRequestHonored`, by equality).
+                    nullable: true
+                    type: string
+                  scanRequestHonored:
+                    description: |-
+                      The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at`
+                      annotation last honored by a completed catalog scan. Compared by
+                      **equality** against the live annotation to decide whether a requested
+                      on-demand scan is still pending — deliberately NOT a timestamp comparison
+                      against `lastRefreshAt` (a periodic refresh completing after the request
+                      was made would otherwise look like it honored the request even though it
+                      started before the annotation was set).
                     nullable: true
                     type: string
                 type: object

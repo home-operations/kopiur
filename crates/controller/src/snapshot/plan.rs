@@ -41,6 +41,15 @@ pub enum DeletionPlan {
     /// `SnapshotRetainedOnScheduleDelete` + cascade-retained counter — loud
     /// but not an orphan-metric storm. (Executor lands in M4.)
     RetainSnapshotOnScheduleDelete,
+    /// A `SnapshotPolicy`-deletion cascade prune (`pruned-by: policy-cascade`,
+    /// stamped by the `SnapshotPolicy` finalizer under `onPolicyDelete: Retain`
+    /// — M3) whose Snapshot's own effective `deletionPolicy` is `Delete`. The
+    /// whole point of the `policy-cascade` stamp is to NEVER contact the
+    /// repository, so this is the loud downgrade: same executor shape as
+    /// `RetainSnapshot` (release finalizer, no repo contact) PLUS a Warning
+    /// event `SnapshotRetainedOnPolicyDelete` + a policy-cascade-retained
+    /// counter — loud but not an orphan-metric storm.
+    RetainSnapshotOnPolicyDelete,
     /// Mass-deletion breaker: do NO delete work, keep the finalizer, phase
     /// Deleting + `DeletionHeld=True` condition, requeue long. Drained by the
     /// repo ack annotation. (Executor lands in M4.)
@@ -117,10 +126,16 @@ pub fn pruned_by(annotations: &BTreeMap<String, String>) -> Option<PrunedBy> {
 /// 2. `ns_terminating`:
 ///    - `ns_policy == None` → `OrphanSnapshot` (existing fail-safe, unchanged).
 ///    - `Some(Orphan)` → `OrphanSnapshot` (existing default, unchanged).
-///    - `Some(Delete)` → fall through to steps 4/5 BYPASSING step 3 (during ns
-///      teardown the schedule is always gone; letting the cascade guard fire
-///      would silently nullify the documented repo-level opt-in) — but NOT
-///      bypassing the breaker.
+///    - `Some(Delete)` → [`plan_ns_delete`]: an EXPLICIT repo-level opt-in.
+///      Retention/failed-history prunes keep their operator-prune semantics
+///      (step 4), but BOTH the schedule cascade guard (step 3 — during ns
+///      teardown the schedule is always gone) AND the IMPLICIT `policy-cascade`
+///      Retain stamp are overridden: an unstamped OR `policy-cascade`-stamped
+///      child resolves as external destructive (step 5, breaker-gated). The
+///      policy cleanup finalizer stamps its live children `policy-cascade`
+///      during the SAME teardown (default `onPolicyDelete: Retain`), and letting
+///      that quiet-retain downgrade win would silently nullify the opt-in and
+///      lose off-site data the user asked to reclaim.
 /// 3. Cascade guard (only when not ns-terminating): `pruned_by == None && owner
 ///    == GoneOrReplaced`:
 ///    - cascade `Retain` && policy `Delete` → `RetainSnapshotOnScheduleDelete`
@@ -128,8 +143,8 @@ pub fn pruned_by(annotations: &BTreeMap<String, String>) -> Option<PrunedBy> {
 ///    - cascade `Retain` && policy `Orphan` → `OrphanSnapshot`
 ///    - cascade `Delete` → fall through (opt-in cascade; still external ⇒
 ///      breaker applies).
-/// 4. Operator prune (`pruned_by == Some(_)`): match policy exhaustively —
-///    Delete→DeleteSnapshot, Retain→RetainSnapshot, Orphan→OrphanSnapshot.
+/// 4. Operator prune (`pruned_by == Some(_)`): match `(prune kind, policy)`
+///    exhaustively via [`plan_prune`] — see its doc for the full 3×3 table.
 ///    NEVER held (retention must keep working during an incident; its rate is
 ///    bounded elsewhere).
 /// 5. External destructive (policy Delete): breaker Held →
@@ -146,13 +161,39 @@ pub fn plan_deletion(f: DeletionFacts<'_>) -> DeletionPlan {
     plan_live_namespace(&f)
 }
 
-/// Step 2: namespace-deletion cascade (ADR-0005 §5). `Delete` bypasses the
-/// cascade guard (step 3) but not the breaker (steps 4-6 still apply).
+/// Step 2: namespace-deletion cascade (ADR-0005 §5). `Delete` is an explicit
+/// repo-level opt-in that bypasses the schedule cascade guard (step 3) AND
+/// overrides the implicit `policy-cascade` Retain stamp (see [`plan_ns_delete`]),
+/// but does not bypass the breaker for external destructive deletes.
 fn plan_ns_terminating(f: &DeletionFacts<'_>) -> DeletionPlan {
     match f.ns_policy {
         None => DeletionPlan::OrphanSnapshot,
         Some(NamespaceDeletePolicy::Orphan) => DeletionPlan::OrphanSnapshot,
-        Some(NamespaceDeletePolicy::Delete) => plan_prune_or_external(f),
+        Some(NamespaceDeletePolicy::Delete) => plan_ns_delete(f),
+    }
+}
+
+/// Step 2, the `Some(Delete)` arm: an EXPLICIT `onNamespaceDelete: Delete`
+/// repo-level opt-in. **Exhaustive over [`PrunedBy`]** (no catch-all): a new
+/// prune kind must decide its namespace-teardown fate here.
+///
+/// - `None` (unstamped) → external destructive ([`plan_external`], breaker-gated).
+/// - `Some(PolicyCascade)` → ALSO external destructive. The opt-in is explicit;
+///   the `policy-cascade` stamp is IMPLICIT — the `SnapshotPolicy` cleanup
+///   finalizer stamps its live children during this SAME namespace teardown,
+///   defaulting to `onPolicyDelete: Retain`. Routing that through [`plan_prune`]
+///   would hit the quiet-retain downgrade
+///   ([`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete))
+///   and silently nullify the opt-in, losing off-site data the user asked to
+///   reclaim. So an explicit ns-delete opt-in WINS over the implicit stamp.
+///   (The retain-wins-ties rule is only for schedule-vs-policy cascade races,
+///   NOT for an explicit namespace-delete opt-in.)
+/// - `Some(Retention | FailedHistory)` → a genuine operator prune keeps its
+///   prune semantics ([`plan_prune`]): never held; effective policy decides.
+fn plan_ns_delete(f: &DeletionFacts<'_>) -> DeletionPlan {
+    match pruned_by(f.annotations) {
+        None | Some(PrunedBy::PolicyCascade) => plan_external(f.policy, f.breaker),
+        Some(p @ (PrunedBy::Retention | PrunedBy::FailedHistory)) => plan_prune(p, f.policy),
     }
 }
 
@@ -200,18 +241,42 @@ fn plan_cascade_guard(
 /// gates `Delete`).
 fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
     match pruned_by(f.annotations) {
-        Some(_) => plan_prune(f.policy),
+        Some(p) => plan_prune(p, f.policy),
         None => plan_external(f.policy, f.breaker),
     }
 }
 
 /// Step 4: operator prune. NEVER held — retention/history-limit pruning must
 /// keep working during an incident; its own rate is bounded elsewhere.
-fn plan_prune(policy: DeletionPolicy) -> DeletionPlan {
-    match policy {
-        DeletionPolicy::Delete => DeletionPlan::DeleteSnapshot,
-        DeletionPolicy::Retain => DeletionPlan::RetainSnapshot,
-        DeletionPolicy::Orphan => DeletionPlan::OrphanSnapshot,
+///
+/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 3×3
+/// match, no catch-all): a new variant of either enum fails to compile until
+/// every cell is decided (ADR §5.5).
+///
+/// | [`PrunedBy`] \\ [`DeletionPolicy`] | `Delete` | `Retain` | `Orphan` |
+/// |---|---|---|---|
+/// | `Retention` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `FailedHistory` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `PolicyCascade` | [`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete) | `RetainSnapshot` | `OrphanSnapshot` |
+///
+/// The `PolicyCascade`/`Delete` cell is the one loud downgrade: a policy
+/// cascade prune under `onPolicyDelete: Retain` never contacts the
+/// repository, even though the Snapshot's own effective policy asked for
+/// `Delete` — that is the entire reason the finalizer stamps `policy-cascade`
+/// instead of leaving the annotation absent.
+fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
+    match (pruned, policy) {
+        (PrunedBy::Retention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
+        (PrunedBy::Retention, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::Retention, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::FailedHistory, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        (PrunedBy::PolicyCascade, DeletionPolicy::Delete) => {
+            DeletionPlan::RetainSnapshotOnPolicyDelete
+        }
+        (PrunedBy::PolicyCascade, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::PolicyCascade, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
     }
 }
 
@@ -255,12 +320,29 @@ pub fn owner_state_from(fetched: Option<&SnapshotSchedule>, owner: &OwnerReferen
     }
 }
 
-/// Whether this pending deletion counts toward its repository's breaker:
-/// external (no valid pruned-by) AND its plan WITHOUT the breaker is
+/// Whether this pending deletion counts toward its repository's breaker: a
+/// destructive EXTERNAL delete whose plan WITHOUT the breaker is
 /// `DeleteSnapshot`. Implemented by re-running [`plan_deletion`] with
 /// `breaker = Allowed` — one decision function, no forked logic.
+///
+/// The `pruned-by` stamp is **exhaustively** classified (no catch-all), because
+/// not every stamp is breaker-exempt:
+///
+/// - `Retention` / `FailedHistory` are OPERATOR prunes — bounded, deliberate,
+///   steady-state deletes whose rate is governed elsewhere; they are exempt
+///   EVERYWHERE (retention must keep working during an incident, never held).
+/// - `PolicyCascade` and unstamped (`None`) are NOT exempt: they fall through to
+///   the plan check. A `policy-cascade`-stamped child is quiet-retained in
+///   steady state (its plan is `RetainSnapshotOnPolicyDelete`, not
+///   `DeleteSnapshot`, so it still doesn't count), but under a namespace
+///   teardown with `onNamespaceDelete: Delete` its plan becomes an external
+///   destructive `DeleteSnapshot` ([`plan_ns_delete`] → [`plan_external`]) — a
+///   mass deletion that only happens because a human deleted a namespace, so it
+///   MUST count/hold exactly like an unstamped external child. A new
+///   [`PrunedBy`] variant fails to compile until its breaker fate is decided
+///   here (ADR §5.5).
 pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
-    if pruned_by(f.annotations).is_some() {
+    if !breaker_relevant(pruned_by(f.annotations)) {
         return false;
     }
     matches!(
@@ -270,6 +352,30 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
         }),
         DeletionPlan::DeleteSnapshot
     )
+}
+
+/// Whether a `pruned-by` classification is breaker-RELEVANT — a destructive
+/// EXTERNAL delete that counts toward / can be held by the mass-deletion breaker
+/// — as opposed to an exempt OPERATOR prune. **Exhaustive over [`PrunedBy`]** (no
+/// catch-all):
+///
+/// - `Retention` / `FailedHistory` → `false`: operator prunes, exempt everywhere.
+/// - `None` (unstamped) / `PolicyCascade` → `true`: breaker-relevant. A
+///   `PolicyCascade` member only ever reaches the destructive `DeleteSnapshot`
+///   plan (and so the counting set) under an `onNamespaceDelete: Delete` namespace
+///   teardown — a mass deletion a human triggered by deleting a namespace, which
+///   must count/hold like any external child.
+///
+/// The single source of truth shared by [`counts_toward_breaker`] and the
+/// [`crate::snapshot::batch::PendingMember::external`] flag, so the breaker's
+/// count, its held-set, and the surfaced ack value never disagree on which
+/// stamps are exempt. A new [`PrunedBy`] variant fails to compile until its
+/// breaker relevance is decided here (ADR §5.5).
+pub fn breaker_relevant(pruned: Option<PrunedBy>) -> bool {
+    match pruned {
+        Some(PrunedBy::Retention | PrunedBy::FailedHistory) => false,
+        None | Some(PrunedBy::PolicyCascade) => true,
+    }
 }
 
 /// Clamp a parsed ack timestamp to `<= now` (clock-skew guard): a future ack
@@ -404,6 +510,56 @@ pub fn mass_deletion_hold_message(
         repo.name,
         mass_deletion_ack_command(repo, ack_value),
         SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
+    )
+}
+
+/// The `SnapshotRetainedOnScheduleDelete` Warning event message for
+/// [`DeletionPlan::RetainSnapshotOnScheduleDelete`]'s executor. Names the CR,
+/// states that the kopia snapshot was kept, and says how it comes back:
+/// rediscovered on the *next catalog scan* (not a promise of "within the
+/// refresh interval" — `periodicRefresh` is off by default, so nothing runs on
+/// a timer unless the user turned it on; the real triggers are a bootstrap, a
+/// spec change, or a recreated policy's automatic scan request), then
+/// auto-adopted by default once a matching `SnapshotPolicy` exists. Pure so
+/// the wording is unit-tested.
+pub fn schedule_cascade_retained_message(namespace: &str, name: &str) -> String {
+    format!(
+        "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
+         is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
+         so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. It \
+         will be rediscovered as `origin: discovered` on the next catalog scan (e.g. a bootstrap, \
+         a spec change, or a recreated policy's automatic scan request — not necessarily on a \
+         timer, since periodic refresh is off by default) and auto-adopted by default once a \
+         SnapshotPolicy with a matching identity exists. To cascade deletes when a schedule is \
+         removed, set the schedule's `spec.deletion.onScheduleDelete: Delete`."
+    )
+}
+
+/// The `SnapshotRetainedOnPolicyDelete` Warning event message for
+/// [`DeletionPlan::RetainSnapshotOnPolicyDelete`]'s executor. Names the CR,
+/// states what became of the kopia snapshot — retained in the repository, or
+/// (`snapshot_recorded == false`) never completed at all because the run was
+/// cancelled mid-flight before any kopia snapshot existed — that it (or any
+/// future one matching the same identity) will be rediscoverable/adoptable,
+/// and the opt-in for users who wanted the cascade to actually delete
+/// kopia-side data. Pure so both phrasings are unit-tested.
+pub fn policy_cascade_retained_message(
+    namespace: &str,
+    name: &str,
+    snapshot_recorded: bool,
+) -> String {
+    let outcome = if snapshot_recorded {
+        "its kopia snapshot was RETAINED in the repository, not deleted"
+    } else {
+        "the kopia snapshot for this run was never completed (the run was cancelled mid-flight), \
+         so there was nothing in the repository to delete"
+    };
+    format!(
+        "Snapshot `{namespace}/{name}` was released, not deleted: its owning SnapshotPolicy is gone \
+         and the policy's `onPolicyDelete` is `Retain` (the safe default), so {outcome}. Any kopia \
+         snapshot it did create remains rediscoverable/adoptable by a future SnapshotPolicy with a \
+         matching identity (catalog scan / auto-adoption). To cascade deletes when a SnapshotPolicy is \
+         removed, set the policy's `spec.deletion.onPolicyDelete: Delete`."
     )
 }
 
@@ -771,6 +927,35 @@ pub(super) fn should_run_preflight(phase: Option<SnapshotPhase>) -> bool {
     matches!(phase, None | Some(SnapshotPhase::Pending))
 }
 
+/// Whether a terminal steady-state pin arm (`pin_discovered_row`/
+/// `pin_adopted_row` in [`super`]) needs to patch status this reconcile: the
+/// observed phase hasn't already converged to the arm's `target` (`Discovered`
+/// for a discovered row, `Succeeded` for an adopted one). Pure + shared, so the
+/// "only pin when unset/divergent" idempotence both arms rely on — never
+/// re-patching (and so never re-generating kstatus conditions/timestamps) once
+/// pinned — is unit-tested without a cluster (M5).
+pub(super) fn needs_terminal_pin(observed: Option<SnapshotPhase>, target: SnapshotPhase) -> bool {
+    observed != Some(target)
+}
+
+/// Whether an `Adopted`-resolving row carries CONTROLLER-WRITTEN provenance —
+/// `status.snapshot`, the kopia id `adopt_one`'s create→status-patch flow records.
+/// [`super::pin_adopted_row`] pins `phase: Succeeded` ONLY when this holds: a
+/// user-applied BARE `origin: adopted` label (which `resolve_origin` still resolves
+/// to `Adopted` via its label fallback) has no `status.snapshot`, and pinning it
+/// would mint a phantom `Succeeded` row that enters GFS retention and sets
+/// `has_history`. Pure + shared with the retention-side provenance guards so the
+/// "only a real adopted row is Succeeded/history" rule is unit-tested without a
+/// cluster. The genuine adopt flow converges within a pass, so an interim row is
+/// only transiently phase-less.
+pub(super) fn adopted_row_has_provenance(backup: &Snapshot) -> bool {
+    backup
+        .status
+        .as_ref()
+        .and_then(|s| s.snapshot.as_ref())
+        .is_some()
+}
+
 /// Whether the preflight deadline has passed: `preflight_since + timeout <= now`.
 /// `timeout == None` ⇒ indefinite (never expires); `preflight_since == None` (the
 /// failure just started this reconcile) ⇒ not expired. Pure / clock-injected.
@@ -867,7 +1052,10 @@ pub fn effective_deletion_policy(
     match origin {
         // Discovered snapshots are never ours to delete — forced Retain.
         Origin::Discovered => DeletionPolicy::Retain,
-        Origin::Scheduled | Origin::Manual => spec_policy.unwrap_or(DeletionPolicy::Delete),
+        // Adopted rows are managed like any produced backup: same fallback default.
+        Origin::Scheduled | Origin::Manual | Origin::Adopted => {
+            spec_policy.unwrap_or(DeletionPolicy::Delete)
+        }
     }
 }
 
@@ -913,6 +1101,7 @@ pub fn resolve_origin(b: &Snapshot) -> Origin {
     {
         Some("scheduled") => Origin::Scheduled,
         Some("discovered") => Origin::Discovered,
+        Some("adopted") => Origin::Adopted,
         _ => Origin::Manual,
     }
 }

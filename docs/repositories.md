@@ -211,6 +211,7 @@ spec:
             perIdentity: 100 # keep the newest N rows per username@hostname:path (0 = no rows)
             maxAgeDays: 90 # no rows for snapshots older than this
         fallbackNamespace: backups # ClusterRepository only — see below
+        adoption: Adopt # Adopt (default) | Ignore — see below
 ```
 
 `retain` bounds the **CR rows, never the data**: a row "expired" by `perIdentity`/`maxAgeDays` is just a deleted CR — the kopia snapshot stays in the repository and remains restorable via [`Restore.source.identity`](restores.md#restoring-a-snapshot-kopiur-didnt-create).
@@ -220,6 +221,23 @@ spec:
 A namespaced `Repository` materializes rows in its own namespace. A **`ClusterRepository`** places each row in the namespace named by the snapshot identity's **hostname** — when that namespace exists and passes the `allowedNamespaces` gate — so an adopted shared repository's snapshots land next to the workloads they belong to. Identities whose hostname maps to no allowed namespace go to `catalog.fallbackNamespace`; with no fallback configured they are skipped, and the `ClusterRepository` gets a Warning Event (`DiscoveredSnapshotUnplaced`) naming the hostnames and the fix.
 
 ///
+
+### `catalog.adoption` — automatically re-attaching discovered snapshots
+
+A discovered row can stop being a dead end. When a `discovered` snapshot's kopia identity **exactly** matches a live `SnapshotPolicy`'s resolved identity (`username` AND `hostname` AND `sourcePath`, never a partial match), the policy **adopts** it: a fresh `origin: adopted` `Snapshot` CR is created in the policy's namespace carrying the policy's config label, and the discovered row is deleted. The adopted row is now GFS-governed exactly like a produced backup — see [Backups → Retention](backups.md#retention--how-long-backups-are-kept-gfs) — instead of sitting in the catalog forever.
+
+```yaml
+spec:
+    catalog:
+        adoption: Ignore # Adopt (default) | Ignore
+```
+
+- **Resolution order**: `SnapshotPolicy.spec.adoption`, if set, always wins over the repository's `catalog.adoption`; an unset policy field inherits the repository's setting; both unset defaults to `Adopt`. Set it on the repository to change the default for every policy against it, or on one policy to carve out an exception.
+- **`Ignore`** turns adoption off (at whichever level it's set) — discovered rows keep accumulating and bounded only by `catalog.retain`, and you restore from them directly instead ([Restores → discovered snapshots](restores.md#restoring-a-snapshot-kopiur-didnt-create)).
+- **A brand-new or delete-then-recreated policy nudges the catalog.** A `SnapshotPolicy` with no adoption history yet, that finds nothing to adopt on its first pass, requests an on-demand catalog scan on its repository (an `AdoptionScanRequested` Normal Event names the identity) instead of waiting on a spec change or the periodic-refresh timer — this is what makes "delete a policy, then re-apply it" self-heal without you manually forcing a re-scan. It fires exactly once per (policy, identity): a scan that turns up nothing stays quiet after that. See [Adopt an existing repo → Delete a policy, then recreate it](scenarios/adopt-existing-repo.md#delete-a-policy-then-recreate-it) for the full walkthrough.
+- **The request is bounded, even on a repository shared by many policies.** Several policies recreated at once each stamp the SAME `catalog-scan-requested-at` annotation on the repository — but the repository only ever needs to run one scan to satisfy all of them (a fresh listing re-materializes every match at once), so a burst of simultaneous requests costs one scan, not one per policy.
+- **`status.catalog.discoveredBackupCount` is transiently stale right after an adoption wave.** It's written by the catalog scan (the `Repository`/`ClusterRepository` reconciler); adoption runs in a **separate** reconcile pass (the `SnapshotPolicy`) that deletes discovered rows without touching that count. Expect it to over-count by however many rows were just adopted until the next scan corrects it — it is not wrong, just one scan behind.
+- **Foreign-cluster snapshots are never adopted**, even on an exact identity match — see [`identityDefaults.cluster`](#identitydefaultscluster--sharing-one-repository-across-clusters).
 
 ## `moverDefaults` — one place to configure every mover
 

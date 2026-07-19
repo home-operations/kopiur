@@ -245,6 +245,7 @@ spec:
                 - scheduled
                 - manual
                 - discovered
+                - adopted
                 nullable: true
                 type: string
               phase:

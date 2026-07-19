@@ -236,6 +236,8 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
             hooks: None,
             mover: None,
             credential_projection: None,
+            deletion: None,
+            adoption: None,
         },
     )
 }
@@ -412,6 +414,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         owner_ref: Default::default(),
         deletion_protection: None,
         mass_deletion_ack: None,
+        catalog: None,
     }
 }
 
@@ -445,6 +448,8 @@ fn config_with_source(name: &str, source: kopiur_api::snapshot_policy::Source) -
             hooks: None,
             mover: None,
             credential_projection: None,
+            deletion: None,
+            adoption: None,
         },
     )
 }
@@ -1113,6 +1118,111 @@ fn operator_pruned_bypasses_guard_and_breaker() {
     }
 }
 
+// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 3×3 matrix (M2) --
+
+#[test]
+fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
+    let cases = [
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Delete,
+            DeletionPlan::DeleteSnapshot,
+        ),
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::Retention,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Delete,
+            DeletionPlan::DeleteSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::FailedHistory,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        // The loud downgrade: a policy-cascade prune under an effective
+        // `Delete` policy NEVER contacts the repository.
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Delete,
+            DeletionPlan::RetainSnapshotOnPolicyDelete,
+        ),
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::PolicyCascade,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+    ];
+    for (kind, policy, expected) in cases {
+        let a = pruned(kind);
+        // Every operator prune bypasses BOTH the schedule cascade guard and
+        // the breaker — set both to what would otherwise divert the
+        // decision, so this test also proves the prune path short-circuits
+        // them for every kind, not just Retention/FailedHistory.
+        let plan = plan_deletion(DeletionFacts {
+            policy,
+            owner: OwnerState::GoneOrReplaced,
+            cascade: ScheduleDeletePolicy::Retain,
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, expected, "{kind:?}/{policy:?}");
+    }
+}
+
+#[test]
+fn policy_cascade_stamp_bypasses_schedule_cascade_guard_not_just_the_breaker() {
+    // A composite of the two "bypass" mechanisms: a policy-cascade stamp
+    // must resolve via the prune path (RetainSnapshotOnPolicyDelete), NOT
+    // the schedule cascade guard, even when the owner is gone/replaced and
+    // the schedule cascade is set to Retain (which would otherwise produce
+    // the DIFFERENT plan RetainSnapshotOnScheduleDelete).
+    let a = pruned(PrunedBy::PolicyCascade);
+    let plan = plan_deletion(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        owner: OwnerState::GoneOrReplaced,
+        cascade: ScheduleDeletePolicy::Retain,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnPolicyDelete);
+}
+
+#[test]
+fn skip_cleanup_annotation_wins_over_a_policy_cascade_stamp() {
+    // Decision step 1 (skip-cleanup) is absolute — it wins even over an
+    // operator prune stamp.
+    let a = ann(&[
+        (
+            PRUNED_BY_ANNOTATION,
+            PrunedBy::PolicyCascade.annotation_value(),
+        ),
+        (SKIP_SNAPSHOT_CLEANUP_ANNOTATION, "true"),
+    ]);
+    let plan = plan_deletion(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::OrphanSnapshot);
+}
+
 #[test]
 fn unknown_pruned_by_value_treated_external() {
     let a = ann(&[(PRUNED_BY_ANNOTATION, "garbage")]);
@@ -1199,6 +1309,76 @@ fn ns_terminating_delete_optin_bypasses_guard_but_not_breaker() {
 }
 
 #[test]
+fn ns_terminating_delete_optin_overrides_policy_cascade_stamp() {
+    // Failure-1 regression guard (PR #272): during namespace teardown the
+    // SnapshotPolicy cleanup finalizer stamps its live children `pruned-by:
+    // policy-cascade` (the default `onPolicyDelete: Retain`). That IMPLICIT stamp
+    // must NOT override an EXPLICIT `onNamespaceDelete: Delete` opt-in — the
+    // stamped child resolves as an ordinary external destructive deletion, so a
+    // `deletionPolicy: Delete` snapshot IS reclaimed, not quietly retained. On
+    // HEAD (before the fix) this returned RetainSnapshotOnPolicyDelete: the bug.
+    let a = pruned(PrunedBy::PolicyCascade);
+    let allowed = plan_deletion(DeletionFacts {
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // Still subject to the mass-deletion breaker, exactly like an unstamped
+    // external delete under the same opt-in.
+    let held = plan_deletion(DeletionFacts {
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn ns_terminating_policy_cascade_stays_nondestructive_under_default_ns_policy() {
+    // The complement to the opt-in override: a `policy-cascade`-stamped child in
+    // a terminating namespace under the DEFAULT ns policy (Orphan) or an
+    // unresolved repository (None) stays non-destructive — the fix must not make
+    // the default namespace-delete path start reclaiming data. Effective policy
+    // is Delete (base_facts), so this proves the ns policy, not the stamp, wins.
+    // (Passes on HEAD too — the ns-terminating Orphan/None arms short-circuit to
+    // OrphanSnapshot before any prune check; this pins that invariant is kept.)
+    let a = pruned(PrunedBy::PolicyCascade);
+    for ns_policy in [None, Some(NamespaceDeletePolicy::Orphan)] {
+        let plan = plan_deletion(DeletionFacts {
+            ns_terminating: true,
+            ns_policy,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::OrphanSnapshot, "{ns_policy:?}");
+    }
+}
+
+#[test]
+fn ns_terminating_retention_prune_keeps_prune_semantics_never_held() {
+    // A genuine OPERATOR prune (Retention/FailedHistory) in a terminating
+    // namespace under `onNamespaceDelete: Delete` keeps its prune semantics: it
+    // deletes on effective `Delete` and is NEVER held by the breaker, even with
+    // the breaker tripping. `plan_ns_delete` routes it to `plan_prune`, not
+    // `plan_external`, so the ns-teardown opt-in does not turn retention into a
+    // breaker-gated mass deletion — retention must keep working during an
+    // incident. This is the invariant the PolicyCascade fix must not disturb.
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        let plan = plan_deletion(DeletionFacts {
+            ns_terminating: true,
+            ns_policy: Some(NamespaceDeletePolicy::Delete),
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::DeleteSnapshot, "{kind:?} never held");
+    }
+}
+
+#[test]
 fn breaker_never_holds_retain_or_orphan() {
     let a = BTreeMap::new();
     for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
@@ -1229,6 +1409,84 @@ fn orphaned_ownerref_children_get_their_own_policy() {
         });
         assert_eq!(plan, expected, "{policy:?}");
     }
+}
+
+// -- Adopted origin: deletion planning (M5) -------------------------------
+//
+// `Origin::Adopted` rows run through `plan_deletion` exactly like a produced
+// (Scheduled/Manual) row once `effective_deletion_policy` has resolved their
+// policy — unlike Discovered, they are NOT forced to Retain. These lock that
+// in end-to-end: `effective_deletion_policy(_, Origin::Adopted)` feeding
+// `plan_deletion`/`counts_toward_breaker`.
+
+#[test]
+fn adopted_external_delete_with_no_schedule_owner_deletes() {
+    // Adopted rows are NOT forced-Retain like Discovered: an external delete
+    // with no schedule owner and the breaker allowed deletes exactly like a
+    // produced row's would.
+    let a = BTreeMap::new();
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+    assert_eq!(policy, DeletionPolicy::Delete);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn adopted_external_delete_counts_toward_and_is_held_by_the_breaker() {
+    // Adopted external deletes count toward the per-repo mass-deletion breaker
+    // exactly like produced ones — the breaker doesn't special-case origin.
+    let a = BTreeMap::new();
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        ..base_facts(&a)
+    }));
+
+    // Over threshold + unacked ⇒ held, never silently deleted.
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn adopted_retention_prune_deletes_never_held() {
+    // Retention is the whole point of adoption: an operator retention prune on
+    // an adopted row deletes even with the breaker Held (operator prunes always
+    // bypass the breaker, same as any produced row).
+    let a = pruned(PrunedBy::Retention);
+    let policy = effective_deletion_policy(Some(DeletionPolicy::Delete), Origin::Adopted);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        owner: OwnerState::NoScheduleOwner,
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::DeleteSnapshot);
+}
+
+#[test]
+fn adopted_policy_cascade_prune_retains_kopia_data() {
+    // A SnapshotPolicy-deletion cascade keeps kopia data even for an adopted
+    // row: the loud downgrade (RetainSnapshotOnPolicyDelete) fires for Adopted
+    // exactly as it does for a produced row under an effective Delete policy.
+    let a = pruned(PrunedBy::PolicyCascade);
+    let policy = effective_deletion_policy(None, Origin::Adopted);
+    let plan = plan_deletion(DeletionFacts {
+        policy,
+        ..base_facts(&a)
+    });
+    assert_eq!(plan, DeletionPlan::RetainSnapshotOnPolicyDelete);
 }
 
 // -- table test: every meaningful row of the decision matrix -------------
@@ -1833,6 +2091,79 @@ fn counts_toward_breaker_cascade_retained_is_false() {
     }));
 }
 
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_false_in_live_namespace() {
+    // In a LIVE namespace a `policy-cascade` stamp is quiet-retained
+    // (RetainSnapshotOnPolicyDelete), never a destructive delete, so it does not
+    // count toward the breaker — even though `PolicyCascade` (unlike
+    // Retention/FailedHistory) is no longer blanket-exempted. The plan check,
+    // not a stamp short-circuit, is what excludes it here.
+    let a = pruned(PrunedBy::PolicyCascade);
+    assert!(!counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_true_under_ns_teardown_delete() {
+    // The gap this fix closes (PR #272): during a namespace teardown with the
+    // explicit `onNamespaceDelete: Delete` opt-in, a `policy-cascade`-stamped
+    // child resolves to an external destructive DeleteSnapshot
+    // (plan_ns_delete → plan_external), so it MUST count toward the per-repo
+    // mass-deletion breaker exactly like an unstamped external child — otherwise
+    // a large teardown that stamps all its children mass-deletes kopia data with
+    // NO breaker hold and NO ack. On HEAD this returned false (any pruned-by was
+    // blanket-exempt), silently nullifying the breaker in the common case.
+    let a = pruned(PrunedBy::PolicyCascade);
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_retention_prune_stays_exempt_even_under_ns_teardown_delete() {
+    // The stamp-exemption exists for OPERATOR prunes: Retention (and
+    // FailedHistory) are bounded, deliberate, steady-state deletes that must
+    // keep working during an incident and are NEVER held. That exemption holds
+    // EVERYWHERE — including a terminating namespace under `Delete` — so an
+    // operator prune never trips the breaker.
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy: DeletionPolicy::Delete,
+                ns_terminating: true,
+                ns_policy: Some(NamespaceDeletePolicy::Delete),
+                ..base_facts(&a)
+            }),
+            "{kind:?} must stay breaker-exempt under ns-teardown Delete"
+        );
+    }
+}
+
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_false_under_ns_teardown_orphan() {
+    // Complement to the Delete case: under the DEFAULT ns policy (Orphan) or an
+    // unresolved repository (None), a terminating `policy-cascade` child plans
+    // OrphanSnapshot — non-destructive — so it must NOT count toward the breaker.
+    let a = pruned(PrunedBy::PolicyCascade);
+    for ns_policy in [None, Some(NamespaceDeletePolicy::Orphan)] {
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy: DeletionPolicy::Delete,
+                ns_terminating: true,
+                ns_policy,
+                ..base_facts(&a)
+            }),
+            "{ns_policy:?}"
+        );
+    }
+}
+
 // -- breaker_stores_ready / parse_mass_deletion_ack ------------------------
 
 #[test]
@@ -1961,6 +2292,82 @@ fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
     assert!(
         msg.contains(SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
         "escape hatch: {msg}"
+    );
+}
+
+// -- schedule_cascade_retained_message (RetainSnapshotOnScheduleDelete executor) --
+
+#[test]
+fn schedule_cascade_retained_message_names_cr_and_opt_in() {
+    let msg = schedule_cascade_retained_message("backups", "nightly-1");
+    assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
+    assert!(msg.contains("RETAINED"), "states retained: {msg}");
+    assert!(
+        msg.contains("spec.deletion.onScheduleDelete: Delete"),
+        "names the opt-in: {msg}"
+    );
+}
+
+#[test]
+fn schedule_cascade_retained_message_does_not_promise_a_refresh_interval() {
+    // Regression: the message used to promise rediscovery "within the
+    // repository's catalog refresh interval", which is misleading now that
+    // periodicRefresh defaults off — nothing runs on a timer unless the user
+    // opted in. The real triggers are a catalog scan (bootstrap, spec change,
+    // or a recreated policy's scan request), followed by default auto-adoption.
+    let msg = schedule_cascade_retained_message("backups", "nightly-1");
+    assert!(
+        !msg.contains("within the repository's catalog refresh interval"),
+        "must not promise a timer-driven refresh: {msg}"
+    );
+    assert!(
+        msg.contains("next catalog scan"),
+        "names the real trigger: {msg}"
+    );
+    assert!(
+        msg.contains("auto-adopted"),
+        "states the post-rediscovery outcome: {msg}"
+    );
+}
+
+// -- policy_cascade_retained_message (RetainSnapshotOnPolicyDelete executor) --
+
+#[test]
+fn policy_cascade_retained_message_names_cr_retained_state_and_opt_in() {
+    let msg = policy_cascade_retained_message("backups", "nightly-1", true);
+    assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
+    assert!(
+        msg.contains("RETAINED in the repository"),
+        "states retained: {msg}"
+    );
+    assert!(
+        msg.contains("rediscoverable/adoptable"),
+        "states rediscoverable: {msg}"
+    );
+    assert!(
+        msg.contains("spec.deletion.onPolicyDelete: Delete"),
+        "names the opt-in: {msg}"
+    );
+}
+
+#[test]
+fn policy_cascade_retained_message_cancelled_mid_flight_names_no_completed_snapshot() {
+    // A live child cascaded before its mover Job ever finished: there is no
+    // kopia snapshot to "retain" — the message must say so, not lie about a
+    // snapshot that never existed.
+    let msg = policy_cascade_retained_message("backups", "nightly-2", false);
+    assert!(
+        msg.contains("never completed") && msg.contains("cancelled mid-flight"),
+        "states not-completed: {msg}"
+    );
+    assert!(!msg.contains("RETAINED in the repository"), "{msg}");
+    assert!(
+        msg.contains("rediscoverable/adoptable"),
+        "still states rediscoverable: {msg}"
+    );
+    assert!(
+        msg.contains("spec.deletion.onPolicyDelete: Delete"),
+        "still names the opt-in: {msg}"
     );
 }
 
@@ -2266,6 +2673,152 @@ fn produced_honors_explicit_spec_policy() {
     assert_eq!(
         effective_deletion_policy(Some(DeletionPolicy::Retain), Origin::Scheduled),
         DeletionPolicy::Retain
+    );
+}
+
+#[test]
+fn adopted_defaults_to_delete_like_produced_not_retain() {
+    // M5: an adopted row is managed like any produced backup (Scheduled/Manual),
+    // NOT forced to Retain like Discovered — retention is the whole point of
+    // adoption, so the default must be Delete when the spec leaves it unset.
+    assert_eq!(
+        effective_deletion_policy(None, Origin::Adopted),
+        DeletionPolicy::Delete
+    );
+    assert_eq!(
+        effective_deletion_policy(Some(DeletionPolicy::Orphan), Origin::Adopted),
+        DeletionPolicy::Orphan
+    );
+}
+
+// --- resolve_origin: status-first precedence over the origin label (M5) ----
+
+/// A bare `Snapshot` with `status.origin`/the origin label set as given, for
+/// exercising [`resolve_origin`]'s precedence. `None`/`None` mirrors a raw
+/// `kubectl create` (no status yet, no label stamped).
+fn backup_with_origin(status_origin: Option<Origin>, label: Option<&str>) -> Snapshot {
+    let mut backup = dummy_backup();
+    if let Some(o) = status_origin {
+        backup.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            origin: Some(o),
+            ..Default::default()
+        });
+    }
+    if let Some(l) = label {
+        backup
+            .labels_mut()
+            .insert(crate::consts::ORIGIN_LABEL.to_string(), l.to_string());
+    }
+    backup
+}
+
+#[test]
+fn resolve_origin_defaults_to_manual_with_no_status_or_label() {
+    assert_eq!(
+        resolve_origin(&backup_with_origin(None, None)),
+        Origin::Manual
+    );
+}
+
+#[test]
+fn resolve_origin_status_wins_over_a_conflicting_label() {
+    // status.origin is canonical: a stale/mismatched `discovered` label (e.g.
+    // from before an M6 adoption re-stamped status) must never demote an
+    // already-adopted row back to Discovered.
+    let backup = backup_with_origin(Some(Origin::Adopted), Some("discovered"));
+    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+}
+
+#[test]
+fn resolve_origin_reads_adopted_from_the_label_when_status_is_unset() {
+    // Label-only adoption (status not yet stamped, e.g. mid-reconcile) still
+    // resolves to Adopted — the label is the fallback, not just Discovered's.
+    let backup = backup_with_origin(None, Some("adopted"));
+    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+}
+
+// --- needs_terminal_pin: shared idempotence gate for the Discovered/Adopted
+// steady-state pin arms (M5) -------------------------------------------------
+//
+// `reconcile_inner`'s `pin_discovered_row`/`pin_adopted_row` are thin async IO
+// wrappers around a `snapshot_ready_status` patch; the one piece of actual
+// decision logic they contain — whether a patch is needed at all this pass —
+// is this pure predicate, extracted so the "only pin when unset/divergent,
+// never re-patch once converged" idempotence is unit-tested without a cluster.
+// The wrapper functions' IO (the patch calls, `ensure_finalizer`, the terminal
+// requeue) is exercised live by the M8 e2e suite, not here.
+
+#[test]
+fn needs_terminal_pin_true_when_phase_unset() {
+    assert!(super::plan::needs_terminal_pin(
+        None,
+        SnapshotPhase::Discovered
+    ));
+    assert!(super::plan::needs_terminal_pin(
+        None,
+        SnapshotPhase::Succeeded
+    ));
+}
+
+#[test]
+fn needs_terminal_pin_true_when_phase_diverges_from_target() {
+    assert!(super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Pending),
+        SnapshotPhase::Succeeded
+    ));
+    assert!(super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Succeeded),
+        SnapshotPhase::Discovered
+    ));
+}
+
+#[test]
+fn needs_terminal_pin_false_once_converged() {
+    // The idempotence both `pin_discovered_row` and `pin_adopted_row` rely on:
+    // once the observed phase matches the arm's own target, no further patch.
+    assert!(!super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Discovered),
+        SnapshotPhase::Discovered
+    ));
+    assert!(!super::plan::needs_terminal_pin(
+        Some(SnapshotPhase::Succeeded),
+        SnapshotPhase::Succeeded
+    ));
+}
+
+#[test]
+fn adopted_row_has_provenance_gates_the_succeeded_pin() {
+    use kopiur_api::common::ResolvedIdentity;
+    use kopiur_api::snapshot::{SnapshotInfo, SnapshotStatus};
+    // I1: a user-applied BARE `origin: adopted` label with NO `status.snapshot`
+    // resolves `Adopted` (label fallback) but carries NO controller-written
+    // provenance — `pin_adopted_row` must NOT pin it `Succeeded`. A phantom
+    // Succeeded row would enter GFS retention (displacing a real snapshot) and set
+    // `has_history` (suppressing a recreated policy's scan). On HEAD
+    // `pin_adopted_row` pinned ANY Adopted-resolving row.
+    let forged = backup_with_origin(None, Some("adopted"));
+    assert_eq!(resolve_origin(&forged), Origin::Adopted);
+    assert!(
+        !super::plan::adopted_row_has_provenance(&forged),
+        "a bare origin:adopted label carries no provenance"
+    );
+    // A genuine adopted row (adopt_one wrote `status.snapshot`) IS pinned.
+    let mut genuine = dummy_backup();
+    genuine.status = Some(SnapshotStatus {
+        origin: Some(Origin::Adopted),
+        snapshot: Some(SnapshotInfo {
+            kopia_snapshot_id: "k-abc".into(),
+            identity: ResolvedIdentity {
+                username: "u".into(),
+                hostname: "h".into(),
+                source_path: Some("/d".into()),
+            },
+        }),
+        ..Default::default()
+    });
+    assert!(
+        super::plan::adopted_row_has_provenance(&genuine),
+        "a controller-written adopted row carries provenance"
     );
 }
 

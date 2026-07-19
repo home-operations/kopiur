@@ -324,6 +324,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `adoption` | enum: Adopt \| Ignore | — | Whether a discovered snapshot whose resolved identity matches a live `SnapshotPolicy` is automatically adopted — re-attached (stamped with that policy's config label, `status.origin` flipped to `Adopted`) so GFS retention governs it and eventually prunes it, instead of it sitting in the catalog forever as an immortal `discovered` row. |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
 | `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster. `status.catalog.foreignSnapshotCount` counts an identity hostname carrying a different `.&lt;cluster&gt;` suffix ALWAYS, under either value below, plus — under `Ignore` only — a bare hostname naming no allowed namespace here. Under `Fallback`, that same disallowed bare host is NOT counted foreign: it materializes into `catalog.fallbackNamespace` exactly like a disallowed `OwnCluster` host would, so it is placed rather than dropped-and-counted (see `classify_hostname`/`decide_cluster_placement`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
@@ -614,6 +615,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
+| `scanRequestAttemptAt` | string | — | RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF a pending `catalog-scan-requested-at` token (i.e. the token arm was the reason the attempt fired). Used only to rate-limit token-driven attempts on a Ready-but-unreachable repository — it is never compared against the token for retirement (that's `scanRequestHonored`, by equality). |
+| `scanRequestHonored` | string | — | The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at` annotation last honored by a completed catalog scan. Compared by **equality** against the live annotation to decide whether a requested on-demand scan is still pending — deliberately NOT a timestamp comparison against `lastRefreshAt` (a periodic refresh completing after the request was made would otherwise look like it honored the request even though it started before the annotation was set). |
 
 #### `status.conditions[]` { #repository-status-conditions }
 
@@ -1000,6 +1003,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `adoption` | enum: Adopt \| Ignore | — | Whether a discovered snapshot whose resolved identity matches a live `SnapshotPolicy` is automatically adopted — re-attached (stamped with that policy's config label, `status.origin` flipped to `Adopted`) so GFS retention governs it and eventually prunes it, instead of it sitting in the catalog forever as an immortal `discovered` row. |
 | `fallbackNamespace` | string | — | Where to materialize discovered `Snapshot`s with no allowed-namespace mapping (ClusterRepository only). |
 | `foreignSnapshots` | enum: Ignore \| Fallback | — | How catalog discovery treats snapshots written by ANOTHER cluster. `status.catalog.foreignSnapshotCount` counts an identity hostname carrying a different `.&lt;cluster&gt;` suffix ALWAYS, under either value below, plus — under `Ignore` only — a bare hostname naming no allowed namespace here. Under `Fallback`, that same disallowed bare host is NOT counted foreign: it materializes into `catalog.fallbackNamespace` exactly like a disallowed `OwnCluster` host would, so it is placed rather than dropped-and-counted (see `classify_hostname`/`decide_cluster_placement`). Meaningful only when `identityDefaults.cluster` is set: without a cluster identity there is no notion of "foreign" and the legacy hostname-names-a-namespace placement applies (validators enforce this). |
 | `periodicRefresh` | boolean | — | Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs current (re-list snapshots; for object-store / volume-backed repos this recycles the bootstrap Job every `refreshInterval`). **Off by default** — the repository still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup failure, but does not re-run on a timer. Enable it if you rely on discovered snapshots reflecting changes made outside this operator. |
@@ -1298,6 +1302,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
+| `scanRequestAttemptAt` | string | — | RFC 3339 timestamp of the last bootstrap/scan attempt initiated BECAUSE OF a pending `catalog-scan-requested-at` token (i.e. the token arm was the reason the attempt fired). Used only to rate-limit token-driven attempts on a Ready-but-unreachable repository — it is never compared against the token for retirement (that's `scanRequestHonored`, by equality). |
+| `scanRequestHonored` | string | — | The RFC3339 token VALUE of the `kopiur.home-operations.com/catalog-scan-requested-at` annotation last honored by a completed catalog scan. Compared by **equality** against the live annotation to decide whether a requested on-demand scan is still pending — deliberately NOT a timestamp comparison against `lastRefreshAt` (a periodic refresh completing after the request was made would otherwise look like it honored the request even though it started before the annotation was set). |
 
 #### `status.conditions[]` { #clusterrepository-status-conditions }
 
@@ -1376,10 +1382,12 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `repository` | [object](#snapshotpolicy-spec-repository) | **required** | Discriminated reference to a `Repository` or `ClusterRepository`. |
+| `adoption` | enum: Adopt \| Ignore | — | Whether a discovered snapshot whose resolved identity matches a live `SnapshotPolicy` is automatically adopted — re-attached (stamped with that policy's config label, `status.origin` flipped to `Adopted`) so GFS retention governs it and eventually prunes it, instead of it sitting in the catalog forever as an immortal `discovered` row. |
 | `compression` | [object](#snapshotpolicy-spec-compression) | — | Compression algorithm + per-extension opt-outs. |
 | `copyMethod` | enum: Snapshot \| Clone \| Direct | `Snapshot` | How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`. |
 | `credentialProjection` | [object](#snapshotpolicy-spec-credentialprojection) | — | Opt-in credential-Secret projection into each backup mover's namespace (default off). |
 | `defaultDeletionPolicy` | enum: Delete \| Retain \| Orphan | `Delete` | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
+| `deletion` | [object](#snapshotpolicy-spec-deletion) | — | Deletion semantics for the `Snapshot` CRs carrying this recipe's config label. |
 | `errorHandling` | [object](#snapshotpolicy-spec-errorhandling) | — | Backup-side error handling: let a snapshot complete-with-errors instead of failing outright. |
 | `extraArgs` | []string | — | Escape hatch for kopia flags not yet modeled. |
 | `files` | [object](#snapshotpolicy-spec-files) | — | Paths/patterns kopia should skip while snapshotting. |
@@ -1416,6 +1424,12 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default. |
+
+#### `spec.deletion` { #snapshotpolicy-spec-deletion }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `onPolicyDelete` | enum: Retain \| Delete | `Retain` | Consulted by the Snapshot finalizer when the deletion is external and the owning `SnapshotPolicy` is gone. Absent resolves to `Retain`. |
 
 #### `spec.errorHandling` { #snapshotpolicy-spec-errorhandling }
 
@@ -1698,12 +1712,23 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `adoption` | [object](#snapshotpolicy-status-adoption) | — | Summary of automatic adoption of discovered snapshots into this recipe. |
 | `conditions` | [][object](#snapshotpolicy-status-conditions) | — | Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`). |
 | `lastSuccessfulSnapshot` | string | — | RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe. |
 | `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
 | `resolved` | [object](#snapshotpolicy-status-resolved) | — | What would be passed to kopia — pinned at admission. |
 | `retention` | [object](#snapshotpolicy-status-retention) | — | Summary of GFS retention pruning against this config's `Snapshot` CRs. |
+
+#### `status.adoption` { #snapshotpolicy-status-adoption }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `lastAdoptedCount` | integer | —<br><sub>min 0</sub> | Number of discovered `Snapshot` CRs adopted by the last adoption pass. |
+| `lastAdoptionAt` | string | — | RFC3339 timestamp of the last adoption pass that adopted at least one snapshot. |
+| `scanRequestedAt` | string | — | RFC3339 token echoing an in-flight on-demand adoption scan request for this policy's identity; cleared once honored. |
+| `scanRequestedIdentity` | string | — | The resolved kopia identity the requested scan was scoped to, pinned at request time so a later identity-changing edit can't retarget an in-flight scan. |
+| `totalAdopted` | integer | —<br><sub>min 0</sub> | Running total of `Snapshot` CRs ever adopted into this recipe. |
 
 #### `status.conditions[]` { #snapshotpolicy-status-conditions }
 
@@ -1790,7 +1815,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `job` | [object](#snapshot-status-job) | — | The mover Job backing this run; absent for discovered. |
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
-| `origin` | enum: scheduled \| manual \| discovered | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
+| `origin` | enum: scheduled \| manual \| discovered \| adopted | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
 | `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered | — | Lifecycle phase of a `Snapshot`. |
 | `pinned` | boolean | — | The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile. |
 | `preflightSince` | string | — | RFC 3339 timestamp of the first reconcile where the repository was `Ready` but a `spec.preflight` check was failing. The one-shot anchor for the preflight `timeout` deadline (so the budget covers preflight only, not the earlier repository-not-Ready wait). Cleared once every preflight check passes, so a later failing episode gets a fresh budget rather than a stale anchor. |

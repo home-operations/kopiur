@@ -479,7 +479,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             }
             // Non-blocking MassDeletionHeld condition from the live Snapshot store
             // (mirrors IndexBlobHealth), folded into the same conditions array.
-            let conditions = fold_mass_deletion(ctx, repo, &conditions);
+            let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
             // Always publish the kstatus Ready conditions for the healthy bare-path
             // repo (issue #245), layered on any conditions built above — even when
             // no index-blob count was read, so a resume clears the suspend branch's
@@ -513,6 +513,8 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 last_refresh_at(repo),
                 interval,
                 CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+                scan_requested_token(repo),
+                scan_requested_honored(repo),
                 chrono::Utc::now(),
             ) {
                 let listing = client.snapshot_list(None).await?;
@@ -601,6 +603,34 @@ fn last_refresh_at(repo: &Repository) -> Option<&str> {
         .and_then(|c| c.last_refresh_at.as_deref())
 }
 
+/// The live `catalog-scan-requested-at` annotation value (opaque token; the
+/// writer is the policy reconciler, M6). `None` when never requested.
+fn scan_requested_token(repo: &Repository) -> Option<&str> {
+    repo.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(crate::consts::CATALOG_SCAN_REQUESTED_ANNOTATION))
+        .map(String::as_str)
+}
+
+/// `status.catalog.scanRequestHonored` from the cached object — the token last
+/// retired by a completed scan (equality-compared against the live annotation).
+fn scan_requested_honored(repo: &Repository) -> Option<&str> {
+    repo.status
+        .as_ref()
+        .and_then(|s| s.catalog.as_ref())
+        .and_then(|c| c.scan_request_honored.as_deref())
+}
+
+/// `status.catalog.scanRequestAttemptAt` from the cached object — rate-limits
+/// how often a pending token may (re-)launch a bootstrap/scan attempt.
+fn scan_requested_attempt_at(repo: &Repository) -> Option<&str> {
+    repo.status
+        .as_ref()
+        .and_then(|s| s.catalog.as_ref())
+        .and_then(|c| c.scan_request_attempt_at.as_deref())
+}
+
 /// The `Repository`'s currently-observed status conditions (empty when it has no status).
 fn repo_conditions(
     repo: &Repository,
@@ -635,7 +665,7 @@ fn mass_deletion_ack_raw(repo: &Repository) -> Option<&str> {
 /// live Snapshot store (ADR-0005 §6; delegates to the shared
 /// [`crate::snapshot::repo_mass_deletion_conditions`]). Returns `conditions`
 /// unchanged when the store is unset/unsynced.
-fn fold_mass_deletion(
+async fn fold_mass_deletion(
     ctx: &Context,
     repo: &Repository,
     conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
@@ -645,9 +675,11 @@ fn fold_mass_deletion(
         &repository_ref(repo),
         mass_deletion_ack_raw(repo),
         repo.spec.deletion_protection.as_ref(),
+        repo.spec.on_namespace_delete,
         conditions,
         repo.metadata.generation,
     )
+    .await
 }
 
 /// Project this `Repository`'s `spec.maintenance` into its managed `Maintenance` CR and
@@ -805,6 +837,10 @@ async fn bootstrap_via_mover(
                         last_refresh_at(repo),
                         interval,
                         CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+                        scan_requested_token(repo),
+                        scan_requested_honored(repo),
+                        scan_requested_attempt_at(repo),
+                        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
                         chrono::Utc::now(),
                     )
                 {
@@ -835,6 +871,10 @@ async fn bootstrap_via_mover(
             last_refresh_at(repo),
             CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
             CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+            scan_requested_token(repo),
+            scan_requested_honored(repo),
+            scan_requested_attempt_at(repo),
+            kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
             chrono::Utc::now(),
         ))
     {
@@ -857,7 +897,7 @@ async fn bootstrap_via_mover(
         // Own guarded write, sourced from the FRESH conditions so it carries all
         // of them (no clobber) and is skipped when unchanged; ensure_maintenance
         // then builds on the folded array.
-        let conditions = fold_mass_deletion(ctx, repo, &conditions);
+        let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());
@@ -871,6 +911,19 @@ async fn bootstrap_via_mover(
         ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
+
+    // Whether we are about to launch a Job BECAUSE OF a pending scan-request
+    // token (regardless of whatever else also fired the gate above) — used only
+    // to stamp `scanRequestAttemptAt` below, the token arm's own rate limit. It
+    // never gates anything else, so recomputing it here (rather than plumbing a
+    // bool out of `bootstrap_create_due`) is simplest and stays pure.
+    let token_driven_scan_request = catalog::scan_requested_due(
+        scan_requested_token(repo),
+        scan_requested_honored(repo),
+        scan_requested_attempt_at(repo),
+        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
+        chrono::Utc::now(),
+    );
 
     // Build + apply the Job (ConfigMap carries the work spec; the result is
     // written back into the same ConfigMap under `result.json`).
@@ -1056,6 +1109,16 @@ async fn bootstrap_via_mover(
     };
     if let Some(token) = reverify_token {
         create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
+    }
+    // Rate-limit backoff for the scan-request token: stamped BEFORE the outcome is
+    // known (a probe-style failure never lands in `run_catalog_scan`, so the
+    // honored-write there is not a reliable place to bound retries) — see
+    // `catalog::scan_requested_due`. Merge-patched under `catalog` so the other
+    // `status.catalog` fields (lastRefreshAt, scanRequestHonored, ...) are untouched.
+    if token_driven_scan_request {
+        create_status["catalog"] = serde_json::json!({
+            "scanRequestAttemptAt": chrono::Utc::now().to_rfc3339(),
+        });
     }
     io::patch_status(api, name, create_status).await?;
     tracing::info!(repo = %name, backend = backend.kind_str(), "launched repository bootstrap Job");
@@ -1364,7 +1427,7 @@ async fn finalize_bootstrap(
     // Non-blocking MassDeletionHeld condition from the live Snapshot store
     // (mirrors IndexBlobHealth), folded into the same conditions array before the
     // kstatus set_ready so the merge-patch replace carries it too.
-    let conditions = fold_mass_deletion(ctx, repo, &conditions);
+    let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and
@@ -1417,6 +1480,8 @@ async fn finalize_bootstrap(
         last_refresh_at(repo),
         interval,
         CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+        scan_requested_token(repo),
+        scan_requested_honored(repo),
         chrono::Utc::now(),
     ) {
         run_catalog_scan(
@@ -1632,15 +1697,24 @@ async fn run_catalog_scan(
         .set_repo_size_bytes(namespace, repo_name, size_bytes);
 
     let api: Api<Repository> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut catalog_patch = serde_json::json!({
+        "discoveredBackupCount": outcome.discovered,
+        "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
+        "foreignSnapshotCount": foreign_total,
+    });
+    // Retire a pending `catalog-scan-requested-at` token: ANY completed scan (not
+    // just one the token itself triggered) honors it, since the request was for
+    // "materialize the catalog", not "run a scan for this specific reason".
+    // `scanRequestAttemptAt` is deliberately left as-is — equality retirement
+    // (`token == honored`) makes it inert from here on regardless of its value.
+    if let Some(token) = scan_requested_token(repo) {
+        catalog_patch["scanRequestHonored"] = serde_json::Value::String(token.to_string());
+    }
     io::patch_status(
         &api,
         repo_name,
         serde_json::json!({
-            "catalog": {
-                "discoveredBackupCount": outcome.discovered,
-                "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
-                "foreignSnapshotCount": foreign_total,
-            },
+            "catalog": catalog_patch,
             "storageStats": { "snapshotCount": total_snapshot_count, "totalSizeBytes": size_bytes },
         }),
     )

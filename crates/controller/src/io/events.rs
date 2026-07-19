@@ -68,6 +68,39 @@ pub async fn publish_warning_event<K>(
     }
 }
 
+/// Emit a `Normal` Event on `obj` so an informational message is visible via
+/// `kubectl describe`/`get events`, not only in the controller log. The `Normal`
+/// counterpart to [`publish_warning_event`]: used for expected, non-error
+/// milestones (e.g. auto-adoption re-attaching discovered snapshots, M6).
+/// Best-effort: a publish failure is logged, never fatal.
+pub async fn publish_normal_event<K>(
+    ctx: &Context,
+    obj: &K,
+    reason: &str,
+    action: &str,
+    message: &str,
+) where
+    K: Resource<DynamicType = ()>,
+{
+    let regarding = event_ref(obj);
+    if let Err(e) = ctx
+        .recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: reason.into(),
+                note: Some(message.to_string()),
+                action: action.into(),
+                secondary: None,
+            },
+            &regarding,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, reason, "failed to publish Normal event");
+    }
+}
+
 /// Emit a `Warning` Event on an explicit [`ObjectReference`], for a referent the
 /// reconciler does not hold as a typed object — e.g. the deletion finalizer
 /// warning about a malformed `allow-mass-deletion` ack on the repository CR it

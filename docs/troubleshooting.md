@@ -361,6 +361,44 @@ $ kubectl get snapshotschedule <name> -n <ns> \
 - If the operator was down across a slot and `startingDeadlineSeconds` elapsed, that slot is skipped on purpose (no late stampede).
 - Repeated failures show up as `status.consecutiveFailures`; the failing `Snapshot` CRs (bounded by `failedJobsHistoryLimit`) carry the reason.
 
+## My old snapshots were pruned after I recreated a policy
+
+You deleted a `SnapshotPolicy` (or it was deleted-and-recreated by GitOps), and
+some of the backup history you expected to keep is now gone.
+
+**What happened**: this is [automatic adoption](repositories.md#catalogadoption--automatically-re-attaching-discovered-snapshots) plus GFS retention working exactly as designed, not a bug. With `onPolicyDelete: Retain` (the default), deleting the policy kept every kopia snapshot in the repository — nothing was lost at that point. Re-applying the policy triggered a catalog scan, which rediscovered them, which triggered adoption, which re-attached them as `origin: adopted` `Snapshot` CRs governed by the SAME `spec.retention` window as any produced backup. If that window is narrower than the effective age of the history you just got back (or narrower than the window the OLD policy used), some of the newly-adopted rows are outside it on the very first reconcile — and GFS prunes them immediately, same as it would any other out-of-window snapshot.
+
+**The paper trail**: a `SnapshotsAdopted` Normal Event on the `SnapshotPolicy` names exactly how many rows were adopted and under which identity, right before retention's own prune events show what went out the other side:
+
+```console
+$ kubectl describe snapshotpolicy <name> -n <ns> | grep -A3 SnapshotsAdopted
+```
+
+**Fix**: widen `spec.retention` on the recreated policy to cover the history you want kept — retention decisions are made fresh on every reconcile, so a wider window applied even after the fact stops future prunes from taking the remaining rows (it does not undo already-deleted CRs; if `Delete` already ran, the kopia snapshot is really gone). If you don't want a recreated policy to inherit history at all, opt out (see below) **before** re-applying it.
+
+**Both opt-outs**, if this isn't the behavior you want going forward:
+
+- `SnapshotPolicy.spec.adoption: Ignore` — this recipe never adopts, regardless of the repository's setting.
+- `Repository`/`ClusterRepository` `spec.catalog.adoption: Ignore` — no policy against this repository adopts.
+
+## Adoption didn't happen
+
+You expected a recreated (or brand-new) `SnapshotPolicy` to pick up matching
+`origin: discovered` snapshots, and it didn't.
+
+| Check                                                                                                    | How                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Adoption is actually on.** The effective mode is `SnapshotPolicy.spec.adoption` if set, else the repository's `spec.catalog.adoption`, else `Adopt`. | `kubectl get snapshotpolicy <name> -n <ns> -o jsonpath='{.spec.adoption}'` and the same on the `Repository`/`ClusterRepository` — either explicitly `Ignore` is a full stop.                                                            |
+| **The identity really matches — exactly.** Adoption never partial-matches: `username` AND `hostname` AND `sourcePath` on the discovered row must ALL equal the policy's resolved identity. | Compare `status.resolved.identity` on the `SnapshotPolicy` against `status.snapshot.identity` on the `Snapshot` you expected adopted. Any one field differing (a typo'd `identity.hostname`, a different `sourcePathOverride`) is a silent non-match — no error, it's simply not a candidate. |
+| **It isn't a foreign-cluster row.** On a repository with [`identityDefaults.cluster`](repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters) set, a discovered row whose hostname classifies as another cluster's is refused even on an otherwise-exact identity match — by design. | Check the repository's `identityDefaults.cluster` and whether the discovered row's hostname belongs to a different cluster. |
+| **The scan request isn't stuck pending against an unreachable repo.** A brand-new/recreated policy with nothing to adopt yet stamps `kopiur.home-operations.com/catalog-scan-requested-at` on the repository and waits for it to be honored. | `kubectl get repository <name> -n <ns> -o jsonpath='{.metadata.annotations.kopiur\.home-operations\.com/catalog-scan-requested-at}{"  honored="}{.status.catalog.scanRequestHonored}{"\n"}'` — if the annotation value and `scanRequestHonored` **differ**, the scan hasn't completed yet (repository not `Ready`, or a launch backoff against a flaky backend — see [Repository never reaches Ready](#repository-never-reaches-ready)). If they're **equal**, the scan already ran; the discovered row genuinely wasn't there or didn't match. |
+| **Enough time has passed for the next reconcile.** Adoption runs on the `SnapshotPolicy`'s own reconcile loop, which fires again once the scan is honored — it isn't instantaneous with the scan completing. | Give it the same ~30s window a normal reconcile takes, then re-check for a `SnapshotsAdopted` Event. |
+
+If every row above checks out and adoption still didn't fire, the discovered
+`Snapshot` may simply not exist yet — confirm it with
+`kubectl get snapshots -n <ns> -l kopiur.home-operations.com/origin=discovered`
+before assuming adoption is broken.
+
 ## CRDs or CRs disappeared after upgrading to 0.6.0
 
 Upgrading **from 0.5.x to 0.6.0** moves the CRDs into Helm's `crds/` directory. On
