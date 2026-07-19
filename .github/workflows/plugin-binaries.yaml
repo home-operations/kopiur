@@ -52,7 +52,7 @@ jobs:
       # installing any mise tools — rustup provisions the leg's toolchain so
       # each runner only downloads its own target's stdlib.
       - name: Setup Mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           cache: false
           experimental: true
