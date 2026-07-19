@@ -143,7 +143,7 @@ fn mass_deletion_ack_raw(repo: &ClusterRepository) -> Option<&str> {
 /// live Snapshot store (ADR-0005 §6; shared
 /// [`crate::snapshot::repo_mass_deletion_conditions`]). Unchanged when the store
 /// is unset/unsynced.
-fn fold_mass_deletion(
+async fn fold_mass_deletion(
     ctx: &Context,
     repo: &ClusterRepository,
     conditions: &[Condition],
@@ -153,9 +153,11 @@ fn fold_mass_deletion(
         &cluster_repository_ref(repo),
         mass_deletion_ack_raw(repo),
         repo.spec.deletion_protection.as_ref(),
+        repo.spec.on_namespace_delete,
         conditions,
         repo.metadata.generation,
     )
+    .await
 }
 
 /// Which namespace a cluster-scoped repository reads its credential `Secret` from (and
@@ -477,7 +479,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
             // Non-blocking MassDeletionHeld condition from the live Snapshot store.
-            let existing = fold_mass_deletion(ctx, repo, &existing);
+            let existing = fold_mass_deletion(ctx, repo, &existing).await;
             let conditions = io::set_ready(
                 &existing,
                 repo.metadata.generation,
@@ -976,7 +978,7 @@ async fn bootstrap_cluster_via_mover(
         // ack-drain watch also lands here on an annotation edit). Own guarded
         // write from the FRESH conditions (no clobber, skipped when unchanged);
         // ensure_maintenance then builds on the folded array.
-        let conditions = fold_mass_deletion(ctx, repo, &conditions);
+        let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());
@@ -1409,7 +1411,7 @@ async fn finalize_cluster_bootstrap(
     }
     // Non-blocking MassDeletionHeld condition from the live Snapshot store,
     // folded into the conditions array before the kstatus set_ready.
-    let conditions = fold_mass_deletion(ctx, repo, &conditions);
+    let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and

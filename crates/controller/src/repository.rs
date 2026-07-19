@@ -479,7 +479,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             }
             // Non-blocking MassDeletionHeld condition from the live Snapshot store
             // (mirrors IndexBlobHealth), folded into the same conditions array.
-            let conditions = fold_mass_deletion(ctx, repo, &conditions);
+            let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
             // Always publish the kstatus Ready conditions for the healthy bare-path
             // repo (issue #245), layered on any conditions built above — even when
             // no index-blob count was read, so a resume clears the suspend branch's
@@ -665,7 +665,7 @@ fn mass_deletion_ack_raw(repo: &Repository) -> Option<&str> {
 /// live Snapshot store (ADR-0005 §6; delegates to the shared
 /// [`crate::snapshot::repo_mass_deletion_conditions`]). Returns `conditions`
 /// unchanged when the store is unset/unsynced.
-fn fold_mass_deletion(
+async fn fold_mass_deletion(
     ctx: &Context,
     repo: &Repository,
     conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
@@ -675,9 +675,11 @@ fn fold_mass_deletion(
         &repository_ref(repo),
         mass_deletion_ack_raw(repo),
         repo.spec.deletion_protection.as_ref(),
+        repo.spec.on_namespace_delete,
         conditions,
         repo.metadata.generation,
     )
+    .await
 }
 
 /// Project this `Repository`'s `spec.maintenance` into its managed `Maintenance` CR and
@@ -895,7 +897,7 @@ async fn bootstrap_via_mover(
         // Own guarded write, sourced from the FRESH conditions so it carries all
         // of them (no clobber) and is skipped when unchanged; ensure_maintenance
         // then builds on the folded array.
-        let conditions = fold_mass_deletion(ctx, repo, &conditions);
+        let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());
@@ -1425,7 +1427,7 @@ async fn finalize_bootstrap(
     // Non-blocking MassDeletionHeld condition from the live Snapshot store
     // (mirrors IndexBlobHealth), folded into the same conditions array before the
     // kstatus set_ready so the merge-patch replace carries it too.
-    let conditions = fold_mass_deletion(ctx, repo, &conditions);
+    let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and

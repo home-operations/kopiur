@@ -1358,6 +1358,27 @@ fn ns_terminating_policy_cascade_stays_nondestructive_under_default_ns_policy() 
 }
 
 #[test]
+fn ns_terminating_retention_prune_keeps_prune_semantics_never_held() {
+    // A genuine OPERATOR prune (Retention/FailedHistory) in a terminating
+    // namespace under `onNamespaceDelete: Delete` keeps its prune semantics: it
+    // deletes on effective `Delete` and is NEVER held by the breaker, even with
+    // the breaker tripping. `plan_ns_delete` routes it to `plan_prune`, not
+    // `plan_external`, so the ns-teardown opt-in does not turn retention into a
+    // breaker-gated mass deletion — retention must keep working during an
+    // incident. This is the invariant the PolicyCascade fix must not disturb.
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        let plan = plan_deletion(DeletionFacts {
+            ns_terminating: true,
+            ns_policy: Some(NamespaceDeletePolicy::Delete),
+            breaker: BreakerState::Held,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::DeleteSnapshot, "{kind:?} never held");
+    }
+}
+
+#[test]
 fn breaker_never_holds_retain_or_orphan() {
     let a = BTreeMap::new();
     for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
@@ -2071,16 +2092,76 @@ fn counts_toward_breaker_cascade_retained_is_false() {
 }
 
 #[test]
-fn counts_toward_breaker_policy_cascade_stamp_is_false() {
-    // Locks the new PrunedBy::PolicyCascade variant into the existing
-    // early-return short-circuit (any valid pruned-by stamp never counts
-    // toward the breaker) — the M3 finalizer must never see this stamp
-    // inflate a repository's pending count.
+fn counts_toward_breaker_policy_cascade_stamp_is_false_in_live_namespace() {
+    // In a LIVE namespace a `policy-cascade` stamp is quiet-retained
+    // (RetainSnapshotOnPolicyDelete), never a destructive delete, so it does not
+    // count toward the breaker — even though `PolicyCascade` (unlike
+    // Retention/FailedHistory) is no longer blanket-exempted. The plan check,
+    // not a stamp short-circuit, is what excludes it here.
     let a = pruned(PrunedBy::PolicyCascade);
     assert!(!counts_toward_breaker(DeletionFacts {
         policy: DeletionPolicy::Delete,
         ..base_facts(&a)
     }));
+}
+
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_true_under_ns_teardown_delete() {
+    // The gap this fix closes (PR #272): during a namespace teardown with the
+    // explicit `onNamespaceDelete: Delete` opt-in, a `policy-cascade`-stamped
+    // child resolves to an external destructive DeleteSnapshot
+    // (plan_ns_delete → plan_external), so it MUST count toward the per-repo
+    // mass-deletion breaker exactly like an unstamped external child — otherwise
+    // a large teardown that stamps all its children mass-deletes kopia data with
+    // NO breaker hold and NO ack. On HEAD this returned false (any pruned-by was
+    // blanket-exempt), silently nullifying the breaker in the common case.
+    let a = pruned(PrunedBy::PolicyCascade);
+    assert!(counts_toward_breaker(DeletionFacts {
+        policy: DeletionPolicy::Delete,
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        ..base_facts(&a)
+    }));
+}
+
+#[test]
+fn counts_toward_breaker_retention_prune_stays_exempt_even_under_ns_teardown_delete() {
+    // The stamp-exemption exists for OPERATOR prunes: Retention (and
+    // FailedHistory) are bounded, deliberate, steady-state deletes that must
+    // keep working during an incident and are NEVER held. That exemption holds
+    // EVERYWHERE — including a terminating namespace under `Delete` — so an
+    // operator prune never trips the breaker.
+    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+        let a = pruned(kind);
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy: DeletionPolicy::Delete,
+                ns_terminating: true,
+                ns_policy: Some(NamespaceDeletePolicy::Delete),
+                ..base_facts(&a)
+            }),
+            "{kind:?} must stay breaker-exempt under ns-teardown Delete"
+        );
+    }
+}
+
+#[test]
+fn counts_toward_breaker_policy_cascade_stamp_is_false_under_ns_teardown_orphan() {
+    // Complement to the Delete case: under the DEFAULT ns policy (Orphan) or an
+    // unresolved repository (None), a terminating `policy-cascade` child plans
+    // OrphanSnapshot — non-destructive — so it must NOT count toward the breaker.
+    let a = pruned(PrunedBy::PolicyCascade);
+    for ns_policy in [None, Some(NamespaceDeletePolicy::Orphan)] {
+        assert!(
+            !counts_toward_breaker(DeletionFacts {
+                policy: DeletionPolicy::Delete,
+                ns_terminating: true,
+                ns_policy,
+                ..base_facts(&a)
+            }),
+            "{ns_policy:?}"
+        );
+    }
 }
 
 // -- breaker_stores_ready / parse_mass_deletion_ack ------------------------

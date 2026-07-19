@@ -320,12 +320,29 @@ pub fn owner_state_from(fetched: Option<&SnapshotSchedule>, owner: &OwnerReferen
     }
 }
 
-/// Whether this pending deletion counts toward its repository's breaker:
-/// external (no valid pruned-by) AND its plan WITHOUT the breaker is
+/// Whether this pending deletion counts toward its repository's breaker: a
+/// destructive EXTERNAL delete whose plan WITHOUT the breaker is
 /// `DeleteSnapshot`. Implemented by re-running [`plan_deletion`] with
 /// `breaker = Allowed` — one decision function, no forked logic.
+///
+/// The `pruned-by` stamp is **exhaustively** classified (no catch-all), because
+/// not every stamp is breaker-exempt:
+///
+/// - `Retention` / `FailedHistory` are OPERATOR prunes — bounded, deliberate,
+///   steady-state deletes whose rate is governed elsewhere; they are exempt
+///   EVERYWHERE (retention must keep working during an incident, never held).
+/// - `PolicyCascade` and unstamped (`None`) are NOT exempt: they fall through to
+///   the plan check. A `policy-cascade`-stamped child is quiet-retained in
+///   steady state (its plan is `RetainSnapshotOnPolicyDelete`, not
+///   `DeleteSnapshot`, so it still doesn't count), but under a namespace
+///   teardown with `onNamespaceDelete: Delete` its plan becomes an external
+///   destructive `DeleteSnapshot` ([`plan_ns_delete`] → [`plan_external`]) — a
+///   mass deletion that only happens because a human deleted a namespace, so it
+///   MUST count/hold exactly like an unstamped external child. A new
+///   [`PrunedBy`] variant fails to compile until its breaker fate is decided
+///   here (ADR §5.5).
 pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
-    if pruned_by(f.annotations).is_some() {
+    if !breaker_relevant(pruned_by(f.annotations)) {
         return false;
     }
     matches!(
@@ -335,6 +352,30 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
         }),
         DeletionPlan::DeleteSnapshot
     )
+}
+
+/// Whether a `pruned-by` classification is breaker-RELEVANT — a destructive
+/// EXTERNAL delete that counts toward / can be held by the mass-deletion breaker
+/// — as opposed to an exempt OPERATOR prune. **Exhaustive over [`PrunedBy`]** (no
+/// catch-all):
+///
+/// - `Retention` / `FailedHistory` → `false`: operator prunes, exempt everywhere.
+/// - `None` (unstamped) / `PolicyCascade` → `true`: breaker-relevant. A
+///   `PolicyCascade` member only ever reaches the destructive `DeleteSnapshot`
+///   plan (and so the counting set) under an `onNamespaceDelete: Delete` namespace
+///   teardown — a mass deletion a human triggered by deleting a namespace, which
+///   must count/hold like any external child.
+///
+/// The single source of truth shared by [`counts_toward_breaker`] and the
+/// [`crate::snapshot::batch::PendingMember::external`] flag, so the breaker's
+/// count, its held-set, and the surfaced ack value never disagree on which
+/// stamps are exempt. A new [`PrunedBy`] variant fails to compile until its
+/// breaker relevance is decided here (ADR §5.5).
+pub fn breaker_relevant(pruned: Option<PrunedBy>) -> bool {
+    match pruned {
+        Some(PrunedBy::Retention | PrunedBy::FailedHistory) => false,
+        None | Some(PrunedBy::PolicyCascade) => true,
+    }
 }
 
 /// Clamp a parsed ack timestamp to `<= now` (clock-skew guard): a future ack
