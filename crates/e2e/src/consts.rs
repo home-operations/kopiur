@@ -102,6 +102,17 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // Final-review flagship counterexample (mass_deletion.rs scenario 9): a held
     // external wave must not be swept into a concurrent breaker-exempt prune's batch.
     "massdel-heldprune",
+    // Policy-cascade + adoption scenarios (feat/policy-cascade-adoption, M8). Each
+    // needs its OWN kopia repository so adoption/retention/cascade counts never leak
+    // between scenarios. adoption.rs: the #210 adopt-then-prune acceptance test
+    // (`adopt-prune`) and the adoption opt-out (`adopt-ignore`); mass_deletion.rs
+    // scenarios 10-12: policy-cascade retain (`polcasc-retain`), breaker-gated opt-in
+    // delete (`polcasc-delete`), and simultaneous schedule+policy delete (`polcasc-simul`).
+    "adopt-prune",
+    "adopt-ignore",
+    "polcasc-retain",
+    "polcasc-delete",
+    "polcasc-simul",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
@@ -285,6 +296,12 @@ pub const BUCKETS: &[&str] = &[
     "kopiur-mc-d2",
     "kopiur-mc-e",
     "kopiur-mc-f",
+    // ClusterRepository cross-namespace adoption (M8, crates/e2e/tests/adoption.rs,
+    // `cluster_repository_adoption_cross_namespace`): a foreign-seeded snapshot whose
+    // identity hostname places its discovered row in the WORKLOAD namespace while the
+    // adopting SnapshotPolicy lives in the OPERATOR namespace — the cluster-wide-LIST
+    // adoption guard.
+    "kopiur-adopt-crepo",
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see

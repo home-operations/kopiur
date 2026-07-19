@@ -71,7 +71,7 @@ use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::events::v1::Event as EventsV1;
 
 use kopiur_api::consts::{
-    ALLOW_MASS_DELETION_ANNOTATION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    ALLOW_MASS_DELETION_ANNOTATION, CONFIG_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
     MASS_DELETION_HELD_CONDITION, OP_LABEL, ORIGIN_LABEL, PRUNED_BY_ANNOTATION,
     REPOSITORY_UID_LABEL, SCHEDULE_LABEL, SNAPSHOT_CLEANUP_FINALIZER,
 };
@@ -2028,5 +2028,724 @@ async fn batch_delete_retries_after_repo_outage() {
     );
 
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Policy-cascade scenarios (feat/policy-cascade-adoption, M8) ----------------
+// The SnapshotPolicy-deletion cascade is the sibling of the schedule-deletion cascade
+// (scenario 1): deleting a `SnapshotPolicy` cascades onto the `Snapshot` CRs carrying
+// its config label, governed by `spec.deletion.onPolicyDelete` (safe-default `Retain`,
+// opt-in `Delete`). These prove the Retain cascade keeps kopia + re-catalogs (10), the
+// `Delete` opt-in is breaker-gated WITHOUT wedging the policy finalizer (11), and a
+// simultaneous schedule+policy delete drains cleanly to Retain (12).
+
+/// This policy's config-labeled `Snapshot` children.
+async fn config_children(backups: &Api<Snapshot>, policy: &str) -> Vec<Snapshot> {
+    backups
+        .list(&ListParams::default().labels(&format!("{CONFIG_LABEL}={policy}")))
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default()
+}
+
+/// This repository's discovered rows (`origin=discovered` + the repository UID).
+async fn repo_discovered_rows(backups: &Api<Snapshot>, repo_uid: &str) -> Vec<Snapshot> {
+    backups
+        .list(&ListParams::default().labels(&format!(
+            "{ORIGIN_LABEL}=discovered,{REPOSITORY_UID_LABEL}={repo_uid}"
+        )))
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default()
+}
+
+// --- Scenario 10: policy-cascade (Retain) cleans CRs, keeps kopia, re-catalogs --
+
+const POLCASC_RETAIN_SUBPATH: &str = "polcasc-retain";
+
+/// Deleting a `SnapshotPolicy` whose `onPolicyDelete` is the safe-default `Retain`
+/// removes EVERY `Snapshot` CR carrying its config label — a schedule-produced one AND
+/// a MANUAL one created by plain apply with only a `spec.policyRef` (proving the M0
+/// webhook config-label stamp end-to-end) — WITHOUT hanging the policy finalizer or
+/// touching kopia. Each cascaded CR fires a `SnapshotRetainedOnPolicyDelete` Warning;
+/// the retained kopia snapshots re-catalog as `discovered`; and a pre-existing
+/// (different-identity) discovered row is untouched throughout.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn policy_cascade_delete_cleans_crs_keeps_kopia() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, POLCASC_RETAIN_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-polcasc-retain-repo";
+    const POLICY: &str = "e2e-polcasc-retain-pol";
+    const SCHED: &str = "e2e-polcasc-retain-sched";
+    const SEED_POL: &str = "e2e-polcasc-retain-seed-pol";
+    const SEED_SNAP: &str = "e2e-polcasc-retain-seed-1";
+    const MANUAL: &str = "e2e-polcasc-retain-manual";
+
+    // Fast catalog refresh so rediscovery is prompt; maintenance off. NO
+    // deletionProtection — the Retain cascade never counts against the breaker.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                POLCASC_RETAIN_SUBPATH,
+                serde_json::json!({
+                    "maintenance": { "enabled": false },
+                    "catalog": { "periodicRefresh": true, "refreshInterval": "30s" }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    let repo_uid = repos
+        .get(REPO)
+        .await
+        .expect("get Repository")
+        .uid()
+        .expect("Repository uid");
+
+    // Main policy: onPolicyDelete unset ⇒ Retain default; generous retention.
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "defaultDeletionPolicy": "Delete", "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create main SnapshotPolicy");
+
+    // Pre-existing DISCOVERED row (different identity): a seed policy produces one
+    // snapshot; deleting its CR (Retain) re-catalogs it as a discovered row, then the
+    // seed policy is removed so NO live policy matches its identity (it must never be
+    // adopted or cascaded — it is the untouched control).
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                SEED_POL,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create seed SnapshotPolicy");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                SEED_SNAP,
+                SEED_POL,
+                serde_json::json!({ "deletionPolicy": "Retain" }),
+            )),
+        )
+        .await
+        .expect("create seed Snapshot");
+    wait_phase(&backups, SEED_SNAP, "Succeeded")
+        .await
+        .expect("seed Snapshot should Succeed");
+    backups
+        .delete(SEED_SNAP, &DeleteParams::default())
+        .await
+        .expect("delete the seed Snapshot CR (Retain ⇒ kopia kept ⇒ rediscovered)");
+    let seed_row = wait_until(
+        "the seed snapshot re-catalogs as a discovered row",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let repo_uid = repo_uid.clone();
+            async move {
+                let rows = repo_discovered_rows(&backups, &repo_uid).await;
+                Ok(rows.into_iter().next())
+            }
+        },
+    )
+    .await
+    .expect("the seed snapshot must re-catalog as a discovered row");
+    let seed_disc_name = seed_row.name_any();
+    let seed_uid = seed_row.uid().expect("seed discovered row uid");
+    // Retire the seed policy so nothing live matches the seed identity.
+    let _ = policies.delete(SEED_POL, &DeleteParams::default()).await;
+
+    // Schedule-produced child.
+    schedules
+        .create(
+            &PostParams::default(),
+            &cr::<SnapshotSchedule>(schedule_json(SCHED, POLICY, "* * * * *")),
+        )
+        .await
+        .expect("create SnapshotSchedule");
+    let sched_selector = format!("{SCHEDULE_LABEL}={SCHED}");
+    wait_until(
+        "the schedule produces ≥1 Succeeded snapshot",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let sel = sched_selector.clone();
+            async move {
+                let list = backups
+                    .list(&ListParams::default().labels(&sel))
+                    .await?
+                    .items;
+                let ok = list.iter().any(|b| {
+                    serde_json::to_value(b)
+                        .unwrap_or_default()
+                        .pointer("/status/phase")
+                        .and_then(|p| p.as_str())
+                        == Some("Succeeded")
+                });
+                Ok(ok.then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("the schedule should produce a Succeeded snapshot");
+    // Freeze production so counts are stable across the cascade.
+    schedules
+        .patch(
+            SCHED,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({ "spec": { "schedule": { "suspend": true } } })),
+        )
+        .await
+        .expect("suspend schedule");
+
+    // MANUAL snapshot by plain apply with ONLY a policyRef (no config label): the
+    // admission webhook must STAMP the config label so it is GFS/cascade-visible.
+    let created: Snapshot = backups
+        .create(
+            &PostParams::default(),
+            &cr::<Snapshot>(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": MANUAL, "namespace": E2E_NAMESPACE },
+                "spec": { "policyRef": { "name": POLICY }, "deletionPolicy": "Delete" }
+            })),
+        )
+        .await
+        .expect("create the manual Snapshot with only a policyRef");
+    assert_eq!(
+        created.labels().get(CONFIG_LABEL).map(String::as_str),
+        Some(POLICY),
+        "the admission webhook must STAMP the config label on a policyRef-only manual Snapshot \
+         (M0), or it would be invisible to GFS retention and the policy cascade"
+    );
+    wait_phase(&backups, MANUAL, "Succeeded")
+        .await
+        .expect("the manual Snapshot should Succeed");
+
+    // The config-labeled child set the cascade must clean (scheduled + manual).
+    let child_names: Vec<String> = config_children(&backups, POLICY)
+        .await
+        .iter()
+        .map(|b| b.name_any())
+        .collect();
+    assert!(
+        child_names.len() >= 2 && child_names.iter().any(|n| n == MANUAL),
+        "expected ≥2 config-labeled children (scheduled + the stamped manual); got {child_names:?}"
+    );
+
+    let kopia_before = observed_snapshot_count(
+        &client,
+        "e2e-polcasc-retain-verify-1",
+        POLCASC_RETAIN_SUBPATH,
+    )
+    .await;
+    assert!(
+        kopia_before >= 3,
+        "kopia should hold the scheduled + manual + seed snapshots (≥3) before the cascade; got {kopia_before}"
+    );
+
+    // Delete ONLY the main policy.
+    policies
+        .delete(POLICY, &DeleteParams::default())
+        .await
+        .expect("delete the main SnapshotPolicy (the cascade trigger)");
+
+    // Drain: every config-labeled child gone AND the policy finalizer released, while
+    // the pre-existing discovered row endures with its ORIGINAL uid throughout (a
+    // cascade wrongly touching it would delete/replace it).
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let seed_now = backups
+            .get_opt(&seed_disc_name)
+            .await
+            .expect("get seed discovered row");
+        assert!(
+            seed_now
+                .as_ref()
+                .and_then(|s| s.uid())
+                .is_some_and(|u| u == seed_uid),
+            "the pre-existing discovered row must be UNTOUCHED by the policy cascade (same uid) \
+             throughout the drain"
+        );
+        let children = config_children(&backups, POLICY).await;
+        let policy_gone = policies
+            .get_opt(POLICY)
+            .await
+            .expect("get policy")
+            .is_none();
+        if children.is_empty() && policy_gone {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the policy cascade must drain every config-labeled child and RELEASE the policy \
+             finalizer; still {} child(ren), policy_gone={policy_gone}",
+            children.len()
+        );
+        tokio::time::sleep(poll_interval()).await;
+    }
+
+    // Each vanished child fired a `SnapshotRetainedOnPolicyDelete` Warning.
+    for name in &child_names {
+        assert!(
+            snapshot_warning_event_exists(
+                &client,
+                E2E_NAMESPACE,
+                name,
+                "SnapshotRetainedOnPolicyDelete"
+            )
+            .await,
+            "cascade-retained snapshot {name} must get a SnapshotRetainedOnPolicyDelete Warning"
+        );
+    }
+
+    // kopia UNCHANGED — the Retain cascade kept every snapshot.
+    let kopia_after = observed_snapshot_count(
+        &client,
+        "e2e-polcasc-retain-verify-2",
+        POLCASC_RETAIN_SUBPATH,
+    )
+    .await;
+    assert_eq!(
+        kopia_after, kopia_before,
+        "a Retain-cascade policy delete MUST NOT touch kopia data; before={kopia_before} after={kopia_after}"
+    );
+
+    // The retained kopia snapshots re-catalog as discovered rows (the child set + the
+    // untouched seed row).
+    wait_until(
+        "the cascade-retained snapshots re-catalog as discovered rows",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let repo_uid = repo_uid.clone();
+            let want = child_names.len() as i64 + 1;
+            async move {
+                let rows = repo_discovered_rows(&backups, &repo_uid).await;
+                Ok((rows.len() as i64 >= want).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("the retained snapshots must re-materialize as discovered rows");
+    // The pre-existing discovered row still endures (final check).
+    assert!(
+        backups
+            .get_opt(&seed_disc_name)
+            .await
+            .expect("get seed row")
+            .and_then(|s| s.uid())
+            .is_some_and(|u| u == seed_uid),
+        "the pre-existing discovered row must survive the whole cascade untouched"
+    );
+
+    // Cleanup: discovered rows are forced-Retain; remove Snapshot CRs before the repo.
+    for r in repo_discovered_rows(&backups, &repo_uid).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
+    let _ = schedules.delete(SCHED, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 11: policy-cascade Delete opt-in is breaker-gated -----------------
+
+const POLCASC_DELETE_SUBPATH: &str = "polcasc-delete";
+
+/// The `onPolicyDelete: Delete` opt-in cascades EXTERNAL deletions, so it is subject
+/// to the per-repository mass-deletion breaker. Deleting a policy whose ≥3 children
+/// exceed the repo threshold HOLDS them (`DeletionHeld=True`, no kopia data touched),
+/// yet the POLICY CR's finalizer still RELEASES (a terminating breaker-held child must
+/// resolve to "no work" — the finalizer must never wedge waiting on an ack that would
+/// never come once the policy is gone). The `allow-mass-deletion` ack then drains the
+/// wave and really deletes the kopia snapshots.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn policy_cascade_opt_in_delete_is_breaker_gated() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, POLCASC_DELETE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-polcasc-delete-repo";
+    const POLICY: &str = "e2e-polcasc-delete-pol";
+    const NAMES: [&str; 3] = [
+        "e2e-polcasc-delete-1",
+        "e2e-polcasc-delete-2",
+        "e2e-polcasc-delete-3",
+    ];
+
+    // threshold: 2 → the 3 cascaded external deletions trip the breaker. Fast refresh
+    // so the repo's MassDeletionHeld condition appears promptly; maintenance off.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                POLCASC_DELETE_SUBPATH,
+                serde_json::json!({
+                    "deletionProtection": { "threshold": 2 },
+                    "maintenance": { "enabled": false },
+                    "catalog": { "periodicRefresh": true, "refreshInterval": "30s" }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository with a threshold-2 breaker");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+
+    // The opt-in: spec.deletion.onPolicyDelete: Delete.
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({
+                    "deletion": { "onPolicyDelete": "Delete" },
+                    "retention": { "keepLatest": 20 }
+                }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy with onPolicyDelete: Delete");
+
+    // Three config-labeled manual children (deletionPolicy Delete), all Succeeded.
+    seed_manual_snapshots(&backups, POLICY, &NAMES).await;
+    let kopia_before = observed_snapshot_count(
+        &client,
+        "e2e-polcasc-delete-verify-1",
+        POLCASC_DELETE_SUBPATH,
+    )
+    .await;
+    assert_eq!(
+        kopia_before, 3,
+        "the three children must all exist in kopia before the cascade, got {kopia_before}"
+    );
+
+    // Delete the policy → the Delete-mode cascade bare-deletes the 3 children as
+    // EXTERNAL deletions → the breaker HOLDS them.
+    policies
+        .delete(POLICY, &DeleteParams::default())
+        .await
+        .expect("delete the SnapshotPolicy (Delete-cascade trigger)");
+
+    // (a) all three children go terminating with DeletionHeld=True / MassDeletionBreaker.
+    for n in NAMES {
+        let cond = wait_condition(&backups, n, "DeletionHeld", "True")
+            .await
+            .unwrap_or_else(|e| panic!("{n} must be HELD by the mass-deletion breaker: {e}"));
+        assert_eq!(
+            cond.get("reason").and_then(|r| r.as_str()),
+            Some("MassDeletionBreaker"),
+            "{n} DeletionHeld reason must be MassDeletionBreaker: {cond}"
+        );
+    }
+
+    // (b) the POLICY finalizer RELEASES even though its children are held — the
+    // load-bearing anti-wedge guarantee (a terminating held child ⇒ no cascade work).
+    wait_until(
+        "the policy finalizer releases despite breaker-held children",
+        Duration::from_secs(150),
+        poll_interval(),
+        || async { Ok(policies.get_opt(POLICY).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect(
+        "the SnapshotPolicy CR must be released even while its Delete-cascaded children are HELD",
+    );
+
+    // (c) the children are STILL held after the policy is gone, and kopia is untouched.
+    for n in NAMES {
+        let s = backups
+            .get_opt(n)
+            .await
+            .expect("get held child")
+            .unwrap_or_else(|| panic!("held child {n} must still exist"));
+        assert!(
+            s.meta().deletion_timestamp.is_some() && snapshot_is_held(&s),
+            "held child {n} must stay terminating + DeletionHeld after the policy released"
+        );
+    }
+    let kopia_held = observed_snapshot_count(
+        &client,
+        "e2e-polcasc-delete-verify-2",
+        POLCASC_DELETE_SUBPATH,
+    )
+    .await;
+    assert_eq!(
+        kopia_held, kopia_before,
+        "NO kopia data may be deleted while the cascaded wave is HELD; before={kopia_before} held={kopia_held}"
+    );
+
+    // (d) ack via the repository annotation → the wave drains and REALLY deletes kopia.
+    let held_msg = status_json(&backups, NAMES[0])
+        .await
+        .get("conditions")
+        .and_then(|c| c.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("DeletionHeld"))
+        })
+        .and_then(|c| c.get("message").and_then(|m| m.as_str()))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let ack_value = parse_ack_value(&held_msg)
+        .unwrap_or_else(|| panic!("the held message must carry an ack value: {held_msg}"));
+    repos
+        .patch(
+            REPO,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "annotations": { ALLOW_MASS_DELETION_ANNOTATION: ack_value } }
+            })),
+        )
+        .await
+        .expect("acknowledge the mass-deletion wave on the repository");
+    wait_all_drained(&backups, &NAMES, Duration::from_secs(180)).await;
+    let kopia_after = observed_snapshot_count(
+        &client,
+        "e2e-polcasc-delete-verify-3",
+        POLCASC_DELETE_SUBPATH,
+    )
+    .await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 3,
+        "the acked cascade must delete all 3 kopia snapshots; before={kopia_before} after={kopia_after}"
+    );
+
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 12: simultaneous schedule + policy delete drains to Retain --------
+
+const POLCASC_SIMUL_SUBPATH: &str = "polcasc-simul";
+
+/// Deleting a `SnapshotSchedule` and its `SnapshotPolicy` back-to-back (both at their
+/// safe-default `Retain`) must NOT wedge: every produced `Snapshot` CR drains (no
+/// stuck finalizer under the overlapping cascades), the kopia data is intact, and NO
+/// `SnapshotDeleteBatch` Job ever fires (nothing is deleted kopia-side).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn schedule_and_policy_simultaneous_delete_drains_to_retain() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, POLCASC_SIMUL_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-polcasc-simul-repo";
+    const POLICY: &str = "e2e-polcasc-simul-pol";
+    const SCHED: &str = "e2e-polcasc-simul-sched";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                POLCASC_SIMUL_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "defaultDeletionPolicy": "Delete", "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+    schedules
+        .create(
+            &PostParams::default(),
+            &cr::<SnapshotSchedule>(schedule_json(SCHED, POLICY, "* * * * *")),
+        )
+        .await
+        .expect("create SnapshotSchedule");
+
+    // Wait for ≥2 Succeeded scheduled children, then freeze the produced set.
+    let sched_selector = format!("{SCHEDULE_LABEL}={SCHED}");
+    wait_until(
+        "the schedule produces ≥2 Succeeded snapshots",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let sel = sched_selector.clone();
+            async move {
+                let list = backups
+                    .list(&ListParams::default().labels(&sel))
+                    .await?
+                    .items;
+                let n = list
+                    .iter()
+                    .filter(|b| {
+                        serde_json::to_value(b)
+                            .unwrap_or_default()
+                            .pointer("/status/phase")
+                            .and_then(|p| p.as_str())
+                            == Some("Succeeded")
+                    })
+                    .count();
+                Ok((n >= 2).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("the schedule should produce ≥2 Succeeded snapshots");
+    schedules
+        .patch(
+            SCHED,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({ "spec": { "schedule": { "suspend": true } } })),
+        )
+        .await
+        .expect("suspend schedule to freeze the produced set");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let children: Vec<Snapshot> = config_children(&backups, POLICY).await;
+    let child_names: Vec<String> = children.iter().map(|b| b.name_any()).collect();
+    let child_uids: BTreeSet<String> = children.iter().filter_map(|b| b.uid()).collect();
+    assert!(
+        child_uids.len() >= 2,
+        "need ≥2 produced children to prove a clean multi-child drain; got {child_names:?}"
+    );
+
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-polcasc-simul-verify-1", POLCASC_SIMUL_SUBPATH).await;
+    assert!(
+        kopia_before >= 2,
+        "kopia should hold ≥2 snapshots before the simultaneous delete; got {kopia_before}"
+    );
+
+    // Delete the schedule and the policy back-to-back (schedule then policy): both
+    // cascades (Retain) now race over the SAME children — neither may wedge a finalizer.
+    schedules
+        .delete(SCHED, &DeleteParams::default())
+        .await
+        .expect("delete the SnapshotSchedule");
+    policies
+        .delete(POLICY, &DeleteParams::default())
+        .await
+        .expect("delete the SnapshotPolicy");
+
+    // Every child drains (no stuck finalizer), and BOTH parents are gone.
+    let names_ref: Vec<&str> = child_names.iter().map(String::as_str).collect();
+    wait_all_drained(&backups, &names_ref, Duration::from_secs(300)).await;
+    wait_until(
+        "the schedule and policy CRs are both released",
+        Duration::from_secs(120),
+        poll_interval(),
+        || async {
+            let sched_gone = schedules.get_opt(SCHED).await?.is_none();
+            let pol_gone = policies.get_opt(POLICY).await?.is_none();
+            Ok((sched_gone && pol_gone).then_some(()))
+        },
+    )
+    .await
+    .expect("both the schedule and policy finalizers must release under the overlapping cascades");
+
+    // NO DeleteSnapshot activity: no batch delete Job ever covered these children, and
+    // the kopia data is intact (both cascades were Retain).
+    let my_batches = my_batch_jobs(&jobs, &child_uids).await;
+    assert!(
+        my_batches.is_empty(),
+        "a Retain double-cascade must launch NO SnapshotDeleteBatch Job; found {:?}",
+        my_batches.iter().map(|j| j.name_any()).collect::<Vec<_>>()
+    );
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-polcasc-simul-verify-2", POLCASC_SIMUL_SUBPATH).await;
+    assert_eq!(
+        kopia_after, kopia_before,
+        "a simultaneous Retain schedule+policy delete MUST keep all kopia data; before={kopia_before} after={kopia_after}"
+    );
+
+    // Cleanup: the retained kopia snapshots may re-catalog as discovered rows; remove
+    // any Snapshot CRs before the repo.
+    let repo_uid = repos
+        .get(REPO)
+        .await
+        .ok()
+        .and_then(|r| r.uid())
+        .unwrap_or_default();
+    for r in repo_discovered_rows(&backups, &repo_uid).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
     let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }
