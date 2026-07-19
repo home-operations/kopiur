@@ -218,8 +218,14 @@ fn is_foreign_cluster(hostname: &str, cluster: Option<&str>) -> bool {
 /// candidate, in the `policy`'s namespace. **Pure.** The status is returned
 /// separately so the caller creates the CR then PATCHes the status subresource.
 ///
-/// - **Name**: `<policy>-adopted-<first16(snapshot_id)>`, length-capped by
-///   [`crate::naming::capped_name`].
+/// - **Name**: `<policy>-adopted-<first16(snapshot_id)>-<hash8(snapshot_id)>`,
+///   length-capped by [`crate::naming::capped_name`]. The first-16 prefix is
+///   kept for human correlation with the kopia id; the trailing
+///   [`crate::naming::short_hash`] of the FULL id makes the name
+///   collision-free even when two ids in the same policy share a ≥16-char
+///   prefix (two ids differing only after char 16 previously minted the SAME
+///   name — see the `adopted_row_matches_candidate` name-collision guard in
+///   `snapshot_policy.rs`, which this fix makes unreachable for that case).
 /// - **Labels**: mirror the discovered-row set — `origin: adopted`,
 ///   `SNAPSHOT_ID_LABEL`, `REPOSITORY_UID_LABEL` — plus `CONFIG_LABEL` (the
 ///   policy name) so retention governs it.
@@ -239,7 +245,8 @@ pub fn build_adopted_snapshot(
     let policy_name = policy.name_any();
     let namespace = policy.namespace().unwrap_or_default();
     let short: String = candidate.snapshot_id.chars().take(16).collect();
-    let cr_name = crate::naming::capped_name(&format!("{policy_name}-adopted-{short}"));
+    let hash = crate::naming::short_hash(&candidate.snapshot_id);
+    let cr_name = crate::naming::capped_name(&format!("{policy_name}-adopted-{short}-{hash}"));
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -682,8 +689,10 @@ mod tests {
         };
         let (snap, status) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
 
-        // Name: <policy>-adopted-<first16(id)>, in the policy's namespace.
-        assert_eq!(snap.name_any(), "app-adopted-0123456789abcdef");
+        // Name: <policy>-adopted-<first16(id)>-<hash8(full id)>, in the policy's
+        // namespace. The trailing hash is over the FULL id (not just the
+        // first-16 prefix), so it stays distinct for ids sharing that prefix.
+        assert_eq!(snap.name_any(), "app-adopted-0123456789abcdef-f9c550c9");
         assert_eq!(snap.namespace().as_deref(), Some("billing"));
 
         // Labels mirror the discovered set + CONFIG_LABEL.
@@ -741,6 +750,68 @@ mod tests {
         let cand = candidate("aaa", identity("app", "billing", Some("/data")), false);
         let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
         assert_eq!(snap.spec.deletion_policy, Some(DeletionPolicy::Orphan));
+    }
+
+    /// The P1 regression test: two kopia snapshot ids that share a ≥16-char
+    /// prefix but differ afterward previously minted the SAME adopted-row
+    /// name (`<policy>-adopted-<first16>`), which drove the second adoption
+    /// into the create-409 branch in `snapshot_policy::adopt_one` — either
+    /// clobbering the first row's status (pre-91093e7) or, post-91093e7,
+    /// permanently wedging the second candidate behind the
+    /// `adopted_row_matches_candidate` stranger guard (skipped + re-warned
+    /// every pass, its discovered row never cleaned up). Appending a hash of
+    /// the FULL id makes the two names distinct.
+    #[test]
+    fn build_adopted_snapshot_names_differ_for_ids_sharing_a_16char_prefix() {
+        let policy = policy_fixture(None);
+        let ident = identity("app", "billing", Some("/data"));
+        let id_a = "0123456789abcdef-AAAA-tail-one";
+        let id_b = "0123456789abcdef-BBBB-tail-two";
+        assert_eq!(
+            &id_a[..16],
+            &id_b[..16],
+            "fixture precondition: shared 16-char prefix"
+        );
+        let cand_a = candidate(id_a, ident.clone(), false);
+        let cand_b = candidate(id_b, ident, false);
+        let (snap_a, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_a);
+        let (snap_b, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_b);
+        assert_ne!(
+            snap_a.name_any(),
+            snap_b.name_any(),
+            "distinct full ids must never collide on their first-16 prefix alone"
+        );
+    }
+
+    #[test]
+    fn build_adopted_snapshot_name_is_deterministic_for_the_same_full_id() {
+        let policy = policy_fixture(None);
+        let ident = identity("app", "billing", Some("/data"));
+        let cand = candidate("0123456789abcdef0123", ident, false);
+        let (snap_1, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap_2, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        assert_eq!(
+            snap_1.name_any(),
+            snap_2.name_any(),
+            "same (policy, full id) must always name the same, so idempotent \
+             re-adoption (already-carried-id skip; 409 -> ensure-status) converges"
+        );
+    }
+
+    #[test]
+    fn build_adopted_snapshot_name_stays_capped_for_long_policy_and_id() {
+        let mut policy = policy_fixture(None);
+        policy.metadata.name = Some("n".repeat(80));
+        let ident = identity("app", "billing", Some("/data"));
+        let long_id = "9".repeat(200);
+        let cand = candidate(&long_id, ident, false);
+        let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let name = snap.name_any();
+        assert!(
+            name.len() <= 63,
+            "capped_name must still cap a long policy name + long id: {} chars ({name})",
+            name.len()
+        );
     }
 
     // -- event message -------------------------------------------------------
