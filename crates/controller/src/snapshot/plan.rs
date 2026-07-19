@@ -126,10 +126,16 @@ pub fn pruned_by(annotations: &BTreeMap<String, String>) -> Option<PrunedBy> {
 /// 2. `ns_terminating`:
 ///    - `ns_policy == None` → `OrphanSnapshot` (existing fail-safe, unchanged).
 ///    - `Some(Orphan)` → `OrphanSnapshot` (existing default, unchanged).
-///    - `Some(Delete)` → fall through to steps 4/5 BYPASSING step 3 (during ns
-///      teardown the schedule is always gone; letting the cascade guard fire
-///      would silently nullify the documented repo-level opt-in) — but NOT
-///      bypassing the breaker.
+///    - `Some(Delete)` → [`plan_ns_delete`]: an EXPLICIT repo-level opt-in.
+///      Retention/failed-history prunes keep their operator-prune semantics
+///      (step 4), but BOTH the schedule cascade guard (step 3 — during ns
+///      teardown the schedule is always gone) AND the IMPLICIT `policy-cascade`
+///      Retain stamp are overridden: an unstamped OR `policy-cascade`-stamped
+///      child resolves as external destructive (step 5, breaker-gated). The
+///      policy cleanup finalizer stamps its live children `policy-cascade`
+///      during the SAME teardown (default `onPolicyDelete: Retain`), and letting
+///      that quiet-retain downgrade win would silently nullify the opt-in and
+///      lose off-site data the user asked to reclaim.
 /// 3. Cascade guard (only when not ns-terminating): `pruned_by == None && owner
 ///    == GoneOrReplaced`:
 ///    - cascade `Retain` && policy `Delete` → `RetainSnapshotOnScheduleDelete`
@@ -155,13 +161,39 @@ pub fn plan_deletion(f: DeletionFacts<'_>) -> DeletionPlan {
     plan_live_namespace(&f)
 }
 
-/// Step 2: namespace-deletion cascade (ADR-0005 §5). `Delete` bypasses the
-/// cascade guard (step 3) but not the breaker (steps 4-6 still apply).
+/// Step 2: namespace-deletion cascade (ADR-0005 §5). `Delete` is an explicit
+/// repo-level opt-in that bypasses the schedule cascade guard (step 3) AND
+/// overrides the implicit `policy-cascade` Retain stamp (see [`plan_ns_delete`]),
+/// but does not bypass the breaker for external destructive deletes.
 fn plan_ns_terminating(f: &DeletionFacts<'_>) -> DeletionPlan {
     match f.ns_policy {
         None => DeletionPlan::OrphanSnapshot,
         Some(NamespaceDeletePolicy::Orphan) => DeletionPlan::OrphanSnapshot,
-        Some(NamespaceDeletePolicy::Delete) => plan_prune_or_external(f),
+        Some(NamespaceDeletePolicy::Delete) => plan_ns_delete(f),
+    }
+}
+
+/// Step 2, the `Some(Delete)` arm: an EXPLICIT `onNamespaceDelete: Delete`
+/// repo-level opt-in. **Exhaustive over [`PrunedBy`]** (no catch-all): a new
+/// prune kind must decide its namespace-teardown fate here.
+///
+/// - `None` (unstamped) → external destructive ([`plan_external`], breaker-gated).
+/// - `Some(PolicyCascade)` → ALSO external destructive. The opt-in is explicit;
+///   the `policy-cascade` stamp is IMPLICIT — the `SnapshotPolicy` cleanup
+///   finalizer stamps its live children during this SAME namespace teardown,
+///   defaulting to `onPolicyDelete: Retain`. Routing that through [`plan_prune`]
+///   would hit the quiet-retain downgrade
+///   ([`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete))
+///   and silently nullify the opt-in, losing off-site data the user asked to
+///   reclaim. So an explicit ns-delete opt-in WINS over the implicit stamp.
+///   (The retain-wins-ties rule is only for schedule-vs-policy cascade races,
+///   NOT for an explicit namespace-delete opt-in.)
+/// - `Some(Retention | FailedHistory)` → a genuine operator prune keeps its
+///   prune semantics ([`plan_prune`]): never held; effective policy decides.
+fn plan_ns_delete(f: &DeletionFacts<'_>) -> DeletionPlan {
+    match pruned_by(f.annotations) {
+        None | Some(PrunedBy::PolicyCascade) => plan_external(f.policy, f.breaker),
+        Some(p @ (PrunedBy::Retention | PrunedBy::FailedHistory)) => plan_prune(p, f.policy),
     }
 }
 

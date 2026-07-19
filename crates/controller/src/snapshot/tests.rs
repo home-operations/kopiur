@@ -1309,6 +1309,55 @@ fn ns_terminating_delete_optin_bypasses_guard_but_not_breaker() {
 }
 
 #[test]
+fn ns_terminating_delete_optin_overrides_policy_cascade_stamp() {
+    // Failure-1 regression guard (PR #272): during namespace teardown the
+    // SnapshotPolicy cleanup finalizer stamps its live children `pruned-by:
+    // policy-cascade` (the default `onPolicyDelete: Retain`). That IMPLICIT stamp
+    // must NOT override an EXPLICIT `onNamespaceDelete: Delete` opt-in — the
+    // stamped child resolves as an ordinary external destructive deletion, so a
+    // `deletionPolicy: Delete` snapshot IS reclaimed, not quietly retained. On
+    // HEAD (before the fix) this returned RetainSnapshotOnPolicyDelete: the bug.
+    let a = pruned(PrunedBy::PolicyCascade);
+    let allowed = plan_deletion(DeletionFacts {
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Allowed,
+        ..base_facts(&a)
+    });
+    assert_eq!(allowed, DeletionPlan::DeleteSnapshot);
+
+    // Still subject to the mass-deletion breaker, exactly like an unstamped
+    // external delete under the same opt-in.
+    let held = plan_deletion(DeletionFacts {
+        ns_terminating: true,
+        ns_policy: Some(NamespaceDeletePolicy::Delete),
+        breaker: BreakerState::Held,
+        ..base_facts(&a)
+    });
+    assert_eq!(held, DeletionPlan::HoldSnapshotDeletion);
+}
+
+#[test]
+fn ns_terminating_policy_cascade_stays_nondestructive_under_default_ns_policy() {
+    // The complement to the opt-in override: a `policy-cascade`-stamped child in
+    // a terminating namespace under the DEFAULT ns policy (Orphan) or an
+    // unresolved repository (None) stays non-destructive — the fix must not make
+    // the default namespace-delete path start reclaiming data. Effective policy
+    // is Delete (base_facts), so this proves the ns policy, not the stamp, wins.
+    // (Passes on HEAD too — the ns-terminating Orphan/None arms short-circuit to
+    // OrphanSnapshot before any prune check; this pins that invariant is kept.)
+    let a = pruned(PrunedBy::PolicyCascade);
+    for ns_policy in [None, Some(NamespaceDeletePolicy::Orphan)] {
+        let plan = plan_deletion(DeletionFacts {
+            ns_terminating: true,
+            ns_policy,
+            ..base_facts(&a)
+        });
+        assert_eq!(plan, DeletionPlan::OrphanSnapshot, "{ns_policy:?}");
+    }
+}
+
+#[test]
 fn breaker_never_holds_retain_or_orphan() {
     let a = BTreeMap::new();
     for policy in [DeletionPolicy::Retain, DeletionPolicy::Orphan] {
