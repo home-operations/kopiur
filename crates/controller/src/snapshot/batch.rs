@@ -329,10 +329,23 @@ pub struct FireEligibility<'a> {
     /// The repository's namespace-deletion cascade policy — a terminating-
     /// namespace peer is fireable ONLY under `Delete`.
     pub on_namespace_delete: NamespaceDeletePolicy,
-    /// The member namespaces observed TERMINATING at fire time (resolved once
-    /// per distinct namespace by the caller). A namespace whose terminating-ness
-    /// could not be read is treated as terminating here — fail-safe UNDER-fire.
+    /// The member namespaces excluded from an `Orphan` peer's fire: `confirmed`
+    /// terminating ∪ `unreadable` (resolved once per distinct namespace by the
+    /// caller). An `onNamespaceDelete: Orphan` peer whose namespace is terminating
+    /// OR unreadable plans `OrphanSnapshot` on its OWN reconcile and must never be
+    /// deleted by a peer's fire, so both go here ([`fire_namespace_ok`]).
     pub terminating_namespaces: &'a HashSet<String>,
+    /// The member namespaces whose terminating-ness could NOT be read at fire time
+    /// (a `namespace_is_terminating` GET erred). A peer in such a namespace is
+    /// EXCLUDED from the FIRE set OUTRIGHT ([`fire_namespace_readable_ok`]),
+    /// regardless of `on_namespace_delete`: we cannot confirm the namespace is
+    /// terminating, so we must not delete a peer on the assumption that it is (its
+    /// own self-fire, whose LIVE namespace read resolves to NOT-terminating via
+    /// `unwrap_or(false)`, drains it correctly). Such a member is still COUNTED
+    /// toward the breaker (over-count is fail-safe). This set is a subset of
+    /// `terminating_namespaces`, so an `Orphan` peer is withheld by that exclusion
+    /// as well — belt-and-braces.
+    pub unreadable_namespaces: &'a HashSet<String>,
     /// Whether the `SnapshotSchedule` reflector store is synced. While `false`,
     /// a schedule-owned EXTERNAL peer is excluded (its owner state would default
     /// to `Alive`, disabling the cascade guard).
@@ -350,7 +363,10 @@ pub struct FireEligibility<'a> {
 ///   held wave's kopia data without an ack.
 /// - IMPORTANT-2: a peer whose namespace is terminating is excluded unless the
 ///   repository's `onNamespaceDelete` is `Delete` (an `Orphan`-destined member
-///   plans `OrphanSnapshot` on its own reconcile — never delete it here).
+///   plans `OrphanSnapshot` on its own reconcile — never delete it here). A peer
+///   whose namespace was UNREADABLE at fire time is excluded outright, whatever
+///   the policy — an unconfirmed terminating state must never authorize a peer's
+///   destructive delete ([`fire_namespace_readable_ok`]).
 /// - IMPORTANT-3a: while the schedule store is unsynced, a schedule-owned
 ///   EXTERNAL peer is excluded (cascade-retain-destined children would look
 ///   fireable when the owner lookup defaults to `Alive`).
@@ -371,6 +387,7 @@ pub fn fire_eligible(pending: Vec<PendingMember>, cx: &FireEligibility<'_>) -> V
             m.uid == cx.self_uid
                 || (fire_pin_ok(m)
                     && fire_schedule_ok(m, cx.schedule_synced)
+                    && fire_namespace_readable_ok(m, cx.unreadable_namespaces)
                     && fire_namespace_ok(m, cx.terminating_namespaces, cx.on_namespace_delete)
                     && fire_breaker_ok(m, breaker_tripping, cx.ack))
         })
@@ -389,6 +406,16 @@ fn fire_pin_ok(m: &PendingMember) -> bool {
 /// even during the store's startup window.
 fn fire_schedule_ok(m: &PendingMember, schedule_synced: bool) -> bool {
     schedule_synced || !m.external || !m.schedule_owned
+}
+
+/// IMPORTANT-2 (readable half): a peer whose namespace could NOT be read as
+/// terminating at fire time is NEVER fireable by a peer — we cannot confirm the
+/// namespace is being torn down, so a destructive delete must not ride an
+/// unconfirmed assumption (its own self-fire, whose LIVE read fails to
+/// NOT-terminating, drains it). Independent of `onNamespaceDelete`: an unreadable
+/// namespace is withheld under `Delete` too (unlike a CONFIRMED-terminating one).
+fn fire_namespace_readable_ok(m: &PendingMember, unreadable: &HashSet<String>) -> bool {
+    !unreadable.contains(&m.namespace)
 }
 
 /// IMPORTANT-2: a terminating-namespace peer is fireable only under
@@ -1265,6 +1292,37 @@ mod tests {
     }
 
     #[test]
+    fn pending_members_unreadable_namespace_keeps_retain_cascade_child_quiet() {
+        // C1 (plan half): a namespace whose terminating-ness could NOT be read is
+        // resolved into the `unreadable` set — NOT `confirmed` — and `pending_members`
+        // is fed ONLY the confirmed set. So a `policy-cascade` retain child in an
+        // unreadable namespace is evaluated in NON-terminating form and stays quiet-
+        // retained (never a counted/fireable destructive delete), exactly as the
+        // finalizer's self-CR path resolves the same unreadable read
+        // (`unwrap_or(false)`). On HEAD (Err→terminating merged into ONE set) it would
+        // have been counted AND become fireable under `onNamespaceDelete: Delete`.
+        let mut backup = member_fixture(
+            "pc",
+            true,
+            true,
+            Some(DeletionPolicy::Delete),
+            false,
+            false,
+            true,
+            Some(repo_ref()),
+        );
+        stamp_policy_cascade(&mut backup);
+        let s = Arc::new(backup);
+        // The child's namespace ("media") is UNREADABLE → absent from the confirmed
+        // set fed to pending_members.
+        let confirmed = HashSet::new();
+        assert!(
+            pending_members(&[s], KEY, alive, &confirmed, NamespaceDeletePolicy::Delete).is_empty(),
+            "a policy-cascade child in an unreadable namespace stays retain (not counted, not fireable)"
+        );
+    }
+
+    #[test]
     fn pending_members_retention_prune_stays_non_external_under_ns_teardown_delete() {
         // A genuine operator prune keeps `external: false` even in a terminating
         // namespace under Delete — it rides the batch Job but must never trip the
@@ -1377,9 +1435,17 @@ mod tests {
         }
     }
 
+    /// A shared empty `HashSet<String>` with `'static` lifetime, for the
+    /// `unreadable_namespaces` default in [`fire_cx`] (a fn can't return a borrow
+    /// of a set it creates locally).
+    fn empty_ns_set() -> &'static HashSet<String> {
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
     /// A `FireEligibility` with benign defaults: no breaker (threshold 0), no
-    /// ack, `Delete` ns policy, nothing terminating, schedule synced. Each test
-    /// perturbs exactly the axis it exercises.
+    /// ack, `Delete` ns policy, nothing terminating, nothing unreadable, schedule
+    /// synced. Each test perturbs exactly the axis it exercises.
     fn fire_cx<'a>(self_uid: &'a str, terminating: &'a HashSet<String>) -> FireEligibility<'a> {
         FireEligibility {
             self_uid,
@@ -1387,6 +1453,7 @@ mod tests {
             ack: None,
             on_namespace_delete: NamespaceDeletePolicy::Delete,
             terminating_namespaces: terminating,
+            unreadable_namespaces: empty_ns_set(),
             schedule_synced: true,
         }
     }
@@ -1519,6 +1586,72 @@ mod tests {
             ..fire_cx("self", &terminating)
         };
         assert_eq!(fire_eligible(pending(), &delete).len(), 3);
+    }
+
+    #[test]
+    fn fire_eligible_excludes_unreadable_namespace_peer_even_under_delete() {
+        // C1: a peer whose namespace could NOT be read (an `Err` from
+        // `namespace_is_terminating`) is EXCLUDED from the fire set even under
+        // `onNamespaceDelete: Delete` — an unconfirmed terminating state must never
+        // authorize a peer's destructive delete. HEAD merged `Err` into the single
+        // `terminating` set, so under `Delete` such a peer WOULD have fired and
+        // deleted retain-promised kopia data in a namespace that is NOT terminating.
+        // The triggering self bypasses the exclusion (its finalizer path resolved
+        // authoritatively); a CONFIRMED-terminating peer under Delete still fires.
+        let unreadable: HashSet<String> = HashSet::from(["unreadable".to_string()]);
+        // The caller feeds `confirmed ∪ unreadable` as `terminating_namespaces`
+        // (here a separate CONFIRMED-terminating namespace "dying" joins the union).
+        let all: HashSet<String> = ["unreadable".to_string(), "dying".to_string()]
+            .into_iter()
+            .collect();
+        let cx = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Delete,
+            unreadable_namespaces: &unreadable,
+            ..fire_cx("self", &all)
+        };
+        let pending = vec![
+            fmember("self", "unreadable", 100, true, true, false), // trigger in unreadable ns
+            fmember("unreadable-peer", "unreadable", 100, true, true, false),
+            fmember("confirmed-peer", "dying", 100, true, true, false), // confirmed-terminating
+            fmember("live-peer", "live", 100, true, true, false),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["confirmed-peer", "live-peer", "self"],
+            "the unreadable-namespace PEER is withheld; self bypass + confirmed-terminating \
+             (Delete) + live peers fire"
+        );
+    }
+
+    #[test]
+    fn fire_eligible_excludes_unreadable_namespace_orphan_peer() {
+        // C1 (pre-existing protection preserved): an `Orphan` peer whose namespace
+        // is unreadable is still excluded from fire. Both the readable check AND the
+        // ns-Orphan exclusion (unreadable ∈ the `confirmed ∪ unreadable` union)
+        // withhold it — belt-and-braces.
+        let unreadable: HashSet<String> = HashSet::from(["unreadable".to_string()]);
+        let all: HashSet<String> = unreadable.clone();
+        let cx = FireEligibility {
+            on_namespace_delete: NamespaceDeletePolicy::Orphan,
+            unreadable_namespaces: &unreadable,
+            ..fire_cx("self", &all)
+        };
+        let pending = vec![
+            fmember("self", "live", 100, true, true, false),
+            fmember(
+                "unreadable-orphan-peer",
+                "unreadable",
+                100,
+                true,
+                true,
+                false,
+            ),
+        ];
+        assert_eq!(
+            sorted_uids(fire_eligible(pending, &cx)),
+            vec!["self"],
+            "an Orphan peer in an unreadable namespace stays withheld"
+        );
     }
 
     #[test]
