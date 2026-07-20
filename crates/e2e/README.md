@@ -21,7 +21,7 @@ The scenarios then create real `kopiur.home-operations.com` CRs and assert on th
 cluster state the operator produces — real mover `Job`s, real kopia snapshots,
 real restored bytes.
 
-Everything is gated behind the **`e2e` cargo feature *and* `#[ignore]`**, and
+Everything is gated behind the **`e2e` cargo feature _and_ `#[ignore]`**, and
 [`World::connect`] skips gracefully when no cluster is reachable. So the hermetic
 `cargo test --workspace` never compiles a cluster body or touches a cluster, and
 even `--features e2e` runs e2e only with `-- --include-ignored`.
@@ -33,13 +33,13 @@ even `--features e2e` runs e2e only with `-- --include-ignored`.
 
 ## Key items
 
-| Item | Role |
-|---|---|
-| [`World`] / [`Need`] | Declarative provisioning: a scenario calls `World::ensure(&[Need::…])` to bring up exactly the cluster state it needs (filesystem fixtures, MinIO, the workload namespace), idempotently. |
-| [`E2E_NAMESPACE`] | The namespace the harness installs the operator and runs scenarios in (matches `deploy/e2e/values.yaml`). |
-| [`try_client`] | Connects to a cluster and probes the API server; returns `None` (printing a skip notice) when unreachable, so an e2e test is a clean no-op off-cluster. |
-| [`wait_until`] | Generic poll helper: re-runs a closure every `interval` until it yields `Ok(Some(value))`, failing with a `what`-tagged error on timeout. `Ok(None)` = keep waiting; `Err` = hard failure. |
-| [`default_timeout`] / [`poll_interval`] | Sensible poll budget (180s) and interval (3s) generous enough for a cold kind node pulling images and running kopia. |
+| Item                                    | Role                                                                                                                                                                                       |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`World`] / [`Need`]                    | Declarative provisioning: a scenario calls `World::ensure(&[Need::…])` to bring up exactly the cluster state it needs (filesystem fixtures, MinIO, the workload namespace), idempotently.  |
+| [`E2E_NAMESPACE`]                       | The namespace the harness installs the operator and runs scenarios in (matches `deploy/e2e/values.yaml`).                                                                                  |
+| [`try_client`]                          | Connects to a cluster and probes the API server; returns `None` (printing a skip notice) when unreachable, so an e2e test is a clean no-op off-cluster.                                    |
+| [`wait_until`]                          | Generic poll helper: re-runs a closure every `interval` until it yields `Ok(Some(value))`, failing with a `what`-tagged error on timeout. `Ok(None)` = keep waiting; `Err` = hard failure. |
+| [`default_timeout`] / [`poll_interval`] | Sensible poll budget (180s) and interval (3s) generous enough for a cold kind node pulling images and running kopia.                                                                       |
 
 ## Running it
 

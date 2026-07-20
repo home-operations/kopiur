@@ -3,7 +3,7 @@
 > [!WARNING]
 >
 > ## 🚧 Heavy construction 🚧
-> 
+>
 > **Please do not open Pull Requests.** The codebase is moving too fast for
 > external PRs to be reviewable right now — they'll likely conflict or target
 > code that's about to be rewritten. **[Open an Issue instead](../../issues/new)**

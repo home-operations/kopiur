@@ -27,14 +27,14 @@ lets the integration tests under `tests/` exercise it directly.
 
 ## Key modules / types
 
-| Item | Role |
-|---|---|
-| [`collect`] | Returns the [`artifact::Artifact`]s a subcommand (`gen-crds` / `gen-rbac` / `gen-all`) is responsible for. |
-| [`run`] | Drives a subcommand end-to-end: writes the artifacts, or in `--check` mode reports drift and returns the process exit code. |
-| [`artifact::Artifact`] | One generated file: a `deploy/`-relative path + its full content (including the generated-file header). |
-| [`artifact::write_all`] / [`artifact::check_all`] | Write every artifact to disk / compare against the checked-in files (the drift guard). |
-| [`paths::workspace_root`] / [`paths::deploy_dir`] | Deterministic workspace-root resolution and the `deploy/` directory under it. |
-| [`crds`] / [`rbac`] / [`dashboards`] | The per-kind artifact generators. |
+| Item                                              | Role                                                                                                                        |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| [`collect`]                                       | Returns the [`artifact::Artifact`]s a subcommand (`gen-crds` / `gen-rbac` / `gen-all`) is responsible for.                  |
+| [`run`]                                           | Drives a subcommand end-to-end: writes the artifacts, or in `--check` mode reports drift and returns the process exit code. |
+| [`artifact::Artifact`]                            | One generated file: a `deploy/`-relative path + its full content (including the generated-file header).                     |
+| [`artifact::write_all`] / [`artifact::check_all`] | Write every artifact to disk / compare against the checked-in files (the drift guard).                                      |
+| [`paths::workspace_root`] / [`paths::deploy_dir`] | Deterministic workspace-root resolution and the `deploy/` directory under it.                                               |
+| [`crds`] / [`rbac`] / [`dashboards`]              | The per-kind artifact generators.                                                                                           |
 
 ## Example
 
