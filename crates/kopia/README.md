@@ -8,7 +8,7 @@ operator's single, controller-agnostic gateway to the `kopia` CLI.
 `kopiur-kopia` is the only crate in Kopiur that knows how to talk to the `kopia`
 binary. It is split into three layers:
 
-- **Typed JSON models** ([`model`]) — Rust structs modeled against the *actual*
+- **Typed JSON models** ([`model`]) — Rust structs modeled against the _actual_
   JSON kopia 0.23 emits (captured by round-tripping a real repository), using
   `camelCase` and tolerating unknown fields so kopia version skew never panics
   the operator.
@@ -19,27 +19,27 @@ binary. It is split into three layers:
   spawn `kopia --json` via `tokio::process::Command`, parse stdout, and retain
   stderr for diagnostics.
 
-Crucially this crate is **controller-agnostic**: it has *no* `kube` or
+Crucially this crate is **controller-agnostic**: it has _no_ `kube` or
 `k8s-openapi` dependency (ADR §5.1). That deliberate split lets both sides of the
 operator depend on it:
 
 - the **controller** uses it for short, idempotent operations it runs in-process
   or as tiny Jobs — `repository connect` to validate a `Repository`, `snapshot
-  list` to materialize the catalog (ADR §5.4);
+list` to materialize the catalog (ADR §5.4);
 - the **mover** ([`kopiur-mover`](../mover)) uses it for the long-running
   snapshot/restore/maintenance subprocesses that must not be stranded by a
   controller restart.
 
 ## Key types
 
-| Type | What it is |
-| --- | --- |
-| [`KopiaClient`] / [`KopiaClientBuilder`] | The `tokio::process` client and its builder |
-| [`ConnectSpec`] | Externally-tagged backend selector (filesystem, s3, azure, gcs, b2, sftp, webdav, rclone, …) |
-| [`RestoreOptions`] / [`VerifyOptions`] / [`PolicyArgs`] | Typed option bundles for the corresponding verbs |
-| [`SnapshotCreateResult`] / [`SnapshotListEntry`] / [`SnapshotSource`] | Snapshot models with convenience accessors |
-| [`RepositoryStatus`] / [`MaintenanceInfo`] | Repository status + maintenance JSON models |
-| [`KopiaError`] / [`KopiaErrorClass`] | Structured failure with retry classification |
+| Type                                                                  | What it is                                                                                   |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| [`KopiaClient`] / [`KopiaClientBuilder`]                              | The `tokio::process` client and its builder                                                  |
+| [`ConnectSpec`]                                                       | Externally-tagged backend selector (filesystem, s3, azure, gcs, b2, sftp, webdav, rclone, …) |
+| [`RestoreOptions`] / [`VerifyOptions`] / [`PolicyArgs`]               | Typed option bundles for the corresponding verbs                                             |
+| [`SnapshotCreateResult`] / [`SnapshotListEntry`] / [`SnapshotSource`] | Snapshot models with convenience accessors                                                   |
+| [`RepositoryStatus`] / [`MaintenanceInfo`]                            | Repository status + maintenance JSON models                                                  |
+| [`KopiaError`] / [`KopiaErrorClass`]                                  | Structured failure with retry classification                                                 |
 
 ## stdout vs stderr
 
