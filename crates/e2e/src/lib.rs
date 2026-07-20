@@ -185,3 +185,95 @@ pub async fn apply_secret(
     .await?;
     Ok(())
 }
+
+/// Guard: every e2e test binary must actually be RUN by CI.
+///
+/// This exists because 11 of 37 binaries were wired into no shard at all —
+/// including `health_probe` and `steady_state`, the two most relevant to #273,
+/// which is exactly why that bug shipped: the regression test for it had been
+/// written, committed, and never once executed.
+///
+/// A *misspelled* `--test <name>` fails loudly (cargo errors on an unknown
+/// target). A binary in NO shard fails silently, forever. This is the only thing
+/// that catches the silent case.
+///
+/// Deliberately hermetic and in `src/` rather than `tests/`: it must run under the
+/// ordinary `cargo test --workspace` job, with no cluster and no `feature = "e2e"`.
+/// Putting it in `tests/` would make the coverage guard itself need wiring — the
+/// exact trap it exists to prevent.
+#[cfg(test)]
+mod shard_coverage {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        // CARGO_MANIFEST_DIR is <root>/crates/e2e.
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root resolves")
+    }
+
+    /// Every `--test` target: `crates/e2e/tests/*.rs` (a directory like `common/`
+    /// is a shared module, not a binary).
+    fn test_binaries() -> BTreeSet<String> {
+        let dir = repo_root().join("crates/e2e/tests");
+        std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "rs")
+                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// Every binary named in a `bins: "..."` value in the e2e workflow matrix.
+    /// The values are single-line and double-quoted, so this needs no YAML parser.
+    fn sharded_binaries() -> BTreeSet<String> {
+        let path = repo_root().join(".github/workflows/e2e.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        yaml.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("bins:")?.trim();
+                let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+                Some(inner.split_whitespace().map(str::to_string))
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn every_e2e_test_binary_runs_in_some_ci_shard() {
+        let binaries = test_binaries();
+        assert!(
+            binaries.len() > 10,
+            "sanity: expected to discover many test binaries, found {binaries:?}"
+        );
+        let sharded = sharded_binaries();
+
+        let orphans: Vec<_> = binaries.difference(&sharded).cloned().collect();
+        assert!(
+            orphans.is_empty(),
+            "these e2e test binaries are in NO shard's `bins:`, so CI never runs them \
+             — they are dead code and cannot catch a regression: {orphans:?}\n\
+             Fix: add each to a `matrix.include` entry's `bins:` in \
+             .github/workflows/e2e.yaml. Set `backends: true` if the binary uses \
+             Need::Minio/WorkloadNs/ProjectionNs (WorkloadNs and ProjectionNs imply \
+             Minio), and `csi: true` if it needs VolumeSnapshots. Give it its own \
+             shard if it restarts or reshapes the operator."
+        );
+
+        // The reverse direction: a `bins:` entry naming a binary that no longer
+        // exists makes `cargo test --test <name>` fail the whole shard.
+        let phantom: Vec<_> = sharded.difference(&binaries).cloned().collect();
+        assert!(
+            phantom.is_empty(),
+            "these names appear in a shard's `bins:` but have no \
+             crates/e2e/tests/<name>.rs — `cargo test --test <name>` will fail the \
+             shard: {phantom:?}"
+        );
+    }
+}

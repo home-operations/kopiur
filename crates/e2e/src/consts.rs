@@ -278,6 +278,12 @@ pub const BUCKETS: &[&str] = &[
     // opt-in probe raises RepositoryVanished without recreating. Isolated so the
     // wipe can't clobber another scenario's repository.
     "kopiur-health-probe",
+    // #273 bootstrap-Job churn guards (crates/e2e/tests/health_probe.rs). One bucket
+    // per kind so the `Repository` and `ClusterRepository` guards never share a kopia
+    // repository — and so neither can be clobbered by the wipe scenario above, whose
+    // in-binary ordering is not guaranteed.
+    BUCKET_PROBE_CHURN_REPO,
+    BUCKET_PROBE_CHURN_CREPO,
     // RepositoryReplication to an S3 destination (crates/e2e/tests/replication.rs,
     // the #200 regression guard): a filesystem source mirrors here, so `sync-to`
     // only succeeds if the destination backend's OWN S3 credentials are injected.
@@ -307,6 +313,11 @@ pub const BUCKETS: &[&str] = &[
 /// The anonymous-policy bucket for the workload-identity scenario (see
 /// [`BUCKETS`]); `mc anonymous set public` is applied to exactly this bucket.
 pub const WI_BUCKET: &str = "kopiur-wi";
+
+/// Bucket for the `Repository` arm of the #273 bootstrap-Job churn guard.
+pub const BUCKET_PROBE_CHURN_REPO: &str = "kopiur-probe-churn-repo";
+/// Bucket for the `ClusterRepository` arm of the #273 bootstrap-Job churn guard.
+pub const BUCKET_PROBE_CHURN_CREPO: &str = "kopiur-probe-churn-crepo";
 
 // --- SFTP backend (in-cluster atmoz/sftp server, key-based auth) ---------------
 // kopia's SFTP backend has no env-var credential form, so the mover materializes

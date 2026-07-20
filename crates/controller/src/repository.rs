@@ -32,7 +32,7 @@ use kopiur_mover::workspec::{
 };
 
 use crate::catalog;
-use crate::consts::{API_VERSION, BOOTSTRAP_JOB_DEADLINE_SECS, REPOSITORY_BOOTSTRAPPED_CONDITION};
+use crate::consts::{API_VERSION, REPOSITORY_BOOTSTRAPPED_CONDITION};
 use crate::context::Context;
 use crate::error::{Error, Result, TERMINAL_HEARTBEAT, error_policy_for};
 use crate::health;
@@ -774,36 +774,54 @@ async fn bootstrap_via_mover(
         .is_some();
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
-    let probe_due = health::health_probe_due(
+    let already_ready = repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
+    let probe_attempt_at = repo
+        .status
+        .as_ref()
+        .and_then(|s| s.health.as_ref())
+        .and_then(|h| h.probe_attempt_at.clone());
+    let probe = health::probe_action(
+        already_ready,
         bootstrapped_before,
         probe_enabled,
         repo.status
             .as_ref()
             .and_then(|s| s.health.as_ref())
             .and_then(|h| h.last_probe_at.as_deref()),
+        probe_attempt_at.as_deref(),
         kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
             repo.spec.health.as_ref(),
         ),
+        health::probe_attempt_timeout(health::bootstrap_deadline_seconds(
+            repo.spec
+                .bootstrap
+                .as_ref()
+                .and_then(|b| b.failure_policy.as_ref())
+                .and_then(|fp| fp.active_deadline_seconds),
+        )),
         chrono::Utc::now(),
     );
     let spec_changed =
         repo.metadata.generation != repo.status.as_ref().and_then(|s| s.observed_generation);
-    // A re-run of an already-bootstrapped, probe-enabled repo on the SAME spec is a
-    // probe: interpret it gently (stay `Ready`) and process the job exactly once
-    // (`finalize_bootstrap` deletes it). A spec change is a real re-bootstrap of new
-    // config and keeps the strict `Failed`-on-error semantics.
-    // `!reverify`: a reverify nudge (a failed backup's forced re-probe) must keep its
-    // strict semantics — flip the phase to `Failed` on a connect failure — and must
-    // NOT be downgraded to an alert-only probe. The probe is a separate, timer-driven
-    // concern (`probe_due`).
-    let probe_run = probe_enabled && bootstrapped_before && !spec_changed && !reverify;
-    // When LAUNCHING such a re-run, do not flip the phase to `Initializing` (that
-    // would fail the `repository_ready` gate and pause backups) — keep `Ready`.
-    let keep_ready_on_launch = probe_enabled && bootstrapped_before && !reverify && !spec_changed;
+    // This finished Job IS the probe's own result (we launched it and stamped
+    // `probeAttemptAt`): interpret it gently (stay `Ready`) and consume it exactly
+    // once (`finalize_bootstrap` deletes it). Keying on `awaits_result()` rather than
+    // on `probe_enabled` alone is what stops a Job left behind by a STRICT launch
+    // from being re-read as a probe — which used to fabricate `lastHealthyAt` from a
+    // connect no probe requested and, worse, route a genuine bootstrap failure into
+    // the alert-only `finalize_probe_failure` (hard-coded `phase: Ready`), silently
+    // resurrecting a terminally-`Failed` repository.
+    // `!reverify`/`!spec_changed`: those are real re-bootstraps of new config and keep
+    // the strict `Failed`-on-error semantics; they are never downgraded to an alert.
+    let probe_run = probe.awaits_result() && !spec_changed && !reverify;
+    // The LAUNCH-side twin of `probe_run`: this launch is a probe-style re-run, so
+    // (a) don't flip the phase to `Initializing` (that would fail the
+    // `repository_ready` gate and pause backups) and (b) stamp `probeAttemptAt` so the
+    // result is recognised as a probe when it lands.
+    let probe_style_launch =
+        probe_enabled && bootstrapped_before && already_ready && !reverify && !spec_changed;
 
     if let Some(job) = job_api.get_opt(&job_name).await? {
-        let already_ready =
-            repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
         return match crate::snapshot::job_terminal_state(&job) {
             // Still running: surface Initializing and poll. A catalog-refresh
             // re-run of an already-Ready repo keeps its phase — flapping
@@ -822,14 +840,19 @@ async fn bootstrap_via_mover(
             // Complete or backoff-exhausted: read the structured result — unless
             // the result is stale (catalog refresh due, the spec changed, or a health
             // probe is due) since it was taken: then recycle the Job so the next
-            // reconcile re-runs the bootstrap for a FRESH connect. `probe_due` is
-            // essential — without it the first probe would re-read the lingering
+            // reconcile re-runs the bootstrap for a FRESH connect. `probe.launches()`
+            // is essential — without it the first probe would re-read the lingering
             // first-bootstrap result and report healthy without ever re-connecting.
+            // It is deliberately `launches()`, NOT "a probe is enabled": once we have
+            // launched the probe's own Job, `probe_action` returns `AwaitingResult` and
+            // this arm stands down so `finalize_bootstrap` can consume it. Recycling
+            // then too is the #273 livelock — it destroys the very result that would
+            // have stamped `lastProbeAt` and cleared the gate.
             Some(success) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
-                    || probe_due
+                    || probe.launches()
                     || catalog::bootstrap_recycle_due(
                         already_ready,
                         repo.metadata.generation,
@@ -863,7 +886,7 @@ async fn bootstrap_via_mover(
     // due, or spec changed) — re-creating unconditionally would pin the refresh
     // cadence to the Job TTL instead of `catalog.refreshInterval`.
     if !(reverify
-        || probe_due
+        || probe.launches()
         || catalog::bootstrap_create_due(
             repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
             repo.metadata.generation,
@@ -1064,12 +1087,12 @@ async fn bootstrap_via_mover(
         // image-pull failure) otherwise never reaches a `Failed` condition, so the
         // controller never finalizes and the repository hangs `Initializing` with
         // no Event. The deadline forces it terminal so `finalize_bootstrap` runs.
+        // Shared with `health::probe_attempt_timeout`, so the bound on a probe Job's
+        // life and the gate that waits for its result can never disagree.
         limits: JobLimits {
-            active_deadline_seconds: Some(
-                bootstrap_fp
-                    .and_then(|fp| fp.active_deadline_seconds)
-                    .unwrap_or(BOOTSTRAP_JOB_DEADLINE_SECS),
-            ),
+            active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
+                bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
+            )),
             backoff_limit: bootstrap_fp
                 .and_then(|fp| fp.backoff_limit)
                 .unwrap_or(JobLimits::default().backoff_limit),
@@ -1099,16 +1122,34 @@ async fn bootstrap_via_mover(
     io::apply_mover_objects(&ctx.client, namespace, &job_name, Some(&cm), &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored.
     // A health-probe re-run of an already-`Ready` repo keeps its phase `Ready`
-    // (`keep_ready_on_launch`) so backups/replication are never paused while the
+    // (`probe_style_launch`) so backups/replication are never paused while the
     // probe connects; only a first bootstrap or a spec-change re-bootstrap shows
     // `Initializing`.
-    let mut create_status = if keep_ready_on_launch {
+    let mut create_status = if probe_style_launch {
         serde_json::json!({ "backend": backend.kind_str() })
     } else {
         serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() })
     };
     if let Some(token) = reverify_token {
         create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
+    }
+    // Launch-side probe stamp (#273) — the loop guard that lets the probe terminate.
+    // `lastProbeAt` is only written at FINALIZE, so it cannot bound the launch: gating
+    // the recycle on it alone deletes every Job whose completion would have cleared
+    // it. Stamping here means the next pass reads `AwaitingResult` and lets the
+    // finished Job through to `finalize_bootstrap`.
+    //
+    // Written as `now` for a probe-style launch and as an explicit `null` otherwise, so
+    // a STRICT relaunch actively clears a stale stamp rather than inheriting it — a
+    // stamp left over from an abandoned probe would make this strict result read as a
+    // probe. Skipped entirely when there is nothing to say, keeping the patch a no-op
+    // for repositories that never enable the probe.
+    if probe_enabled || probe_attempt_at.is_some() {
+        create_status["health"] = health::probe_attempt_health_patch(
+            probe_style_launch
+                .then(|| chrono::Utc::now().to_rfc3339())
+                .as_deref(),
+        );
     }
     // Rate-limit backoff for the scan-request token: stamped BEFORE the outcome is
     // known (a probe-style failure never lands in `run_catalog_scan`, so the
@@ -1574,7 +1615,12 @@ async fn finalize_probe_failure(
         current.as_ref(),
         serde_json::json!({
             "phase": "Ready",
-            "health": upd.health,
+            // NOT `upd.health` directly: every field is `skip_serializing_if =
+            // "Option::is_none"`, so the typed `None` for `probeAttemptAt` would be
+            // ELIDED from this merge patch and the launch stamp would survive — leaving
+            // the repo stuck `AwaitingResult` and making the next finished Job read as a
+            // probe. `probe_failure_health_patch` emits the explicit RFC 7386 null.
+            "health": health::probe_failure_health_patch(&upd.health),
             "conditions": conditions,
         }),
     )

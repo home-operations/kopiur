@@ -476,6 +476,16 @@ pub struct RepositoryHealthStatus {
     /// RFC 3339 timestamp of the first failure in the current failing streak.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_failure_at: Option<String>,
+    /// RFC 3339 timestamp at which the last backend health probe was *launched*
+    /// (the bootstrap Job created for it), cleared when its result is finalized.
+    ///
+    /// This is the **launch-side** rate limit, and it is what makes the probe
+    /// terminate. `lastProbeAt` is written only at *finalize*, so gating the
+    /// launch on that alone recycles the bootstrap Job forever: the gate destroys
+    /// every Job whose completion would have cleared it (#273). Never compared
+    /// against `lastProbeAt` — see `kopiur_controller::health::probe_action`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_attempt_at: Option<String>,
 }
 
 /// Aggregate repository storage figures from the last catalog scan.

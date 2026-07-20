@@ -646,8 +646,24 @@ async fn sweep_reaps_legacy_projected_secret_but_not_stable_or_live_copies() {
         "app.kubernetes.io/managed-by": "kopiur",
         "app.kubernetes.io/component": "credentials"
     });
-    let projected_from =
-        serde_json::json!({ "kopiur.home-operations.com/projected-from": "kopiur-e2e/repo-pw" });
+    // The creds kernels refuse to reap anything younger than
+    // `sweep::CREDS_MIN_AGE_FLOOR_SECS` (15m), a HARD floor that deliberately
+    // overrides the harness's 30s `KOPIUR_WORK_SPEC_SWEEP_MIN_AGE_SECS` — it exists so
+    // an admin who zeroes that shared knob cannot hand the creds kernels a zero-width
+    // guard on the project→create-Job window. A fixture created just now can therefore
+    // never age into eligibility inside `default_timeout()` (420s), so stamp
+    // `projected-at` in the past instead: `sweep::creds_age_secs` prefers that
+    // annotation over `creationTimestamp` (which the apiserver owns and we cannot
+    // backdate). An hour is comfortably past the floor.
+    //
+    // Every fixture below carries the SAME backdated stamp, so the two controls are a
+    // real control: they survive the pass that reaps the orphan because of the marker
+    // and the in-use guard, not merely because they were too young to be considered.
+    let projected_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let projected_from = serde_json::json!({
+        "kopiur.home-operations.com/projected-from": "kopiur-e2e/repo-pw",
+        "kopiur.home-operations.com/projected-at": projected_at,
+    });
     let orphan = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -719,9 +735,10 @@ async fn sweep_reaps_legacy_projected_secret_but_not_stable_or_live_copies() {
     });
     let _ = jobs.create(&PostParams::default(), &cr(live_job)).await;
 
-    // The sweep reaps the orphan once it ages past the harness min-age (30s) —
-    // the wait must also absorb the sweep's fixed 60s first-pass delay after
-    // leader election plus the 15s cadence, all well inside default_timeout().
+    // The sweep reaps the orphan on its next pass: the backdated `projected-at` above
+    // already puts it past the creds floor, so the wait only has to absorb the sweep's
+    // fixed 60s first-pass delay after leader election plus the 15s cadence — well
+    // inside default_timeout().
     wait_until(
         "legacy projected credential Secret swept",
         default_timeout(),

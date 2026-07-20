@@ -637,6 +637,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `firstFailureAt` | string | — | RFC 3339 timestamp of the first failure in the current failing streak. |
 | `lastHealthyAt` | string | — | RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present). |
 | `lastProbeAt` | string | — | RFC 3339 timestamp of the last completed probe (success or failure); drives the `health_probe_due` timer so the probe re-fires on cadence. |
+| `probeAttemptAt` | string | — | RFC 3339 timestamp at which the last backend health probe was *launched* (the bootstrap Job created for it), cleared when its result is finalized.<br>This is the **launch-side** rate limit, and it is what makes the probe terminate. `lastProbeAt` is written only at *finalize*, so gating the launch on that alone recycles the bootstrap Job forever: the gate destroys every Job whose completion would have cleared it (#273). Never compared against `lastProbeAt` — see `kopiur_controller::health::probe_action`. |
 
 #### `status.parameters` { #repository-status-parameters }
 
@@ -1324,6 +1325,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `firstFailureAt` | string | — | RFC 3339 timestamp of the first failure in the current failing streak. |
 | `lastHealthyAt` | string | — | RFC 3339 timestamp of the last *successful* probe (backend reachable, repo present). |
 | `lastProbeAt` | string | — | RFC 3339 timestamp of the last completed probe (success or failure); drives the `health_probe_due` timer so the probe re-fires on cadence. |
+| `probeAttemptAt` | string | — | RFC 3339 timestamp at which the last backend health probe was *launched* (the bootstrap Job created for it), cleared when its result is finalized.<br>This is the **launch-side** rate limit, and it is what makes the probe terminate. `lastProbeAt` is written only at *finalize*, so gating the launch on that alone recycles the bootstrap Job forever: the gate destroys every Job whose completion would have cleared it (#273). Never compared against `lastProbeAt` — see `kopiur_controller::health::probe_action`. |
 
 #### `status.parameters` { #clusterrepository-status-parameters }
 

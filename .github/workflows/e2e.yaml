@@ -118,10 +118,10 @@ jobs:
             bins: "lifecycle"
             backends: false # Filesystem only — skip the backend-image preload
           - shard: restore
-            bins: "restore"
+            bins: "restore leak_cleanup"
             backends: false # Filesystem only — the restore class needs no object store
           - shard: backends
-            bins: "backends"
+            bins: "backends ttl_rerun"
             backends: true
           - shard: cross-ns
             bins: "cross_namespace credential_projection"
@@ -129,11 +129,36 @@ jobs:
           - shard: misc
             bins: "object_store cache_and_events terminal_failure webhook observability"
             backends: true
+          # Reconcile-quiescence guards. Both watch for CHURN over a fixed window —
+          # steady_state a 45s quiet window on status/resourceVersion, health_probe a
+          # 180s window on bootstrap-Job UIDs (the #273 regression guard) — so this
+          # shard must not share a cluster with a binary that restarts the operator
+          # (mass_deletion) or floods the apiserver. steady_state runs FIRST, on the
+          # cleanest cluster: its own bound is eroded by leftover CRs' requeue ticks.
+          # backends: true for health_probe's MinIO buckets; steady_state is
+          # Filesystem-only and rides along.
+          - shard: quiescence
+            bins: "steady_state health_probe"
+            backends: true
+          # Mass-deletion protection + the batched delete dispatcher. Own shard:
+          # throttle_caps_concurrent_batch_jobs patches the controller Deployment's
+          # KOPIUR_MAX_CONCURRENT_DELETE_JOBS and waits out a rollout — it restores the
+          # env on exit, but the restart inside that window must not race another
+          # binary's reconciles. Filesystem-only (isolated repo subpaths per scenario).
+          - shard: mass-deletion
+            bins: "mass_deletion"
+            backends: false
+          # kubectl-kopiur plugin (the `run` task builds kopiur-cli before the suite)
+          # + multi-cluster shared-repository scenarios. Both S3-backed, both large,
+          # neither mutates the install.
+          - shard: cli-multicluster
+            bins: "cli multi_cluster"
+            backends: true
           # Workload identity (auth.workloadIdentity): full S3 pipeline with NO
           # static keys via the anonymous-policy bucket + kopia's ambient chain,
           # plus the Job-shape and missing-SA-condition assertions.
           - shard: workload-identity
-            bins: "workload_identity"
+            bins: "workload_identity import"
             backends: true
           # ADR-0004/0005 reshape scenarios (Filesystem only). Split in two so the
           # cron-driven verify/replication waits don't push one shard past the job
@@ -148,7 +173,7 @@ jobs:
           # httpRequest hook reuses the WebDAV fixture as its receiver, so this
           # shard preloads the backend images.
           - shard: hooks-retention
-            bins: "hooks retention policy_knobs"
+            bins: "hooks retention policy_knobs adoption"
             backends: true
           - shard: reshape-async
             bins: "verification replication"
@@ -164,7 +189,7 @@ jobs:
           # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
           # SecurityContextCompatible reconcile condition. Filesystem only.
           - shard: security-context-compat
-            bins: "security_context_compat"
+            bins: "security_context_compat colocation preflight"
             backends: false
           # Leader election (--leader-elect, chart default): Lease held by the
           # controller pod, single holder at 2 replicas, failover on holder
