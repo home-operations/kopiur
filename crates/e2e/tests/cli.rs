@@ -1605,27 +1605,49 @@ async fn cli_migrate_volsync_kopia() {
         )
     };
     let want_identity = format!("{}@{}:{}", VSK_IDENTITY.0, VSK_IDENTITY.1, VSK_IDENTITY.2);
-    let discovered_selector = format!(
-        "kopiur.home-operations.com/origin=discovered,\
-         kopiur.home-operations.com/repository-uid={repo_uid}"
-    );
+    // Select on the repository only, NOT on `origin=discovered`.
+    //
+    // The catalog materializes the seeded snapshot as `discovered`, but `migrate`
+    // also emits a SnapshotPolicy pinning this exact fork identity — so policy
+    // auto-adoption (#272) immediately re-attaches the row and flips its origin to
+    // `adopted`. Both are correct outcomes of a successful migration, and which one
+    // you observe is a race against the adoption pass; pinning `discovered` made this
+    // assertion silently unsatisfiable the moment #272 landed.
+    //
+    // What is actually load-bearing here is the IDENTITY surviving the migration
+    // intact, which is asserted below and holds under either origin.
+    let repo_selector = format!("kopiur.home-operations.com/repository-uid={repo_uid}");
+    // Origin is read from the LABEL, not `spec.origin`: the label is what the catalog
+    // and the adoption pass both stamp (and what a selector could filter on), while
+    // `spec.origin` is elided from the serialized object for these rows.
+    let origin_of = |s: &Snapshot| {
+        s.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kopiur.home-operations.com/origin"))
+            .cloned()
+            .unwrap_or_default()
+    };
     wait_until(
-        "the seeded fork snapshot is discovered with its identity intact",
+        "the seeded fork snapshot surfaces with its identity intact",
         default_timeout(),
         poll_interval(),
         || async {
             let rows = snapshots
-                .list(&ListParams::default().labels(&discovered_selector))
+                .list(&ListParams::default().labels(&repo_selector))
                 .await?
                 .items;
             Ok(rows
                 .iter()
-                .any(|s| identity_of(s) == want_identity)
+                .any(|s| {
+                    identity_of(s) == want_identity
+                        && matches!(origin_of(s).as_str(), "discovered" | "adopted")
+                })
                 .then_some(()))
         },
     )
     .await
-    .expect("discovered Snapshot with the fork identity");
+    .expect("Snapshot carrying the fork identity (discovered, or adopted by the migrated policy)");
 
     // --- 5. History continuity: the next snapshot through the translated
     // policy records the SAME identity the fork was writing.
