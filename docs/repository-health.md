@@ -134,6 +134,32 @@ backend) before you act.
 
 ///
 
+/// note | How a probe run is tracked
+
+On an object-store, server, or volume-backed backend a probe re-connects by
+running the repository's `<name>-bootstrap` mover Job, so kopiur tracks each run
+across two reconciles:
+
+- `status.health.probeAttemptAt` is stamped when the Job is **launched** and
+  cleared when its result is finalized. While it is set, the finished Job is
+  recognised as *that probe's* result rather than a stale one to recycle.
+- `status.health.lastProbeAt` is stamped when the run **finishes** (success or
+  failure) and drives the interval timer.
+
+A probe consumes its Job exactly once, so a healthy repository creates and
+destroys **one** mover Job per `interval` — if you see the bootstrap Job
+recreated every few seconds, that is [#273][issue-273], fixed in v0.7.6.
+
+A probe also stands aside while a real (re-)bootstrap is in flight: a repository
+that is not `Ready` (a spec change is being applied, or the bootstrap has failed)
+does not probe, and its `BackendReachable` condition holds its last value until
+the repository is `Ready` again. `phase: Failed` is the louder signal in that
+window.
+
+[issue-273]: https://github.com/home-operations/kopiur/issues/273
+
+///
+
 ## Backup preflight (opt-in)
 
 The readiness gate above is a single hard-coded precondition: *the repository is

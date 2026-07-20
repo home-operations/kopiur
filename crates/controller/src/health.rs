@@ -227,6 +227,135 @@ pub fn health_probe_due(
     enabled && bootstrapped_before && crate::catalog::refresh_due(last_probe_at, interval, now)
 }
 
+/// Extra headroom over the bootstrap Job's own deadline before a stamped
+/// `probeAttemptAt` is treated as abandoned. Covers the gap between the Job going
+/// terminal and the controller finalizing it (a restart, a requeue backoff).
+pub const PROBE_ATTEMPT_GRACE_SECS: i64 = 60;
+
+/// The bootstrap Job's `activeDeadlineSeconds`: the user's override, else
+/// [`crate::consts::BOOTSTRAP_JOB_DEADLINE_SECS`]. One definition shared by the Job
+/// builder and [`probe_attempt_timeout`], so the launch bound and the gate that
+/// waits on it can never disagree.
+pub fn bootstrap_deadline_seconds(active_deadline_seconds: Option<i64>) -> i64 {
+    active_deadline_seconds.unwrap_or(crate::consts::BOOTSTRAP_JOB_DEADLINE_SECS)
+}
+
+/// How long a stamped `probeAttemptAt` still means "a probe Job is in flight".
+///
+/// Derived from the Job's own deadline rather than the probe interval: the
+/// interval floor is 30s (and the e2e uses exactly that), so a slow backend would
+/// be declared abandoned mid-flight. A bootstrap Job cannot outlive its
+/// `activeDeadlineSeconds`, so that plus a grace window is the true upper bound.
+pub fn probe_attempt_timeout(active_deadline_seconds: i64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        active_deadline_seconds
+            .saturating_add(PROBE_ATTEMPT_GRACE_SECS)
+            .max(1) as u64,
+    )
+}
+
+/// Whether a probe Job launched at `attempt_at` is still plausibly in flight.
+///
+/// **Fails OPEN**: an absent or unparseable stamp reads as "not pending", so a
+/// malformed value can never wedge the probe forever. This controller is the only
+/// writer of the field, mirroring [`crate::catalog::scan_requested_due`]'s
+/// reasoning.
+pub fn probe_attempt_pending(
+    attempt_at: Option<&str>,
+    timeout: std::time::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(raw) = attempt_at else {
+        return false;
+    };
+    let Ok(started) = DateTime::parse_from_rfc3339(raw) else {
+        return false;
+    };
+    let Ok(timeout) = chrono::Duration::from_std(timeout) else {
+        return false;
+    };
+    started.with_timezone(&Utc) + timeout > now
+}
+
+/// What the backend health probe wants from this reconcile pass.
+///
+/// A closed enum so both reconcilers stay symmetric and a new variant cannot
+/// compile until every arm accounts for it (CLAUDE.md "type-safety end-to-end").
+/// It replaces the bare `probe_due` bool, whose single value had to serve two
+/// incompatible questions — "should I launch a probe?" and "is this finished Job
+/// my probe's result?" — which is precisely how #273 happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAction {
+    /// Nothing to do: disabled, never bootstrapped, not `Ready`, or not yet due.
+    Idle,
+    /// A probe is due and none is in flight — (re)launch the bootstrap Job.
+    Launch,
+    /// A probe Job was launched and its result has not been finalized yet. The
+    /// finished Job MUST be allowed through to `finalize_*` — recycling it here is
+    /// the #273 livelock.
+    AwaitingResult,
+}
+
+impl ProbeAction {
+    /// Whether this pass should launch (or recycle-then-relaunch) a probe Job.
+    pub fn launches(self) -> bool {
+        match self {
+            Self::Launch => true,
+            Self::Idle | Self::AwaitingResult => false,
+        }
+    }
+
+    /// Whether a finished bootstrap Job observed on this pass is *this probe's*
+    /// result, and must therefore be finalized as a probe rather than recycled.
+    pub fn awaits_result(self) -> bool {
+        match self {
+            Self::AwaitingResult => true,
+            Self::Idle | Self::Launch => false,
+        }
+    }
+}
+
+/// Decide what the probe wants from this pass.
+///
+/// **The #273 fix, and the mirror image of [`crate::catalog::scan_requested_pending`].**
+/// That doc comment warns against using the *rate-limited launch* predicate at
+/// *finalize* time. This is the converse hazard: `lastProbeAt` is a *finalize-side*
+/// stamp, and gating the *launch-side* recycle on it alone means the gate deletes
+/// every Job whose completion would have cleared it — so `finalize_*` (the only
+/// writer of `lastProbeAt`) is unreachable and the probe recycles its Job forever.
+/// The launch-side stamp `probeAttemptAt` is what breaks that cycle.
+///
+/// `phase_is_ready` is load-bearing twice over. It stops a probe from racing a real
+/// (re-)bootstrap — mirroring [`crate::catalog::bootstrap_recycle_due`]'s own
+/// `if !phase_is_ready { return false }` guard, which the probe arm was missing —
+/// and it stops a terminally-`Failed` repository's lingering Job from being re-read
+/// as a probe, which would flip it back to `Ready` (see `finalize_probe_failure`).
+/// It does NOT weaken [`health_probe_due`]'s deliberate "keyed on
+/// `bootstrapped_before`, not `phase == Ready`" property: a repository that has
+/// raised an alert *stays* `Ready` by design, so it keeps probing.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_action(
+    phase_is_ready: bool,
+    bootstrapped_before: bool,
+    enabled: bool,
+    last_probe_at: Option<&str>,
+    probe_attempt_at: Option<&str>,
+    interval: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+    now: DateTime<Utc>,
+) -> ProbeAction {
+    if !(enabled && bootstrapped_before && phase_is_ready) {
+        return ProbeAction::Idle;
+    }
+    if probe_attempt_pending(probe_attempt_at, attempt_timeout, now) {
+        return ProbeAction::AwaitingResult;
+    }
+    if health_probe_due(bootstrapped_before, enabled, last_probe_at, interval, now) {
+        return ProbeAction::Launch;
+    }
+    ProbeAction::Idle
+}
+
 /// How a failing probe is classified — the load-bearing distinction the user
 /// demanded before anything destructive is ever even *suggested*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +416,7 @@ pub fn reconcile_probe_success(
             last_healthy_at: Some(now.to_string()),
             consecutive_probe_failures: None,
             first_failure_at: None,
+            probe_attempt_at: None,
         },
         event: None,
     }
@@ -304,6 +434,42 @@ pub fn probe_success_health_patch(now: &str) -> serde_json::Value {
         "lastHealthyAt": now,
         "consecutiveProbeFailures": serde_json::Value::Null,
         "firstFailureAt": serde_json::Value::Null,
+        // Retire the launch-side attempt stamp: this probe's result is now recorded,
+        // so the next pass must read `Idle`/`Launch`, never `AwaitingResult` (#273).
+        "probeAttemptAt": serde_json::Value::Null,
+    })
+}
+
+/// The `status.health` merge-patch fragment for a **failing** probe.
+///
+/// [`reconcile_probe_failure`] returns a typed [`RepositoryHealthStatus`], and every
+/// field is `skip_serializing_if = "Option::is_none"` — so serializing it directly
+/// can never CLEAR `probeAttemptAt`; the `None` is simply elided and the stale stamp
+/// survives in the stored object, leaving the repository stuck `AwaitingResult` until
+/// the timeout and making the *next* finished Job read as a probe. Emits the explicit
+/// RFC 7386 null the merge needs. Success twin: [`probe_success_health_patch`].
+pub fn probe_failure_health_patch(health: &RepositoryHealthStatus) -> serde_json::Value {
+    let mut value = serde_json::to_value(health).unwrap_or_else(|_| serde_json::json!({}));
+    value["probeAttemptAt"] = serde_json::Value::Null;
+    value
+}
+
+/// The `status.health` merge-patch fragment written when a bootstrap Job is
+/// **launched**: stamps `probeAttemptAt` for a probe-style launch, or explicitly
+/// clears it for any other launch.
+///
+/// Clearing is not optional. A strict relaunch (spec change, reverify) that merely
+/// *left* a stale stamp alone would have its result re-read as a probe on the next
+/// pass — fabricating `lastHealthyAt` from a connect no probe requested, and (worse)
+/// routing a genuine bootstrap failure into the alert-only `finalize_probe_failure`,
+/// which hard-codes `phase: Ready`. Writing `now | null` at the single launch site
+/// kills that whole class at the source.
+pub fn probe_attempt_health_patch(launched_at: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "probeAttemptAt": match launched_at {
+            Some(now) => serde_json::Value::String(now.to_string()),
+            None => serde_json::Value::Null,
+        },
     })
 }
 
@@ -345,6 +511,9 @@ pub fn reconcile_probe_failure(
         last_healthy_at: prior.and_then(|h| h.last_healthy_at.clone()),
         consecutive_probe_failures: Some(consecutive),
         first_failure_at: Some(first_failure_at),
+        // Retired by the caller through `probe_failure_health_patch`, which emits the
+        // explicit null this `None` cannot express through a merge patch.
+        probe_attempt_at: None,
     };
 
     let threshold = failure_threshold.max(1);
@@ -567,6 +736,330 @@ mod tests {
         // (and stayed Ready) keeps probing — `bootstrapped_before` stays true.
     }
 
+    // ---- #273: the launch-side attempt stamp -------------------------------
+
+    /// The attempt timeout used throughout these tests: the default Job deadline
+    /// (120s) plus the grace window (60s) = 180s.
+    fn attempt_timeout() -> std::time::Duration {
+        probe_attempt_timeout(bootstrap_deadline_seconds(None))
+    }
+
+    #[test]
+    fn probe_action_truth_table() {
+        let interval = std::time::Duration::from_secs(1800);
+        let to = attempt_timeout();
+        let action = |ready, boot, enabled, last: Option<&str>, attempt: Option<&str>, now| {
+            probe_action(ready, boot, enabled, last, attempt, interval, to, now)
+        };
+
+        // Ready + enabled + bootstrapped + never probed + no attempt → launch.
+        assert_eq!(
+            action(true, true, true, None, None, t(10_000)),
+            ProbeAction::Launch
+        );
+        // THE #273 ASSERTION: with a fresh attempt stamped, the pass must NOT launch
+        // (i.e. must not recycle) — it must wait for that Job's result. On the buggy
+        // code this state did not exist and the Job was recycled forever.
+        assert_eq!(
+            action(
+                true,
+                true,
+                true,
+                None,
+                Some(&t(9_950).to_rfc3339()),
+                t(10_000)
+            ),
+            ProbeAction::AwaitingResult
+        );
+        // The liveness escape: once the attempt is older than the timeout (a crashed
+        // controller, a TTL-reaped Job, a result ConfigMap that never materialised),
+        // the probe must become launchable again rather than wedging forever.
+        assert_eq!(
+            action(
+                true,
+                true,
+                true,
+                None,
+                Some(&t(9_000).to_rfc3339()),
+                t(10_000)
+            ),
+            ProbeAction::Launch
+        );
+        // Fail-open: an unparseable stamp must never wedge the probe.
+        assert_eq!(
+            action(true, true, true, None, Some("not-a-timestamp"), t(10_000)),
+            ProbeAction::Launch
+        );
+        // Timer not elapsed → idle.
+        assert_eq!(
+            action(
+                true,
+                true,
+                true,
+                Some(&t(9_000).to_rfc3339()),
+                None,
+                t(10_000)
+            ),
+            ProbeAction::Idle
+        );
+        // Timer elapsed → launch again (the probe re-fires on cadence).
+        assert_eq!(
+            action(true, true, true, Some(&t(0).to_rfc3339()), None, t(10_000)),
+            ProbeAction::Launch
+        );
+        // Disabled / never bootstrapped → idle regardless.
+        assert_eq!(
+            action(true, true, false, None, None, t(10_000)),
+            ProbeAction::Idle
+        );
+        assert_eq!(
+            action(true, false, true, None, None, t(10_000)),
+            ProbeAction::Idle
+        );
+    }
+
+    /// A repository that is NOT `Ready` must never produce probe activity, even when
+    /// every other input says a probe is due.
+    ///
+    /// Two distinct hazards. (1) A probe must not race a real (re-)bootstrap: without
+    /// this guard a spec change opens a second livelock — the generation arm recycles
+    /// the fresh strict result before it can write `observedGeneration`. (2) A
+    /// terminally-`Failed` repository's lingering Job must not be re-read as a probe:
+    /// `finalize_probe_failure` hard-codes `phase: Ready`, so that would silently
+    /// resurrect a failed repository and open every downstream `repository_ready` gate.
+    #[test]
+    fn a_repository_that_is_not_ready_never_probes() {
+        let interval = std::time::Duration::from_secs(1800);
+        let to = attempt_timeout();
+        // Due by every other measure, but not Ready.
+        assert_eq!(
+            probe_action(false, true, true, None, None, interval, to, t(10_000)),
+            ProbeAction::Idle
+        );
+        // Even with a fresh attempt stamped, a non-Ready repo never claims the result.
+        let upd = probe_action(
+            false,
+            true,
+            true,
+            None,
+            Some(&t(9_950).to_rfc3339()),
+            interval,
+            to,
+            t(10_000),
+        );
+        assert_eq!(upd, ProbeAction::Idle);
+        assert!(
+            !upd.awaits_result(),
+            "a Failed/Initializing repository must never treat a finished Job as its \
+             probe result — finalize_probe_failure would flip it back to Ready"
+        );
+    }
+
+    /// #273 encoded as an executable regression: drive the pure predicates through the
+    /// real reconcile sequence and assert it CONVERGES.
+    ///
+    /// On the buggy code the cycle was: due → recycle Job → recreate → completes →
+    /// still due (nothing ever stamped `lastProbeAt`, because the recycle returned
+    /// before `finalize_*`) → recycle → … forever. The launch-side stamp is what makes
+    /// the middle state (`AwaitingResult`) reachable, and therefore the timer clearable.
+    #[test]
+    fn probe_attempt_stamp_breaks_the_recycle_livelock() {
+        let interval = std::time::Duration::from_secs(1800);
+        let to = attempt_timeout();
+
+        // Pass 1 — a Ready, bootstrapped repo with the probe on and nothing recorded.
+        let mut last_probe_at: Option<String> = None;
+        let mut probe_attempt_at: Option<String> = None;
+        let first = probe_action(
+            true,
+            true,
+            true,
+            last_probe_at.as_deref(),
+            probe_attempt_at.as_deref(),
+            interval,
+            to,
+            t(10_000),
+        );
+        assert_eq!(first, ProbeAction::Launch);
+
+        // The reconciler launches the Job and stamps the attempt (create-site write).
+        probe_attempt_at = Some(t(10_000).to_rfc3339());
+
+        // Pass 2 — the Job is running/finished. This MUST NOT be another Launch, or the
+        // finished Job is recycled and we are back in the livelock.
+        let second = probe_action(
+            true,
+            true,
+            true,
+            last_probe_at.as_deref(),
+            probe_attempt_at.as_deref(),
+            interval,
+            to,
+            t(10_020),
+        );
+        assert_eq!(
+            second,
+            ProbeAction::AwaitingResult,
+            "#273: a launched probe must be awaited, not relaunched — relaunching \
+             destroys the result that would stamp lastProbeAt"
+        );
+        assert!(
+            second.awaits_result() && !second.launches(),
+            "the finished Job must reach finalize_*, which is the only writer of \
+             lastProbeAt"
+        );
+
+        // `finalize_*` runs: stamps lastProbeAt and CLEARS the attempt.
+        last_probe_at = Some(t(10_020).to_rfc3339());
+        probe_attempt_at = None;
+
+        // Pass 3 — converged. Quiet until the interval elapses.
+        assert_eq!(
+            probe_action(
+                true,
+                true,
+                true,
+                last_probe_at.as_deref(),
+                probe_attempt_at.as_deref(),
+                interval,
+                to,
+                t(10_030),
+            ),
+            ProbeAction::Idle,
+            "#273: the steady state after a completed probe must be quiet — a Launch \
+             here means the bootstrap Job churns forever"
+        );
+        // ... and re-fires exactly once the interval has passed.
+        assert_eq!(
+            probe_action(
+                true,
+                true,
+                true,
+                last_probe_at.as_deref(),
+                probe_attempt_at.as_deref(),
+                interval,
+                to,
+                t(10_020 + 1800),
+            ),
+            ProbeAction::Launch,
+            "the probe must still re-fire on cadence — fixing the loop must not mean \
+             never probing again"
+        );
+    }
+
+    /// A finished Job that no probe launched must never be claimed as a probe result.
+    /// This is what used to fabricate `lastHealthyAt` from a connect nobody requested.
+    #[test]
+    fn a_job_no_probe_launched_is_never_read_as_a_probe() {
+        let interval = std::time::Duration::from_secs(1800);
+        let to = attempt_timeout();
+        // No attempt stamped (the Job came from a spec-change re-bootstrap or a
+        // reverify) → the pass never claims its result.
+        let action = probe_action(
+            true,
+            true,
+            true,
+            Some(&t(9_990).to_rfc3339()),
+            None,
+            interval,
+            to,
+            t(10_000),
+        );
+        assert!(!action.awaits_result());
+    }
+
+    #[test]
+    fn probe_attempt_timeout_outlives_the_job_deadline() {
+        // The window must exceed the Job's own deadline, or an attempt is declared
+        // abandoned while its Job is still legitimately running.
+        let default = probe_attempt_timeout(bootstrap_deadline_seconds(None));
+        assert!(
+            default
+                > std::time::Duration::from_secs(crate::consts::BOOTSTRAP_JOB_DEADLINE_SECS as u64),
+            "the attempt window must outlive the Job deadline it waits on"
+        );
+        // A user raising activeDeadlineSeconds for a slow backend widens it too.
+        assert!(probe_attempt_timeout(bootstrap_deadline_seconds(Some(900))) > default);
+        assert_eq!(
+            bootstrap_deadline_seconds(None),
+            crate::consts::BOOTSTRAP_JOB_DEADLINE_SECS
+        );
+        assert_eq!(bootstrap_deadline_seconds(Some(42)), 42);
+    }
+
+    #[test]
+    fn probe_attempt_pending_truth_table() {
+        let to = std::time::Duration::from_secs(180);
+        assert!(!probe_attempt_pending(None, to, t(10_000)), "absent");
+        assert!(
+            !probe_attempt_pending(Some("garbage"), to, t(10_000)),
+            "unparseable must fail OPEN so a bad value cannot wedge the probe"
+        );
+        assert!(probe_attempt_pending(
+            Some(&t(9_950).to_rfc3339()),
+            to,
+            t(10_000)
+        ));
+        assert!(!probe_attempt_pending(
+            Some(&t(9_000).to_rfc3339()),
+            to,
+            t(10_000)
+        ));
+    }
+
+    #[test]
+    fn probe_attempt_health_patch_stamps_or_clears() {
+        let now = t(200).to_rfc3339();
+        assert_eq!(
+            probe_attempt_health_patch(Some(&now))["probeAttemptAt"].as_str(),
+            Some(now.as_str())
+        );
+        // A strict relaunch must CLEAR, and an empty object would not — the merge
+        // patch needs an explicit null or the stale stamp survives.
+        let cleared = probe_attempt_health_patch(None);
+        assert!(
+            cleared["probeAttemptAt"].is_null(),
+            "must be an explicit null, got {cleared:?}"
+        );
+    }
+
+    #[test]
+    fn probe_failure_health_patch_clears_the_attempt_stamp() {
+        // The trap: `RepositoryHealthStatus` fields are `skip_serializing_if =
+        // "Option::is_none"`, so serializing the typed struct directly ELIDES the
+        // `None` and the launch stamp survives in the stored object — leaving the repo
+        // stuck `AwaitingResult` and making the next finished Job read as a probe.
+        let health = RepositoryHealthStatus {
+            last_probe_at: Some(t(100).to_rfc3339()),
+            last_healthy_at: Some(t(50).to_rfc3339()),
+            consecutive_probe_failures: Some(2),
+            first_failure_at: Some(t(80).to_rfc3339()),
+            probe_attempt_at: Some(t(90).to_rfc3339()),
+        };
+        let raw = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            raw["probeAttemptAt"].as_str(),
+            Some(t(90).to_rfc3339().as_str()),
+            "sanity: the typed struct round-trips the stamp"
+        );
+
+        let patch = probe_failure_health_patch(&health);
+        assert!(
+            patch["probeAttemptAt"].is_null(),
+            "the failure patch must emit an explicit null to retire the attempt"
+        );
+        // ... while preserving everything the debounce depends on.
+        assert_eq!(
+            patch["lastProbeAt"].as_str(),
+            Some(t(100).to_rfc3339().as_str())
+        );
+        assert_eq!(patch["consecutiveProbeFailures"].as_i64(), Some(2));
+        assert_eq!(
+            patch["firstFailureAt"].as_str(),
+            Some(t(80).to_rfc3339().as_str())
+        );
+    }
+
     // ---- Part B: probe failure debounce + classification -------------------
 
     fn reachable_cond(status: &str, reason: &str) -> Condition {
@@ -588,6 +1081,7 @@ mod tests {
             last_healthy_at: Some(t(0).to_rfc3339()),
             consecutive_probe_failures: Some(n),
             first_failure_at: Some(t(0).to_rfc3339()),
+            probe_attempt_at: None,
         }
     }
 
@@ -753,6 +1247,13 @@ mod tests {
             patch["firstFailureAt"].is_null(),
             "must be explicit null so the merge clears it, got {:?}",
             patch["firstFailureAt"]
+        );
+        // #273: the launch-side attempt stamp must be retired here too. If it survives,
+        // the next pass still reads `AwaitingResult` and the probe never re-fires.
+        assert!(
+            patch["probeAttemptAt"].is_null(),
+            "must be explicit null so the merge retires the attempt, got {:?}",
+            patch["probeAttemptAt"]
         );
     }
 }

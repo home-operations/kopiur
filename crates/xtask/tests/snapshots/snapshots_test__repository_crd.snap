@@ -1,6 +1,5 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
-assertion_line: 24
 expression: "body(&artifacts, \"repositories\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -2710,6 +2709,18 @@ spec:
                     description: |-
                       RFC 3339 timestamp of the last completed probe (success or failure); drives
                       the `health_probe_due` timer so the probe re-fires on cadence.
+                    nullable: true
+                    type: string
+                  probeAttemptAt:
+                    description: |-
+                      RFC 3339 timestamp at which the last backend health probe was *launched*
+                      (the bootstrap Job created for it), cleared when its result is finalized.
+
+                      This is the **launch-side** rate limit, and it is what makes the probe
+                      terminate. `lastProbeAt` is written only at *finalize*, so gating the
+                      launch on that alone recycles the bootstrap Job forever: the gate destroys
+                      every Job whose completion would have cleared it (#273). Never compared
+                      against `lastProbeAt` — see `kopiur_controller::health::probe_action`.
                     nullable: true
                     type: string
                 type: object
