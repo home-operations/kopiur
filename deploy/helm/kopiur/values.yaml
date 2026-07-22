@@ -68,6 +68,9 @@ installScope: cluster
 #   * mover      — the per-Job image (one Job per Backup/Restore/Maintenance
 #                  run); see mover.image below.
 # When `digest` is set it wins over `tag` (tag defaults to .Chart.AppVersion).
+# Charts published to oci://ghcr.io/home-operations/charts ship all three
+# digests pinned to the release images (the in-repo defaults stay empty and
+# float on tags); on a published chart set digest: "" to make tag effective.
 image:
   # -- Full controller image repository (registry + path).
   repository: ghcr.io/home-operations/kopiur-controller
@@ -399,12 +402,15 @@ webhook:
   # When false, validation falls back to the controller's defensive checks only.
   enabled: true
   replicaCount: 1
-  # -- Admission webhook image (see the controller `image` block for the
-  # digest/tag rules).
+  # Admission webhook image (same tag/digest rules as the controller `image`).
   image:
+    # -- Full webhook image repository (registry + path).
     repository: ghcr.io/home-operations/kopiur-webhook
+    # -- Defaults to .Chart.AppVersion when empty.
     tag: ""
+    # -- Pin by digest (e.g. "sha256:..."); takes precedence over tag.
     digest: ""
+    # -- Image pull policy for the webhook.
     pullPolicy: IfNotPresent
   # -- failurePolicy for both webhook configurations: Fail (fail-closed,
   # recommended for a backup operator) or Ignore. Fail means a webhook outage
@@ -534,7 +540,9 @@ webhook:
 # image is configurable here.
 mover:
   image:
+    # -- Full mover image repository (registry + path).
     repository: ghcr.io/home-operations/kopiur-mover
+    # -- Defaults to .Chart.AppVersion when empty.
     tag: ""
     # -- Pin the mover image by digest so a re-pulled tag can never change what
     # runs in a data-protection Job. STRONGLY RECOMMENDED in production.

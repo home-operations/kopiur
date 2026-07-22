@@ -126,7 +126,7 @@
       "type": "object"
     },
     "image": {
-      "description": "=============================================================================\nController image\n=============================================================================\nThree images ship with kopiur:\n  * controller — the operator (reconcilers); exposes /metrics. Configured here.\n  * webhook    — the axum admission server; see webhook.image below.\n  * mover      — the per-Job image (one Job per Backup/Restore/Maintenance\n                 run); see mover.image below.\nWhen `digest` is set it wins over `tag` (tag defaults to .Chart.AppVersion).",
+      "description": "=============================================================================\nController image\n=============================================================================\nThree images ship with kopiur:\n  * controller — the operator (reconcilers); exposes /metrics. Configured here.\n  * webhook    — the axum admission server; see webhook.image below.\n  * mover      — the per-Job image (one Job per Backup/Restore/Maintenance\n                 run); see mover.image below.\nWhen `digest` is set it wins over `tag` (tag defaults to .Chart.AppVersion).\nCharts published to oci://ghcr.io/home-operations/charts ship all three\ndigests pinned to the release images (the in-repo defaults stay empty and\nfloat on tags); on a published chart set digest: \"\" to make tag effective.",
       "properties": {
         "digest": {
           "default": "",
@@ -449,11 +449,13 @@
             },
             "repository": {
               "default": "ghcr.io/home-operations/kopiur-mover",
+              "description": "Full mover image repository (registry + path).",
               "title": "repository",
               "type": "string"
             },
             "tag": {
               "default": "",
+              "description": "Defaults to .Chart.AppVersion when empty.",
               "title": "tag",
               "type": "string"
             }
@@ -836,25 +838,29 @@
           "type": "string"
         },
         "image": {
-          "description": "Admission webhook image (see the controller `image` block for the\ndigest/tag rules).",
+          "description": "Admission webhook image (same tag/digest rules as the controller `image`).",
           "properties": {
             "digest": {
               "default": "",
+              "description": "Pin by digest (e.g. \"sha256:...\"); takes precedence over tag.",
               "title": "digest",
               "type": "string"
             },
             "pullPolicy": {
               "default": "IfNotPresent",
+              "description": "Image pull policy for the webhook.",
               "title": "pullPolicy",
               "type": "string"
             },
             "repository": {
               "default": "ghcr.io/home-operations/kopiur-webhook",
+              "description": "Full webhook image repository (registry + path).",
               "title": "repository",
               "type": "string"
             },
             "tag": {
               "default": "",
+              "description": "Defaults to .Chart.AppVersion when empty.",
               "title": "tag",
               "type": "string"
             }

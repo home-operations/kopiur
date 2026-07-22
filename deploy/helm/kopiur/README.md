@@ -1,6 +1,6 @@
 # kopiur
 
-![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
+![Version: 0.8.0](https://img.shields.io/badge/Version-0.8.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.8.0](https://img.shields.io/badge/AppVersion-0.8.0-informational?style=flat-square)
 
 Kopiur — a Kopia-native Kubernetes backup operator written in Rust.
 Installs the controller, admission webhook, the 8 kopiur.home-operations.com/v1alpha1 CRDs,
@@ -17,10 +17,15 @@ Requires Kubernetes **>= 1.32** — the floor matches the default
 ```bash
 # cluster install (default): manages kopiur objects cluster-wide and reconciles
 # ClusterRepository. The webhook cert is self-managed by default — no
-# cert-manager, no manual steps:
-helm install kopiur deploy/helm/kopiur \
+# cert-manager, no manual steps. Installing from the published OCI chart is the
+# preferred path — its images are digest-pinned to the release and it is
+# cosign-signed (add --version x.y.z to pin a release):
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --namespace kopiur-system --create-namespace
 ```
+
+Working from a checkout instead? Swap the OCI ref for the local chart path
+`deploy/helm/kopiur` — the dev copy floats image tags (empty digests).
 
 See [`docs/install.md`](../../../docs/install.md) for the full quickstart and prerequisites.
 
@@ -36,7 +41,7 @@ See [`docs/install.md`](../../../docs/install.md) for the full quickstart and pr
 `cluster` is the default: a namespace-scoped `Role` can't reach the cluster-scoped `ClusterRepository` kind, so a namespaced install silently can't run a shared backup tier. Choose `namespaced` as the explicit least-privilege opt-down for a single-team install.
 
 ```bash
-helm install kopiur deploy/helm/kopiur --set installScope=namespaced ...
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur --set installScope=namespaced ...
 ```
 
 The RBAC rules are **synced from `cargo xtask gen-rbac`** (the checked-in `deploy/rbac/operator-*.yaml`), which derives the `kopiur.home-operations.com` permissions from the kube-rs `Resource` traits. The xtask is the source of truth; the chart templates carry a header comment to that effect and own only the names/labels.
@@ -110,8 +115,8 @@ The 8 CRDs ship in the chart's special `crds/` directory. Helm installs them on 
 | monitoring.serviceMonitor.scrapeTimeout | string | `"10s"` | Scrape timeout. |
 | mover.image.digest | string | `""` | Pin the mover image by digest so a re-pulled tag can never change what runs in a data-protection Job. STRONGLY RECOMMENDED in production. |
 | mover.image.pullPolicy | string | `"IfNotPresent"` | Pull policy used on the mover Job pods. |
-| mover.image.repository | string | `"ghcr.io/home-operations/kopiur-mover"` |  |
-| mover.image.tag | string | `""` |  |
+| mover.image.repository | string | `"ghcr.io/home-operations/kopiur-mover"` | Full mover image repository (registry + path). |
+| mover.image.tag | string | `""` | Defaults to .Chart.AppVersion when empty. |
 | nameOverride | string | `""` | Override the chart name used in resource names (defaults to .Chart.Name = "kopiur"). |
 | nodeSelector | object | `{}` | Scheduling controls (fall back to global.* when left empty). |
 | observability.otlp.enabled | bool | `false` | Enable OTLP export (sets OTEL_EXPORTER_OTLP_ENDPOINT on all components). |
@@ -149,7 +154,10 @@ The 8 CRDs ship in the chart's special `crds/` directory. Helm installs them on 
 | webhook.enabled | bool | `true` | Deploy the webhook (Deployment + Service + Validating/Mutating configs). When false, validation falls back to the controller's defensive checks only. |
 | webhook.extraEnv | list | `[]` | Extra environment variables for the webhook container (list of `{name, value}` / `{name, valueFrom}` entries), appended after the operator-managed env. Mirrors the root `extraEnv`. |
 | webhook.failurePolicy | string | `"Fail"` | failurePolicy for both webhook configurations: Fail (fail-closed, recommended for a backup operator) or Ignore. Fail means a webhook outage blocks kopiur CR writes — see podDisruptionBudget below for why HA matters. |
-| webhook.image | object | `{"digest":"","pullPolicy":"IfNotPresent","repository":"ghcr.io/home-operations/kopiur-webhook","tag":""}` | Admission webhook image (see the controller `image` block for the digest/tag rules). |
+| webhook.image.digest | string | `""` | Pin by digest (e.g. "sha256:..."); takes precedence over tag. |
+| webhook.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the webhook. |
+| webhook.image.repository | string | `"ghcr.io/home-operations/kopiur-webhook"` | Full webhook image repository (registry + path). |
+| webhook.image.tag | string | `""` | Defaults to .Chart.AppVersion when empty. |
 | webhook.livenessProbe | object | `{"httpGet":{"path":"/healthz","port":"https","scheme":"HTTPS"},"initialDelaySeconds":5,"periodSeconds":15}` | Liveness probe for the webhook container. Passed through with `toYaml` (retune timings/thresholds or swap the probe; `{}` drops it). The webhook only serves HTTPS, so `scheme: HTTPS` on the named `https` port. |
 | webhook.nodeSelector | object | `{}` | Scheduling controls (fall back to global.* when left empty). |
 | webhook.podAnnotations | object | `{}` |  |

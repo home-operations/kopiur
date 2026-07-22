@@ -56,7 +56,7 @@ You don't need a separate apply for them: they're applied along with everything 
 Install the chart into its own namespace. By default the operator manages the webhook's serving certificate itself — **no cert-manager required**. (Prefer cert-manager or a hand-supplied cert? See [Installation → Webhook TLS](install.md#webhook-tls).)
 
 ```console
-$ helm install kopiur deploy/helm/kopiur \
+$ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
     --namespace kopiur-system --create-namespace
 ```
 

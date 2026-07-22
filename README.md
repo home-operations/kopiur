@@ -29,10 +29,11 @@
 ## Quickstart
 
 ```bash
-kubectl create namespace kopiur-system
-helm install kopiur deploy/helm/kopiur \
-  --namespace kopiur-system \
-  --set webhook.certManager.enabled=true
+# The published OCI chart is the preferred install: cosign-signed, with all
+# three images digest-pinned to the release. The webhook cert is self-managed
+# by default — no cert-manager required.
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
+  --namespace kopiur-system --create-namespace
 kubectl get crd -l app.kubernetes.io/part-of=kopiur
 ```
 

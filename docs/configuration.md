@@ -450,7 +450,7 @@ once. Pass it with `helm -f`:
 ```
 
 ```bash
-helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
+helm upgrade --install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
   -f deploy/observability-values.yaml
 ```
 

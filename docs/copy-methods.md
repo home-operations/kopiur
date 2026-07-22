@@ -118,6 +118,25 @@ The staged PVC is brand-new and unheld, so the backup mover **schedules freely**
 - The **external-snapshotter** — the `snapshot-controller` Deployment **and** the `VolumeSnapshot`/`VolumeSnapshotContent`/`VolumeSnapshotClass` CRDs (see the [kubernetes-csi external-snapshotter docs](https://kubernetes-csi.github.io/docs/snapshot-controller.html)). Many managed distributions (EKS, GKE, AKS, Talos, k3s add-ons) ship or offer this.
 - A **`VolumeSnapshotClass`** whose `driver` matches the CSI provisioner of your source PVC's `StorageClass`.
 
+If your distribution does **not** bundle a `snapshot-controller`, the home-operations [`snapshot-controller`](https://github.com/home-operations/helm-charts) chart installs the controller and the snapshot CRDs (vendored byte-for-byte from the [upstream external-snapshotter](https://github.com/kubernetes-csi/external-snapshotter) release):
+
+```bash
+helm install snapshot-controller oci://ghcr.io/home-operations/charts/snapshot-controller \
+  --namespace kube-system
+```
+
+The same chart can create the `VolumeSnapshotClass` for you: add an entry under its `volumeSnapshotClasses` value naming the `driver` for your source's storage (optionally annotated `snapshot.storage.kubernetes.io/is-default-class: "true"`), so the whole prerequisite lands in one install. Skip the chart on a distribution that already runs a controller (EKS, GKE, AKS, Talos, k3s add-ons); a second one just contends for the same CRs.
+
+/// warning | Helm never upgrades the snapshot CRDs
+
+Like Kopiur's own chart, this one ships the CRDs in its `crds/` directory: `helm install` creates them, but `helm upgrade` leaves them untouched. After bumping the chart across an appVersion, reapply the matching CRDs yourself:
+
+```bash
+helm show crds oci://ghcr.io/home-operations/charts/snapshot-controller | kubectl apply --server-side -f -
+```
+
+///
+
 If any of this is missing, the backup **fails with a clear condition** telling you exactly what to do — Kopiur never silently downgrades a `Snapshot` backup to a live read. See [Troubleshooting](#troubleshooting) below.
 
 ### Choosing the `VolumeSnapshotClass`
@@ -307,7 +326,7 @@ If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapsho
 
 | Condition / symptom | Cause | Fix |
 | --- | --- | --- |
-| `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API — the external-snapshotter isn't installed. | Install the [snapshot-controller + CRDs](https://kubernetes-csi.github.io/docs/snapshot-controller.html) and a `VolumeSnapshotClass`, or set `copyMethod: Direct`. |
+| `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API — the external-snapshotter isn't installed. | Install the snapshot-controller and a `VolumeSnapshotClass` ([What it requires](#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
 | `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver (or several do with no single default). | Create/annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
 | `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The VolumeSnapshot was **still reporting an error when the staging deadline passed** (`spec.staging.timeout`, default `10m`) — transient errors during the wait are retried, never fatal on their own. | Read the message (it includes the driver's last error); fix the class/driver, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run (or a new `Snapshot`) retries. |
 | `SourceStaged=False`, reason **`StagingTimedOut`** | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported **no error** — the CSI driver / snapshot-controller is stuck or very slow. | Check the driver and the snapshot-controller; raise `spec.staging.timeout` (or set it to `"0"` to wait indefinitely) if the backend is just slow. |

@@ -67,7 +67,7 @@ features:
 …or on the command line:
 
 ```console
-$ helm upgrade kopiur deploy/helm/kopiur \
+$ helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur \
     --reuse-values --set features.kopiaUi.enabled=true
 ```
 
