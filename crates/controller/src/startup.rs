@@ -262,6 +262,11 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         ctx,
         streaming_lists,
         config.watch_scope.clone(),
+        config.reconcile_concurrency,
+    );
+    tracing::info!(
+        reconcile_concurrency = ?config.reconcile_concurrency.map(std::num::NonZeroU16::get),
+        "per-controller reconcile concurrency configured (None = unbounded)"
     );
 
     match leadership_lost {

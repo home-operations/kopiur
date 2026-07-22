@@ -959,6 +959,12 @@ impl KopiaClient {
         &self.common_args
     }
 
+    /// The timeout applied to every invocation when set (useful for tests
+    /// asserting a caller time-bounds its subprocesses).
+    pub fn default_timeout(&self) -> Option<Duration> {
+        self.default_timeout
+    }
+
     /// Run kopia with the given subcommand args, returning raw output. Applies
     /// `common_env` and inserts `common_args` immediately after the subcommand,
     /// plus a per-invocation environment overlay (`Some(value)` sets a variable,

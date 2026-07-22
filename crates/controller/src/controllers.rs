@@ -131,6 +131,7 @@ pub(crate) async fn spawn_all(
     ctx: Arc<Context>,
     streaming_lists: bool,
     scope: config::WatchScope,
+    reconcile_concurrency: Option<std::num::NonZeroU16>,
 ) {
     // Cluster-scoped kinds (ClusterRepository primaries + referents, Namespace
     // referents) are registered ONLY in cluster scope: a namespaced install
@@ -181,8 +182,30 @@ pub(crate) async fn spawn_all(
     // exists today (the controller is the sole steady-state status writer; mover
     // stamps are one-shot), so if a reconciler ever looks starved, look for a new
     // sub-window event source on its primary.
-    let ctrl_cfg = kube::runtime::controller::Config::default()
+    let mut ctrl_cfg = kube::runtime::controller::Config::default()
         .debounce(std::time::Duration::from_millis(250));
+    // Per-controller cap on concurrent reconciles (kube's default is UNBOUNDED).
+    // This is the primary fix from the apiserver-outage incident: after every
+    // watcher reconnect the re-list re-drives EVERY primary (and the referent
+    // mappers fan single events out to whole fleets — one ClusterRepository
+    // touch enqueues every SnapshotSchedule cluster-wide). Unbounded, that
+    // dispatched hundreds of reconciles at once, each holding sockets against a
+    // dead apiserver until the process exhausted its fd table (EMFILE) within
+    // seconds; the /healthz listener then couldn't accept, the kubelet killed
+    // the pod, and the restart's re-list repeated the storm.
+    //
+    // SIZING — the cap bounds fds/API-load (8 controllers × N slots, each slot
+    // ≤ ~5 SEQUENTIAL API calls), but a slot is held for the reconcile's FULL
+    // duration, so the floor is set by the slow holders: Snapshot hooks (block
+    // their slot up to the user's hook timeout, default 300s — deliberate:
+    // detaching hooks would stretch the app's quiesce window) and in-process
+    // kopia ops (bounded by config::KOPIA_SUBPROCESS_TIMEOUT). The default (8,
+    // config::DEFAULT_RECONCILE_CONCURRENCY) keeps a few slow holders from
+    // starving a controller while clearing a few-hundred-object re-list in
+    // seconds. `0`/None = unbounded escape hatch (the pre-fix behavior).
+    if let Some(n) = reconcile_concurrency {
+        ctrl_cfg = ctrl_cfg.concurrency(n.get());
+    }
 
     // Snapshot owns its mover Job + ConfigMap (reaped via owner-ref GC, §4.10), and
     // watches its `SnapshotPolicy` recipe so a policy edit (or a policy whose

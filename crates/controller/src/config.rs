@@ -191,6 +191,39 @@ pub const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_J
 /// [`ControllerConfig::max_concurrent_delete_jobs`]`: None`.
 pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: usize = 0;
 
+/// Per-controller cap on concurrently running reconciles (the operator runs 8
+/// controllers, so the process-wide worst case is 8× this). Unlike
+/// [`MAX_CONCURRENT_DELETE_JOBS_ENV`] — where batching is the primary
+/// protection and uncapped is the safe default — reconcile concurrency has NO
+/// other bound: kube-runtime's default (`0` = unlimited) is what let a
+/// post-restart re-list dispatch every object's reconcile simultaneously
+/// during an apiserver outage, each attempt pinning sockets against the dead
+/// endpoint until the process exhausted its fd table (EMFILE) within seconds.
+/// Reachable via the chart's top-level `reconcileConcurrency` value.
+pub const RECONCILE_CONCURRENCY_ENV: &str = "KOPIUR_RECONCILE_CONCURRENCY";
+
+/// Fallback (raw, `0`-sentinel) per-controller reconcile cap when
+/// [`RECONCILE_CONCURRENCY_ENV`] is unset: BOUNDED at 8. Sized so a re-list
+/// clears a few-hundred-object fleet in seconds (reconciles are usually
+/// sub-second) while capping in-flight API sockets at ≤64 process-wide — and
+/// high enough that the slowest slot-holders (hooks, kopia subprocess ops,
+/// both minutes-bounded by their own timeouts) can't starve a whole
+/// controller. `0` = unbounded (the pre-fix behavior; not recommended).
+/// [`ControllerArgs::resolve`] turns the sentinel into
+/// [`ControllerConfig::reconcile_concurrency`]`: None`.
+pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
+
+/// Timeout for the controller's short in-process kopia subprocess ops (repo
+/// connect-validate, catalog `snapshot list`, finalizer `snapshot delete` —
+/// long work runs in mover Jobs). Previously unbounded: a hung backend (dead
+/// NFS mount, stuck object store) blocked the subprocess in IO indefinitely
+/// and pinned its reconcile slot forever. With the per-controller reconcile
+/// cap ([`RECONCILE_CONCURRENCY_ENV`]) a few such hangs would starve a whole
+/// controller, so the cap and this bound exist together. 120s is generous for
+/// ops that normally complete in seconds, even against a cold/slow backend; a
+/// timeout surfaces as a retryable kopia error (Transient requeue).
+pub const KOPIA_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Steady-state cadence for re-checking the webhook cert for rotation and
 /// re-asserting the `caBundle`. The leaf is long-lived and renewed well before
 /// expiry, so a slow cadence is ample once the cert is established.
@@ -337,6 +370,16 @@ pub struct ControllerArgs {
           default_value_t = DEFAULT_MAX_CONCURRENT_DELETE_JOBS,
           value_parser = parse_max_concurrent_delete_jobs)]
     pub max_concurrent_delete_jobs: usize,
+
+    /// Per-controller cap on concurrently running reconciles. `0` means
+    /// unbounded (the pre-fix behavior; not recommended — see
+    /// [`RECONCILE_CONCURRENCY_ENV`]). Raw `u16`, `0`-sentinel — resolved to
+    /// [`ControllerConfig::reconcile_concurrency`]`: Option<NonZeroU16>` in
+    /// [`ControllerArgs::resolve`].
+    #[arg(long, env = RECONCILE_CONCURRENCY_ENV,
+          default_value_t = DEFAULT_RECONCILE_CONCURRENCY,
+          value_parser = parse_reconcile_concurrency)]
+    pub reconcile_concurrency: u16,
 
     /// Cluster-scoped install: watch every namespace and reconcile
     /// ClusterRepository. The chart stamps it for `installScope: cluster`.
@@ -557,6 +600,12 @@ pub struct ControllerConfig {
     /// primary protection; this is an opt-in backstop. `Option<NonZeroUsize>`
     /// so "no cap" can't be mistaken for "cap of zero" at any call site.
     pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+    /// Per-controller cap on concurrently running reconciles. `None` means
+    /// UNBOUNDED (the explicit `0` escape hatch — the pre-fix behavior, not
+    /// recommended); the default is BOUNDED at
+    /// [`DEFAULT_RECONCILE_CONCURRENCY`]. `Option<NonZeroU16>` so "no cap"
+    /// can't be mistaken for "cap of zero" at any call site.
+    pub reconcile_concurrency: Option<std::num::NonZeroU16>,
 }
 
 impl ControllerArgs {
@@ -637,6 +686,7 @@ impl ControllerArgs {
             max_concurrent_delete_jobs: std::num::NonZeroUsize::new(
                 self.max_concurrent_delete_jobs,
             ),
+            reconcile_concurrency: std::num::NonZeroU16::new(self.reconcile_concurrency),
         })
     }
 }
@@ -702,6 +752,23 @@ fn parse_max_concurrent_delete_jobs(value: &str) -> Result<usize, String> {
             "KOPIUR_MAX_CONCURRENT_DELETE_JOBS='{value}' is not a valid job count; use a \
              non-negative integer (0 = uncapped, the default); unset it to use the default \
              {DEFAULT_MAX_CONCURRENT_DELETE_JOBS}"
+        )
+    })
+}
+
+/// Value parser for [`RECONCILE_CONCURRENCY_ENV`]. Empty means "unset" (→ the
+/// BOUNDED default — falling back to unbounded here would silently reopen the
+/// EMFILE hole the default exists to close); `0` is explicitly valid and means
+/// unbounded (the deliberate escape hatch). Only garbage is rejected.
+fn parse_reconcile_concurrency(value: &str) -> Result<u16, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_RECONCILE_CONCURRENCY);
+    }
+    value.parse::<u16>().map_err(|_| {
+        format!(
+            "KOPIUR_RECONCILE_CONCURRENCY='{value}' is not a valid per-controller reconcile \
+             cap; use an integer 0-65535 (0 = unbounded, not recommended), e.g. 8; unset it \
+             to use the default {DEFAULT_RECONCILE_CONCURRENCY}"
         )
     })
 }
@@ -782,6 +849,12 @@ mod tests {
         assert_eq!(cfg.leader_election, None);
         // Uncapped by default: batching is the primary protection.
         assert_eq!(cfg.max_concurrent_delete_jobs, None);
+        // BOUNDED by default: reconcile concurrency has no other bound (the
+        // apiserver-outage EMFILE fix).
+        assert_eq!(
+            cfg.reconcile_concurrency,
+            std::num::NonZeroU16::new(DEFAULT_RECONCILE_CONCURRENCY)
+        );
     }
 
     #[test]
@@ -818,6 +891,8 @@ mod tests {
             "mwc",
             "--max-concurrent-delete-jobs",
             "4",
+            "--reconcile-concurrency",
+            "12",
         ]);
         assert_eq!(cfg.mover_image, "example.com/mover:v1");
         assert!(cfg.mover_image_overridden);
@@ -838,6 +913,7 @@ mod tests {
             cfg.max_concurrent_delete_jobs,
             std::num::NonZeroUsize::new(4)
         );
+        assert_eq!(cfg.reconcile_concurrency, std::num::NonZeroU16::new(12));
     }
 
     // --- the chart argv contract: deployment.tpl has stamped these args since
@@ -1098,6 +1174,67 @@ mod tests {
         assert_eq!(
             resolve(&["--max-concurrent-delete-jobs", "10"]).max_concurrent_delete_jobs,
             std::num::NonZeroUsize::new(10)
+        );
+    }
+
+    // --- KOPIUR_RECONCILE_CONCURRENCY: BOUNDED by default (unlike the delete-Job
+    // cap, where batching is the primary protection and uncapped is safe). kube's
+    // implicit unbounded reconcile concurrency is what let a post-outage re-list
+    // dispatch every object at once and exhaust the fd table (EMFILE) while the
+    // apiserver flapped; `0` is the explicit unbounded escape hatch. ---
+
+    #[test]
+    #[serial]
+    fn reconcile_concurrency_defaults_bounded() {
+        // The bounded default IS the incident fix: unset must never mean
+        // unbounded again.
+        assert_eq!(
+            resolve(&[]).reconcile_concurrency,
+            std::num::NonZeroU16::new(DEFAULT_RECONCILE_CONCURRENCY)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_concurrency_zero_means_unbounded() {
+        assert_eq!(
+            resolve(&["--reconcile-concurrency", "0"]).reconcile_concurrency,
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_concurrency_empty_means_default_not_unbounded() {
+        // The chart can render the env as ""; that has always meant "unset" —
+        // which here must fall back to the BOUNDED default, not to 0/unbounded.
+        assert_eq!(
+            resolve(&["--reconcile-concurrency="]).reconcile_concurrency,
+            std::num::NonZeroU16::new(DEFAULT_RECONCILE_CONCURRENCY)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_concurrency_garbage_fails_loudly() {
+        let err = ControllerArgs::try_parse_from([
+            "kopiur-controller",
+            "--reconcile-concurrency",
+            "many",
+        ])
+        .expect_err("garbage reconcile cap must not silently default");
+        let msg = err.to_string();
+        assert!(msg.contains("KOPIUR_RECONCILE_CONCURRENCY='many'"), "{msg}");
+        assert!(msg.contains("0 = unbounded"), "{msg}");
+        assert!(msg.contains("unset it to use the default"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_concurrency_flag_overrides_the_default() {
+        assert_eq!(
+            resolve(&["--reconcile-concurrency", "16"]).reconcile_concurrency,
+            std::num::NonZeroU16::new(16)
         );
     }
 
