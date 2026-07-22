@@ -218,10 +218,15 @@ async fn run_workload_exec(
                 .to_string(),
         ));
     }
-    // The read-timeout-exempt client: the exec WebSocket must survive a
-    // quiesce command that is silent for longer than the hardened client's
-    // read window (see Context::exec_client).
-    let pods: Api<Pod> = Api::namespaced(ctx.exec_client.clone(), namespace);
+    // Two Api handles over the same Pods, deliberately on DIFFERENT clients:
+    // the unary LIST rides the hardened client (its 305s read timeout bounds a
+    // stalled apiserver — an untimed list here would pin this reconcile slot,
+    // recreating exactly the starvation the concurrency cap bounds), while the
+    // exec WebSocket rides the read-timeout-EXEMPT client, because a quiesce
+    // command legitimately stays silent longer than the hardened read window
+    // (see Context::exec_client). `pods_exec` must never serve unary calls.
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let pods_exec: Api<Pod> = Api::namespaced(ctx.exec_client.clone(), namespace);
     let listed = pods.list(&ListParams::default().labels(&query)).await?;
     let pod = match pick_exec_pod(&listed.items, &query, namespace) {
         Ok(p) => p,
@@ -234,7 +239,7 @@ async fn run_workload_exec(
         params = params.container(c.clone());
     }
     let timeout = hook_timeout(hook.timeout.as_deref());
-    let exec = pods.exec(&pod_name, hook.command.clone(), &params);
+    let exec = pods_exec.exec(&pod_name, hook.command.clone(), &params);
     let mut attached = match tokio::time::timeout(timeout, exec).await {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => return Err(e.into()),
