@@ -105,7 +105,12 @@ impl KopiaClientFactory {
             .env("KOPIA_CHECK_FOR_UPDATES", "false")
             .env(kopia_env::CACHE_DIRECTORY_ENV, cache.to_string_lossy())
             .env(kopia_env::LOG_DIR_ENV, logs.to_string_lossy())
-            .env(kopia_env::CONFIG_PATH_ENV, config.to_string_lossy());
+            .env(kopia_env::CONFIG_PATH_ENV, config.to_string_lossy())
+            // Time-bound every subprocess: a hung backend must surface as a
+            // retryable kopia error, not pin a reconcile slot forever (see
+            // config::KOPIA_SUBPROCESS_TIMEOUT for why this pairs with the
+            // reconcile-concurrency cap).
+            .default_timeout(crate::config::KOPIA_SUBPROCESS_TIMEOUT);
         if let Some(bin) = &self.binary {
             b = b.binary(bin.clone());
         }
@@ -122,6 +127,15 @@ impl KopiaClientFactory {
 pub struct Context {
     /// The Kubernetes API client.
     pub client: Client,
+    /// A second client from the same inferred config but WITHOUT the read
+    /// timeout, used ONLY for the hooks `workloadExec` attach: the exec
+    /// WebSocket rides the same timeout-wrapped connector as unary calls, so
+    /// the hardened [`crate::config::KUBE_CLIENT_READ_TIMEOUT`] on
+    /// [`client`](Self::client) would kill any quiesce command silent for
+    /// longer than the window ("returned no status (connection closed
+    /// early)"). Exec streams are rare and bounded by the hook timeout, so
+    /// exempting them costs nothing.
+    pub exec_client: Client,
     /// Factory for short-lived kopia clients (idempotent ops only).
     pub kopia: KopiaClientFactory,
     /// Controller + business metrics.
@@ -227,6 +241,7 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
+        exec_client: Client,
         kopia: KopiaClientFactory,
         metrics: Metrics,
         recorder: Recorder,
@@ -245,6 +260,7 @@ impl Context {
     ) -> Self {
         Context {
             client,
+            exec_client,
             kopia,
             metrics,
             recorder,
@@ -293,6 +309,35 @@ impl Context {
         crate::config::effective_mover_pull_policy(
             self.mover_pull_policy,
             self.mover_image_overridden,
+        )
+    }
+
+    /// A `Context` over the given (usually `tower::service_fn` mock) client,
+    /// with the Recorder built from the same client and every other field at a
+    /// neutral default — for hermetic tests of policy/glue code that needs a
+    /// whole `Context` (e.g. `error_policy_for`), not a live cluster.
+    #[cfg(test)]
+    pub(crate) fn test_context(client: Client) -> Self {
+        use kube::runtime::events::Reporter;
+        let recorder = Recorder::new(client.clone(), Reporter::from("kopiur-test"));
+        Context::new(
+            client.clone(),
+            client,
+            KopiaClientFactory::new(),
+            Metrics::new(),
+            recorder,
+            "example.com/kopiur-mover:test".to_string(),
+            false,
+            None,
+            None,
+            crate::config::DEFAULT_MOVER_NAME.to_string(),
+            crate::config::DEFAULT_MOVER_ROLE_KIND,
+            Vec::new(),
+            kube::runtime::reflector::store::<Maintenance>().0,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            crate::config::WatchScope::Cluster,
+            None,
         )
     }
 }
@@ -347,6 +392,23 @@ mod tests {
 
     fn base() -> PathBuf {
         std::env::temp_dir().join("kopiur-factory-test")
+    }
+
+    // --- regression (apiserver-outage EMFILE fix): factory-built kopia clients
+    // ran with NO subprocess timeout, so a hung backend (dead NFS mount, stuck
+    // object store) pinned its reconcile slot forever. Unbounded reconcile
+    // concurrency hid this (only that one object wedged); with the per-controller
+    // reconcile cap, a few hung subprocesses would starve a WHOLE controller —
+    // the cap and this timeout must exist together. ---
+    #[test]
+    fn factory_built_clients_carry_the_subprocess_timeout() {
+        let client = KopiaClientFactory::new().with_cache_dir(base()).build([]);
+        assert_eq!(
+            client.default_timeout(),
+            Some(crate::config::KOPIA_SUBPROCESS_TIMEOUT),
+            "every factory-built kopia client must be time-bounded so a hung \
+             backend cannot pin a reconcile slot"
+        );
     }
 
     #[test]

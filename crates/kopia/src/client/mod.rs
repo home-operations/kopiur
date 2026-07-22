@@ -928,6 +928,20 @@ pub struct KopiaClient {
     default_timeout: Option<Duration>,
 }
 
+/// SIGKILL a timed-out kopia child AND reap it before returning
+/// (`Child::kill()` = `start_kill` + `wait`). Without the wait the killed
+/// child lingers as a zombie until tokio's SIGCHLD-driven orphan reaper gets
+/// to it — best-effort and non-deterministic; with the controller's 120s
+/// `default_timeout`, a hung backend would leave one transient zombie per
+/// retry. Reaping inline makes cleanup a guarantee instead of a race.
+/// Best-effort on error: nothing here can improve on the Timeout being
+/// returned, so a kill/wait failure is only logged.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    if let Err(e) = child.kill().await {
+        tracing::debug!(error = %e, "could not kill/reap a timed-out kopia child");
+    }
+}
+
 /// The raw outcome of running a kopia subprocess.
 struct RawOutput {
     code: Option<i32>,
@@ -957,6 +971,12 @@ impl KopiaClient {
     /// present).
     pub fn common_args(&self) -> &[String] {
         &self.common_args
+    }
+
+    /// The timeout applied to every invocation when set (useful for tests
+    /// asserting a caller time-bounds its subprocesses).
+    pub fn default_timeout(&self) -> Option<Duration> {
+        self.default_timeout
     }
 
     /// Run kopia with the given subcommand args, returning raw output. Applies
@@ -1070,9 +1090,7 @@ impl KopiaClient {
                     source,
                 })?,
                 Err(_) => {
-                    // Best-effort kill; ignore the result since we're erroring
-                    // out regardless.
-                    let _ = child.start_kill();
+                    kill_and_reap(&mut child).await;
                     return Err(KopiaError::Timeout {
                         args: display_args,
                         seconds: t.as_secs(),
@@ -1632,7 +1650,7 @@ impl KopiaClient {
                     source,
                 })?,
                 Err(_) => {
-                    let _ = child.start_kill();
+                    kill_and_reap(&mut child).await;
                     return Err(KopiaError::Timeout {
                         args: display_args,
                         seconds: t.as_secs(),

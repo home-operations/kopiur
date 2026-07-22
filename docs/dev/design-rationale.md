@@ -358,6 +358,37 @@ keeping Kopiur's own retention pruning unaffected:
   (`CreateContainerConfigError`/`ImagePullBackOff`/`Unschedulable`); a wedged pod never
   reaches a terminal phase and `backoffLimit` never trips, so this is the only backstop.
 
+## Controller resilience under API-server outage
+
+A production control plane was OOM-killed ~5 times in a row (July 2026); each flap
+the controller exhausted its fd table (`EMFILE`) within ~11s of startup, its
+`/healthz` listener stopped accepting, the kubelet restarted it, and the restart's
+re-list re-ran the storm — the election Lease reached `leaseTransitions=80`. The
+amplification chain: watcher re-lists re-drive every primary × referent fan-out
+(one ClusterRepository event enqueues every SnapshotSchedule cluster-wide) ×
+**unbounded** reconcile concurrency × ~3–5 API reads per reconcile × one spawned
+Warning-Event POST per failure × 30s connect timeouts pinning an fd per blackholed
+SYN × no `NOFILE` handling.
+
+The fix package (see
+[watch-and-reconcile → API-outage resilience](watch-and-reconcile.md#api-outage-resilience)
+for the per-defense detail): a **bounded-by-default reconcile concurrency cap**
+(`reconcileConcurrency: 8` per controller — unlike `maxConcurrentDeleteJobs`,
+where batching is the primary protection and uncapped is safe, reconcile
+concurrency had NO other bound), paired with a kopia subprocess timeout so a hung
+backend can't starve a capped controller; transport-error Event suppression plus a
+16-permit/10s bound on failure publishes; deterministic [30s, 60s) jitter on the
+transient requeue; 5s connect / 305s read client timeouts (exec streams exempt);
+a deadline on each leader renew attempt; a fail-closed streamingLists probe; and
+an `RLIMIT_NOFILE` soft→hard raise.
+
+**Deliberately unchanged:** exit-on-lost-lease (abdicating and restarting beats a
+split-brain double-reconcile; bounded concurrency makes each restart's re-list
+cheap); hooks staying inline on the reconcile slot (detaching them would stretch
+the app's quiesce window across requeues — the slot-hold is bounded by the hook
+timeout, the kopia timeout, and cap sizing); and the axum accept loop (axum 0.8
+already sleeps 1s and retries on `EMFILE`, matching the incident logs' cadence).
+
 ## See also
 
 - [CRD reference](../reference/crds/index.md) — the per-field user documentation.

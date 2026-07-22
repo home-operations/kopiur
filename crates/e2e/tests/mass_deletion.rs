@@ -652,57 +652,96 @@ async fn schedule_cascade_delete_leaves_kopia_intact_and_recatalogs() {
         );
     }
 
-    // (e) within the catalog interval, discovered rows re-materialize for the retained
-    // kopia snapshots (keyed to THIS repo's uid), each forced deletionPolicy Retain.
+    // (e) within the catalog interval, the retained kopia snapshots re-materialize
+    // as Snapshot CRs keyed to THIS repo's uid. Since policy-cascade auto-adoption
+    // (#210/#272) the END state depends on whether a matching policy still exists —
+    // and here the POLICY deliberately survives the schedule cascade, so the
+    // rediscovered rows are auto-adopted straight back to it (`origin: adopted`,
+    // spec re-derived from the policy) — often fast enough that the interim
+    // `discovered` row is never observable from a 3s poll. Accept BOTH states:
+    // a row still `discovered` must be forced Retain; an `adopted` row must
+    // reference the policy and carry its defaultDeletionPolicy (adoption hands
+    // the lifecycle back to the policy — deliberately NOT forced Retain).
     let repo_uid = repos
         .get(REPO)
         .await
         .expect("get Repository")
         .uid()
         .expect("Repository uid");
-    let disc_selector = format!("{ORIGIN_LABEL}=discovered,{REPOSITORY_UID_LABEL}={repo_uid}");
-    let discovered = wait_until(
-        "catalog rediscovers the retained kopia snapshots as discovered rows",
+    fn catalog_origin(row: &Snapshot) -> String {
+        row.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(ORIGIN_LABEL))
+            .cloned()
+            .unwrap_or_default()
+    }
+    let uid_selector = format!("{REPOSITORY_UID_LABEL}={repo_uid}");
+    let rematerialized = wait_until(
+        "catalog re-materializes the retained kopia snapshots (discovered or adopted)",
         default_timeout(),
         poll_interval(),
         || async {
-            let rows = backups
-                .list(&ListParams::default().labels(&disc_selector))
+            let rows: Vec<Snapshot> = backups
+                .list(&ListParams::default().labels(&uid_selector))
                 .await?
-                .items;
+                .items
+                .into_iter()
+                .filter(|r| matches!(catalog_origin(r).as_str(), "discovered" | "adopted"))
+                .collect();
             Ok((rows.len() as i64 >= kopia_before).then_some(rows))
         },
     )
     .await
-    .expect("the retained kopia snapshots must re-materialize as discovered Snapshot CRs");
-    for row in &discovered {
+    .expect("the retained kopia snapshots must re-materialize as discovered/adopted CRs");
+    for row in &rematerialized {
         let v = serde_json::to_value(row).unwrap_or_default();
-        assert_eq!(
-            v.pointer("/spec/deletionPolicy").and_then(|x| x.as_str()),
-            Some("Retain"),
-            "a rediscovered snapshot must be FORCED deletionPolicy Retain: {v}"
-        );
+        match catalog_origin(row).as_str() {
+            "discovered" => assert_eq!(
+                v.pointer("/spec/deletionPolicy").and_then(|x| x.as_str()),
+                Some("Retain"),
+                "a not-yet-adopted rediscovered snapshot must be FORCED Retain: {v}"
+            ),
+            "adopted" => {
+                assert_eq!(
+                    v.pointer("/spec/policyRef/name").and_then(|x| x.as_str()),
+                    Some(POLICY),
+                    "an adopted row must reference the surviving policy: {v}"
+                );
+                assert_eq!(
+                    v.pointer("/spec/deletionPolicy").and_then(|x| x.as_str()),
+                    Some("Delete"),
+                    "an adopted row carries the policy's defaultDeletionPolicy: {v}"
+                );
+            }
+            other => panic!("unexpected catalog origin label {other:?}: {v}"),
+        }
     }
 
-    // Cleanup: discovered rows are forced-Retain, so deleting them leaves kopia
-    // intact; remove Snapshot CRs BEFORE the Repository (the finalizer needs it).
-    for row in &discovered {
+    // Cleanup: remove the catalog CRs BEFORE the Repository (the finalizer needs
+    // it). Deleting an adopted row (deletionPolicy Delete) deletes its kopia
+    // snapshot — fine at teardown, the scenario-scoped repo goes next; the wave
+    // stays under the breaker threshold.
+    for row in &rematerialized {
         let _ = backups
             .delete(&row.name_any(), &DeleteParams::default())
             .await;
     }
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
-    // Best-effort: let the discovered CRs' finalizers release before the repo goes.
+    // Best-effort: let the catalog CRs' finalizers release before the repo goes.
     let _ = wait_until(
-        "discovered CRs drain before repo teardown",
+        "catalog CRs drain before repo teardown",
         Duration::from_secs(60),
         poll_interval(),
         || async {
             let rows = backups
-                .list(&ListParams::default().labels(&disc_selector))
+                .list(&ListParams::default().labels(&uid_selector))
                 .await?
-                .items;
-            Ok(rows.is_empty().then_some(()))
+                .items
+                .into_iter()
+                .filter(|r| matches!(catalog_origin(r).as_str(), "discovered" | "adopted"))
+                .count();
+            Ok((rows == 0).then_some(()))
         },
     )
     .await;

@@ -218,7 +218,15 @@ async fn run_workload_exec(
                 .to_string(),
         ));
     }
+    // Two Api handles over the same Pods, deliberately on DIFFERENT clients:
+    // the unary LIST rides the hardened client (its 305s read timeout bounds a
+    // stalled apiserver — an untimed list here would pin this reconcile slot,
+    // recreating exactly the starvation the concurrency cap bounds), while the
+    // exec WebSocket rides the read-timeout-EXEMPT client, because a quiesce
+    // command legitimately stays silent longer than the hardened read window
+    // (see Context::exec_client). `pods_exec` must never serve unary calls.
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let pods_exec: Api<Pod> = Api::namespaced(ctx.exec_client.clone(), namespace);
     let listed = pods.list(&ListParams::default().labels(&query)).await?;
     let pod = match pick_exec_pod(&listed.items, &query, namespace) {
         Ok(p) => p,
@@ -231,7 +239,7 @@ async fn run_workload_exec(
         params = params.container(c.clone());
     }
     let timeout = hook_timeout(hook.timeout.as_deref());
-    let exec = pods.exec(&pod_name, hook.command.clone(), &params);
+    let exec = pods_exec.exec(&pod_name, hook.command.clone(), &params);
     let mut attached = match tokio::time::timeout(timeout, exec).await {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => return Err(e.into()),
@@ -389,11 +397,17 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
             .map_err(|_| format!("hook method {m:?} is not a valid HTTP method"))?,
     };
     let timeout = hook_timeout(hook.timeout.as_deref());
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("could not build the hook HTTP client: {e}"))?;
-    let mut req = client.request(method.clone(), url.clone());
+    // One process-wide client: building a reqwest::Client per invocation
+    // minted a fresh connection pool + TLS stack + resolver (its own fds)
+    // every time a hook fired. The per-hook timeout moves to the REQUEST so
+    // the shared client stays timeout-neutral. `Client::new()` panics only on
+    // TLS-backend init failure, which the old per-call builder would have hit
+    // identically on every invocation.
+    static HOOK_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(reqwest::Client::new);
+    let mut req = HOOK_HTTP_CLIENT
+        .request(method.clone(), url.clone())
+        .timeout(timeout);
     if !user.is_empty() {
         req = req.basic_auth(&user, pass.as_deref());
     }

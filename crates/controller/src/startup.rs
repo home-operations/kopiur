@@ -28,9 +28,16 @@ use crate::webhook_tls;
 /// kube's watcher does not degrade from WatchList to paged lists by itself, so we
 /// only enable streaming when the server actually supports it. Returns `false`
 /// immediately when streaming was not requested; otherwise probes the apiserver
-/// version and downgrades (with a warning) on a server that predates WatchList. A
-/// probe failure or unparseable version honors the configured value rather than
-/// silently disabling an explicitly-requested optimization.
+/// version and downgrades (with a warning) on a server that predates WatchList.
+///
+/// A probe FAILURE fails **closed** (paged lists): with no version evidence at
+/// all — e.g. booting mid-outage — enabling streaming against a pre-1.32
+/// server would leave every watcher retrying an unsupported verb forever (an
+/// inert controller that also hammers the apiserver), while the cost on a
+/// modern server is only one process-lifetime without the optimization. An
+/// UNPARSEABLE version from a live apiserver still honors the request
+/// ([`watchlist_supported`]) — that's evidence of a server too new/odd to
+/// second-guess, not absence of evidence.
 async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     if !configured {
         return false;
@@ -38,8 +45,13 @@ async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     let (major, minor) = match client.apiserver_version().await {
         Ok(info) => (info.major, info.minor),
         Err(e) => {
-            tracing::warn!(error = %e, "apiserver version probe failed; honoring streamingLists as configured");
-            return true;
+            tracing::warn!(
+                error = %e,
+                "apiserver version probe failed; using paged lists this run (fail closed — kube \
+                 cannot self-degrade from WatchList on a pre-1.32 server). Restart once the API \
+                 server is reachable to re-probe, or set streamingLists: false to silence this."
+            );
+            return false;
         }
     };
     let supported = watchlist_supported(&major, &minor);
@@ -70,6 +82,38 @@ fn watchlist_supported(major: &str, minor: &str) -> bool {
     }
 }
 
+/// Raise the `RLIMIT_NOFILE` soft limit to the hard limit, returning
+/// `(old_soft, new_soft)`. Defense in depth for the apiserver-outage EMFILE
+/// incident: the container inherits the runtime's soft limit (commonly 1024)
+/// while the hard limit is far higher, and raising soft→hard never needs
+/// privileges (`CAP_SYS_RESOURCE` gates only the hard limit). Applies to
+/// in-process kopia children too — kopia is Go/epoll, so there is no
+/// `FD_SETSIZE` hazard in widening it. Degrade-and-log at the call site,
+/// never fatal.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() -> std::io::Result<(u64, u64)> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read/write a valid rlimit struct owned by
+    // this frame; both are thread-safe syscall wrappers with no other side
+    // effects on failure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let old = rl.rlim_cur;
+    if rl.rlim_cur >= rl.rlim_max {
+        return Ok((old, old));
+    }
+    rl.rlim_cur = rl.rlim_max;
+    // SAFETY: as above; `rl` holds the validated current hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((old, rl.rlim_max))
+}
+
 /// Build the controller manager and run every controller concurrently, plus the
 /// `/metrics` server, until shutdown.
 ///
@@ -86,13 +130,53 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // fmt-only and the call succeeds.
     let _telemetry = kopiur_telemetry::init_tracing("kopiur-controller")?;
 
+    // Widen the fd headroom before anything opens sockets (defense in depth
+    // for the apiserver-outage EMFILE incident). Non-critical: degrade-and-log.
+    #[cfg(unix)]
+    match raise_nofile_soft_limit() {
+        Ok((old, new)) if old != new => {
+            tracing::info!(
+                old_soft = old,
+                new_soft = new,
+                "raised RLIMIT_NOFILE soft limit to the hard limit"
+            );
+        }
+        Ok((_, soft)) => {
+            tracing::debug!(
+                soft = soft,
+                "RLIMIT_NOFILE soft limit already at the hard limit"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not raise the RLIMIT_NOFILE soft limit; continuing with the inherited \
+                 limit (fd headroom stays at the container runtime's default)"
+            );
+        }
+    }
+
     // Install the process-level rustls CryptoProvider before the kube client
     // builds any TLS config; without this, kube's rustls-tls backend panics with
     // "no process-level CryptoProvider available". Idempotent: ignore the error
     // if a provider is already installed (e.g. the webhook installed it).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client = Client::try_default().await?;
+    // One inferred config, two clients (`Client::try_default` is exactly
+    // infer + try_from, so behavior is otherwise identical):
+    // - `client`: read/connect timeouts hardened (see the config consts — the
+    //   apiserver-outage fd fix). Everything rides this one.
+    // - `exec_client`: same connect timeout but NO read timeout, used ONLY for
+    //   the hooks `workloadExec` attach — the exec WebSocket rides the same
+    //   timeout-wrapped connector as unary calls, and a read timeout would
+    //   kill any quiesce command that stays silent longer than the window.
+    let mut kube_config = kube::Config::infer().await?;
+    kube_config.connect_timeout = Some(config::KUBE_CLIENT_CONNECT_TIMEOUT);
+    kube_config.read_timeout = Some(config::KUBE_CLIENT_READ_TIMEOUT);
+    let client = Client::try_from(kube_config.clone())?;
+    let mut exec_config = kube_config;
+    exec_config.read_timeout = None;
+    let exec_client = Client::try_from(exec_config)?;
     let metrics = Metrics::new();
 
     // The HTTP server (probes + /metrics) starts BEFORE the leader-election
@@ -198,6 +282,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
 
     let ctx = Arc::new(Context::new(
         client.clone(),
+        exec_client,
         kopia_factory,
         metrics.clone(),
         recorder,
@@ -262,6 +347,11 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         ctx,
         streaming_lists,
         config.watch_scope.clone(),
+        config.reconcile_concurrency,
+    );
+    tracing::info!(
+        reconcile_concurrency = ?config.reconcile_concurrency.map(std::num::NonZeroU16::get),
+        "per-controller reconcile concurrency configured (None = unbounded)"
     );
 
     match leadership_lost {
@@ -443,6 +533,23 @@ fn spawn_webhook_tls_reconcile(client: Client, cfg: webhook_tls::WebhookTlsConfi
 mod tests {
     use super::watchlist_supported;
 
+    // --- RLIMIT_NOFILE raise (apiserver-outage EMFILE fix, defense in depth):
+    // the container inherits the runtime's soft limit (commonly 1024) while
+    // the hard limit is far higher; raising soft→hard needs no privileges and
+    // widens the headroom the bounded-concurrency fixes protect. ---
+    #[cfg(unix)]
+    #[test]
+    fn raise_nofile_soft_limit_raises_soft_to_hard_and_is_idempotent() {
+        let (_, new_soft) = super::raise_nofile_soft_limit()
+            .expect("getrlimit/setrlimit must succeed unprivileged");
+        // Raising soft→hard is monotonic and safe under parallel tests: a
+        // second call must observe the pinned value and no-op.
+        let (again_old, again_new) =
+            super::raise_nofile_soft_limit().expect("second call must succeed");
+        assert_eq!(again_old, new_soft, "the raised soft limit must persist");
+        assert_eq!(again_old, again_new, "already at the hard limit → no-op");
+    }
+
     #[test]
     fn watchlist_supported_gates_on_1_32() {
         // At or above 1.32 → supported.
@@ -461,9 +568,46 @@ mod tests {
     #[test]
     fn watchlist_supported_honors_config_on_unparseable_version() {
         // An unreadable version string must not silently disable an explicit
-        // streamingLists request — honor it (return true).
+        // streamingLists request — honor it (return true). (A PARSEABLE
+        // version answered by a live apiserver is trustworthy evidence either
+        // way; contrast with the probe-FAILURE case below, which has no
+        // evidence at all and must fail closed.)
         assert!(watchlist_supported("", ""));
         assert!(watchlist_supported("x", "y"));
         assert!(watchlist_supported("1", ""));
+    }
+
+    // --- probe failure fails CLOSED (apiserver-outage follow-up): kube never
+    // self-degrades from WatchList to paged lists, so enabling streaming
+    // against a pre-1.32 server leaves every watcher retrying an unsupported
+    // verb forever — an inert controller that also hammers the apiserver. A
+    // failed probe (e.g. booting during an outage) has no version evidence,
+    // and the safe default is paged lists: on a modern server that costs one
+    // process-lifetime of the optimization; on an old server it avoids the
+    // inert-controller failure mode entirely. ---
+    #[tokio::test]
+    async fn effective_streaming_lists_fails_closed_when_the_probe_fails() {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+
+        // Every request errors — the version probe cannot succeed.
+        let svc = tower::service_fn(move |_req: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        br#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":503}"#
+                            .to_vec(),
+                    ))
+                    .unwrap(),
+            )
+        });
+        let client = kube::Client::new(svc, "test-ns");
+        assert!(
+            !super::effective_streaming_lists(&client, true).await,
+            "a failed version probe must downgrade to paged lists (fail closed)"
+        );
+        assert!(!super::effective_streaming_lists(&client, false).await);
     }
 }

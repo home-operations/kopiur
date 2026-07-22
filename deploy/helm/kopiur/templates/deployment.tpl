@@ -94,6 +94,11 @@ spec:
             # opt-in backstop.
             - name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
               value: {{ .Values.maxConcurrentDeleteJobs | quote }}
+            # Per-controller cap on concurrent reconciles. Bounds apiserver
+            # load and fds during re-list storms/outages; 0 = unbounded (the
+            # pre-fix behavior; not recommended).
+            - name: KOPIUR_RECONCILE_CONCURRENCY
+              value: {{ .Values.reconcileConcurrency | quote }}
             # Bind address for the HTTP server (/metrics, /healthz, /readyz),
             # rendered "[::]:<port>" from metrics.port — the dual-stack wildcard
             # serves both IPv4 and IPv6 kubelets.

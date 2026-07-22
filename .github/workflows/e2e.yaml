@@ -198,6 +198,15 @@ jobs:
           - shard: leader-election
             bins: "leader_election"
             backends: false
+          # API-server-flap resilience (the 2026-07 EMFILE incident): kills the
+          # kind kube-apiserver process repeatedly under a seeded fleet, then
+          # asserts the controller survives (no EMFILE in logs, bounded
+          # restarts/lease transitions) and converges (a post-flap backup
+          # Succeeds). Own shard: it takes the control plane down, which no
+          # other test may race.
+          - shard: apiserver-flap
+            bins: "apiserver_flap"
+            backends: false
           # Namespaced install (installScope=namespaced, Role-only RBAC): the
           # operator must reconcile its release namespace (the pre-scoping
           # controller sat Ready-but-inert on 403'd cluster-wide watches) and

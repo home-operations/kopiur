@@ -204,6 +204,30 @@ If you use the [web UI](server.md) (`spec.server` on a `Repository`/`ClusterRepo
 
 ///
 
+## Runtime tuning
+
+The chart's defaults are sized for a typical homelab-to-mid-size cluster; four
+top-level values tune the controller's runtime footprint and API-server load
+(full rationale in the
+[developer docs](dev/watch-and-reconcile.md#memory-footprint)):
+
+| Value | Default | What it does |
+|---|---|---|
+| `workerThreads` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
+| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists on a pre-1.32 apiserver — or when the startup version probe fails. |
+| `reconcileConcurrency` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
+| `maxConcurrentDeleteJobs` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
+
+/// note | Why reconcileConcurrency is bounded by default
+
+Unbounded reconcile concurrency let an API-server outage exhaust the
+controller's file descriptors within seconds (every re-listed object
+reconciling — and failing — at once). The default of 8 per controller clears a
+few-hundred-object re-list in seconds while keeping the controller a good
+citizen toward a struggling control plane.
+
+///
+
 ## CRD lifecycle
 
 The 8 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
