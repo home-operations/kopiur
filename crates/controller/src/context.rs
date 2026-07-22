@@ -127,6 +127,15 @@ impl KopiaClientFactory {
 pub struct Context {
     /// The Kubernetes API client.
     pub client: Client,
+    /// A second client from the same inferred config but WITHOUT the read
+    /// timeout, used ONLY for the hooks `workloadExec` attach: the exec
+    /// WebSocket rides the same timeout-wrapped connector as unary calls, so
+    /// the hardened [`crate::config::KUBE_CLIENT_READ_TIMEOUT`] on
+    /// [`client`](Self::client) would kill any quiesce command silent for
+    /// longer than the window ("returned no status (connection closed
+    /// early)"). Exec streams are rare and bounded by the hook timeout, so
+    /// exempting them costs nothing.
+    pub exec_client: Client,
     /// Factory for short-lived kopia clients (idempotent ops only).
     pub kopia: KopiaClientFactory,
     /// Controller + business metrics.
@@ -232,6 +241,7 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
+        exec_client: Client,
         kopia: KopiaClientFactory,
         metrics: Metrics,
         recorder: Recorder,
@@ -250,6 +260,7 @@ impl Context {
     ) -> Self {
         Context {
             client,
+            exec_client,
             kopia,
             metrics,
             recorder,
@@ -310,6 +321,7 @@ impl Context {
         use kube::runtime::events::Reporter;
         let recorder = Recorder::new(client.clone(), Reporter::from("kopiur-test"));
         Context::new(
+            client.clone(),
             client,
             KopiaClientFactory::new(),
             Metrics::new(),

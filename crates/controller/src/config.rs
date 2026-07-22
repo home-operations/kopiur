@@ -213,6 +213,25 @@ pub const RECONCILE_CONCURRENCY_ENV: &str = "KOPIUR_RECONCILE_CONCURRENCY";
 /// [`ControllerConfig::reconcile_concurrency`]`: None`.
 pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
 
+/// Read timeout for the shared kube client. kube 4.0 defaults `read_timeout`
+/// to `None`, so a connection that stalls after establishing (the OOM-flapping
+/// apiserver's signature) held its fd until TCP gave up. MUST exceed the watch
+/// long-poll window — kube-runtime requests 290s server-side watch timeouts
+/// and applies its own 290+5s client idle timeout — or every healthy-but-quiet
+/// watch stream would be killed mid-cycle. 295s effective window + 10s
+/// headroom. NOTE: the hooks `workloadExec` stream is exempt (it rides
+/// [`crate::context::Context::exec_client`], which carries no read timeout) —
+/// a quiesce command that is silent for >305s is legitimate there.
+pub const KUBE_CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(305);
+
+/// Connect timeout for the shared kube client (kube 4.0 default: 30s). During
+/// the apiserver outage each blackholed connect pinned an fd for the full 30s
+/// — the dominant per-fd hold time. In-cluster the apiserver is one ClusterIP
+/// hop and a healthy accept is milliseconds; 5s tolerates real blips while
+/// cutting the worst-case hold 6×. A too-slow control plane surfaces as a
+/// Transient requeue, exactly like today.
+pub const KUBE_CLIENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Cap on concurrently in-flight reconcile-failure Event publishes, process
 /// wide. The error policy's publish is fire-and-forget; during an apiserver
 /// outage EVERY reconcile fails at once and an unbounded spawn-per-failure was
@@ -1194,6 +1213,26 @@ mod tests {
             resolve(&["--max-concurrent-delete-jobs", "10"]).max_concurrent_delete_jobs,
             std::num::NonZeroUsize::new(10)
         );
+    }
+
+    // --- kube client timeouts (apiserver-outage incident): the defaults were
+    // read_timeout=None (a stalled established connection holds its fd until
+    // TCP gives up) and connect_timeout=30s (each blackholed SYN pins an fd
+    // for 30s — the dominant per-fd hold during the outage). These pin the
+    // contract; the wiring is compile-checked in startup. ---
+
+    #[test]
+    #[serial]
+    fn kube_client_timeouts_cover_the_watch_long_poll() {
+        // kube-runtime requests 290s server-side watch timeouts and applies its
+        // own 290+5s client idle timeout; a read timeout at or below that
+        // effective 295s window would kill every healthy-but-quiet watch
+        // stream mid-cycle.
+        assert!(KUBE_CLIENT_READ_TIMEOUT > std::time::Duration::from_secs(295));
+        // In-cluster the apiserver is one ClusterIP hop (connects are
+        // ms-scale); anything close to the old 30s default re-opens the
+        // blackholed-connect fd hold.
+        assert!(KUBE_CLIENT_CONNECT_TIMEOUT <= std::time::Duration::from_secs(10));
     }
 
     // --- KOPIUR_RECONCILE_CONCURRENCY: BOUNDED by default (unlike the delete-Job

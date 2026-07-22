@@ -92,7 +92,21 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // if a provider is already installed (e.g. the webhook installed it).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client = Client::try_default().await?;
+    // One inferred config, two clients (`Client::try_default` is exactly
+    // infer + try_from, so behavior is otherwise identical):
+    // - `client`: read/connect timeouts hardened (see the config consts — the
+    //   apiserver-outage fd fix). Everything rides this one.
+    // - `exec_client`: same connect timeout but NO read timeout, used ONLY for
+    //   the hooks `workloadExec` attach — the exec WebSocket rides the same
+    //   timeout-wrapped connector as unary calls, and a read timeout would
+    //   kill any quiesce command that stays silent longer than the window.
+    let mut kube_config = kube::Config::infer().await?;
+    kube_config.connect_timeout = Some(config::KUBE_CLIENT_CONNECT_TIMEOUT);
+    kube_config.read_timeout = Some(config::KUBE_CLIENT_READ_TIMEOUT);
+    let client = Client::try_from(kube_config.clone())?;
+    let mut exec_config = kube_config;
+    exec_config.read_timeout = None;
+    let exec_client = Client::try_from(exec_config)?;
     let metrics = Metrics::new();
 
     // The HTTP server (probes + /metrics) starts BEFORE the leader-election
@@ -198,6 +212,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
 
     let ctx = Arc::new(Context::new(
         client.clone(),
+        exec_client,
         kopia_factory,
         metrics.clone(),
         recorder,

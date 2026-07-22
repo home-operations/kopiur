@@ -218,7 +218,10 @@ async fn run_workload_exec(
                 .to_string(),
         ));
     }
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    // The read-timeout-exempt client: the exec WebSocket must survive a
+    // quiesce command that is silent for longer than the hardened client's
+    // read window (see Context::exec_client).
+    let pods: Api<Pod> = Api::namespaced(ctx.exec_client.clone(), namespace);
     let listed = pods.list(&ListParams::default().labels(&query)).await?;
     let pod = match pick_exec_pod(&listed.items, &query, namespace) {
         Ok(p) => p,
