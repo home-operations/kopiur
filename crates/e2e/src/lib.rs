@@ -113,6 +113,55 @@ pub async fn scrape_controller_metrics(client: &Client) -> anyhow::Result<String
     Ok(client.request_text(req).await?)
 }
 
+/// Flap the kind control-plane's kube-apiserver: kill its process `kills`
+/// times, `gap` apart, via `docker exec` into the node container — the kubelet
+/// restarts the static pod after each kill, reproducing an OOM-flapping
+/// control plane while the operator pod (same single node) keeps running.
+///
+/// Host-side runtime mutation from a Rust scenario has precedent (the
+/// mass-deletion suite flips its repo dir read-only mid-test); like there, the
+/// scenario using this MUST own its CI shard — no other test may race a downed
+/// apiserver. Do NOT `docker pause` the node instead: on single-node kind that
+/// would freeze the operator pod too, destroying the premise.
+///
+/// `pkill` exiting 1 (no process matched — the apiserver is still coming back
+/// from the previous kill) counts as a delivered disruption; any other failure
+/// (docker missing, container absent) is a hard error naming the fix.
+pub async fn flap_apiserver(kills: u32, gap: Duration) -> anyhow::Result<()> {
+    let node = consts::KIND_CONTROL_PLANE_CONTAINER;
+    for i in 1..=kills {
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", node, "pkill", "-f", "kube-apiserver"])
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "could not run `docker exec {node} pkill`: {e} — the apiserver-flap \
+                     scenario needs host docker access to the kind node (is this the e2e \
+                     harness host?)"
+                )
+            })?;
+        match out.status.code() {
+            Some(0) => eprintln!("[flap_apiserver] kill {i}/{kills}: kube-apiserver signalled"),
+            Some(1) => eprintln!(
+                "[flap_apiserver] kill {i}/{kills}: no kube-apiserver process (still \
+                 restarting from the previous kill) — counted as disruption"
+            ),
+            code => {
+                anyhow::bail!(
+                    "`docker exec {node} pkill -f kube-apiserver` failed (exit {code:?}): \
+                     {} — is the kind cluster `kopiur-e2e` running?",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+        if i < kills {
+            tokio::time::sleep(gap).await;
+        }
+    }
+    Ok(())
+}
+
 /// Ensure a `Namespace` named `ns` exists (idempotent: a 409 Conflict is treated
 /// as success). Used by the cross-namespace scenarios that run a workload + Snapshot
 /// in a namespace separate from the operator's.

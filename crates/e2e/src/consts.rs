@@ -14,6 +14,13 @@ pub const OPERATOR_NS: &str = "kopiur-e2e";
 /// namespace separate from the operator's). Provisioned by `World` (`Need::WorkloadNs`).
 pub const WORKLOAD_NS: &str = "kopiur-e2e-xns";
 
+/// The docker container backing the kind cluster's (single) control-plane
+/// node: `<cluster>-control-plane`. Crosses the host boundary — the cluster
+/// name is `CLUSTER=kopiur-e2e` in `crates/e2e/mise.toml` (`cluster-create`);
+/// keep the two in lockstep. Used by the apiserver-flap resilience scenario
+/// to kill the kube-apiserver static pod's process from the host.
+pub const KIND_CONTROL_PLANE_CONTAINER: &str = "kopiur-e2e-control-plane";
+
 /// Workload namespace for the credential-projection scenarios. Like [`WORKLOAD_NS`]
 /// it has a source PVC, but DELIBERATELY no credentials Secret — so a mover there
 /// fails without projection and succeeds with it. Provisioned by `Need::ProjectionNs`.
