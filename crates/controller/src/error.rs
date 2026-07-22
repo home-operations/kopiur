@@ -194,6 +194,33 @@ impl Error {
     }
 }
 
+/// Deterministic per-object transient requeue in
+/// [[`TRANSIENT_BACKOFF`], 2×[`TRANSIENT_BACKOFF`]), seeded by a stable FNV
+/// hash of `kind/namespace/name` ([`kopiur_api::jitter_offset`] — the repo's
+/// croner-H convention: NO RNG, identical across restarts and HA replicas).
+///
+/// Why: a flat 30s requeue re-synchronizes every object that failed together
+/// (an apiserver outage fails them ALL together) into one 30s retry wave.
+/// Spreading OBJECTS across the window — rather than re-rolling per retry —
+/// breaks the wave while keeping a given object's cadence stable and
+/// debuggable. Scope honesty: watch-driven re-triggers (e.g. the re-list after
+/// a watcher reconnects) override any requeue because the scheduler keeps the
+/// EARLIER deadline, so this de-synchronizes steady-state REPEAT failures; the
+/// recovery stampede itself is bounded by the reconcile-concurrency cap.
+/// Structural/Terminal cadences stay fixed: structural failures wait on a
+/// human spec fix (they don't correlate into waves) and terminal wakes are
+/// no-op heartbeats behind the terminal gate.
+pub(crate) fn jittered_transient_requeue(
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Duration {
+    let seed = format!("{kind}/{}/{name}", namespace.unwrap_or(""));
+    // slot_start_unix = 0: there is no schedule slot here; the seed alone
+    // spreads objects. Whole-second resolution → 30 buckets over [30s, 60s).
+    TRANSIENT_BACKOFF + kopiur_api::jitter_offset(&seed, 0, TRANSIENT_BACKOFF)
+}
+
 /// Transport/client-infrastructure failures, where an Event POST would ride
 /// the same broken path the failing call just used. Exhaustive over the
 /// `kube::Error` variants compiled under this workspace's kube features
@@ -280,7 +307,20 @@ where
             event,
         );
     }
-    class.action()
+    // Exhaustive on class (no `_ =>`): Transient gets the per-object jitter,
+    // the other cadences stay exactly `class.action()` — see
+    // [`jittered_transient_requeue`] for why only Transient is spread.
+    match class {
+        ErrorClass::Transient => {
+            let meta = obj.meta();
+            Action::requeue(jittered_transient_requeue(
+                kind,
+                meta.namespace.as_deref(),
+                meta.name.as_deref().unwrap_or(""),
+            ))
+        }
+        ErrorClass::Structural | ErrorClass::Terminal => class.action(),
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +439,54 @@ mod tests {
         let terminal = ErrorClass::Terminal.action();
         assert_eq!(terminal, Action::requeue(Duration::from_secs(1800)));
         assert_ne!(terminal, Action::requeue(Duration::from_secs(30)));
+    }
+
+    // --- transient requeue jitter (apiserver-outage incident): a flat 30s
+    // requeue re-synchronized every failed object into one retry wave. The
+    // jitter is DETERMINISTIC (FNV — the croner-H convention: no RNG, stable
+    // across restarts) and spread per OBJECT across [30s, 60s), so a given
+    // object's cadence stays debuggable while the fleet de-synchronizes.
+    // Scope honesty: watch-driven re-triggers (recovery re-lists) override any
+    // requeue — the scheduler keeps the EARLIER deadline — so this shapes
+    // steady-state REPEAT failures; the recovery stampede is bounded by the
+    // reconcile-concurrency cap, not by jitter. ---
+
+    #[test]
+    fn transient_requeue_is_jittered_within_one_to_two_backoffs() {
+        for (kind, ns, name) in [
+            ("Snapshot", Some("media"), "qbittorrent-b2-20260721"),
+            ("SnapshotSchedule", Some("default"), "paperless-b2"),
+            ("SnapshotPolicy", Some("media"), "bazarr-b2"),
+            ("ClusterRepository", None, "nas"),
+        ] {
+            let d = jittered_transient_requeue(kind, ns, name);
+            assert!(
+                d >= TRANSIENT_BACKOFF && d < TRANSIENT_BACKOFF * 2,
+                "{kind}/{ns:?}/{name}: {d:?} must land in [30s, 60s)"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_jitter_is_deterministic_per_object() {
+        // HA-replica/restart stability, same as croner-H: identical inputs →
+        // identical requeue, every time.
+        let a = jittered_transient_requeue("Snapshot", Some("media"), "seerr");
+        let b = jittered_transient_requeue("Snapshot", Some("media"), "seerr");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn transient_jitter_spreads_across_objects() {
+        let distinct: std::collections::BTreeSet<Duration> = (0..100)
+            .map(|i| jittered_transient_requeue("Snapshot", Some("media"), &format!("app-{i}")))
+            .collect();
+        assert!(
+            distinct.len() > 10,
+            "100 objects must spread across well over 10 of the 30 one-second \
+             buckets, got {}",
+            distinct.len()
+        );
     }
 
     // --- regression (apiserver-outage EMFILE fix): `error_policy_for` used to
@@ -555,5 +643,53 @@ mod tests {
         );
         assert_eq!(log[0].0, "POST");
         assert!(log[0].1.contains("/events"), "{}", log[0].1);
+    }
+
+    #[tokio::test]
+    async fn error_policy_transient_action_differs_across_objects() {
+        // THE wave-breaking regression test: two different objects failing
+        // transiently at the same instant must NOT be requeued for the same
+        // instant again. (Before the fix both got a flat 30s.)
+        let ctx = crate::context::Context::test_context(recording_client(Arc::new(Mutex::new(
+            Vec::new(),
+        ))));
+        // A transport error, which also skips the Event publish — the Action
+        // is the entire observable output here.
+        let err = Error::Kube(kube::Error::Service("client error (Connect)".into()));
+        let a = error_policy_for("Snapshot", &test_obj("qbittorrent-b2"), &err, &ctx);
+        let b = error_policy_for("Snapshot", &test_obj("photos-b2"), &err, &ctx);
+        assert_ne!(
+            a, b,
+            "two objects' transient requeues must land in different jitter buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_policy_structural_and_terminal_cadence_unchanged() {
+        // Jitter is a Transient-only concern: structural failures need a human
+        // spec fix (they don't correlate into waves) and terminal wakes are
+        // no-op heartbeats behind the terminal gate.
+        let ctx = crate::context::Context::test_context(recording_client(Arc::new(Mutex::new(
+            Vec::new(),
+        ))));
+        let structural = error_policy_for(
+            "SnapshotPolicy",
+            &test_obj("bad-spec"),
+            &Error::Validation("bad".into()),
+            &ctx,
+        );
+        assert_eq!(structural, Action::requeue(STRUCTURAL_BACKOFF));
+        let terminal = error_policy_for(
+            "SnapshotPolicy",
+            &test_obj("perm-denied"),
+            &Error::Kopia(KopiaError::NonZeroExit {
+                args: "repository connect".into(),
+                code: Some(1),
+                class: KopiaErrorClass::PermissionDenied,
+                stderr_tail: "permission denied".into(),
+            }),
+            &ctx,
+        );
+        assert_eq!(terminal, Action::requeue(TERMINAL_HEARTBEAT));
     }
 }
