@@ -137,22 +137,39 @@ async fn lease_transitions(leases: &Api<Lease>) -> Result<i32, kube::Error> {
         .unwrap_or(0))
 }
 
-/// Controller logs (current container, plus the previous instance when one
-/// exists — a by-design abdication restart must not hide an EMFILE line).
-async fn controller_logs(pods: &Api<Pod>, pod: &str) -> String {
-    let mut all = String::new();
-    for previous in [true, false] {
-        let params = LogParams {
-            previous,
-            ..Default::default()
-        };
-        // previous=true errors when the container never restarted: best-effort.
-        if let Ok(chunk) = pods.logs(pod, &params).await {
-            all.push_str(&chunk);
-            all.push('\n');
-        }
+/// Controller logs: the CURRENT container's log is required (retried through
+/// post-flap apiserver blips — an empty string here would make the EMFILE
+/// assertion vacuously pass), the PREVIOUS instance's log is best-effort (it
+/// errors when the container never restarted; a by-design abdication restart
+/// must not hide an EMFILE line when it exists).
+async fn controller_logs(pods: &Api<Pod>, pod: &str) -> anyhow::Result<String> {
+    let current = wait_until(
+        "controller current-container logs are readable",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let chunk = pods.logs(pod, &LogParams::default()).await?;
+            // The controller logs its startup banner immediately; an empty
+            // body means kubelet is still wiring the log stream — retry.
+            Ok((!chunk.is_empty()).then_some(chunk))
+        },
+    )
+    .await?;
+    let mut all = current;
+    if let Ok(prev) = pods
+        .logs(
+            pod,
+            &LogParams {
+                previous: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        all.push('\n');
+        all.push_str(&prev);
     }
-    all
+    Ok(all)
 }
 
 #[tokio::test]
@@ -218,15 +235,31 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
         .expect("flap the kind apiserver");
 
     // The apiserver comes back (kubelet restarts the static pod); wait_until
-    // tolerates the dead-window polls.
+    // tolerates the dead-window polls. Require SUSTAINED health — several
+    // consecutive successful probes — not one lucky answer: a restarting
+    // apiserver serves a request and drops the next ("tls handshake eof"),
+    // and the assertions below must run against a stable control plane.
+    let consecutive_ok = std::sync::atomic::AtomicU32::new(0);
     wait_until(
-        "apiserver answers again after the flap",
+        "apiserver stably answering after the flap",
         default_timeout(),
         poll_interval(),
-        || async { Ok(client.apiserver_version().await.ok().map(|_| ())) },
+        || async {
+            use std::sync::atomic::Ordering;
+            match client.apiserver_version().await {
+                Ok(_) => {
+                    let n = consecutive_ok.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok((n >= 5).then_some(()))
+                }
+                Err(e) => {
+                    consecutive_ok.store(0, Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        },
     )
     .await
-    .expect("apiserver must recover");
+    .expect("apiserver must recover to sustained health");
 
     // -- survival assertions --------------------------------------------------
     // (a) The controller pod is Running with a bounded restart count. Restarts
@@ -267,18 +300,28 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
     .await
     .expect("controller pod must be Running after the flap");
 
-    // (b) NO fd exhaustion, current or previous container instance.
-    let logs = controller_logs(&pods, &pod_name).await;
+    // (b) NO fd exhaustion, current or previous container instance. The log
+    // fetch retries through residual blips and requires a non-empty current
+    // log — an unreadable log must fail the test, not vacuously pass it.
+    let logs = controller_logs(&pods, &pod_name)
+        .await
+        .expect("controller logs must be readable after recovery");
     assert!(
         !logs.contains("Too many open files"),
         "controller hit fd exhaustion (EMFILE) during the apiserver flap"
     );
 
     // (c) Lease churn stays bounded: one takeover per abdication, not the
-    // incident's runaway counter.
-    let transitions = lease_transitions(&leases)
-        .await
-        .expect("read post-flap lease transitions");
+    // incident's runaway counter. Read through wait_until — a residual blip
+    // on this one GET must not fail the scenario.
+    let transitions = wait_until(
+        "post-flap lease transitions readable",
+        default_timeout(),
+        poll_interval(),
+        || async { lease_transitions(&leases).await.map(Some) },
+    )
+    .await
+    .expect("read post-flap lease transitions");
     let delta = transitions - baseline_transitions;
     assert!(
         delta <= (KILLS as i32) * 2 + 1,
@@ -289,13 +332,28 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
     // (d) The operator actually WORKS after recovery: a fresh backup runs to
     // Succeeded with a real kopia snapshot id — the assertion that would hang
     // forever on a controller that survived but stopped reconciling.
-    backups
-        .create(
-            &PostParams::default(),
-            &cr(snapshot_json("flap-proof", "flap-pol-0")),
-        )
-        .await
-        .expect("create post-flap Snapshot");
+    // Create through a blip-tolerant retry; a 409 means an earlier attempt
+    // landed before its response was lost — success.
+    wait_until(
+        "post-flap Snapshot created",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            match backups
+                .create(
+                    &PostParams::default(),
+                    &cr(snapshot_json("flap-proof", "flap-pol-0")),
+                )
+                .await
+            {
+                Ok(_) => Ok(Some(())),
+                Err(kube::Error::Api(e)) if e.code == 409 => Ok(Some(())),
+                Err(e) => Err(e),
+            }
+        },
+    )
+    .await
+    .expect("create post-flap Snapshot");
     wait_phase(&backups, "flap-proof", "Succeeded")
         .await
         .expect("post-flap Snapshot must reach Succeeded");
