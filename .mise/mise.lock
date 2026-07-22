@@ -440,9 +440,6 @@ provenance = "github-attestations"
 version = "24.17.0"
 backend = "core:node"
 
-[tools.node.options]
-compile = "true"
-
 [tools.node."platforms.linux-arm64"]
 checksum = "sha256:faa0d59ba7fe7045c950ed09b190578fb8eee73e4358686d38fcc99ca58c1480"
 url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-arm64.tar.gz"
@@ -470,6 +467,17 @@ url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-x64.tar.gz"
 [tools.node."platforms.windows-x64"]
 checksum = "sha256:f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda2528ab"
 url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-x64.zip"
+
+[[tools.node]]
+version = "24.17.0"
+backend = "core:node"
+
+[tools.node.options]
+compile = "true"
+
+[tools.node."platforms.linux-x64"]
+checksum = "sha256:e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f1265f"
+url = "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz"
 
 [[tools.oxfmt]]
 version = "0.59.0"
