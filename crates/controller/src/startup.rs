@@ -70,6 +70,38 @@ fn watchlist_supported(major: &str, minor: &str) -> bool {
     }
 }
 
+/// Raise the `RLIMIT_NOFILE` soft limit to the hard limit, returning
+/// `(old_soft, new_soft)`. Defense in depth for the apiserver-outage EMFILE
+/// incident: the container inherits the runtime's soft limit (commonly 1024)
+/// while the hard limit is far higher, and raising soft→hard never needs
+/// privileges (`CAP_SYS_RESOURCE` gates only the hard limit). Applies to
+/// in-process kopia children too — kopia is Go/epoll, so there is no
+/// `FD_SETSIZE` hazard in widening it. Degrade-and-log at the call site,
+/// never fatal.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() -> std::io::Result<(u64, u64)> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read/write a valid rlimit struct owned by
+    // this frame; both are thread-safe syscall wrappers with no other side
+    // effects on failure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let old = rl.rlim_cur;
+    if rl.rlim_cur >= rl.rlim_max {
+        return Ok((old, old));
+    }
+    rl.rlim_cur = rl.rlim_max;
+    // SAFETY: as above; `rl` holds the validated current hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((old, rl.rlim_max))
+}
+
 /// Build the controller manager and run every controller concurrently, plus the
 /// `/metrics` server, until shutdown.
 ///
@@ -85,6 +117,32 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // Errors only surface under KOPIUR_OTEL_STRICT; otherwise OTLP degrades to
     // fmt-only and the call succeeds.
     let _telemetry = kopiur_telemetry::init_tracing("kopiur-controller")?;
+
+    // Widen the fd headroom before anything opens sockets (defense in depth
+    // for the apiserver-outage EMFILE incident). Non-critical: degrade-and-log.
+    #[cfg(unix)]
+    match raise_nofile_soft_limit() {
+        Ok((old, new)) if old != new => {
+            tracing::info!(
+                old_soft = old,
+                new_soft = new,
+                "raised RLIMIT_NOFILE soft limit to the hard limit"
+            );
+        }
+        Ok((_, soft)) => {
+            tracing::debug!(
+                soft = soft,
+                "RLIMIT_NOFILE soft limit already at the hard limit"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not raise the RLIMIT_NOFILE soft limit; continuing with the inherited \
+                 limit (fd headroom stays at the container runtime's default)"
+            );
+        }
+    }
 
     // Install the process-level rustls CryptoProvider before the kube client
     // builds any TLS config; without this, kube's rustls-tls backend panics with
@@ -462,6 +520,23 @@ fn spawn_webhook_tls_reconcile(client: Client, cfg: webhook_tls::WebhookTlsConfi
 #[cfg(test)]
 mod tests {
     use super::watchlist_supported;
+
+    // --- RLIMIT_NOFILE raise (apiserver-outage EMFILE fix, defense in depth):
+    // the container inherits the runtime's soft limit (commonly 1024) while
+    // the hard limit is far higher; raising soft→hard needs no privileges and
+    // widens the headroom the bounded-concurrency fixes protect. ---
+    #[cfg(unix)]
+    #[test]
+    fn raise_nofile_soft_limit_raises_soft_to_hard_and_is_idempotent() {
+        let (_, new_soft) = super::raise_nofile_soft_limit()
+            .expect("getrlimit/setrlimit must succeed unprivileged");
+        // Raising soft→hard is monotonic and safe under parallel tests: a
+        // second call must observe the pinned value and no-op.
+        let (again_old, again_new) =
+            super::raise_nofile_soft_limit().expect("second call must succeed");
+        assert_eq!(again_old, new_soft, "the raised soft limit must persist");
+        assert_eq!(again_old, again_new, "already at the hard limit → no-op");
+    }
 
     #[test]
     fn watchlist_supported_gates_on_1_32() {
