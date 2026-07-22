@@ -163,9 +163,70 @@ and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
   enables `Config::streaming_lists()` on the cluster-wide watches to cut peak memory on
   the initial resync. **On by default** (the chart's `kubeVersion` floor is 1.32): it
   needs apiserver WatchList support (beta 1.32/1.33, GA 1.34), so the controller gates
-  it on the server version at startup and falls back to paged lists below 1.32. Set
+  it on the server version at startup and falls back to paged lists below 1.32. A
+  **failed** version probe (e.g. booting mid-outage) also falls back to paged lists for
+  that run — kube cannot self-degrade from WatchList, and streaming against a pre-1.32
+  server would leave every watcher retrying an unsupported verb forever. Set
   `streamingLists: false` only if your apiserver has the WatchList feature gate disabled.
+- **Reconcile concurrency cap.** `KOPIUR_RECONCILE_CONCURRENCY` /
+  `reconcileConcurrency` (default **8 per controller**; the operator runs 8
+  controllers, so ≤64 in-flight reconciles process-wide; `0` = unbounded, not
+  recommended) — see [API-outage resilience](#api-outage-resilience) for why the
+  default is bounded.
 
 Observe it: `kopiur_process_resident_memory_bytes` (an observable gauge sampled from
 `/proc/self/statm` at scrape time) exposes the controller's RSS on `/metrics` and
 guards these wins against regressions.
+
+## API-outage resilience
+
+An OOM-flapping apiserver once drove the controller to fd exhaustion (`EMFILE`)
+within ~11 seconds of startup: every watcher reconnect re-listed every primary, the
+referent mappers fanned single events out to whole fleets, **unbounded** reconcile
+concurrency dispatched all of it at once, every reconcile failed with a connect
+error that pinned a socket for the 30s connect timeout, and every failure spawned
+one more Event POST at the dead endpoint. With the fd table full, the
+`/metrics`+`/healthz` listener could no longer `accept()`, the kubelet's liveness
+probe failed at the TCP layer, and the restart's re-list repeated the storm (the
+election Lease logged `transitions=80`). The defenses, layered:
+
+- **Bounded reconcile concurrency** (`reconcileConcurrency`, above) — the primary
+  fix: bounds in-flight API calls and sockets no matter how large the re-list or
+  fan-out. A slot is held for the reconcile's full duration, so the floor is set by
+  the slow holders: hooks (deliberately inline — detaching them would stretch the
+  app's quiesce window) and in-process kopia ops, now themselves bounded by
+  `config::KOPIA_SUBPROCESS_TIMEOUT` (120s; previously a hung NFS mount pinned a
+  slot forever).
+- **Futile-Event suppression + bounded publishes** — a failure whose cause is the
+  kube transport being down (`Error::event_publish_futile()`, exhaustive over
+  `kube::Error`) skips its Warning-Event POST; all remaining failure publishes
+  share a 16-permit pool (saturation **drops**, never queues) and a 10s per-publish
+  timeout. Drops are visible as
+  `kopiur_controller_failure_events_dropped{cause=transport|saturated|timeout}` —
+  the `/metrics` signature of an outage, when Events themselves can't get through.
+- **Jittered transient requeue** — the flat 30s retry re-synchronized every failed
+  object into lockstep waves; transient requeues now spread deterministically
+  (FNV of kind/namespace/name, no RNG) across [30s, 60s). Watch-driven re-triggers
+  override any requeue (the scheduler keeps the earlier deadline), so jitter shapes
+  steady-state repeat failures; the recovery stampede is bounded by the concurrency
+  cap.
+- **Client timeouts** — connect 5s (was 30s: the dominant per-fd hold on a
+  blackholed endpoint), read 305s (was unbounded; must exceed kube-runtime's
+  290+5s watch idle window). The hooks `workloadExec` stream rides a second,
+  read-timeout-exempt client (`Context::exec_client`) so a long-quiet quiesce
+  command is not killed mid-stream.
+- **Leader renew attempt deadline** — each Lease renew attempt runs under
+  `RENEW_DEADLINE` (10s); a connected-but-stalled apiserver previously wedged the
+  renew loop forever (in HA: split-brain once a standby claimed the expired
+  Lease). Exit-on-lost-lease itself is deliberate (split-brain avoidance) — during
+  a long outage the pod still restarts by design, but bounded concurrency makes
+  each restart's re-list cheap.
+- **`RLIMIT_NOFILE` soft→hard raise at startup** — defense in depth; logged,
+  never fatal.
+
+The axum accept loop needed no change: axum 0.8 already sleeps 1s and retries on
+`EMFILE` (exactly the cadence the incident logs showed) and recovers once fds free.
+Regression guards: hermetic tests across `config.rs`/`error.rs`/`io/tests.rs`/
+`leader.rs`/`startup.rs`, plus the `apiserver_flap` e2e shard (kills the kind
+apiserver under a seeded fleet; asserts no EMFILE, bounded restarts/lease
+transitions, and post-recovery convergence).
