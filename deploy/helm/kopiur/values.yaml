@@ -122,6 +122,20 @@ streamingLists: true
 # deletes, nor does it gate whether a deletion is allowed at all — that's
 # deletionProtection.threshold on the Repository/ClusterRepository.
 maxConcurrentDeleteJobs: 0
+# @schema
+# type: integer
+# minimum: 0
+# maximum: 65535
+# @schema
+# -- Per-controller cap on concurrently running reconciles (the operator runs
+# 8 controllers, so the process-wide worst case is 8x this). Bounds API-server
+# load and file descriptors during re-list storms and API-server outages —
+# unbounded reconcile concurrency is what let an apiserver flap exhaust the
+# controller's fd table (EMFILE) within seconds. The default 8 clears a
+# few-hundred-object re-list in seconds while keeping slow reconciles (hooks,
+# in-process kopia ops) from starving a controller. 0 = unbounded (the
+# pre-fix behavior; not recommended).
+reconcileConcurrency: 8
 # -- Extra CLI args appended to the controller container.
 extraArgs: []
 # -- Extra environment variables for the controller container.

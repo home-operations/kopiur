@@ -656,6 +656,14 @@
       "title": "readinessProbe",
       "type": "object"
     },
+    "reconcileConcurrency": {
+      "default": 8,
+      "description": "Per-controller cap on concurrently running reconciles (the operator runs\n8 controllers, so the process-wide worst case is 8x this). Bounds API-server\nload and file descriptors during re-list storms and API-server outages —\nunbounded reconcile concurrency is what let an apiserver flap exhaust the\ncontroller's fd table (EMFILE) within seconds. The default 8 clears a\nfew-hundred-object re-list in seconds while keeping slow reconciles (hooks,\nin-process kopia ops) from starving a controller. 0 = unbounded (the\npre-fix behavior; not recommended).",
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "reconcileConcurrency",
+      "type": "integer"
+    },
     "replicaCount": {
       "default": 1,
       "description": "=============================================================================\nController runtime behavior\n=============================================================================\nNumber of controller replicas. \u003e1 enables HA via leader election; only the\nelected leader reconciles, so deterministic jitter keeps schedules identical\nacross replicas and across failover. Pair \u003e1 with podDisruptionBudget and\ntopologySpreadConstraints below to make it genuinely highly-available.",

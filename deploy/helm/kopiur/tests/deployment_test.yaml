@@ -142,6 +142,26 @@ tests:
             name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
             value: "5"
 
+  # The apiserver-outage EMFILE fix: the reconcile cap defaults BOUNDED
+  # (unlike the delete-job cap, which has batching as its primary protection).
+  - it: defaults the reconcile concurrency cap to 8 per controller
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_RECONCILE_CONCURRENCY
+            value: "8"
+
+  - it: renders reconcileConcurrency 0 (the explicit unbounded escape hatch)
+    set:
+      reconcileConcurrency: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_RECONCILE_CONCURRENCY
+            value: "0"
+
   - it: renders the default controller probes
     asserts:
       - equal:
