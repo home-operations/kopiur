@@ -44,7 +44,11 @@
 //!   claims the Lease immediately instead of waiting out the full duration on
 //!   every rolling upgrade.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// tokio's Instant, not std's: identical monotonic semantics at runtime, but
+// paused-test-aware — the renewal-deadline tests drive it with virtual time.
+use tokio::time::Instant;
 
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
@@ -321,7 +325,25 @@ pub fn spawn_renewal(
                         .await?;
                 Ok::<_, kube::Error>((won, holder))
             };
-            match attempt.await {
+            // The attempt itself is deadline-bounded: against a
+            // connected-but-STALLED apiserver (the OOM-flap signature) an
+            // unbounded await would wedge here forever — never reaching the
+            // deadline check below — while in HA a standby claims the expired
+            // Lease after LEASE_DURATION: split-brain double-reconcile. A
+            // stalled attempt is a failed renew; by the time the timeout fires
+            // (sleep + RENEW_DEADLINE since last_ok) the deadline has
+            // necessarily passed, so the Err arm abdicates.
+            let attempt = tokio::time::timeout(RENEW_DEADLINE, attempt);
+            match attempt.await.unwrap_or_else(|_elapsed| {
+                Err(kube::Error::Service(
+                    format!(
+                        "lease renew attempt stalled past the renew deadline ({}s) — the API \
+                         server accepted the connection but never answered",
+                        RENEW_DEADLINE.as_secs()
+                    )
+                    .into(),
+                ))
+            }) {
                 Ok((true, _)) => {
                     last_ok = Instant::now();
                     delay = RENEW_PERIOD;
@@ -760,6 +782,46 @@ mod tests {
                 outcome.is_err(),
                 "the renewal task must keep retrying (not abdicate) while the Lease names us"
             );
+        }
+
+        /// A client whose responses never arrive — a connected-but-stalled
+        /// apiserver (the OOM-flap signature), as opposed to one that refuses.
+        fn hanging_client() -> Client {
+            let svc = tower::service_fn(move |_req: Request<Body>| async move {
+                std::future::pending::<()>().await;
+                unreachable!("the hanging mock never responds");
+                #[allow(unreachable_code)]
+                Ok::<Response<Body>, std::convert::Infallible>(
+                    Response::builder().body(Body::empty()).unwrap(),
+                )
+            });
+            Client::new(svc, "test-ns")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn renewal_abdicates_when_the_apiserver_stalls_instead_of_hanging() {
+            // regression (apiserver-outage incident): the renew ATTEMPT itself
+            // had no timeout — against a connected-but-stalled apiserver the
+            // `attempt.await` wedged forever, so the deadline check after it
+            // never ran. Leadership was never abdicated while, in HA, a
+            // standby claimed the expired Lease after 15s: split-brain
+            // double-reconcile. A stalled attempt must count as a failed renew
+            // and abdicate at the deadline.
+            let handle = spawn_renewal(
+                hanging_client(),
+                LeaderElection {
+                    lease_name: "kopiur-leader".to_string(),
+                    namespace: "test-ns".to_string(),
+                },
+                ME.to_string(),
+            );
+            tokio::time::timeout(Duration::from_secs(60), handle)
+                .await
+                .expect(
+                    "a stalled renew attempt must abdicate at the renew deadline, not hang \
+                     leadership forever",
+                )
+                .expect("renewal task must not panic");
         }
 
         #[tokio::test]
