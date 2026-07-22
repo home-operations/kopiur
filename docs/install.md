@@ -52,6 +52,11 @@ three images by digest.
 /// tab | Flux
 
 ```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-system
+---
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: OCIRepository
 metadata:
@@ -73,10 +78,15 @@ spec:
   chartRef:
     kind: OCIRepository
     name: kopiur
-  install:
-    createNamespace: true
   # values: {}   # override chart values here
 ```
+
+The `OCIRepository` and `HelmRelease` are namespaced, so `kopiur-system` must
+exist before they apply; that is why the `Namespace` is included above (Flux's
+`install.createNamespace` only creates the release's *target* namespace, not
+the one the `HelmRelease` object itself lives in). In a real Flux repo the
+namespace usually comes from the parent Kustomization; keep it here so the
+snippet applies stand-alone.
 
 ///
 
