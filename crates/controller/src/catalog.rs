@@ -264,6 +264,7 @@ pub fn bootstrap_recycle_due(
     generation: Option<i64>,
     observed_generation: Option<i64>,
     last_refresh_at: Option<&str>,
+    job_completed_at: Option<&str>,
     interval: std::time::Duration,
     periodic_enabled: bool,
     scan_requested_token: Option<&str>,
@@ -280,6 +281,17 @@ pub fn bootstrap_recycle_due(
     }
     // The timed refresh arm only fires when periodic refresh is opted in; otherwise a
     // succeeded bootstrap is never recycled on a timer (one-time bootstrap semantics).
+    //
+    // It additionally requires the finished Job's result to have been CONSUMED
+    // already (`lastRefreshAt` >= the Job's `completionTime`): `lastRefreshAt`
+    // is only stamped by finalize's scan, so recycling on the bare timer ate
+    // any result whose Job round trip exceeded `refreshInterval` — the fresh
+    // result arrived already-stale-by-the-timer, was recycled before finalize
+    // could scan it, and the stamp never advanced: a load-dependent livelock
+    // (Jobs churn forever, discovered rows never materialize) that only showed
+    // on slow CI runners. Same launch-stamp/finalize-stamp discipline as the
+    // scan-request token's `scanRequestAttemptAt`.
+    //
     // The token arm uses the RATE-LIMITED `scan_requested_due` (not
     // `scan_requested_pending`): this predicate decides whether to recycle a
     // finished Job so a NEW one gets launched, and a pending token against an
@@ -287,7 +299,9 @@ pub fn bootstrap_recycle_due(
     // `scan_requested_pending`'s doc for the full rationale of the split. Fires
     // regardless of `periodic_enabled` — an on-demand request must not depend on
     // an opt-in feature the user may not have set.
-    (periodic_enabled && refresh_due(last_refresh_at, interval, now))
+    (periodic_enabled
+        && refresh_due(last_refresh_at, interval, now)
+        && result_already_consumed(last_refresh_at, job_completed_at))
         || scan_requested_due(
             scan_requested_token,
             scan_requested_honored,
@@ -295,6 +309,31 @@ pub fn bootstrap_recycle_due(
             scan_requested_retry_interval,
             now,
         )
+}
+
+/// Whether a finished bootstrap Job's result has already been scanned into the
+/// catalog: `last_refresh_at` (stamped by finalize's scan) is at or after the
+/// Job's `completionTime`. `last_refresh_at: None` with a finished Job means
+/// the result IS the first scan's input — not consumed. Missing/unparseable
+/// completion info fails open to "consumed" (the pre-fix timer behavior):
+/// this fn is a recycle GUARD, and failing open only re-permits the old
+/// recycle, never blocks finalize.
+fn result_already_consumed(last_refresh_at: Option<&str>, job_completed_at: Option<&str>) -> bool {
+    let Some(completed) = job_completed_at else {
+        return true;
+    };
+    let Ok(completed) = DateTime::parse_from_rfc3339(completed) else {
+        return true;
+    };
+    let Some(refreshed) = last_refresh_at else {
+        return false;
+    };
+    match DateTime::parse_from_rfc3339(refreshed) {
+        Ok(refreshed) => refreshed >= completed,
+        // An unparseable stamp is "never scanned" (this code writes the field,
+        // so garbage means absent): the result is unconsumed.
+        Err(_) => false,
+    }
 }
 
 /// `true` when a fresh repository listing should actually be SCANNED into the
@@ -375,6 +414,9 @@ pub fn bootstrap_create_due(
         generation,
         observed_generation,
         last_refresh_at,
+        // No Job exists on this branch, so there is no unconsumed result to
+        // protect — the timer arm keeps its plain refresh_due behavior.
+        None,
         interval,
         periodic_enabled,
         scan_requested_token,
@@ -1394,6 +1436,7 @@ mod tests {
             Some(2),
             Some(1),
             None,
+            None,
             interval,
             true,
             None,
@@ -1409,6 +1452,7 @@ mod tests {
             Some(2),
             Some(1),
             Some(&fresh),
+            None,
             interval,
             false,
             None,
@@ -1423,6 +1467,7 @@ mod tests {
             Some(2),
             Some(2),
             Some(&fresh),
+            None,
             interval,
             true,
             None,
@@ -1437,6 +1482,7 @@ mod tests {
             Some(2),
             Some(2),
             Some(&stale),
+            None,
             interval,
             true,
             None,
@@ -1452,8 +1498,92 @@ mod tests {
             Some(2),
             Some(2),
             Some(&stale),
+            None,
             interval,
             false,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    // Regression (mass-deletion e2e flake, found shepherding PR #287; latent
+    // since the periodic-refresh arm existed, first exposed when #278 gave the
+    // shard CI time): the timed-refresh arm recycled a finished Job whenever
+    // the timer was due — but `lastRefreshAt` is only stamped when a result is
+    // CONSUMED (finalize's scan), so any Job whose round trip exceeded
+    // `refreshInterval` arrived already-stale-by-the-timer and was recycled
+    // BEFORE finalize could scan it. Load-dependent livelock: rows never
+    // materialize, the stamp never advances, Jobs churn forever (passes on a
+    // fast box, times out on a loaded CI runner). The timer may only recycle a
+    // result that has ALREADY been consumed — lastRefreshAt >= the Job's
+    // completionTime (the launch-stamp/finalize-stamp discipline).
+    #[test]
+    fn refresh_recycle_only_fires_on_an_already_consumed_result() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(30);
+        let stale_refresh = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let completed_after_refresh = (now - chrono::Duration::seconds(10)).to_rfc3339();
+        let completed_before_refresh = (now - chrono::Duration::minutes(10)).to_rfc3339();
+
+        // Timer due, but the finished Job completed AFTER the last consumed
+        // scan: its result is unscanned — finalize must win, never the timer.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&stale_refresh),
+            Some(&completed_after_refresh),
+            interval,
+            true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+        // Timer due and the result was already consumed (lastRefreshAt is
+        // newer than the completion) → recycle for a fresh listing.
+        assert!(bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&stale_refresh),
+            Some(&completed_before_refresh),
+            interval,
+            true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+        // Never scanned at all: the finished result IS the first scan's input.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            None,
+            Some(&completed_after_refresh),
+            interval,
+            true,
+            None,
+            None,
+            None,
+            interval,
+            now
+        ));
+        // No completion info (defensive): preserve the pre-fix timer behavior.
+        assert!(bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&stale_refresh),
+            None,
+            interval,
+            true,
             None,
             None,
             None,
@@ -1474,6 +1604,7 @@ mod tests {
             Some(2),
             Some(2),
             Some(&fresh),
+            None,
             interval,
             true,
             None,
@@ -1487,6 +1618,7 @@ mod tests {
             Some(2),
             Some(2),
             Some(&fresh),
+            None,
             interval,
             false,
             None,
@@ -1657,6 +1789,7 @@ mod tests {
             true,
             Some(2),
             Some(2),
+            None,
             None,
             interval,
             false,

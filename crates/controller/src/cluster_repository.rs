@@ -938,6 +938,13 @@ async fn bootstrap_cluster_via_mover(
                         repo.metadata.generation,
                         repo.status.as_ref().and_then(|s| s.observed_generation),
                         cluster_last_refresh_at(repo),
+                        // The Job's completionTime: the timer arm may only
+                        // recycle a result finalize has already consumed.
+                        job.status
+                            .as_ref()
+                            .and_then(|s| s.completion_time.as_ref())
+                            .map(|t| t.0.to_string())
+                            .as_deref(),
                         interval,
                         CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
                         cluster_scan_requested_token(repo),
