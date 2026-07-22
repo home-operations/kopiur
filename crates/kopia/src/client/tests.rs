@@ -1289,3 +1289,70 @@ fn set_parameters_durations_always_carry_a_unit() {
         );
     }
 }
+
+// --- timed-out subprocess reaping (Greptile P1 on PR #287): the timeout branch
+// used `start_kill()` and returned immediately, so the SIGKILLed kopia child was
+// never `wait()`ed — a zombie per attempt, for the parent's whole lifetime. With
+// the controller's 120s default_timeout, a hung backend would mint zombies on
+// every retry. The child must be killed AND reaped before Timeout returns. ---
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timed_out_child_is_killed_and_reaped_not_left_a_zombie() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    // A shim standing in for `kopia`: records its PID, then hangs far past the
+    // timeout.
+    let dir = std::env::temp_dir().join(format!("kopiur-reap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("kopia");
+    let pid_file = dir.join("pid");
+    let _ = std::fs::remove_file(&pid_file);
+    {
+        let mut f = std::fs::File::create(&shim).unwrap();
+        write!(f, "#!/bin/sh\necho $$ > \"$KOPIUR_REAP_PID\"\nsleep 300\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let client = KopiaClient::builder()
+        .binary(&shim)
+        .env("KOPIUR_REAP_PID", pid_file.to_str().unwrap())
+        .default_timeout(Duration::from_millis(300))
+        .build();
+
+    let err = client
+        .run_ok(&["repository".into(), "status".into()])
+        .await
+        .expect_err("the hanging shim must time out");
+    assert!(
+        matches!(err, KopiaError::Timeout { .. }),
+        "expected Timeout, got {err:?}"
+    );
+
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the shim wrote its PID before hanging")
+        .trim()
+        .parse()
+        .unwrap();
+
+    // The child must be reaped BEFORE Timeout returns (`kill().await` =
+    // SIGKILL + wait), so this immediate — deliberately un-polled — check is
+    // deterministic: /proc/<pid> is already gone. On the pre-fix code
+    // (`start_kill()` + return) the child is still present here as a dying/
+    // zombie process; tokio's SIGCHLD-driven orphan reaper only cleans it up
+    // best-effort LATER, and this assertion runs synchronously before the
+    // signal driver can — pinning the deterministic-reap contract rather than
+    // the racy transient.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
+            .rsplit(") ")
+            .next()
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or('?');
+        panic!(
+            "timed-out kopia child (pid {pid}) still present (state '{state}') when \
+             Timeout returned — killed but not reaped before returning"
+        );
+    }
+}
