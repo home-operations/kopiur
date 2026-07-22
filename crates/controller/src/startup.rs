@@ -28,9 +28,16 @@ use crate::webhook_tls;
 /// kube's watcher does not degrade from WatchList to paged lists by itself, so we
 /// only enable streaming when the server actually supports it. Returns `false`
 /// immediately when streaming was not requested; otherwise probes the apiserver
-/// version and downgrades (with a warning) on a server that predates WatchList. A
-/// probe failure or unparseable version honors the configured value rather than
-/// silently disabling an explicitly-requested optimization.
+/// version and downgrades (with a warning) on a server that predates WatchList.
+///
+/// A probe FAILURE fails **closed** (paged lists): with no version evidence at
+/// all — e.g. booting mid-outage — enabling streaming against a pre-1.32
+/// server would leave every watcher retrying an unsupported verb forever (an
+/// inert controller that also hammers the apiserver), while the cost on a
+/// modern server is only one process-lifetime without the optimization. An
+/// UNPARSEABLE version from a live apiserver still honors the request
+/// ([`watchlist_supported`]) — that's evidence of a server too new/odd to
+/// second-guess, not absence of evidence.
 async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     if !configured {
         return false;
@@ -38,8 +45,13 @@ async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     let (major, minor) = match client.apiserver_version().await {
         Ok(info) => (info.major, info.minor),
         Err(e) => {
-            tracing::warn!(error = %e, "apiserver version probe failed; honoring streamingLists as configured");
-            return true;
+            tracing::warn!(
+                error = %e,
+                "apiserver version probe failed; using paged lists this run (fail closed — kube \
+                 cannot self-degrade from WatchList on a pre-1.32 server). Restart once the API \
+                 server is reachable to re-probe, or set streamingLists: false to silence this."
+            );
+            return false;
         }
     };
     let supported = watchlist_supported(&major, &minor);
@@ -556,9 +568,46 @@ mod tests {
     #[test]
     fn watchlist_supported_honors_config_on_unparseable_version() {
         // An unreadable version string must not silently disable an explicit
-        // streamingLists request — honor it (return true).
+        // streamingLists request — honor it (return true). (A PARSEABLE
+        // version answered by a live apiserver is trustworthy evidence either
+        // way; contrast with the probe-FAILURE case below, which has no
+        // evidence at all and must fail closed.)
         assert!(watchlist_supported("", ""));
         assert!(watchlist_supported("x", "y"));
         assert!(watchlist_supported("1", ""));
+    }
+
+    // --- probe failure fails CLOSED (apiserver-outage follow-up): kube never
+    // self-degrades from WatchList to paged lists, so enabling streaming
+    // against a pre-1.32 server leaves every watcher retrying an unsupported
+    // verb forever — an inert controller that also hammers the apiserver. A
+    // failed probe (e.g. booting during an outage) has no version evidence,
+    // and the safe default is paged lists: on a modern server that costs one
+    // process-lifetime of the optimization; on an old server it avoids the
+    // inert-controller failure mode entirely. ---
+    #[tokio::test]
+    async fn effective_streaming_lists_fails_closed_when_the_probe_fails() {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+
+        // Every request errors — the version probe cannot succeed.
+        let svc = tower::service_fn(move |_req: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        br#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":503}"#
+                            .to_vec(),
+                    ))
+                    .unwrap(),
+            )
+        });
+        let client = kube::Client::new(svc, "test-ns");
+        assert!(
+            !super::effective_streaming_lists(&client, true).await,
+            "a failed version probe must downgrade to paged lists (fail closed)"
+        );
+        assert!(!super::effective_streaming_lists(&client, false).await);
     }
 }
