@@ -32,7 +32,7 @@ Helm knobs (`logging.*`, applied to controller + webhook, and through to movers)
 
 ```bash
 # JSON logs everywhere, and show kopia's progress in mover logs:
-helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
+helm upgrade --install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
   --set logging.format=json --set logging.level='info,kopia=debug'
 ```
 
@@ -101,7 +101,7 @@ Notes:
 ## Enabling everything (Helm)
 
 ```bash
-helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
+helm upgrade --install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
   --set monitoring.serviceMonitor.enabled=true \
   --set monitoring.prometheusRule.enabled=true \
   --set monitoring.dashboards.enabled=true \
@@ -113,7 +113,7 @@ helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
 A ready-to-use values overlay is at [`deploy/observability-values.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/observability-values.yaml):
 
 ```bash
-helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
+helm upgrade --install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
   -f deploy/observability-values.yaml
 ```
 

@@ -190,7 +190,7 @@ before upgrading.
 With the Helm CLI, pass your migrated values file:
 
 ```bash
-helm upgrade kopiur deploy/helm/kopiur -n kopiur-system -f my-values.yaml
+helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur --version 0.6.0 -n kopiur-system -f my-values.yaml
 ```
 
 With Flux/Argo, bump the chart to `0.6.0` (e.g. `spec.chart.spec.version: 0.6.0` on the

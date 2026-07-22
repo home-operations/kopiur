@@ -15,10 +15,15 @@ Requires Kubernetes **>= 1.32** — the floor matches the default
 ```bash
 # cluster install (default): manages kopiur objects cluster-wide and reconciles
 # ClusterRepository. The webhook cert is self-managed by default — no
-# cert-manager, no manual steps:
-helm install kopiur deploy/helm/kopiur \
+# cert-manager, no manual steps. Installing from the published OCI chart is the
+# preferred path — its images are digest-pinned to the release and it is
+# cosign-signed (add --version x.y.z to pin a release):
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --namespace kopiur-system --create-namespace
 ```
+
+Working from a checkout instead? Swap the OCI ref for the local chart path
+`deploy/helm/kopiur` — the dev copy floats image tags (empty digests).
 
 See [`docs/install.md`](../../../docs/install.md) for the full quickstart and prerequisites.
 
@@ -34,7 +39,7 @@ See [`docs/install.md`](../../../docs/install.md) for the full quickstart and pr
 `cluster` is the default: a namespace-scoped `Role` can't reach the cluster-scoped `ClusterRepository` kind, so a namespaced install silently can't run a shared backup tier. Choose `namespaced` as the explicit least-privilege opt-down for a single-team install.
 
 ```bash
-helm install kopiur deploy/helm/kopiur --set installScope=namespaced ...
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur --set installScope=namespaced ...
 ```
 
 The RBAC rules are **synced from `cargo xtask gen-rbac`** (the checked-in `deploy/rbac/operator-*.yaml`), which derives the `kopiur.home-operations.com` permissions from the kube-rs `Resource` traits. The xtask is the source of truth; the chart templates carry a header comment to that effect and own only the names/labels.

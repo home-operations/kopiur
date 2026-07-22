@@ -1,6 +1,14 @@
 # Installing Kopiur
 
-Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide covers installing the operator with the bundled Helm chart and verifying it.
+Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide covers installing the operator with the Helm chart and verifying it.
+
+The chart is published as an OCI artifact at
+`oci://ghcr.io/home-operations/charts/kopiur` — **that is the preferred way to
+install**. Every published version is cosign-signed and ships with all three
+component images (controller, webhook, mover) pinned by digest to the exact
+release build. The in-repo chart (`deploy/helm/kopiur`) is the development
+copy: its image digests are empty and its tags float, so use it only when
+working from a checkout.
 
 > Status: **alpha** — API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
 
@@ -16,9 +24,10 @@ Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide
 ## Quickstart
 
 ```bash
-# 1. Install the chart, creating the operator namespace. No extra flags needed
-#    — the webhook cert is self-managed by default (no cert-manager required).
-helm install kopiur deploy/helm/kopiur \
+# 1. Install the published chart, creating the operator namespace. No extra
+#    flags needed — the webhook cert is self-managed by default (no
+#    cert-manager required). Add --version x.y.z to pin a release.
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --namespace kopiur-system --create-namespace
 
 # 2. Wait for rollout. (The webhook pod stays in ContainerCreating until the
@@ -30,6 +39,80 @@ kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 # 3. Confirm the 8 CRDs are registered.
 kubectl get crd | grep kopiur.home-operations.com
 ```
+
+## GitOps install (Flux / Argo)
+
+Point your GitOps tool at the same OCI chart — **never at the in-repo
+`deploy/helm/kopiur` path**, whose image digests are empty and whose tags float
+(a git-sourced install renders image tags from the chart's `appVersion`, so a
+checkout can pull a tag that was never published). The published chart pins all
+three images by digest.
+
+/// tab | Flux
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: kopiur
+  namespace: kopiur-system
+spec:
+  interval: 1h
+  url: oci://ghcr.io/home-operations/charts/kopiur
+  ref:
+    tag: 0.8.0 # pin the chart version
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kopiur
+  namespace: kopiur-system
+spec:
+  interval: 1h
+  chartRef:
+    kind: OCIRepository
+    name: kopiur
+  install:
+    createNamespace: true
+  # values: {}   # override chart values here
+```
+
+///
+
+/// tab | Argo CD
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kopiur
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/home-operations/charts # no oci:// prefix here
+    chart: kopiur
+    targetRevision: 0.8.0
+    # helm:
+    #   valuesObject: {}   # override chart values here
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kopiur-system
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+```
+
+///
+
+/// warning | `helm upgrade` and GitOps reconciles never update the CRDs
+
+The 8 CRDs ship in the chart's special `crds/` directory, which Helm installs
+once and never touches on upgrade (see [CRD lifecycle](#crd-lifecycle) below).
+A GitOps tool with a `CreateReplace` / server-side-apply CRD policy handles
+schema changes automatically; otherwise apply `deploy/crds/` yourself.
+
+///
 
 ## Webhook TLS
 
@@ -48,7 +131,7 @@ Nothing to configure — this is the `helm install` above. The operator grants i
 ### `cert-manager`
 
 ```bash
-helm install kopiur deploy/helm/kopiur \
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --namespace kopiur-system \
   --set webhook.tls.mode=cert-manager
 # Optionally point at your own Issuer/ClusterIssuer instead of the chart's
@@ -59,7 +142,7 @@ helm install kopiur deploy/helm/kopiur \
 
 ```bash
 # create a kubernetes.io/tls Secret named per webhook.tls.secretName, then:
-helm install kopiur deploy/helm/kopiur \
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --namespace kopiur-system \
   --set webhook.tls.mode=manual \
   --set webhook.tls.secretName=kopiur-webhook-tls \
@@ -69,7 +152,7 @@ helm install kopiur deploy/helm/kopiur \
 Or disable the webhook entirely (validation then relies on the controller's defensive checks only — not recommended):
 
 ```bash
-helm install kopiur deploy/helm/kopiur -n kopiur-system --set webhook.enabled=false
+helm install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system --set webhook.enabled=false
 ```
 
 ## Install scope
@@ -162,7 +245,7 @@ Eight runnable walkthroughs live in `deploy/examples/`:
 Turn it all on with the ready-made overlay:
 
 ```bash
-helm upgrade kopiur deploy/helm/kopiur -n kopiur-system \
+helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
   -f deploy/observability-values.yaml
 ```
 
@@ -171,8 +254,8 @@ See [`docs/dev/observability.md`](dev/observability.md) for the full metric list
 ## Upgrade / uninstall
 
 ```bash
-helm upgrade kopiur deploy/helm/kopiur -n kopiur-system   # does NOT touch crds/ — apply schema changes yourself (see CRD lifecycle)
-helm uninstall kopiur -n kopiur-system                     # leaves the crds/ CRDs (and your CRs) in place
+helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system   # does NOT touch crds/ — apply schema changes yourself (see CRD lifecycle)
+helm uninstall kopiur -n kopiur-system                                             # leaves the crds/ CRDs (and your CRs) in place
 ```
 
 Upgrading **from 0.5.x** needs a one-time pre-step so the CRD move doesn't delete your resources — see [Upgrading](upgrade.md).
