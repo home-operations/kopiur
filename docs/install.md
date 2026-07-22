@@ -17,6 +17,7 @@ working from a checkout.
 - **Kubernetes >= 1.24.** The deploy-or-restore volume-populator path (`Restore` + `PVC.spec.dataSourceRef`) relies on the `AnyVolumeDataSource` feature, available from 1.24.
 - **Helm 3 or 4.**
 - A **kopia repository backend** you can reach: S3/MinIO, Azure Blob, GCS, B2, filesystem (PVC), SFTP, WebDAV, or rclone.
+- A **CSI snapshot stack** (a `snapshot-controller` plus a `VolumeSnapshotClass` for your driver) for the **default** `copyMethod: Snapshot`. Many distributions bundle it (EKS, GKE, AKS, Talos, k3s add-ons); where yours does not, install the home-operations [`snapshot-controller`](https://github.com/home-operations/helm-charts) chart (`oci://ghcr.io/home-operations/charts/snapshot-controller`). Not needed if every `SnapshotPolicy` sets `copyMethod: Direct`. See [Copy methods → What it requires](copy-methods.md#what-it-requires).
 - _(Optional)_ **cert-manager** — only if you prefer it to manage the admission webhook's certificate. **It is not required**: by default the operator manages the webhook cert itself (see [Webhook TLS](#webhook-tls)).
 - _(Optional)_ **volume-data-source-validator** — recommended alongside CSI populators so a malformed `dataSourceRef` is surfaced as an event rather than a silently-stuck PVC.
 - _(Optional)_ **Prometheus Operator** — if you want the chart's `ServiceMonitor`.
