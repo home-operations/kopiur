@@ -392,11 +392,17 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
             .map_err(|_| format!("hook method {m:?} is not a valid HTTP method"))?,
     };
     let timeout = hook_timeout(hook.timeout.as_deref());
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("could not build the hook HTTP client: {e}"))?;
-    let mut req = client.request(method.clone(), url.clone());
+    // One process-wide client: building a reqwest::Client per invocation
+    // minted a fresh connection pool + TLS stack + resolver (its own fds)
+    // every time a hook fired. The per-hook timeout moves to the REQUEST so
+    // the shared client stays timeout-neutral. `Client::new()` panics only on
+    // TLS-backend init failure, which the old per-call builder would have hit
+    // identically on every invocation.
+    static HOOK_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(reqwest::Client::new);
+    let mut req = HOOK_HTTP_CLIENT
+        .request(method.clone(), url.clone())
+        .timeout(timeout);
     if !user.is_empty() {
         req = req.basic_auth(&user, pass.as_deref());
     }
