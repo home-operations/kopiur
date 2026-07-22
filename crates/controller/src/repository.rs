@@ -1347,6 +1347,47 @@ async fn finalize_bootstrap(
                 return finalize_probe_failure(ctx, repo, api, name, job_name, &failure).await;
             }
             let reason = failure.reason();
+            // A result-less Job failure carries no backend verdict (mover
+            // crashed / evicted / deadline / result write hit a down apiserver
+            // — the outage incident): recycle the dead Job and retry as
+            // `Degraded` (the retryable-class semantics of the in-process
+            // path) instead of parking `Failed` and re-reading the same Job
+            // every pass until its TTL reaps it. Guarded write + stable
+            // message keep repeats a no-op (no hot-loop).
+            if failure.recycles_for_retry() {
+                io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+                let conditions =
+                    bootstrap_condition(repo, false, reason, &failure.condition_message());
+                let conditions = io::set_ready(
+                    &conditions,
+                    repo.metadata.generation,
+                    io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+                    reason,
+                    &failure.condition_message(),
+                );
+                let current = serde_json::to_value(&repo.status).ok();
+                let wrote = io::patch_status_if_changed(
+                    api,
+                    name,
+                    current.as_ref(),
+                    serde_json::json!({
+                        "phase": "Degraded",
+                        "backend": backend.kind_str(),
+                        "observedGeneration": repo.metadata.generation,
+                        "conditions": conditions,
+                    }),
+                )
+                .await?;
+                if wrote {
+                    failure.publish(ctx, &io::event_ref(repo), name).await;
+                    tracing::warn!(
+                        repo = %name,
+                        reason,
+                        "bootstrap Job failed without a result; recycled it for retry"
+                    );
+                }
+                return Ok(Action::requeue(Duration::from_secs(120)));
+            }
             let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
             // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
             // should fail its health check fast, not hang until timeout.

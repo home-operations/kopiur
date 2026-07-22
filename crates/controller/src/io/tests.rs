@@ -154,6 +154,36 @@ fn bootstrap_failure_backend_reason_is_the_kopia_class_label() {
     assert_eq!(f.condition_message(), "Access Denied");
 }
 
+// --- regression (apiserver-outage e2e, PR #287): a bootstrap Job that
+// straddled the outage failed with NO result (its result-ConfigMap write hit
+// the dead apiserver; the Job then blew activeDeadlineSeconds). The reconciler
+// parked the Repository at terminal `Failed` and re-read the SAME dead Job
+// every 120s until its TTL reaped it — minutes-to-hours of self-heal latency
+// for a failure that carries no backend verdict at all. A result-less Job
+// failure is infrastructure, not a repository verdict: it must recycle the
+// Job and retry (phase Degraded, the retryable-class semantics the in-process
+// path already uses). Typed backend verdicts keep parking terminally. ---
+#[test]
+fn only_result_less_job_failures_recycle_for_retry() {
+    assert!(
+        BootstrapFailure::JobFailedWithoutResult {
+            job_name: "flap-repo-bootstrap".to_string(),
+        }
+        .recycles_for_retry(),
+        "no result = no backend verdict = retry, never a terminal park"
+    );
+    // A typed kopia rejection IS a backend verdict — parking at Failed is right.
+    assert!(
+        !BootstrapFailure::Backend {
+            class: KopiaErrorClass::AccessDenied,
+            message: "Access Denied".to_string(),
+        }
+        .recycles_for_retry()
+    );
+    // Create-disabled on an absent repo needs a spec change, not a retry loop.
+    assert!(!BootstrapFailure::RepositoryNotInitialized.recycles_for_retry());
+}
+
 #[test]
 fn bootstrap_failure_job_without_result_has_its_own_reason_and_actionable_message() {
     let f = BootstrapFailure::JobFailedWithoutResult {

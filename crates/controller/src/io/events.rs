@@ -572,6 +572,26 @@ impl BootstrapFailure {
         }
     }
 
+    /// Whether this failure should RECYCLE the bootstrap Job and retry instead
+    /// of parking the repository at terminal `Failed`.
+    ///
+    /// A result-less Job failure carries **no backend verdict** — the mover
+    /// crashed, was evicted, blew its deadline, or (the apiserver-outage
+    /// incident) could not write its result ConfigMap because the control
+    /// plane was down. Terminal `Failed` is reserved for non-retryable
+    /// *verdicts*; infrastructure eating the Job is retryable, and without the
+    /// recycle the reconciler re-reads the same dead Job every pass until its
+    /// TTL reaps it (minutes-to-hours of self-heal latency after an outage).
+    /// Typed backend rejections and the create-disabled sentinel keep the
+    /// terminal park: retrying them cannot succeed without a spec change.
+    /// Exhaustive so a new variant must choose.
+    pub fn recycles_for_retry(&self) -> bool {
+        match self {
+            BootstrapFailure::JobFailedWithoutResult { .. } => true,
+            BootstrapFailure::Backend { .. } | BootstrapFailure::RepositoryNotInitialized => false,
+        }
+    }
+
     /// The stable, actionable condition message (what failed / why / how to find
     /// the cause). Volatile-free so the guarded status write stays a no-op across
     /// repeated identical failures (no hot-loop — see [`crate::io::patch_status_if_changed`]).

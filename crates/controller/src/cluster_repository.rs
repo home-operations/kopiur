@@ -1357,6 +1357,46 @@ async fn finalize_cluster_bootstrap(
                 .await;
             }
             let reason = failure.reason();
+            // A result-less Job failure carries no backend verdict (mover
+            // crashed / evicted / deadline / result write hit a down apiserver
+            // — the outage incident): recycle the dead Job and retry as
+            // `Degraded` instead of parking `Failed` until the Job's TTL
+            // finally reaps it. Mirrors `repository.rs::finalize_bootstrap`.
+            if failure.recycles_for_retry() {
+                io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
+                let conditions =
+                    cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+                let conditions = io::set_ready(
+                    &conditions,
+                    repo.metadata.generation,
+                    io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+                    reason,
+                    &failure.condition_message(),
+                );
+                let current = serde_json::to_value(&repo.status).ok();
+                let wrote = io::patch_status_if_changed(
+                    api,
+                    name,
+                    current.as_ref(),
+                    serde_json::json!({
+                        "phase": "Degraded",
+                        "backend": backend.kind_str(),
+                        "observedGeneration": repo.metadata.generation,
+                        "conditions": conditions,
+                    }),
+                )
+                .await?;
+                if wrote {
+                    failure.publish(ctx, &io::event_ref(repo), name).await;
+                    tracing::warn!(
+                        repo = %name,
+                        reason,
+                        "ClusterRepository bootstrap Job failed without a result; recycled it \
+                         for retry"
+                    );
+                }
+                return Ok(Action::requeue(Duration::from_secs(120)));
+            }
             let conditions =
                 cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
             // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux

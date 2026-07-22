@@ -329,6 +329,16 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
          (baseline {baseline_transitions}, now {transitions})"
     );
 
+    // (d0) The Repository self-heals. A bootstrap Job that straddles the
+    // outage fails WITHOUT a result (its result-ConfigMap write hits the dead
+    // apiserver, then the Job blows its deadline); the reconciler must recycle
+    // that verdict-less Job and retry — never park the repo at terminal
+    // `Failed` until the Job's TTL reap. Regression: the first CI run left
+    // flap-repo Failed for 7+ minutes and (d) below timed out.
+    wait_phase(&repos, "flap-repo", "Ready")
+        .await
+        .expect("flap-repo must self-heal to Ready after the outage");
+
     // (d) The operator actually WORKS after recovery: a fresh backup runs to
     // Succeeded with a real kopia snapshot id — the assertion that would hang
     // forever on a controller that survived but stopped reconciling.
