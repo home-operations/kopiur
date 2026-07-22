@@ -166,6 +166,69 @@ impl Error {
             | Error::Invariant(_) => ErrorClass::Structural,
         }
     }
+
+    /// Whether publishing a failure Event for this error is futile because the
+    /// SAME kube client the Recorder rides cannot currently complete requests.
+    ///
+    /// During an apiserver outage every reconcile fails with a transport error
+    /// at once; publishing a Warning about "the API server is unreachable" TO
+    /// the unreachable API server only opens another doomed socket per failure
+    /// (one of the fd-exhaustion amplifiers in the apiserver-outage incident).
+    /// Everything that is NOT a kube transport failure keeps publishing — the
+    /// Event is the user-visible breadcrumb, and for those the client works.
+    /// Exhaustive `match` (ADR §5.5): a new variant cannot compile unclassified.
+    pub fn event_publish_futile(&self) -> bool {
+        match self {
+            Error::Kube(e) => kube_error_is_transport(e),
+            Error::Kopia(_)
+            | Error::Validation(_)
+            | Error::MissingDependency(_)
+            | Error::BlockedOnGrant(_)
+            | Error::Serialization(_)
+            | Error::BuildJob(_)
+            | Error::InvalidSchedule(_)
+            | Error::Invariant(_)
+            | Error::WebhookSetup(_)
+            | Error::WebhookCert(_) => false,
+        }
+    }
+}
+
+/// Transport/client-infrastructure failures, where an Event POST would ride
+/// the same broken path the failing call just used. Exhaustive over the
+/// `kube::Error` variants compiled under this workspace's kube features
+/// (`client`, `rustls-tls`, `ws`) — `kube::Error` is not `#[non_exhaustive]`,
+/// so a kube bump that adds a variant forces a classification decision here
+/// instead of silently defaulting.
+fn kube_error_is_transport(err: &kube::Error) -> bool {
+    match err {
+        // Futile: the client cannot complete ANY request right now — a dead or
+        // unreachable endpoint (`Service` is the incident's
+        // "ServiceError: client error (Connect)"), a connection that died
+        // mid-stream, an unusable TLS/auth/config layer.
+        kube::Error::Service(_)
+        | kube::Error::HyperError(_)
+        | kube::Error::ReadEvents(_)
+        | kube::Error::RustlsTls(_)
+        | kube::Error::TlsRequired
+        | kube::Error::Auth(_)
+        | kube::Error::InferConfig(_)
+        | kube::Error::InferKubeconfig(_)
+        | kube::Error::ProxyProtocolUnsupported { .. }
+        | kube::Error::ProxyProtocolDisabled { .. } => true,
+        // Publishable: the apiserver ANSWERED (`Api` — any code, including a
+        // 429/500/503 from a half-alive control plane) or the failure is local
+        // to THIS request's payload/URL — the transport itself works, so the
+        // Warning Event both can and should reach the user.
+        kube::Error::Api(_)
+        | kube::Error::FromUtf8(_)
+        | kube::Error::LinesCodecMaxLineLengthExceeded
+        | kube::Error::HttpError(_)
+        | kube::Error::SerdeError(_)
+        | kube::Error::BuildRequest(_)
+        | kube::Error::Discovery(_)
+        | kube::Error::UpgradeConnection(_) => false,
+    }
 }
 
 /// Result alias for reconcile functions.
@@ -197,11 +260,25 @@ where
         error = %err,
         "reconcile error; requeueing"
     );
-    let event = crate::io::reconcile_failure_event(err, crate::io::operator_uid());
-    let regarding = crate::io::event_ref(obj);
-    let recorder = ctx.recorder.clone();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(crate::io::publish_failure(recorder, regarding, event));
+    if err.event_publish_futile() {
+        // The client's transport is down: an Event POST would only open
+        // another doomed socket against the same dead endpoint. Count the
+        // drop so an outage is visible on /metrics even without Events.
+        ctx.metrics.record_failure_event_dropped("transport");
+        tracing::debug!(
+            kind = kind,
+            "skipping failure Event: kube transport error — the publish would ride the same \
+             dead connection"
+        );
+    } else {
+        let event = crate::io::reconcile_failure_event(err, crate::io::operator_uid());
+        let regarding = crate::io::event_ref(obj);
+        crate::io::try_spawn_failure_publish(
+            ctx.metrics.clone(),
+            ctx.recorder.clone(),
+            regarding,
+            event,
+        );
     }
     class.action()
 }
@@ -322,5 +399,161 @@ mod tests {
         let terminal = ErrorClass::Terminal.action();
         assert_eq!(terminal, Action::requeue(Duration::from_secs(1800)));
         assert_ne!(terminal, Action::requeue(Duration::from_secs(30)));
+    }
+
+    // --- regression (apiserver-outage EMFILE fix): `error_policy_for` used to
+    // fire-and-forget a Warning-Event POST for EVERY failed reconcile — even
+    // when the failure itself was the kube client's transport being down, so
+    // each failure spawned another socket-opening request against the dead
+    // apiserver. Transport-level failures must suppress the (futile) publish;
+    // API-level answers (403/429/503 from a live apiserver) must keep it. ---
+
+    #[test]
+    fn transport_level_kube_errors_suppress_the_failure_event() {
+        // The incident signature: `ServiceError: client error (Connect)`.
+        let connect = Error::Kube(kube::Error::Service("client error (Connect)".into()));
+        assert!(connect.event_publish_futile());
+        // A connection that died mid-stream is the same broken transport.
+        let read = Error::Kube(kube::Error::ReadEvents(std::io::Error::other(
+            "connection reset by peer",
+        )));
+        assert!(read.event_publish_futile());
+    }
+
+    #[test]
+    fn api_level_kube_errors_still_publish() {
+        // The apiserver ANSWERED — an Event publish is possible and valuable
+        // (during a half-alive apiserver these are exactly the breadcrumbs a
+        // user greps for). 403: RBAC gap; 503: overloaded but alive.
+        for code in [403u16, 429, 503] {
+            let err = Error::Kube(kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            })));
+            assert!(
+                !err.event_publish_futile(),
+                "Api({code}) must keep publishing"
+            );
+        }
+    }
+
+    #[test]
+    fn non_kube_errors_always_publish() {
+        // Everything that is not a kube transport failure reached the error
+        // policy over a WORKING client — the Event is the user-visible surface.
+        for err in [
+            Error::MissingDependency("repo `x` not found".into()),
+            Error::Validation("bad spec".into()),
+            Error::BlockedOnGrant("namespace not opted in".into()),
+            Error::InvalidSchedule("bad cron".into()),
+            Error::Invariant("no name".into()),
+            Error::WebhookSetup("no config".into()),
+        ] {
+            assert!(!err.event_publish_futile(), "{err} must keep publishing");
+        }
+        let kopia = Error::Kopia(KopiaError::NonZeroExit {
+            args: "repository connect".into(),
+            code: Some(1),
+            class: KopiaErrorClass::RepositoryUnavailable,
+            stderr_tail: "dial tcp: connection refused".into(),
+        });
+        assert!(!kopia.event_publish_futile());
+    }
+
+    // -- the policy itself, against a request-recording mock client --
+
+    use std::sync::{Arc, Mutex};
+
+    use http::{Request, Response, StatusCode};
+    use kube::Client;
+    use kube::client::Body;
+
+    /// Recorded API call: HTTP method + path.
+    type Recorded = (String, String);
+
+    /// A kube `Client` that records every request and answers POSTs by echoing
+    /// the posted body back (a created Event parses as itself), everything
+    /// else with 200 `{}`.
+    fn recording_client(log: Arc<Mutex<Vec<Recorded>>>) -> Client {
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            async move {
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("collect request body")
+                    .to_bytes();
+                log.lock().unwrap().push((method.clone(), path));
+                let (status, body) = if method == "POST" {
+                    (StatusCode::CREATED, bytes.to_vec())
+                } else {
+                    (StatusCode::OK, b"{}".to_vec())
+                };
+                let resp = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    fn test_obj(name: &str) -> k8s_openapi::api::core::v1::ConfigMap {
+        k8s_openapi::api::core::v1::ConfigMap {
+            metadata: kube::core::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("test-ns".to_string()),
+                uid: Some("00000000-0000-0000-0000-000000000000".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Let the (current-thread) runtime drive any spawned publish to
+    /// completion; deterministic — if nothing was spawned, nothing can run.
+    async fn drain_spawned(log: &Arc<Mutex<Vec<Recorded>>>) {
+        for _ in 0..64 {
+            if !log.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn error_policy_skips_event_post_for_transport_errors() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ctx = crate::context::Context::test_context(recording_client(log.clone()));
+        let err = Error::Kube(kube::Error::Service("client error (Connect)".into()));
+        let _ = error_policy_for("Snapshot", &test_obj("storm-a"), &err, &ctx);
+        drain_spawned(&log).await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a transport-level failure must not spawn an Event POST over the same dead transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_policy_publishes_event_post_for_api_errors() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ctx = crate::context::Context::test_context(recording_client(log.clone()));
+        let err = Error::Kube(kube::Error::Api(Box::new(kube::core::Status {
+            code: 503,
+            ..Default::default()
+        })));
+        let _ = error_policy_for("Snapshot", &test_obj("alive-a"), &err, &ctx);
+        drain_spawned(&log).await;
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "an API-level failure must publish exactly one Warning Event; got {log:?}"
+        );
+        assert_eq!(log[0].0, "POST");
+        assert!(log[0].1.contains("/events"), "{}", log[0].1);
     }
 }

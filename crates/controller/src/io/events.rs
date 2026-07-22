@@ -362,6 +362,76 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
     }
 }
 
+/// Process-wide permit pool for reconcile-failure Event publishes. `static`
+/// so a permit acquired here is `SemaphorePermit<'static>` and can move into
+/// the spawned publish task. Sized by
+/// [`crate::config::MAX_INFLIGHT_FAILURE_EVENT_PUBLISHES`].
+static FAILURE_EVENT_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::config::MAX_INFLIGHT_FAILURE_EVENT_PUBLISHES);
+
+/// Spawn a best-effort, BOUNDED failure-Event publish; returns whether it was
+/// spawned. Bounds both dimensions an apiserver outage attacks:
+///
+/// - **count** — a process-wide permit pool; on saturation the Event is
+///   DROPPED (debug log + `kopiur_controller_failure_events_dropped` metric),
+///   never queued, so a failure storm cannot pile up unbounded tasks/sockets;
+/// - **hold time** — each publish runs under
+///   [`crate::config::FAILURE_EVENT_PUBLISH_TIMEOUT`], so a half-alive
+///   apiserver that accepts-then-stalls cannot pin permits (and their
+///   sockets) until the 295s client write timeout.
+///
+/// Outside a tokio runtime (pure unit tests) the publish is skipped — degrade,
+/// never panic, matching the old fire-and-forget behavior.
+pub(crate) fn try_spawn_failure_publish(
+    metrics: crate::metrics::Metrics,
+    recorder: Recorder,
+    regarding: ObjectReference,
+    event: FailureEvent,
+) -> bool {
+    try_spawn_failure_publish_with(&FAILURE_EVENT_PERMITS, metrics, recorder, regarding, event)
+}
+
+/// [`try_spawn_failure_publish`] with an injectable permit pool, so tests use
+/// a private leaked `Semaphore` and never contend with the global one (fully
+/// deterministic saturation — no `#[serial]`, no timing).
+pub(crate) fn try_spawn_failure_publish_with(
+    permits: &'static tokio::sync::Semaphore,
+    metrics: crate::metrics::Metrics,
+    recorder: Recorder,
+    regarding: ObjectReference,
+    event: FailureEvent,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    let Ok(permit) = permits.try_acquire() else {
+        metrics.record_failure_event_dropped("saturated");
+        tracing::debug!(
+            reason = event.reason,
+            "dropping failure Event: too many in-flight publishes (best-effort observability; \
+             repeats aggregate server-side, so little is lost)"
+        );
+        return false;
+    };
+    handle.spawn(async move {
+        // Held for the publish lifetime; dropping it (completion OR timeout)
+        // frees the slot.
+        let _permit = permit;
+        let deadline = crate::config::FAILURE_EVENT_PUBLISH_TIMEOUT;
+        if tokio::time::timeout(deadline, publish_failure(recorder, regarding, event))
+            .await
+            .is_err()
+        {
+            metrics.record_failure_event_dropped("timeout");
+            tracing::debug!(
+                timeout = ?deadline,
+                "failure Event publish stalled past its deadline; dropped (best-effort)"
+            );
+        }
+    });
+    true
+}
+
 /// Publish a [`FailureEvent`] as a Warning on `regarding`. Owned arguments so
 /// the sync `error_policy` can fire-and-forget it on the runtime (`tokio::spawn`).
 /// Best-effort: a failed publish is logged, never fatal — a dropped Event must

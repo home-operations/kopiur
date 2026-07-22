@@ -2704,3 +2704,168 @@ fn pins_identity_is_false_for_a_group_the_hardened_default_already_gives() {
         "fsGroup 1000 is not the default — inheriting it changed the mover"
     );
 }
+
+// --- bounded failure-Event publishing (apiserver-outage EMFILE fix): the
+// error-policy publish used to be an UNBOUNDED fire-and-forget spawn per failed
+// reconcile. During an outage every reconcile fails at once, so the spawns —
+// each opening a socket to the dead apiserver — were one of the fd-exhaustion
+// amplifiers. The helper bounds in-flight COUNT (permits; drop, never queue)
+// and per-publish HOLD TIME (timeout), because a half-alive apiserver answers
+// 429/500/503 (which still publish) — the permit bound is load-bearing even
+// with the transport-error suppression in place. ---
+mod bounded_failure_publish {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use http::{Request, Response, StatusCode};
+    use kube::Client;
+    use kube::client::Body;
+    use kube::runtime::events::{Recorder, Reporter};
+    use tokio::sync::Semaphore;
+
+    use crate::error::Error;
+    use crate::metrics::Metrics;
+
+    /// A client that records request methods and answers POSTs by echoing the
+    /// body (a created Event parses as itself).
+    fn counting_client(log: Arc<Mutex<Vec<String>>>) -> Client {
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            async move {
+                let method = req.method().as_str().to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("collect request body")
+                    .to_bytes();
+                log.lock().unwrap().push(method.clone());
+                let (status, body) = if method == "POST" {
+                    (StatusCode::CREATED, bytes.to_vec())
+                } else {
+                    (StatusCode::OK, b"{}".to_vec())
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+            }
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    /// A client whose responses never arrive — a stalled/half-dead apiserver.
+    fn hanging_client() -> Client {
+        let svc = tower::service_fn(move |_req: Request<Body>| async move {
+            std::future::pending::<()>().await;
+            unreachable!("the hanging mock never responds");
+            #[allow(unreachable_code)]
+            Ok::<Response<Body>, std::convert::Infallible>(
+                Response::builder().body(Body::empty()).unwrap(),
+            )
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    fn leaked_semaphore(permits: usize) -> &'static Semaphore {
+        Box::leak(Box::new(Semaphore::new(permits)))
+    }
+
+    fn some_failure() -> (
+        k8s_openapi::api::core::v1::ObjectReference,
+        events::FailureEvent,
+    ) {
+        let obj = k8s_openapi::api::core::v1::ConfigMap {
+            metadata: kube::core::ObjectMeta {
+                name: Some("victim".into()),
+                namespace: Some("test-ns".into()),
+                uid: Some("00000000-0000-0000-0000-000000000000".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (
+            events::event_ref(&obj),
+            events::reconcile_failure_event(
+                &Error::MissingDependency("repo `x` not found".into()),
+                TEST_UID,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn dropped_when_permits_are_saturated() {
+        // A private leaked semaphore, NOT the global: saturation is set up
+        // deterministically with zero timing dependence.
+        let sem = leaked_semaphore(1);
+        let _held = sem.try_acquire().expect("free permit");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::new(counting_client(log.clone()), Reporter::from("kopiur-test"));
+        let (regarding, event) = some_failure();
+        let spawned =
+            events::try_spawn_failure_publish_with(sem, Metrics::new(), recorder, regarding, event);
+        assert!(!spawned, "a saturated permit pool must DROP, never queue");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "no request may be issued for a dropped publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_publish_posts_and_releases_its_permit() {
+        let sem = leaked_semaphore(2);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::new(counting_client(log.clone()), Reporter::from("kopiur-test"));
+        let (regarding, event) = some_failure();
+        let spawned =
+            events::try_spawn_failure_publish_with(sem, Metrics::new(), recorder, regarding, event);
+        assert!(spawned);
+        for _ in 0..64 {
+            if sem.available_permits() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "the permit must return after the POST"
+        );
+        assert_eq!(log.lock().unwrap().as_slice(), ["POST"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_publish_times_out_and_releases_its_permit() {
+        let sem = leaked_semaphore(2);
+        let recorder = Recorder::new(hanging_client(), Reporter::from("kopiur-test"));
+        let (regarding, event) = some_failure();
+        let spawned =
+            events::try_spawn_failure_publish_with(sem, Metrics::new(), recorder, regarding, event);
+        assert!(spawned);
+        // Let the task start and hit the never-responding IO: the permit is held.
+        tokio::task::yield_now().await;
+        assert_eq!(sem.available_permits(), 1);
+        // Past the deadline the timeout must reap the stalled publish — without
+        // it, a permit (and its socket) would be pinned until the write timeout
+        // (295s) or forever, silently re-shrinking the pool to zero.
+        tokio::time::advance(crate::config::FAILURE_EVENT_PUBLISH_TIMEOUT + Duration::from_secs(1))
+            .await;
+        for _ in 0..16 {
+            if sem.available_permits() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "a stalled publish must release its permit at the deadline"
+        );
+    }
+}

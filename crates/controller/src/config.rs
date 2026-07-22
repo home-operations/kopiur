@@ -213,6 +213,25 @@ pub const RECONCILE_CONCURRENCY_ENV: &str = "KOPIUR_RECONCILE_CONCURRENCY";
 /// [`ControllerConfig::reconcile_concurrency`]`: None`.
 pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
 
+/// Cap on concurrently in-flight reconcile-failure Event publishes, process
+/// wide. The error policy's publish is fire-and-forget; during an apiserver
+/// outage EVERY reconcile fails at once and an unbounded spawn-per-failure was
+/// one of the fd-exhaustion amplifiers (each publish opens a socket to the
+/// dead endpoint). Failure Events are best-effort observability with
+/// Recorder-side series aggregation, so dropping repeats under saturation
+/// loses almost nothing; 16 is far above any healthy cluster's concurrent
+/// failure-publish rate. Saturation DROPS (debug log + metric), never queues.
+pub const MAX_INFLIGHT_FAILURE_EVENT_PUBLISHES: usize = 16;
+
+/// Deadline for a single reconcile-failure Event publish. Bounds the permit
+/// (and socket) HOLD TIME — the orthogonal dimension to
+/// [`MAX_INFLIGHT_FAILURE_EVENT_PUBLISHES`]'s count bound: a half-alive
+/// apiserver can accept the connection and then stall, which would otherwise
+/// pin permits until the client write timeout (295s) and silently shrink the
+/// pool to zero. A healthy Event POST completes in milliseconds; 10s is
+/// generous.
+pub const FAILURE_EVENT_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Timeout for the controller's short in-process kopia subprocess ops (repo
 /// connect-validate, catalog `snapshot list`, finalizer `snapshot delete` —
 /// long work runs in mover Jobs). Previously unbounded: a hung backend (dead

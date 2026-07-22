@@ -300,6 +300,34 @@ impl Context {
             self.mover_image_overridden,
         )
     }
+
+    /// A `Context` over the given (usually `tower::service_fn` mock) client,
+    /// with the Recorder built from the same client and every other field at a
+    /// neutral default — for hermetic tests of policy/glue code that needs a
+    /// whole `Context` (e.g. `error_policy_for`), not a live cluster.
+    #[cfg(test)]
+    pub(crate) fn test_context(client: Client) -> Self {
+        use kube::runtime::events::Reporter;
+        let recorder = Recorder::new(client.clone(), Reporter::from("kopiur-test"));
+        Context::new(
+            client,
+            KopiaClientFactory::new(),
+            Metrics::new(),
+            recorder,
+            "example.com/kopiur-mover:test".to_string(),
+            false,
+            None,
+            None,
+            crate::config::DEFAULT_MOVER_NAME.to_string(),
+            crate::config::DEFAULT_MOVER_ROLE_KIND,
+            Vec::new(),
+            kube::runtime::reflector::store::<Maintenance>().0,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            crate::config::WatchScope::Cluster,
+            None,
+        )
+    }
 }
 
 /// Flip an informer-synced flag to `true` (idempotent), logging ONCE on the first

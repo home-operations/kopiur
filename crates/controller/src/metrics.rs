@@ -53,6 +53,7 @@ pub struct Metrics {
     reconciliations: Counter<u64>,
     reconcile_errors: Counter<u64>,
     reconcile_duration: Histogram<f64>,
+    failure_events_dropped: Counter<u64>,
 
     // Snapshot business metrics.
     //
@@ -226,6 +227,16 @@ impl Metrics {
         let reconcile_errors = m
             .u64_counter("kopiur_controller_reconcile_errors")
             .with_description("Total reconcile errors per CRD kind and error class.")
+            .build();
+        let failure_events_dropped = m
+            .u64_counter("kopiur_controller_failure_events_dropped")
+            .with_description(
+                "Reconcile-failure Warning Events dropped instead of published, by cause: \
+                 transport = the kube client's connection is down so a publish is futile; \
+                 saturated = too many in-flight publishes (best-effort, never queued); \
+                 timeout = the publish stalled past its deadline. A burst here is the \
+                 /metrics-visible signature of an apiserver outage.",
+            )
             .build();
         let reconcile_duration = m
             .f64_histogram("kopiur_controller_reconcile_duration_seconds")
@@ -462,6 +473,7 @@ impl Metrics {
             provider: Arc::new(provider),
             reconciliations,
             reconcile_errors,
+            failure_events_dropped,
             reconcile_duration,
             backup_verified_timestamp,
             backup_consecutive_failures,
@@ -512,6 +524,15 @@ impl Metrics {
                 KeyValue::new("class", class.to_string()),
             ],
         );
+    }
+
+    /// Count a reconcile-failure Warning Event that was dropped instead of
+    /// published. `cause` ∈ {"transport", "saturated", "timeout"} — see the
+    /// counter description; a burst is the /metrics-visible signature of an
+    /// apiserver outage (when Events themselves cannot get through).
+    pub fn record_failure_event_dropped(&self, cause: &'static str) {
+        self.failure_events_dropped
+            .add(1, &[KeyValue::new("cause", cause)]);
     }
 
     // ---- store-backed observable gauges ------------------------------------
