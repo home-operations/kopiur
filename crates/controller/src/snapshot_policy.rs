@@ -892,9 +892,44 @@ async fn run_adoption(
         tracing::info!(policy = %name, adopted, identity = %identity_str, "auto-adopted discovered snapshots");
     }
 
+    // 7b. Retention-gate observability (adoption inv. 8). Transition-gated: the
+    //     event and the status write fire when the withheld COUNT changes, so a
+    //     steady fully-withheld state publishes once and then stays byte-silent
+    //     (status-churn rule).
+    let prior_skipped = u64::from(
+        config
+            .status
+            .as_ref()
+            .and_then(|s| s.adoption.as_ref())
+            .and_then(|a| a.skipped_by_retention)
+            .unwrap_or(0),
+    );
+    let skipped_changed = plan.skipped_by_retention != prior_skipped;
+    if plan.skipped_by_retention > 0 {
+        tracing::debug!(
+            policy = %name,
+            skipped = plan.skipped_by_retention,
+            identity = %identity_str,
+            "adoption withheld by the retention gate (inv. 8)"
+        );
+        if skipped_changed {
+            io::publish_normal_event(
+                ctx,
+                config,
+                crate::consts::ADOPTION_SKIPPED_BY_RETENTION_REASON,
+                crate::consts::REVIEW_RETENTION_ACTION,
+                &crate::adoption::adoption_skipped_event_message(
+                    plan.skipped_by_retention,
+                    &identity_str,
+                ),
+            )
+            .await;
+        }
+    }
+
     // 8. `status.adoption` summary (guarded, prior-carrying — only touched when
     //    there is activity, so a steady-state pass writes nothing).
-    if adopted > 0 || plan.request_scan {
+    if adopted > 0 || plan.request_scan || skipped_changed {
         write_adoption_status(
             api,
             name,
@@ -902,6 +937,7 @@ async fn run_adoption(
             config,
             adopted,
             plan.request_scan,
+            plan.skipped_by_retention,
             &now,
             &identity_str,
         )
@@ -1076,6 +1112,7 @@ async fn write_adoption_status(
     config: &SnapshotPolicy,
     adopted: u64,
     request_scan: bool,
+    skipped_by_retention: u64,
     now: &str,
     identity: &str,
 ) -> Result<()> {
@@ -1083,6 +1120,9 @@ async fn write_adoption_status(
     let prior = config.status.as_ref().and_then(|s| s.adoption.as_ref());
     let prior_total = prior.and_then(|a| a.total_adopted).unwrap_or(0);
     let summary = AdoptionSummary {
+        // The CURRENT pass's gate outcome, not prior-carried: this is a live
+        // gauge of how many matching rows are deliberately left discovered.
+        skipped_by_retention: Some(u32::try_from(skipped_by_retention).unwrap_or(u32::MAX)),
         last_adoption_at: if adopted > 0 {
             Some(now.to_string())
         } else {

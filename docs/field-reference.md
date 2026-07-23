@@ -1746,6 +1746,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `lastAdoptionAt` | string | — | RFC3339 timestamp of the last adoption pass that adopted at least one snapshot. |
 | `scanRequestedAt` | string | — | RFC3339 token echoing an in-flight on-demand adoption scan request for this policy's identity; cleared once honored. |
 | `scanRequestedIdentity` | string | — | The resolved kopia identity the requested scan was scoped to, pinned at request time so a later identity-changing edit can't retarget an in-flight scan. |
+| `skippedByRetention` | integer | —<br><sub>min 0</sub> | Identity-matching discovered snapshots the last adoption pass left discovered because `spec.retention` would prune them immediately under the effective `deletionPolicy` (`Retain`/`Orphan` — a CR-only prune that would re-discover and re-adopt forever). `0`/absent when nothing was withheld. See the `AdoptionSkippedByRetention` event for the levers. |
 | `totalAdopted` | integer | —<br><sub>min 0</sub> | Running total of `Snapshot` CRs ever adopted into this recipe. |
 
 #### `status.conditions[]` { #snapshotpolicy-status-conditions }

@@ -763,6 +763,13 @@ pub struct AdoptionSummary {
     /// Running total of `Snapshot` CRs ever adopted into this recipe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_adopted: Option<u64>,
+    /// Identity-matching discovered snapshots the last adoption pass left
+    /// discovered because `spec.retention` would prune them immediately under
+    /// the effective `deletionPolicy` (`Retain`/`Orphan` — a CR-only prune that
+    /// would re-discover and re-adopt forever). `0`/absent when nothing was
+    /// withheld. See the `AdoptionSkippedByRetention` event for the levers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_by_retention: Option<u32>,
     /// RFC3339 token echoing an in-flight on-demand adoption scan request for
     /// this policy's identity; cleared once honored.
     #[serde(default, skip_serializing_if = "Option::is_none")]

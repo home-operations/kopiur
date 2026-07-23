@@ -437,6 +437,22 @@ pub fn effective_deletion_policy(policy: &SnapshotPolicy) -> DeletionPolicy {
         .unwrap_or(DeletionPolicy::Delete)
 }
 
+/// The `AdoptionSkippedByRetention` Normal-Event note (inv. 8). **Pure** so the
+/// required contents are unit-asserted: the count, the identity, why the rows
+/// stay discovered, and every lever that changes the outcome.
+pub fn adoption_skipped_event_message(count: u64, identity: &str) -> String {
+    format!(
+        "Left {count} discovered snapshot(s) matching identity {identity} unadopted: \
+         spec.retention would prune them immediately, and this policy's effective \
+         deletionPolicy (Retain/Orphan) deletes only the Snapshot CR — the kopia snapshot \
+         would be re-discovered and re-adopted in an endless loop. They remain in the \
+         catalog as discovered rows. To change this: widen spec.retention, set \
+         spec.defaultDeletionPolicy: Delete (adopted rows then genuinely prune kopia \
+         data), pin a snapshot via spec.pin on its discovered row, or set spec.adoption: \
+         Ignore."
+    )
+}
+
 /// The `SnapshotsAdopted` Normal-Event note. **Pure** so the required contents
 /// are unit-asserted: the count, the identity, that the rows are now GFS-governed
 /// and WILL be pruned per `spec.retention`, and BOTH opt-outs.
@@ -1284,5 +1300,20 @@ mod tests {
             msg.contains("spec.catalog.adoption: Ignore"),
             "repository opt-out"
         );
+    }
+
+    #[test]
+    fn adoption_skipped_event_message_states_count_identity_and_all_levers() {
+        let msg = adoption_skipped_event_message(2, "app@billing:/data");
+        assert!(msg.contains('2'), "count");
+        assert!(msg.contains("app@billing:/data"), "identity");
+        assert!(msg.contains("spec.retention"), "lever: widen retention");
+        assert!(
+            msg.contains("spec.defaultDeletionPolicy: Delete"),
+            "lever: switch to real pruning"
+        );
+        assert!(msg.contains("spec.pin"), "lever: pin a snapshot");
+        assert!(msg.contains("spec.adoption: Ignore"), "lever: opt out");
+        assert!(msg.contains("discovered"), "states where the rows remain");
     }
 }
