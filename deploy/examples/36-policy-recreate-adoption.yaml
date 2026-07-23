@@ -32,7 +32,11 @@
 #    spec.retention below prunes them once they age out of the window. This
 #    is by design, not a bug: see docs/backups.md "Retention" and
 #    "troubleshooting.md" if backups you didn't expect to lose disappear
-#    right after a recreate.
+#    right after a recreate. (That destructive prune applies under the
+#    default `defaultDeletionPolicy: Delete`. Under Retain/Orphan, out-of-
+#    window history is never adopted at all — it stays `discovered`, counted
+#    in status.adoption.skippedByRetention — because a CR-only prune would
+#    just re-discover and re-adopt forever.)
 #
 # On a repository SHARED by many namespaces/policies, this scan-request is
 # bounded: many policies recreated at once each stamp the SAME repository

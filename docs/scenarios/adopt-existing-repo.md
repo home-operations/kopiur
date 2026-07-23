@@ -153,11 +153,19 @@ flowchart LR
    `SnapshotsAdopted` Normal Event fires naming the count and identity.
 5. **Retention resumes.** Adopted rows are GFS-governed exactly like produced
    ones — `spec.retention` starts pruning them the moment they age out of the
-   window. If you recreated the policy with a **narrower** retention window
-   than before, expect some of the just-adopted history to be pruned on the
-   very next reconcile — that's [by design](../backups.md#retention--how-long-backups-are-kept-gfs),
-   not a bug (see [Troubleshooting](../troubleshooting.md#my-old-snapshots-were-pruned-after-i-recreated-a-policy)
-   if this surprises you).
+   window. What happens to history **outside** a narrower window depends on the
+   policy's effective `defaultDeletionPolicy`:
+   - **`Delete` (the default)**: everything matching is adopted, and the
+     out-of-window rows are pruned on the very next reconcile — kopia data
+     included. That's [by design](../backups.md#retention--how-long-backups-are-kept-gfs),
+     not a bug (see [Troubleshooting](../troubleshooting.md#my-old-snapshots-were-pruned-after-i-recreated-a-policy)
+     if this surprises you).
+   - **`Retain`/`Orphan`**: pruning would delete only the CR while the kopia
+     snapshot survives to be re-discovered and re-adopted forever, so Kopiur
+     adopts **only the in-window candidates** and deliberately leaves the rest
+     as `discovered` rows. `status.adoption.skippedByRetention` counts them and
+     an `AdoptionSkippedByRetention` Normal Event on the policy names the
+     levers.
 
 ```yaml
 --8<-- "deploy/examples/36-policy-recreate-adoption.yaml"
