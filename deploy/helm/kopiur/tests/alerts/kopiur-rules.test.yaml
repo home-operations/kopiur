@@ -97,3 +97,18 @@ tests:
       - eval_time: 90m
         alertname: KopiurLastBackupFailed
         exp_alerts: []
+  # 5. Overlapping scrape targets disagree (a deposed leader's final samples,
+  #    or a rolling update): stale instance says 0, fresh instance says 1 →
+  #    the max-by aggregation trusts the recovered value and stays silent.
+  #    FAILS against an unaggregated `kopiur_snapshotpolicy_last_backup_success
+  #    == 0` expr, which pages from the stale series alone (Greptile P1, PR #296).
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-old", pod="kopiur-a"}'
+        values: "0x60"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-new", pod="kopiur-b"}'
+        values: "1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurLastBackupFailed
+        exp_alerts: []

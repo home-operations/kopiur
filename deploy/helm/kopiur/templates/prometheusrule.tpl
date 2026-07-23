@@ -57,7 +57,12 @@ spec:
           # newer backup succeeds (VolSync-style). Store-backed: the series
           # exists only while the policy's terminal Snapshot CRs exist —
           # KopiurBackupStale covers the all-CRs-pruned / never-succeeded case.
-          expr: kopiur_snapshotpolicy_last_backup_success == 0
+          # max-by aggregates across scrape targets: only the leader emits the
+          # gauge, but pod replacement can briefly overlap two targets (or leave
+          # a dead pod's final samples until Prometheus drops it), and without
+          # aggregation those instance-labeled series would churn the alert's
+          # identity or hold a stale value against a fresh one.
+          expr: max by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 0
           for: 10m
           labels:
             severity: warning
