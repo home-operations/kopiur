@@ -1,0 +1,28 @@
+suite: prometheusrule
+templates:
+  - prometheusrule.tpl
+tests:
+  - it: renders nothing when disabled
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: ships a recovery-aware policy-level failure alert
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[2].alert
+          value: KopiurLastBackupFailed
+      - matchRegex:
+          path: spec.groups[0].rules[2].expr
+          pattern: max by \(namespace, policy\) \(kopiur_snapshotpolicy_last_backup_success\) == 0
+  - it: gates the per-CR snapshot alert on policy recovery
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[4].alert
+          value: KopiurSnapshotFailed
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: unless on \(namespace, policy\)

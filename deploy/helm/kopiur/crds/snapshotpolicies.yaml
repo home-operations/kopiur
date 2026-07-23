@@ -203,6 +203,22 @@ spec:
                             continueOnFailure:
                               description: 'If `true`, a failed request does not abort the backup (default: abort).'
                               type: boolean
+                            headers:
+                              description: 'Additional request headers (e.g. `Content-Type: application/json`).'
+                              items:
+                                description: One HTTP header sent with an `httpRequest` hook.
+                                properties:
+                                  name:
+                                    description: Header name (case-insensitive; RFC 7230 token, e.g. `Content-Type`).
+                                    type: string
+                                  value:
+                                    description: Header value.
+                                    type: string
+                                required:
+                                - name
+                                - value
+                                type: object
+                              type: array
                             method:
                               description: HTTP method (default `POST`).
                               nullable: true
@@ -313,6 +329,22 @@ spec:
                             continueOnFailure:
                               description: 'If `true`, a failed request does not abort the backup (default: abort).'
                               type: boolean
+                            headers:
+                              description: 'Additional request headers (e.g. `Content-Type: application/json`).'
+                              items:
+                                description: One HTTP header sent with an `httpRequest` hook.
+                                properties:
+                                  name:
+                                    description: Header name (case-insensitive; RFC 7230 token, e.g. `Content-Type`).
+                                    type: string
+                                  value:
+                                    description: Header value.
+                                    type: string
+                                required:
+                                - name
+                                - value
+                                type: object
+                              type: array
                             method:
                               description: HTTP method (default `POST`).
                               nullable: true

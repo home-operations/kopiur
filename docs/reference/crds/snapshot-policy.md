@@ -265,7 +265,12 @@ Each hook is exactly one of three forms:
 - `runJob` — a full Kubernetes `JobSpec` run as a one-shot Job (the k8up
   `PreBackupPod` analog).
 - `httpRequest` — a typed HTTP request for cross-system orchestration, with `url`,
-  `method` (default `POST`), optional `body`, and `timeout`.
+  `method` (default `POST`), optional `body`, optional `headers`, and `timeout`.
+  `headers` is a list of `{name, value}` objects, validated at admission: names are
+  case-insensitive RFC 7230 tokens, values must be single-line, and duplicate names
+  are rejected. Kopiur sends no default `Content-Type` with a `body`, so set one via
+  `headers` if the endpoint needs it. An explicit `Authorization` header replaces
+  `user:pass@…` credentials in the `url` (setting both is rejected).
 
 A hook failure aborts the backup by default; set `continueOnFailure: true` on any
 hook form to let the backup proceed past a failed hook. Timeouts are Go duration

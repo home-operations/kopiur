@@ -296,6 +296,52 @@ pub fn webdav_service(ns: &str) -> Service {
     }))
 }
 
+/// An in-cluster HTTP header-echo receiver (`mendhak/http-https-echo`) for the
+/// `httpRequest`-hook headers e2e (#290): it logs every request — method, path,
+/// and every header — as one JSON object on stdout, so a scenario can PROVE a
+/// hook header arrived by reading the pod logs. The echo answers `200` on every
+/// path, so a plain `httpGet /` readiness probe is fine here (unlike WebDAV,
+/// whose unauthenticated GET is a 401 and needs a TCP probe).
+pub fn http_echo_deployment(ns: &str) -> Deployment {
+    from_json(json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "http-echo", "namespace": ns },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": "http-echo" } },
+            "template": {
+                "metadata": { "labels": { "app": "http-echo" } },
+                "spec": {
+                    "containers": [{
+                        "name": "http-echo",
+                        "image": consts::HTTP_ECHO_IMAGE,
+                        "imagePullPolicy": "IfNotPresent",
+                        "ports": [{ "containerPort": 8080 }],
+                        "readinessProbe": {
+                            "httpGet": { "path": "/", "port": 8080 },
+                            "periodSeconds": 3,
+                        },
+                    }],
+                },
+            },
+        },
+    }))
+}
+
+/// The `Service` fronting the header-echo receiver on port 8080.
+pub fn http_echo_service(ns: &str) -> Service {
+    from_json(json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "http-echo", "namespace": ns },
+        "spec": {
+            "selector": { "app": "http-echo" },
+            "ports": [{ "name": "http", "port": 8080, "targetPort": 8080 }],
+        },
+    }))
+}
+
 /// The in-cluster NFS server `Deployment` (`obeone/docker-nfs-server`, kernel
 /// `nfsd`). Runs **privileged** — it loads `nfsd` and mounts the nfsd/rpc_pipefs
 /// filesystems inside the container — and exports [`consts::NFS_EXPORT_PATH`]
@@ -906,6 +952,29 @@ mod tests {
             .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
             .collect();
         assert!(names.contains(&"USERNAME") && names.contains(&"PASSWORD"));
+    }
+
+    #[test]
+    fn http_echo_deployment_sets_image_and_httpget_probe_on_8080() {
+        let d = http_echo_deployment(consts::OPERATOR_NS);
+        let v = val(&d);
+        let c = v
+            .pointer("/spec/template/spec/containers/0")
+            .expect("container");
+        assert_eq!(c.pointer("/image").unwrap(), consts::HTTP_ECHO_IMAGE);
+        assert_eq!(c.pointer("/ports/0/containerPort").unwrap(), 8080);
+        // The echo answers 200 on every path, so a plain httpGet / probe is fine.
+        assert_eq!(c.pointer("/readinessProbe/httpGet/port").unwrap(), 8080);
+        assert_eq!(c.pointer("/readinessProbe/httpGet/path").unwrap(), "/");
+    }
+
+    #[test]
+    fn http_echo_service_targets_8080() {
+        let s = http_echo_service(consts::OPERATOR_NS);
+        let v = val(&s);
+        assert_eq!(v.pointer("/spec/ports/0/port").unwrap(), 8080);
+        assert_eq!(v.pointer("/spec/ports/0/targetPort").unwrap(), 8080);
+        assert_eq!(v.pointer("/spec/selector/app").unwrap(), "http-echo");
     }
 
     #[test]

@@ -95,6 +95,14 @@ spec:
           url: http://notifier.tools.svc:8080/fire # http://user:pass@… becomes Basic auth
           method: POST # the default; shown for teaching
           body: '{"event": "postgres-data backed up"}'
+          # Optional request headers ({name, value} objects). Kopiur sends NO
+          # default Content-Type with a body, so set one here if the endpoint
+          # needs it. Names are case-insensitive RFC 7230 tokens and values must
+          # be single-line; a duplicate name — or an explicit Authorization that
+          # collides with URL user:pass@ credentials — is rejected at admission.
+          headers:
+            - name: Content-Type
+              value: application/json
           timeout: 30s
           continueOnFailure: true
       # The third form, runJob, materializes a full one-shot Job — use it when the

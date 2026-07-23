@@ -539,7 +539,7 @@ $ kubectl logs -n kopiur-system deploy/kopiur-controller
 $ kubectl -n kopiur-system get deploy kopiur-controller kopiur-webhook
 ```
 
-The controller and webhook also expose `kopiur_*` metrics on `/metrics` (and `/healthz`, `/readyz`). If you've enabled the chart's `ServiceMonitor`/`PrometheusRule`, the kopiur alerts fire on stuck phases and consecutive failures — see [Installation → Observability](install.md#observability) and [Observability](dev/observability.md).
+The controller and webhook also expose `kopiur_*` metrics on `/metrics` (and `/healthz`, `/readyz`). If you've enabled the chart's `ServiceMonitor`/`PrometheusRule`, the kopiur alerts fire on stuck phases, consecutive failures, and failed backups. The backup-failure alerts are recovery-aware: `KopiurLastBackupFailed` (a `SnapshotPolicy`'s most recent completed backup failed) and the per-`Snapshot` `KopiurSnapshotFailed` both clear once the policy completes a newer successful backup, so a retained Failed `Snapshot` won't page indefinitely. See [Installation → Observability](install.md#observability) and [Observability](dev/observability.md).
 
 ## See also
 

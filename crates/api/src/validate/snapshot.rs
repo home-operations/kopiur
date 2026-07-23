@@ -2,7 +2,7 @@ use super::*;
 use crate::common::ScheduleDeletePolicy;
 use crate::error::{ValidationError, ValidationResult};
 use crate::snapshot::{Origin, SnapshotSpec};
-use crate::snapshot_policy::{CopyMethod, Hook, SnapshotPolicySpec};
+use crate::snapshot_policy::{CopyMethod, Hook, HttpRequestHook, SnapshotPolicySpec};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 
 /// Validate a `SnapshotPolicy` spec, accumulating all problems.
@@ -412,9 +412,128 @@ fn validate_hook(list: &str, index: usize, hook: &Hook) -> ValidationResult {
                     });
                 }
             }
+            if let Some(e) = validate_http_hook_headers(h, list, index) {
+                return Err(e);
+            }
             check_timeout("httpRequest.timeout", h.timeout.as_deref())
         }
     }
+}
+
+/// Largest header name `http::HeaderName::from_bytes` will accept: `http` 1.4.2
+/// rejects anything longer via its `MAX_HEADER_NAME_LEN = 65535` guard. Mirrored
+/// EXACTLY here so a name admitted at the webhook can never fail to parse at run
+/// time (the branch's "anything admitted never fails at runtime" guarantee).
+const MAX_HEADER_NAME_LEN: usize = 65_535;
+
+/// RFC 7230 token — exactly the character set `http::HeaderName` accepts. This
+/// is the token check only; `http` ALSO caps the byte length at
+/// [`MAX_HEADER_NAME_LEN`], enforced separately in [`header_name_error`].
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(b,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+                | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+        })
+}
+
+/// Validate a single header name against everything `http::HeaderName` enforces
+/// — the RFC 7230 token set AND the [`MAX_HEADER_NAME_LEN`] byte cap — returning
+/// the first problem as a ready-to-return [`ValidationError`]. A length problem
+/// is not a token problem, so each carries its own what/why/fix message. Split
+/// out of [`validate_http_hook_headers`] to keep that function's branch count
+/// (and cognitive complexity) unchanged.
+fn header_name_error(name: &str, list: &str, i: usize, j: usize) -> Option<ValidationError> {
+    if !is_valid_header_name(name) {
+        return Some(ValidationError::InvalidFieldValue {
+            field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
+            reason: format!(
+                "{name:?} is not a valid HTTP header name — names are case-insensitive \
+                 RFC 7230 tokens (letters, digits, and !#$%&'*+-.^_`|~); remove \
+                 spaces and other separators"
+            ),
+        });
+    }
+    if name.len() > MAX_HEADER_NAME_LEN {
+        return Some(ValidationError::InvalidFieldValue {
+            field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
+            reason: format!(
+                "header name is {} bytes — HTTP header names are limited to \
+                 {MAX_HEADER_NAME_LEN} bytes; use a shorter name",
+                name.len()
+            ),
+        });
+    }
+    None
+}
+
+/// Field-content bytes `http::HeaderValue::from_str` accepts: HTAB, or any
+/// byte >= 0x20 except DEL (0x7F). Blocks CR/LF header injection.
+fn is_valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+}
+
+/// True when the URL's authority component carries `user[:pass]@` credentials.
+fn url_has_userinfo(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.contains('@')
+}
+
+/// Validate an `httpRequest` hook's headers so a value admitted here can never
+/// fail `http::HeaderName`/`HeaderValue` parsing at run time. Extracted from
+/// [`validate_hook`] to keep that match arm below the cognitive-complexity
+/// ratchet. Returns the first problem found, matching the arm's early-return
+/// style; the field paths mirror the CRD shape
+/// (`spec.hooks.{list}[{i}].httpRequest.headers[{j}].{name|value}`).
+fn validate_http_hook_headers(
+    h: &HttpRequestHook,
+    list: &str,
+    i: usize,
+) -> Option<ValidationError> {
+    let mut seen: Vec<String> = Vec::new();
+    for (j, header) in h.headers.iter().enumerate() {
+        if let Some(e) = header_name_error(&header.name, list, i, j) {
+            return Some(e);
+        }
+        if !is_valid_header_value(&header.value) {
+            return Some(ValidationError::InvalidFieldValue {
+                field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].value"),
+                reason: "control characters (including CR/LF) are not allowed in header \
+                         values — put multi-line payloads in `body`, not a header"
+                    .into(),
+            });
+        }
+        let lower = header.name.to_ascii_lowercase();
+        if seen.contains(&lower) {
+            return Some(ValidationError::InvalidFieldValue {
+                field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
+                reason: format!(
+                    "duplicate header {:?} — each header may be set once; combine values \
+                     into a single comma-separated header if the endpoint expects repeats",
+                    header.name
+                ),
+            });
+        }
+        seen.push(lower);
+    }
+    if url_has_userinfo(&h.url)
+        && h.headers
+            .iter()
+            .any(|hd| hd.name.eq_ignore_ascii_case("authorization"))
+    {
+        return Some(ValidationError::InvalidFieldValue {
+            field: format!("spec.hooks.{list}[{i}].httpRequest.headers"),
+            reason: "an explicit Authorization header conflicts with credentials in the \
+                     URL (user:pass@…) — use one auth source, not both"
+                .into(),
+        });
+    }
+    None
 }
 
 /// Validate a `Snapshot` spec for a given origin, accumulating all problems.

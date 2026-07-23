@@ -9,8 +9,11 @@
 //! "succeeded".
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
-//! Driven by `mise run //crates/e2e:test` (isolated `hooks` repo subpath; the
-//! httpRequest scenario reuses the WebDAV fixture as its in-cluster receiver).
+//! Driven by `mise run //crates/e2e:test` (isolated `hooks` repo subpath). There
+//! are two httpRequest scenarios: one aims the hook at the WebDAV fixture and
+//! rounds the request body back out of it, the other aims at the `Need::HttpEcho`
+//! fixture and verifies the hook's `headers` reached the receiver — a separate
+//! fixture because WebDAV stores a body but can't echo request headers.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -20,7 +23,7 @@ use common::{
     cr, ensure_repo, repository_json, snapshot_json, snapshot_policy_json, status_json,
     wait_condition, wait_phase,
 };
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
 use kube::{Api, Client};
 
 use k8s_openapi::api::batch::v1::Job;
@@ -511,4 +514,118 @@ async fn http_request_post_hook_hits_in_cluster_receiver() {
         .await
         .expect("the httpRequest post-hook's PUT must have landed on the receiver");
     let _ = pods.delete(verifier, &DeleteParams::default()).await;
+}
+
+/// `httpRequest` hook headers reach the receiver (#290): the WebDAV fixture can't
+/// prove this (Apache mod_dav neither persists a PUT's `Content-Type` nor logs
+/// arbitrary request headers), so this stands up the `Need::HttpEcho` receiver —
+/// which logs every request's headers as one JSON object on stdout — and asserts
+/// both the `Content-Type` and a custom marker header show up in the pod logs.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn http_request_hook_sends_custom_headers() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem, Need::HttpEcho])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    let src = "e2e-hooks-src-hdr";
+    ensure_hooks_world(&client, src).await;
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let marker = "kopiur-e2e-hdr-290";
+    let cfg = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-hooks-hdr-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({
+            "sources": [ { "pvc": { "name": src } } ],
+            "hooks": { "afterSnapshot": [ { "httpRequest": {
+                "url": consts::HTTP_ECHO_URL,
+                "method": "POST",
+                "body": "{\"event\":\"done\"}",
+                "headers": [
+                    { "name": "Content-Type", "value": "application/json" },
+                    { "name": "X-Kopiur-E2e", "value": marker }
+                ],
+                "timeout": "30s"
+            } } ] }
+        }),
+    );
+    let _ = configs.create(&PostParams::default(), &cr(cfg)).await;
+
+    let backup = "e2e-hooks-hdr";
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                backup,
+                "e2e-hooks-hdr-cfg",
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+    wait_phase(&backups, backup, "Succeeded")
+        .await
+        .expect("Snapshot with a header-carrying httpRequest post-hook should succeed");
+    // Same debounce race as the sibling test: the post-hook fires in the
+    // controller's FOLLOW-UP reconcile and stamps `hooks.postCompletedAt` a beat
+    // after the mover's terminal `Succeeded`. Poll for the stamp so we don't read
+    // status before the post-hook reconcile has landed.
+    wait_until(
+        "snapshot stamps hooks.postCompletedAt after the post-hook reconcile",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            async move {
+                let s = status_json(&backups, backup).await;
+                Ok(s.pointer("/hooks/postCompletedAt")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !t.is_empty())
+                    .then_some(s))
+            }
+        },
+    )
+    .await
+    .expect("status.hooks.postCompletedAt must be stamped after a Succeeded post-hook snapshot");
+
+    // The echo pod logs one pretty-printed JSON object per request; node's http
+    // server lowercases header names, so the hook's `Content-Type`/`X-Kopiur-E2e`
+    // appear as `content-type`/`x-kopiur-e2e`. Poll the logs until BOTH the custom
+    // marker and `application/json` land — proving the controller actually sent the
+    // hook's `headers`, not just reached the URL. The marker header is the real
+    // regression guard; the content-type check is matched loosely (bare substring,
+    // not the exact `"content-type": "application/json"` pair) so it can't break on
+    // the echo image's JSON pretty-print spacing.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "echo receiver logged the hook's headers",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let pods = pods.clone();
+            async move {
+                let list = pods
+                    .list(&ListParams::default().labels("app=http-echo"))
+                    .await?;
+                let Some(name) = list.items.first().and_then(|p| p.metadata.name.clone()) else {
+                    return Ok(None);
+                };
+                let logs = pods
+                    .logs(&name, &LogParams::default())
+                    .await
+                    .unwrap_or_default();
+                Ok((logs.contains(marker) && logs.contains("application/json")).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("both the custom marker header and Content-Type must have reached the receiver");
 }

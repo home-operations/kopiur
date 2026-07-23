@@ -19,6 +19,10 @@ spec:
   endpoints:
     - port: metrics
       path: /metrics
+      # Without honorLabels the scrape target's `namespace` (the controller's)
+      # clobbers the metric's own CR-namespace label into `exported_namespace`,
+      # so every alert reports the wrong namespace (#280).
+      honorLabels: true
       interval: {{ .Values.monitoring.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
       {{- with .Values.monitoring.serviceMonitor.relabelings }}
