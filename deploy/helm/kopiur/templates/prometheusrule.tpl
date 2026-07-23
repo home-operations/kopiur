@@ -57,12 +57,14 @@ spec:
           # newer backup succeeds (VolSync-style). Store-backed: the series
           # exists only while the policy's terminal Snapshot CRs exist —
           # KopiurBackupStale covers the all-CRs-pruned / never-succeeded case.
-          # max-by aggregates across scrape targets: only the leader emits the
-          # gauge, but pod replacement can briefly overlap two targets (or leave
-          # a dead pod's final samples until Prometheus drops it), and without
-          # aggregation those instance-labeled series would churn the alert's
-          # identity or hold a stale value against a fresh one.
-          expr: max by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 0
+          # Aggregating across scrape targets fixes alert-identity churn when
+          # pod replacement briefly overlaps two targets; min-vs-max decides who
+          # wins while they DISAGREE. min errs toward the failure signal: a
+          # deposed/wedged pod's frozen 1 must never mask a real failure (the
+          # missed-alert direction is data-loss-shaped), while the converse
+          # transient — a stale 0 against a fresh 1 — is evicted by scrape
+          # staleness (~5m) before `for: 10m` completes, so it never pages.
+          expr: min by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 0
           for: 10m
           labels:
             severity: warning
@@ -89,9 +91,15 @@ spec:
           # Snapshots without a policyRef have no `policy` label, never match
           # the health series, and so keep the always-fire behavior — for an
           # ad-hoc backup there is no "newer success" to defer to.
+          # The RHS must aggregate with min: an `unless` only checks PRESENCE of
+          # the on-label signature, so any lone series with value 1 — e.g. a
+          # deposed leader's stale samples — would suppress a real failure.
+          # min-by demands unanimity across scrape targets before suppressing;
+          # the converse stale-0 transient is evicted by scrape staleness (~5m)
+          # before `for: 10m` completes.
           expr: >-
             max by (namespace, name, policy) (kopiur_resource_phase{kind="Snapshot", phase="Failed"}) == 1
-            unless on (namespace, policy) (kopiur_snapshotpolicy_last_backup_success == 1)
+            unless on (namespace, policy) (min by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 1)
           for: 10m
           labels:
             severity: warning
