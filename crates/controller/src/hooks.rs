@@ -397,6 +397,35 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
             .map_err(|_| format!("hook method {m:?} is not a valid HTTP method"))?,
     };
     let timeout = hook_timeout(hook.timeout.as_deref());
+    // Parse and validate every hook header up front. A malformed name or value
+    // is the user's mistake to fix — a *business* error, exactly like the url
+    // and method above — so it must surface BEFORE any network I/O (the shared
+    // client build included), never as a request that reaches the endpoint and
+    // fails there. An explicit Authorization header also SUPPRESSES the
+    // URL-userinfo basic auth below (admission rejects the combination; this
+    // guard keeps runtime sane if the webhook was bypassed — reqwest's
+    // .header() appends, and two Authorization headers is never what anyone
+    // wants).
+    let explicit_authz = hook
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("authorization"));
+    let mut headers = Vec::with_capacity(hook.headers.len());
+    for h in &hook.headers {
+        let name = reqwest::header::HeaderName::from_bytes(h.name.as_bytes()).map_err(|_| {
+            format!(
+                "hook header name {:?} is not a valid HTTP header name",
+                h.name
+            )
+        })?;
+        let value = reqwest::header::HeaderValue::from_str(&h.value).map_err(|_| {
+            format!(
+                "hook header {:?} has an invalid value (control characters are not allowed)",
+                h.name
+            )
+        })?;
+        headers.push((name, value));
+    }
     // One process-wide client: building a reqwest::Client per invocation
     // minted a fresh connection pool + TLS stack + resolver (its own fds)
     // every time a hook fired. The per-hook timeout moves to the REQUEST so
@@ -408,11 +437,14 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
     let mut req = HOOK_HTTP_CLIENT
         .request(method.clone(), url.clone())
         .timeout(timeout);
-    if !user.is_empty() {
+    if !user.is_empty() && !explicit_authz {
         req = req.basic_auth(&user, pass.as_deref());
     }
     if let Some(body) = &hook.body {
         req = req.body(body.clone());
+    }
+    for (name, value) in headers {
+        req = req.header(name, value);
     }
     let resp = req.send().await.map_err(|e| {
         format!(
@@ -545,6 +577,7 @@ mod tests {
             url: "not a url".into(),
             method: None,
             body: None,
+            headers: Vec::new(),
             timeout: None,
             continue_on_failure: false,
         };
@@ -555,10 +588,48 @@ mod tests {
             url: "http://example.invalid/notify".into(),
             method: Some("FETCH IT".into()),
             body: None,
+            headers: Vec::new(),
             timeout: None,
             continue_on_failure: false,
         };
         let err = run_http_hook(&bad_method).await.unwrap_err();
         assert!(err.contains("not a valid HTTP method"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn http_hook_rejects_bad_headers_with_actionable_messages() {
+        let hook = HttpRequestHook {
+            url: "https://example/notify".into(),
+            method: None,
+            body: None,
+            headers: vec![kopiur_api::snapshot_policy::HttpHeader {
+                name: "Bad Header".into(),
+                value: "x".into(),
+            }],
+            timeout: None,
+            continue_on_failure: false,
+        };
+        let err = run_http_hook(&hook).await.unwrap_err();
+        assert!(
+            err.contains("Bad Header"),
+            "message names the offending header: {err}"
+        );
+
+        let hook = HttpRequestHook {
+            url: "https://example/notify".into(),
+            method: None,
+            body: None,
+            headers: vec![kopiur_api::snapshot_policy::HttpHeader {
+                name: "X-Api-Key".into(),
+                value: "bad\nvalue".into(),
+            }],
+            timeout: None,
+            continue_on_failure: false,
+        };
+        let err = run_http_hook(&hook).await.unwrap_err();
+        assert!(
+            err.contains("X-Api-Key"),
+            "message names the offending header: {err}"
+        );
     }
 }
