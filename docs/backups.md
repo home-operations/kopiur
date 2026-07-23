@@ -494,7 +494,13 @@ hooks:
               command: ["/bin/sh", "-c", "pg_backup_stop"]
 ```
 
-The other two forms are `runJob` (run a full one-shot `Job` owned by the `Snapshot` — the k8up `PreBackupPod` analog) and `httpRequest` (call a URL — default `POST`; `http://user:pass@…` becomes Basic auth). A worked manifest with all the knobs is [example 20](examples.md#example-20--quiesce-with-hooks).
+The other two forms are `runJob` (run a full one-shot `Job` owned by the `Snapshot` — the k8up `PreBackupPod` analog) and `httpRequest` (call a URL — default `POST`; `http://user:pass@…` becomes Basic auth, and an optional `headers` list of `{name, value}` objects rides along). A worked manifest with all the knobs is [example 20](examples.md#example-20--quiesce-with-hooks).
+
+/// warning | httpRequest headers, Content-Type, and auth
+
+Set request headers on an `httpRequest` hook with a `headers` list of `{name, value}` objects. Kopiur sends **no** default `Content-Type` even when you set a `body`, so a JSON endpoint needs an explicit header (`- name: Content-Type` / `value: application/json`) — that omission is deliberate, not a bug. The admission webhook checks headers on `kubectl apply`: names are case-insensitive RFC 7230 tokens, values must be single-line (control characters, including CR/LF, are rejected), and duplicate names (case-insensitive) are rejected. An explicit `Authorization` header **replaces** `user:pass@…` credentials in the URL; setting both is rejected — use one auth source.
+
+///
 
 Semantics you can rely on:
 
