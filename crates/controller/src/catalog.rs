@@ -299,16 +299,27 @@ pub fn bootstrap_recycle_due(
     // `scan_requested_pending`'s doc for the full rationale of the split. Fires
     // regardless of `periodic_enabled` — an on-demand request must not depend on
     // an opt-in feature the user may not have set.
+    //
+    // The token arm ALSO requires the finished result to have been consumed
+    // (#297): adoption stamps a fresh token per wave, and on a busy repository
+    // (thousands of candidates, several policies racing) a newer token is
+    // routinely pending by the time the Job completes. Without this guard the
+    // finished Job was deleted BEFORE finalize could scan its result — the work
+    // was discarded, `scanRequestHonored` never caught up to the annotation,
+    // and the Job recycled every ~15-25s for as long as adoption stayed hot.
+    // Consume-then-recycle: finalize scans the result (and retires the token it
+    // saw); a still-newer token then recycles on the NEXT pass, so every Job's
+    // listing counts and each token still gets its fresh scan.
     (periodic_enabled
         && refresh_due(last_refresh_at, interval, now)
         && result_already_consumed(last_refresh_at, job_completed_at))
-        || scan_requested_due(
+        || (scan_requested_due(
             scan_requested_token,
             scan_requested_honored,
             scan_requested_attempt_at,
             scan_requested_retry_interval,
             now,
-        )
+        ) && result_already_consumed(last_refresh_at, job_completed_at))
 }
 
 /// Whether a finished bootstrap Job's result has already been scanned into the
@@ -1660,6 +1671,105 @@ mod tests {
             interval,
             true,
             None,
+            None,
+            None,
+            interval,
+            now
+        ));
+    }
+
+    // Regression (#297): the scan-request-token arm must never recycle a
+    // finished Job whose result has not been consumed yet. Adoption stamps a
+    // fresh token per wave, so on a busy repository a newer token is routinely
+    // pending when the Job completes — recycling then throws the Job's listing
+    // away, `scanRequestHonored` never catches the annotation, and the Job
+    // churns every ~15-25s for as long as adoption stays hot (observed at 4898
+    // snapshots). Same consume-then-recycle discipline the timed arm got in
+    // #287.
+    #[test]
+    fn token_recycle_only_fires_on_an_already_consumed_result() {
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(30);
+        let refreshed = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let completed_after_refresh = (now - chrono::Duration::seconds(10)).to_rfc3339();
+        let completed_before_refresh = (now - chrono::Duration::minutes(10)).to_rfc3339();
+        let token = now.to_rfc3339();
+
+        // Pending token, but the finished Job's result is UNCONSUMED
+        // (completed after the last scan): finalize must win — recycling here
+        // is THE #297 bug.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&refreshed),
+            Some(&completed_after_refresh),
+            interval,
+            false,
+            Some(&token),
+            None,
+            None,
+            interval,
+            now
+        ));
+        // Pending token and the result was already consumed → recycle so the
+        // new token gets its fresh listing.
+        assert!(bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&refreshed),
+            Some(&completed_before_refresh),
+            interval,
+            false,
+            Some(&token),
+            None,
+            None,
+            interval,
+            now
+        ));
+        // Token already retired (== honored) → no recycle, consumed or not.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&refreshed),
+            Some(&completed_before_refresh),
+            interval,
+            false,
+            Some(&token),
+            Some(&token),
+            None,
+            interval,
+            now
+        ));
+        // Never scanned at all: the finished result IS the pending token's
+        // input — consume it, don't discard it.
+        assert!(!bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            None,
+            Some(&completed_after_refresh),
+            interval,
+            false,
+            Some(&token),
+            None,
+            None,
+            interval,
+            now
+        ));
+        // No Job (the create path passes completion None): the token arm keeps
+        // its plain behavior — nothing exists to consume.
+        assert!(bootstrap_recycle_due(
+            true,
+            Some(2),
+            Some(2),
+            Some(&refreshed),
+            None,
+            interval,
+            false,
+            Some(&token),
             None,
             None,
             interval,
