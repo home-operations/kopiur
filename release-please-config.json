@@ -12,7 +12,10 @@
       "include-v-in-tag": false,
       "include-v-in-release-name": false,
       "always-update": true,
-      "extra-files": ["deploy/helm/kopiur/Chart.yaml"]
+      "extra-files": [
+        { "type": "generic", "path": "deploy/helm/kopiur/Chart.yaml" },
+        "deploy/helm/kopiur/README.md"
+      ]
     }
   },
   "changelog-sections": [
