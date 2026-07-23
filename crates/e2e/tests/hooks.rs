@@ -9,8 +9,11 @@
 //! "succeeded".
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
-//! Driven by `mise run //crates/e2e:test` (isolated `hooks` repo subpath; the
-//! httpRequest scenario reuses the WebDAV fixture as its in-cluster receiver).
+//! Driven by `mise run //crates/e2e:test` (isolated `hooks` repo subpath). There
+//! are two httpRequest scenarios: one aims the hook at the WebDAV fixture and
+//! rounds the request body back out of it, the other aims at the `Need::HttpEcho`
+//! fixture and verifies the hook's `headers` reached the receiver — a separate
+//! fixture because WebDAV stores a body but can't echo request headers.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -596,8 +599,11 @@ async fn http_request_hook_sends_custom_headers() {
     // The echo pod logs one pretty-printed JSON object per request; node's http
     // server lowercases header names, so the hook's `Content-Type`/`X-Kopiur-E2e`
     // appear as `content-type`/`x-kopiur-e2e`. Poll the logs until BOTH the custom
-    // marker and the Content-Type land — proving the controller actually sent the
-    // hook's `headers`, not just reached the URL.
+    // marker and `application/json` land — proving the controller actually sent the
+    // hook's `headers`, not just reached the URL. The marker header is the real
+    // regression guard; the content-type check is matched loosely (bare substring,
+    // not the exact `"content-type": "application/json"` pair) so it can't break on
+    // the echo image's JSON pretty-print spacing.
     let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     wait_until(
         "echo receiver logged the hook's headers",
@@ -616,9 +622,7 @@ async fn http_request_hook_sends_custom_headers() {
                     .logs(&name, &LogParams::default())
                     .await
                     .unwrap_or_default();
-                Ok((logs.contains(marker)
-                    && logs.contains("\"content-type\": \"application/json\""))
-                .then_some(()))
+                Ok((logs.contains(marker) && logs.contains("application/json")).then_some(()))
             }
         },
     )

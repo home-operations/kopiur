@@ -420,7 +420,15 @@ fn validate_hook(list: &str, index: usize, hook: &Hook) -> ValidationResult {
     }
 }
 
-/// RFC 7230 token — exactly the set `http::HeaderName` accepts.
+/// Largest header name `http::HeaderName::from_bytes` will accept: `http` 1.4.2
+/// rejects anything longer via its `MAX_HEADER_NAME_LEN = 65535` guard. Mirrored
+/// EXACTLY here so a name admitted at the webhook can never fail to parse at run
+/// time (the branch's "anything admitted never fails at runtime" guarantee).
+const MAX_HEADER_NAME_LEN: usize = 65_535;
+
+/// RFC 7230 token — exactly the character set `http::HeaderName` accepts. This
+/// is the token check only; `http` ALSO caps the byte length at
+/// [`MAX_HEADER_NAME_LEN`], enforced separately in [`header_name_error`].
 fn is_valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| {
@@ -429,6 +437,36 @@ fn is_valid_header_name(name: &str) -> bool {
                 | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
                 | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
         })
+}
+
+/// Validate a single header name against everything `http::HeaderName` enforces
+/// — the RFC 7230 token set AND the [`MAX_HEADER_NAME_LEN`] byte cap — returning
+/// the first problem as a ready-to-return [`ValidationError`]. A length problem
+/// is not a token problem, so each carries its own what/why/fix message. Split
+/// out of [`validate_http_hook_headers`] to keep that function's branch count
+/// (and cognitive complexity) unchanged.
+fn header_name_error(name: &str, list: &str, i: usize, j: usize) -> Option<ValidationError> {
+    if !is_valid_header_name(name) {
+        return Some(ValidationError::InvalidFieldValue {
+            field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
+            reason: format!(
+                "{name:?} is not a valid HTTP header name — names are case-insensitive \
+                 RFC 7230 tokens (letters, digits, and !#$%&'*+-.^_`|~); remove \
+                 spaces and other separators"
+            ),
+        });
+    }
+    if name.len() > MAX_HEADER_NAME_LEN {
+        return Some(ValidationError::InvalidFieldValue {
+            field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
+            reason: format!(
+                "header name is {} bytes — HTTP header names are limited to \
+                 {MAX_HEADER_NAME_LEN} bytes; use a shorter name",
+                name.len()
+            ),
+        });
+    }
+    None
 }
 
 /// Field-content bytes `http::HeaderValue::from_str` accepts: HTAB, or any
@@ -459,16 +497,8 @@ fn validate_http_hook_headers(
 ) -> Option<ValidationError> {
     let mut seen: Vec<String> = Vec::new();
     for (j, header) in h.headers.iter().enumerate() {
-        if !is_valid_header_name(&header.name) {
-            return Some(ValidationError::InvalidFieldValue {
-                field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
-                reason: format!(
-                    "{:?} is not a valid HTTP header name — names are case-insensitive \
-                     RFC 7230 tokens (letters, digits, and !#$%&'*+-.^_`|~); remove \
-                     spaces and other separators",
-                    header.name
-                ),
-            });
+        if let Some(e) = header_name_error(&header.name, list, i, j) {
+            return Some(e);
         }
         if !is_valid_header_value(&header.value) {
             return Some(ValidationError::InvalidFieldValue {
