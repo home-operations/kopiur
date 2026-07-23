@@ -591,14 +591,33 @@ impl ScanOwner<'_> {
 }
 
 /// The kopia snapshot ids of scheduled/manual/adopted `Snapshot` CRs that resolve
-/// to this repository CR (via `status.resolved.repository` or the owner reference —
-/// the same derivation `Restore` and the kubectl plugin use). These are this
-/// cluster's *produced* (or adopted-into-managed) snapshots: a rescan must never
-/// duplicate them as discovered rows. Origin uses
-/// [`crate::snapshot::resolve_origin`]'s precedence (status, then label, default
-/// manual) — NOT the label alone, because a bare `kubectl create` manual Snapshot
-/// may never carry the origin label. Pure.
-pub fn produced_ids_for(owner: ScanOwner<'_>, snapshots: &[Snapshot]) -> BTreeSet<String> {
+/// to this repository CR. These are this cluster's *produced* (or
+/// adopted-into-managed) snapshots: a rescan must never duplicate them as
+/// discovered rows. Origin uses [`crate::snapshot::resolve_origin`]'s precedence
+/// (status, then label, default manual) — NOT the label alone, because a bare
+/// `kubectl create` manual Snapshot may never carry the origin label. Pure.
+///
+/// A row contributes its id through either of two arms:
+/// - **status arm**: `status.resolved.repository` (or the owner reference — the
+///   same derivation `Restore` and the kubectl plugin use) matches `owner`, and
+///   `status.snapshot.kopiaSnapshotID` is set;
+/// - **label arm**: the controller-stamped `REPOSITORY_UID_LABEL` equals this
+///   repository's live `repo_uid` and `SNAPSHOT_ID_LABEL` is present. Adopted
+///   rows carry both labels from CREATION (`adoption::build_adopted_snapshot`)
+///   but resolve no repository ref until their status patch lands — without
+///   this arm, a scan in that window re-materializes a just-adopted id as a
+///   discovered row, which the next adoption pass deletes again (churn).
+///
+/// Trust model: labels are user-forgeable, but this arm can only SUPPRESS a
+/// discovered row for the forged id — it never deletes anything and never
+/// grants GFS participation (`snapshot_policy::retention_view` still requires
+/// controller-written `status.snapshot` provenance). The status arm remains the
+/// primary classifier once status lands.
+pub fn produced_ids_for(
+    owner: ScanOwner<'_>,
+    repo_uid: &str,
+    snapshots: &[Snapshot],
+) -> BTreeSet<String> {
     use kopiur_api::Origin;
     snapshots
         .iter()
@@ -607,30 +626,42 @@ pub fn produced_ids_for(owner: ScanOwner<'_>, snapshots: &[Snapshot]) -> BTreeSe
             Origin::Scheduled | Origin::Manual | Origin::Adopted => true,
             Origin::Discovered => false,
         })
-        .filter(|s| {
-            let Some(rref) = repository_ref_for(s) else {
-                return false;
-            };
-            if rref.kind != owner.kind() {
-                return false;
-            }
-            match owner {
-                ScanOwner::Repository { name, namespace } => {
-                    let ref_ns = rref
-                        .namespace
-                        .clone()
-                        .or_else(|| s.namespace())
-                        .unwrap_or_default();
-                    rref.name == name && ref_ns == namespace
-                }
-                ScanOwner::ClusterRepository { name } => rref.name == name,
-            }
-        })
         .filter_map(|s| {
-            s.status
-                .as_ref()
-                .and_then(|st| st.snapshot.as_ref())
-                .map(|i| i.kopia_snapshot_id.clone())
+            let status_arm = || {
+                let rref = repository_ref_for(s)?;
+                if rref.kind != owner.kind() {
+                    return None;
+                }
+                let matches = match owner {
+                    ScanOwner::Repository { name, namespace } => {
+                        let ref_ns = rref
+                            .namespace
+                            .clone()
+                            .or_else(|| s.namespace())
+                            .unwrap_or_default();
+                        rref.name == name && ref_ns == namespace
+                    }
+                    ScanOwner::ClusterRepository { name } => rref.name == name,
+                };
+                if !matches {
+                    return None;
+                }
+                s.status
+                    .as_ref()
+                    .and_then(|st| st.snapshot.as_ref())
+                    .map(|i| i.kopia_snapshot_id.clone())
+            };
+            let label_arm = || {
+                let labels = s.labels();
+                if labels.get(REPOSITORY_UID_LABEL).map(String::as_str) != Some(repo_uid) {
+                    return None;
+                }
+                labels
+                    .get(SNAPSHOT_ID_LABEL)
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+            };
+            status_arm().or_else(label_arm)
         })
         .collect()
 }
@@ -941,7 +972,7 @@ pub async fn scan(
     let all_api: Api<Snapshot> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
     let all_snapshots = all_api.list(&ListParams::default()).await?.items;
     let rows = rows_for(repo_uid, &all_snapshots);
-    let produced_ids = produced_ids_for(owner, &all_snapshots);
+    let produced_ids = produced_ids_for(owner, repo_uid, &all_snapshots);
 
     // Identity-aware placement pass over the FULL listing, BEFORE plan_catalog (see
     // the module docs): thin IO here (one cached `Namespace` GET per distinct
@@ -1176,6 +1207,50 @@ mod tests {
         );
         assert_eq!(ids(&plan), vec!["bbb"]);
         assert!(plan.expire.is_empty());
+    }
+
+    #[test]
+    fn plan_catalog_steady_state_is_idempotent() {
+        // Converged state: rows exactly mirror the keep-set (retain caps
+        // applied), produced ids stable, complete listing → a re-scan must plan
+        // NOTHING. Any create or expire here would repeat every refresh
+        // interval as visible CR churn.
+        let listing = vec![
+            entry("a1", ("u", "a", "/p"), t(30)),
+            entry("a2", ("u", "a", "/p"), t(20)),
+            entry("a3", ("u", "a", "/p"), t(10)),
+            entry("ours", ("app", "ns", "/data"), t(5)),
+        ];
+        let produced: BTreeSet<String> = ["ours".to_string()].into();
+        let retain = CatalogRetain {
+            per_identity: Some(2),
+            max_age_days: None,
+        };
+        // The materialized state a prior scan under this config produced:
+        // the 2 newest of identity `a` (a1 over the cap, `ours` produced).
+        let rows = vec![
+            row("r-a3", "a3", Some(t(10))),
+            row("r-a2", "a2", Some(t(20))),
+        ];
+        let plan = plan_catalog(
+            &rows,
+            &produced,
+            &BTreeSet::new(),
+            &listing,
+            false,
+            Some(&retain),
+            Utc::now(),
+        );
+        assert!(
+            plan.create.is_empty(),
+            "steady state creates nothing: {:?}",
+            ids(&plan)
+        );
+        assert!(
+            plan.expire.is_empty(),
+            "steady state expires nothing: {:?}",
+            expired(&plan)
+        );
     }
 
     #[test]
@@ -2130,11 +2205,14 @@ mod tests {
             v
         };
         // The produced snapshots resolve to Repository/repo in their own namespace.
+        // Passing the repo uid the DISCOVERED rows carry is deliberate: the
+        // origin filter must keep those rows out of the label arm.
         let ids = produced_ids_for(
             ScanOwner::Repository {
                 name: "repo",
                 namespace: "ns1",
             },
+            "uid-1",
             &all,
         );
         assert_eq!(ids, ["ccc".to_string(), "ddd".to_string()].into());
@@ -2145,11 +2223,75 @@ mod tests {
                     name: "repo",
                     namespace: "other-ns",
                 },
+                "uid-1",
                 &all,
             )
             .is_empty()
         );
-        assert!(produced_ids_for(ScanOwner::ClusterRepository { name: "repo" }, &all).is_empty());
+        assert!(
+            produced_ids_for(ScanOwner::ClusterRepository { name: "repo" }, "uid-1", &all)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn produced_ids_label_fallback_excludes_statusless_adopted_rows() {
+        // A freshly-created adopted row (adoption inv. 4) has NO status yet —
+        // its repository pin and kopia id arrive via a later status patch — but
+        // it DOES carry the dedup labels from creation. The label arm must
+        // contribute its id, or a scan in that window re-materializes a
+        // discovered row for a just-adopted id (create/expire churn).
+        fn labeled(name: &str, origin: &str, labels: &[(&str, &str)]) -> Snapshot {
+            let mut s = Snapshot::new(
+                name,
+                serde_json::from_value::<kopiur_api::snapshot::SnapshotSpec>(serde_json::json!({}))
+                    .unwrap(),
+            );
+            let mut map = BTreeMap::new();
+            map.insert(ORIGIN_LABEL.to_string(), origin.to_string());
+            for (k, v) in labels {
+                map.insert((*k).to_string(), (*v).to_string());
+            }
+            s.metadata.namespace = Some("apps".to_string());
+            s.metadata.labels = Some(map);
+            s
+        }
+
+        let owner = ScanOwner::Repository {
+            name: "repo",
+            namespace: "apps",
+        };
+        // Status-less adopted row of THIS repo → contributes via the label arm.
+        let adopted = labeled(
+            "pol-adopted-aaa",
+            "adopted",
+            &[(REPOSITORY_UID_LABEL, "uid-1"), (SNAPSHOT_ID_LABEL, "aaa")],
+        );
+        // Same shape but ANOTHER repository's uid → not ours, no contribution.
+        let foreign_repo = labeled(
+            "pol-adopted-bbb",
+            "adopted",
+            &[(REPOSITORY_UID_LABEL, "uid-2"), (SNAPSHOT_ID_LABEL, "bbb")],
+        );
+        // Discovered rows never count as produced, uid label or not.
+        let discovered = labeled(
+            "repo-disc-ccc",
+            "discovered",
+            &[(REPOSITORY_UID_LABEL, "uid-1"), (SNAPSHOT_ID_LABEL, "ccc")],
+        );
+        // Adopted-labeled but missing the snapshot-id label → nothing to contribute.
+        let no_id = labeled(
+            "pol-adopted-noid",
+            "adopted",
+            &[(REPOSITORY_UID_LABEL, "uid-1")],
+        );
+        let all = vec![adopted, foreign_repo, discovered, no_id];
+        let ids = produced_ids_for(owner, "uid-1", &all);
+        assert_eq!(
+            ids,
+            ["aaa".to_string()].into(),
+            "only the status-less adopted row of THIS repo contributes"
+        );
     }
 
     #[test]
