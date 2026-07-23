@@ -1283,7 +1283,7 @@ mod tests {
             CredsEnvFrom::plain("kopia-password"),
             CredsEnvFrom::plain("s3-creds"),
         ];
-        i.result_configmap = Some("repo-bootstrap");
+        i.result_configmap = Some("repo-discovery");
 
         let job = build_job(&i).unwrap();
         let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
@@ -1300,7 +1300,7 @@ mod tests {
             .iter()
             .find(|e| e.name == RESULT_CONFIGMAP_ENV)
             .expect("result configmap env present");
-        assert_eq!(result_env.value.as_deref(), Some("repo-bootstrap"));
+        assert_eq!(result_env.value.as_deref(), Some("repo-discovery"));
     }
 
     #[test]

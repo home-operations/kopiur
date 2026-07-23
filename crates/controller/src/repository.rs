@@ -743,7 +743,10 @@ async fn bootstrap_via_mover(
     api: &Api<Repository>,
     backend: &Backend,
 ) -> Result<Action> {
-    let job_name = format!("{name}-bootstrap");
+    // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
+    // repository, but every later run of this Job is a catalog re-scan — the
+    // name follows the recurring purpose users actually see.
+    let job_name = format!("{name}-discovery");
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
@@ -940,6 +943,23 @@ async fn bootstrap_via_mover(
         .await?;
         ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
+    }
+
+    // Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` rename: the
+    // Job name is the lookup key, so a previous operator version's Job is
+    // invisible to the match above. Reap it here — reached only when we are
+    // about to create the renamed Job — so two movers never run against this
+    // repository concurrently mid-upgrade. (A finished old Job is TTL-reaped
+    // regardless; this covers the in-flight one. Removable once no supported
+    // upgrade path predates the rename.)
+    let legacy_job = format!("{name}-bootstrap");
+    if job_api.get_opt(&legacy_job).await?.is_some() {
+        tracing::info!(
+            repository = %name,
+            job = %legacy_job,
+            "reaping the pre-rename bootstrap Job before creating its discovery successor"
+        );
+        io::delete_mover_run(&ctx.client, namespace, &legacy_job).await?;
     }
 
     // Whether we are about to launch a Job BECAUSE OF a pending scan-request

@@ -202,7 +202,7 @@ async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
 // `probe_due` was derived from `status.health.lastProbeAt`, but the finished-Job
 // branch deleted the Job and returned BEFORE `finalize_*` — the only writer of
 // `lastProbeAt`. So the gate destroyed every Job whose completion would have
-// cleared it: the `<name>-bootstrap` Job was recreated every ~15-25s forever,
+// cleared it: the `<name>-discovery` Job was recreated every ~15-25s forever,
 // `status.health` stayed permanently empty, and `BackendReachable` was never
 // written. Only Job-based backends (object stores, server, volume-backed
 // filesystem) were affected; bare-path filesystem repos connect in-process.
@@ -224,10 +224,10 @@ async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
 const CHURN_PROBE_INTERVAL: &str = "10m";
 const CHURN_PROBE_INTERVAL_SECS: u64 = 600;
 
-/// How long the `<name>-bootstrap` Job is watched, measured from `Ready`.
+/// How long the `<name>-discovery` Job is watched, measured from `Ready`.
 const CHURN_WINDOW: Duration = Duration::from_secs(180);
 
-/// Distinct `<name>-bootstrap` Job UIDs a CORRECT operator may produce inside
+/// Distinct `<name>-discovery` Job UIDs a CORRECT operator may produce inside
 /// [`CHURN_WINDOW`]:
 ///
 /// ```text
@@ -252,7 +252,7 @@ fn churn_health_spec() -> serde_json::Value {
     })
 }
 
-/// Sample the `<name>-bootstrap` Job's `metadata.uid` every [`poll_interval`] for
+/// Sample the `<name>-discovery` Job's `metadata.uid` every [`poll_interval`] for
 /// `window`, returning every DISTINCT uid seen.
 ///
 /// A missing Job (the gap between a delete and the next create) and a transient API
@@ -358,7 +358,7 @@ async fn assert_probe_finalizes_without_churn(
 }
 
 /// #273: a probe-enabled `Repository` on an object store must FINALIZE its probe
-/// instead of recycling the `<name>-bootstrap` Job forever.
+/// instead of recycling the `<name>-discovery` Job forever.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn probe_finalizes_instead_of_recreating_the_bootstrap_job() {
@@ -372,7 +372,7 @@ async fn probe_finalizes_instead_of_recreating_the_bootstrap_job() {
     let client = world.client().clone();
 
     let name = "e2e-probe-churn";
-    let job_name = format!("{name}-bootstrap");
+    let job_name = format!("{name}-discovery");
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
 
@@ -424,7 +424,7 @@ async fn cluster_repository_probe_finalizes_instead_of_recreating_the_bootstrap_
     let client = world.client().clone();
 
     let name = "e2e-probe-churn-crepo";
-    let job_name = format!("{name}-bootstrap");
+    let job_name = format!("{name}-discovery");
     let repos: Api<ClusterRepository> = Api::all(client.clone());
     // A ClusterRepository's bootstrap Job lands in the credential Secret's namespace,
     // which the spec below pins to E2E_NAMESPACE.

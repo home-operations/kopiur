@@ -147,10 +147,10 @@ pub struct CatalogBounds {
     pub retain: Option<CatalogRetain>,
     /// Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
     /// current (re-list snapshots; for object-store / volume-backed repos this recycles
-    /// the bootstrap Job every `refreshInterval`). **Off by default** — the repository
-    /// still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup
-    /// failure, but does not re-run on a timer. Enable it if you rely on discovered
-    /// snapshots reflecting changes made outside this operator.
+    /// the `<name>-discovery` mover Job every `refreshInterval`). **Off by default** —
+    /// the repository still bootstraps once, re-bootstraps on a spec change, and
+    /// re-probes on a backup failure, but does not re-run on a timer. Enable it if you
+    /// rely on discovered snapshots reflecting changes made outside this operator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub periodic_refresh: bool,
     /// How often to re-scan when `periodicRefresh: true` (Go-style duration; minimum

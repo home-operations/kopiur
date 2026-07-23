@@ -137,7 +137,7 @@ backend) before you act.
 /// note | How a probe run is tracked
 
 On an object-store, server, or volume-backed backend a probe re-connects by
-running the repository's `<name>-bootstrap` mover Job, so kopiur tracks each run
+running the repository's `<name>-discovery` mover Job, so kopiur tracks each run
 across two reconciles:
 
 - `status.health.probeAttemptAt` is stamped when the Job is **launched** and

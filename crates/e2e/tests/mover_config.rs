@@ -59,10 +59,10 @@ async fn mover_defaults_inherited_by_bootstrap_and_backup_with_recipe_override()
         .await
         .expect("create Repository with moverDefaults");
 
-    // (1) BOOTSTRAP GAP FIX: the connect/create Job (`<repo>-bootstrap`) inherits the
+    // (1) BOOTSTRAP GAP FIX: the connect/create Job (`<repo>-discovery`) inherits the
     //     repository's moverDefaults. Before ADR-0004 the bootstrap path used a bare
     //     hardened context and ignored moverDefaults entirely.
-    let boot = wait_for_job(&jobs, &format!("{repo}-bootstrap")).await;
+    let boot = wait_for_job(&jobs, &format!("{repo}-discovery")).await;
     assert_eq!(
         job_pod_sc(&boot).and_then(|sc| sc.fs_group),
         Some(65532),
