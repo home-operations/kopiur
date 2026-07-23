@@ -44,6 +44,11 @@ pub enum Need {
     /// A running WebDAV server (basic auth) and the WebDAV credentials Secret.
     /// Implies [`Need::Filesystem`] for a backup source PVC.
     WebDav,
+    /// A running HTTP header-echo receiver (`mendhak/http-https-echo`) that logs
+    /// every request's headers as JSON — the in-cluster target for the
+    /// `httpRequest`-hook headers e2e (#290). No credentials Secret (the echo
+    /// needs none); implies [`Need::Filesystem`] for a backup source PVC.
+    HttpEcho,
     /// The rclone credentials Secret (an `rclone.conf` whose `s3` remote points at
     /// the in-cluster MinIO). Implies [`Need::Minio`].
     Rclone,
@@ -67,6 +72,7 @@ pub struct World {
     projection_ns: OnceCell<()>,
     sftp: OnceCell<()>,
     webdav: OnceCell<()>,
+    http_echo: OnceCell<()>,
     rclone: OnceCell<()>,
     /// Holds the nfs `Service` ClusterIP once provisioned — the in-tree NFS
     /// volume is mounted by the kubelet in the node's host netns, which cannot
@@ -88,6 +94,7 @@ impl World {
             projection_ns: OnceCell::new(),
             sftp: OnceCell::new(),
             webdav: OnceCell::new(),
+            http_echo: OnceCell::new(),
             rclone: OnceCell::new(),
             nfs: OnceCell::new(),
             error_source: OnceCell::new(),
@@ -138,6 +145,11 @@ impl World {
                 }
                 Need::WebDav => {
                     self.webdav.get_or_try_init(|| self.ensure_webdav()).await?;
+                }
+                Need::HttpEcho => {
+                    self.http_echo
+                        .get_or_try_init(|| self.ensure_http_echo())
+                        .await?;
                 }
                 Need::Rclone => {
                     self.rclone.get_or_try_init(|| self.ensure_rclone()).await?;
@@ -358,6 +370,22 @@ impl World {
         ];
         apply_all(&self.client, &fixtures).await?;
         wait::deployment_ready(&self.client, consts::OPERATOR_NS, "webdav").await
+    }
+
+    /// Stand up the in-cluster HTTP header-echo receiver (`mendhak/http-https-echo`)
+    /// the `httpRequest`-hook headers e2e (#290) posts to. It logs every request's
+    /// headers as JSON on stdout, so the scenario proves a hook header arrived by
+    /// reading the pod logs. Needs a backup source (the Snapshot whose post-hook
+    /// fires), so it depends on the filesystem fixtures. No credentials Secret —
+    /// the echo authenticates nothing.
+    async fn ensure_http_echo(&self) -> Result<()> {
+        self.fs.get_or_try_init(|| self.ensure_filesystem()).await?;
+        let fixtures: Vec<Fixture> = vec![
+            builders::http_echo_deployment(consts::OPERATOR_NS).into(),
+            builders::http_echo_service(consts::OPERATOR_NS).into(),
+        ];
+        apply_all(&self.client, &fixtures).await?;
+        wait::deployment_ready(&self.client, consts::OPERATOR_NS, "http-echo").await
     }
 
     /// Seed the rclone credentials Secret (an `rclone.conf` whose `s3` remote

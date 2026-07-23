@@ -81,6 +81,10 @@ preload minio/mc:latest
 # atmoz/sftp:debian (OpenSSH 9.x) — NOT :alpine (OpenSSH 10.2 hangs kopia's go-ssh).
 preload atmoz/sftp:debian
 preload bytemark/webdav:2.4
+# HTTP header-echo receiver for the httpRequest-hook headers e2e (#290, mirror
+# crates/e2e/src/consts.rs HTTP_ECHO_IMAGE). Preloaded so the http-echo Deployment
+# doesn't miss its 180s readiness window on GitHub runners pulling in-cluster.
+preload mendhak/http-https-echo:37
 # Userspace NFS-Ganesha (digest-pinned; mirror crates/e2e/src/consts.rs NFS_IMAGE).
 # Preloading avoids an in-cluster pull that previously made the nfs Deployment miss
 # its 180s readiness window on GitHub runners.

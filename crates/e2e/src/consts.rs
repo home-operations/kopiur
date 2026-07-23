@@ -416,6 +416,20 @@ pub const KEY_WEBDAV_USERNAME: &str = "KOPIA_WEBDAV_USERNAME";
 /// Env key the mover/kopia read the WebDAV password from.
 pub const KEY_WEBDAV_PASSWORD: &str = "KOPIA_WEBDAV_PASSWORD";
 
+// --- HTTP header-echo receiver (hooks e2e, #290) -------------------------------
+/// Echo server that logs every request (method, path, headers) as one JSON
+/// object on stdout — the only way to PROVE a hook header arrived. The WebDAV
+/// fixture's Apache mod_dav cannot: the filesystem DAV provider does not persist
+/// a PUT's `Content-Type` (GET re-derives it from the extension), and its access
+/// log omits arbitrary request headers. Pinned tag verified present on the
+/// registry (`docker manifest inspect mendhak/http-https-echo:37`); the echo
+/// answers 200 on every path, so a mover/controller POST to any path is logged.
+pub const HTTP_ECHO_IMAGE: &str = "mendhak/http-https-echo:37";
+/// In-cluster URL the `httpRequest` hook posts to (Service `http-echo`, HTTP
+/// port 8080). Host is composed the same way as [`WEBDAV_URL`] etc. —
+/// `<svc>.kopiur-e2e.svc.cluster.local`.
+pub const HTTP_ECHO_URL: &str = "http://http-echo.kopiur-e2e.svc.cluster.local:8080/kopiur-hook";
+
 // --- rclone backend (rclone `s3` remote → the same in-cluster MinIO) -----------
 /// Secret holding the rclone config the mover materializes (+ repo password).
 pub const SECRET_RCLONE_CREDS: &str = "kopia-rclone-creds";
