@@ -1,0 +1,15 @@
+suite: servicemonitor
+templates:
+  - servicemonitor.tpl
+tests:
+  - it: renders nothing when disabled
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: honors metric labels so alerts report the CR namespace
+    set:
+      monitoring.serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].honorLabels
+          value: true
