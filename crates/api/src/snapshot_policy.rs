@@ -599,6 +599,7 @@ impl Hook {
     ///     url: "https://example/notify".into(),
     ///     method: None,
     ///     body: None,
+    ///     headers: Vec::new(),
     ///     timeout: None,
     ///     continue_on_failure: false,
     /// });
@@ -646,6 +647,16 @@ pub struct RunJobHook {
     pub continue_on_failure: bool,
 }
 
+/// One HTTP header sent with an `httpRequest` hook.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpHeader {
+    /// Header name (case-insensitive; RFC 7230 token, e.g. `Content-Type`).
+    pub name: String,
+    /// Header value.
+    pub value: String,
+}
+
 /// A hook that issues an HTTP request for cross-system orchestration.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -658,6 +669,9 @@ pub struct HttpRequestHook {
     /// Optional request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Additional request headers (e.g. `Content-Type: application/json`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpHeader>,
     /// Max time to wait for the response (Go duration string).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
@@ -1234,10 +1248,26 @@ runJob:
 
     #[test]
     fn hook_http_request_variant() {
-        let hook: Hook = from_yaml("httpRequest:\n  url: https://example/notify\n  method: POST\n");
+        let hook: Hook = from_yaml(
+            "httpRequest:\n  url: https://example/notify\n  method: POST\n  headers:\n    - name: Content-Type\n      value: application/json\n    - name: X-Api-Key\n      value: sekrit\n",
+        );
         assert_eq!(hook.kind_str(), "HttpRequest");
-        let json = serde_json::to_value(&hook).unwrap();
-        assert_eq!(json["httpRequest"]["url"], "https://example/notify");
+        let v = serde_json::to_value(&hook).unwrap();
+        assert_eq!(v["httpRequest"]["url"], "https://example/notify");
+        assert_eq!(
+            v.pointer("/httpRequest/headers/0/name")
+                .and_then(|x| x.as_str()),
+            Some("Content-Type")
+        );
+        assert_eq!(
+            v.pointer("/httpRequest/headers/1/value")
+                .and_then(|x| x.as_str()),
+            Some("sekrit")
+        );
+        // Omitted headers stay off the wire (skip_serializing_if).
+        let bare: Hook = from_yaml("httpRequest:\n  url: https://example/notify\n");
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.pointer("/httpRequest/headers").is_none());
     }
 
     #[test]

@@ -1,0 +1,114 @@
+# Semantic tests for the kopiur PrometheusRule (issue #280).
+#
+# helm-unittest pins the rendered TEXT of these rules; this file pins their
+# BEHAVIOR — which alerts fire, with which labels, for a given time series.
+# Scenario 1 is THE #280 regression and FAILS against the pre-fix expr.
+#
+# promtool compares BOTH labels and annotations for every firing alert, so the
+# firing scenarios must spell out exp_annotations verbatim (the rendered
+# summary/description). Silent scenarios (exp_alerts: []) need neither.
+rule_files:
+  - kopiur-rules.yaml
+evaluation_interval: 1m
+tests:
+  # 1. THE #280 regression: an old retained Failed Snapshot CR, but the policy's
+  #    latest completed backup succeeded → NO alerts. (The pre-fix expr fired
+  #    KopiurSnapshotFailed forever here.)
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_resource_phase{kind="Snapshot", namespace="apps", name="daily-old", phase="Failed", policy="daily"}'
+        values: "1x60"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily"}'
+        values: "1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurSnapshotFailed
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KopiurLastBackupFailed
+        exp_alerts: []
+  # 2. Latest backup failed → BOTH alerts fire, labeled with the CR namespace.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_resource_phase{kind="Snapshot", namespace="apps", name="daily-new", phase="Failed", policy="daily"}'
+        values: "1x60"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurSnapshotFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              name: daily-new
+              policy: daily
+              severity: warning
+            exp_annotations:
+              summary: "Snapshot apps/daily-new failed"
+              description: "Snapshot apps/daily-new is Failed and its policy has not completed a newer successful backup."
+      - eval_time: 30m
+        alertname: KopiurLastBackupFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              policy: daily
+              severity: warning
+            exp_annotations:
+              summary: "Latest backup for apps/daily failed"
+              description: "The most recent completed backup for SnapshotPolicy apps/daily failed. Resolves automatically once a newer backup succeeds."
+  # 3. A Failed Snapshot with no policyRef has no recovery signal → still fires.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_resource_phase{kind="Snapshot", namespace="apps", name="adhoc", phase="Failed"}'
+        values: "1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurSnapshotFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              name: adhoc
+              severity: warning
+            exp_annotations:
+              summary: "Snapshot apps/adhoc failed"
+              description: "Snapshot apps/adhoc is Failed and its policy has not completed a newer successful backup."
+  # 4. Recovery actually RESOLVES: failed → success mid-stream.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_resource_phase{kind="Snapshot", namespace="apps", name="daily-x", phase="Failed", policy="daily"}'
+        values: "1x120"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily"}'
+        values: "0x59 1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurSnapshotFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              name: daily-x
+              policy: daily
+              severity: warning
+            exp_annotations:
+              summary: "Snapshot apps/daily-x failed"
+              description: "Snapshot apps/daily-x is Failed and its policy has not completed a newer successful backup."
+      - eval_time: 90m
+        alertname: KopiurSnapshotFailed
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: KopiurLastBackupFailed
+        exp_alerts: []
+  # 5. Overlapping scrape targets disagree (a deposed leader's final samples,
+  #    or a rolling update): stale instance says 0, fresh instance says 1 →
+  #    the max-by aggregation trusts the recovered value and stays silent.
+  #    FAILS against an unaggregated `kopiur_snapshotpolicy_last_backup_success
+  #    == 0` expr, which pages from the stale series alone (Greptile P1, PR #296).
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-old", pod="kopiur-a"}'
+        values: "0x60"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-new", pod="kopiur-b"}'
+        values: "1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurLastBackupFailed
+        exp_alerts: []

@@ -9,7 +9,7 @@ use crate::repository::{RepositoryHealthSpec, RepositorySpec};
 use crate::repository_replication::RepositoryReplicationSpec;
 use crate::restore::{RestoreSource, RestoreSpec, RestoreTarget};
 use crate::snapshot::{Origin, SnapshotSpec};
-use crate::snapshot_policy::{Hook, SnapshotPolicySpec, Source};
+use crate::snapshot_policy::{Hook, HttpHeader, SnapshotPolicySpec, Source};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -911,6 +911,7 @@ fn hooks_are_validated_at_admission_with_actionable_messages() {
             url: "notifier.tools/fire".into(),
             method: Some("FETCH".into()),
             body: None,
+            headers: Vec::new(),
             timeout: Some("soon".into()),
             continue_on_failure: false,
         })],
@@ -936,11 +937,147 @@ fn hooks_are_validated_at_admission_with_actionable_messages() {
             url: "https://notifier.tools.svc/fire".into(),
             method: Some("post".into()),
             body: Some("done".into()),
+            headers: Vec::new(),
             timeout: Some("30s".into()),
             continue_on_failure: true,
         })],
     });
     assert!(validate_backup_config(&spec).is_empty());
+}
+
+/// Build a `SnapshotPolicySpec` whose single `afterSnapshot` hook is an
+/// `httpRequest` with the given URL and headers — the fixture for the header
+/// admission checks below.
+fn http_hook_spec(url: &str, headers: Vec<HttpHeader>) -> SnapshotPolicySpec {
+    use crate::snapshot_policy::{Hooks, HttpRequestHook};
+    let mut spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    spec.hooks = Some(Hooks {
+        before_snapshot: vec![],
+        after_snapshot: vec![Hook::HttpRequest(HttpRequestHook {
+            url: url.into(),
+            method: None,
+            body: None,
+            headers,
+            timeout: None,
+            continue_on_failure: false,
+        })],
+    });
+    spec
+}
+
+#[test]
+fn http_hook_headers_validate() {
+    let hdr = |n: &str, v: &str| HttpHeader {
+        name: n.into(),
+        value: v.into(),
+    };
+
+    let ok = http_hook_spec(
+        "https://example/notify",
+        vec![hdr("Content-Type", "application/json")],
+    );
+    assert!(validate_backup_config(&ok).is_empty());
+
+    let bad_name = http_hook_spec("https://example/notify", vec![hdr("Bad Header", "x")]); // space = not a token
+    let errs = validate_backup_config(&bad_name);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("headers[0].name")),
+        "{errs:?}"
+    );
+
+    let bad_value = http_hook_spec(
+        "https://example/notify",
+        vec![hdr("X-Api-Key", "line1\nline2")],
+    ); // CR/LF injection
+    assert!(!validate_backup_config(&bad_value).is_empty());
+
+    let dup = http_hook_spec(
+        "https://example/notify",
+        vec![hdr("X-K", "a"), hdr("x-k", "b")],
+    ); // case-insensitive dup
+    assert!(!validate_backup_config(&dup).is_empty());
+
+    // Allowed edges — pin the mirror guarantee's boundaries so a later tightening
+    // of the validator can't silently start rejecting values `http` accepts.
+
+    // (a) A HTAB inside a value is valid field-content, not a control char.
+    let tab_value = http_hook_spec("https://example/notify", vec![hdr("X-Tab", "a\tb")]);
+    assert!(
+        validate_backup_config(&tab_value).is_empty(),
+        "a tab in a header value must pass: {:?}",
+        validate_backup_config(&tab_value)
+    );
+
+    // (b) Non-ASCII UTF-8 bytes are all >= 0x20 and never DEL, so they pass —
+    // `HeaderValue::from_str` accepts them too.
+    let utf8_value = http_hook_spec("https://example/notify", vec![hdr("X-Utf8", "naïve-ütf8")]);
+    assert!(
+        validate_backup_config(&utf8_value).is_empty(),
+        "a non-ASCII UTF-8 header value must pass: {:?}",
+        validate_backup_config(&utf8_value)
+    );
+
+    // (c) An empty header name is not a token and must be rejected.
+    let empty_name = http_hook_spec("https://example/notify", vec![hdr("", "x")]);
+    let errs = validate_backup_config(&empty_name);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("headers[0].name")),
+        "an empty header name must be rejected: {errs:?}"
+    );
+
+    // (d) The header-name length cap mirrors `http`'s MAX_HEADER_NAME_LEN exactly:
+    // 65535 all-token bytes pass; 65536 are rejected at admission (not at runtime).
+    let max_name = "x".repeat(65_535);
+    let at_cap = http_hook_spec("https://example/notify", vec![hdr(&max_name, "v")]);
+    assert!(
+        validate_backup_config(&at_cap).is_empty(),
+        "a 65535-byte header name must pass: {:?}",
+        validate_backup_config(&at_cap)
+    );
+    let over_name = "x".repeat(65_536);
+    let over_cap = http_hook_spec("https://example/notify", vec![hdr(&over_name, "v")]);
+    let errs = validate_backup_config(&over_cap);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("headers[0].name")),
+        "a 65536-byte header name must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn http_hook_authorization_header_conflicts_with_url_userinfo() {
+    let hdr = |n: &str, v: &str| HttpHeader {
+        name: n.into(),
+        value: v.into(),
+    };
+
+    let both = http_hook_spec(
+        "https://user:pass@example/notify",
+        vec![hdr("Authorization", "Bearer t")],
+    );
+    let errs = validate_backup_config(&both);
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().to_lowercase().contains("authorization")),
+        "{errs:?}"
+    );
+
+    // Either auth source alone is fine.
+    assert!(
+        validate_backup_config(&http_hook_spec("https://user:pass@example/notify", vec![]))
+            .is_empty()
+    );
+    assert!(
+        validate_backup_config(&http_hook_spec(
+            "https://example/notify",
+            vec![hdr("Authorization", "Bearer t")]
+        ))
+        .is_empty()
+    );
 }
 
 #[test]

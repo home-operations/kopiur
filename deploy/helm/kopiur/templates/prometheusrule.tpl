@@ -51,6 +51,24 @@ spec:
           annotations:
             summary: "No recent successful backup for {{`{{ $labels.namespace }}/{{ $labels.policy }}`}}"
             description: "Either the last successful backup was over {{ div .Values.monitoring.prometheusRule.backupStaleAfterSeconds 3600 }}h ago, or SnapshotPolicy {{`{{ $labels.namespace }}/{{ $labels.policy }}`}} has never succeeded (or its Succeeded Snapshot CRs were all deleted) and is currently failing."
+        - alert: KopiurLastBackupFailed
+          # Policy-level, recovery-aware (#280): fires while a SnapshotPolicy's
+          # MOST RECENT completed backup failed, and auto-resolves the moment a
+          # newer backup succeeds (VolSync-style). Store-backed: the series
+          # exists only while the policy's terminal Snapshot CRs exist —
+          # KopiurBackupStale covers the all-CRs-pruned / never-succeeded case.
+          # max-by aggregates across scrape targets: only the leader emits the
+          # gauge, but pod replacement can briefly overlap two targets (or leave
+          # a dead pod's final samples until Prometheus drops it), and without
+          # aggregation those instance-labeled series would churn the alert's
+          # identity or hold a stale value against a fresh one.
+          expr: max by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Latest backup for {{`{{ $labels.namespace }}/{{ $labels.policy }}`}} failed"
+            description: "The most recent completed backup for SnapshotPolicy {{`{{ $labels.namespace }}/{{ $labels.policy }}`}} failed. Resolves automatically once a newer backup succeeds."
         - alert: KopiurRepositoryNotReady
           # Active-only emission means kopiur_resource_phase never carries a 0-valued
           # series, so `== 1` is redundant here; left in place because max-by over a
@@ -64,13 +82,22 @@ spec:
             summary: "Repository {{`{{ $labels.namespace }}/{{ $labels.name }}`}} is {{`{{ $labels.phase }}`}}"
             description: "A kopiur repository has been Degraded/Failed for 15m; backups to it will not run."
         - alert: KopiurSnapshotFailed
-          expr: max by (namespace, name) (kopiur_resource_phase{kind="Snapshot", phase="Failed"}) == 1
+          # Per-CR, gated on recovery (#280): failed Snapshot CRs are retained
+          # by design, so an ungated phase match would page forever for CRs
+          # whose policy has long since recovered. The `unless` drops every
+          # failed CR whose policy's LATEST completed backup succeeded.
+          # Snapshots without a policyRef have no `policy` label, never match
+          # the health series, and so keep the always-fire behavior — for an
+          # ad-hoc backup there is no "newer success" to defer to.
+          expr: >-
+            max by (namespace, name, policy) (kopiur_resource_phase{kind="Snapshot", phase="Failed"}) == 1
+            unless on (namespace, policy) (kopiur_snapshotpolicy_last_backup_success == 1)
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: "Snapshot {{`{{ $labels.namespace }}/{{ $labels.name }}`}} failed"
-            description: "A Snapshot CR has been in phase=Failed for 10m."
+            description: "Snapshot {{`{{ $labels.namespace }}/{{ $labels.name }}`}} is Failed and its policy has not completed a newer successful backup."
         - alert: KopiurRestoreFailed
           expr: max by (namespace, name) (kopiur_resource_phase{kind="Restore", phase="Failed"}) == 1
           for: 10m

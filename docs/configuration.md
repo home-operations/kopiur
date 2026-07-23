@@ -327,14 +327,37 @@ additionally wires up the Prometheus Operator and Grafana:
 
 - **`monitoring.serviceMonitor.enabled`** — create a `ServiceMonitor` scraping
   the controller's `/metrics` (plain HTTP; needs the Prometheus-Operator CRDs);
-  set `.labels` to match your `serviceMonitorSelector`.
+  set `.labels` to match your `serviceMonitorSelector`. The `ServiceMonitor` sets
+  `honorLabels: true`, so each `kopiur_*` series keeps its own `namespace` label —
+  the namespace of the CR the metric describes — instead of having it overwritten
+  by the controller's namespace (which Prometheus would otherwise move aside to
+  `exported_namespace`).
 - **`monitoring.prometheusRule.enabled`** — ship the kopiur alert rules.
   `backupStaleAfterSeconds` (default 48h) is the age after which a
-  `SnapshotPolicy`'s last success is considered stale.
+  `SnapshotPolicy`'s last success is considered stale. The backup-failure alerts
+  are **recovery-aware**: `KopiurLastBackupFailed` fires while a `SnapshotPolicy`'s
+  most recent completed backup failed and resolves automatically the moment a
+  newer backup succeeds; `KopiurSnapshotFailed` (per-`Snapshot`) stops firing for a
+  retained Failed `Snapshot` once its policy's latest backup succeeds — a
+  `Snapshot` with no policy reference keeps the always-fire behavior instead.
+  `KopiurBackupStale` still covers the policy that has never succeeded or whose
+  successful `Snapshot` CRs were all pruned. Both recovery-aware alerts wait
+  `for: 10m` at `severity: warning`.
 - **`monitoring.dashboards.enabled`** — ship the dashboard. By default it's a
   sidecar-discoverable `ConfigMap` (source: `deploy/dashboards/kopiur.json`); flip
   `monitoring.dashboards.grafanaOperator.enabled` to render a grafana-operator
   `GrafanaDashboard` CR from the very same JSON instead.
+
+/// warning | `honorLabels: true` changes the `namespace` label
+
+With `honorLabels: true`, the `namespace` label on every scraped `kopiur_*` series
+is now the **CR's** namespace rather than the controller's. If you keyed external
+dashboards or queries on `exported_namespace` (where the CR namespace previously
+landed), update them to `namespace`. The dashboard this chart ships already assumed
+CR-namespace semantics, so this fixes its `$namespace` dropdown rather than breaking
+it.
+
+///
 
 The webhook's own HTTPS scrape lives separately under
 [`webhook.serviceMonitor`](#admission-webhook).

@@ -1474,8 +1474,16 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 | `url` | string | **required** | Target URL to call. |
 | `body` | string | — | Optional request body. |
 | `continueOnFailure` | boolean | — | If `true`, a failed request does not abort the backup (default: abort). |
+| `headers` | [][object](#snapshotpolicy-spec-hooks-aftersnapshot-httprequest-headers) | — | Additional request headers (e.g. `Content-Type: application/json`). |
 | `method` | string | — | HTTP method (default `POST`). |
 | `timeout` | string | — | Max time to wait for the response (Go duration string). |
+
+###### `spec.hooks.afterSnapshot[].httpRequest.headers[]` { #snapshotpolicy-spec-hooks-aftersnapshot-httprequest-headers }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Header name (case-insensitive; RFC 7230 token, e.g. `Content-Type`). |
+| `value` | string | **required** | Header value. |
 
 ###### `spec.hooks.afterSnapshot[].runJob` { #snapshotpolicy-spec-hooks-aftersnapshot-runjob }
 
@@ -1512,8 +1520,16 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 | `url` | string | **required** | Target URL to call. |
 | `body` | string | — | Optional request body. |
 | `continueOnFailure` | boolean | — | If `true`, a failed request does not abort the backup (default: abort). |
+| `headers` | [][object](#snapshotpolicy-spec-hooks-beforesnapshot-httprequest-headers) | — | Additional request headers (e.g. `Content-Type: application/json`). |
 | `method` | string | — | HTTP method (default `POST`). |
 | `timeout` | string | — | Max time to wait for the response (Go duration string). |
+
+###### `spec.hooks.beforeSnapshot[].httpRequest.headers[]` { #snapshotpolicy-spec-hooks-beforesnapshot-httprequest-headers }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Header name (case-insensitive; RFC 7230 token, e.g. `Content-Type`). |
+| `value` | string | **required** | Header value. |
 
 ###### `spec.hooks.beforeSnapshot[].runJob` { #snapshotpolicy-spec-hooks-beforesnapshot-runjob }
 
