@@ -37,12 +37,23 @@
 //! 6. **Adoption AFTER retention** (IO side), consuming SEPARATE LISTs.
 //! 7. **Batching**: at most [`POLICY_ADOPTION_BATCH`] adoptions per pass, in
 //!    deterministic (snapshot-id) order.
+//! 8. **Retention-aware under `Retain`/`Orphan`** ([`AdoptionRetentionGate`]):
+//!    a candidate GFS would immediately prune is never adopted — the adopted
+//!    CR would be deleted on the next retention pass while the kopia snapshot
+//!    survives, be re-discovered by the next catalog scan, and be re-adopted:
+//!    an adopt→prune→rediscover cycle that never converges and recycles the
+//!    repository's discovery Job forever. Under `Delete` every candidate is
+//!    adopted (the #210 drain: retention then genuinely prunes kopia data, so
+//!    the pool empties).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kube::ResourceExt;
 
-use kopiur_api::common::{DeletionPolicy, PolicyRef, ResolvedIdentity, SnapshotAdoption};
+use kopiur_api::common::{
+    DeletionPolicy, PolicyRef, ResolvedIdentity, Retention, SnapshotAdoption,
+};
+use kopiur_api::retention::select_kept;
 use kopiur_api::snapshot::{
     ResolvedSnapshot, SnapshotInfo, SnapshotSpec, SnapshotStats, SnapshotStatus, SnapshotTiming,
 };
@@ -51,6 +62,7 @@ use kopiur_api::{
 };
 
 use crate::consts::{CONFIG_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL, SNAPSHOT_ID_LABEL};
+use crate::snapshot_policy::SnapshotRetentionView;
 
 /// At most this many discovered snapshots are adopted per reconcile pass. This
 /// bound is what keeps the (unbatched) retention delete loop bounded per pass:
@@ -130,6 +142,42 @@ pub struct AdoptionPlan {
     pub adopt: Vec<AdoptionCandidate>,
     /// Whether to stamp the on-demand catalog-scan request on the repository.
     pub request_scan: bool,
+    /// Identity-matching, non-owned candidates deliberately left `discovered`
+    /// because [`AdoptionRetentionGate`] proved GFS would immediately prune
+    /// them (inv. 8). Surfaced via `status.adoption.skippedByRetention`.
+    pub skipped_by_retention: u64,
+}
+
+/// What this policy already carries and has already asked for — the inputs to
+/// the own-id filter and the once-per-identity scan-request arm.
+pub struct AdoptionHistory<'a> {
+    /// Kopia ids of the policy's existing config-labeled `Snapshot` children.
+    pub own_snapshot_ids: &'a BTreeSet<String>,
+    /// Whether the policy has ANY terminal-successful history.
+    pub has_history: bool,
+    /// `status.adoption.scanRequestedIdentity` — the identity a no-match scan
+    /// was already requested for, so that arm fires once per (policy, identity).
+    pub scan_requested_identity: Option<&'a str>,
+}
+
+/// The retention context [`plan_adoption`] needs to enforce invariant 8. Built
+/// by `snapshot_policy::run_adoption` from the SAME pre-prune `backups` LIST
+/// the retention pass just evaluated.
+pub struct AdoptionRetentionGate<'a> {
+    /// The policy's GFS retention (`spec.retention`). `None` = the policy never
+    /// prunes, so adopting cannot loop — no gating.
+    pub retention: Option<&'a Retention>,
+    /// The `deletionPolicy` adopted rows will carry — resolve it with
+    /// [`effective_deletion_policy`] so this gate and [`build_adopted_snapshot`]
+    /// can never disagree on which convergence regime applies.
+    pub deletion_policy: DeletionPolicy,
+    /// Retention views of the policy's current config-labeled children.
+    pub own_views: &'a [SnapshotRetentionView],
+    /// The policy CR name — candidate views take the FUTURE adopted CR name
+    /// ([`adopted_cr_name`]) as their retention id, so `select_kept`'s
+    /// equal-`end_time` tie-break resolves identically at gate time and on the
+    /// next retention pass.
+    pub policy_name: &'a str,
 }
 
 /// Decide the adoption plan for one pass. **Pure** — exhaustive over
@@ -139,34 +187,39 @@ pub struct AdoptionPlan {
 /// - [`SnapshotAdoption::Adopt`] → adopt every candidate that (inv. 2) matches
 ///   the policy's live-resolved identity structurally AND (inv. 3) is not a
 ///   foreign-cluster hostname AND is not already carried by a config-label
-///   `Snapshot` (`own_snapshot_ids`); sorted by snapshot id and capped at
-///   [`POLICY_ADOPTION_BATCH`] (inv. 7).
+///   `Snapshot` (`own_snapshot_ids`) AND (inv. 8) would survive the policy's
+///   retention under an effective `Retain`/`Orphan` deletion policy (`gate`);
+///   sorted by snapshot id and capped at [`POLICY_ADOPTION_BATCH`] (inv. 7).
 ///
 /// `request_scan` is true when this pass adopted anything (a wave implies more
 /// may exist behind the catalog's `retain` caps), OR — for a brand-new /
 /// delete-then-recreated policy — when NO candidate matched at all, the policy
 /// has no history yet, and no scan was already requested for THIS identity
 /// (`scan_requested_identity`). That last arm fires exactly once per (policy,
-/// identity): a scan that yields nothing stays quiet forever after.
+/// identity): a scan that yields nothing stays quiet forever after. A wave
+/// whose every candidate was withheld by the retention gate requests NO scan
+/// (`adopt` is empty, and gated candidates count as `matched_any`) — this is
+/// what lets the pathological adopt→prune→rediscover cycle terminate.
 pub fn plan_adoption(
     mode: SnapshotAdoption,
     policy_identity: &ResolvedIdentity,
     repo_cluster: Option<&str>,
     candidates: Vec<AdoptionCandidate>,
-    own_snapshot_ids: &BTreeSet<String>,
-    has_history: bool,
-    scan_requested_identity: Option<&str>,
+    history: &AdoptionHistory<'_>,
+    gate: &AdoptionRetentionGate<'_>,
 ) -> AdoptionPlan {
     match mode {
         SnapshotAdoption::Ignore => AdoptionPlan {
             adopt: Vec::new(),
             request_scan: false,
+            skipped_by_retention: 0,
         },
         SnapshotAdoption::Adopt => {
             // Identity-matching, non-foreign candidates (inv. 2 + 3). `matched_any`
             // is computed BEFORE the own-id filter: a candidate that matched but is
             // already ours means there IS relevant history, so it must not trigger a
-            // "nothing matched" scan request.
+            // "nothing matched" scan request. The retention gate (inv. 8) runs after
+            // BOTH — a retention-withheld candidate is still "history exists".
             let mut matched: Vec<AdoptionCandidate> = candidates
                 .into_iter()
                 .filter(|c| {
@@ -175,7 +228,8 @@ pub fn plan_adoption(
                 })
                 .collect();
             let matched_any = !matched.is_empty();
-            matched.retain(|c| !own_snapshot_ids.contains(&c.snapshot_id));
+            matched.retain(|c| !history.own_snapshot_ids.contains(&c.snapshot_id));
+            let skipped_by_retention = apply_retention_gate(&mut matched, gate);
             // Deterministic order (inv. 7) so a capped pass always adopts the same
             // prefix, and the batch cap.
             matched.sort_by(|a, b| a.snapshot_id.cmp(&b.snapshot_id));
@@ -183,15 +237,74 @@ pub fn plan_adoption(
             let adopt = matched;
 
             let already_requested =
-                scan_requested_identity == Some(identity_string(policy_identity).as_str());
+                history.scan_requested_identity == Some(identity_string(policy_identity).as_str());
             let request_scan =
-                !adopt.is_empty() || (!matched_any && !has_history && !already_requested);
+                !adopt.is_empty() || (!matched_any && !history.has_history && !already_requested);
             AdoptionPlan {
                 adopt,
                 request_scan,
+                skipped_by_retention,
             }
         }
     }
+}
+
+/// Invariant 8: withhold every candidate GFS would immediately prune when the
+/// adopted row's `deletionPolicy` would be `Retain`/`Orphan` (a CR-only prune —
+/// the kopia snapshot survives, re-discovers, and re-adopts forever). Under
+/// `Delete` the adopt-then-prune cycle performs real kopia deletion and
+/// converges, so nothing is withheld. Exhaustive over [`DeletionPolicy`].
+/// Returns how many candidates were withheld.
+///
+/// The gate evaluates `select_kept` over own views ∪ candidate views. This
+/// pre-prune evaluation is stable across passes because (a) `select_kept` is
+/// time-invariant (buckets derive purely from end times — no `now`), (b)
+/// removing a non-kept row never changes any other row's bucket outcome, and
+/// (c) equal-`end_time` ties break by id, and candidate views use the future
+/// adopted CR name — so the gate and the next retention pass resolve ties
+/// identically.
+fn apply_retention_gate(
+    matched: &mut Vec<AdoptionCandidate>,
+    gate: &AdoptionRetentionGate<'_>,
+) -> u64 {
+    let retention = match gate.deletion_policy {
+        DeletionPolicy::Delete => return 0,
+        DeletionPolicy::Retain | DeletionPolicy::Orphan => match gate.retention {
+            None => return 0,
+            Some(r) => r,
+        },
+    };
+    let before = matched.len();
+    let mut views: Vec<SnapshotRetentionView> = gate.own_views.to_vec();
+    views.extend(
+        matched
+            .iter()
+            .filter_map(|c| candidate_view(gate.policy_name, c)),
+    );
+    let kept: BTreeSet<String> = select_kept(&views, retention).keep.into_iter().collect();
+    matched.retain(|c| kept.contains(&adopted_cr_name(gate.policy_name, &c.snapshot_id)));
+    (before - matched.len()) as u64
+}
+
+/// The retention view the adopted CR for `candidate` WOULD have: id = the
+/// future adopted CR name, end time from the discovered row's timing, pin
+/// carried. A candidate with no parseable end time yields `None` and is thus
+/// withheld by the gate — its kept-ness is unprovable, so it stays a truthful
+/// discovered row. (Defensive: the catalog always writes timing on discovered
+/// rows.)
+fn candidate_view(
+    policy_name: &str,
+    candidate: &AdoptionCandidate,
+) -> Option<SnapshotRetentionView> {
+    let end = candidate.timing.as_ref()?.end_time.as_deref()?;
+    let end_time = chrono::DateTime::parse_from_rfc3339(end)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(SnapshotRetentionView {
+        name: adopted_cr_name(policy_name, &candidate.snapshot_id),
+        end_time,
+        pinned: candidate.pinned,
+    })
 }
 
 /// Structured identity equality (inv. 2): username AND hostname AND `sourcePath`
@@ -244,9 +357,7 @@ pub fn build_adopted_snapshot(
 ) -> (Snapshot, SnapshotStatus) {
     let policy_name = policy.name_any();
     let namespace = policy.namespace().unwrap_or_default();
-    let short: String = candidate.snapshot_id.chars().take(16).collect();
-    let hash = crate::naming::short_hash(&candidate.snapshot_id);
-    let cr_name = crate::naming::capped_name(&format!("{policy_name}-adopted-{short}-{hash}"));
+    let cr_name = adopted_cr_name(&policy_name, &candidate.snapshot_id);
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -257,10 +368,7 @@ pub fn build_adopted_snapshot(
     labels.insert(SNAPSHOT_ID_LABEL.to_string(), candidate.snapshot_id.clone());
     labels.insert(REPOSITORY_UID_LABEL.to_string(), repo_uid.to_string());
 
-    let deletion_policy = policy
-        .spec
-        .default_deletion_policy
-        .unwrap_or(DeletionPolicy::Delete);
+    let deletion_policy = effective_deletion_policy(policy);
 
     let mut snapshot = Snapshot::new(
         &cr_name,
@@ -303,6 +411,30 @@ pub fn build_adopted_snapshot(
     };
 
     (snapshot, status)
+}
+
+/// The name the adopted `Snapshot` CR for `snapshot_id` gets:
+/// `<policy>-adopted-<first16(id)>-<hash8(full id)>`, length-capped. The
+/// first-16 prefix keeps human correlation with the kopia id; the trailing
+/// hash of the FULL id keeps names distinct for ids sharing a ≥16-char prefix.
+/// Shared by [`build_adopted_snapshot`] and the retention gate's candidate
+/// views (inv. 8 tie-break determinism) — keep them on this one helper.
+pub fn adopted_cr_name(policy_name: &str, snapshot_id: &str) -> String {
+    let short: String = snapshot_id.chars().take(16).collect();
+    let hash = crate::naming::short_hash(snapshot_id);
+    crate::naming::capped_name(&format!("{policy_name}-adopted-{short}-{hash}"))
+}
+
+/// The `deletionPolicy` an adopted row will carry: the policy's
+/// `spec.defaultDeletionPolicy`, else `Delete`. One resolver shared by
+/// [`build_adopted_snapshot`] and [`AdoptionRetentionGate::deletion_policy`]
+/// so the builder and the gate can never disagree on which convergence regime
+/// (inv. 8) applies.
+pub fn effective_deletion_policy(policy: &SnapshotPolicy) -> DeletionPolicy {
+    policy
+        .spec
+        .default_deletion_policy
+        .unwrap_or(DeletionPolicy::Delete)
 }
 
 /// The `SnapshotsAdopted` Normal-Event note. **Pure** so the required contents
@@ -379,6 +511,17 @@ mod tests {
         }
     }
 
+    /// A Delete/no-retention gate — the regime in which invariant 8 never
+    /// withholds anything, so the legacy truth tables hold unchanged.
+    fn delete_gate() -> AdoptionRetentionGate<'static> {
+        AdoptionRetentionGate {
+            retention: None,
+            deletion_policy: DeletionPolicy::Delete,
+            own_views: &[],
+            policy_name: "pol",
+        }
+    }
+
     fn adopt_plan(
         policy_identity: &ResolvedIdentity,
         repo_cluster: Option<&str>,
@@ -392,9 +535,12 @@ mod tests {
             policy_identity,
             repo_cluster,
             candidates,
-            own,
-            has_history,
-            requested,
+            &AdoptionHistory {
+                own_snapshot_ids: own,
+                has_history,
+                scan_requested_identity: requested,
+            },
+            &delete_gate(),
         )
     }
 
@@ -567,9 +713,12 @@ mod tests {
             &id,
             None,
             vec![candidate("aaa", id.clone(), false)],
-            &BTreeSet::new(),
-            false,
-            None,
+            &AdoptionHistory {
+                own_snapshot_ids: &BTreeSet::new(),
+                has_history: false,
+                scan_requested_identity: None,
+            },
+            &delete_gate(),
         );
         assert!(plan.adopt.is_empty());
         assert!(!plan.request_scan);
@@ -652,6 +801,313 @@ mod tests {
             .map(|i| format!("id{i:02}"))
             .collect();
         assert_eq!(ids, want.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    // -- retention gate (inv. 8) ---------------------------------------------
+
+    fn timed_candidate(
+        id: &str,
+        ident: ResolvedIdentity,
+        end: &str,
+        pinned: bool,
+    ) -> AdoptionCandidate {
+        let mut c = candidate(id, ident, pinned);
+        c.timing = Some(SnapshotTiming {
+            start_time: None,
+            end_time: Some(end.into()),
+            duration_seconds: None,
+        });
+        c
+    }
+
+    fn own_view(name: &str, end: &str, pinned: bool) -> SnapshotRetentionView {
+        SnapshotRetentionView {
+            name: name.into(),
+            end_time: chrono::DateTime::parse_from_rfc3339(end)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            pinned,
+        }
+    }
+
+    fn retention_of(v: serde_json::Value) -> Retention {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn retain_gate<'a>(
+        retention: Option<&'a Retention>,
+        own_views: &'a [SnapshotRetentionView],
+    ) -> AdoptionRetentionGate<'a> {
+        AdoptionRetentionGate {
+            retention,
+            deletion_policy: DeletionPolicy::Retain,
+            own_views,
+            policy_name: "pol",
+        }
+    }
+
+    fn gated_plan(
+        policy_identity: &ResolvedIdentity,
+        candidates: Vec<AdoptionCandidate>,
+        own: &BTreeSet<String>,
+        has_history: bool,
+        gate: &AdoptionRetentionGate<'_>,
+    ) -> AdoptionPlan {
+        plan_adoption(
+            SnapshotAdoption::Adopt,
+            policy_identity,
+            None,
+            candidates,
+            &AdoptionHistory {
+                own_snapshot_ids: own,
+                has_history,
+                scan_requested_identity: None,
+            },
+            gate,
+        )
+    }
+
+    fn adopt_ids(plan: &AdoptionPlan) -> Vec<&str> {
+        plan.adopt.iter().map(|c| c.snapshot_id.as_str()).collect()
+    }
+
+    #[test]
+    fn retain_gate_skips_candidates_gfs_would_immediately_prune() {
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("ccc", id.clone(), "2026-01-01T00:00:00Z", false),
+            timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+        ];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+        let gate = retain_gate(Some(&ret), &[]);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(adopt_ids(&plan), vec!["aaa"], "only the GFS-kept newest");
+        assert_eq!(plan.skipped_by_retention, 2);
+        assert!(
+            plan.request_scan,
+            "a non-empty wave still drains the catalog"
+        );
+    }
+
+    #[test]
+    fn retain_gate_all_skipped_requests_no_scan_and_terminates_the_loop() {
+        // THE loop-termination pin: every candidate is older than the own row
+        // keepLatest:1 keeps, so the whole wave is withheld — and the plan must
+        // request NO scan even with `has_history: false` and no prior request
+        // (withheld candidates count as matched history). On pre-fix code this
+        // input re-stamped a scan token every pass, recycling the discovery Job
+        // seconds after each completion, forever.
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("old1", id.clone(), "2026-01-01T00:00:00Z", false),
+            timed_candidate("old2", id.clone(), "2026-01-02T00:00:00Z", false),
+        ];
+        let own = [own_view("pol-live", "2026-01-10T00:00:00Z", false)];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+        let gate = retain_gate(Some(&ret), &own);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert!(plan.adopt.is_empty());
+        assert_eq!(plan.skipped_by_retention, 2);
+        assert!(
+            !plan.request_scan,
+            "a fully-withheld wave must go quiet, or the scan/adopt loop never converges"
+        );
+    }
+
+    #[test]
+    fn delete_mode_adopts_everything_regardless_of_retention() {
+        // The #210 drain design: under Delete, adopt-then-prune performs real
+        // kopia deletion, so the gate must not withhold anything.
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+            timed_candidate("ccc", id.clone(), "2026-01-01T00:00:00Z", false),
+        ];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+        let gate = AdoptionRetentionGate {
+            retention: Some(&ret),
+            deletion_policy: DeletionPolicy::Delete,
+            own_views: &[],
+            policy_name: "pol",
+        };
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(plan.adopt.len(), 3);
+        assert_eq!(plan.skipped_by_retention, 0);
+    }
+
+    #[test]
+    fn orphan_mode_gates_like_retain() {
+        // Orphan also deletes only the CR (no repository contact), so adopting
+        // a would-be-pruned candidate is the same non-converging no-op.
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+        ];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+        let gate = AdoptionRetentionGate {
+            retention: Some(&ret),
+            deletion_policy: DeletionPolicy::Orphan,
+            own_views: &[],
+            policy_name: "pol",
+        };
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(adopt_ids(&plan), vec!["aaa"]);
+        assert_eq!(plan.skipped_by_retention, 1);
+    }
+
+    #[test]
+    fn no_retention_configured_adopts_everything_under_retain() {
+        // retention: None = the policy never prunes = adopting cannot loop.
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+        ];
+        let gate = retain_gate(None, &[]);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(plan.adopt.len(), 2);
+        assert_eq!(plan.skipped_by_retention, 0);
+    }
+
+    #[test]
+    fn empty_retention_object_skips_all_unpinned_candidates_under_retain() {
+        // `retention: {}` keeps nothing, so every unpinned candidate would be
+        // pruned instantly — the correct terminal state is: none adopted, all
+        // stay discovered. Pinned candidates are GFS-exempt and still adopt.
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+            timed_candidate("pin", id.clone(), "2026-01-01T00:00:00Z", true),
+        ];
+        let ret = retention_of(serde_json::json!({}));
+        let gate = retain_gate(Some(&ret), &[]);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(adopt_ids(&plan), vec!["pin"]);
+        assert_eq!(plan.skipped_by_retention, 2);
+    }
+
+    #[test]
+    fn pinned_candidate_is_adopted_even_when_outside_every_bucket() {
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![
+            timed_candidate("new", id.clone(), "2026-01-03T00:00:00Z", false),
+            timed_candidate("mid", id.clone(), "2026-01-02T00:00:00Z", false),
+            timed_candidate("pin", id.clone(), "2026-01-01T00:00:00Z", true),
+        ];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+        let gate = retain_gate(Some(&ret), &[]);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert_eq!(adopt_ids(&plan), vec!["new", "pin"]);
+        assert_eq!(plan.skipped_by_retention, 1);
+    }
+
+    #[test]
+    fn candidate_without_end_time_is_skipped_under_retain_gating() {
+        // No parseable end time → kept-ness unprovable → withheld (defensive;
+        // the catalog always writes timing on discovered rows).
+        let id = identity("app", "billing", Some("/data"));
+        let cands = vec![candidate("aaa", id.clone(), false)];
+        let ret = retention_of(serde_json::json!({ "keepLatest": 5 }));
+        let gate = retain_gate(Some(&ret), &[]);
+        let plan = gated_plan(&id, cands, &BTreeSet::new(), false, &gate);
+        assert!(plan.adopt.is_empty());
+        assert_eq!(plan.skipped_by_retention, 1);
+        assert!(!plan.request_scan);
+    }
+
+    #[test]
+    fn retain_gate_is_stable_across_passes() {
+        let id = identity("app", "billing", Some("/data"));
+        let ret = retention_of(serde_json::json!({ "keepLatest": 1 }));
+
+        // Pass 1: no history; three candidates → adopt only the GFS-kept newest.
+        let cands = || {
+            vec![
+                timed_candidate("aaa", id.clone(), "2026-01-03T00:00:00Z", false),
+                timed_candidate("bbb", id.clone(), "2026-01-02T00:00:00Z", false),
+                timed_candidate("ccc", id.clone(), "2026-01-01T00:00:00Z", false),
+            ]
+        };
+        let gate1 = retain_gate(Some(&ret), &[]);
+        let plan1 = gated_plan(&id, cands(), &BTreeSet::new(), false, &gate1);
+        assert_eq!(adopt_ids(&plan1), vec!["aaa"]);
+
+        // Pass 2: the adopted row is an own child under its adopted name; the
+        // remaining candidates are re-offered. Nothing more is adopted, nothing
+        // is requested — the plan is a fixed point.
+        let own = [own_view(
+            &adopted_cr_name("pol", "aaa"),
+            "2026-01-03T00:00:00Z",
+            false,
+        )];
+        let own_ids: BTreeSet<String> = ["aaa".to_string()].into_iter().collect();
+        let gate2 = retain_gate(Some(&ret), &own);
+        let plan2 = gated_plan(&id, cands(), &own_ids, true, &gate2);
+        assert!(plan2.adopt.is_empty());
+        assert!(!plan2.request_scan);
+        assert_eq!(plan2.skipped_by_retention, 2);
+
+        // Displaced-own guard: an own row that already LOST keepLatest:1 to a
+        // newer child gets (Retain-)pruned, re-discovers, and is re-offered as
+        // a candidate — it must not be re-adopted (no oscillation).
+        let displaced = timed_candidate("old-displaced", id.clone(), "2026-01-01T00:00:00Z", false);
+        let plan3 = gated_plan(&id, vec![displaced], &own_ids, true, &gate2);
+        assert!(plan3.adopt.is_empty());
+        assert_eq!(plan3.skipped_by_retention, 1);
+        assert!(!plan3.request_scan);
+
+        // Exact end-time tie at the boundary: the candidate competes under its
+        // FUTURE adopted name, so the id tie-break resolves identically at gate
+        // time and after adoption — the winner, once adopted, keeps winning.
+        let tied_end = "2026-01-05T00:00:00Z";
+        let own_tied = [own_view("zzz-own", tied_end, false)];
+        let cand_tied = timed_candidate("t1", id.clone(), tied_end, false);
+        assert!(
+            adopted_cr_name("pol", "t1").as_str() < "zzz-own",
+            "fixture precondition: the adopted name wins the id tie-break"
+        );
+        let gate_tied = retain_gate(Some(&ret), &own_tied);
+        let plan_tied = gated_plan(&id, vec![cand_tied], &BTreeSet::new(), true, &gate_tied);
+        assert_eq!(
+            adopt_ids(&plan_tied),
+            vec!["t1"],
+            "tie goes to the smaller id"
+        );
+        // After adoption the same population re-planned (winner now own, loser
+        // re-offered) reproduces itself: the displaced row is not re-adopted.
+        let own_after = [own_view(&adopted_cr_name("pol", "t1"), tied_end, false)];
+        let own_ids_after: BTreeSet<String> = ["t1".to_string()].into_iter().collect();
+        // The pruned "zzz-own" re-discovers under its kopia id ("zzz"), so it
+        // now competes under adopted_cr_name("pol","zzz") — still a loser.
+        let re_offered = timed_candidate("zzz", id.clone(), tied_end, false);
+        let gate_after = retain_gate(Some(&ret), &own_after);
+        let plan_after = gated_plan(&id, vec![re_offered], &own_ids_after, true, &gate_after);
+        assert!(
+            plan_after.adopt.is_empty(),
+            "no oscillation after the tie resolves"
+        );
+        assert!(!plan_after.request_scan);
+    }
+
+    #[test]
+    fn adopted_cr_name_matches_build_adopted_snapshot() {
+        // Refactor pin: the gate's candidate views and the builder must mint
+        // the SAME name, or tie-breaks diverge between planning and reality.
+        let policy = policy_fixture(None);
+        let cand = candidate(
+            "0123456789abcdef0123",
+            identity("app", "billing", Some("/data")),
+            false,
+        );
+        let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        assert_eq!(
+            snap.name_any(),
+            adopted_cr_name("app", "0123456789abcdef0123")
+        );
     }
 
     // -- build_adopted_snapshot ----------------------------------------------

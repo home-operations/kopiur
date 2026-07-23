@@ -31,6 +31,9 @@ use crate::metrics::PolicyCascadeMode;
 
 /// A minimal view of a `Snapshot` for retention selection: its CR name (the id
 /// used in delete decisions) and its snapshot end time (the GFS bucketing key).
+/// `Clone` so the adoption retention gate (adoption inv. 8) can union these
+/// views with candidate views without re-deriving them from the CRs.
+#[derive(Debug, Clone)]
 pub struct SnapshotRetentionView {
     /// CR name — the stable id returned in the kept/delete sets.
     pub name: String,
@@ -821,15 +824,33 @@ async fn run_adoption(
         .as_ref()
         .and_then(|d| d.cluster.as_deref());
 
+    // Retention gate inputs (adoption inv. 8), from the SAME pre-prune `backups`
+    // slice the retention pass just evaluated. That pre-prune evaluation matches
+    // what the next retention pass will decide because `select_kept` is
+    // time-invariant (buckets derive purely from end times), removing a non-kept
+    // row never changes any other row's bucket outcome, and equal-end_time ties
+    // break by id — with candidate views carrying the future adopted CR name, so
+    // gate-time and next-pass tie-breaks are bit-identical.
+    let own_views: Vec<SnapshotRetentionView> = backups.iter().filter_map(retention_view).collect();
+    let gate = crate::adoption::AdoptionRetentionGate {
+        retention: config.spec.retention.as_ref(),
+        deletion_policy: crate::adoption::effective_deletion_policy(config),
+        own_views: &own_views,
+        policy_name: name,
+    };
+
     // 4. Plan (pure).
     let plan = crate::adoption::plan_adoption(
         SnapshotAdoption::Adopt,
         policy_identity,
         repo_cluster,
         candidates,
-        &own_ids,
-        has_history,
-        scan_requested_identity,
+        &crate::adoption::AdoptionHistory {
+            own_snapshot_ids: &own_ids,
+            has_history,
+            scan_requested_identity,
+        },
+        &gate,
     );
 
     // 5. Execute adoptions (inv. 4: create → ensure-status → delete discovered).
