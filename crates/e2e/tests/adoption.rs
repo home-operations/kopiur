@@ -48,6 +48,7 @@ use common::{
 const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
     "kopiur.home-operations.com/catalog-scan-requested-at";
 const SNAPSHOTS_ADOPTED_REASON: &str = "SnapshotsAdopted";
+const ADOPTION_SKIPPED_BY_RETENTION_REASON: &str = "AdoptionSkippedByRetention";
 
 // --- shared helpers ---------------------------------------------------------------
 
@@ -1059,4 +1060,341 @@ async fn cluster_repository_adoption_cross_namespace() {
     }
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
     let _ = crepos.delete(CREPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 4: Retain-policy adoption converges without Job churn ---------------
+
+const S4_BUCKET: &str = "kopiur-adopt-retain";
+const S4_DIR: &str = "retain";
+
+/// THE adopt/prune/rediscover-livelock regression pin. With an effective
+/// `deletionPolicy: Retain` and a tight `retention: {keepLatest: 1}` over ≥3
+/// pre-existing matching kopia snapshots, pre-fix code adopted ALL of them,
+/// retention pruned the over-bound CRs (kopia untouched), the catalog
+/// re-discovered them, adoption re-adopted them and stamped a fresh scan-request
+/// token every wave — recreating the repository's discovery Job seconds after
+/// each completion, forever, with discovered rows created and deleted every
+/// cycle.
+///
+/// Fixture choices are load-bearing:
+/// - an OBJECT-STORE repository, because a bare-path filesystem repo scans
+///   in-process and has no discovery Job to churn;
+/// - `periodicRefresh` OFF (the default), so the scan-request token arm is the
+///   ONLY thing that can recycle the finished discovery Job — a stable Job uid
+///   is then exactly the "no more tokens" proof. The natural token flow (the
+///   adopt wave requests one drain scan) drives every scan this test needs.
+///
+/// Post-fix contract: adoption takes ONLY the GFS-kept newest snapshot
+/// (invariant 8), the two over-bound ones stay `discovered`
+/// (`status.adoption.skippedByRetention == 2` + an `AdoptionSkippedByRetention`
+/// event), and after convergence the discovery Job uid, the scan-request
+/// annotation, the discovered-row set, and the config-labeled set are all
+/// byte-stable across a settle window. kopia data is never touched (Retain).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn retain_policy_adoption_converges_without_job_churn() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    // Minio for the object-store repo; Filesystem for the operator-namespace
+    // source PVC the policy references (identity resolution only — no backup runs).
+    world
+        .ensure(&[Need::Filesystem, Need::Minio])
+        .await
+        .expect("provision MinIO + operator source PVC");
+    let client: Client = world.client().clone();
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<k8s_openapi::api::batch::v1::Job> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-adopt-retain-repo";
+    // The policy name doubles as the seeded kopia username (the resolver default).
+    const POLICY: &str = "e2e-adopt-retain-pol";
+    let job_name = format!("{REPO}-discovery");
+
+    // Foreign history: THREE distinct snapshots under EXACTLY the identity the
+    // policy below resolves to (username = policy name, hostname pinned, path =
+    // the sourcePathOverride).
+    run_seeder(
+        &client,
+        "e2e-adopt-retain-seed",
+        &[
+            SeedStep::WipeBucket { bucket: S4_BUCKET },
+            SeedStep::WriteFile {
+                dir: S4_DIR,
+                file: "f.txt",
+                content: "v1",
+            },
+            SeedStep::CreateRepo {
+                bucket: S4_BUCKET,
+                username: POLICY,
+                hostname: E2E_NAMESPACE,
+            },
+            SeedStep::Snapshot { dir: S4_DIR },
+            SeedStep::WriteFile {
+                dir: S4_DIR,
+                file: "f.txt",
+                content: "v2",
+            },
+            SeedStep::Snapshot { dir: S4_DIR },
+            SeedStep::WriteFile {
+                dir: S4_DIR,
+                file: "f.txt",
+                content: "v3",
+            },
+            SeedStep::Snapshot { dir: S4_DIR },
+        ],
+    )
+    .await;
+
+    // Object-store repository, connect-only, maintenance off, NO periodicRefresh.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Repository",
+                "metadata": { "name": REPO, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "backend": { "s3": {
+                        "bucket": S4_BUCKET,
+                        "endpoint": consts::MINIO_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": {
+                            "name": consts::SECRET_S3_CREDS, "namespace": E2E_NAMESPACE
+                        } }
+                    }},
+                    "encryption": { "passwordSecretRef": {
+                        "name": consts::SECRET_S3_CREDS, "key": "KOPIA_PASSWORD"
+                    }},
+                    "create": { "enabled": false },
+                    "maintenance": { "enabled": false }
+                }
+            })),
+        )
+        .await
+        .expect("create object-store Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    let repo_uid = repos
+        .get(REPO)
+        .await
+        .expect("get Repository")
+        .uid()
+        .expect("Repository uid");
+    let want_identity = format!("{POLICY}@{E2E_NAMESPACE}:/data/{S4_DIR}");
+
+    // The initial bootstrap scan materializes all three as discovered rows.
+    wait_until(
+        "the seeded history materializes as 3 discovered rows",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            let repo_uid = repo_uid.clone();
+            let want = want_identity.clone();
+            async move {
+                let rows = discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await;
+                let matching = rows.iter().filter(|r| row_identity(r) == want).count();
+                Ok((matching >= 3).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("the initial bootstrap scan must discover the 3 seeded snapshots");
+
+    // THE PATHOLOGICAL INPUT: Retain + keepLatest:1 over 3 matching candidates.
+    // On pre-fix code this loops forever.
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({
+                    "identity": { "hostname": E2E_NAMESPACE },
+                    "sources": [ { "pvc": { "name": consts::PVC_SRC },
+                                   "sourcePathOverride": format!("/data/{S4_DIR}") } ],
+                    "defaultDeletionPolicy": "Retain",
+                    "retention": { "keepLatest": 1 }
+                }),
+            )),
+        )
+        .await
+        .expect("create the Retain SnapshotPolicy");
+
+    // Convergence: exactly ONE adopted config-labeled row (the GFS-kept newest),
+    // the two over-bound candidates deliberately left discovered
+    // (skippedByRetention == 2), and the adopt wave's one drain-scan token
+    // retired (annotation == status.catalog.scanRequestHonored). None of this is
+    // ever simultaneously true on pre-fix code (skippedByRetention does not
+    // exist there), so a livelocked operator times out here.
+    wait_until(
+        "adoption converges: 1 adopted row, 2 skipped-by-retention, token retired",
+        Duration::from_secs(420),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            let repos = repos.clone();
+            let policies = policies.clone();
+            let repo_uid = repo_uid.clone();
+            let want = want_identity.clone();
+            async move {
+                let labeled = config_labeled(&client, E2E_NAMESPACE, POLICY).await;
+                let one_adopted = labeled.len() == 1
+                    && labeled[0].labels().get(ORIGIN_LABEL).map(String::as_str) == Some("adopted")
+                    && status_origin(&labeled[0]) == "adopted"
+                    && labeled[0].metadata.deletion_timestamp.is_none();
+                let skipped = status_json(&policies, POLICY)
+                    .await
+                    .pointer("/adoption/skippedByRetention")
+                    .and_then(|v| v.as_i64());
+                let disc = discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await;
+                let disc_matching = disc.iter().filter(|r| row_identity(r) == want).count();
+                let annotation = scan_requested_annotation(&repos, REPO).await;
+                let honored = status_json(&repos, REPO)
+                    .await
+                    .pointer("/catalog/scanRequestHonored")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let token_retired = annotation.is_some() && annotation == honored;
+                Ok(
+                    (one_adopted && skipped == Some(2) && disc_matching == 2 && token_retired)
+                        .then_some(()),
+                )
+            }
+        },
+    )
+    .await
+    .expect(
+        "retention-aware adoption must converge (1 adopted, 2 left discovered, scan token \
+         retired) — a timeout here means the adopt/prune/rediscover livelock is back",
+    );
+
+    // Capture the converged fixed points.
+    let frozen_annotation = scan_requested_annotation(&repos, REPO)
+        .await
+        .expect("scan-request annotation present after convergence");
+    let frozen_discovered: BTreeSet<(String, String)> =
+        discovered_rows(&client, E2E_NAMESPACE, &repo_uid)
+            .await
+            .iter()
+            .map(|r| (r.name_any(), r.uid().unwrap_or_default()))
+            .collect();
+    let frozen_survivor = config_labeled(&client, E2E_NAMESPACE, POLICY).await[0]
+        .uid()
+        .expect("adopted row uid");
+    // The finished discovery Job may already be TTL-reaped; what matters is that
+    // no NEW uid ever appears once converged.
+    let mut job_uids: BTreeSet<String> = BTreeSet::new();
+    if let Ok(Some(job)) = jobs.get_opt(&job_name).await
+        && let Some(uid) = job.uid()
+    {
+        job_uids.insert(uid);
+    }
+
+    // Settle window: everything above is a fixed point. On pre-fix code the Job
+    // uid churns and the discovered set flaps within one adoption wave (~30s).
+    let settle_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(Some(job)) = jobs.get_opt(&job_name).await
+            && let Some(uid) = job.uid()
+        {
+            job_uids.insert(uid);
+        }
+        assert!(
+            job_uids.len() <= 1,
+            "the discovery Job must NOT be recycled after convergence (the scan-request \
+             token arm is its only trigger here) — distinct uids seen: {job_uids:?}"
+        );
+        let annotation = scan_requested_annotation(&repos, REPO).await;
+        assert_eq!(
+            annotation.as_deref(),
+            Some(frozen_annotation.as_str()),
+            "no adoption pass may stamp a fresh scan-request token after convergence"
+        );
+        let disc_now: BTreeSet<(String, String)> =
+            discovered_rows(&client, E2E_NAMESPACE, &repo_uid)
+                .await
+                .iter()
+                .map(|r| (r.name_any(), r.uid().unwrap_or_default()))
+                .collect();
+        assert_eq!(
+            disc_now, frozen_discovered,
+            "the discovered-row set must be byte-stable (same names AND uids) — churn here \
+             is the create/delete loop the user saw"
+        );
+        let labeled = config_labeled(&client, E2E_NAMESPACE, POLICY).await;
+        assert!(
+            labeled.len() == 1 && labeled[0].uid().as_deref() == Some(frozen_survivor.as_str()),
+            "exactly the SAME adopted row must survive retention across the window"
+        );
+        if Instant::now() >= settle_deadline {
+            break;
+        }
+        tokio::time::sleep(poll_interval()).await;
+    }
+
+    // Retain touched no kopia data: the repository still counts all 3 snapshots.
+    let s = status_json(&repos, REPO).await;
+    assert_eq!(
+        s.pointer("/storageStats/snapshotCount")
+            .and_then(|v| v.as_i64()),
+        Some(3),
+        "Retain adoption must never delete kopia data; repo status: {s}"
+    );
+    // The wave was recorded: one adoption + the skip event with the levers.
+    assert_eq!(
+        status_json(&policies, POLICY)
+            .await
+            .pointer("/adoption/lastAdoptedCount")
+            .and_then(|v| v.as_i64()),
+        Some(1),
+        "exactly one snapshot (the GFS-kept newest) must have been adopted"
+    );
+    assert!(
+        event_exists(
+            &client,
+            E2E_NAMESPACE,
+            ADOPTION_SKIPPED_BY_RETENTION_REASON,
+            "SnapshotPolicy",
+            POLICY
+        )
+        .await,
+        "an `AdoptionSkippedByRetention` Normal event must be published on the policy"
+    );
+
+    // Cleanup: Snapshot CRs BEFORE the Repository (finalizers need it).
+    for r in config_labeled(&client, E2E_NAMESPACE, POLICY).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
+    for r in discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = wait_until(
+        "snapshot CRs drain before repo teardown",
+        Duration::from_secs(120),
+        poll_interval(),
+        || async {
+            let live = backups
+                .list(&ListParams::default().labels(&format!("{REPOSITORY_UID_LABEL}={repo_uid}")))
+                .await?
+                .items;
+            Ok(live.is_empty().then_some(()))
+        },
+    )
+    .await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }

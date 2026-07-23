@@ -315,6 +315,12 @@ pub const BUCKETS: &[&str] = &[
     // adopting SnapshotPolicy lives in the OPERATOR namespace — the cluster-wide-LIST
     // adoption guard.
     "kopiur-adopt-crepo",
+    // Retain-policy adoption convergence (crates/e2e/tests/adoption.rs,
+    // `retain_policy_adoption_converges_without_job_churn`): a Retain +
+    // keepLatest:1 policy over pre-seeded foreign history must adopt ONLY the
+    // GFS-kept snapshot and then go quiet — no discovery-Job churn, no
+    // discovered-row create/delete loop (the adopt/prune/rediscover livelock).
+    "kopiur-adopt-retain",
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see
