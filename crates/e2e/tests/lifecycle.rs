@@ -2571,7 +2571,7 @@ async fn server_exposes_repository_ui() {
     assert!(
         lower.contains("kopia") || lower.contains("<!doctype") || lower.contains("<html"),
         "proxied response should be the kopia web UI, got: {}",
-        &ui.chars().take(200).collect::<String>()
+        ui.chars().take(200).collect::<String>()
     );
 
     // 4. Disable the server (spec.server = null) → owned objects are torn down.
@@ -2705,7 +2705,7 @@ async fn server_read_only_ui_connects_read_only() {
     assert!(
         lower.contains("kopia") || lower.contains("<!doctype") || lower.contains("<html"),
         "proxied response should be the kopia web UI, got: {}",
-        &ui.chars().take(200).collect::<String>()
+        ui.chars().take(200).collect::<String>()
     );
 
     // Cleanup.
