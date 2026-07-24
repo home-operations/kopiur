@@ -886,7 +886,7 @@ mod tests {
         // would make a completed bootstrap look result-less.
         let cms = vec![cm(
             "kopiur-system",
-            "repo-bootstrap",
+            "repo-discovery",
             2 * HOUR,
             &[WORK_SPEC_FILE, RESULT_CONFIGMAP_KEY],
             true,

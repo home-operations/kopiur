@@ -755,7 +755,7 @@ async fn s3_cluster_repository_maintenance_self_corrects_at_steady_state() {
     // Reach the frozen state: with the bootstrap Job gone (the TTL controller reaps it in
     // the real world), every later reconcile takes the steady-state early-exit — the one
     // that used to skip the maintenance check entirely.
-    let bootstrap_job = format!("{name}-bootstrap");
+    let bootstrap_job = format!("{name}-discovery");
     let _ = jobs
         .delete(
             &bootstrap_job,

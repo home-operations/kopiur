@@ -129,7 +129,7 @@ async fn assert_job_stays_gone(jobs: &Api<Job>, name: &str, while_doing: &str) {
 /// Assert no Job whose name starts with `prefix` exists at any point during
 /// [`QUIET_WINDOW`] — for per-slot Job families whose exact slot suffix isn't
 /// known up front (Maintenance). Pick a prefix no other Job in the namespace
-/// shares (a repository's `<name>-bootstrap` is the classic collision).
+/// shares (a repository's `<name>-discovery` is the classic collision).
 async fn assert_no_job_with_prefix(jobs: &Api<Job>, prefix: &str, while_doing: &str) {
     let deadline = tokio::time::Instant::now() + QUIET_WINDOW;
     while tokio::time::Instant::now() < deadline {
@@ -435,7 +435,7 @@ async fn ready_repository_is_not_rebootstrapped_after_its_job_is_ttl_reaped() {
         .await
         .expect("repository should reach Ready");
 
-    wait_job_reaped(&jobs, "e2e-ttl-boot-bootstrap").await;
+    wait_job_reaped(&jobs, "e2e-ttl-boot-discovery").await;
 
     // The Repository does not own its bootstrap Job, so the reap does not wake
     // it — force reconciles the way any watch event would. On the buggy code
@@ -445,7 +445,7 @@ async fn ready_repository_is_not_rebootstrapped_after_its_job_is_ttl_reaped() {
     poke(&repos, "e2e-ttl-boot", "2").await;
     assert_job_stays_gone(
         &jobs,
-        "e2e-ttl-boot-bootstrap",
+        "e2e-ttl-boot-discovery",
         "poking a Ready Repository whose refresh is not due",
     )
     .await;
@@ -474,7 +474,7 @@ async fn ready_repository_is_not_rebootstrapped_after_its_job_is_ttl_reaped() {
         poll_interval(),
         || async {
             Ok(jobs
-                .get_opt("e2e-ttl-boot-bootstrap")
+                .get_opt("e2e-ttl-boot-discovery")
                 .await?
                 .is_some()
                 .then_some(()))

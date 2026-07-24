@@ -830,7 +830,10 @@ async fn bootstrap_cluster_via_mover(
         creds.namespace.as_deref(),
         ctx.operator_namespace.as_deref(),
     )?;
-    let job_name = format!("{name}-bootstrap");
+    // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
+    // repository, but every later run of this Job is a catalog re-scan — the
+    // name follows the recurring purpose users actually see.
+    let job_name = format!("{name}-discovery");
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &job_ns);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
@@ -1024,6 +1027,28 @@ async fn bootstrap_cluster_via_mover(
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
         )));
+    }
+
+    // Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` rename: the
+    // Job name is the lookup key, so a previous operator version's Job is
+    // invisible to the match above. Reap it here — reached only when we are
+    // about to create the renamed Job — and hold off creating the successor
+    // until the legacy Job is fully GONE (foreground delete keeps it visible
+    // while its pod terminates), so two movers never run against this
+    // repository concurrently mid-upgrade. The scan-request attempt stamp only
+    // lands with the successor's creation, so the pending token re-fires this
+    // path after the requeue. (A finished old Job is TTL-reaped regardless;
+    // this covers the in-flight one. Removable once no supported upgrade path
+    // predates the rename.)
+    if !io::legacy_bootstrap_cleared(
+        &ctx.client,
+        &job_ns,
+        name,
+        repo.metadata.uid.as_deref().unwrap_or_default(),
+    )
+    .await?
+    {
+        return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
     // Whether we are about to launch a Job BECAUSE OF a pending scan-request

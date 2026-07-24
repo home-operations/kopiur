@@ -97,18 +97,59 @@ tests:
       - eval_time: 90m
         alertname: KopiurLastBackupFailed
         exp_alerts: []
-  # 5. Overlapping scrape targets disagree (a deposed leader's final samples,
-  #    or a rolling update): stale instance says 0, fresh instance says 1 →
-  #    the max-by aggregation trusts the recovered value and stays silent.
-  #    FAILS against an unaggregated `kopiur_snapshotpolicy_last_backup_success
-  #    == 0` expr, which pages from the stale series alone (Greptile P1, PR #296).
+  # 5. Pod transition, stale FAILURE + fresh success: a deposed leader's final
+  #    samples say 0 while the new leader says 1. The stale target stops being
+  #    scraped (staleness ends its series within ~5m in production; modeled with
+  #    an explicit `stale` marker here), so the min-by disagreement window is
+  #    shorter than `for: 10m` — the alert goes pending but NEVER fires. This is
+  #    the false-page direction the `for` clause exists to absorb.
   - interval: 1m
     input_series:
       - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-old", pod="kopiur-a"}'
-        values: "0x60"
+        values: "0x8 stale"
       - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-new", pod="kopiur-b"}'
         values: "1x60"
     alert_rule_test:
+      - eval_time: 9m
+        alertname: KopiurLastBackupFailed
+        exp_alerts: []
       - eval_time: 30m
         alertname: KopiurLastBackupFailed
         exp_alerts: []
+  # 6. Pod transition, stale SUCCESS + fresh failure (Greptile P1, PR #296): the
+  #    deposed leader's final samples say 1 while the current leader reports the
+  #    latest backup FAILED. Suppression must require unanimity (`min by`): a
+  #    stale lone 1 must not mask a real failure — for a backup system the
+  #    missed-alert direction is data-loss-shaped, so disagreement resolves
+  #    toward alerting. FAILS against `max by` / an unaggregated `unless` RHS,
+  #    which both stay suppressed until the stale series is evicted.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-old", pod="kopiur-a"}'
+        values: "1x8 stale"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="daily", instance="ctrl-new", pod="kopiur-b"}'
+        values: "0x60"
+      - series: 'kopiur_resource_phase{kind="Snapshot", namespace="apps", name="daily-y", phase="Failed", policy="daily"}'
+        values: "1x60"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KopiurLastBackupFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              policy: daily
+              severity: warning
+            exp_annotations:
+              summary: "Latest backup for apps/daily failed"
+              description: "The most recent completed backup for SnapshotPolicy apps/daily failed. Resolves automatically once a newer backup succeeds."
+      - eval_time: 15m
+        alertname: KopiurSnapshotFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              name: daily-y
+              policy: daily
+              severity: warning
+            exp_annotations:
+              summary: "Snapshot apps/daily-y failed"
+              description: "Snapshot apps/daily-y is Failed and its policy has not completed a newer successful backup."

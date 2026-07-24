@@ -115,6 +115,15 @@ pub const REVIEW_ADOPTION_ACTION: &str = "ReviewAdoption";
 pub const ADOPTION_SCAN_REQUESTED_REASON: &str = "AdoptionScanRequested";
 /// Event `action` (guidance) for [`ADOPTION_SCAN_REQUESTED_REASON`].
 pub const AWAIT_CATALOG_SCAN_ACTION: &str = "AwaitCatalogScan";
+/// Normal Event reason on a `SnapshotPolicy` when the retention-aware adoption
+/// gate (adoption inv. 8) left identity-matching discovered snapshots
+/// unadopted because `spec.retention` would immediately prune them under an
+/// effective `deletionPolicy` of `Retain`/`Orphan`. Transition-gated: published
+/// when the withheld count changes, not every pass.
+pub const ADOPTION_SKIPPED_BY_RETENTION_REASON: &str = "AdoptionSkippedByRetention";
+/// Event `action` (guidance) for [`ADOPTION_SKIPPED_BY_RETENTION_REASON`]: the
+/// levers that change the outcome (retention width, deletionPolicy, pin, opt-out).
+pub const REVIEW_RETENTION_ACTION: &str = "ReviewRetention";
 
 /// Condition reason when a `Maintenance` (managed or external) covers the repo.
 pub const MAINTENANCE_CONFIGURED_REASON: &str = "MaintenanceConfigured";

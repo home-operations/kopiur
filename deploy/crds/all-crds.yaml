@@ -506,8 +506,9 @@ spec:
                 type: object
               bootstrap:
                 description: |-
-                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
-                  repository the operator cannot reach in-process.
+                  Tuning for the bootstrap/discovery mover Job (`<name>-discovery`) that
+                  connects/creates an object-store repository the operator cannot reach
+                  in-process (and re-runs for catalog re-scans).
                 nullable: true
                 properties:
                   failurePolicy:
@@ -579,10 +580,10 @@ spec:
                     description: |-
                       Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
                       current (re-list snapshots; for object-store / volume-backed repos this recycles
-                      the bootstrap Job every `refreshInterval`). **Off by default** — the repository
-                      still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup
-                      failure, but does not re-run on a timer. Enable it if you rely on discovered
-                      snapshots reflecting changes made outside this operator.
+                      the `<name>-discovery` mover Job every `refreshInterval`). **Off by default** —
+                      the repository still bootstraps once, re-bootstraps on a spec change, and
+                      re-probes on a backup failure, but does not re-run on a timer. Enable it if you
+                      rely on discovered snapshots reflecting changes made outside this operator.
                     type: boolean
                   refreshInterval:
                     default: 1h
@@ -3446,8 +3447,9 @@ spec:
                 type: object
               bootstrap:
                 description: |-
-                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
-                  repository the operator cannot reach in-process.
+                  Tuning for the bootstrap/discovery mover Job (`<name>-discovery`) that
+                  connects/creates an object-store repository the operator cannot reach
+                  in-process (and re-runs for catalog re-scans).
                 nullable: true
                 properties:
                   failurePolicy:
@@ -3519,10 +3521,10 @@ spec:
                     description: |-
                       Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
                       current (re-list snapshots; for object-store / volume-backed repos this recycles
-                      the bootstrap Job every `refreshInterval`). **Off by default** — the repository
-                      still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup
-                      failure, but does not re-run on a timer. Enable it if you rely on discovered
-                      snapshots reflecting changes made outside this operator.
+                      the `<name>-discovery` mover Job every `refreshInterval`). **Off by default** —
+                      the repository still bootstraps once, re-bootstraps on a spec change, and
+                      re-probes on a backup failure, but does not re-run on a timer. Enable it if you
+                      rely on discovered snapshots reflecting changes made outside this operator.
                     type: boolean
                   refreshInterval:
                     default: 1h
@@ -7129,6 +7131,17 @@ spec:
                       in-flight scan.
                     nullable: true
                     type: string
+                  skippedByRetention:
+                    description: |-
+                      Identity-matching discovered snapshots the last adoption pass left
+                      discovered because `spec.retention` would prune them immediately under
+                      the effective `deletionPolicy` (`Retain`/`Orphan` — a CR-only prune that
+                      would re-discover and re-adopt forever). `0`/absent when nothing was
+                      withheld. See the `AdoptionSkippedByRetention` event for the levers.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   totalAdopted:
                     description: Running total of `Snapshot` CRs ever adopted into this recipe.
                     format: uint64

@@ -74,13 +74,111 @@ pub async fn delete_mover_run(
     namespace: &str,
     job_name: &str,
 ) -> Result<()> {
+    delete_mover_run_with(client, namespace, job_name, &DeleteParams::background()).await
+}
+
+async fn delete_mover_run_with(
+    client: &kube::Client,
+    namespace: &str,
+    job_name: &str,
+    dp: &DeleteParams,
+) -> Result<()> {
     let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
-    match job_api.delete(job_name, &DeleteParams::background()).await {
+    match job_api.delete(job_name, dp).await {
         Ok(_) => {}
         Err(kube::Error::Api(ae)) if ae.code == 404 => {}
         Err(e) => return Err(Error::Kube(e)),
     }
     delete_work_spec_cm(client, namespace, job_name).await
+}
+
+/// What one pass of the `{name}-bootstrap` → `{name}-discovery` upgrade reap
+/// must do, decided purely from the observed legacy Job. The reap uses
+/// FOREGROUND deletion precisely so this decision can key on plain visibility:
+/// a foreground-deleting Job stays readable (deletionTimestamp set) until every
+/// pod it owns is fully gone, so "the Job is still visible" is exactly "a
+/// legacy mover pod may still be running".
+#[derive(Debug, PartialEq, Eq)]
+pub enum LegacyReapStep {
+    /// Legacy Job present and not yet deleting: start a foreground delete,
+    /// then wait — the successor must not be created this pass.
+    StartDelete,
+    /// A foreground delete is already in flight (deletionTimestamp set); its
+    /// pod may still be terminating. Keep waiting.
+    AwaitGone,
+    /// No legacy Job of OURS remains: safe to create the renamed successor.
+    Clear,
+}
+
+/// Pure decision for [`legacy_bootstrap_cleared`]; split out so the
+/// no-mover-overlap invariant is unit-testable without a cluster.
+///
+/// `owner_uid` scopes the reap to Jobs actually owned by the reconciled
+/// repository: every operator version that could have created the legacy Job
+/// stamped it with the CR's CONTROLLER `OwnerReference` (`owner_ref_for`,
+/// `controller: true` — that is how GC ties the Job to the CR), so the match
+/// requires the controller flag, not just the UID. A Job that merely COLLIDES
+/// on the name — a user's unrelated `{name}-bootstrap`, including one carrying
+/// a NON-controller ownerRef to this repository purely for GC-with-the-CR —
+/// is `Clear`: never deleted, never waited on (the successor's `-discovery`
+/// name cannot collide with it).
+pub fn legacy_reap_step(legacy: Option<&Job>, owner_uid: &str) -> LegacyReapStep {
+    let owned = |job: &Job| {
+        job.metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|or| or.uid == owner_uid && or.controller == Some(true))
+    };
+    match legacy {
+        None => LegacyReapStep::Clear,
+        Some(job) if !owned(job) => LegacyReapStep::Clear,
+        Some(job) => match job.metadata.deletion_timestamp {
+            None => LegacyReapStep::StartDelete,
+            Some(_) => LegacyReapStep::AwaitGone,
+        },
+    }
+}
+
+/// Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` Job rename:
+/// reap a previous operator version's Job before its renamed successor is
+/// created. Returns `true` when the caller may proceed to create the
+/// successor; `false` means a legacy Job (and possibly its pod) still exists —
+/// requeue shortly and retry, so two mover pods never touch the same
+/// repository concurrently mid-upgrade. Only a Job whose `ownerReferences`
+/// carry `owner_uid` (the reconciled CR's UID) is treated as the legacy mover;
+/// a name-colliding foreign Job is left untouched. Removable once no supported
+/// upgrade path predates the rename.
+pub async fn legacy_bootstrap_cleared(
+    client: &kube::Client,
+    namespace: &str,
+    repo_name: &str,
+    owner_uid: &str,
+) -> Result<bool> {
+    let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let legacy_job = format!("{repo_name}-bootstrap");
+    match legacy_reap_step(job_api.get_opt(&legacy_job).await?.as_ref(), owner_uid) {
+        LegacyReapStep::StartDelete => {
+            tracing::info!(
+                repository = %repo_name,
+                job = %legacy_job,
+                "reaping the pre-rename bootstrap Job (foreground) before creating its discovery successor"
+            );
+            delete_mover_run_with(client, namespace, &legacy_job, &DeleteParams::foreground())
+                .await?;
+            Ok(false)
+        }
+        LegacyReapStep::AwaitGone => {
+            tracing::debug!(
+                repository = %repo_name,
+                job = %legacy_job,
+                "waiting for the pre-rename bootstrap Job to finish terminating"
+            );
+            Ok(false)
+        }
+        LegacyReapStep::Clear => Ok(true),
+    }
 }
 
 /// Labels marking the per-namespace mover RBAC objects as kopiur-managed.
@@ -1135,6 +1233,118 @@ mod wedged_tests {
         assert_eq!(
             classify_wedged_pods(&[], 300, 600),
             WedgedVerdict::Progressing
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_reap_tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    const REPO_UID: &str = "repo-uid-1234";
+
+    fn ownref(uid: &str, controller: bool) -> OwnerReference {
+        OwnerReference {
+            api_version: "kopiur.home-operations.com/v1alpha1".to_string(),
+            kind: "Repository".to_string(),
+            name: "repo".to_string(),
+            uid: uid.to_string(),
+            // The operator's own stamp (`owner_ref_for`) always sets
+            // `controller: true`; a user-added GC-only ref leaves it unset.
+            controller: controller.then_some(true),
+            ..Default::default()
+        }
+    }
+
+    fn job_with_refs(deleting: bool, refs: Vec<OwnerReference>) -> Job {
+        Job {
+            metadata: ObjectMeta {
+                name: Some("repo-bootstrap".to_string()),
+                owner_references: Some(refs),
+                deletion_timestamp: deleting.then(|| {
+                    Time(k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap())
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A legacy Job as every prior operator version actually built it: a
+    /// controller ownerRef back to the reconciled CR.
+    fn job(deleting: bool, owner_uids: &[&str]) -> Job {
+        job_with_refs(
+            deleting,
+            owner_uids.iter().map(|uid| ownref(uid, true)).collect(),
+        )
+    }
+
+    /// The no-mover-overlap invariant: a visible legacy Job of OURS — deleting
+    /// or not — must never let the discovery successor be created this pass.
+    #[test]
+    fn visible_legacy_job_starts_a_foreground_delete() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &[REPO_UID])), REPO_UID),
+            LegacyReapStep::StartDelete
+        );
+    }
+
+    #[test]
+    fn deleting_legacy_job_keeps_waiting_until_fully_gone() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(true, &[REPO_UID])), REPO_UID),
+            LegacyReapStep::AwaitGone
+        );
+    }
+
+    #[test]
+    fn absent_legacy_job_clears_the_successor_to_launch() {
+        assert_eq!(legacy_reap_step(None, REPO_UID), LegacyReapStep::Clear);
+    }
+
+    /// The no-collateral-damage invariant: a user's unrelated Job that merely
+    /// collides on the `{name}-bootstrap` name — no ownerRef back to the
+    /// reconciled repository — is never deleted and never blocks the successor.
+    #[test]
+    fn name_colliding_foreign_job_is_left_alone_and_does_not_block() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &[])), REPO_UID),
+            LegacyReapStep::Clear
+        );
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &["some-other-owner"])), REPO_UID),
+            LegacyReapStep::Clear
+        );
+    }
+
+    /// A user Job carrying a NON-controller ownerRef to the repository (a
+    /// legitimate GC-with-the-CR tie, allowed in any number per object) is
+    /// NOT ours: only the operator's `controller: true` stamp counts.
+    #[test]
+    fn non_controller_owner_reference_does_not_count_as_ours() {
+        assert_eq!(
+            legacy_reap_step(
+                Some(&job_with_refs(false, vec![ownref(REPO_UID, false)])),
+                REPO_UID
+            ),
+            LegacyReapStep::Clear
+        );
+    }
+
+    /// Ownership matches on ANY controller ownerRef carrying the CR's UID,
+    /// wherever it sits in the list.
+    #[test]
+    fn ownership_matches_any_owner_reference_with_the_repo_uid() {
+        assert_eq!(
+            legacy_reap_step(
+                Some(&job_with_refs(
+                    false,
+                    vec![ownref("unrelated", false), ownref(REPO_UID, true)]
+                )),
+                REPO_UID
+            ),
+            LegacyReapStep::StartDelete
         );
     }
 }

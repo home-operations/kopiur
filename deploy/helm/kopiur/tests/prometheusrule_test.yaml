@@ -15,7 +15,7 @@ tests:
           value: KopiurLastBackupFailed
       - matchRegex:
           path: spec.groups[0].rules[2].expr
-          pattern: max by \(namespace, policy\) \(kopiur_snapshotpolicy_last_backup_success\) == 0
+          pattern: min by \(namespace, policy\) \(kopiur_snapshotpolicy_last_backup_success\) == 0
   - it: gates the per-CR snapshot alert on policy recovery
     set:
       monitoring.prometheusRule.enabled: true
@@ -25,4 +25,4 @@ tests:
           value: KopiurSnapshotFailed
       - matchRegex:
           path: spec.groups[0].rules[4].expr
-          pattern: unless on \(namespace, policy\)
+          pattern: unless on \(namespace, policy\) \(min by \(namespace, policy\)

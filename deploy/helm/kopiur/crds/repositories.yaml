@@ -506,8 +506,9 @@ spec:
                 type: object
               bootstrap:
                 description: |-
-                  Tuning for the one-shot bootstrap Job that connects/creates an object-store
-                  repository the operator cannot reach in-process.
+                  Tuning for the bootstrap/discovery mover Job (`<name>-discovery`) that
+                  connects/creates an object-store repository the operator cannot reach
+                  in-process (and re-runs for catalog re-scans).
                 nullable: true
                 properties:
                   failurePolicy:
@@ -579,10 +580,10 @@ spec:
                     description: |-
                       Opt-in: periodically re-scan the repository to keep discovered `Snapshot` CRs
                       current (re-list snapshots; for object-store / volume-backed repos this recycles
-                      the bootstrap Job every `refreshInterval`). **Off by default** — the repository
-                      still bootstraps once, re-bootstraps on a spec change, and re-probes on a backup
-                      failure, but does not re-run on a timer. Enable it if you rely on discovered
-                      snapshots reflecting changes made outside this operator.
+                      the `<name>-discovery` mover Job every `refreshInterval`). **Off by default** —
+                      the repository still bootstraps once, re-bootstraps on a spec change, and
+                      re-probes on a backup failure, but does not re-run on a timer. Enable it if you
+                      rely on discovered snapshots reflecting changes made outside this operator.
                     type: boolean
                   refreshInterval:
                     default: 1h

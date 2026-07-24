@@ -56,8 +56,9 @@ pub struct RepositorySpec {
     /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
-    /// Tuning for the one-shot bootstrap Job that connects/creates an object-store
-    /// repository the operator cannot reach in-process.
+    /// Tuning for the bootstrap/discovery mover Job (`<name>-discovery`) that
+    /// connects/creates an object-store repository the operator cannot reach
+    /// in-process (and re-runs for catalog re-scans).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap: Option<BootstrapSpec>,
     /// Base mover configuration inherited by every mover this repository spawns.
@@ -109,7 +110,7 @@ pub struct RepositorySpec {
     pub parameters: Option<RepositoryParameters>,
 }
 
-/// Tuning for the one-shot bootstrap Job, shared by `Repository` and
+/// Tuning for the bootstrap/discovery mover Job, shared by `Repository` and
 /// `ClusterRepository`. Bootstrap connects (or, with `create`, creates) an
 /// object-store repository the operator cannot reach in-process.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]

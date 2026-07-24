@@ -457,4 +457,62 @@ mod tests {
             "delete: months outside keepMonthly:2 and the same-day older duplicate"
         );
     }
+
+    /// Convergence keystone for adoption invariant 8 (controller crate): the
+    /// selection is stable on its own kept set — re-running it over exactly the
+    /// survivors deletes nothing and keeps the same set. This is what makes the
+    /// adoption gate's pre-prune evaluation equal the next retention pass's
+    /// decision: pruning the non-kept rows never re-selects (or de-selects) a
+    /// survivor. Holds because the selection is time-invariant (buckets derive
+    /// purely from end times), a non-kept row is never a newest-in-period
+    /// representative, and ties break deterministically by id.
+    #[test]
+    fn select_kept_is_stable_on_its_own_kept_set() {
+        let populations: Vec<Vec<Fake>> = vec![
+            // Dense multi-day spread with a same-instant id tie and a pinned
+            // straggler far outside every bucket.
+            vec![
+                fake("tie-a", at(2026, 5, 24, 2, 0)),
+                fake("tie-b", at(2026, 5, 24, 2, 0)),
+                fake("d23", at(2026, 5, 23, 2, 0)),
+                fake("d22-am", at(2026, 5, 22, 2, 0)),
+                fake("d22-pm", at(2026, 5, 22, 14, 0)),
+                fake("w-old", at(2026, 5, 1, 2, 0)),
+                pinned("pin-ancient", at(2020, 1, 1, 0, 0)),
+            ],
+            // Single row; empty input handled by select_kept directly.
+            vec![fake("only", at(2026, 5, 24, 2, 0))],
+        ];
+        let policies = [
+            policy(Some(2), None, None, None, None, None),
+            policy(None, None, Some(2), None, None, None),
+            policy(Some(1), None, Some(2), Some(1), Some(1), Some(1)),
+            policy(None, None, None, None, None, None), // keeps only pins
+        ];
+        for snaps in &populations {
+            for pol in &policies {
+                let first = select_kept(snaps, pol);
+                let survivors: Vec<Fake> = snaps
+                    .iter()
+                    .filter(|s| first.keep.iter().any(|k| k == &s.id))
+                    .map(|s| Fake {
+                        id: s.id.clone(),
+                        end: s.end,
+                        pinned: s.pinned,
+                    })
+                    .collect();
+                let second = select_kept(&survivors, pol);
+                assert!(
+                    second.delete.is_empty(),
+                    "keep(S) must be a fixed point; policy {pol:?} re-deleted {:?}",
+                    second.delete
+                );
+                assert_eq!(
+                    as_set(&second.keep),
+                    as_set(&first.keep),
+                    "keep(keep(S)) == keep(S) for policy {pol:?}"
+                );
+            }
+        }
+    }
 }
