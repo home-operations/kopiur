@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.1](https://github.com/home-operations/kopiur/compare/0.8.0...0.8.1) (2026-07-24)
+
+
+### Features
+
+* **deps:** update rust crate base64 (0.22.1 → 0.23.0) ([#293](https://github.com/home-operations/kopiur/issues/293)) ([5ab14d5](https://github.com/home-operations/kopiur/commit/5ab14d5e7d19af218c0273c70ce3d42ac05064da))
+* **deps:** update rust crate kube (4.0.0 → 4.2.0) ([#288](https://github.com/home-operations/kopiur/issues/288)) ([b067458](https://github.com/home-operations/kopiur/commit/b0674583347dd4b017b15256c8a6a5a778f7db5a))
+* httpRequest hook headers ([#290](https://github.com/home-operations/kopiur/issues/290)) + recovery-aware alerts ([#280](https://github.com/home-operations/kopiur/issues/280)) ([#296](https://github.com/home-operations/kopiur/issues/296)) ([f388a14](https://github.com/home-operations/kopiur/commit/f388a14f6a0310fdd2d18ebd4e5f3d85ce84948b))
+* **renovate:** automerge if it passes CI ([66f243f](https://github.com/home-operations/kopiur/commit/66f243f3e763504b567d78489488c32d4253e5bc))
+
+
+### Bug Fixes
+
+* **controller:** survive an API-server outage without exhausting file descriptors ([#287](https://github.com/home-operations/kopiur/issues/287)) ([ce184b6](https://github.com/home-operations/kopiur/commit/ce184b6835fcc02926dfb373993ee122311811ca))
+* **deps:** update rust crate clap (4.6.2 → 4.6.3) ([#277](https://github.com/home-operations/kopiur/issues/277)) ([e3d4113](https://github.com/home-operations/kopiur/commit/e3d4113034ce1a327c688ecc316dd7b6fd15fbe2))
+* **deps:** update rust crate libc (0.2.186 → 0.2.189) ([#283](https://github.com/home-operations/kopiur/issues/283)) ([2b2e636](https://github.com/home-operations/kopiur/commit/2b2e6363aa99496ba3233d400a97b4a93473a13b))
+* **deps:** update rust crate serde_json (1.0.150 → 1.0.151) ([#275](https://github.com/home-operations/kopiur/issues/275)) ([1410f42](https://github.com/home-operations/kopiur/commit/1410f42f97e94d96ad11ded78bc71591b97043e3))
+* **deps:** update rust crate time (0.3.53 → 0.3.54) ([#276](https://github.com/home-operations/kopiur/issues/276)) ([ff250ff](https://github.com/home-operations/kopiur/commit/ff250ffdacf7f276d7ecd67fc0d958c1ddddc9d4))
+* **deps:** update rust crate tokio (1.53.0 → 1.53.1) ([#281](https://github.com/home-operations/kopiur/issues/281)) ([82082e9](https://github.com/home-operations/kopiur/commit/82082e9323a81c241df9cb003e7db5dbc22bb71e))
+* **helm:** stamp Chart.yaml version on release + document image sub-fields ([#289](https://github.com/home-operations/kopiur/issues/289)) ([041549a](https://github.com/home-operations/kopiur/commit/041549a338642855a132cd720fa86bfbb78f992e))
+* **probe:** stamp the health probe at launch so it stops recycling its Job ([#273](https://github.com/home-operations/kopiur/issues/273)) ([#278](https://github.com/home-operations/kopiur/issues/278)) ([7fa3657](https://github.com/home-operations/kopiur/commit/7fa36571698908691e24c6abe65a4b1bb705476c))
+* **release:** use the generic updater for Chart.yaml + stamp README badges ([#292](https://github.com/home-operations/kopiur/issues/292)) ([f4a3141](https://github.com/home-operations/kopiur/commit/f4a31419b40bd1eba3b56496ef50671e2ca24a43))
+* retention-aware adoption stops the adopt/prune/rediscover livelock ([#299](https://github.com/home-operations/kopiur/issues/299)) ([4093f12](https://github.com/home-operations/kopiur/commit/4093f12185b2156c7a50bfeff114e0a6588ecb7d))
+
+
+### Styles
+
+* indent markdown at 2 to match embedded yaml ([#279](https://github.com/home-operations/kopiur/issues/279)) ([06885e0](https://github.com/home-operations/kopiur/commit/06885e069a0bec4b88ea7de09d3945a7e6652dc0))
+
+
+### Miscellaneous Chores
+
+* **github-release:** Update release helm-unittest/helm-unittest (v1.1.1 → v1.1.2) ([#301](https://github.com/home-operations/kopiur/issues/301)) ([e62272d](https://github.com/home-operations/kopiur/commit/e62272d7b0567a4e987fd27d5965648abb0d50ab))
+* **krew:** kopiur 0.8.0 manifest ([2be416f](https://github.com/home-operations/kopiur/commit/2be416ffd31c367d502ede66fb9a9eaea1465df6))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.29 → 0.11.30) ([#282](https://github.com/home-operations/kopiur/issues/282)) ([e12f96c](https://github.com/home-operations/kopiur/commit/e12f96c1e7a798e173b28563facd2adc60f0ba70))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.30 → 0.11.31) ([#286](https://github.com/home-operations/kopiur/issues/286)) ([a3f31e6](https://github.com/home-operations/kopiur/commit/a3f31e68a03d98ce90d9eccd9811636ba920e8a0))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.31 → 0.11.32) ([#298](https://github.com/home-operations/kopiur/issues/298)) ([9d8c171](https://github.com/home-operations/kopiur/commit/9d8c171a199d52cf256c72c2d85e046111354d32))
+* **mise:** Update tool kubectl (1.36.2 → 1.36.3) ([#291](https://github.com/home-operations/kopiur/issues/291)) ([ef290f8](https://github.com/home-operations/kopiur/commit/ef290f81aac128ba54f8a3f10ff4c8b3e0f00dc3))
+* **mise:** Update tool oxfmt (0.59.0 → 0.60.0) ([#284](https://github.com/home-operations/kopiur/issues/284)) ([ad8a18a](https://github.com/home-operations/kopiur/commit/ad8a18a15548f0e7dbe5b0dacd1fc69dfad59744))
+* **mise:** Update tool rust (1.96.1 → 1.97.1) ([#222](https://github.com/home-operations/kopiur/issues/222)) ([fbeb2fa](https://github.com/home-operations/kopiur/commit/fbeb2faa68d4e7a8790c5a00582a3f1fb1496f78))
+* **mise:** Update tool zizmor (1.27.0 → 1.28.0) ([#285](https://github.com/home-operations/kopiur/issues/285)) ([9ef35ce](https://github.com/home-operations/kopiur/commit/9ef35ce8c9605e4be0c26b83a8cea6a71c34cd67))
+
 ## [0.8.0](https://github.com/home-operations/kopiur/compare/0.7.5...0.8.0) (2026-07-19)
 
 ### ⚠ BREAKING CHANGES
