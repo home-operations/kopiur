@@ -1749,32 +1749,39 @@ async fn drive_direct_restore(
                 ctx.metrics.set_restore_duration(namespace, name, secs);
             }
             if phase != Some(RestorePhase::Completed) {
-                // A deferred (object-store/identity) resolution may have come up
-                // empty under `Continue`. The mover pins the outcome to
-                // status.resolved before its Job goes terminal, so a fresh read
-                // tells a real restore from a deploy-or-restore-empty — without it
-                // the success message would falsely claim "data was written".
-                let resolved = api
-                    .get_opt(name)
-                    .await?
-                    .and_then(|r| r.status)
-                    .and_then(|s| s.resolved);
-                io::patch_status(
-                    api,
-                    name,
-                    restore_success_status(restore, resolved.as_ref()),
-                )
-                .await?;
+                // A fresh read serves two purposes. (1) A deferred
+                // (object-store/identity) resolution may have come up empty under
+                // `Continue`: the mover pins the outcome to status.resolved before
+                // its Job goes terminal, so the live object tells a real restore
+                // from a deploy-or-restore-empty — without it the success message
+                // would falsely claim "data was written". (2) The conditions BASE:
+                // `restore_ready_status` rebuilds the conditions array from its
+                // argument, and the watch-store copy driving this reconcile can
+                // predate this controller's own launch-time condition patches
+                // (SecurityContextInherited, the MoverPermitted clear) — on a
+                // fast mover Job, building the terminal write on the stale copy
+                // durably erased them (the condition-writers-clobber class,
+                // caught by the recorded-identity restore e2e's 3s Job).
+                let Some(live) = io::live_conditions_source(api, name, restore).await else {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+                };
+                let resolved = live.status.as_ref().and_then(|s| s.resolved.clone());
+                io::patch_status(api, name, restore_success_status(&live, resolved.as_ref()))
+                    .await?;
             }
             Ok(Action::requeue(std::time::Duration::from_secs(600)))
         }
         MoverOutcome::Failed => {
             if phase != Some(RestorePhase::Failed) {
+                // Live conditions base for the same reason as the Succeeded arm.
+                let Some(live) = io::live_conditions_source(api, name, restore).await else {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+                };
                 io::patch_status(
                     api,
                     name,
                     restore_ready_status(
-                        restore,
+                        &live,
                         RestorePhase::Failed,
                         "MoverJobFailed",
                         "the restore mover Job failed; see the Job/pod logs for the \
@@ -1802,10 +1809,17 @@ async fn drive_direct_restore(
             };
             // A new Job always writes; a poll only on a phase flip.
             if created || phase != Some(RestorePhase::Restoring) {
+                // Live conditions base: on `created` this write follows the SAME
+                // reconcile's inherit/compat condition patches (which re-read
+                // live), so building on the reconcile-start copy would erase them
+                // moments after they were written.
+                let Some(live) = io::live_conditions_source(api, name, restore).await else {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                };
                 io::patch_status(
                     api,
                     name,
-                    restore_ready_status(restore, target_phase, reason, msg),
+                    restore_ready_status(&live, target_phase, reason, msg),
                 )
                 .await?;
             }
@@ -1865,17 +1879,26 @@ async fn steady_terminal_restore(
     phase: RestorePhase,
 ) -> Result<Action> {
     if !kstatus_settled_for(restore, phase) {
+        // Live conditions base: this reconcile is typically triggered by the
+        // MOVER's own terminal-phase PATCH, and the watch-store copy carrying it
+        // can predate this controller's launch-time condition patches
+        // (SecurityContextInherited, the MoverPermitted clear). Rebuilding the
+        // conditions array from that stale copy durably erased them on fast
+        // mover Jobs (the condition-writers-clobber class, caught by the
+        // recorded-identity restore e2e's 3s Job) — the heal must build on the
+        // live object.
+        let Some(live) = io::live_conditions_source(api, name, restore).await else {
+            return Ok(Action::requeue(std::time::Duration::from_secs(600)));
+        };
         let status = if phase == RestorePhase::Completed {
             // The mover wrote `phase: Completed` + `status.resolved` in one
             // PATCH, so `resolved` is observed here — distinguish a real
             // restore from a deploy-or-restore that came up empty.
-            restore_success_status(
-                restore,
-                restore.status.as_ref().and_then(|s| s.resolved.as_ref()),
-            )
+            let resolved = live.status.as_ref().and_then(|s| s.resolved.clone());
+            restore_success_status(&live, resolved.as_ref())
         } else {
             restore_ready_status(
-                restore,
+                &live,
                 phase,
                 "MoverJobFailed",
                 "the restore mover reported a terminal failure; see \
