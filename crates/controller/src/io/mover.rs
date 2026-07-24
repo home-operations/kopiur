@@ -106,15 +106,31 @@ pub enum LegacyReapStep {
     /// A foreground delete is already in flight (deletionTimestamp set); its
     /// pod may still be terminating. Keep waiting.
     AwaitGone,
-    /// No legacy Job remains: safe to create the renamed successor.
+    /// No legacy Job of OURS remains: safe to create the renamed successor.
     Clear,
 }
 
 /// Pure decision for [`legacy_bootstrap_cleared`]; split out so the
 /// no-mover-overlap invariant is unit-testable without a cluster.
-pub fn legacy_reap_step(legacy: Option<&Job>) -> LegacyReapStep {
+///
+/// `owner_uid` scopes the reap to Jobs actually owned by the reconciled
+/// repository: every operator version that could have created the legacy Job
+/// stamped it with the CR's `OwnerReference` (that is how GC ties the Job to
+/// the CR), so a Job that merely COLLIDES on the name — a user's unrelated
+/// `{name}-bootstrap` — is `Clear`: never deleted, never waited on (the
+/// successor's `-discovery` name cannot collide with it).
+pub fn legacy_reap_step(legacy: Option<&Job>, owner_uid: &str) -> LegacyReapStep {
+    let owned = |job: &Job| {
+        job.metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|or| or.uid == owner_uid)
+    };
     match legacy {
         None => LegacyReapStep::Clear,
+        Some(job) if !owned(job) => LegacyReapStep::Clear,
         Some(job) => match job.metadata.deletion_timestamp {
             None => LegacyReapStep::StartDelete,
             Some(_) => LegacyReapStep::AwaitGone,
@@ -127,16 +143,19 @@ pub fn legacy_reap_step(legacy: Option<&Job>) -> LegacyReapStep {
 /// created. Returns `true` when the caller may proceed to create the
 /// successor; `false` means a legacy Job (and possibly its pod) still exists —
 /// requeue shortly and retry, so two mover pods never touch the same
-/// repository concurrently mid-upgrade. Removable once no supported upgrade
-/// path predates the rename.
+/// repository concurrently mid-upgrade. Only a Job whose `ownerReferences`
+/// carry `owner_uid` (the reconciled CR's UID) is treated as the legacy mover;
+/// a name-colliding foreign Job is left untouched. Removable once no supported
+/// upgrade path predates the rename.
 pub async fn legacy_bootstrap_cleared(
     client: &kube::Client,
     namespace: &str,
     repo_name: &str,
+    owner_uid: &str,
 ) -> Result<bool> {
     let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
     let legacy_job = format!("{repo_name}-bootstrap");
-    match legacy_reap_step(job_api.get_opt(&legacy_job).await?.as_ref()) {
+    match legacy_reap_step(job_api.get_opt(&legacy_job).await?.as_ref(), owner_uid) {
         LegacyReapStep::StartDelete => {
             tracing::info!(
                 repository = %repo_name,
@@ -1220,10 +1239,24 @@ mod legacy_reap_tests {
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
-    fn job(deleting: bool) -> Job {
+    const REPO_UID: &str = "repo-uid-1234";
+
+    fn job(deleting: bool, owner_uids: &[&str]) -> Job {
         Job {
             metadata: ObjectMeta {
                 name: Some("repo-bootstrap".to_string()),
+                owner_references: Some(
+                    owner_uids
+                        .iter()
+                        .map(|uid| OwnerReference {
+                            api_version: "kopiur.home-operations.com/v1alpha1".to_string(),
+                            kind: "Repository".to_string(),
+                            name: "repo".to_string(),
+                            uid: (*uid).to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
                 deletion_timestamp: deleting.then(|| {
                     Time(k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap())
                 }),
@@ -1233,12 +1266,12 @@ mod legacy_reap_tests {
         }
     }
 
-    /// The no-mover-overlap invariant: a visible legacy Job — deleting or not —
-    /// must never let the discovery successor be created this pass.
+    /// The no-mover-overlap invariant: a visible legacy Job of OURS — deleting
+    /// or not — must never let the discovery successor be created this pass.
     #[test]
     fn visible_legacy_job_starts_a_foreground_delete() {
         assert_eq!(
-            legacy_reap_step(Some(&job(false))),
+            legacy_reap_step(Some(&job(false, &[REPO_UID])), REPO_UID),
             LegacyReapStep::StartDelete
         );
     }
@@ -1246,13 +1279,38 @@ mod legacy_reap_tests {
     #[test]
     fn deleting_legacy_job_keeps_waiting_until_fully_gone() {
         assert_eq!(
-            legacy_reap_step(Some(&job(true))),
+            legacy_reap_step(Some(&job(true, &[REPO_UID])), REPO_UID),
             LegacyReapStep::AwaitGone
         );
     }
 
     #[test]
     fn absent_legacy_job_clears_the_successor_to_launch() {
-        assert_eq!(legacy_reap_step(None), LegacyReapStep::Clear);
+        assert_eq!(legacy_reap_step(None, REPO_UID), LegacyReapStep::Clear);
+    }
+
+    /// The no-collateral-damage invariant: a user's unrelated Job that merely
+    /// collides on the `{name}-bootstrap` name — no ownerRef back to the
+    /// reconciled repository — is never deleted and never blocks the successor.
+    #[test]
+    fn name_colliding_foreign_job_is_left_alone_and_does_not_block() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &[])), REPO_UID),
+            LegacyReapStep::Clear
+        );
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &["some-other-owner"])), REPO_UID),
+            LegacyReapStep::Clear
+        );
+    }
+
+    /// Ownership matches on ANY ownerRef carrying the CR's UID, wherever it
+    /// sits in the list.
+    #[test]
+    fn ownership_matches_any_owner_reference_with_the_repo_uid() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(false, &["unrelated", REPO_UID])), REPO_UID),
+            LegacyReapStep::StartDelete
+        );
     }
 }

@@ -956,7 +956,14 @@ async fn bootstrap_via_mover(
     // path after the requeue. (A finished old Job is TTL-reaped regardless;
     // this covers the in-flight one. Removable once no supported upgrade path
     // predates the rename.)
-    if !io::legacy_bootstrap_cleared(&ctx.client, namespace, name).await? {
+    if !io::legacy_bootstrap_cleared(
+        &ctx.client,
+        namespace,
+        name,
+        repo.metadata.uid.as_deref().unwrap_or_default(),
+    )
+    .await?
+    {
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
