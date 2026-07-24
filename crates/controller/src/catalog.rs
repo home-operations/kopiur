@@ -942,6 +942,21 @@ pub struct ScanOutcome {
     /// reaches this scan). The `status.catalog.foreignSnapshotCount` /
     /// `kopiur_repo_foreign_snapshots` value.
     pub foreign: i64,
+    /// Entries whose `kopiur-meta` tag declared a schema newer than this
+    /// operator understands (degraded to recorded-absent). Aggregated per scan,
+    /// like the foreign-suffix counts — never a per-entry log line a foreign
+    /// writer could amplify.
+    pub meta_unsupported: i64,
+    /// Entries whose `kopiur-meta` tag was present but undecodable (degraded to
+    /// recorded-absent). Aggregated per scan, same rule as above.
+    pub meta_malformed: i64,
+    /// Discovered entries whose CR create/status write was rejected 4xx and was
+    /// skipped so the rest of the scan proceeds (a single bad entry used to
+    /// re-wedge every pass).
+    pub create_failed: i64,
+    /// Existing `Snapshot` CRs backfilled with `status.recorded`
+    /// (+ description) this scan.
+    pub backfilled: i64,
 }
 
 /// Run a catalog scan: LIST the relevant `Snapshot` CRs, run the identity-aware
@@ -1028,21 +1043,18 @@ pub async fn scan(
         ..Default::default()
     };
 
-    for entry in &plan.create {
-        let host = entry.source.host.as_str();
-        let target_ns = match pass.decisions.get(host) {
-            Some(PlacementDecision::Place(ns)) => ns.clone(),
-            Some(PlacementDecision::Unplaced) | None => {
-                outcome.unplaced_hosts.insert(host.to_string());
-                continue;
-            }
-            // Excluded from `plan.create` via `foreign_ignored_ids` above; this arm
-            // is defensive (never actually reached).
-            Some(PlacementDecision::ForeignIgnored) => continue,
-        };
-        materialize_discovered(ctx, &owner_ref, &target_ns, repo_name, repo_uid, entry).await?;
-        outcome.created += 1;
-    }
+    create_discovered_rows(
+        ctx,
+        &owner_ref,
+        repo_name,
+        repo_uid,
+        &plan,
+        &pass,
+        &mut outcome,
+    )
+    .await?;
+    let backfill_failed =
+        backfill_recorded_meta(ctx, repo_name, listing, &all_snapshots, &mut outcome).await;
 
     for (ns, name) in &plan.expire {
         let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
@@ -1054,7 +1066,26 @@ pub async fn scan(
     }
 
     outcome.discovered = (rows.len() as i64 - outcome.expired).max(0) + outcome.created;
-    if outcome.created > 0 || outcome.expired > 0 || outcome.foreign > 0 {
+    log_scan_summary(repo_name, &outcome, &pass, backfill_failed);
+    Ok(outcome)
+}
+
+/// The per-scan summary logging: one info line when the scan changed anything,
+/// and ONE aggregated warn for decode/write degradations — counts only, never
+/// per-entry lines (a foreign writer controls the tag values and must not be
+/// able to make a scan emit thousands of warnings).
+fn log_scan_summary(
+    repo_name: &str,
+    outcome: &ScanOutcome,
+    pass: &PlacementPass,
+    backfill_failed: i64,
+) {
+    let changed = outcome.created > 0
+        || outcome.expired > 0
+        || outcome.foreign > 0
+        || outcome.backfilled > 0
+        || outcome.create_failed > 0;
+    if changed {
         // Bounded top-N (never in status: cardinality is foreign-writer-controlled).
         let mut top: Vec<(&String, &i64)> = pass.foreign_suffix_counts.iter().collect();
         top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -1065,17 +1096,242 @@ pub async fn scan(
             expired = outcome.expired,
             discovered = outcome.discovered,
             foreign = outcome.foreign,
+            backfilled = outcome.backfilled,
             foreign_top_suffixes = ?top,
             "catalog scan reconciled discovered Snapshot CRs"
         );
     }
-    Ok(outcome)
+    if outcome.meta_unsupported > 0 || outcome.meta_malformed > 0 || outcome.create_failed > 0 {
+        tracing::warn!(
+            repo = repo_name,
+            meta_unsupported = outcome.meta_unsupported,
+            meta_malformed = outcome.meta_malformed,
+            create_failed = outcome.create_failed,
+            backfill_failed,
+            "catalog scan degraded some entries (kopiur-meta undecodable and/or \
+             apiserver-rejected rows); affected rows carry no status.recorded"
+        );
+    }
+}
+
+/// The create half of [`scan`]: materialize every planned entry, placement-
+/// routed, with the `kopiur-meta` decode aggregate-counted and per-entry 4xx
+/// rejections SKIPPED (one bad entry used to re-wedge every pass at the `?`).
+/// Non-4xx errors still abort — the whole pass would fail anyway and a retry
+/// can genuinely fix them.
+async fn create_discovered_rows(
+    ctx: &Context,
+    owner_ref: &OwnerReference,
+    repo_name: &str,
+    repo_uid: &str,
+    plan: &CatalogPlan<'_>,
+    pass: &PlacementPass,
+    outcome: &mut ScanOutcome,
+) -> Result<()> {
+    for entry in &plan.create {
+        let host = entry.source.host.as_str();
+        let target_ns = match pass.decisions.get(host) {
+            Some(PlacementDecision::Place(ns)) => ns.clone(),
+            Some(PlacementDecision::Unplaced) | None => {
+                outcome.unplaced_hosts.insert(host.to_string());
+                continue;
+            }
+            // Excluded from `plan.create` via `foreign_ignored_ids`; this arm
+            // is defensive (never actually reached).
+            Some(PlacementDecision::ForeignIgnored) => continue,
+        };
+        let recorded = decode_recorded_counted(entry, outcome);
+        match materialize_discovered(
+            ctx,
+            owner_ref,
+            &target_ns,
+            repo_name,
+            repo_uid,
+            entry,
+            recorded.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => outcome.created += 1,
+            // A 4xx is THIS entry's problem (a schema-invalid name/field the
+            // apiserver rejects) — skip it so one bad entry no longer wedges
+            // the scan.
+            Err(Error::Kube(kube::Error::Api(ae))) if (400..500).contains(&ae.code) => {
+                outcome.create_failed += 1;
+                if outcome.create_failed == 1 {
+                    tracing::warn!(
+                        repo = repo_name,
+                        namespace = %target_ns,
+                        entry = %entry.id,
+                        code = ae.code,
+                        reason = %ae.message,
+                        "skipping a discovered entry the apiserver rejected; the scan \
+                         continues (first rejection logged; total in the scan summary)"
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The backfill half of [`scan`]: an already-materialized (or pre-feature
+/// produced) CR whose kopia snapshot NOW shows decodable `kopiur-meta` gains
+/// `status.recorded` (+ description) via a targeted patch ([`backfill_patch`])
+/// — issued ONLY while absent, so the steady state plans no write (no status
+/// churn, and these patches never touch the conditions array). Matched by
+/// `status.snapshot.kopiaSnapshotID`, which covers discovered AND produced
+/// rows. Returns the count of failed patches (opportunistic: a rejected
+/// backfill never wedges the scan).
+async fn backfill_recorded_meta(
+    ctx: &Context,
+    repo_name: &str,
+    listing: &[SnapshotListEntry],
+    all_snapshots: &[Snapshot],
+    outcome: &mut ScanOutcome,
+) -> i64 {
+    let mut by_kopia_id: BTreeMap<&str, Vec<&Snapshot>> = BTreeMap::new();
+    for s in all_snapshots {
+        // Never patch a row that is already being deleted.
+        if s.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        if let Some(id) = s
+            .status
+            .as_ref()
+            .and_then(|st| st.snapshot.as_ref())
+            .map(|i| i.kopia_snapshot_id.as_str())
+            .filter(|id| !id.is_empty())
+        {
+            by_kopia_id.entry(id).or_default().push(s);
+        }
+    }
+    let mut backfill_failed: i64 = 0;
+    for entry in listing {
+        let Some(crs) = by_kopia_id.get(entry.id.as_str()) else {
+            continue;
+        };
+        if crs
+            .iter()
+            .all(|s| s.status.as_ref().is_none_or(|st| st.recorded.is_some()))
+        {
+            continue; // steady state: nothing lacks `recorded`.
+        }
+        if decode_recorded_counted(entry, outcome).is_none() {
+            continue;
+        }
+        for cr in crs {
+            let Some(patch) = backfill_patch(entry, cr) else {
+                continue;
+            };
+            let ns = cr.namespace().unwrap_or_default();
+            let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &ns);
+            match io::patch_status(&api, &cr.name_any(), patch).await {
+                Ok(()) => outcome.backfilled += 1,
+                Err(e) => {
+                    backfill_failed += 1;
+                    if backfill_failed == 1 {
+                        tracing::warn!(
+                            repo = repo_name,
+                            snapshot = %cr.name_any(),
+                            namespace = %ns,
+                            error = %e,
+                            "recorded-metadata backfill patch failed; skipping \
+                             (first failure logged; total in the scan summary)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    backfill_failed
+}
+
+/// Decode an entry's recorded mover identity with the decode problems
+/// aggregate-counted on `outcome` — never per-entry logged, because the tag
+/// value is foreign-writer-controlled. Shared by the create and backfill loops
+/// so the counting rule cannot fork.
+fn decode_recorded_counted(
+    entry: &SnapshotListEntry,
+    outcome: &mut ScanOutcome,
+) -> Option<kopiur_api::RecordedSnapshotMeta> {
+    match recorded_from_entry(entry) {
+        kopiur_api::MetaTagDecode::Decoded(meta) => Some(meta),
+        kopiur_api::MetaTagDecode::Absent => None,
+        kopiur_api::MetaTagDecode::UnsupportedSchema { .. } => {
+            outcome.meta_unsupported += 1;
+            None
+        }
+        kopiur_api::MetaTagDecode::Malformed { .. } => {
+            outcome.meta_malformed += 1;
+            None
+        }
+    }
+}
+
+/// Decode the `kopiur-meta` tag off one listing entry — the single funnel for
+/// BOTH wires: an in-process listing's entries carry the raw manifest keys
+/// (`tag:kopiur-meta`), while bootstrap-result entries were normalized by the
+/// mover to the bare key with the raw user tags cleared
+/// (`kopiur_mover::bootstrap::slim_catalog_entry`). [`kopiur_api::decode_meta_tag`]
+/// accepts both key shapes, so neither wire needs its own decode path.
+pub fn recorded_from_entry(entry: &SnapshotListEntry) -> kopiur_api::MetaTagDecode {
+    kopiur_api::decode_meta_tag(&entry.tags)
+}
+
+/// Byte cap on the kopia description copied onto a `Snapshot` CR
+/// (char-boundary-safe; also stated in the CRD field doc). The description is
+/// foreign-writer-controlled repository data — a multi-MB value must never 4xx
+/// the CR write.
+pub const DESCRIPTION_CAP_BYTES: usize = 1024;
+
+/// The (capped) description a listing entry contributes to a CR, `None` when empty.
+fn entry_description(entry: &SnapshotListEntry) -> Option<String> {
+    (!entry.description.is_empty()).then(|| {
+        kopiur_api::recorded::truncate_utf8(&entry.description, DESCRIPTION_CAP_BYTES).to_string()
+    })
+}
+
+/// The targeted status patch backfilling `recorded` (+ `snapshot.description`)
+/// onto an existing CR for `entry`, or `None` when nothing should be written.
+/// Pure. The contract that keeps this safe to run every scan:
+///
+/// - the CR must MATCH the entry (`status.snapshot.kopiaSnapshotID == entry.id`);
+/// - `recorded` is written ONLY while absent (idempotent — the steady state
+///   plans no write, so there is no status churn);
+/// - description is added only when the CR lacks one and the entry has one
+///   (capped, [`DESCRIPTION_CAP_BYTES`]);
+/// - the patch touches ONLY these fields — in particular never the conditions
+///   array, which a concurrent writer could otherwise clobber.
+pub fn backfill_patch(entry: &SnapshotListEntry, cr: &Snapshot) -> Option<serde_json::Value> {
+    let status = cr.status.as_ref()?;
+    let info = status.snapshot.as_ref()?;
+    if info.kopia_snapshot_id != entry.id {
+        return None;
+    }
+    if status.recorded.is_some() {
+        return None;
+    }
+    let kopiur_api::MetaTagDecode::Decoded(meta) = recorded_from_entry(entry) else {
+        return None;
+    };
+    let mut patch = serde_json::json!({ "recorded": meta });
+    if info.description.is_none()
+        && let Some(d) = entry_description(entry)
+    {
+        patch["snapshot"] = serde_json::json!({ "description": d });
+    }
+    Some(patch)
 }
 
 /// Create one `origin: discovered` `Snapshot` CR for a listing entry.
 /// `deletionPolicy` is FORCED to `Retain` (the operator never deletes a
 /// discovered snapshot, §4.5); identity, timing, and size come from the kopia
 /// listing so `kubectl kopiur snapshots list` shows real data for foreign rows.
+/// `recorded` is the caller-decoded `kopiur-meta` metadata (decoded once in
+/// [`scan`], where UnsupportedSchema/Malformed are aggregate-counted);
+/// the entry's description is copied capped ([`DESCRIPTION_CAP_BYTES`]).
 async fn materialize_discovered(
     ctx: &Context,
     owner: &OwnerReference,
@@ -1083,6 +1339,7 @@ async fn materialize_discovered(
     repo_name: &str,
     repo_uid: &str,
     entry: &SnapshotListEntry,
+    recorded: Option<&kopiur_api::RecordedSnapshotMeta>,
 ) -> Result<()> {
     use kopiur_api::common::{DeletionPolicy, ResolvedIdentity};
     use kopiur_api::snapshot::{
@@ -1128,6 +1385,7 @@ async fn materialize_discovered(
                 hostname: entry.source.host.clone(),
                 source_path: Some(entry.source.path.clone()),
             },
+            description: entry_description(entry),
         }),
         timing: Some(SnapshotTiming {
             start_time: Some(entry.start_time.to_rfc3339()),
@@ -1138,6 +1396,7 @@ async fn materialize_discovered(
             size_bytes: i64::try_from(entry.stats.total_size).ok(),
             ..Default::default()
         }),
+        recorded: recorded.cloned(),
         ..Default::default()
     });
 
@@ -1176,6 +1435,7 @@ mod tests {
             stats: SnapshotStats::default(),
             root_entry: None,
             retention_reason: vec![],
+            tags: Default::default(),
         }
     }
 
@@ -1198,6 +1458,115 @@ mod tests {
 
     fn expired<'a>(plan: &'a CatalogPlan<'_>) -> Vec<&'a str> {
         plan.expire.iter().map(|(_, n)| n.as_str()).collect()
+    }
+
+    // --- recorded_from_entry / backfill_patch / entry_description -----------
+
+    fn meta_entry(id: &str, tag_key: &str, value: &str) -> SnapshotListEntry {
+        let mut e = entry(id, ("u", "h", "/p"), t(10));
+        e.tags.insert(tag_key.to_string(), value.to_string());
+        e
+    }
+
+    fn cr_with(id: &str, recorded: bool, description: Option<&str>) -> Snapshot {
+        use kopiur_api::snapshot::{SnapshotInfo, SnapshotStatus};
+        let mut s = Snapshot::new(
+            "row",
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+        );
+        s.metadata.namespace = Some("ns".into());
+        s.status = Some(SnapshotStatus {
+            snapshot: Some(SnapshotInfo {
+                kopia_snapshot_id: id.to_string(),
+                identity: kopiur_api::common::ResolvedIdentity {
+                    username: "u".into(),
+                    hostname: "h".into(),
+                    source_path: Some("/p".into()),
+                },
+                description: description.map(String::from),
+            }),
+            recorded: recorded.then_some(kopiur_api::RecordedSnapshotMeta {
+                schema: 1,
+                src: kopiur_api::RecordedSrc::Explicit,
+                uid: Some(1),
+                gid: None,
+                fs_group: None,
+            }),
+            ..Default::default()
+        });
+        s
+    }
+
+    const VALID_META: &str = r#"{"schema":1,"src":"inherited","uid":1000}"#;
+
+    #[test]
+    fn recorded_from_entry_accepts_both_wire_key_shapes() {
+        use kopiur_api::MetaTagDecode;
+        // In-process listing: raw manifest key.
+        let raw = meta_entry("a", "tag:kopiur-meta", VALID_META);
+        assert!(matches!(
+            recorded_from_entry(&raw),
+            MetaTagDecode::Decoded(m) if m.uid == Some(1000)
+        ));
+        // Bootstrap-result wire: mover-normalized bare key.
+        let normalized = meta_entry("a", "kopiur-meta", VALID_META);
+        assert!(matches!(
+            recorded_from_entry(&normalized),
+            MetaTagDecode::Decoded(m) if m.uid == Some(1000)
+        ));
+        assert!(matches!(
+            recorded_from_entry(&entry("a", ("u", "h", "/p"), t(10))),
+            MetaTagDecode::Absent
+        ));
+    }
+
+    #[test]
+    fn backfill_patch_adds_recorded_only_while_absent() {
+        let e = meta_entry("a", "tag:kopiur-meta", VALID_META);
+        // Absent → a targeted patch carrying exactly `recorded`.
+        let patch = backfill_patch(&e, &cr_with("a", false, None)).expect("patch planned");
+        assert_eq!(patch["recorded"]["uid"], 1000);
+        assert_eq!(patch["recorded"]["src"], "inherited");
+        assert!(
+            patch.get("conditions").is_none() && patch.get("phase").is_none(),
+            "the backfill must touch ONLY recorded/description: {patch}"
+        );
+        // Already recorded → idempotent no-op (no churn).
+        assert!(backfill_patch(&e, &cr_with("a", true, None)).is_none());
+        // Id mismatch → never patch someone else's row.
+        assert!(backfill_patch(&e, &cr_with("other", false, None)).is_none());
+        // Malformed tag → degrade to no patch (counted by the scan, not here).
+        let bad = meta_entry("a", "kopiur-meta", "not json");
+        assert!(backfill_patch(&bad, &cr_with("a", false, None)).is_none());
+    }
+
+    #[test]
+    fn backfill_patch_adds_description_only_when_cr_lacks_one() {
+        let mut e = meta_entry("a", "kopiur-meta", VALID_META);
+        e.description = "from the repository".to_string();
+        let patch = backfill_patch(&e, &cr_with("a", false, None)).unwrap();
+        assert_eq!(patch["snapshot"]["description"], "from the repository");
+        // CR already carries a description → leave it alone.
+        let patch = backfill_patch(&e, &cr_with("a", false, Some("existing"))).unwrap();
+        assert!(patch.get("snapshot").is_none(), "{patch}");
+    }
+
+    #[test]
+    fn entry_description_is_capped_char_boundary_safe() {
+        let mut e = entry("a", ("u", "h", "/p"), t(10));
+        assert_eq!(entry_description(&e), None, "empty stays absent");
+        e.description = "short".into();
+        assert_eq!(entry_description(&e).as_deref(), Some("short"));
+        // A foreign-writer-sized description is capped at DESCRIPTION_CAP_BYTES.
+        e.description = "é".repeat(DESCRIPTION_CAP_BYTES); // 2 bytes per char
+        let capped = entry_description(&e).unwrap();
+        assert!(capped.len() <= DESCRIPTION_CAP_BYTES);
+        assert!(capped.is_char_boundary(capped.len()));
+        assert_eq!(
+            capped.len(),
+            DESCRIPTION_CAP_BYTES,
+            "even split backs off safely"
+        );
     }
 
     #[test]
@@ -2259,6 +2628,7 @@ mod tests {
                         hostname: "h".into(),
                         source_path: Some("/p".into()),
                     },
+                    description: None,
                 }),
                 resolved: Some(ResolvedSnapshot {
                     repository: Some(RepositoryRef {
@@ -2294,6 +2664,7 @@ mod tests {
                         hostname: "h".into(),
                         source_path: Some("/p".into()),
                     },
+                    description: None,
                 }),
                 resolved: Some(ResolvedSnapshot {
                     repository: Some(RepositoryRef {

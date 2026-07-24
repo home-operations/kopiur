@@ -917,6 +917,7 @@ mod tests {
                     hostname: "h".into(),
                     source_path: Some("/data".into()),
                 },
+                description: None,
             }),
             resolved: Some(ResolvedSnapshot {
                 repository: pinned_repo,

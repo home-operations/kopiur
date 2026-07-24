@@ -610,6 +610,36 @@ pub enum InheritOutcome {
         /// The actionable reason inheritance failed, for the condition/Event message.
         reason: String,
     },
+    /// Restore-only: inherited the identity RECORDED on the backup
+    /// (`inheritSecurityContextFrom.snapshot` — `Snapshot.status.recorded`, decoded
+    /// from the `kopiur-meta` kopia tag) instead of reading a live pod.
+    InheritedFromSnapshot {
+        /// `namespace/name` of the `Snapshot` CR the recorded identity came from.
+        snapshot: String,
+        /// The recorded EFFECTIVE `runAsUser` the inherited layer contributed
+        /// (`RecordedSnapshotMeta::uid`); `None` when the backup mover's UID was
+        /// image-determined, so inheriting contributed no UID at all.
+        uid: Option<i64>,
+        /// Which layer pinned the recorded identity at BACKUP time. Only
+        /// [`RecordedSrc::Inherited`] means it tracked the workload — condition
+        /// text keys its honesty on this.
+        src: kopiur_api::recorded::RecordedSrc,
+    },
+}
+
+/// The recorded-identity source for a restore's `inheritSecurityContextFrom.snapshot`,
+/// resolved by the RESTORE reconciler before
+/// [`resolve_mover_security_contexts`] runs: the `Snapshot` CR (direct for
+/// `snapshotRef`; via the CR-catalog search for `fromPolicy`/`identity`) and its
+/// decoded `status.recorded`, when present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRecordedSource {
+    /// `namespace/name` of the `Snapshot` CR, for condition/Event messages.
+    pub snapshot: String,
+    /// The CR's `status.recorded`; `None` when the row carries none (pre-feature
+    /// or foreign backup) — resolution then holds with an actionable error
+    /// unless the explicit context pins a fallback identity.
+    pub meta: Option<kopiur_api::recorded::RecordedSnapshotMeta>,
 }
 
 /// The mover's recipe-layer security contexts plus how they were arrived at.
@@ -887,14 +917,16 @@ pub async fn ensure_cache_pvc(
 /// explicit one.
 ///
 /// When `inheritSecurityContextFrom` is set, the workload's contexts are copied and the
-/// recipe's **explicit** `securityContext`/`podSecurityContext` are then overlaid on top
-/// (field-wise, explicit wins). The two are layers, not alternatives: what you wrote always
-/// wins, and inheritance fills in whatever the workload pins that you left blank. Doing the
-/// overlay here — rather than threading a fourth layer through
+/// recipe's **explicit** `securityContext`/`podSecurityContext` are then overlaid on top via
+/// [`kopiur_api::common::merge_context_pair`] (explicit wins; the winning layer's effective
+/// UID/GID is promoted so a lower layer's container-level value can never shadow it across
+/// dimensions). The two are layers, not alternatives: what you wrote always wins, and
+/// inheritance fills in whatever the workload pins that you left blank. Doing the overlay
+/// here — rather than threading a fourth layer through
 /// [`kopiur_api::common::resolve_mover`] — keeps that function and all seven of its call sites
-/// untouched, and is field-wise identical because the merge is a per-field `over.or(base)` and
-/// therefore associative: every field resolves to
-/// `explicit.or(inherited).or(moverDefaults).or(hardened)`.
+/// untouched, and is identical to a flat four-layer merge because the pair merge is
+/// associative: the effective identity resolves to
+/// `explicit.or(inherited).or(moverDefaults).or(hardened)` — the highest layer that pins one.
 ///
 /// One exception to "explicit wins": an inherited `runAsUser: 0` under an explicit
 /// `runAsNonRoot: true` is normalized by INV-1 ([`kopiur_api::invariants`]) into a *root*
@@ -909,11 +941,18 @@ pub async fn ensure_cache_pvc(
 /// `inheritSecurityContextFrom.pvcConsumer` mode to discover the workload that mounts it;
 /// pass `None` for restore/maintenance movers (which have no backup source — `pvcConsumer`
 /// then fails with an actionable error, as it is backup-source-only).
+///
+/// `recorded` is the resolved recorded-identity source for the restore-only
+/// `inheritSecurityContextFrom.snapshot` mode: the RESTORE reconciler resolves the
+/// `Snapshot` CR (and its `status.recorded`) BEFORE this call and passes it here; every
+/// other caller passes `None` (the variant is admission-rejected on their kinds, so a
+/// `snapshot` inherit without a source is a defensive `Invariant` error, never a panic).
 pub async fn resolve_mover_security_contexts(
     client: &kube::Client,
     ns: &str,
     mover: Option<&MoverSpec>,
     source_pvc: Option<&str>,
+    recorded: Option<&SnapshotRecordedSource>,
 ) -> Result<ResolvedMoverSecurity> {
     let Some(m) = mover else {
         return Ok(ResolvedMoverSecurity {
@@ -933,6 +972,37 @@ pub async fn resolve_mover_security_contexts(
             resolve_pvc_consumer_security_context(client, ns, source_pvc, pc.container.as_deref())
                 .await
                 .map(|(source, pods)| (source, Some(pods)))
+        }
+        Some(InheritSecurityContextFrom::Snapshot(_)) => {
+            let Some(source) = recorded else {
+                // Backup/maintenance callers pass `None`, and the validators make the
+                // variant unreachable on their kinds — so reaching this arm without a
+                // source is an operator bug, reported actionably instead of panicking.
+                return Err(Error::Invariant(format!(
+                    "mover.inheritSecurityContextFrom.snapshot reached a reconciler that \
+                     resolved no recorded-identity source in namespace `{ns}` — this variant \
+                     is restore-only (admission rejects it on SnapshotPolicy/Maintenance/\
+                     RepositoryReplication). This is a kopiur bug; please report it. As a \
+                     workaround, set mover.securityContext explicitly."
+                )));
+            };
+            match &source.meta {
+                // The recorded identity IS the inherited layer; no pod IO at all.
+                Some(meta) => return Ok(resolved_from_recorded(m, &source.snapshot, meta)),
+                // A permanent-shaped hold, phrased as MissingDependency so the
+                // fallback machinery below can proceed on an explicit pinned
+                // identity exactly like the live-pod modes; the restore
+                // reconciler turns the propagated error into the
+                // `MissingRecordedIdentity` condition + slow requeue.
+                None => Err(Error::MissingDependency(format!(
+                    "Snapshot `{}` carries no recorded identity (`status.recorded`) — it \
+                     predates the kopiur-meta feature or was written by a foreign tool; the \
+                     catalog scan backfills it when the kopia snapshot carries the tag. Set \
+                     mover.securityContext explicitly, or use \
+                     inheritSecurityContextFrom.workloadSelector.",
+                    source.snapshot
+                ))),
+            }
         }
         None => {
             return Ok(ResolvedMoverSecurity {
@@ -979,23 +1049,67 @@ pub async fn resolve_mover_security_contexts(
         pins_identity: source.pins_identity(),
     };
     // `inherited ⊂ explicit`: the recipe's explicit context is the higher layer, so each field
-    // it sets wins and the inherited value fills the rest. Reuses the exhaustive merge helpers
-    // (a k8s-openapi field addition breaks their struct literals) rather than re-deriving one.
+    // it sets wins and the inherited value fills the rest. The pair merge (NOT the lone
+    // per-dimension helpers) so a workload that pins its uid at the pod level cannot later be
+    // shadowed by a lower layer's container-level value in `resolve_mover`.
     let (inherited_sc, inherited_psc) = source.contexts;
     Ok(ResolvedMoverSecurity {
-        contexts: (
-            kopiur_api::common::merge_security_context_opt(
-                inherited_sc.as_ref(),
-                m.security_context.as_ref(),
-            ),
-            kopiur_api::common::merge_pod_security_context_opt(
-                inherited_psc.as_ref(),
-                m.pod_security_context.as_ref(),
-            ),
+        contexts: kopiur_api::common::merge_context_pair(
+            inherited_sc.as_ref(),
+            inherited_psc.as_ref(),
+            m.security_context.as_ref(),
+            m.pod_security_context.as_ref(),
         ),
         outcome,
         unfiltered_pods,
     })
+}
+
+/// Pure core of the `inheritSecurityContextFrom.snapshot` arm: synthesize the
+/// inherited layer from the backup's recorded identity and fold the recipe's
+/// explicit context over it — the exact shape live-pod inherit produces, so the
+/// Phase-1 identity-aware ladder, INV-1 normalization, and the privileged-mover
+/// gate all apply downstream with zero new code. A recorded root UID (uid 0) is
+/// therefore gated exactly like an inherited-from-a-live-root-pod one.
+///
+/// Layer placement is a stated semantic: the synthesized layer enters
+/// `resolve_mover` as the recipe layer, so backup-time recorded values (including
+/// the near-always-present fsGroup) sit ABOVE the restore cluster's
+/// `moverDefaults` — faithful reproduction of the identity the data expects wins
+/// over restore-side operational defaults. The recorded `src` provenance rides the
+/// outcome so condition text can be honest about whether that identity ever
+/// tracked a workload.
+pub(crate) fn resolved_from_recorded(
+    m: &MoverSpec,
+    snapshot: &str,
+    meta: &kopiur_api::recorded::RecordedSnapshotMeta,
+) -> ResolvedMoverSecurity {
+    // uid/gid go on the container dimension, fsGroup on the pod dimension —
+    // `merge_context_pair`'s identity promotion makes the placement immaterial
+    // for precedence, and fsGroup is pod-only in Kubernetes.
+    let inherited_sc = SecurityContext {
+        run_as_user: meta.uid,
+        run_as_group: meta.gid,
+        ..Default::default()
+    };
+    let inherited_psc = PodSecurityContext {
+        fs_group: meta.fs_group,
+        ..Default::default()
+    };
+    ResolvedMoverSecurity {
+        contexts: kopiur_api::common::merge_context_pair(
+            Some(&inherited_sc),
+            Some(&inherited_psc),
+            m.security_context.as_ref(),
+            m.pod_security_context.as_ref(),
+        ),
+        outcome: InheritOutcome::InheritedFromSnapshot {
+            snapshot: snapshot.to_string(),
+            uid: meta.uid,
+            src: meta.src,
+        },
+        unfiltered_pods: None,
+    }
 }
 
 /// Container `waiting.reason` values that mean the pod will never start without a spec

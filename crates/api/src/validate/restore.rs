@@ -100,17 +100,28 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
             });
         }
         RestoreTarget::Populator(_) => {
-            if let Some(m) = &spec.mover
-                && m.inherit_security_context_from.is_some()
-            {
-                return Err(ValidationError::InvalidFieldValue {
-                    field: "restore.mover.inheritSecurityContextFrom".to_string(),
-                    reason: "is not allowed with target.populator: no workload pod exists at \
-                             provision time to inherit a security context from; set \
-                             mover.securityContext explicitly or rely on the repository's \
-                             moverDefaults instead"
-                        .to_string(),
-                });
+            // Exhaustive over the inherit variant: the live-pod modes cannot work
+            // (no workload pod exists at provision time), but `snapshot` reads the
+            // backup's RECORDED identity in the controller before the Job — it needs
+            // no live pod, so it is deliberately ALLOWED with a populator target.
+            if let Some(m) = &spec.mover {
+                use crate::common::InheritSecurityContextFrom;
+                match &m.inherit_security_context_from {
+                    None | Some(InheritSecurityContextFrom::Snapshot(_)) => {}
+                    Some(InheritSecurityContextFrom::WorkloadSelector(_))
+                    | Some(InheritSecurityContextFrom::PvcConsumer(_)) => {
+                        return Err(ValidationError::InvalidFieldValue {
+                            field: "restore.mover.inheritSecurityContextFrom".to_string(),
+                            reason: "is not allowed with target.populator: no workload pod \
+                                     exists at provision time to inherit a security context \
+                                     from. Set mover.securityContext explicitly, use \
+                                     inheritSecurityContextFrom: { snapshot: {} } (the \
+                                     backup's recorded identity — needs no live pod), or rely \
+                                     on the repository's moverDefaults instead"
+                                .to_string(),
+                        });
+                    }
+                }
             }
         }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}

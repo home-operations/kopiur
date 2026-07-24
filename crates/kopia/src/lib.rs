@@ -18,6 +18,7 @@ pub use model::{
     ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite, EntryError,
     IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule, RepositoryStatus,
     RootEntry, SnapshotCreateResult, SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo,
+    user_tags,
 };
 pub use selection::{filter_as_of, pick_offset};
 pub use session::SessionCmd;

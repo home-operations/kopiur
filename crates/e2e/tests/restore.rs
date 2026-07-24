@@ -14,7 +14,9 @@
 
 #![cfg(all(unix, feature = "e2e"))]
 
-use kube::api::{DeleteParams, PostParams};
+mod common;
+
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1331,4 +1333,236 @@ async fn restore_wait_timeout_waits_for_late_snapshot() {
         .await
         .expect("waiting restore should complete once the snapshot appears");
     cleanup_restore(&restores, name).await;
+}
+
+// --- Phase 3: `inheritSecurityContextFrom: { snapshot: {} }` — restore as the RECORDED identity ---
+
+/// Isolated repo for the recorded-identity scenario: EVERYTHING here runs at
+/// uid/gid 3001 (moverDefaults for bootstrap/scan + the policy's explicit mover
+/// context), because a kopia filesystem repo's 0600 control files are only readable
+/// by the uid that wrote them — so it cannot share the restore shard's 65532 seed
+/// repo. Subpath in `consts::REPO_SUBPATHS` + the mise node-seed list (LOCKSTEP).
+const REC_SUBPATH: &str = "recrestore";
+const REC_REPO: &str = "e2e-recrestore-repo";
+const REC_CFG: &str = "e2e-recrestore-cfg";
+const REC_BACKUP: &str = "e2e-recrestore-seed";
+
+/// Seed the recorded-identity repo/policy/backup (all pinned to uid/gid 3001) and
+/// wait for the backup to Succeed carrying `status.recorded`. Idempotent.
+async fn ensure_recorded_seed(client: &Client) {
+    common::ensure_repo(client, REC_SUBPATH).await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    if repos.get_opt(REC_REPO).await.ok().flatten().is_none() {
+        let _ = repos
+            .create(
+                &PostParams::default(),
+                &cr(common::repository_json(
+                    REC_REPO,
+                    REC_SUBPATH,
+                    serde_json::json!({
+                        "maintenance": { "enabled": false },
+                        "moverDefaults": {
+                            "securityContext": { "runAsUser": 3001, "runAsGroup": 3001 }
+                        }
+                    }),
+                )),
+            )
+            .await;
+    }
+    wait_phase(&repos, REC_REPO, "Ready")
+        .await
+        .expect("recorded-identity Repository should reach Ready");
+    if configs.get_opt(REC_CFG).await.ok().flatten().is_none() {
+        let _ = configs
+            .create(
+                &PostParams::default(),
+                &cr(common::snapshot_policy_json(
+                    E2E_NAMESPACE,
+                    REC_CFG,
+                    "Repository",
+                    REC_REPO,
+                    serde_json::json!({
+                        "mover": { "securityContext": { "runAsUser": 3001, "runAsGroup": 3001 } }
+                    }),
+                )),
+            )
+            .await;
+    }
+    if backups.get_opt(REC_BACKUP).await.ok().flatten().is_none() {
+        let _ = backups
+            .create(
+                &PostParams::default(),
+                &cr(common::snapshot_json(
+                    E2E_NAMESPACE,
+                    REC_BACKUP,
+                    REC_CFG,
+                    serde_json::json!({}),
+                )),
+            )
+            .await;
+    }
+    wait_phase(&backups, REC_BACKUP, "Succeeded")
+        .await
+        .expect("recorded-identity seed Snapshot should Succeed");
+}
+
+/// A Restore against the recorded-identity seed with `snapshot: {}` inherit.
+fn recorded_restore_json(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": REC_REPO },
+            "source": { "snapshotRef": { "name": REC_BACKUP } },
+            "target": { "pvc": { "name": format!("{name}-dst"), "capacity": "1Gi", "accessModes": ["ReadWriteOnce"] } },
+            "mover": { "inheritSecurityContextFrom": { "snapshot": {} } }
+        }
+    })
+}
+
+/// Phase-3 acceptance, one wait-heavy scenario:
+///
+/// (1) A Restore with `inheritSecurityContextFrom: { snapshot: {} }` runs its mover
+///     as the uid RECORDED on the backup (3001 — pinned by the seed policy, ridden
+///     on the `kopiur-meta` tag / `status.recorded`), reaches `Completed`, and
+///     reports `SecurityContextInherited=True` / `RecordedApplied` naming the
+///     Snapshot, the uid, and the provenance.
+/// (2) The same shape against a Snapshot whose `status.recorded` is STRIPPED holds
+///     with `SecurityContextInherited=False` / `MissingRecordedIdentity` (the
+///     permanent-shaped hold, never a silent generic error), then completes once
+///     the recorded identity is restored.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn restore_inherits_recorded_identity_and_holds_without_it() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_recorded_seed(&client).await;
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Sanity: the Phase-2 pipeline stamped the recorded identity on the seed.
+    let seed_status = status_json(&backups, REC_BACKUP).await;
+    assert_eq!(
+        seed_status
+            .pointer("/recorded/uid")
+            .and_then(|v| v.as_i64()),
+        Some(3001),
+        "the seed backup must carry status.recorded.uid=3001: {seed_status}"
+    );
+    let recorded = seed_status
+        .get("recorded")
+        .cloned()
+        .expect("seed status.recorded present");
+
+    // (1) Positive: the restore mover runs as the RECORDED uid, not the mover
+    // image's 65532 — and completes.
+    let name = "e2e-rec-inherit";
+    restores
+        .create(&PostParams::default(), &cr(recorded_restore_json(name)))
+        .await
+        .expect("create recorded-inherit Restore");
+    let job = wait_for_job(&jobs, name).await;
+    assert_eq!(
+        job_run_as_user(&job),
+        Some(3001),
+        "the restore mover must run as the uid recorded on the backup (3001)"
+    );
+    wait_phase(&restores, name, "Completed")
+        .await
+        .expect("recorded-inherit Restore should Complete");
+    wait_condition(&restores, name, "SecurityContextInherited", "True")
+        .await
+        .expect("SecurityContextInherited should report True");
+    let s = status_json(&restores, name).await;
+    assert_eq!(
+        condition_reason(&s, "SecurityContextInherited"),
+        "RecordedApplied",
+        "reason: {s}"
+    );
+    let msg = condition_field(&s, "SecurityContextInherited", "message");
+    assert!(
+        msg.contains(REC_BACKUP) && msg.contains("3001") && msg.contains("explicit"),
+        "the True message must name the Snapshot, the recorded uid, and the \
+         provenance; got: {msg}"
+    );
+    cleanup_restore(&restores, name).await;
+
+    // (2) Negative: strip status.recorded off the seed — the same Restore shape
+    // must HOLD with the actionable MissingRecordedIdentity condition.
+    backups
+        .patch_status(
+            REC_BACKUP,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "recorded": null } })),
+        )
+        .await
+        .expect("strip status.recorded off the seed");
+    let hold = "e2e-rec-hold";
+    restores
+        .create(&PostParams::default(), &cr(recorded_restore_json(hold)))
+        .await
+        .expect("create held Restore");
+    wait_condition(&restores, hold, "SecurityContextInherited", "False")
+        .await
+        .expect("the Restore should hold with SecurityContextInherited=False");
+    let s = status_json(&restores, hold).await;
+    assert_eq!(
+        condition_reason(&s, "SecurityContextInherited"),
+        "MissingRecordedIdentity",
+        "reason: {s}"
+    );
+    let msg = condition_field(&s, "SecurityContextInherited", "message");
+    assert!(
+        msg.contains("status.recorded"),
+        "the hold message must say WHAT is missing: {msg}"
+    );
+    assert_ne!(
+        s.get("phase").and_then(|p| p.as_str()),
+        Some("Completed"),
+        "a held Restore must not have completed: {s}"
+    );
+
+    // Heal: restore the recorded identity, then kick the Restore (the hold
+    // deliberately requeues on the SLOW structural cadence — 300s — so the test
+    // re-enqueues it via an annotation touch instead of waiting that out).
+    backups
+        .patch_status(
+            REC_BACKUP,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "recorded": recorded } })),
+        )
+        .await
+        .expect("restore status.recorded on the seed");
+    restores
+        .patch(
+            hold,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": { "e2e.kopiur.io/kick": "healed" } }
+            })),
+        )
+        .await
+        .expect("re-enqueue the held Restore");
+    wait_phase(&restores, hold, "Completed")
+        .await
+        .expect("the healed Restore should Complete");
+    wait_condition(&restores, hold, "SecurityContextInherited", "True")
+        .await
+        .expect("the hold must CLEAR to True once the recorded identity is back");
+    let s = status_json(&restores, hold).await;
+    assert_eq!(
+        condition_reason(&s, "SecurityContextInherited"),
+        "RecordedApplied",
+        "the stale MissingRecordedIdentity must be replaced: {s}"
+    );
+    cleanup_restore(&restores, hold).await;
 }

@@ -120,7 +120,7 @@ target:
 
 /// warning | `target` is required — the empty-`target` form is gone
 
-A `Restore` with **no** `target` is rejected by the webhook. Populator intent must be the **explicit** `target.populator: {}` (not an omitted `target`). Also, `inheritSecurityContextFrom` is invalid in populator mode — there's no workload pod at provision time, so the webhook rejects it and points you at `moverDefaults` / an explicit `securityContext`.
+A `Restore` with **no** `target` is rejected by the webhook. Populator intent must be the **explicit** `target.populator: {}` (not an omitted `target`). The live-pod `inheritSecurityContextFrom` modes (`workloadSelector`/`pvcConsumer`) are invalid in populator mode — there's no workload pod at provision time, so the webhook rejects them and points you at `moverDefaults` / an explicit `securityContext` / `inheritSecurityContextFrom: { snapshot: {} }`, which **is** allowed: it replays the identity recorded on the backup and needs no live pod (see [the re-bootstrap section](#declarative-re-bootstrap--restore-as-the-recorded-identity)).
 
 ///
 
@@ -195,7 +195,8 @@ spec:
     mover:
         securityContext: { runAsUser: 1000, runAsGroup: 1000, ... } # CONTAINER: own the restored files
         podSecurityContext: { fsGroup: 1000 } # POD: make a fresh volume writable
-        # inheritSecurityContextFrom: { workloadSelector: { podSelector: {...} } }  # ...or copy from a live pod (restore: use workloadSelector, not pvcConsumer)
+        # inheritSecurityContextFrom: { workloadSelector: { podSelector: {...} } }  # ...or copy from a live pod (restore: workloadSelector, not pvcConsumer)
+        # inheritSecurityContextFrom: { snapshot: {} }                              # ...or replay the identity RECORDED on the backup (no live pod needed)
         cache: { capacity: 16Gi, mode: Persistent, contentCacheSizeMb: 10000 }
     failurePolicy:
         backoffLimit: 4
@@ -205,7 +206,7 @@ spec:
 
 - **`mover.securityContext`** — run the restore mover (its **container**) as the UID/GID that should own the restored files. Without it the mover runs as the hardened default (UID 65532), which may write files the app can't read. This is the fix for "the restore mover had no UID control".
 - **`mover.podSecurityContext.fsGroup`** — a **pod**-level `fsGroup` that makes a freshly-provisioned target volume group-writable, so an **unprivileged** `runAsUser: 1000` mover can populate it on restore (instead of needing a root mover just to write the new volume). The headline case for restoring into a brand-new PVC as non-root. See [Security context → fsGroup](security-context.md).
-- **`mover.inheritSecurityContextFrom`** — instead of hard-coding them, copy **both** the container `securityContext` **and** the pod-level `securityContext` (so the restore mover gets the app's UID *and* its `fsGroup`) from a live workload pod. On a Restore, use **`workloadSelector: { podSelector, container? }`** to name the pod that will *read* the restored data. The **`pvcConsumer`** form is **backup-only** — it derives the workload from a backup *source* PVC, which a restore doesn't have (the target's consumer may not exist yet), so the webhook **rejects `pvcConsumer` on a `Restore`**. Combines with `securityContext`/`podSecurityContext`: they are the higher merge layer, so an explicit field overrides the inherited one, and they stand in alone when no workload pod resolves — in which case the restore proceeds on them and reports `SecurityContextInherited=False` / `InheritFallback`, because the restored files will then be owned as *your* context says rather than as the workload you named. The condition `RestoreSecurityContextCompatible` reports (positively) when the future consumer will be able to read what the mover writes. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload) and [example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload).
+- **`mover.inheritSecurityContextFrom`** — instead of hard-coding them, copy **both** the container `securityContext` **and** the pod-level `securityContext` (so the restore mover gets the app's UID *and* its `fsGroup`) from somewhere authoritative. On a Restore, two forms work: **`workloadSelector: { podSelector, container? }`** names a live pod that will *read* the restored data, and **`snapshot: {}`** replays the identity **recorded on the backup itself** (`Snapshot.status.recorded` — no live pod needed; see [the re-bootstrap section below](#declarative-re-bootstrap--restore-as-the-recorded-identity)). The **`pvcConsumer`** form is **backup-only** — it derives the workload from a backup *source* PVC, which a restore doesn't have (the target's consumer may not exist yet), so the webhook **rejects `pvcConsumer` on a `Restore`**. Combines with `securityContext`/`podSecurityContext`: they are the higher merge layer, so an explicit field overrides the inherited one, and they stand in alone when no workload pod resolves — in which case the restore proceeds on them and reports `SecurityContextInherited=False` / `InheritFallback`, because the restored files will then be owned as *your* context says rather than as the workload you named. The condition `RestoreSecurityContextCompatible` reports (positively) when the future consumer will be able to read what the mover writes. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload) and [example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload).
 - **`mover.cache`** — size the kopia cache for a large restore. `mode: Ephemeral` (default) gives a fresh per-run volume sized by `capacity` (or an `emptyDir` when unset); `mode: Persistent` keeps a controller-owned cache PVC and reuses it across runs for a warm cache. `contentCacheSizeMb` / `metadataCacheSizeMb` pass kopia's `--content/metadata-cache-size-mb` budgets. A repository's `moverDefaults.cache` are inherited and overlaid by `mover.cache`.
 - **`failurePolicy`** — the restore Job's `backoffLimit`, `activeDeadlineSeconds`, and `podStartupDeadlineSeconds`. Absent uses the defaults (2 retries; a 48h `activeDeadlineSeconds` backstop so a *running* Job can't linger forever; a 5-minute `podStartupDeadlineSeconds` so a restore mover that can't **start** — bad image, unschedulable, impossible `securityContext` — fails fast with `MoverPodWedged` instead of hanging). The two deadlines are explained in [Backups → `failurePolicy`](backups.md#failurepolicy--retry--deadline-for-the-mover-job).
 
@@ -249,6 +250,41 @@ Snapshots written by a foreign kopia client, or predating your install, are mate
 ```console
 $ kubectl get snapshots -n backups -l kopiur.home-operations.com/origin=discovered
 ```
+
+/// note | Snapshots carry their recorded mover identity
+
+Every snapshot Kopiur produces records the resolved mover identity (uid/gid/fsGroup and its provenance) on the snapshot itself as the `kopiur-meta` tag, and the catalog scan decodes it into `status.recorded` on discovered rows — so the identity the data expects survives a cluster rebuild with the repository. `kubectl kopiur snapshots list -o wide` shows it, and a `Restore` can run **as** it via `inheritSecurityContextFrom: { snapshot: {} }` (next section). See [Backups → tags](backups.md#tags--label-the-snapshot-in-the-repository).
+
+///
+
+## Declarative re-bootstrap — restore as the recorded identity
+
+After a full cluster loss, the workload whose UID a restore should run as does not exist yet — there is no pod to inherit from. `mover.inheritSecurityContextFrom: { snapshot: {} }` closes that gap: the restore mover runs as the identity **recorded on the backup** (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag), with no live pod involved. The whole recovery is then one declarative apply:
+
+1. GitOps applies **Repository + SnapshotPolicy + Restore** (`source.fromPolicy` + `snapshot: {}`) to the fresh cluster.
+2. The repository connects; the **catalog scan** materializes `discovered` Snapshot CRs from the repository, decoding each snapshot's recorded identity into `status.recorded`.
+3. Until a matching row exists, the Restore **holds** with `SecurityContextInherited=False` / `MissingRecordedIdentity` (a Warning Event says why; it re-checks every few minutes). This is the expected intermediate state, not an error to fix.
+4. The moment the scan lands, the Restore resolves the recorded identity, runs the mover as it, and completes.
+
+No hand-authored snapshot names anywhere: `fromPolicy` re-resolves the kopia identity from the live `SnapshotPolicy` and the controller picks the matching Snapshot CR from the catalog (honoring `asOf`/`offset`; `source.identity` works the same way, including a pinned `snapshotID`). `source.snapshotRef` also supports `snapshot: {}` — it reads that CR's `status.recorded` directly. Pair with `target: { populator: {} }` for [deploy-or-restore](#deploy-or-restore-gitops): `snapshot` needs no live pod, so it is the **one** inherit mode allowed with a populator target.
+
+```yaml
+--8<-- "deploy/examples/37-restore-recorded-identity.yaml"
+```
+
+What the mover runs as, the trust boundary for recorded metadata (it is repository data and can be forged — a recorded root identity stays gated on the namespace opt-in), and the full `SecurityContextInherited` reason table live in [Security context → `snapshot`](security-context.md#snapshot--inherit-the-backups-recorded-identity-restore).
+
+/// note | Restoring into a *renamed* cluster
+
+The catalog scan pre-filters identities that belong to **other clusters** (foreign hostname suffixes), so a repository restored into a cluster with a *different* identity scheme may materialize no discovered rows for your old snapshots — and a `fromPolicy` search then holds forever. The escape hatch is the `identity` source: give it the old raw kopia triple (`username`/`hostname`) and it searches the CR catalog — and selects the snapshot — by exactly that identity, still with `snapshot: {}`.
+
+///
+
+/// note | `asOf` selects twice — CR-side identity vs repository-side data
+
+With `fromPolicy`/`identity` plus `snapshot: {}`, **data and identity are pinned from the same catalog row**: the controller selects one matching Snapshot CR (honoring `asOf`/`offset`), pins its kopia snapshot id as the data to restore, and replays that same snapshot's recorded identity — the two can never diverge, so snapshot B's data is never restored under snapshot A's uid/gid/fsGroup. The trade-off is deliberate: selection runs against the **CR catalog**, not the live repository listing, so under catalog lag the restore pins the newest *catalogued* snapshot (the scan converges the catalog; a not-yet-catalogued snapshot simply isn't eligible yet). The condition message names the exact Snapshot both came from.
+
+///
 
 ## Watching a restore
 

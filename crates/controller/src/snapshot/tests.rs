@@ -836,6 +836,7 @@ fn list_entry(
         stats: Default::default(),
         root_entry: None,
         retention_reason: vec![],
+        tags: Default::default(),
     }
 }
 
@@ -2813,6 +2814,7 @@ fn adopted_row_has_provenance_gates_the_succeeded_pin() {
                 hostname: "h".into(),
                 source_path: Some("/d".into()),
             },
+            description: None,
         }),
         ..Default::default()
     });
@@ -2981,6 +2983,238 @@ fn staged_watchdog_budget_pins_zero_absent_and_positive() {
     );
 }
 
+// --- tags_for: user tags merged under the reserved operator tags -----------
+
+mod tags_for_tests {
+    use super::*;
+
+    fn backup_with_tags(pairs: &[(&str, &str)]) -> kopiur_api::Snapshot {
+        // SnapshotSpec derives no Default; an empty spec via the wire shape.
+        let empty: kopiur_api::SnapshotSpec =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let mut snap = kopiur_api::Snapshot::new("b", empty);
+        if !pairs.is_empty() {
+            snap.spec.tags = Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
+        snap
+    }
+
+    #[test]
+    fn no_user_tags_yields_only_the_reserved_config_tag() {
+        let tags = tags_for(&backup_with_tags(&[]), &sample_policy());
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags.get("kopiur:config").map(String::as_str), Some("pg"));
+    }
+
+    #[test]
+    fn user_tags_are_merged_and_reserved_wins_last() {
+        let backup = backup_with_tags(&[("reason", "pre-upgrade"), ("team", "billing")]);
+        let tags = tags_for(&backup, &sample_policy());
+        assert_eq!(tags.get("reason").map(String::as_str), Some("pre-upgrade"));
+        assert_eq!(tags.get("team").map(String::as_str), Some("billing"));
+        assert_eq!(
+            tags.get("kopiur:config").map(String::as_str),
+            Some("pg"),
+            "reserved tag must be present and authoritative"
+        );
+    }
+
+    #[test]
+    fn invalid_stored_keys_are_skipped_never_fatal() {
+        // Pre-validator stored objects can carry anything; the build path skips
+        // (warn) rather than failing the backup of a stored object.
+        let long_key = "k".repeat(64);
+        let long_value = "v".repeat(257);
+        let backup = backup_with_tags(&[
+            ("env:prod", "colon"),        // first-colon mangled + reserved-collision risk
+            ("kopiur-meta", "spoof"),     // reserved prefix
+            (long_key.as_str(), "v"),     // oversize key
+            ("big", long_value.as_str()), // oversize value
+            ("", "empty"),                // empty key
+            ("ok", "kept"),
+        ]);
+        let tags = tags_for(&backup, &sample_policy());
+        assert_eq!(tags.get("ok").map(String::as_str), Some("kept"));
+        assert_eq!(
+            tags.len(),
+            2,
+            "only the valid user tag + the reserved tag: {tags:?}"
+        );
+    }
+
+    #[test]
+    fn user_tags_are_capped_at_the_admission_bound() {
+        let pairs: Vec<(String, String)> = (0..15)
+            .map(|i| (format!("k{i:02}"), "v".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let tags = tags_for(&backup_with_tags(&refs), &sample_policy());
+        // 10 user tags + the reserved config tag.
+        assert_eq!(tags.len(), kopiur_api::validate::MAX_SNAPSHOT_TAGS + 1);
+        assert!(tags.contains_key("kopiur:config"));
+    }
+}
+
+// --- recorded_meta: the kopiur-meta value stamped on every produced run -----
+
+mod recorded_meta_tests {
+    use super::*;
+    use crate::io::InheritOutcome;
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+    use kopiur_api::common::{MOVER_NONROOT_ID, MoverDefaults, MoverSpec, resolve_mover};
+    use kopiur_api::{KOPIUR_META_SCHEMA_V1, RecordedSrc};
+
+    fn inherited(uid: Option<i64>, pins_identity: bool) -> InheritOutcome {
+        InheritOutcome::Inherited {
+            pod: "app-0".into(),
+            container: Some("app".into()),
+            uid,
+            pins_identity,
+        }
+    }
+
+    fn sc_uid(uid: i64) -> SecurityContext {
+        SecurityContext {
+            run_as_user: Some(uid),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inherited_won_records_src_inherited() {
+        // The workload pinned 1000 and the merge kept it.
+        let resolved = resolve_mover(None, Some(&sc_uid(1000)), None, None, None, None);
+        let meta = recorded_meta(&resolved, &inherited(Some(1000), true), None);
+        assert_eq!(meta.schema, KOPIUR_META_SCHEMA_V1);
+        assert_eq!(meta.src, RecordedSrc::Inherited);
+        assert_eq!(meta.uid, Some(1000));
+        assert_eq!(meta.fs_group, Some(MOVER_NONROOT_ID), "hardened fsGroup");
+    }
+
+    #[test]
+    fn restore_only_snapshot_outcome_never_records_src_inherited() {
+        // Defensive classification of the restore-only `InheritedFromSnapshot`
+        // outcome (unreachable from a backup — validators): replaying a recorded
+        // identity is NOT reading the live workload, so even if it ever reached a
+        // backup's recorder it must not claim `src: inherited`.
+        let resolved = resolve_mover(None, Some(&sc_uid(3001)), None, None, None, None);
+        let meta = recorded_meta(
+            &resolved,
+            &InheritOutcome::InheritedFromSnapshot {
+                snapshot: "app/pg-b1".into(),
+                uid: Some(3001),
+                src: RecordedSrc::Inherited,
+            },
+            None,
+        );
+        assert_ne!(meta.src, RecordedSrc::Inherited);
+        assert_eq!(
+            meta.src,
+            RecordedSrc::Defaults,
+            "no explicit context either"
+        );
+    }
+
+    #[test]
+    fn explicit_displacing_an_inherited_uid_records_src_explicit() {
+        // The workload pinned 0 but the recipe's explicit context won with 3001.
+        let mover = MoverSpec {
+            security_context: Some(sc_uid(3001)),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, Some(&sc_uid(3001)), None, None, None, None);
+        let meta = recorded_meta(&resolved, &inherited(Some(0), true), Some(&mover));
+        assert_eq!(meta.src, RecordedSrc::Explicit);
+        assert_eq!(meta.uid, Some(3001));
+    }
+
+    #[test]
+    fn fallback_on_an_explicit_pod_level_uid_records_src_explicit() {
+        // Inheritance failed; the run proceeded on the recipe's explicit
+        // POD-level uid (the promotion carries it to the effective identity).
+        let psc = PodSecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        };
+        let mover = MoverSpec {
+            pod_security_context: Some(psc.clone()),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, None, Some(&psc), None, None, None);
+        let meta = recorded_meta(
+            &resolved,
+            &InheritOutcome::Fallback {
+                reason: "no pod matches".into(),
+            },
+            Some(&mover),
+        );
+        assert_eq!(meta.src, RecordedSrc::Explicit);
+        assert_eq!(meta.uid, Some(2000));
+    }
+
+    #[test]
+    fn moverdefaults_pinned_uid_records_src_defaults() {
+        let defaults = MoverDefaults {
+            security_context: Some(sc_uid(2000)),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(Some(&defaults), None, None, None, None, None);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, None);
+        assert_eq!(meta.src, RecordedSrc::Defaults);
+        assert_eq!(meta.uid, Some(2000));
+    }
+
+    #[test]
+    fn nothing_pinned_records_absent_uid_and_src_defaults() {
+        // Absent uid = image-determined, recorded honestly (never baked to 65532).
+        let resolved = resolve_mover(None, None, None, None, None, None);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, None);
+        assert_eq!(meta.src, RecordedSrc::Defaults);
+        assert_eq!(meta.uid, None);
+        assert_eq!(meta.gid, None);
+        assert_eq!(meta.fs_group, Some(MOVER_NONROOT_ID));
+    }
+
+    #[test]
+    fn inherit_that_pinned_nothing_over_moverdefaults_records_src_defaults() {
+        // pins_identity: false — inheriting was a no-op; moverDefaults' uid is
+        // what the mover ran as, and claiming `inherited` would be a lie.
+        let defaults = MoverDefaults {
+            security_context: Some(sc_uid(2000)),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(Some(&defaults), None, None, None, None, None);
+        let meta = recorded_meta(&resolved, &inherited(None, false), None);
+        assert_eq!(meta.src, RecordedSrc::Defaults);
+        assert_eq!(meta.uid, Some(2000));
+    }
+
+    #[test]
+    fn gid_records_the_effective_run_as_group() {
+        let sc = SecurityContext {
+            run_as_user: Some(3001),
+            run_as_group: Some(3002),
+            ..Default::default()
+        };
+        let mover = MoverSpec {
+            security_context: Some(sc.clone()),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, Some(&sc), None, None, None, None);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
+        assert_eq!(meta.src, RecordedSrc::Explicit);
+        assert_eq!(meta.gid, Some(3002));
+    }
+}
+
 // --- inherit_verdict: what `inheritSecurityContextFrom` actually achieved. ---
 //
 // Pure, so every arm is exercised without a cluster. The property that matters most is that
@@ -3023,6 +3257,27 @@ mod inherit_verdict_tests {
             )
             .is_none(),
             "the condition must not appear on recipes that never asked to inherit"
+        );
+    }
+
+    #[test]
+    fn restore_only_snapshot_outcome_is_defensively_ignored_on_backups() {
+        // `InheritedFromSnapshot` is restore-only (the variant is admission-rejected
+        // on SnapshotPolicy and the backup reconciler passes no recorded source), so
+        // the backup verdict must not invent a condition for it — the restore
+        // reconciler owns that reporting.
+        assert!(
+            inherit_verdict(
+                &InheritOutcome::InheritedFromSnapshot {
+                    snapshot: "app/pg-b1".into(),
+                    uid: Some(3001),
+                    src: kopiur_api::recorded::RecordedSrc::Inherited,
+                },
+                &resolved_with_uid(Some(3001)),
+                None
+            )
+            .is_none(),
+            "a backup must never report the restore-only recorded-inherit outcome"
         );
     }
 
@@ -3109,40 +3364,85 @@ mod inherit_verdict_tests {
         assert!(!v.ok);
         assert_eq!(v.reason, INHERIT_OVERRIDDEN_REASON);
         assert!(
-            v.message.contains("this recipe's mover.securityContext")
-                && v.message.contains("Remove the explicit runAsUser"),
+            v.message
+                .contains("this recipe's explicit mover.securityContext.runAsUser")
+                && v.message.contains("Remove mover.securityContext.runAsUser"),
             "{}",
             v.message
         );
     }
 
     #[test]
-    fn an_overridden_inherit_names_moverdefaults_when_the_recipe_sets_no_uid() {
-        // The remedy used to say "Remove the explicit runAsUser" unconditionally. With the
-        // override coming from the repository, the user reads their policy, finds no
-        // runAsUser, and has nowhere to go.
+    fn moverdefaults_cannot_displace_an_inherited_uid_so_the_verdict_is_healthy() {
+        // The matter-server regression, through the REAL fold pipeline: the workload
+        // pins uid 2500 at the POD level, moverDefaults pins 1000 at the container
+        // level. Pre-fix the moverDefaults value shadowed the inherited one across
+        // dimensions and this reported InheritOverridden blaming moverDefaults "by
+        // design"; post-fix the inherited identity wins every layer and the verdict is
+        // the healthy InheritApplied. (This is also why the moverDefaults message
+        // branch was deleted: the state it described is unrepresentable now.)
         let defaults = MoverDefaults {
             security_context: Some(SecurityContext {
-                run_as_user: Some(2000),
+                run_as_user: Some(1000),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let resolved = resolve_mover(Some(&defaults), None, None, None, None, None);
-        // A recipe that sets a context but NO uid (e.g. seccomp only).
+        let inherited_psc = PodSecurityContext {
+            run_as_user: Some(2500),
+            ..Default::default()
+        };
+        // What resolve_mover_security_contexts produces: inherited ⊂ explicit(unset).
+        let (recipe_sc, recipe_psc) =
+            kopiur_api::common::merge_context_pair(None, Some(&inherited_psc), None, None);
+        let resolved = resolve_mover(
+            Some(&defaults),
+            recipe_sc.as_ref(),
+            recipe_psc.as_ref(),
+            None,
+            None,
+            None,
+        );
+        let v = inherit_verdict(&inherited(Some(2500), true), &resolved, None).unwrap();
+        assert!(v.ok, "the inherited uid won every layer: {}", v.message);
+        assert!(v.message.contains("uid 2500"), "{}", v.message);
+    }
+
+    #[test]
+    fn an_overridden_inherit_names_the_pod_level_field_when_that_is_what_won() {
+        // The recipe can displace the inherited uid from either dimension; the remedy
+        // must name the field the user actually wrote.
         let explicit = MoverSpec {
             pod_security_context: Some(PodSecurityContext {
-                fs_group: Some(1234),
+                run_as_user: Some(1000),
                 ..Default::default()
             }),
             ..Default::default()
         };
+        let inherited_sc = SecurityContext {
+            run_as_user: Some(2500),
+            ..Default::default()
+        };
+        let (recipe_sc, recipe_psc) = kopiur_api::common::merge_context_pair(
+            Some(&inherited_sc),
+            None,
+            explicit.security_context.as_ref(),
+            explicit.pod_security_context.as_ref(),
+        );
+        let resolved = resolve_mover(
+            None,
+            recipe_sc.as_ref(),
+            recipe_psc.as_ref(),
+            None,
+            None,
+            None,
+        );
         let v = inherit_verdict(&inherited(Some(2500), true), &resolved, Some(&explicit)).unwrap();
         assert!(!v.ok);
         assert_eq!(v.reason, INHERIT_OVERRIDDEN_REASON);
         assert!(
-            v.message.contains("moverDefaults") && v.message.contains("NOT this recipe"),
-            "must point at the layer that actually won: {}",
+            v.message.contains("mover.podSecurityContext.runAsUser"),
+            "must name the pod-level field that actually won: {}",
             v.message
         );
     }

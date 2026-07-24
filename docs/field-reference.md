@@ -427,11 +427,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 ###### `spec.maintenance.mover.inheritSecurityContextFrom` { #repository-spec-maintenance-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#repository-spec-maintenance-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#repository-spec-maintenance-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.maintenance.mover.inheritSecurityContextFrom.pvcConsumer` { #repository-spec-maintenance-mover-inheritsecuritycontextfrom-pvcconsumer }
@@ -1113,11 +1114,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 ###### `spec.maintenance.mover.inheritSecurityContextFrom` { #clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.maintenance.mover.inheritSecurityContextFrom.pvcConsumer` { #clusterrepository-spec-maintenance-mover-inheritsecuritycontextfrom-pvcconsumer }
@@ -1580,11 +1582,12 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 
 ##### `spec.mover.inheritSecurityContextFrom` { #snapshotpolicy-spec-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#snapshotpolicy-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#snapshotpolicy-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #snapshotpolicy-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
@@ -1806,7 +1809,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
-| `tags` | map[string]string | — | Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`). |
+| `tags` | map[string]string | — | Free-form tags attached to the kopia snapshot manifest itself (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the repository, independent of this CR. Keys must be non-empty, colon-free (kopia splits on the first colon), and must not start with the reserved `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes (webhook-enforced). |
 
 #### `spec.failurePolicy` { #snapshot-spec-failurepolicy }
 
@@ -1838,6 +1841,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered | — | Lifecycle phase of a `Snapshot`. |
 | `pinned` | boolean | — | The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile. |
 | `preflightSince` | string | — | RFC 3339 timestamp of the first reconcile where the repository was `Ready` but a `spec.preflight` check was failing. The one-shot anchor for the preflight `timeout` deadline (so the budget covers preflight only, not the earlier repository-not-Ready wait). Cleared once every preflight check passes, so a later failing episode gets a fresh budget rather than a stale anchor. |
+| `recorded` | [object](#snapshot-status-recorded) | — | The mover identity recorded on the kopia snapshot itself (the `kopiur-meta` tag): the resolved effective uid/gid/fsGroup the backup ran as, plus its provenance. Produced runs stamp this at launch (from the same value written into the tag); discovered rows decode it from the tag during the catalog scan. Absent for pre-feature snapshots, foreign backups without the tag, or a tag this operator version cannot decode. |
 | `resolved` | [object](#snapshot-status-resolved) | — | Frozen recipe values at run time (scheduled/manual). |
 | `snapshot` | [object](#snapshot-status-snapshot) | — | The kopia artifact this CR represents. |
 | `staged` | [object](#snapshot-status-staged) | — | The CSI staging objects the run created for `copyMethod: Snapshot`/`Clone`. |
@@ -1885,6 +1889,16 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `attempts` | integer | — | Number of attempts so far (bounded by `failurePolicy.backoffLimit`). |
 | `name` | string | — | Name of the mover `Job`. |
 
+#### `status.recorded` { #snapshot-status-recorded }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `schema` | integer | **required** | The `kopiur-meta` schema version this value was written under. Writers emit the lowest schema that represents the data (currently `KOPIUR_META_SCHEMA_V1`); readers reject only a schema NEWER than they understand (degrading to recorded-absent, never an error). |
+| `src` | enum: inherited \| explicit \| defaults \| unknown | **required** | Which layer pinned the recorded identity. Only `inherited` means the identity tracked the workload. |
+| `fsGroup` | integer | — | The resolved pod-level `fsGroup` the mover ran with (the hardened default is `65532`). Absent = no layer set one. |
+| `gid` | integer | — | The resolved effective `runAsGroup` the mover ran as at backup time (container `runAsGroup`, else pod). Absent = image-determined. |
+| `uid` | integer | — | The resolved effective `runAsUser` the mover ran as at backup time (container `runAsUser`, else pod). Absent = no layer pinned a UID, so the mover's UID was image-determined. |
+
 #### `status.resolved` { #snapshot-status-resolved }
 
 | Field | Type | Default | Description |
@@ -1920,6 +1934,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `identity` | [object](#snapshot-status-snapshot-identity) | **required** | The `username@hostname:path` identity recorded for this snapshot. |
 | `kopiaSnapshotID` | string | **required** | kopia's snapshot ID — the handle the finalizer uses to delete content. |
+| `description` | string | — | The kopia snapshot description (`snapshot create --description`), when one is recorded and non-empty. For discovered rows this is copied from the repository listing TRUNCATED to 1024 bytes (char-boundary-safe) — the value is foreign-writer-controlled and must never fail the CR write. |
 
 ##### `status.snapshot.identity` { #snapshot-status-snapshot-identity }
 
@@ -2192,11 +2207,12 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
 
 ##### `spec.mover.inheritSecurityContextFrom` { #restore-spec-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#restore-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#restore-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #restore-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
@@ -2438,11 +2454,12 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector
 
 ##### `spec.mover.inheritSecurityContextFrom` { #maintenance-spec-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#maintenance-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#maintenance-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #maintenance-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
@@ -2814,11 +2831,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 ##### `spec.mover.inheritSecurityContextFrom` { #repositoryreplication-spec-mover-inheritsecuritycontextfrom }
 
-Externally tagged — set **exactly one** of: `pvcConsumer` · `workloadSelector`.
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pvcConsumer` | [object](#repositoryreplication-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
 | `workloadSelector` | [object](#repositoryreplication-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
 
 ###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #repositoryreplication-spec-mover-inheritsecuritycontextfrom-pvcconsumer }

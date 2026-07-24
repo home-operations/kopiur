@@ -27,7 +27,9 @@ use k8s_openapi::api::admissionregistration::v1::{
 use k8s_openapi::api::core::v1::Secret;
 
 use kopiur_api::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION;
-use kopiur_api::{ClusterRepository, Repository, RepositoryReplication, Snapshot, SnapshotPolicy};
+use kopiur_api::{
+    ClusterRepository, Repository, RepositoryReplication, Restore, Snapshot, SnapshotPolicy,
+};
 use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
 
 /// Names the chart renders for release "kopiur" (the e2e release).
@@ -191,6 +193,85 @@ async fn self_managed_webhook_tls_bootstraps_and_gates_admission() {
         "the rejection should come from the admission webhook, got: {msg}"
     );
     let _ = repls.delete(bad_repl, &DeleteParams::default()).await;
+
+    // 7. The restore-only `inheritSecurityContextFrom: { snapshot: {} }` variant is
+    //    DENIED on a SnapshotPolicy: a backup's identity is read from the live
+    //    workload — it is the run that CREATES the recorded identity, it cannot
+    //    consume one.
+    let bad_snap_inherit = "webhook-deny-policy-snapshot-inherit";
+    let _ = configs
+        .delete(bad_snap_inherit, &DeleteParams::default())
+        .await;
+    let err = configs
+        .create(
+            &PostParams::default(),
+            &backup_config_with_snapshot_inherit(bad_snap_inherit),
+        )
+        .await
+        .expect_err("inheritSecurityContextFrom.snapshot on a SnapshotPolicy must be DENIED");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied the request") || msg.to_lowercase().contains("admission"),
+        "the rejection should come from the admission webhook, got: {msg}"
+    );
+    assert!(
+        msg.contains("restore-only"),
+        "the denial must say the variant is restore-only, got: {msg}"
+    );
+    let _ = configs
+        .delete(bad_snap_inherit, &DeleteParams::default())
+        .await;
+
+    // 8. The SAME variant on a Restore is ACCEPTED — with the declarative
+    //    `fromPolicy` source (the recorded identity resolves via the controller's
+    //    CR-catalog search, so admission has nothing to reject). This is the pair
+    //    that proves the deployed webhook distinguishes the kinds.
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let ok_restore = "webhook-allow-restore-snapshot-inherit";
+    let _ = restores.delete(ok_restore, &DeleteParams::default()).await;
+    restores
+        .create(
+            &PostParams::default(),
+            &restore_with_snapshot_inherit(ok_restore),
+        )
+        .await
+        .expect("fromPolicy + inheritSecurityContextFrom.snapshot must be ADMITTED on a Restore");
+    // Don't let it linger holding on MissingRecordedIdentity against absent infra.
+    let _ = restores.delete(ok_restore, &DeleteParams::default()).await;
+}
+
+/// A `SnapshotPolicy` whose mover sets the restore-only `snapshot: {}` inherit —
+/// structurally valid (the CRD schema carries the variant on every mover surface),
+/// but semantically impossible on a backup: admission rejects it.
+fn backup_config_with_snapshot_inherit(name: &str) -> SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "any" },
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "retention": { "keepLatest": 5 },
+            "mover": { "inheritSecurityContextFrom": { "snapshot": {} } }
+        }
+    }))
+    .expect("SnapshotPolicy JSON deserializes")
+}
+
+/// A `Restore` inheriting the backup's RECORDED identity with the declarative
+/// `fromPolicy` source — valid at admission with every source (Phase 3).
+fn restore_with_snapshot_inherit(name: &str) -> Restore {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "source": { "fromPolicy": { "name": "any" } },
+            "target": { "pvcRef": { "name": "any-target" } },
+            "mover": { "inheritSecurityContextFrom": { "snapshot": {} } }
+        }
+    }))
+    .expect("Restore JSON deserializes")
 }
 
 /// A `RepositoryReplication` whose mover sets `inheritSecurityContextFrom` — structurally

@@ -840,7 +840,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
     }
 
-    let (work_spec, mut source_volume, repo_volume, _) =
+    let (mut work_spec, mut source_volume, repo_volume, _) =
         build_backup_run(backup, &config, &repo, &namespace, &name)?;
 
     // The mover Job runs in THIS (workload) namespace, where the operator SA does
@@ -902,6 +902,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         config.spec.mover.as_ref(),
         source_pvc,
+        // `inheritSecurityContextFrom.snapshot` is restore-only (admission-rejected
+        // on SnapshotPolicy), so a backup never has a recorded source to pass.
+        None,
     )
     .await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
@@ -929,6 +932,41 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
+
+    // Record the RESOLVED mover identity on the kopia snapshot itself (the
+    // `kopiur-meta` tag) AND on `status.recorded` below — one value feeds both,
+    // so the tag and the status can never diverge. This is what lets a restore
+    // on a rebuilt cluster (workload not deployed, nothing in etcd) reproduce
+    // the identity the data expects.
+    let recorded = recorded_meta(
+        &resolved_mover,
+        &mover_security.outcome,
+        config.spec.mover.as_ref(),
+    );
+    match &mut work_spec.operation {
+        Operation::Snapshot(op) => {
+            op.tags.insert(
+                kopiur_api::KOPIUR_META_TAG.to_string(),
+                kopiur_api::encode_meta_tag(&recorded),
+            );
+        }
+        // build_backup_run constructs Operation::Snapshot by construction; every
+        // other variant is an invariant breach, enumerated so a new operation
+        // cannot compile into silence here.
+        Operation::Restore(_)
+        | Operation::SnapshotDelete(_)
+        | Operation::SnapshotDeleteBatch(_)
+        | Operation::BootstrapRepository(_)
+        | Operation::Maintenance(_)
+        | Operation::SnapshotPin(_)
+        | Operation::Verify(_)
+        | Operation::Replicate(_)
+        | Operation::BrowseSession(_) => {
+            return Err(Error::Invariant(
+                "build_backup_run produced a non-Snapshot operation".into(),
+            ));
+        }
+    }
 
     // Privileged-mover gate (ADR §4.11/§G16, VolSync-parity): an elevated mover
     // (root/privileged/added caps/`privilegedMode`, container- OR pod-level) requires
@@ -1463,6 +1501,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // recipe is gone — the namespace-deletion cascade usually reaps the
             // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
             "resolved": resolved_run_status(&config, &namespace, &work_spec),
+            // The SAME value written into the kopia `kopiur-meta` tag above —
+            // single source, so tag and status cannot diverge.
+            "recorded": recorded,
         }),
     )
     .await?;
@@ -3829,14 +3870,31 @@ fn inherit_verdict(
 
     match outcome {
         io::InheritOutcome::NotRequested => None,
+        // Restore-only outcome (`inheritSecurityContextFrom.snapshot`): unreachable
+        // from a backup — the variant is admission-rejected on SnapshotPolicy and the
+        // backup reconciler passes no recorded source (the resolver errors before it
+        // could ever produce this). Defensive: report no verdict rather than invent a
+        // condition for a state that cannot arise here; the restore reconciler owns
+        // the recorded-inherit reporting.
+        io::InheritOutcome::InheritedFromSnapshot { snapshot, .. } => {
+            tracing::debug!(
+                %snapshot,
+                "backup inherit_verdict saw the restore-only InheritedFromSnapshot outcome; \
+                 ignoring (validators make this unreachable)"
+            );
+            None
+        }
         io::InheritOutcome::Fallback { reason } => Some(InheritVerdict {
             ok: false,
             reason: INHERIT_FALLBACK_REASON,
             action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
             message: format!(
-                "{reason}. Proceeding with the recipe's explicit mover.securityContext ({}), \
-                 which pins the mover's identity itself — so this run is not tracking the \
-                 workload.",
+                "the mover runs as {} from this recipe's explicit mover securityContext, \
+                 not from the workload: {reason}. An explicit context that pins an \
+                 identity is the deliberate fallback, so the run proceeded — but it is \
+                 not tracking the workload. Scale the workload up or fix the selector to \
+                 resume inheriting, or drop inheritSecurityContextFrom if the explicit \
+                 context is the intent.",
                 identity()
             ),
         }),
@@ -3851,13 +3909,14 @@ fn inherit_verdict(
             reason: INHERIT_PINNED_NO_UID_REASON,
             action: PIN_WORKLOAD_RUN_AS_USER_ACTION,
             message: format!(
-                "pod `{pod}`{} pins no runAsUser, and no runAsGroup/fsGroup/supplementalGroups \
-                 beyond the mover's own defaults — its identity comes from its container image, \
-                 which Kopiur cannot read from the pod spec. Inheriting therefore copied \
-                 nothing, and the mover runs as {}, which did NOT come from the workload and \
-                 will likely fail to read the source with permission denied. Set runAsUser on \
-                 the workload, or set mover.securityContext.runAsUser (it merges with, and \
-                 overrides, inherited values).",
+                "inheriting from pod `{pod}`{} copied nothing: the pod pins no runAsUser, \
+                 and no runAsGroup/fsGroup/supplementalGroups beyond the mover's own \
+                 defaults, so its identity lives in its container image, which Kopiur \
+                 cannot read from the pod spec. The mover therefore runs as {} — an \
+                 identity that did NOT come from the workload — and will likely fail to \
+                 read the source with permission denied. Set runAsUser on the workload, \
+                 or pin mover.securityContext.runAsUser in this recipe (it merges with, \
+                 and overrides, inherited values).",
                 container
                     .as_deref()
                     .map(|c| format!(" (container `{c}`)"))
@@ -3870,37 +3929,43 @@ fn inherit_verdict(
             uid: Some(inherited_uid),
             ..
         } if effective != Some(*inherited_uid) => {
-            // A higher layer displaced the inherited UID. Intended — explicit wins by design —
-            // but it makes inheritance a permanent no-op for that field, and the compat
-            // condition is positive-only so it stays silent on exactly this shape. Name the
-            // layer that actually won: telling someone to "remove the explicit runAsUser" when
-            // the override came from the repository's moverDefaults sends them hunting through
-            // a recipe that does not contain one.
-            let recipe_uid = kopiur_api::common::effective_run_as_user(
-                explicit.and_then(|m| m.security_context.as_ref()),
-                explicit.and_then(|m| m.pod_security_context.as_ref()),
+            // Only the recipe's explicit context sits above the inherited layer, and the
+            // pair merge resolves the effective identity to the HIGHEST layer that pins
+            // one — so a displaced inherited uid always means the recipe pinned the
+            // winner. (The old "the repository's moverDefaults overrides inherited
+            // values" branch died with the cross-dimension shadowing bug: a lower layer
+            // can no longer displace an inherited identity, in either dimension.)
+            // Intended — explicit wins by design — but it makes inheritance a permanent
+            // no-op for that field, and the compat condition is positive-only so it
+            // stays silent on exactly this shape. Name the exact field so the remedy is
+            // a one-line edit.
+            debug_assert_eq!(
+                kopiur_api::common::effective_run_as_user(
+                    explicit.and_then(|m| m.security_context.as_ref()),
+                    explicit.and_then(|m| m.pod_security_context.as_ref()),
+                ),
+                effective,
+                "a displaced inherited uid can only come from the recipe's explicit context"
             );
-            let (layer, remedy) = if recipe_uid.is_some() && recipe_uid == effective {
-                (
-                    "this recipe's mover.securityContext",
-                    "Remove the explicit runAsUser to track the workload",
-                )
+            let field = if explicit
+                .and_then(|m| m.security_context.as_ref())
+                .and_then(|s| s.run_as_user)
+                == effective
+            {
+                "mover.securityContext.runAsUser"
             } else {
-                (
-                    "the repository's moverDefaults.securityContext (NOT this recipe — it sets \
-                     no runAsUser)",
-                    "Clear runAsUser from the repository's moverDefaults, or override it here",
-                )
+                "mover.podSecurityContext.runAsUser"
             };
             Some(InheritVerdict {
                 ok: false,
                 reason: INHERIT_OVERRIDDEN_REASON,
                 action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
                 message: format!(
-                    "the mover runs as {}, not the uid {inherited_uid} inherited from pod \
-                     `{pod}`: {layer} overrides inherited values by design. \
-                     inheritSecurityContextFrom is a no-op for runAsUser here and will not \
-                     follow the workload if it changes. {remedy}, or drop \
+                    "the mover runs as {}, not the uid {inherited_uid} it inherited from \
+                     pod `{pod}`: this recipe's explicit {field} overrides the inherited \
+                     value — an explicit field always wins — so \
+                     inheritSecurityContextFrom will not follow the workload if its uid \
+                     changes. Remove {field} to track the workload, or drop \
                      inheritSecurityContextFrom to stop implying that it does.",
                     identity()
                 ),

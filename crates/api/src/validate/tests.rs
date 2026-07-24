@@ -1151,6 +1151,190 @@ fn pvc_consumer_is_forbidden_on_non_backup_kinds() {
     assert!(forbid_pvc_consumer(&MoverSpec::default(), "maintenance", "x").is_ok());
 }
 
+// --- the `snapshot` inherit variant is restore-only (variant × kind matrix) ---
+
+/// Helper: a `MoverSpec` carrying one `inheritSecurityContextFrom` variant.
+fn mover_with_inherit(i: crate::common::InheritSecurityContextFrom) -> crate::common::MoverSpec {
+    crate::common::MoverSpec {
+        inherit_security_context_from: Some(i),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn forbid_snapshot_inherit_rejects_only_the_snapshot_variant() {
+    use crate::common::{
+        InheritSecurityContextFrom, MoverSpec, PodSelector, PvcConsumerInherit, SnapshotInherit,
+    };
+
+    let err = forbid_snapshot_inherit(
+        &mover_with_inherit(InheritSecurityContextFrom::Snapshot(SnapshotInherit {})),
+        "snapshotPolicy",
+        "restore-only; use pvcConsumer/workloadSelector.",
+    )
+    .unwrap_err();
+    match err {
+        ValidationError::InvalidFieldValue { field, reason } => {
+            assert_eq!(
+                field,
+                "snapshotPolicy.mover.inheritSecurityContextFrom.snapshot"
+            );
+            assert!(reason.contains("restore-only"), "{reason}");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+
+    // Every other shape passes through untouched.
+    for ok in [
+        mover_with_inherit(InheritSecurityContextFrom::WorkloadSelector(PodSelector {
+            pod_selector: Default::default(),
+            container: None,
+        })),
+        mover_with_inherit(InheritSecurityContextFrom::PvcConsumer(
+            PvcConsumerInherit::default(),
+        )),
+        MoverSpec::default(),
+    ] {
+        assert!(forbid_snapshot_inherit(&ok, "maintenance", "x").is_ok());
+    }
+}
+
+#[test]
+fn snapshot_inherit_is_forbidden_on_snapshot_policy() {
+    use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+    use crate::snapshot_policy::SnapshotPolicySpec;
+
+    let mut spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n",
+    );
+    assert!(validate_backup_config(&spec).is_empty(), "baseline valid");
+    spec.mover = Some(mover_with_inherit(InheritSecurityContextFrom::Snapshot(
+        SnapshotInherit {},
+    )));
+    let errs = validate_backup_config(&spec);
+    let msg = errs
+        .iter()
+        .find(|e| {
+            matches!(e, ValidationError::InvalidFieldValue { field, .. }
+                if field == "snapshotPolicy.mover.inheritSecurityContextFrom.snapshot")
+        })
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| panic!("expected the snapshot-inherit rejection, got: {errs:?}"));
+    // What/why/fix: a backup reads the LIVE workload; `snapshot` is restore-only.
+    assert!(msg.contains("live workload"), "{msg}");
+    assert!(msg.contains("restore-only"), "{msg}");
+}
+
+#[test]
+fn snapshot_inherit_is_forbidden_on_maintenance() {
+    use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+    use crate::maintenance::{MaintenanceSpec, Ownership};
+
+    let mut spec = MaintenanceSpec {
+        repository: repo_ref(RepositoryKind::Repository, None),
+        schedule: crate::maintenance::default_maintenance_schedule(),
+        ownership: Ownership {
+            owner: "kopiur/prod/nas".into(),
+            owner_aliases: Vec::new(),
+            takeover_policy: Default::default(),
+        },
+        mover: None,
+        failure_policy: None,
+        credential_projection: None,
+    };
+    assert!(validate_maintenance(&spec).is_empty(), "baseline valid");
+    spec.mover = Some(mover_with_inherit(InheritSecurityContextFrom::Snapshot(
+        SnapshotInherit {},
+    )));
+    let errs = validate_maintenance(&spec);
+    let named = errs.iter().any(|e| {
+        matches!(e, ValidationError::InvalidFieldValue { field, .. }
+            if field == "maintenance.mover.inheritSecurityContextFrom.snapshot")
+    });
+    assert!(
+        named,
+        "expected the snapshot-inherit rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn snapshot_inherit_on_replication_is_covered_by_the_whole_field_rejection() {
+    use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+
+    // RepositoryReplication rejects `inheritSecurityContextFrom` ENTIRELY
+    // (`forbid_inherit`), so the new variant is rejected without a per-variant rule
+    // — verified here so the coverage cannot silently regress if that ever changes.
+    let err = super::forbid_inherit(
+        &mover_with_inherit(InheritSecurityContextFrom::Snapshot(SnapshotInherit {})),
+        "RepositoryReplication spec",
+        "is not honored by a replication mover",
+    )
+    .expect_err("the snapshot variant must be caught by the whole-field rejection");
+    assert!(
+        err.to_string().contains("inheritSecurityContextFrom"),
+        "{err}"
+    );
+}
+
+#[test]
+fn snapshot_inherit_is_valid_on_restore_with_every_source() {
+    use crate::restore::RestoreSpec;
+
+    // All admission-time source shapes accept the variant: `snapshotRef` reads the
+    // CR directly; `fromPolicy`/`identity` (with or without a pinned snapshotID)
+    // resolve recorded meta via the controller's CR-catalog search.
+    let sources = [
+        "source: { snapshotRef: { name: b } }\nrepository: { kind: Repository, name: r }\n",
+        "source: { fromPolicy: { name: pg } }\nrepository: { kind: Repository, name: r }\n",
+        "source: { identity: { username: u, hostname: h } }\n\
+         repository: { kind: Repository, name: r }\n",
+        "source: { identity: { username: u, hostname: h, snapshotID: k1 } }\n\
+         repository: { kind: Repository, name: r }\n",
+    ];
+    for src in sources {
+        let yaml = format!(
+            "{src}target: {{ pvcRef: {{ name: restored }} }}\n\
+             mover: {{ inheritSecurityContextFrom: {{ snapshot: {{}} }} }}\n"
+        );
+        let spec: RestoreSpec = crate::testutil::from_yaml(&yaml);
+        assert!(
+            validate_restore(&spec).is_ok(),
+            "snapshot inherit must be valid with source: {src}"
+        );
+        assert!(validate_restore_spec(&spec).is_empty(), "{src}");
+    }
+}
+
+#[test]
+fn snapshot_inherit_is_allowed_with_populator_but_live_pod_variants_are_not() {
+    use crate::restore::RestoreSpec;
+
+    // `snapshot` needs no live pod at provision time — the recorded identity is
+    // resolved in the controller before the Job — so it is the ONE inherit mode
+    // valid with `target.populator` (deliberate carve-out).
+    let ok: RestoreSpec = crate::testutil::from_yaml(
+        "source: { fromPolicy: { name: pg } }\n\
+         target: { populator: {} }\n\
+         mover: { inheritSecurityContextFrom: { snapshot: {} } }\n",
+    );
+    assert!(validate_restore(&ok).is_ok());
+
+    // The live-pod variant keeps its populator rejection.
+    let selector: RestoreSpec = crate::testutil::from_yaml(
+        "source: { fromPolicy: { name: pg } }\n\
+         target: { populator: {} }\n\
+         mover: { inheritSecurityContextFrom: { workloadSelector: { podSelector: { \
+         matchLabels: { app: pg } } } } }\n",
+    );
+    let err = validate_restore(&selector).unwrap_err();
+    assert!(
+        matches!(&err, ValidationError::InvalidFieldValue { field, .. }
+            if field == "restore.mover.inheritSecurityContextFrom"),
+        "got {err:?}"
+    );
+}
+
 // --- validate_mover: inheritSecurityContextFrom COMBINES with explicit (container / pod) ---
 
 /// `inheritSecurityContextFrom` alongside an explicit `securityContext`/`podSecurityContext`
@@ -1408,6 +1592,120 @@ fn backup_aggregate_rejects_discovered_delete() {
         errs[0],
         ValidationError::DiscoveredMustRetain { .. }
     ));
+}
+
+// --- validate_snapshot_tags ---
+
+fn tags_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn snapshot_tags_clean_pass_and_absent_pass() {
+    assert!(validate_snapshot_tags(None).is_empty());
+    let tags = tags_of(&[("reason", "pre-upgrade"), ("team", "billing")]);
+    assert!(validate_snapshot_tags(Some(&tags)).is_empty());
+}
+
+#[test]
+fn snapshot_tags_reject_empty_key() {
+    let tags = tags_of(&[("", "v")]);
+    let errs = validate_snapshot_tags(Some(&tags));
+    assert_eq!(errs.len(), 1);
+    let msg = errs[0].to_string();
+    assert!(msg.contains("spec.tags"), "{msg}");
+    assert!(msg.contains("non-empty"), "{msg}");
+}
+
+#[test]
+fn snapshot_tags_reject_colon_keys_citing_the_first_colon_split() {
+    let tags = tags_of(&[("env:prod", "v")]);
+    let errs = validate_snapshot_tags(Some(&tags));
+    assert_eq!(errs.len(), 1);
+    let msg = errs[0].to_string();
+    // What (the key), why (kopia's first-colon split + the duplicate-key create
+    // failure it can trip), fix (colon-free key).
+    assert!(msg.contains("env:prod"), "{msg}");
+    assert!(msg.contains("first colon"), "{msg}");
+    assert!(msg.contains("duplicate"), "{msg}");
+    assert!(msg.contains("colon-free"), "{msg}");
+}
+
+#[test]
+fn snapshot_tags_reject_reserved_kopiur_prefix() {
+    for key in ["kopiur", "kopiur-meta", "kopiurfoo"] {
+        let tags = tags_of(&[(key, "v")]);
+        let errs = validate_snapshot_tags(Some(&tags));
+        assert_eq!(errs.len(), 1, "{key} must be rejected");
+        let msg = errs[0].to_string();
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains(key), "{msg}");
+    }
+}
+
+#[test]
+fn snapshot_tags_reject_oversize_key_and_value() {
+    let long_key = "k".repeat(MAX_SNAPSHOT_TAG_KEY_LEN + 1);
+    let errs = validate_snapshot_tags(Some(&tags_of(&[(long_key.as_str(), "v")])));
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].to_string().contains("63"), "{}", errs[0]);
+
+    let long_value = "v".repeat(MAX_SNAPSHOT_TAG_VALUE_LEN + 1);
+    let errs = validate_snapshot_tags(Some(&tags_of(&[("k", long_value.as_str())])));
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].to_string().contains("256"), "{}", errs[0]);
+
+    // Exactly at the bounds is fine.
+    let max_key = "k".repeat(MAX_SNAPSHOT_TAG_KEY_LEN);
+    let max_value = "v".repeat(MAX_SNAPSHOT_TAG_VALUE_LEN);
+    assert!(
+        validate_snapshot_tags(Some(&tags_of(&[(max_key.as_str(), max_value.as_str())])))
+            .is_empty()
+    );
+}
+
+#[test]
+fn snapshot_tags_bound_the_count() {
+    let pairs: Vec<(String, String)> = (0..=MAX_SNAPSHOT_TAGS)
+        .map(|i| (format!("k{i:02}"), "v".to_string()))
+        .collect();
+    let tags: BTreeMap<String, String> = pairs.into_iter().collect();
+    let errs = validate_snapshot_tags(Some(&tags));
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].to_string().contains("10"), "{}", errs[0]);
+
+    let ok: BTreeMap<String, String> = (0..MAX_SNAPSHOT_TAGS)
+        .map(|i| (format!("k{i:02}"), "v".to_string()))
+        .collect();
+    assert!(validate_snapshot_tags(Some(&ok)).is_empty());
+}
+
+#[test]
+fn snapshot_tags_accumulate_every_problem() {
+    let tags = tags_of(&[("a:b", "v"), ("kopiur-x", "v")]);
+    let errs = validate_snapshot_tags(Some(&tags));
+    assert_eq!(errs.len(), 2, "{errs:?}");
+}
+
+#[test]
+fn backup_aggregate_rejects_reserved_tags() {
+    let spec = SnapshotSpec {
+        policy_ref: None,
+        tags: Some(tags_of(&[("kopiur-meta", "{}")])),
+        failure_policy: None,
+        description: None,
+        deletion_policy: None,
+        on_schedule_delete: None,
+        pin: false,
+    };
+    let errs = validate_backup(&spec, Origin::Manual);
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("reserved")),
+        "{errs:?}"
+    );
 }
 
 // --- validate_backup_on_schedule_delete ---

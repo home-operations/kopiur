@@ -481,6 +481,29 @@ pub(crate) fn forbid_pvc_consumer(
     Ok(())
 }
 
+/// `inheritSecurityContextFrom.snapshot` reproduces the identity RECORDED on a backup
+/// (`Snapshot.status.recorded`), so it only makes sense where a snapshot is being consumed —
+/// a `Restore`. A backup's identity comes from the live workload and maintenance touches no
+/// snapshot at all, so those kinds reject the variant at admission rather than fail (or,
+/// worse, silently no-op) at runtime. `field_prefix` names the owning kind (e.g.
+/// `"snapshotPolicy"`/`"maintenance"`), `reason` is the kind-appropriate what/why/fix.
+pub(crate) fn forbid_snapshot_inherit(
+    mover: &MoverSpec,
+    field_prefix: &str,
+    reason: &str,
+) -> ValidationResult {
+    if matches!(
+        mover.inherit_security_context_from,
+        Some(crate::common::InheritSecurityContextFrom::Snapshot(_))
+    ) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field_prefix}.mover.inheritSecurityContextFrom.snapshot"),
+            reason: reason.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Reject `inheritSecurityContextFrom` **entirely**, for a kind whose reconciler never resolves
 /// it. Stronger than [`forbid_pvc_consumer`]: that rejects one variant on a kind that *does*
 /// honor the other, this rejects the whole field on a kind that honors none of it.

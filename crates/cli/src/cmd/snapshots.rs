@@ -124,9 +124,45 @@ pub fn headers(all_namespaces: bool, wide: bool) -> Vec<&'static str> {
         "AGE",
     ]);
     if wide {
-        h.extend(["IDENTITY", "DELETION-POLICY", "PINNED"]);
+        h.extend([
+            "IDENTITY",
+            "DELETION-POLICY",
+            "PINNED",
+            "RECORDED",
+            "DESCRIPTION",
+        ]);
     }
     h
+}
+
+/// Render `status.recorded` as a compact `uid:gid` cell (`-` per missing part;
+/// the whole cell empty when nothing was recorded). The recorded identity is
+/// what a Phase-3 restore will reproduce, so surfacing it here is what makes
+/// the feature visible from the plugin at all.
+fn recorded_cell(status: Option<&kopiur_api::SnapshotStatus>) -> String {
+    match status.and_then(|s| s.recorded.as_ref()) {
+        None => EMPTY_CELL.into(),
+        Some(rec) => {
+            let part = |v: Option<i64>| v.map_or_else(|| EMPTY_CELL.into(), |n| n.to_string());
+            format!("{}:{}", part(rec.uid), part(rec.gid))
+        }
+    }
+}
+
+/// The kopia description, truncated for the table (full value via `-o yaml`).
+fn description_cell(status: Option<&kopiur_api::SnapshotStatus>) -> String {
+    const MAX: usize = 40;
+    match status
+        .and_then(|s| s.snapshot.as_ref())
+        .and_then(|i| i.description.as_deref())
+    {
+        None => EMPTY_CELL.into(),
+        Some(d) if d.chars().count() <= MAX => d.to_string(),
+        Some(d) => {
+            let cut: String = d.chars().take(MAX - 1).collect();
+            format!("{cut}…")
+        }
+    }
 }
 
 fn origin_cell(origin: Option<Origin>) -> String {
@@ -223,7 +259,13 @@ pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool
         let pinned = status
             .and_then(|s| s.pinned)
             .map_or_else(|| EMPTY_CELL.into(), |p| p.to_string());
-        cells.extend([identity, deletion, pinned]);
+        cells.extend([
+            identity,
+            deletion,
+            pinned,
+            recorded_cell(status),
+            description_cell(status),
+        ]);
     }
     cells
 }
@@ -487,14 +529,37 @@ status:
     }
 
     #[test]
-    fn wide_row_appends_identity_deletion_policy_and_pin() {
+    fn wide_row_appends_identity_deletion_policy_pin_recorded_and_description() {
         let snap: Snapshot = from_yaml(SUCCEEDED_SNAPSHOT);
         let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
         let cells = row(&snap, now, true, true);
         // -A inserts NAMESPACE after NAME.
         assert_eq!(cells[1], "media");
-        let tail = &cells[cells.len() - 3..];
-        assert_eq!(tail, ["nightly@media:/pvc/data", "delete", "-"]);
+        let tail = &cells[cells.len() - 5..];
+        // Nothing recorded / no description on this row → placeholder cells.
+        assert_eq!(tail, ["nightly@media:/pvc/data", "delete", "-", "-", "-"]);
+        assert_eq!(headers(true, true).len(), cells.len());
+    }
+
+    #[test]
+    fn wide_row_renders_recorded_identity_and_description() {
+        let mut snap: Snapshot = from_yaml(SUCCEEDED_SNAPSHOT);
+        let status = snap.status.as_mut().unwrap();
+        status.recorded = serde_json::from_value(serde_json::json!({
+            "schema": 1, "src": "explicit", "uid": 3001, "fsGroup": 65532
+        }))
+        .unwrap();
+        status.snapshot.as_mut().unwrap().description =
+            Some("pre-upgrade snapshot with a description far past the forty character cap".into());
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        let cells = row(&snap, now, false, true);
+        let tail = &cells[cells.len() - 2..];
+        // uid recorded, gid image-determined → `3001:-`; description truncated
+        // with an ellipsis (the full value stays available via -o yaml).
+        assert_eq!(tail[0], "3001:-");
+        assert!(tail[1].starts_with("pre-upgrade snapshot"), "{}", tail[1]);
+        assert!(tail[1].ends_with('…'), "{}", tail[1]);
+        assert!(tail[1].chars().count() <= 40);
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub const HOSTPATH_REPOS_ROOT: &str = "/kopiur-e2e/repos";
 /// at 0777 for each — keep the two lists in lockstep.
 pub const REPO_SUBPATHS: &[&str] = &[
     "moverdefaults",
+    "scc-shadow",
+    "recmeta",
     "nsdel-orphan",
     "nsdel-delete",
     "pin",
@@ -120,6 +122,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "polcasc-retain",
     "polcasc-delete",
     "polcasc-simul",
+    // Phase-3 recorded-identity restore (restore.rs::restore_inherits_recorded_identity):
+    // the whole repo runs at uid/gid 3001 (bootstrap AND backup — kopia's 0600 control
+    // files must share one owner), so it cannot share the restore shard's 65532 seed repo.
+    "recrestore",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per

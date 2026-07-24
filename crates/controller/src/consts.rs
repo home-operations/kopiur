@@ -336,6 +336,16 @@ pub const MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION: &str = "MatchWorkloadSecurityC
 /// - [`INHERIT_OVERRIDDEN_REASON`] — an explicit `runAsUser` displaced the inherited one, so
 ///   inheritance is not tracking the workload for that field.
 ///
+/// On a `Restore` with `inheritSecurityContextFrom.snapshot` (recorded-identity inherit)
+/// the SAME condition reports positively too — provable provenance is that mode's value:
+///
+/// - [`RECORDED_APPLIED_REASON`] — `True`; the backup's recorded identity was applied
+///   (message names the Snapshot, the recorded uid, and the provenance).
+/// - [`RECORDED_PINNED_NO_UID_REASON`] — `False`; the record pins nothing beyond the
+///   hardened baseline, so inheriting it was a provable no-op.
+/// - [`MISSING_RECORDED_IDENTITY_REASON`] — `False`; no recorded identity is resolvable
+///   yet (missing CR / no `status.recorded` / catalog scan pending) — a slow-requeued hold.
+///
 /// Distinct from [`SECURITY_CONTEXT_COMPATIBLE_CONDITION`], which is about whether the mover
 /// can *read the source*; this is about whether *inheritance did what you asked*.
 pub const SECURITY_CONTEXT_INHERITED_CONDITION: &str = "SecurityContextInherited";
@@ -362,6 +372,28 @@ pub const INHERIT_OVERRIDDEN_REASON: &str = "InheritOverridden";
 pub const INHERIT_APPLIED_REASON: &str = "InheritApplied";
 /// Event `action` (remediation hint) for the inherit-pinned-no-uid case.
 pub const PIN_WORKLOAD_RUN_AS_USER_ACTION: &str = "PinWorkloadRunAsUser";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `False` on a `Restore` whose
+/// `inheritSecurityContextFrom.snapshot` cannot resolve a recorded identity yet: the
+/// referenced `Snapshot` CR is missing, carries no `status.recorded` (pre-feature or
+/// foreign backup), or no CR matching the source identity exists (catalog scan pending).
+/// Permanent-shaped: the hold requeues on the slow structural cadence, and clears when the
+/// scan lands/backfills or the spec pins an explicit context.
+pub const MISSING_RECORDED_IDENTITY_REASON: &str = "MissingRecordedIdentity";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `False` on a `Restore` when the
+/// backup's recorded metadata pins nothing beyond the mover's own hardened baseline (no
+/// uid, no gid, fsGroup absent or the hardened 65532) — the restore counterpart of
+/// [`INHERIT_PINNED_NO_UID_REASON`]: inheriting the record is a provable no-op and the
+/// mover runs as its image's uid.
+pub const RECORDED_PINNED_NO_UID_REASON: &str = "RecordedPinnedNoUid";
+/// `reason` for [`SECURITY_CONTEXT_INHERITED_CONDITION`] = `True` on a `Restore`: the
+/// identity recorded on the backup (`Snapshot.status.recorded`) was applied to the restore
+/// mover. The message always names the Snapshot, the recorded uid, and the provenance
+/// (`src`) — only `src: inherited` may claim the identity tracked the workload, and a
+/// recorded ROOT uid is named explicitly so a forged tag stays auditable (§3.4).
+pub const RECORDED_APPLIED_REASON: &str = "RecordedApplied";
+/// Event `action` (remediation hint) when recorded-identity inherit cannot proceed or
+/// contributed nothing: pin `mover.securityContext` explicitly (or drop the inherit).
+pub const SET_EXPLICIT_MOVER_CONTEXT_ACTION: &str = "SetExplicitMoverSecurityContext";
 /// `Restore` condition reporting whether the *future* consumer of the restore target PVC
 /// will be able to read what the mover writes (a securityContext-only heuristic; no runtime
 /// layer exists for restore since the consumer may not exist yet). Same tri-state semantics

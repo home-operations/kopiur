@@ -493,6 +493,145 @@ async fn snapshot_create_accepts_m4_flag_sweep_and_records_the_description() {
     assert_eq!(entry.description, "m4 flag sweep smoke test");
 }
 
+/// The permanent guard for every kopia tag-mechanics assumption the `kopiur-meta`
+/// snapshot-metadata feature rests on, proven against the pinned binary (each point
+/// was also manually verified against this exact kopia 0.23.1 while writing the
+/// test):
+///
+/// 1. **First-colon split**: the legacy CLI string `kopiur:config:<name>` is stored
+///    under manifest key `tag:kopiur` with value `config:<name>`. `kopiur` is
+///    therefore an occupied CLI key, and any new kopiur tag MUST use a colon-free
+///    CLI key (`kopiur-meta`).
+/// 2. **`tag:` manifest prefix**: user tags land in the manifest `tags` map with a
+///    `tag:` key prefix ([`kopiur_kopia::user_tags`] strips it), and a JSON-blob
+///    value — colons, braces, quotes — survives verbatim.
+/// 3. **Duplicate keys fail the create outright** ("Duplicate tag <key> found"):
+///    two CLI tags whose strings collide on the first-colon key (`kopiur:meta` +
+///    `kopiur:config:x` → both key `kopiur`) BREAK THE BACKUP. This is why
+///    `Snapshot.spec.tags` reserves the `kopiur` prefix and forbids colons.
+/// 4. **`snapshot list --json` emits the tags map** — the read-back path the
+///    catalog scan depends on exists.
+/// 5. **Tags survive manifest rewrites**: `snapshot pin` (which CHANGES the
+///    manifest id) and full maintenance both preserve the tags map.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn tag_mechanics_first_colon_split_duplicate_keys_and_rewrite_survival() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"tagged\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+
+    // The exact two tags the controller writes: the legacy `kopiur:config` string and
+    // the kopiur-meta JSON blob.
+    let meta_json = r#"{"schema":1,"uid":1000,"gid":1000,"fsGroup":65532}"#;
+    let mut tags = BTreeMap::new();
+    tags.insert("kopiur:config".to_string(), "mypolicy".to_string());
+    tags.insert("kopiur-meta".to_string(), meta_json.to_string());
+    let created = client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &tags,
+            Some("taguser@taghost:/data"),
+        )
+        .await
+        .expect("create with the legacy tag + the meta tag must not collide");
+
+    // (1)+(2): first-colon split and the `tag:` manifest prefix, on the create echo.
+    assert_eq!(
+        created.tags.get("tag:kopiur").map(String::as_str),
+        Some("config:mypolicy"),
+        "kopia splits the CLI string on the FIRST colon: key `kopiur`, value \
+         `config:mypolicy`, stored under the `tag:` manifest prefix; got {:?}",
+        created.tags
+    );
+    assert_eq!(
+        created.tags.get("tag:kopiur-meta").map(String::as_str),
+        Some(meta_json),
+        "the JSON blob value must survive verbatim"
+    );
+    let stripped = kopiur_kopia::user_tags(&created.tags);
+    assert_eq!(
+        stripped.get("kopiur-meta").map(String::as_str),
+        Some(meta_json)
+    );
+
+    // (3): a second CLI tag colliding on the first-colon key fails the create.
+    let mut colliding = BTreeMap::new();
+    colliding.insert("kopiur".to_string(), "meta".to_string());
+    colliding.insert("kopiur:config".to_string(), "x".to_string());
+    let err = client
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &colliding,
+            Some("taguser@taghost:/data"),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "two CLI tags colliding on the first-colon key (`kopiur`) must fail the \
+         create — this is the backup-breaking hazard the reserved-prefix validator \
+         exists to prevent"
+    );
+
+    // (4): the list read-back path carries the tags.
+    let list = client.snapshot_list(None).await.expect("snapshot list");
+    let entry = list
+        .iter()
+        .find(|e| e.id == created.id)
+        .expect("created snapshot present in list");
+    assert_eq!(entry.tags, created.tags, "list must echo the manifest tags");
+
+    // (5): pin REWRITES the manifest (the id changes) — tags must survive, and the
+    // reconciler-visible lesson is that the id is NOT stable across a pin.
+    client
+        .snapshot_pin(&created.id, "protected")
+        .await
+        .expect("pin");
+    let pinned_list = client
+        .snapshot_list(Some(&created.source))
+        .await
+        .expect("list after pin");
+    let pinned = pinned_list
+        .first()
+        .expect("snapshot still present after pin");
+    assert_ne!(
+        pinned.id, created.id,
+        "pin rewrites the manifest under a NEW id (reconcilers must re-resolve)"
+    );
+    assert_eq!(
+        pinned.tags, created.tags,
+        "tags must survive the pin's manifest rewrite"
+    );
+
+    // ...and full maintenance must not strip them either.
+    client
+        .maintenance_run(MaintenanceMode::Full)
+        .await
+        .expect("full maintenance");
+    let after = client
+        .snapshot_list(Some(&created.source))
+        .await
+        .expect("list after maintenance");
+    assert_eq!(
+        after.first().map(|e| &e.tags),
+        Some(&created.tags),
+        "tags must survive full maintenance"
+    );
+}
+
 /// M0b (confirmed data-loss bug): real-kopia proof that pinning the six
 /// `--keep-*` fields to a very large value at the IDENTITY scope, before the
 /// first `snapshot create`, neutralizes kopia's own create-time retention.

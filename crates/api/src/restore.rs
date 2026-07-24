@@ -851,6 +851,52 @@ mover:
     }
 
     #[test]
+    fn restore_crd_schema_carries_the_snapshot_inherit_variant() {
+        // `Restore::crd()`/`SnapshotPolicy::crd()` smoke for the new externally-tagged
+        // variant: schema generation must not panic, and the Restore schema must
+        // surface `inheritSecurityContextFrom.snapshot` as an object property (the
+        // SnapshotPolicy schema carries it too — the restriction is webhook-level,
+        // not structural).
+        let crd = Restore::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let inherit = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["mover"]["properties"]["inheritSecurityContextFrom"]["properties"];
+        assert!(
+            inherit["snapshot"].is_object(),
+            "inheritSecurityContextFrom must carry the `snapshot` variant; got {inherit}"
+        );
+        assert_eq!(inherit["snapshot"]["type"], "object");
+        // The other variants are untouched.
+        assert!(inherit["workloadSelector"].is_object());
+        assert!(inherit["pvcConsumer"].is_object());
+        let _ = crate::SnapshotPolicy::crd();
+    }
+
+    #[test]
+    fn restore_snapshot_inherit_mover_roundtrip() {
+        // The restore-only recorded-identity inherit mode, parsed the cluster's way.
+        use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+        let yaml = r#"
+source: { snapshotRef: { name: app-data-backup } }
+target: { pvcRef: { name: app-data-restored } }
+mover:
+  inheritSecurityContextFrom:
+    snapshot: {}
+"#;
+        let spec: RestoreSpec = from_yaml(yaml);
+        assert!(matches!(
+            spec.mover
+                .as_ref()
+                .and_then(|m| m.inherit_security_context_from.as_ref()),
+            Some(InheritSecurityContextFrom::Snapshot(SnapshotInherit {})),
+        ));
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert!(json["mover"]["inheritSecurityContextFrom"]["snapshot"].is_object());
+        let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
     fn restore_source_unknown_variant_is_rejected() {
         let value: serde_json::Value = serde_yaml::from_str("snapshotUrl:\n  url: x\n").unwrap();
         assert!(serde_json::from_value::<RestoreSource>(value).is_err());

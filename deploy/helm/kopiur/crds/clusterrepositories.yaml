@@ -901,6 +901,8 @@ spec:
                           - workloadSelector
                         - required:
                           - pvcConsumer
+                        - required:
+                          - snapshot
                         properties:
                           pvcConsumer:
                             description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
@@ -909,6 +911,16 @@ spec:
                                 description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
                                 nullable: true
                                 type: string
+                            type: object
+                          snapshot:
+                            description: |-
+                              Restores only: inherit the identity RECORDED on the backup itself
+                              (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) —
+                              uid/gid/fsGroup the backup mover actually ran as. Needs no live workload
+                              pod, so it works on a rebuilt cluster and with `target.populator`.
+                              Rejected at admission on SnapshotPolicy/Maintenance (backups read the
+                              live workload; maintenance has no snapshot). Write it as `snapshot: {}`
+                              (an empty sub-object) — a bare `snapshot:` is null and rejected.
                             type: object
                           workloadSelector:
                             description: Inherit from workload pod(s) matched by an explicit label selector (backup or restore).

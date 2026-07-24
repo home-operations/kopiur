@@ -910,6 +910,15 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
         ) {
             errs.push(e);
         }
+        if let Err(e) = forbid_snapshot_inherit(
+            m,
+            "maintenance",
+            "a maintenance mover operates on the repository, not on a snapshot's data, so \
+             there is no recorded identity to reproduce; `snapshot` is restore-only. Use an \
+             explicit mover.securityContext instead.",
+        ) {
+            errs.push(e);
+        }
         if let Err(e) = validate_mover(m, "Maintenance mover") {
             errs.push(e);
         }

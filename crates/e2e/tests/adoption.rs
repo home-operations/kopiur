@@ -13,7 +13,10 @@
 //! NON-matching seeded snapshot stays a forced-Retain `discovered` row (its kopia
 //! data untouched). Scenario 2 proves the `catalog.adoption: Ignore` opt-out leaves
 //! matching rows discovered. Scenario 3 proves cross-namespace `ClusterRepository`
-//! adoption (the cluster-wide-LIST guard).
+//! adoption (the cluster-wide-LIST guard). Scenario 4 proves the Phase-2
+//! `kopiur-meta` loop: the recorded backup-time mover identity + description ride
+//! the kopia snapshot itself, survive CR deletion, come back on the adopted row,
+//! and the scan BACKFILLS `status.recorded` onto rows that lack it.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
@@ -1378,6 +1381,299 @@ async fn retain_policy_adoption_converges_without_job_churn() {
             .await;
     }
     for r in discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = wait_until(
+        "snapshot CRs drain before repo teardown",
+        Duration::from_secs(120),
+        poll_interval(),
+        || async {
+            let live = backups
+                .list(&ListParams::default().labels(&format!("{REPOSITORY_UID_LABEL}={repo_uid}")))
+                .await?
+                .items;
+            Ok(live.is_empty().then_some(()))
+        },
+    )
+    .await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 4 — Phase-2 `kopiur-meta`: recorded identity survives CR deletion.
+// ---------------------------------------------------------------------------
+
+const S4_SUBPATH: &str = "recmeta";
+
+/// The `kopiur-meta` full loop: the backup-time mover identity is recorded ON the
+/// kopia snapshot, so it survives the CR being deleted (the re-bootstrap premise).
+/// 1. A policy pinning an explicit mover uid/gid (3001) + a manual Snapshot with
+///    user `spec.tags` and a `description` → `Succeeded`. The mover Job's work
+///    spec carries all three tag classes (the user tag — previously an inert
+///    field, the reserved `kopiur:config`, and `kopiur-meta`), and the produced CR
+///    carries `status.recorded` {schema:1, src:explicit, uid/gid:3001,
+///    fsGroup:65532} + `status.snapshot.description`.
+/// 2. The CR is deleted (`Retain`) — kopia keeps the snapshot AND its tags. The
+///    next catalog cycle re-attaches it as an `origin: adopted` row carrying the
+///    SAME `status.recorded` + description, recovered from the kopia tag with
+///    nothing left in etcd.
+/// 3. Stripping `status.recorded` off the row is healed by the next scan's
+///    targeted backfill patch (matched by `kopiaSnapshotID`, only-while-absent) —
+///    the upgrade path for rows written before this feature existed.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn recorded_meta_round_trips_through_deletion_and_adoption() {
+    use k8s_openapi::api::batch::v1::Job;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, S4_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-recmeta-repo";
+    const POLICY: &str = "e2e-recmeta-pol";
+    const SNAP: &str = "e2e-recmeta-1";
+
+    // Fast catalog cycles so adoption + backfill don't wait an hour; maintenance
+    // off to cut Job churn. moverDefaults pins the SAME uid/gid the recipe pins
+    // explicitly below: a kopia filesystem repo's 0600 control files are only
+    // readable by the uid that wrote them, so the bootstrap/scan movers and the
+    // backup mover must agree — a 65532 bootstrap + a 3001 backup would fail with
+    // permission denied. (The recipe's explicit context still pins the winning
+    // identity, so `recorded.src` stays `explicit`.)
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                S4_SUBPATH,
+                serde_json::json!({
+                    "maintenance": { "enabled": false },
+                    "catalog": { "periodicRefresh": true, "refreshInterval": "30s" },
+                    "moverDefaults": {
+                        "securityContext": { "runAsUser": 3001, "runAsGroup": 3001 }
+                    }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    let repo_uid = repos
+        .get(REPO)
+        .await
+        .expect("get Repository")
+        .metadata
+        .uid
+        .expect("Repository uid");
+
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({
+                    "retention": { "keepLatest": 20 },
+                    "mover": { "securityContext": { "runAsUser": 3001, "runAsGroup": 3001 } }
+                }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                SNAP,
+                POLICY,
+                serde_json::json!({
+                    "tags": { "team": "e2e" },
+                    "description": "recorded-meta e2e"
+                }),
+            )),
+        )
+        .await
+        .expect("create Snapshot with user tags + description");
+
+    // (1a) The work spec carries all three tag classes. Read it off the live Job
+    // (before Succeeded — the Job self-GCs on its TTL after finishing).
+    let ws = common::wait_for_work_spec_json(&jobs, SNAP).await;
+    let tags = ws
+        .pointer("/operation/snapshot/tags")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        tags.get("team").and_then(|v| v.as_str()),
+        Some("e2e"),
+        "user spec.tags must reach the work spec (the field was inert before): {tags}"
+    );
+    assert_eq!(
+        tags.get("kopiur:config").and_then(|v| v.as_str()),
+        Some(POLICY),
+        "the reserved config tag must survive the user-tag merge: {tags}"
+    );
+    let meta_raw = tags
+        .get("kopiur-meta")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("the kopiur-meta tag must ride the work spec: {tags}"));
+    let meta: serde_json::Value =
+        serde_json::from_str(meta_raw).expect("kopiur-meta tag value is JSON");
+    assert_eq!(meta["schema"], 1, "schema-versioned: {meta}");
+    assert_eq!(
+        meta["uid"], 3001,
+        "the resolved mover uid is recorded: {meta}"
+    );
+
+    wait_phase(&backups, SNAP, "Succeeded")
+        .await
+        .expect("Snapshot should Succeed");
+
+    // (1b) The produced CR carries the recorded identity + the description.
+    fn expect_recorded(s: &serde_json::Value, ctx: &str) {
+        assert_eq!(
+            s.pointer("/recorded/schema").and_then(|v| v.as_i64()),
+            Some(1),
+            "{ctx}: {s}"
+        );
+        assert_eq!(
+            s.pointer("/recorded/src").and_then(|v| v.as_str()),
+            Some("explicit"),
+            "{ctx}: the identity was pinned by the recipe, and provenance must say so: {s}"
+        );
+        assert_eq!(
+            s.pointer("/recorded/uid").and_then(|v| v.as_i64()),
+            Some(3001),
+            "{ctx}: {s}"
+        );
+        assert_eq!(
+            s.pointer("/recorded/gid").and_then(|v| v.as_i64()),
+            Some(3001),
+            "{ctx}: {s}"
+        );
+        assert_eq!(
+            s.pointer("/recorded/fsGroup").and_then(|v| v.as_i64()),
+            Some(65532),
+            "{ctx}: the hardened pod fsGroup is recorded: {s}"
+        );
+    }
+    let s = status_json(&backups, SNAP).await;
+    expect_recorded(&s, "produced CR");
+    assert_eq!(
+        s.pointer("/snapshot/description").and_then(|v| v.as_str()),
+        Some("recorded-meta e2e"),
+        "spec.description must surface on status.snapshot: {s}"
+    );
+    let kopia_id = s
+        .pointer("/snapshot/kopiaSnapshotID")
+        .and_then(|v| v.as_str())
+        .expect("kopia snapshot id on the produced CR")
+        .to_string();
+
+    // (2) Delete the CR (Retain) — then the adopted row must come back with the
+    // recorded meta, recovered purely from the kopia snapshot.
+    backups
+        .delete(SNAP, &DeleteParams::default())
+        .await
+        .expect("delete the produced Snapshot CR");
+    wait_until(
+        "produced CR fully gone",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(backups.get_opt(SNAP).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("Retain deletion should release the CR");
+
+    let adopted_name = wait_until(
+        "adopted row re-appears carrying status.recorded",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            let kopia_id = kopia_id.clone();
+            async move {
+                for r in config_labeled(&client, E2E_NAMESPACE, POLICY).await {
+                    let v = serde_json::to_value(&r).unwrap_or_default();
+                    if v.pointer("/status/snapshot/kopiaSnapshotID")
+                        .and_then(|x| x.as_str())
+                        == Some(kopia_id.as_str())
+                        && status_origin(&r) == "adopted"
+                        && v.pointer("/status/recorded").is_some_and(|x| !x.is_null())
+                    {
+                        return Ok(Some(r.name_any()));
+                    }
+                }
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .expect("the adopted row must reappear with the recovered recorded meta");
+    let s = status_json(&backups, &adopted_name).await;
+    expect_recorded(&s, "adopted row (recovered from the kopia tag)");
+    assert_eq!(
+        s.pointer("/snapshot/description").and_then(|v| v.as_str()),
+        Some("recorded-meta e2e"),
+        "the description is recovered from the kopia manifest: {s}"
+    );
+
+    // (3) Backfill: strip `recorded`; the next scan's targeted patch heals it.
+    backups
+        .patch_status(
+            &adopted_name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "recorded": null } })),
+        )
+        .await
+        .expect("strip status.recorded off the adopted row");
+    let stripped = status_json(&backups, &adopted_name).await;
+    assert!(
+        stripped
+            .pointer("/recorded")
+            .is_none_or(serde_json::Value::is_null),
+        "the strip must take before the backfill assertion means anything: {stripped}"
+    );
+    wait_until(
+        "the scan backfills the stripped recorded meta",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let backups = backups.clone();
+            let name = adopted_name.clone();
+            async move {
+                let s = status_json(&backups, &name).await;
+                Ok(
+                    (s.pointer("/recorded/uid").and_then(|v| v.as_i64()) == Some(3001))
+                        .then_some(()),
+                )
+            }
+        },
+    )
+    .await
+    .expect("backfill must restore status.recorded from the kopia tag");
+
+    // Cleanup: rows → policy → drain → repo (the file's convention).
+    for r in config_labeled(&client, E2E_NAMESPACE, POLICY).await {
         let _ = backups
             .delete(&r.name_any(), &DeleteParams::default())
             .await;

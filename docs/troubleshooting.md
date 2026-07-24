@@ -162,7 +162,7 @@ $ kubectl get snapshot <name> -o jsonpath='{.status.conditions[?(@.type=="Securi
 | `True` / `InheritApplied` | Inheritance resolved and stuck. The message names the pod and the uid the mover runs as. |
 | `False` / `InheritPinnedNoUid` | The resolved workload pins no identity beyond the mover's own defaults — inheriting copied nothing. The message names the uid the mover actually runs as (`65532` unless `moverDefaults` supplied one). |
 | `False` / `InheritFallback` | No workload pod resolved; the run proceeded on your explicit `mover.securityContext` instead of being held. |
-| `False` / `InheritOverridden` | Inherit resolved a UID but a higher layer overrode it — inherit is a no-op for that field and won't follow the workload. The message names which layer won: the recipe, or the repository's `moverDefaults`. |
+| `False` / `InheritOverridden` | Inherit resolved a UID but this recipe's explicit `runAsUser` overrode it — inherit is a no-op for that field and won't follow the workload. The message names the exact field that won; only the recipe can displace an inherited UID, never the repository's `moverDefaults`. |
 
 ### Admission warning: securityContext likely can't read the source
 

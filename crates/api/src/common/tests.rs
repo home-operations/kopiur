@@ -502,6 +502,223 @@ fn nonroot_inherited_uid_keeps_run_as_non_root_true() {
     assert_eq!(m.security_context.run_as_non_root, Some(true));
 }
 
+// --- cross-dimension identity precedence (the moverDefaults-shadows-inherited bug) ---
+
+#[test]
+fn moverdefaults_container_uid_cannot_shadow_an_inherited_pod_level_uid() {
+    // The matter-server shape: the workload pins root at the POD level, so the
+    // inherited context (folded into the recipe layer) carries `psc.runAsUser: 0`,
+    // while the repository's moverDefaults pins `sc.runAsUser: 1000` at the
+    // CONTAINER level. The ladder says inherited beats moverDefaults, but the
+    // kubelet's effective UID is `container ?? pod` — without identity promotion
+    // the lower layer's container value shadows the higher layer's pod value and
+    // the mover silently runs as 1000.
+    let defaults = MoverDefaults {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(1000),
+            run_as_group: Some(1000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let inherited_psc = PodSecurityContext {
+        run_as_user: Some(0),
+        ..Default::default()
+    };
+    let m = resolve_mover(
+        Some(&defaults),
+        None,
+        Some(&inherited_psc),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        super::effective_run_as_user(Some(&m.security_context), m.pod_security_context.as_ref()),
+        Some(0),
+        "the inherited pod-level uid is the higher layer and must win the \
+         effective identity, regardless of which dimension each layer wrote"
+    );
+    // INV-1 keys on the effective UID: a root result must clear the hardened
+    // runAsNonRoot:true or the kubelet wedges the pod in CreateContainerConfigError.
+    assert_eq!(m.security_context.run_as_non_root, Some(false));
+    // And the result is still recognized as elevated → privileged gate applies.
+    assert!(requires_privilege_resolved(
+        Some(&m.security_context),
+        m.pod_security_context.as_ref(),
+        None
+    ));
+}
+
+#[test]
+fn explicit_pod_level_uid_beats_moverdefaults_container_uid() {
+    // The fully-silent variant of the same bug: no inheritance involved. A recipe
+    // that pins its identity via `mover.podSecurityContext.runAsUser` is the top
+    // layer and must win over `moverDefaults.securityContext.runAsUser`.
+    let defaults = MoverDefaults {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let recipe_psc = PodSecurityContext {
+        run_as_user: Some(2000),
+        ..Default::default()
+    };
+    let m = resolve_mover(Some(&defaults), None, Some(&recipe_psc), None, None, None);
+    assert_eq!(
+        super::effective_run_as_user(Some(&m.security_context), m.pod_security_context.as_ref()),
+        Some(2000),
+        "the recipe's pod-level uid is the top layer and must win"
+    );
+    // Non-root result: the hardened runAsNonRoot:true must survive untouched.
+    assert_eq!(m.security_context.run_as_non_root, Some(true));
+}
+
+#[test]
+fn moverdefaults_container_gid_cannot_shadow_a_recipe_pod_level_gid() {
+    // The runAsGroup analog: effective group is also `container ?? pod`, so a
+    // moverDefaults container-level gid shadows a higher layer's pod-level gid
+    // the same way.
+    let defaults = MoverDefaults {
+        security_context: Some(SecurityContext {
+            run_as_group: Some(999),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let recipe_psc = PodSecurityContext {
+        run_as_group: Some(568),
+        ..Default::default()
+    };
+    let m = resolve_mover(Some(&defaults), None, Some(&recipe_psc), None, None, None);
+    let psc = m.pod_security_context.as_ref();
+    let effective_gid = m
+        .security_context
+        .run_as_group
+        .or_else(|| psc.and_then(|p| p.run_as_group));
+    assert_eq!(
+        effective_gid,
+        Some(568),
+        "the recipe's pod-level gid is the higher layer and must win the \
+         effective group"
+    );
+}
+
+#[test]
+fn identity_promotion_never_invents_an_identity() {
+    // Layers that pin nothing must stay pinned-nothing: a moverDefaults that only
+    // tweaks non-identity fields plus an identity-free recipe must not conjure a
+    // runAsUser/runAsGroup from anywhere.
+    let defaults = MoverDefaults {
+        security_context: Some(SecurityContext {
+            read_only_root_filesystem: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let m = resolve_mover(Some(&defaults), None, None, None, None, None);
+    assert_eq!(
+        super::effective_run_as_user(Some(&m.security_context), m.pod_security_context.as_ref()),
+        None,
+        "no layer pinned a uid, so the identity stays image-determined"
+    );
+    assert_eq!(m.security_context.run_as_group, None);
+}
+
+#[test]
+fn within_one_layer_container_uid_still_beats_pod_uid() {
+    // Intra-layer semantics are Kubernetes semantics: a single layer that sets
+    // both `sc.runAsUser: 1000` and `psc.runAsUser: 0` means uid 1000 (container
+    // wins within the layer). Promotion must respect that, not resurrect the
+    // pod-level 0.
+    let recipe_sc = SecurityContext {
+        run_as_user: Some(1000),
+        ..Default::default()
+    };
+    let recipe_psc = PodSecurityContext {
+        run_as_user: Some(0),
+        ..Default::default()
+    };
+    let m = resolve_mover(None, Some(&recipe_sc), Some(&recipe_psc), None, None, None);
+    assert_eq!(
+        super::effective_run_as_user(Some(&m.security_context), m.pod_security_context.as_ref()),
+        Some(1000),
+        "within one layer the container uid wins, exactly as the kubelet resolves it"
+    );
+}
+
+#[test]
+fn merge_context_pair_is_associative_and_resolves_the_highest_pinning_layer() {
+    // The property the controller's pre-fold (inherited ⊂ explicit) and
+    // `resolve_mover`'s fold (hardened ⊂ moverDefaults ⊂ recipe) both rely on:
+    // any grouping of the layer chain merges to the identical pair, and the
+    // effective identity is the highest layer's pinned one. This is also the
+    // guard for `inherit_verdict`'s deleted moverDefaults branch — if promotion
+    // ever regressed, a lower layer could displace an inherited uid again and
+    // this property would break.
+    let uids = [None, Some(0i64), Some(1000)];
+    let gids = [None, Some(568i64)];
+    let mut layers = Vec::new();
+    for sc_uid in uids {
+        for psc_uid in uids {
+            for sc_gid in gids {
+                for psc_gid in gids {
+                    let sc = (sc_uid.is_some() || sc_gid.is_some()).then(|| SecurityContext {
+                        run_as_user: sc_uid,
+                        run_as_group: sc_gid,
+                        ..Default::default()
+                    });
+                    let psc =
+                        (psc_uid.is_some() || psc_gid.is_some()).then(|| PodSecurityContext {
+                            run_as_user: psc_uid,
+                            run_as_group: psc_gid,
+                            ..Default::default()
+                        });
+                    layers.push((sc, psc));
+                }
+            }
+        }
+    }
+    let pair = |base: &(Option<SecurityContext>, Option<PodSecurityContext>),
+                over: &(Option<SecurityContext>, Option<PodSecurityContext>)| {
+        super::merge_context_pair(
+            base.0.as_ref(),
+            base.1.as_ref(),
+            over.0.as_ref(),
+            over.1.as_ref(),
+        )
+    };
+    let effective = |p: &(Option<SecurityContext>, Option<PodSecurityContext>)| {
+        (
+            super::effective_run_as_user(p.0.as_ref(), p.1.as_ref()),
+            super::effective_run_as_group(p.0.as_ref(), p.1.as_ref()),
+        )
+    };
+    for a in &layers {
+        for b in &layers {
+            for c in &layers {
+                let left = pair(&pair(a, b), c);
+                let right = pair(a, &pair(b, c));
+                assert_eq!(left, right, "grouping must not change the merged pair");
+                let (uid, gid) = effective(&left);
+                let (ea, eb, ec) = (effective(a), effective(b), effective(c));
+                assert_eq!(
+                    uid,
+                    ec.0.or(eb.0).or(ea.0),
+                    "effective uid must be the highest layer's pinned one"
+                );
+                assert_eq!(
+                    gid,
+                    ec.1.or(eb.1).or(ea.1),
+                    "effective gid must be the highest layer's pinned one"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn pod_startup_deadline_defaults_to_five_minutes() {
     // The contract every reconciler relies on: unset → 5 minutes. Pinned so a careless
@@ -725,6 +942,37 @@ fn inherit_security_context_from_parses_both_variants_the_cluster_way() {
         Some(InheritSecurityContextFrom::PvcConsumer(PvcConsumerInherit { container }))
             if container.as_deref() == Some("app"),
     ));
+}
+
+#[test]
+fn inherit_security_context_from_snapshot_variant_parses_the_cluster_way() {
+    // Externally tagged `{ snapshot: {} }` — the restore-only mode that inherits the
+    // identity RECORDED on the backup (`kopiur-meta` / `Snapshot.status.recorded`)
+    // instead of reading a live pod.
+    let snap: MoverSpec = crate::testutil::from_yaml(
+        r#"
+            inheritSecurityContextFrom:
+              snapshot: {}
+            "#,
+    );
+    assert!(matches!(
+        snap.inherit_security_context_from,
+        Some(InheritSecurityContextFrom::Snapshot(SnapshotInherit {})),
+    ));
+    // Round-trips through the cluster wire shape.
+    let json = serde_json::to_value(&snap).unwrap();
+    assert!(json["inheritSecurityContextFrom"]["snapshot"].is_object());
+    let back: MoverSpec = serde_json::from_value(json).unwrap();
+    assert_eq!(snap, back);
+
+    // The YAML footgun: `snapshot:` (null) is NOT the empty sub-object — serde
+    // rejects it rather than guessing. Doc examples must write `snapshot: {}`.
+    let null_value: serde_json::Value =
+        serde_yaml::from_str("inheritSecurityContextFrom:\n  snapshot:\n").unwrap();
+    assert!(
+        serde_json::from_value::<MoverSpec>(null_value).is_err(),
+        "a null `snapshot:` must be rejected, not silently treated as `snapshot: {{}}`"
+    );
 }
 
 // --- §12 mover Job TTL precedence (recipe over default over built-in) ---

@@ -13,6 +13,31 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Strip kopia's `tag:` manifest-key prefix from a snapshot `tags` map, yielding the
+/// tags under the keys the CLI was given (`--tags key:value` → manifest `tag:key`).
+///
+/// kopia splits each `--tags` argument on the FIRST colon and stores the key with a
+/// `tag:` prefix in the manifest (verified against the pinned 0.23.1 binary by
+/// `integration_roundtrip::tag_mechanics_...`). Keys without the prefix are kept
+/// verbatim, so a kopia release that dropped the prefix would degrade gracefully
+/// instead of hiding every tag.
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// let mut m = BTreeMap::new();
+/// m.insert("tag:kopiur-meta".to_string(), "{\"schema\":1}".to_string());
+/// m.insert("bare".to_string(), "kept".to_string());
+/// let u = kopiur_kopia::user_tags(&m);
+/// assert_eq!(u.get("kopiur-meta").map(String::as_str), Some("{\"schema\":1}"));
+/// assert_eq!(u.get("bare").map(String::as_str), Some("kept"));
+/// ```
+pub fn user_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    tags.iter()
+        .map(|(k, v)| (k.strip_prefix("tag:").unwrap_or(k).to_string(), v.clone()))
+        .collect()
+}
 
 /// Kopia's snapshot identity triple: `userName@host:path`. Present on both
 /// snapshot-create results and snapshot-list entries.
@@ -174,6 +199,12 @@ pub struct SnapshotCreateResult {
     /// Root directory entry with its summary.
     #[serde(default)]
     pub root_entry: Option<RootEntry>,
+    /// Snapshot tags as stored on the manifest — keys carry kopia's `tag:` prefix
+    /// (strip with [`user_tags`]). Empty for untagged snapshots and on kopia
+    /// versions that omit the field; an empty map is elided on re-serialization
+    /// (these types also ride the mover result wire).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 impl SnapshotCreateResult {
@@ -299,6 +330,12 @@ pub struct SnapshotListEntry {
     /// `latest-1`, `daily-1`). Empty for snapshots outside any retention class.
     #[serde(default)]
     pub retention_reason: Vec<String>,
+    /// Snapshot tags as stored on the manifest — keys carry kopia's `tag:` prefix
+    /// (strip with [`user_tags`]). Empty for untagged snapshots and on kopia
+    /// versions that omit the field; an empty map is elided on re-serialization
+    /// (these types also ride the mover result wire).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// One entry of a kopia directory manifest (`kopia show <dir-object-id>`).

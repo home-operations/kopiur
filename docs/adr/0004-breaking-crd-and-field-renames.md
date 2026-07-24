@@ -40,6 +40,8 @@ spec:
 
 `securityContext`/`podSecurityContext` resolve by **field-wise merge**, lowest→highest: `built-in hardened default ⊂ repo.moverDefaults ⊂ recipe.mover`. Each explicitly-set field wins; unset fields inherit the layer below; the privileged-mover gate (ADR-0003 §4.11/§G16) runs on the merged result. This is **required for §1's inheritance to compose** — under replace, a recipe setting one SC field would wipe `moverDefaults`. The `unwrap_or_else(default_security_context)` path is deleted and the doc comment made accurate.
 
+> **Amended 2026-07-24:** a purely per-dimension field-wise merge inverted this ladder for the mover's *identity*: the kubelet resolves the effective UID/GID as `container ?? pod` *across* dimensions, so a lower layer's container-level `runAsUser` silently shadowed a higher layer's pod-level one. Layers now merge as `(container, pod)` pairs (`merge_context_pair`) with the winning layer's effective identity promoted onto the mover container, so the effective UID/GID always belongs to the highest layer that pins one. Non-identity fields keep the plain field-wise rule.
+
 ### B. Naming
 
 #### §3 — CRD kind names follow Kopia nomenclature

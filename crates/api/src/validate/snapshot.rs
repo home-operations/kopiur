@@ -87,10 +87,20 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 .to_string(),
         });
     }
-    if let Some(m) = &spec.mover
-        && let Err(e) = validate_mover(m, "SnapshotPolicy mover")
-    {
-        errs.push(e);
+    if let Some(m) = &spec.mover {
+        // `inheritSecurityContextFrom.snapshot` replays a backup's RECORDED identity;
+        // a backup has no recorded identity to replay — it is the run that records one.
+        if let Err(e) = forbid_snapshot_inherit(
+            m,
+            "snapshotPolicy",
+            "a backup mover's identity is read from the live workload \
+             (pvcConsumer/workloadSelector), not from a snapshot; `snapshot` is restore-only",
+        ) {
+            errs.push(e);
+        }
+        if let Err(e) = validate_mover(m, "SnapshotPolicy mover") {
+            errs.push(e);
+        }
     }
     // `snapshot create --upload-limit-mb` (M4 flag sweep, issue #216): a count
     // knob, must be at least 1 (0 or negative disables the flag's own purpose).
@@ -552,6 +562,91 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Origin) -> Vec<ValidationErr
         && let Err(e) = validate_failure_policy(fp, "Snapshot")
     {
         errs.push(e);
+    }
+    errs.extend(validate_snapshot_tags(spec.tags.as_ref()));
+    errs
+}
+
+/// At most this many user tags per `Snapshot` — unbounded user tags would
+/// inflate every kopia manifest AND the catalog result wire.
+pub const MAX_SNAPSHOT_TAGS: usize = 10;
+/// Longest admissible user tag key, in bytes.
+pub const MAX_SNAPSHOT_TAG_KEY_LEN: usize = 63;
+/// Longest admissible user tag value, in bytes.
+pub const MAX_SNAPSHOT_TAG_VALUE_LEN: usize = 256;
+
+/// Why one `spec.tags` key/value pair is invalid, or `None` when it is clean.
+///
+/// One predicate, two callers (the shared-validator pattern): the admission
+/// validator ([`validate_snapshot_tags`]) rejects NEW objects with these
+/// reasons, and the controller's build path defensively SKIPS (warn, never
+/// fail) the same keys on already-stored pre-feature objects.
+pub fn snapshot_tag_error(key: &str, value: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("tag keys must be non-empty; remove the empty key".to_string());
+    }
+    if key.contains(':') {
+        return Some(format!(
+            "tag key {key:?} contains a colon — kopia splits each `--tags` argument on the \
+             first colon, so this key would be stored mangled (everything after the colon \
+             becomes part of the value) and can collide with kopiur's reserved `kopiur:config` \
+             tag, which makes kopia fail the snapshot create with a duplicate-tag error. Use a \
+             colon-free key."
+        ));
+    }
+    if key.starts_with("kopiur") {
+        return Some(format!(
+            "tag key {key:?} uses the reserved `kopiur` prefix — kopiur writes its own tags \
+             there (`kopiur:config`, `kopiur-meta`) and a user tag under that prefix would \
+             collide with or spoof them. Pick a key that does not start with `kopiur`."
+        ));
+    }
+    if key.len() > MAX_SNAPSHOT_TAG_KEY_LEN {
+        return Some(format!(
+            "tag key is {} bytes; keys are limited to {MAX_SNAPSHOT_TAG_KEY_LEN} bytes — use a \
+             shorter key",
+            key.len()
+        ));
+    }
+    if value.len() > MAX_SNAPSHOT_TAG_VALUE_LEN {
+        return Some(format!(
+            "tag value is {} bytes; values are limited to {MAX_SNAPSHOT_TAG_VALUE_LEN} bytes — \
+             every tag is stored on the kopia manifest and read back by every catalog scan, so \
+             unbounded values inflate the repository and the scan wire. Use a shorter value.",
+            value.len()
+        ));
+    }
+    None
+}
+
+/// Validate `Snapshot.spec.tags` (admission): every key/value must pass
+/// [`snapshot_tag_error`] and the map is bounded to [`MAX_SNAPSHOT_TAGS`]
+/// entries. Accumulates every problem, one error per offending tag.
+pub fn validate_snapshot_tags(
+    tags: Option<&std::collections::BTreeMap<String, String>>,
+) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    let Some(tags) = tags else {
+        return errs;
+    };
+    if tags.len() > MAX_SNAPSHOT_TAGS {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.tags".to_string(),
+            reason: format!(
+                "{} tags; at most {MAX_SNAPSHOT_TAGS} user tags are allowed per Snapshot — \
+                 every tag is stored on the kopia manifest and read back by every catalog \
+                 scan. Remove tags until at most {MAX_SNAPSHOT_TAGS} remain.",
+                tags.len()
+            ),
+        });
+    }
+    for (key, value) in tags {
+        if let Some(reason) = snapshot_tag_error(key, value) {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: format!("spec.tags[{key:?}]"),
+                reason,
+            });
+        }
     }
     errs
 }

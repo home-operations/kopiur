@@ -260,6 +260,9 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
     // override, exactly as movers resolve it (ADR-0004 §2). This is what lets the
     // server carry `supplementalGroups` to write a group-owned NFS/RWX backend —
     // `fsGroup` alone is silently ignored by the kubelet for in-tree NFS mounts.
+    // No `merge_context_pair` needed here: the container context is replace-not-merge
+    // and the only lower layer (hardened) pins no identity, so cross-dimension
+    // shadowing cannot arise.
     let pod_sec_ctx = match &inputs.pod_security_context {
         Some(over) => merge_pod_security_context(&hardened_pod_security_context(), over),
         None => hardened_pod_security_context(),

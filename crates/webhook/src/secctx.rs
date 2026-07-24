@@ -27,11 +27,14 @@ use kube::{Api, Client};
 /// the recipe (so the webhook can actually decide). `None` ⇒ stay silent.
 fn pinned_mover_identity(mover: Option<&MoverSpec>) -> Option<secctx_compat::MoverIdentity> {
     let m = mover?;
-    // An inherit recipe's real identity is only known once a live workload pod is resolved at
-    // reconcile time. Judging it from the explicit context alone would miss the inherited
-    // groups that soften a mismatch, producing a warning that contradicts what the operator
-    // actually does. (The two were mutually exclusive before, so this path never spoke; the
-    // guard keeps that silence now that they combine.)
+    // An inherit recipe's real identity is only known at reconcile time — a live workload
+    // pod for `workloadSelector`/`pvcConsumer`, the backup's recorded metadata
+    // (`Snapshot.status.recorded`) for the restore-only `snapshot` variant. Judging it from
+    // the explicit context alone would miss the inherited values that soften a mismatch,
+    // producing a warning that contradicts what the operator actually does. (The two were
+    // mutually exclusive before, so this path never spoke; the guard keeps that silence now
+    // that they combine.) Deliberately `is_some()`, not a per-variant match: EVERY inherit
+    // mode resolves at reconcile, so a new variant is silent here by default.
     if m.inherit_security_context_from.is_some() {
         return None;
     }

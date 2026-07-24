@@ -1677,6 +1677,7 @@ mod tests {
                     hostname: "h".into(),
                     source_path: None,
                 },
+                description: None,
             });
 
         let all = vec![a, b, c, ok, term, with_artifact];
