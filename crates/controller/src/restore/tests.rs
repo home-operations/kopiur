@@ -884,11 +884,14 @@ fn select_recorded_source_picks_the_newest_matching_row() {
             Some(Some(3002)),
         ),
     ];
-    let (name, meta) =
-        select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
-            .expect("a match");
-    assert_eq!(name, "new");
-    assert_eq!(meta.uid, Some(3003));
+    let row = select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
+        .expect("a match");
+    assert_eq!(row.name, "new");
+    assert_eq!(row.meta.uid, Some(3003));
+    // COHERENCE (the P1 rule): the selected row carries ITS OWN kopia id, so the
+    // caller pins the restored data to the same snapshot the identity came from.
+    assert_eq!(row.kopia_snapshot_id, "k3");
+    assert_eq!(row.identity.username, "pg");
 }
 
 #[test]
@@ -932,15 +935,14 @@ fn select_recorded_source_matches_identity_exactly_and_source_path_any_when_abse
         ),
     ];
     // An explicit sourcePath in the triple must match exactly.
-    let (name, _) =
-        select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
-            .expect("a match");
-    assert_eq!(name, "match");
+    let row = select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
+        .expect("a match");
+    assert_eq!(row.name, "match");
     // An absent sourcePath matches any path for the identity (the mover's own
     // selector semantics) — newest of /other (June 2) vs /data (June 1) wins.
-    let (name, _) =
+    let row =
         select_recorded_source(&triple("pg", "app", None), None, 0, None, &rows).expect("a match");
-    assert_eq!(name, "other-path");
+    assert_eq!(row.name, "other-path");
     // No identity match at all -> None (the MissingRecordedIdentity hold).
     assert!(select_recorded_source(&triple("nope", "app", None), None, 0, None, &rows).is_none());
 }
@@ -969,11 +971,14 @@ fn select_recorded_source_requires_status_recorded() {
             Some(Some(3001)),
         ),
     ];
-    let (name, meta) =
-        select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
-            .expect("the recorded row");
-    assert_eq!(name, "recorded-older");
-    assert_eq!(meta.uid, Some(3001));
+    let row = select_recorded_source(&triple("pg", "app", Some("/data")), None, 0, None, &rows)
+        .expect("the recorded row");
+    assert_eq!(row.name, "recorded-older");
+    assert_eq!(row.meta.uid, Some(3001));
+    assert_eq!(
+        row.kopia_snapshot_id, "k1",
+        "the id pinned as data must be the recorded row's own"
+    );
     // Only bare rows -> None.
     let bare = vec![catalog_row(
         "bare",
@@ -1012,7 +1017,7 @@ fn select_recorded_source_pins_by_snapshot_id() {
         ),
     ];
     // The pin wins over "newest".
-    let (name, meta) = select_recorded_source(
+    let row = select_recorded_source(
         &triple("pg", "app", Some("/data")),
         None,
         0,
@@ -1020,8 +1025,9 @@ fn select_recorded_source_pins_by_snapshot_id() {
         &rows,
     )
     .expect("the pinned row");
-    assert_eq!(name, "old");
-    assert_eq!(meta.uid, Some(3001));
+    assert_eq!(row.name, "old");
+    assert_eq!(row.meta.uid, Some(3001));
+    assert_eq!(row.kopia_snapshot_id, "k1", "pinned id round-trips");
     // A pin that matches no row -> None.
     assert!(
         select_recorded_source(
@@ -1073,27 +1079,27 @@ fn select_recorded_source_honors_as_of_and_offset_like_the_mover_selection() {
     ];
     let t = triple("pg", "app", Some("/data"));
     // asOf keeps rows at-or-before the cutoff (mirrors filter_as_of).
-    let (name, _) =
+    let row =
         select_recorded_source(&t, Some(cutoff("2026-06-02T12:00:00Z")), 0, None, &rows).unwrap();
-    assert_eq!(name, "k2");
+    assert_eq!(row.name, "k2");
     // Exactly AT an endTime keeps it.
-    let (name, _) =
+    let row =
         select_recorded_source(&t, Some(cutoff("2026-06-02T00:00:00Z")), 0, None, &rows).unwrap();
-    assert_eq!(name, "k2");
+    assert_eq!(row.name, "k2");
     // asOf composes with offset ("the previous one as of just after k2").
-    let (name, _) =
+    let row =
         select_recorded_source(&t, Some(cutoff("2026-06-02T12:00:00Z")), 1, None, &rows).unwrap();
-    assert_eq!(name, "k1");
+    assert_eq!(row.name, "k1");
     // Before everything -> None.
     assert!(
         select_recorded_source(&t, Some(cutoff("2026-05-01T00:00:00Z")), 0, None, &rows).is_none()
     );
     // offset semantics mirror pick_offset: out-of-range None, negative clamps.
-    let (name, _) = select_recorded_source(&t, None, 2, None, &rows).unwrap();
-    assert_eq!(name, "k1");
+    let row = select_recorded_source(&t, None, 2, None, &rows).unwrap();
+    assert_eq!(row.name, "k1");
     assert!(select_recorded_source(&t, None, 3, None, &rows).is_none());
-    let (name, _) = select_recorded_source(&t, None, -1, None, &rows).unwrap();
-    assert_eq!(name, "k3");
+    let row = select_recorded_source(&t, None, -1, None, &rows).unwrap();
+    assert_eq!(row.name, "k3");
 }
 
 #[test]
@@ -1120,16 +1126,49 @@ fn select_recorded_source_undated_rows_sort_last_and_are_excluded_under_a_cutoff
     ];
     let t = triple("pg", "app", Some("/data"));
     // Newest-first puts the dated row first; the undated one is still reachable.
-    let (name, _) = select_recorded_source(&t, None, 0, None, &rows).unwrap();
-    assert_eq!(name, "dated");
-    let (name, _) = select_recorded_source(&t, None, 1, None, &rows).unwrap();
-    assert_eq!(name, "undated");
+    let row = select_recorded_source(&t, None, 0, None, &rows).unwrap();
+    assert_eq!(row.name, "dated");
+    let row = select_recorded_source(&t, None, 1, None, &rows).unwrap();
+    assert_eq!(row.name, "undated");
     // Under a cutoff an undated row cannot prove membership -> excluded.
     let got = select_recorded_source(&t, Some(cutoff("2026-06-02T00:00:00Z")), 1, None, &rows);
     assert!(
         got.is_none(),
         "undated row must be excluded under asOf, got {got:?}"
     );
+}
+
+#[test]
+fn snapshot_inherit_active_matches_only_the_snapshot_variant() {
+    use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, SnapshotInherit};
+    let with_inherit = |i: Option<InheritSecurityContextFrom>| -> Restore {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "r", "namespace": "app" },
+            "spec": {
+                "source": { "snapshotRef": { "name": "s" } },
+                "target": { "pvcRef": { "name": "dst" } },
+                "mover": serde_json::to_value(MoverSpec {
+                    inherit_security_context_from: i,
+                    ..Default::default()
+                }).unwrap(),
+            }
+        }))
+        .expect("restore fixture")
+    };
+    // The gate for the P1 coherence rule: only the `snapshot` variant makes
+    // `resolve_snapshot` pin data + identity from one CR-catalog row.
+    assert!(snapshot_inherit_active(&with_inherit(Some(
+        InheritSecurityContextFrom::Snapshot(SnapshotInherit {})
+    ))));
+    assert!(!snapshot_inherit_active(&with_inherit(None)));
+    assert!(!snapshot_inherit_active(&with_inherit(Some(
+        InheritSecurityContextFrom::WorkloadSelector(kopiur_api::PodSelector {
+            pod_selector: Default::default(),
+            container: None,
+        })
+    ))));
 }
 
 // --- recorded_inherit_verdict: the SecurityContextInherited text for snapshot inherit ---

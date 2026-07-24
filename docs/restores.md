@@ -282,7 +282,7 @@ The catalog scan pre-filters identities that belong to **other clusters** (forei
 
 /// note | `asOf` selects twice — CR-side identity vs repository-side data
 
-With `fromPolicy`/`identity` the **data** to restore is selected by the mover against the live repository listing, while the **recorded identity** is selected from the matching Snapshot CRs. Under `asOf`/`offset` the two can, in edge cases (e.g. rows the scan has not materialized yet), pick *different manifests of the same source*. Identity metadata is per-source in practice — every snapshot of a source records the same uid/gid unless the workload itself changed — so the divergence is cosmetic; a changed workload identity between the two picks would surface in the condition message, which names the exact Snapshot the identity came from.
+With `fromPolicy`/`identity` plus `snapshot: {}`, **data and identity are pinned from the same catalog row**: the controller selects one matching Snapshot CR (honoring `asOf`/`offset`), pins its kopia snapshot id as the data to restore, and replays that same snapshot's recorded identity — the two can never diverge, so snapshot B's data is never restored under snapshot A's uid/gid/fsGroup. The trade-off is deliberate: selection runs against the **CR catalog**, not the live repository listing, so under catalog lag the restore pins the newest *catalogued* snapshot (the scan converges the catalog; a not-yet-catalogued snapshot simply isn't eligible yet). The condition message names the exact Snapshot both came from.
 
 ///
 

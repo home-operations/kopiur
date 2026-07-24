@@ -2054,14 +2054,22 @@ async fn run_restore_mover(
     // `SecurityContextInherited=False`/`MissingRecordedIdentity` condition + Event and
     // requeued on the slow structural cadence (300s) instead of the fast transient one
     // — a bare `?` here would hot-loop a generic error with no condition.
-    let recorded_source = match snapshot_recorded_source(ctx, restore, namespace).await {
-        Ok(s) => s,
-        Err(Error::MissingDependency(msg)) => {
-            report_missing_recorded_identity(restore, api, &msg, ctx).await?;
-            return Err(Error::MissingRecordedIdentity(msg));
-        }
-        Err(e) => return Err(e),
+    // The concrete kopia id this dispatch restores, when there is one — the meta
+    // reader uses it to select the SAME catalog row the resolution pinned, so the
+    // replayed identity always belongs to the snapshot actually being restored.
+    let dispatch_pinned_id = match selection {
+        RestoreSelection::Snapshot(id) => Some(id.as_str()),
+        RestoreSelection::Resolve(_) => None,
     };
+    let recorded_source =
+        match snapshot_recorded_source(ctx, restore, namespace, dispatch_pinned_id).await {
+            Ok(s) => s,
+            Err(Error::MissingDependency(msg)) => {
+                report_missing_recorded_identity(restore, api, &msg, ctx).await?;
+                return Err(Error::MissingRecordedIdentity(msg));
+            }
+            Err(e) => return Err(e),
+        };
     // Restore has no backup *source* PVC; `pvcConsumer` is backup-only (validator-rejected
     // for restore), so pass None.
     let mover_security = match io::resolve_mover_security_contexts(
@@ -2566,20 +2574,36 @@ async fn restore_source_anchor(
 ///
 /// Every `Err(MissingDependency)` from here is a permanent-shaped hold the caller
 /// reports as `MissingRecordedIdentity` and requeues slowly.
-async fn snapshot_recorded_source(
-    ctx: &Context,
-    restore: &Restore,
-    namespace: &str,
-) -> Result<Option<io::SnapshotRecordedSource>> {
+/// Whether this restore's mover replays the identity RECORDED on its snapshot
+/// (`inheritSecurityContextFrom: { snapshot: {} }`). Pure; shared by the meta
+/// reader and by `resolve_snapshot`, which must then pin data + identity to the
+/// SAME snapshot (the P1 coherence rule).
+fn snapshot_inherit_active(restore: &Restore) -> bool {
     use kopiur_api::common::InheritSecurityContextFrom;
-    if !matches!(
+    matches!(
         restore
             .spec
             .mover
             .as_ref()
             .and_then(|m| m.inherit_security_context_from.as_ref()),
         Some(InheritSecurityContextFrom::Snapshot(_))
-    ) {
+    )
+}
+
+/// `pinned_id` is the concrete kopia snapshot id the CURRENT dispatch restores
+/// (from the in-memory `RestoreSelection`), when there is one. For
+/// `fromPolicy`/`identity` sources it is the coherence key: `resolve_snapshot`
+/// pinned data + identity from one CR-catalog row, and passing the id back in
+/// here selects exactly that row again — the recorded meta can never come from
+/// a different (newer/other) snapshot than the one being restored, even if the
+/// catalog changed between reconciles.
+async fn snapshot_recorded_source(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    pinned_id: Option<&str>,
+) -> Result<Option<io::SnapshotRecordedSource>> {
+    if !snapshot_inherit_active(restore) {
         return Ok(None);
     }
     // Exhaustive over the source: each arm must state how recorded meta is found.
@@ -2614,9 +2638,21 @@ async fn snapshot_recorded_source(
                 cfg_ns,
                 repo.identity_defaults.as_ref(),
             )?;
-            search_recorded_source(ctx, cfg_ns, &triple, c.as_of.as_deref(), c.offset, None)
-                .await
-                .map(Some)
+            // A pinned data id (the resolution pinned from this same catalog) selects
+            // exactly that row; asOf/offset only apply on the un-pinned first pass.
+            let row = search_recorded_source(
+                ctx,
+                cfg_ns,
+                &triple,
+                c.as_of.as_deref().filter(|_| pinned_id.is_none()),
+                if pinned_id.is_some() { 0 } else { c.offset },
+                pinned_id,
+            )
+            .await?;
+            Ok(Some(io::SnapshotRecordedSource {
+                snapshot: format!("{cfg_ns}/{}", row.name),
+                meta: Some(row.meta),
+            }))
         }
         RestoreSource::Identity(id) => {
             let triple = kopiur_api::common::ResolvedIdentity {
@@ -2624,18 +2660,41 @@ async fn snapshot_recorded_source(
                 hostname: id.hostname.clone(),
                 source_path: id.source_path.clone(),
             };
-            search_recorded_source(
+            let effective_pin = pinned_id.or(id.snapshot_id.as_deref());
+            let row = search_recorded_source(
                 ctx,
                 namespace,
                 &triple,
-                id.as_of.as_deref(),
-                id.offset.unwrap_or(0),
-                id.snapshot_id.as_deref(),
+                id.as_of.as_deref().filter(|_| effective_pin.is_none()),
+                if effective_pin.is_some() {
+                    0
+                } else {
+                    id.offset.unwrap_or(0)
+                },
+                effective_pin,
             )
-            .await
-            .map(Some)
+            .await?;
+            Ok(Some(io::SnapshotRecordedSource {
+                snapshot: format!("{namespace}/{}", row.name),
+                meta: Some(row.meta),
+            }))
         }
     }
+}
+
+/// The `Snapshot` CR row a `fromPolicy`/`identity` restore selected from the CR
+/// catalog: the recorded identity it supplies AND the exact kopia snapshot it
+/// belongs to, so identity and data are pinned to the SAME snapshot.
+#[derive(Debug, Clone)]
+struct RecordedRow {
+    /// The CR's name (in the searched namespace).
+    name: String,
+    /// `status.snapshot.kopiaSnapshotID` — what the restore must pin as its data.
+    kopia_snapshot_id: String,
+    /// `status.snapshot.identity` — pinned as the resolution's provenance/anchor.
+    identity: kopiur_api::common::ResolvedIdentity,
+    /// `status.recorded` — the identity the restore mover replays.
+    meta: kopiur_api::recorded::RecordedSnapshotMeta,
 }
 
 /// LIST the namespace's Snapshot CRs and run the pure [`select_recorded_source`]
@@ -2648,7 +2707,7 @@ async fn search_recorded_source(
     as_of: Option<&str>,
     offset: i64,
     snapshot_id: Option<&str>,
-) -> Result<io::SnapshotRecordedSource> {
+) -> Result<RecordedRow> {
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
     let rows = api.list(&kube::api::ListParams::default()).await?.items;
     // `asOf` was validated at admission with the same parser; re-parse defensively
@@ -2657,22 +2716,20 @@ async fn search_recorded_source(
     let cutoff = as_of
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&chrono::Utc));
-    let Some((name, meta)) = select_recorded_source(triple, cutoff, offset, snapshot_id, &rows)
-    else {
-        return Err(Error::MissingDependency(format!(
+    select_recorded_source(triple, cutoff, offset, snapshot_id, &rows).ok_or_else(|| {
+        Error::MissingDependency(format!(
             "no Snapshot CR carrying recorded identity (`status.recorded`) matches \
-             `{}@{}:{}` in namespace `{ns}` yet — the catalog scan may still be running \
+             `{}@{}:{}`{} in namespace `{ns}` yet — the catalog scan may still be running \
              (it materializes discovered rows and backfills recorded metadata when the \
              kopia snapshot carries the `kopiur-meta` tag); the Restore holds until one \
              appears",
             triple.username,
             triple.hostname,
             triple.source_path.as_deref().unwrap_or("*"),
-        )));
-    };
-    Ok(io::SnapshotRecordedSource {
-        snapshot: format!("{ns}/{name}"),
-        meta: Some(meta),
+            snapshot_id
+                .map(|id| format!(" (kopia snapshot `{id}`)"))
+                .unwrap_or_default(),
+        ))
     })
 }
 
@@ -2695,17 +2752,20 @@ async fn search_recorded_source(
 /// cutoff, and `offset` steps back from the newest (negative clamps to 0;
 /// out-of-range yields `None`).
 ///
-/// Caveat (documented in `docs/restores.md`): the mover's OWN selection under
-/// `asOf` runs against the live repository listing, so it can pick a different
-/// manifest of the same source than this CR-side match — identity metadata is
-/// per-source in practice, so the divergence is cosmetic.
+/// Coherence (the P1 review finding): the returned row carries its
+/// `kopiaSnapshotID` so the caller can pin the DATA selection to the very
+/// snapshot that supplied the identity. `resolve_snapshot` pins it for
+/// `fromPolicy`/unpinned-`identity` sources whenever the `snapshot` inherit is
+/// active — the mover never runs its own independent live-listing selection
+/// there, so catalog lag or repository changes can no longer restore snapshot
+/// B's data under snapshot A's recorded uid/gid/fsGroup.
 fn select_recorded_source(
     triple: &kopiur_api::common::ResolvedIdentity,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     offset: i64,
     snapshot_id: Option<&str>,
     rows: &[Snapshot],
-) -> Option<(String, kopiur_api::recorded::RecordedSnapshotMeta)> {
+) -> Option<RecordedRow> {
     let identity_matches = |row: &kopiur_api::snapshot::SnapshotInfo| {
         row.identity.username == triple.username
             && row.identity.hostname == triple.hostname
@@ -2738,7 +2798,17 @@ fn select_recorded_source(
 
     let pick = |snap: &Snapshot| {
         let status = snap.status.as_ref()?;
-        Some((snap.name_any(), status.recorded.clone()?))
+        let info = status.snapshot.as_ref()?;
+        Some(RecordedRow {
+            name: snap.name_any(),
+            kopia_snapshot_id: info.kopia_snapshot_id.clone(),
+            identity: kopiur_api::common::ResolvedIdentity {
+                username: info.identity.username.clone(),
+                hostname: info.identity.hostname.clone(),
+                source_path: info.identity.source_path.clone(),
+            },
+            meta: status.recorded.clone()?,
+        })
     };
 
     if let Some(id) = snapshot_id {
@@ -2909,10 +2979,14 @@ async fn ensure_restore_target_pvc(
 /// resolve to a concrete id the controller pins ([`ResolveOutcome::Pinned`]);
 /// `fromPolicy`/`identity`-without-id defer the by-identity snapshot listing to
 /// the mover Job ([`ResolveOutcome::Deferred`]) because in-process listing only
-/// works for filesystem repos, and the mover reaches every backend. Returns
-/// `None` ONLY for a `snapshotRef` whose `Snapshot` CR has no resolved snapshot
-/// yet (the caller applies `waitTimeout` + `onMissingSnapshot`); deferred sources
-/// never return `None` — the mover applies `onMissingSnapshot` in-Job.
+/// works for filesystem repos, and the mover reaches every backend — EXCEPT when
+/// `inheritSecurityContextFrom: { snapshot: {} }` is active: the mover then
+/// replays a snapshot's recorded identity, so data and identity must pin from the
+/// SAME CR-catalog row ([`pin_from_recorded_catalog`]; the P1 coherence rule) and
+/// those sources pin too. Returns `None` ONLY for a `snapshotRef` whose
+/// `Snapshot` CR has no resolved snapshot yet (the caller applies `waitTimeout` +
+/// `onMissingSnapshot`); deferred sources never return `None` — the mover applies
+/// `onMissingSnapshot` in-Job.
 async fn resolve_snapshot(
     ctx: &Context,
     restore: &Restore,
@@ -2978,6 +3052,30 @@ async fn resolve_snapshot(
                     }),
                 })));
             }
+            let triple = ResolvedIdentity {
+                username: id.username.clone(),
+                hostname: id.hostname.clone(),
+                source_path: id.source_path.clone(),
+            };
+            if snapshot_inherit_active(restore) {
+                // COHERENCE (the P1 review finding): the mover replays the identity
+                // recorded on a snapshot, so the DATA must be that same snapshot. A
+                // deferred selection would let the mover pick from the LIVE listing
+                // while the identity came from the CR catalog — catalog lag or
+                // repository changes could then restore snapshot B's data under
+                // snapshot A's uid/gid/fsGroup. Pin both from one CR-catalog row.
+                return pin_from_recorded_catalog(
+                    ctx,
+                    restore,
+                    namespace,
+                    namespace,
+                    &triple,
+                    id.as_of.as_deref(),
+                    id.offset.unwrap_or(0),
+                )
+                .await
+                .map(Some);
+            }
             Ok(Some(ResolveOutcome::Deferred(RestoreSelector {
                 username: id.username.clone(),
                 hostname: id.hostname.clone(),
@@ -3002,6 +3100,21 @@ async fn resolve_snapshot(
                 cfg_ns,
                 repo.identity_defaults.as_ref(),
             )?;
+            if snapshot_inherit_active(restore) {
+                // Same coherence rule as the `identity` arm above: identity and data
+                // pin from ONE CR-catalog row, never two independent selections.
+                return pin_from_recorded_catalog(
+                    ctx,
+                    restore,
+                    namespace,
+                    cfg_ns,
+                    &identity,
+                    c.as_of.as_deref(),
+                    c.offset,
+                )
+                .await
+                .map(Some);
+            }
             Ok(Some(ResolveOutcome::Deferred(RestoreSelector {
                 username: identity.username,
                 hostname: identity.hostname,
@@ -3012,6 +3125,40 @@ async fn resolve_snapshot(
                 wait_deadline: wait_deadline.clone(),
             })))
         }
+    }
+}
+
+/// Pin a `fromPolicy`/unpinned-`identity` + `snapshot`-inherit restore from ONE
+/// CR-catalog row: the row supplies BOTH the kopia snapshot id (the data) and,
+/// later via [`snapshot_recorded_source`] re-selecting the same id, the recorded
+/// identity — so the two can never diverge (the P1 coherence rule). Under catalog
+/// lag this restores the newest *catalogued* snapshot rather than the newest live
+/// one, coherently; the scan converges the catalog. No matching row is the
+/// `MissingRecordedIdentity` hold (condition + Event + slow structural requeue).
+async fn pin_from_recorded_catalog(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    search_ns: &str,
+    triple: &kopiur_api::common::ResolvedIdentity,
+    as_of: Option<&str>,
+    offset: i64,
+) -> Result<ResolveOutcome> {
+    match search_recorded_source(ctx, search_ns, triple, as_of, offset, None).await {
+        Ok(row) => Ok(ResolveOutcome::Pinned(ResolvedSource {
+            kopia_snapshot_id: row.kopia_snapshot_id,
+            snapshot_ref: Some(kopiur_api::common::ObjectRef {
+                name: row.name,
+                namespace: Some(search_ns.to_string()),
+            }),
+            identity: Some(row.identity),
+        })),
+        Err(Error::MissingDependency(msg)) => {
+            let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
+            report_missing_recorded_identity(restore, &api, &msg, ctx).await?;
+            Err(Error::MissingRecordedIdentity(msg))
+        }
+        Err(e) => Err(e),
     }
 }
 
