@@ -89,6 +89,11 @@ pub struct AdoptionCandidate {
     pub stats: Option<SnapshotStats>,
     /// The row's `spec.pin`, carried onto the adopted row.
     pub pinned: bool,
+    /// The row's decoded `kopiur-meta` metadata (`status.recorded`), carried
+    /// onto the adopted row verbatim so adoption never drops recorded identity.
+    pub recorded: Option<kopiur_api::RecordedSnapshotMeta>,
+    /// The row's `status.snapshot.description`, carried onto the adopted row.
+    pub description: Option<String>,
 }
 
 /// Extract adoption candidates from a `Snapshot` LIST: `discovered`-origin rows
@@ -129,6 +134,8 @@ pub fn adoption_candidates(repo_uid: &str, rows: &[Snapshot]) -> Vec<AdoptionCan
                 timing: status.timing.clone(),
                 stats: status.stats.clone(),
                 pinned: s.spec.pin,
+                recorded: status.recorded.clone(),
+                description: info.description.clone(),
             })
         })
         .collect()
@@ -396,9 +403,11 @@ pub fn build_adopted_snapshot(
         snapshot: Some(SnapshotInfo {
             kopia_snapshot_id: candidate.snapshot_id.clone(),
             identity: candidate.identity.clone(),
+            description: candidate.description.clone(),
         }),
         timing: candidate.timing.clone(),
         stats: candidate.stats.clone(),
+        recorded: candidate.recorded.clone(),
         resolved: Some(ResolvedSnapshot {
             repository: Some(pinned_repo),
             sources: Vec::new(),
@@ -500,6 +509,7 @@ mod tests {
             snapshot: Some(SnapshotInfo {
                 kopia_snapshot_id: id.to_string(),
                 identity: ident,
+                description: None,
             }),
             timing: Some(SnapshotTiming {
                 start_time: Some("2026-01-01T00:00:00Z".into()),
@@ -524,6 +534,8 @@ mod tests {
             timing: None,
             stats: None,
             pinned,
+            recorded: None,
+            description: None,
         }
     }
 
@@ -610,6 +622,27 @@ mod tests {
         let got = adoption_candidates("repo-1", &[row]);
         assert_eq!(got.len(), 1);
         assert!(got[0].pinned, "spec.pin is carried onto the candidate");
+    }
+
+    #[test]
+    fn candidates_carry_recorded_meta_and_description() {
+        // A discovered row whose scan decoded kopiur-meta (+ description) must
+        // not lose either through adoption.
+        let ident = identity("app", "billing", Some("/data"));
+        let mut row = discovered_row("repo-1", "meta", "aaa", ident);
+        let status = row.status.as_mut().unwrap();
+        status.recorded = Some(kopiur_api::RecordedSnapshotMeta {
+            schema: 1,
+            src: kopiur_api::RecordedSrc::Inherited,
+            uid: Some(1000),
+            gid: Some(1000),
+            fs_group: Some(1000),
+        });
+        status.snapshot.as_mut().unwrap().description = Some("from the repo".into());
+        let got = adoption_candidates("repo-1", &[row]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].recorded.as_ref().unwrap().uid, Some(1000));
+        assert_eq!(got[0].description.as_deref(), Some("from the repo"));
     }
 
     // -- plan_adoption: matching + refusals ----------------------------------
@@ -1158,6 +1191,14 @@ mod tests {
                 ..Default::default()
             }),
             pinned: true,
+            recorded: Some(kopiur_api::RecordedSnapshotMeta {
+                schema: kopiur_api::KOPIUR_META_SCHEMA_V1,
+                src: kopiur_api::RecordedSrc::Explicit,
+                uid: Some(3001),
+                gid: None,
+                fs_group: Some(65532),
+            }),
+            description: Some("kept description".into()),
         };
         let (snap, status) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
 
@@ -1203,6 +1244,9 @@ mod tests {
         assert_eq!(info.identity, cand.identity);
         assert_eq!(status.timing, cand.timing);
         assert_eq!(status.stats, cand.stats);
+        // Recorded identity + description survive adoption verbatim.
+        assert_eq!(status.recorded, cand.recorded);
+        assert_eq!(info.description, cand.description);
         let pinned = status
             .resolved
             .as_ref()

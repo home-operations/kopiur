@@ -99,6 +99,12 @@ The whole problem reduces to one number (sometimes two): the **numeric** UID/GID
     - **Restore** — pick the UID/GID that should **own** the restored files, so the app can read them afterward. (To reproduce the *original* ownership exactly, see [Preserving ownership on restore](#preserving-original-ownership-on-restore).)
 3. **Choose how to express it** — one of the three approaches below.
 
+/// note | The resolved identity is recorded on every snapshot
+
+Whichever way you express it, the **resolved** identity each backup actually ran as (uid/gid, pod `fsGroup`, and whether it was inherited, explicit, or a default) is recorded on the kopia snapshot itself as the `kopiur-meta` tag and mirrored to the Snapshot's `status.recorded` — durable in the repository, so it survives a cluster rebuild and re-appears on discovered rows. See [Backups → tags](backups.md#tags--label-the-snapshot-in-the-repository).
+
+///
+
 ## Three ways to set the context
 
 ### 1. Set it explicitly
@@ -127,7 +133,7 @@ Full, apply-ready example:
 
 ### 2. Inherit it from the workload
 
-If you'd rather "run as **whatever the app runs as**" than track a UID, `inheritSecurityContextFrom` copies the security context from a live workload pod onto the mover — **both** the container `securityContext` (UID/GID) **and** the pod-level `securityContext` (e.g. `fsGroup`). This is the answer to *"back up / restore as the pod that mounts this PVC,"* at both levels. It is an **externally-tagged choice** — pick exactly one form:
+If you'd rather "run as **whatever the app runs as**" than track a UID, `inheritSecurityContextFrom` copies the security context from a live workload pod onto the mover — **both** the container `securityContext` (UID/GID) **and** the pod-level `securityContext` (e.g. `fsGroup`). This is the answer to *"back up / restore as the pod that mounts this PVC,"* at both levels. It is an **externally-tagged choice** — pick exactly one form (two read a live pod; the third, restore-only [`snapshot`](#snapshot--inherit-the-backups-recorded-identity-restore), replays the identity *recorded on the backup* and needs no pod at all):
 
 #### `pvcConsumer` — auto-derive from the source PVC (backup, recommended)
 
@@ -157,7 +163,7 @@ If no `runAsUser` appears, set one on the workload, or set `mover.securityContex
 
 ///
 
-`pvcConsumer` is **backup-only**: a Restore writes a *target* PVC whose consumer may not exist yet, so use `workloadSelector` (below) there. (The admission webhook rejects `pvcConsumer` on a Restore.)
+`pvcConsumer` is **backup-only**: a Restore writes a *target* PVC whose consumer may not exist yet, so use `workloadSelector` (below) or the recorded-identity [`snapshot`](#snapshot--inherit-the-backups-recorded-identity-restore) mode there. (The admission webhook rejects `pvcConsumer` on a Restore.)
 
 #### `workloadSelector` — name the workload by label (backup or restore)
 
@@ -191,6 +197,55 @@ Things to remember:
 - **Inheriting a *root* workload is still elevated.** The *resolved* contexts are what's evaluated — container **and** pod — so inheriting from a pod that runs as root (or with `runAsUser: 0` at either level, or added capabilities) trips the [privileged-mover gate](#privileged-and-root-movers) exactly like an explicit root context would.
 - **Inheriting root just works — you don't hand-set `runAsNonRoot`.** When the workload runs as `runAsUser: 0`, Kopiur produces a *valid* root mover for you (it reconciles `runAsNonRoot` to `false`, since `runAsNonRoot: true` + `runAsUser: 0` is a contradiction the kubelet rejects with `CreateContainerConfigError`). So you only opt the namespace into [privileged movers](#privileged-and-root-movers); you never need to add `runAsNonRoot: false` to an `inheritSecurityContextFrom` recipe.
 
+#### `snapshot` — inherit the backup's recorded identity (restore)
+
+Every backup **records** the uid/gid/fsGroup its mover actually ran as — on the kopia snapshot itself (the `kopiur-meta` tag) and as `Snapshot.status.recorded`. On a **Restore**, `snapshot: {}` replays that recorded identity onto the restore mover:
+
+```yaml
+spec:
+  mover:
+    inheritSecurityContextFrom:
+      snapshot: {} # the empty sub-object is required — see the warning below
+```
+
+Unlike `workloadSelector`, this needs **no live pod**: it works when the app is not deployed yet, after a full cluster re-bootstrap, and with `target: { populator: {} }` (it is the one inherit mode allowed with a populator target). It works with **every** restore source:
+
+- **`snapshotRef`** reads the referenced `Snapshot` CR's `status.recorded` directly.
+- **`fromPolicy` / `identity`** search the namespace's Snapshot CRs by kopia identity — honoring `asOf`, `offset`, and `snapshotID` — so a purely declarative [re-bootstrap](restores.md#declarative-re-bootstrap--restore-as-the-recorded-identity) works: apply Repository + SnapshotPolicy + Restore and let the catalog scan materialize the rows the search needs.
+
+If no recorded identity is resolvable yet — the CR is missing, it carries no `status.recorded` (a pre-feature or foreign backup), or the catalog scan hasn't landed — the Restore **holds** with `SecurityContextInherited=False` / `MissingRecordedIdentity` and re-checks every few minutes; the scan backfills `status.recorded` automatically whenever the kopia snapshot carries the tag. An explicit `mover.securityContext` that pins a `runAsUser` acts as the fallback (`InheritFallback`) exactly as with the live-pod modes, and explicit fields override recorded ones the same way (`recorded ⊂ explicit`).
+
+The `SecurityContextInherited` condition then reports what the record achieved:
+
+| `status` / `reason` | What happened | What to do |
+| --- | --- | --- |
+| `True` / `RecordedApplied` | The recorded identity was applied. The message names the Snapshot, the recorded uid/gid/fsGroup, and the **provenance** (`inherited` = it tracked the workload at backup time; `explicit`/`defaults` = it reproduces the backup mover's identity, which was never workload-derived). | Nothing. |
+| `False` / `RecordedPinnedNoUid` | The backup recorded no pinned uid — and no group beyond the mover's own defaults — so its mover's identity was image-determined and there is nothing to replay; the restore mover runs as its image's uid `65532`. | Pin `mover.securityContext.runAsUser` on the Restore, or pin an identity on the backup's mover so future snapshots record one. |
+| `False` / `MissingRecordedIdentity` | No recorded identity is resolvable yet (see above). The Restore holds. | Usually nothing — wait for the catalog scan. Or set an explicit `mover.securityContext`, or drop `snapshot: {}`. |
+
+/// warning | Write `snapshot: {}`, not `snapshot:`
+
+A bare `snapshot:` is YAML **null**, not an empty object, and admission rejects it (the variant is a sub-object so future knobs can slot in). Always write `snapshot: {}`.
+
+///
+
+/// danger | Recorded metadata is untrusted repository data
+
+The `kopiur-meta` tag lives **in the repository**: anyone with repository write credentials — a NAS admin, a peer cluster sharing the repo, a compromised replication target — can forge `{"schema":1,"uid":0}` on any snapshot. That is a different (and usually weaker) trust domain than the RBAC needed to run a root pod in your namespace. Kopiur's mitigations:
+
+- A recorded **root** identity trips the [privileged-mover gate](#privileged-and-root-movers) exactly like live-pod inherit — nothing runs as uid 0 until the namespace opts in via the `privileged-movers` annotation. Root-via-recorded-metadata deliberately needs no *stronger* opt-in: the gate expresses namespace-scoped intent to run privileged movers, whatever the identity source.
+- The condition and Events always name the **recorded uid, its provenance, and the Snapshot** it came from — so a forged uid-0 tag stays auditable even in namespaces already annotated for privileged movers.
+
+///
+
+`snapshot` is **restore-only**: a backup's identity comes from the live workload (`pvcConsumer`/`workloadSelector`) — it is the run that *creates* the record — and maintenance touches no snapshot data. The admission webhook rejects the variant on `SnapshotPolicy` and `Maintenance`.
+
+Apply-ready example (direct + declarative re-bootstrap):
+
+```yaml
+--8<-- "deploy/examples/37-restore-recorded-identity.yaml"
+```
+
 #### Combining inherit with an explicit context
 
 `inheritSecurityContextFrom` and `securityContext`/`podSecurityContext` are **layers, not alternatives** — you can set both. The full merge order is:
@@ -199,7 +254,9 @@ Things to remember:
 hardened  ⊂  moverDefaults  ⊂  inherited  ⊂  mover.securityContext
 ```
 
-So **what you write always wins**, inheritance fills in whatever the workload pins that you left blank, and your context stands in **alone** when inheritance can't resolve a pod. That last property makes it the natural fallback:
+So **what you write always wins**, inheritance fills in whatever the workload pins that you left blank, and your context stands in **alone** when inheritance can't resolve a pod. That last property makes it the natural fallback.
+
+Layers merge as (container, pod) **pairs**, and the mover's *identity* — `runAsUser`/`runAsGroup` — always belongs to the **highest layer that pins one, regardless of which level it was written at**. A workload that pins `runAsUser` at the *pod* level beats a `moverDefaults.securityContext.runAsUser` written at the *container* level (Kubernetes alone would resolve that the other way — container beats pod — but Kopiur promotes the winning layer's identity onto the mover container, which is the pod's only container, so the ladder above is the whole story). Non-identity fields (`runAsNonRoot`, `seccompProfile`, …) merge field-wise per level.
 
 ```yaml
 --8<-- "deploy/examples/18-inherit-security-context.yaml:merged"
@@ -224,7 +281,7 @@ If that's not what you meant, leave `runAsUser` out and let inherit supply it. K
 | `True` / `InheritApplied` | Inheritance resolved a workload and its values survived every layer. The message names the pod and the uid the mover runs as. | Nothing. |
 | `False` / `InheritFallback` | No workload pod resolved (scaled to zero, mid-rollout, selector matches nothing). Your explicit context stood in, so the run proceeded rather than being held. | Nothing, if that's the intent. Otherwise scale the workload up. |
 | `False` / `InheritPinnedNoUid` | A pod resolved, but pins no `runAsUser` and no group beyond the mover's own defaults — its identity is in its image, which Kopiur cannot read. Inheriting copied nothing. | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser`. |
-| `False` / `InheritOverridden` | Inheritance resolved a UID, but a higher layer overrode it. Correct by design — but inherit is a no-op for that field and won't follow the workload. The message names **which** layer won: this recipe, or the repository's `moverDefaults`. | Drop the winning `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
+| `False` / `InheritOverridden` | Inheritance resolved a UID, but this recipe's explicit `runAsUser` overrode it. Correct by design — but inherit is a no-op for that field and won't follow the workload. The message names the **exact field** that won (`mover.securityContext.runAsUser` or `mover.podSecurityContext.runAsUser`) — only this recipe can displace an inherited UID; the repository's `moverDefaults` never can. | Remove the named `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
 
 ```console
 $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextInherited")]}'
@@ -480,7 +537,7 @@ That's the behavior when the recipe has **nothing else to go on**, as here. Add 
 | Set the UID/GID to… | an identity that can read the data | the identity that should **own** the restored files |
 | Default if unset | UID `65532` (reads world-readable / `65532`-owned only), pod `fsGroup: 65532` | UID `65532` (files land owned by `65532`), pod `fsGroup: 65532` |
 | Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` |
-| Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` | `Restore.spec.mover.inheritSecurityContextFrom` |
+| Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}` — the backup's recorded identity, no live pod) |
 | Elevated context | namespace `privileged-movers` opt-in | same opt-in |
 | Tolerate permission errors | fails on unreadable files | `spec.options.ignorePermissionErrors` (default `true`) reports instead of failing |
 
@@ -514,6 +571,7 @@ A backup that reports **`Succeeded` but zero files/bytes** is the classic sign t
 | Default | container: UID `65532`, `runAsNonRoot: true`, drop ALL caps, seccomp `RuntimeDefault`, no escalation. pod: `fsGroup: 65532`, `fsGroupChangePolicy: OnRootMismatch` |
 | Set the UID/GID | `securityContext.runAsUser` / `runAsGroup` (match the data owner) |
 | Inherit from a workload | `inheritSecurityContextFrom.podSelector` (+ optional `container`) — copies container **and** pod context (UID + fsGroup). Needs the workload to pin `runAsUser`; combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback |
+| Inherit the backup's recorded identity (restore) | `inheritSecurityContextFrom: { snapshot: {} }` — replay the uid/gid/fsGroup recorded on the backup (`Snapshot.status.recorded`); works with every source, needs no live pod, holds on `MissingRecordedIdentity` until the catalog scan lands |
 | Root / preserve ownership | `runAsUser: 0` + `runAsNonRoot: false` (+ `privilegedMode: true` for restore ownership) |
 | Privileged-mover opt-in | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
 | Find the owning UID | [Permissions → Find the UID/GID](permissions.md#step-1--find-the-uidgid-that-owns-your-data) |

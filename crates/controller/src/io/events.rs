@@ -321,6 +321,16 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  reconciles automatically — no re-apply needed."
             ),
         ),
+        Error::MissingRecordedIdentity(_) => (
+            crate::consts::MISSING_RECORDED_IDENTITY_REASON,
+            crate::consts::SET_EXPLICIT_MOVER_CONTEXT_ACTION,
+            format!(
+                "{err}. The Restore holds (re-checked every few minutes) until a Snapshot CR \
+                 carrying status.recorded matches the source — the catalog scan materializes \
+                 and backfills rows automatically. To proceed without it, set \
+                 mover.securityContext explicitly or drop inheritSecurityContextFrom.snapshot."
+            ),
+        ),
         Error::Serialization(_) => (
             SERIALIZATION_FAILED_REASON,
             REPORT_ISSUE_ACTION,

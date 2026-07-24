@@ -1,0 +1,77 @@
+# Example 37 — Restore as the identity RECORDED on the backup
+#
+# Every backup records the uid/gid/fsGroup its mover actually ran as on the kopia
+# snapshot itself (the `kopiur-meta` tag), surfaced as `Snapshot.status.recorded`.
+# `inheritSecurityContextFrom: { snapshot: {} }` makes a Restore's mover run as
+# that recorded identity — no live workload pod needed, so it works when the app
+# is not deployed yet and after a full cluster re-bootstrap.
+#
+# Works with EVERY source:
+#   - `snapshotRef`          reads the referenced Snapshot CR's status.recorded.
+#   - `fromPolicy`/`identity` search the CR catalog by kopia identity, honoring
+#     asOf/offset/snapshotID — this is what makes the GitOps re-bootstrap
+#     declarative (second Restore below).
+#
+# Holds and warnings (SecurityContextInherited condition):
+#   - `MissingRecordedIdentity` (False): the Snapshot CR is missing, carries no
+#     status.recorded (pre-feature or foreign backup), or the catalog scan has
+#     not materialized a matching row yet. The Restore holds and re-checks every
+#     few minutes; the scan backfills recorded metadata automatically.
+#   - `RecordedPinnedNoUid` (False): the backup recorded no pinned uid (its
+#     mover's identity was image-determined) — inheriting contributes nothing.
+#   - `RecordedApplied` (True): names the Snapshot, the recorded uid, and its
+#     provenance (`inherited`/`explicit`/`defaults`).
+#
+# TRUST BOUNDARY: recorded metadata is repository data — anyone with repository
+# write credentials can forge it (including uid 0). A recorded ROOT identity is
+# gated on the namespace privileged-movers opt-in exactly like live-pod inherit,
+# and the condition/Events always name the recorded uid + snapshot.
+#
+# Field shapes verified against crates/api:
+#   spec.mover.inheritSecurityContextFrom : exactly one of
+#       { workloadSelector: {...} } | { pvcConsumer: {...} } | { snapshot: {} }
+#   `snapshot` is RESTORE-only (webhook-rejected on SnapshotPolicy/Maintenance).
+#
+# YAML FOOTGUN: write `snapshot: {}` — a bare `snapshot:` is YAML null and is
+# rejected at admission (the variant is an empty sub-object, not a null).
+---
+# Direct: restore a specific Snapshot as the identity it recorded.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-restore-as-recorded
+  namespace: billing
+spec:
+  source:
+    snapshotRef:
+      name: postgres-data-20260523-021300
+  target:
+    pvc:
+      name: postgres-data-restored
+      capacity: 100Gi
+  mover:
+    inheritSecurityContextFrom:
+      snapshot: {} # the empty sub-object is required (`snapshot:` alone is null)
+---
+# Declarative re-bootstrap (GitOps): apply Repository + SnapshotPolicy + this
+# Restore together on a fresh cluster. The Restore holds on
+# `MissingRecordedIdentity` until the catalog scan materializes a discovered
+# Snapshot CR carrying `status.recorded` for the policy's identity, then
+# restores the latest backup as the identity it recorded. Pair with
+# `target: { populator: {} }` for deploy-or-restore (`snapshot` needs no live
+# pod, so it is the one inherit mode allowed with a populator target).
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-rebootstrap
+  namespace: billing
+spec:
+  source:
+    fromPolicy:
+      name: postgres-data # identity re-resolved from the live SnapshotPolicy
+  target:
+    pvcRef:
+      name: postgres-data # the PVC your app deployment already claims
+  mover:
+    inheritSecurityContextFrom:
+      snapshot: {}

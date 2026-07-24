@@ -185,19 +185,23 @@ pub struct ResolvedMover {
     pub throttle: Option<Throttle>,
 }
 
-/// Resolve the effective mover configuration via the 3-layer field-wise merge
+/// Resolve the effective mover configuration via the layer merge
 /// `hardened ⊂ moverDefaults ⊂ recipe` (ADR-0004 §1/§2).
 ///
 /// - `defaults`: the repository's `moverDefaults` (None when the repo sets none).
 /// - `recipe_sc`/`recipe_psc`: the recipe's **effective** container/pod context, which the
 ///   controller has already resolved — the explicit `mover.securityContext`/
 ///   `podSecurityContext` overlaid on top of any context inherited from a workload via
-///   `inheritSecurityContextFrom` (they combine; explicit wins field-wise). The full ladder
-///   is therefore `hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`. Because each merge is a
-///   per-field `over.or(base)`, folding the inner two layers before this call is field-wise
-///   identical to a flat four-layer merge. The recipe layer enters here as a *layer*, NOT a
-///   whole-chain replacement — so the hardened base + `moverDefaults` still supply
-///   `drop:[ALL]`/seccomp and a partial recipe context can only tighten.
+///   `inheritSecurityContextFrom` (they combine; explicit wins). The full ladder is
+///   therefore `hardened ⊂ moverDefaults ⊂ inherited ⊂ explicit`. Layers merge as
+///   `(container, pod)` **pairs** via [`merge_context_pair`]: field-wise per dimension,
+///   plus identity promotion so the effective UID/GID belongs to the **highest layer that
+///   pins one, regardless of which dimension it wrote** — a `moverDefaults` container-level
+///   `runAsUser` can never shadow an inherited pod-level one. The pair merge is
+///   associative, so folding the inner two layers before this call is identical to a flat
+///   four-layer merge. The recipe layer enters here as a *layer*, NOT a whole-chain
+///   replacement — the hardened base + `moverDefaults` still supply `drop:[ALL]`/seccomp
+///   and a partial recipe context can only tighten.
 /// - `recipe_resources`/`recipe_cache`: from `mover.resources` / `mover.cache`.
 ///
 /// `node_selector`/`tolerations`/`affinity`/`ttl` flow from `moverDefaults` (no per-recipe
@@ -210,33 +214,24 @@ pub fn resolve_mover(
     recipe_cache: Option<&CacheDefaults>,
     recipe_ttl_seconds_after_finished: Option<i64>,
 ) -> ResolvedMover {
-    let hardened = hardened_security_context();
-    // hardened ⊂ moverDefaults.securityContext
-    let sc_base = match defaults.and_then(|d| d.security_context.as_ref()) {
-        Some(d_sc) => merge_security_context(&hardened, d_sc),
-        None => hardened,
-    };
-    // (hardened ⊂ moverDefaults) ⊂ recipe.securityContext
-    let security_context = match recipe_sc {
-        Some(r) => merge_security_context(&sc_base, r),
-        None => sc_base,
-    };
-    // Pod context resolves identically to the container one (ADR-0004 §2): a hardened
-    // base (notably the `fsGroup` that makes the cache writable) overlaid by
-    // moverDefaults then the recipe. Always `Some` so every mover pod — bootstrap,
-    // backup, restore, maintenance, verification, replication — carries the same
-    // hardened fsGroup unless explicitly overridden.
+    // The hardened pair is the lowest layer: the container hardening plus the pod-level
+    // fsGroup that makes the cache writable. Both are always present, so every mover pod
+    // — bootstrap, backup, restore, maintenance, verification, replication — carries the
+    // hardened defaults unless a higher layer overrides them.
+    let hardened_sc = hardened_security_context();
     let hardened_psc = hardened_pod_security_context();
-    // hardened ⊂ moverDefaults.podSecurityContext
-    let psc_base = match defaults.and_then(|d| d.pod_security_context.as_ref()) {
-        Some(d_psc) => merge_pod_security_context(&hardened_psc, d_psc),
-        None => hardened_psc,
-    };
-    // (hardened ⊂ moverDefaults) ⊂ recipe.podSecurityContext
-    let pod_security_context = Some(match recipe_psc {
-        Some(r) => merge_pod_security_context(&psc_base, r),
-        None => psc_base,
-    });
+    // hardened ⊂ moverDefaults, as one (container, pod) layer pair.
+    let (base_sc, base_psc) = merge_context_pair(
+        Some(&hardened_sc),
+        Some(&hardened_psc),
+        defaults.and_then(|d| d.security_context.as_ref()),
+        defaults.and_then(|d| d.pod_security_context.as_ref()),
+    );
+    // (hardened ⊂ moverDefaults) ⊂ recipe.
+    let (security_context, pod_security_context) =
+        merge_context_pair(base_sc.as_ref(), base_psc.as_ref(), recipe_sc, recipe_psc);
+    let security_context =
+        security_context.expect("the hardened container base layer is always present");
     // Normalize the merged result against every kubelet/apiserver security-context invariant
     // (see `crate::invariants`) so a contradiction the field-wise merge can assemble — most
     // importantly an inherited-root `runAsUser: 0` left under the hardened `runAsNonRoot:
@@ -294,7 +289,22 @@ pub enum InheritSecurityContextFrom {
     WorkloadSelector(PodSelector),
     /// Backup sources only: auto-derive the workload from the PVC this snapshot backs up.
     PvcConsumer(PvcConsumerInherit),
+    /// Restores only: inherit the identity RECORDED on the backup itself
+    /// (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) —
+    /// uid/gid/fsGroup the backup mover actually ran as. Needs no live workload
+    /// pod, so it works on a rebuilt cluster and with `target.populator`.
+    /// Rejected at admission on SnapshotPolicy/Maintenance (backups read the
+    /// live workload; maintenance has no snapshot). Write it as `snapshot: {}`
+    /// (an empty sub-object) — a bare `snapshot:` is null and rejected.
+    Snapshot(SnapshotInherit),
 }
+
+/// Tuning for [`InheritSecurityContextFrom::Snapshot`]. Empty today; a
+/// sub-object (like [`PopulatorTarget`](crate::restore::PopulatorTarget)) so
+/// future knobs slot in without API breakage.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInherit {}
 
 /// Tuning for [`InheritSecurityContextFrom::PvcConsumer`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default, JsonSchema)]

@@ -1295,6 +1295,7 @@ mod tests {
                     hostname: "h".into(),
                     source_path: Some("/d".into()),
                 },
+                description: None,
             }),
             ..Default::default()
         });

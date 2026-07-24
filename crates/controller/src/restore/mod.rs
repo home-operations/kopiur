@@ -31,11 +31,12 @@ use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, ORPHANED_PRIME_REAPED_REASON,
-    POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-    RECREATE_CLAIM_TO_RESTORE_ACTION, RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    RESTORE_TARGET_ALREADY_BOUND_REASON, SECURITY_CONTEXT_COMPATIBLE_REASON,
-    SECURITY_CONTEXT_INHERITED_CONDITION,
+    MISSING_CREDENTIALS_REASON, MISSING_RECORDED_IDENTITY_REASON, MOVER_PERMITTED_CONDITION,
+    ORPHANED_PRIME_REAPED_REASON, POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    RECORDED_APPLIED_REASON, RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
+    RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION, RESTORE_TARGET_ALREADY_BOUND_REASON,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
+    SET_EXPLICIT_MOVER_CONTEXT_ACTION,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -481,6 +482,222 @@ async fn report_restore_inherit_fallback(
         }
         Ok(false) => {}
         Err(e) => tracing::debug!(error = %e, "restore inherit fallback: condition patch failed"),
+    }
+}
+
+/// Park the restore on the `MissingRecordedIdentity` hold:
+/// `SecurityContextInherited=False` + `Pending` + a Warning Event (mirrors the
+/// missing-ServiceAccount pattern above). The hold is permanent-*shaped* — a
+/// pre-feature/foreign snapshot, or a catalog scan that has not materialized the
+/// matching CR yet — so the caller requeues it on the slow structural cadence via
+/// [`Error::MissingRecordedIdentity`], never the fast transient one.
+async fn report_missing_recorded_identity(
+    restore: &Restore,
+    api: &Api<Restore>,
+    msg: &str,
+    ctx: &Context,
+) -> Result<()> {
+    let name = restore.name_any();
+    // Not necessarily the first conditions writer across reconciles — build from the
+    // LIVE conditions and only patch (and Event) on a real transition, so the 300s
+    // requeue does not re-fire an identical Warning forever.
+    let Some(live) = io::live_conditions_source(api, &name, restore).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let conditions = io::upsert_condition(
+        &existing_conditions(&live),
+        SECURITY_CONTEXT_INHERITED_CONDITION,
+        false,
+        MISSING_RECORDED_IDENTITY_REASON,
+        msg,
+        restore.metadata.generation,
+    );
+    let current = serde_json::to_value(&live.status).ok();
+    if io::patch_status_if_changed(
+        api,
+        &name,
+        current.as_ref(),
+        serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+    )
+    .await?
+    {
+        io::publish_warning_event(
+            ctx,
+            restore,
+            MISSING_RECORDED_IDENTITY_REASON,
+            SET_EXPLICIT_MOVER_CONTEXT_ACTION,
+            msg,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// The `SecurityContextInherited` verdict for a restore that inherited the identity
+/// RECORDED on its backup (`inheritSecurityContextFrom.snapshot`).
+struct RecordedInheritVerdict {
+    /// `true` when the record contributed a real identity to reproduce.
+    ok: bool,
+    reason: &'static str,
+    message: String,
+}
+
+/// Decide what inheriting a backup's recorded identity actually achieved. Pure — every
+/// arm is unit-testable without a cluster.
+///
+/// Reuses the pins-identity-vs-baseline logic from live-pod inherit: a record that
+/// contributes nothing beyond the mover's own hardened baseline (no uid, no gid, and an
+/// fsGroup that is absent or the hardened 65532) is a provable no-op — the mover runs
+/// as its image's uid — and must warn (`RecordedPinnedNoUid`), not claim success. A
+/// non-baseline fsGroup-only record is the blessed restore shape (the kubelet applies
+/// fsGroup to the fresh target volume) and reports `True`, as does a pinned uid.
+///
+/// The message ALWAYS names the Snapshot, the recorded uid, and the provenance —
+/// only `src: inherited` may claim the identity tracked the workload — and a recorded
+/// ROOT uid is called out explicitly: recorded metadata is untrusted repository data
+/// (anyone with repository write credentials can forge `{"schema":1,"uid":0}`), so the
+/// elevation must stay auditable in the condition text even in namespaces already
+/// annotated for privileged movers (plan §3.4).
+fn recorded_inherit_verdict(
+    snapshot: &str,
+    uid: Option<i64>,
+    src: kopiur_api::recorded::RecordedSrc,
+    gid: Option<i64>,
+    fs_group: Option<i64>,
+) -> RecordedInheritVerdict {
+    use kopiur_api::common::MOVER_NONROOT_ID;
+    use kopiur_api::recorded::RecordedSrc;
+
+    // Exhaustive over the provenance so a new variant must state its honesty here.
+    let provenance = match src {
+        RecordedSrc::Inherited => {
+            "recorded provenance `inherited`: the identity was read from the live workload \
+             at backup time, so this restore reproduces the identity the workload actually \
+             ran as"
+        }
+        RecordedSrc::Explicit => {
+            "recorded provenance `explicit`: the backup recipe's explicit mover context \
+             pinned this identity — it reproduces the backup mover's identity, which was \
+             never workload-derived"
+        }
+        RecordedSrc::Defaults => {
+            "recorded provenance `defaults`: the identity came from repository/hardened \
+             mover defaults at backup time, not from the workload"
+        }
+        RecordedSrc::Unknown => {
+            "recorded provenance is a value this operator version does not recognize \
+             (written by a newer kopiur) — whether it tracked the workload is unknown"
+        }
+    };
+
+    let contributes =
+        uid.is_some() || gid.is_some() || fs_group.is_some_and(|f| f != MOVER_NONROOT_ID);
+    if !contributes {
+        return RecordedInheritVerdict {
+            ok: false,
+            reason: RECORDED_PINNED_NO_UID_REASON,
+            message: format!(
+                "Snapshot `{snapshot}` recorded no pinned uid — and no gid/fsGroup beyond \
+                 the mover's own defaults — so inheriting it contributed nothing: the mover \
+                 runs as its image's uid {MOVER_NONROOT_ID}, an identity that did NOT come \
+                 from the backup ({provenance}). The backup mover's identity was \
+                 image-determined at backup time. Pin mover.securityContext.runAsUser on \
+                 this Restore if the restored files must be owned by a specific uid."
+            ),
+        };
+    }
+
+    let identity = match uid {
+        Some(u) => format!("uid {u}"),
+        None => format!(
+            "its image's uid {MOVER_NONROOT_ID} (the record pins no uid), with the \
+             recorded group identity applied"
+        ),
+    };
+    let detail = [
+        gid.map(|g| format!("gid {g}")),
+        fs_group.map(|f| format!("fsGroup {f}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    };
+    // A recorded ROOT uid must be visible in the condition itself: the privileged-mover
+    // gate + Events fire elsewhere, but this text is what makes a FORGED uid-0 tag
+    // auditable per-restore, naming both the elevation and where it came from.
+    let root_note = if uid == Some(0) {
+        format!(
+            " The mover runs as ROOT (uid 0) because Snapshot `{snapshot}` recorded uid 0 \
+             — recorded metadata is repository data, forgeable by anyone with repository \
+             write credentials, so verify this snapshot is trusted; the run is additionally \
+             gated on the namespace's privileged-movers opt-in."
+        )
+    } else {
+        String::new()
+    };
+    RecordedInheritVerdict {
+        ok: true,
+        reason: RECORDED_APPLIED_REASON,
+        message: format!(
+            "the mover inherited the identity recorded on Snapshot `{snapshot}` and runs \
+             as {identity}{detail}; {provenance}.{root_note}"
+        ),
+    }
+}
+
+/// Write the recorded-inherit verdict as the `SecurityContextInherited` condition
+/// (True or False) and, on a warning transition, a Warning Event. Mirrors
+/// [`report_restore_inherit_fallback`]'s two-writer discipline: live conditions +
+/// patch-if-changed, so the privileged-gate/stale-clear writers above are not erased
+/// and a steady state re-fires nothing.
+async fn report_restore_recorded_inherit(
+    namespace: &str,
+    restore: &Restore,
+    verdict: &RecordedInheritVerdict,
+    ctx: &Context,
+) {
+    let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
+    let name = restore.name_any();
+    let Some(live) = io::live_conditions_source(&api, &name, restore).await else {
+        return; // deleted mid-reconcile
+    };
+    let conditions = io::upsert_condition(
+        &existing_conditions(&live),
+        SECURITY_CONTEXT_INHERITED_CONDITION,
+        verdict.ok,
+        verdict.reason,
+        &verdict.message,
+        restore.metadata.generation,
+    );
+    let current = serde_json::to_value(&live.status).ok();
+    match io::patch_status_if_changed(
+        &api,
+        &name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await
+    {
+        // Only a problem is worth an Event; the healthy arm is a silent confirmation.
+        Ok(true) if !verdict.ok => {
+            io::publish_warning_event(
+                ctx,
+                restore,
+                verdict.reason,
+                SET_EXPLICIT_MOVER_CONTEXT_ACTION,
+                &verdict.message,
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "restore recorded inherit: condition patch failed");
+        }
     }
 }
 
@@ -1800,20 +2017,52 @@ async fn run_restore_mover(
         Err(e) => return Err(e),
     };
 
-    // Resolve the restore mover's EFFECTIVE security context once (explicit, or
-    // inherited from a workload pod via `inheritSecurityContextFrom`). Both the gate
-    // and the Job use it, so an inherited root context is gated like an explicit one.
-    // The effective container + pod security contexts — explicit, or both inherited
-    // from a workload pod via `inheritSecurityContextFrom`.
+    // Resolve the restore mover's EFFECTIVE security context once (explicit, inherited
+    // from a workload pod via `inheritSecurityContextFrom`, or replayed from the
+    // backup's RECORDED identity via `inheritSecurityContextFrom.snapshot`). Both the
+    // gate and the Job use it, so an inherited/recorded root context is gated like an
+    // explicit one.
+    //
+    // The recorded-identity source resolves FIRST (a no-op `None` unless the mover uses
+    // the `snapshot` variant): the Snapshot CR's `status.recorded` — direct for
+    // `snapshotRef`, via the CR-catalog search for `fromPolicy`/`identity`. Its
+    // `MissingDependency` holds are permanent-SHAPED (a pre-feature snapshot or a
+    // catalog scan that has not landed yet), so they are surfaced as an explicit
+    // `SecurityContextInherited=False`/`MissingRecordedIdentity` condition + Event and
+    // requeued on the slow structural cadence (300s) instead of the fast transient one
+    // — a bare `?` here would hot-loop a generic error with no condition.
+    let recorded_source = match snapshot_recorded_source(ctx, restore, namespace).await {
+        Ok(s) => s,
+        Err(Error::MissingDependency(msg)) => {
+            report_missing_recorded_identity(restore, api, &msg, ctx).await?;
+            return Err(Error::MissingRecordedIdentity(msg));
+        }
+        Err(e) => return Err(e),
+    };
     // Restore has no backup *source* PVC; `pvcConsumer` is backup-only (validator-rejected
     // for restore), so pass None.
-    let mover_security = io::resolve_mover_security_contexts(
+    let mover_security = match io::resolve_mover_security_contexts(
         &ctx.client,
         namespace,
         restore.spec.mover.as_ref(),
         None,
+        recorded_source.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(s) => s,
+        // The snapshot-inherit hold: the matched CR carries no `status.recorded` AND the
+        // explicit context pins no fallback identity (the resolver reports a `Fallback`
+        // outcome instead when it does — that path stays reported as today). Same
+        // explicit condition + slow requeue as above. Guarded on `recorded_source` so a
+        // live-pod inherit's MissingDependency (workload scaled to zero) keeps its
+        // existing fast-transient propagation.
+        Err(Error::MissingDependency(msg)) if recorded_source.is_some() => {
+            report_missing_recorded_identity(restore, api, &msg, ctx).await?;
+            return Err(Error::MissingRecordedIdentity(msg));
+        }
+        Err(e) => return Err(e),
+    };
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -1918,6 +2167,22 @@ async fn run_restore_mover(
     match &mover_security.outcome {
         io::InheritOutcome::Fallback { reason } => {
             report_restore_inherit_fallback(namespace, restore, reason, ctx).await;
+        }
+        // Recorded-identity inherit reports POSITIVELY too (unlike `workloadSelector`
+        // restores, which stay Fallback-only): provable provenance is this mode's entire
+        // value, so the condition must name the Snapshot, the recorded uid, and the
+        // provenance — and a record that contributed nothing beyond the hardened
+        // baseline must warn, not claim success.
+        io::InheritOutcome::InheritedFromSnapshot { snapshot, uid, src } => {
+            let meta = recorded_source.as_ref().and_then(|s| s.meta.as_ref());
+            let verdict = recorded_inherit_verdict(
+                snapshot,
+                *uid,
+                *src,
+                meta.and_then(|m| m.gid),
+                meta.and_then(|m| m.fs_group),
+            );
+            report_restore_recorded_inherit(namespace, restore, &verdict, ctx).await;
         }
         // The backup-only `InheritPinnedNoUid` warning has no restore counterpart on purpose:
         // an fsGroup-only inherit is a *blessed* restore shape (`RestoreBasis::FsGroupMatch`),
@@ -2251,6 +2516,228 @@ async fn restore_source_anchor(
         username,
         hostname,
     }
+}
+
+/// Resolve the recorded-identity source for `inheritSecurityContextFrom.snapshot`,
+/// BEFORE the mover security-context resolution. `None` unless this restore's mover
+/// uses the `snapshot` variant (every other shape needs no Snapshot CR read).
+///
+/// - `source.snapshotRef` reads the referenced `Snapshot` CR directly (mirrors
+///   [`restore_source_anchor`]) and hands back its `status.recorded` — possibly
+///   absent, which the resolver turns into the actionable hold (or a reported
+///   `Fallback` when the explicit context pins an identity).
+/// - `source.fromPolicy`/`source.identity` run the CR-catalog search
+///   ([`select_recorded_source`]): derive the kopia identity triple (fromPolicy:
+///   re-resolved from the LIVE SnapshotPolicy exactly like source resolution;
+///   identity: the user-supplied triple), LIST the Snapshot CRs where that source's
+///   rows live, and pick the recorded-carrying row honoring
+///   `asOf`/`offset`/`snapshotID`. This is what makes the GitOps re-bootstrap
+///   declarative: apply Repository + SnapshotPolicy + Restore, and the restore
+///   resolves the moment the catalog scan materializes a discovered row.
+///
+/// Namespace choice for the search: fromPolicy rows live in the POLICY's namespace
+/// (schedules create Snapshots there, and the catalog materializes a discovered row
+/// in the namespace named by the identity's hostname — the policy namespace by
+/// construction); a raw `identity` source searches the Restore's own namespace (the
+/// renamed-cluster escape hatch restores into the namespace being rebuilt).
+///
+/// Every `Err(MissingDependency)` from here is a permanent-shaped hold the caller
+/// reports as `MissingRecordedIdentity` and requeues slowly.
+async fn snapshot_recorded_source(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+) -> Result<Option<io::SnapshotRecordedSource>> {
+    use kopiur_api::common::InheritSecurityContextFrom;
+    if !matches!(
+        restore
+            .spec
+            .mover
+            .as_ref()
+            .and_then(|m| m.inherit_security_context_from.as_ref()),
+        Some(InheritSecurityContextFrom::Snapshot(_))
+    ) {
+        return Ok(None);
+    }
+    // Exhaustive over the source: each arm must state how recorded meta is found.
+    match &restore.spec.source {
+        RestoreSource::SnapshotRef(r) => {
+            let ns = r.namespace.as_deref().unwrap_or(namespace);
+            let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
+            let snap = api.get_opt(&r.name).await?.ok_or_else(|| {
+                Error::MissingDependency(format!(
+                    "snapshotRef Snapshot `{ns}/{}` not found — if this cluster was \
+                     re-bootstrapped, the catalog scan materializes discovered/adopted \
+                     rows; the Restore holds until it appears. (Or use source.fromPolicy/\
+                     identity, which search the catalog by identity instead of by name.)",
+                    r.name
+                ))
+            })?;
+            Ok(Some(io::SnapshotRecordedSource {
+                snapshot: format!("{ns}/{}", r.name),
+                meta: snap.status.as_ref().and_then(|s| s.recorded.clone()),
+            }))
+        }
+        RestoreSource::FromPolicy(c) => {
+            use kopiur_api::SnapshotPolicy;
+            let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
+            let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
+            let config = cfg_api.get_opt(&c.name).await?.ok_or_else(|| {
+                Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", c.name))
+            })?;
+            let repo = resolve_restore_repository(ctx, restore, namespace).await?;
+            let triple = crate::snapshot_policy::config_identity(
+                &config,
+                cfg_ns,
+                repo.identity_defaults.as_ref(),
+            )?;
+            search_recorded_source(ctx, cfg_ns, &triple, c.as_of.as_deref(), c.offset, None)
+                .await
+                .map(Some)
+        }
+        RestoreSource::Identity(id) => {
+            let triple = kopiur_api::common::ResolvedIdentity {
+                username: id.username.clone(),
+                hostname: id.hostname.clone(),
+                source_path: id.source_path.clone(),
+            };
+            search_recorded_source(
+                ctx,
+                namespace,
+                &triple,
+                id.as_of.as_deref(),
+                id.offset.unwrap_or(0),
+                id.snapshot_id.as_deref(),
+            )
+            .await
+            .map(Some)
+        }
+    }
+}
+
+/// LIST the namespace's Snapshot CRs and run the pure [`select_recorded_source`]
+/// over them; no match is the `MissingRecordedIdentity` hold (the scan may still be
+/// running). Thin IO wrapper so the selection semantics stay unit-tested.
+async fn search_recorded_source(
+    ctx: &Context,
+    ns: &str,
+    triple: &kopiur_api::common::ResolvedIdentity,
+    as_of: Option<&str>,
+    offset: i64,
+    snapshot_id: Option<&str>,
+) -> Result<io::SnapshotRecordedSource> {
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
+    let rows = api.list(&kube::api::ListParams::default()).await?.items;
+    // `asOf` was validated at admission with the same parser; re-parse defensively
+    // (an unparseable stored value degrades to "no cutoff" rather than erroring —
+    // the shared validator rejects it separately on the reconcile path).
+    let cutoff = as_of
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    let Some((name, meta)) = select_recorded_source(triple, cutoff, offset, snapshot_id, &rows)
+    else {
+        return Err(Error::MissingDependency(format!(
+            "no Snapshot CR carrying recorded identity (`status.recorded`) matches \
+             `{}@{}:{}` in namespace `{ns}` yet — the catalog scan may still be running \
+             (it materializes discovered rows and backfills recorded metadata when the \
+             kopia snapshot carries the `kopiur-meta` tag); the Restore holds until one \
+             appears",
+            triple.username,
+            triple.hostname,
+            triple.source_path.as_deref().unwrap_or("*"),
+        )));
+    };
+    Ok(io::SnapshotRecordedSource {
+        snapshot: format!("{ns}/{name}"),
+        meta: Some(meta),
+    })
+}
+
+/// §3.6 CR-catalog search, pure: pick the `Snapshot` CR whose recorded identity a
+/// `fromPolicy`/`identity` restore should inherit.
+///
+/// Candidates must match the kopia identity triple on `status.snapshot.identity`
+/// (username/hostname exact; a `sourcePath` in the triple must match exactly, an
+/// absent one matches any path — the same "absent matches any" the mover's own
+/// selector uses) and must carry `status.recorded` (a row without it cannot supply
+/// an identity — the backfill adds it when the kopia snapshot carries the tag).
+/// Discovered rows match too: identity comparison never touches `policyRef`.
+///
+/// Selection mirrors `kopiur_kopia::selection::{filter_as_of, pick_offset}` against
+/// `status.timing`: a `snapshotID` pins the exact row by
+/// `status.snapshot.kopiaSnapshotID` (admission forbids combining it with
+/// `asOf`/`offset`); otherwise candidates are ordered newest-first by timing
+/// (`endTime`, else `startTime`; undated rows sort last and are excluded under a
+/// cutoff, since membership cannot be proven), `asOf` keeps rows at-or-before the
+/// cutoff, and `offset` steps back from the newest (negative clamps to 0;
+/// out-of-range yields `None`).
+///
+/// Caveat (documented in `docs/restores.md`): the mover's OWN selection under
+/// `asOf` runs against the live repository listing, so it can pick a different
+/// manifest of the same source than this CR-side match — identity metadata is
+/// per-source in practice, so the divergence is cosmetic.
+fn select_recorded_source(
+    triple: &kopiur_api::common::ResolvedIdentity,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    offset: i64,
+    snapshot_id: Option<&str>,
+    rows: &[Snapshot],
+) -> Option<(String, kopiur_api::recorded::RecordedSnapshotMeta)> {
+    let identity_matches = |row: &kopiur_api::snapshot::SnapshotInfo| {
+        row.identity.username == triple.username
+            && row.identity.hostname == triple.hostname
+            && match &triple.source_path {
+                Some(p) => row.identity.source_path.as_deref() == Some(p.as_str()),
+                None => true,
+            }
+    };
+    // A row's selection timestamp: timing endTime, else startTime (RFC3339).
+    let row_time = |snap: &Snapshot| -> Option<chrono::DateTime<chrono::Utc>> {
+        let timing = snap.status.as_ref()?.timing.as_ref()?;
+        let raw = timing
+            .end_time
+            .as_deref()
+            .or(timing.start_time.as_deref())?;
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let mut candidates: Vec<(&Snapshot, Option<chrono::DateTime<chrono::Utc>>)> = rows
+        .iter()
+        .filter(|snap| {
+            let Some(status) = snap.status.as_ref() else {
+                return false;
+            };
+            status.recorded.is_some() && status.snapshot.as_ref().is_some_and(&identity_matches)
+        })
+        .map(|snap| (snap, row_time(snap)))
+        .collect();
+
+    let pick = |snap: &Snapshot| {
+        let status = snap.status.as_ref()?;
+        Some((snap.name_any(), status.recorded.clone()?))
+    };
+
+    if let Some(id) = snapshot_id {
+        // An exact pin: `asOf`/`offset` are admission-rejected alongside it.
+        return candidates
+            .iter()
+            .find(|(snap, _)| {
+                snap.status
+                    .as_ref()
+                    .and_then(|s| s.snapshot.as_ref())
+                    .is_some_and(|s| s.kopia_snapshot_id == id)
+            })
+            .and_then(|(snap, _)| pick(snap));
+    }
+    if let Some(cutoff) = as_of {
+        // Undated rows cannot prove "at or before the cutoff" — exclude them.
+        candidates.retain(|(_, t)| t.is_some_and(|t| t <= cutoff));
+    }
+    // Newest-first; undated rows last; name as the deterministic tie-break.
+    candidates.sort_by(|(a, ta), (b, tb)| tb.cmp(ta).then_with(|| a.name_any().cmp(&b.name_any())));
+    let idx = usize::try_from(offset.max(0)).ok()?;
+    candidates.get(idx).and_then(|(snap, _)| pick(snap))
 }
 
 /// Best-effort, **positive-only** restore-direction securityContext check. If a pod already

@@ -1,5 +1,6 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
+assertion_line: 30
 expression: "body(&artifacts, \"snapshots\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -117,7 +118,13 @@ spec:
               tags:
                 additionalProperties:
                   type: string
-                description: 'Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`).'
+                description: |-
+                  Free-form tags attached to the kopia snapshot manifest itself
+                  (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the
+                  repository, independent of this CR. Keys must be non-empty, colon-free
+                  (kopia splits on the first colon), and must not start with the reserved
+                  `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes
+                  (webhook-enforced).
                 nullable: true
                 type: object
             type: object
@@ -275,6 +282,60 @@ spec:
                   so a later failing episode gets a fresh budget rather than a stale anchor.
                 nullable: true
                 type: string
+              recorded:
+                description: |-
+                  The mover identity recorded on the kopia snapshot itself (the
+                  `kopiur-meta` tag): the resolved effective uid/gid/fsGroup the backup ran
+                  as, plus its provenance. Produced runs stamp this at launch (from the
+                  same value written into the tag); discovered rows decode it from the tag
+                  during the catalog scan. Absent for pre-feature snapshots, foreign
+                  backups without the tag, or a tag this operator version cannot decode.
+                nullable: true
+                properties:
+                  fsGroup:
+                    description: |-
+                      The resolved pod-level `fsGroup` the mover ran with (the hardened
+                      default is `65532`). Absent = no layer set one.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  gid:
+                    description: |-
+                      The resolved effective `runAsGroup` the mover ran as at backup time
+                      (container `runAsGroup`, else pod). Absent = image-determined.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  schema:
+                    description: |-
+                      The `kopiur-meta` schema version this value was written under. Writers
+                      emit the lowest schema that represents the data (currently
+                      [`KOPIUR_META_SCHEMA_V1`]); readers reject only a schema NEWER than they
+                      understand (degrading to recorded-absent, never an error).
+                    format: int64
+                    type: integer
+                  src:
+                    description: |-
+                      Which layer pinned the recorded identity. Only `inherited` means the
+                      identity tracked the workload.
+                    enum:
+                    - inherited
+                    - explicit
+                    - defaults
+                    - unknown
+                    type: string
+                  uid:
+                    description: |-
+                      The resolved effective `runAsUser` the mover ran as at backup time
+                      (container `runAsUser`, else pod). Absent = no layer pinned a UID, so
+                      the mover's UID was image-determined.
+                    format: int64
+                    nullable: true
+                    type: integer
+                required:
+                - schema
+                - src
+                type: object
               resolved:
                 description: Frozen recipe values at run time (scheduled/manual).
                 nullable: true
@@ -337,6 +398,14 @@ spec:
                 description: The kopia artifact this CR represents.
                 nullable: true
                 properties:
+                  description:
+                    description: |-
+                      The kopia snapshot description (`snapshot create --description`), when
+                      one is recorded and non-empty. For discovered rows this is copied from
+                      the repository listing TRUNCATED to 1024 bytes (char-boundary-safe) —
+                      the value is foreign-writer-controlled and must never fail the CR write.
+                    nullable: true
+                    type: string
                   identity:
                     description: The `username@hostname:path` identity recorded for this snapshot.
                     properties:

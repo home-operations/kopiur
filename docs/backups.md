@@ -580,6 +580,33 @@ postgres-data-manual-x9f   Succeeded   manual   k1f1ec0a8   44s
 
 `ORIGIN` tells you where a `Snapshot` came from: `scheduled` (a `SnapshotSchedule`), `manual` (you / automation), or `discovered` (materialized from snapshots Kopiur didn't create — see [Restores → discovered](restores.md#restoring-a-snapshot-kopiur-didnt-create)).
 
+### `tags` — label the snapshot in the repository
+
+`spec.tags` attaches free-form `key: value` pairs to the kopia snapshot manifest itself (`kopia snapshot create --tags`), so they survive in the repository independently of the CR — visible to any kopia client and to other clusters sharing the repository:
+
+```yaml
+spec:
+    policyRef: { name: postgres-data }
+    tags:
+        reason: pre-upgrade
+        ticket: OPS-1234
+```
+
+/// warning | Tag keys are constrained (webhook-enforced)
+
+kopia splits each tag argument on the **first colon** to separate key from value, so a key containing `:` would be stored mangled — and can collide with Kopiur's own reserved tag, which makes kopia **fail the snapshot create** with a duplicate-tag error. The webhook therefore rejects tag keys that are empty, contain `:`, or start with the reserved prefix `kopiur`, and bounds the map to at most **10 tags**, keys ≤ **63** bytes, values ≤ **256** bytes (every tag is stored on the manifest and read back by every catalog scan). Tags on objects stored before these rules existed are skipped with a warning rather than failing the backup.
+
+///
+
+Kopiur reserves the `kopiur` key prefix for the tags it writes on every produced snapshot:
+
+| Tag (as passed to kopia)  | Stored manifest key/value                        | What it records                                                                                                                                                                                                                          |
+| ------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kopiur:config:<policy>`  | key `tag:kopiur`, value `config:<policy>`        | Which `SnapshotPolicy` produced the snapshot (kopia's first-colon split puts `config:<policy>` in the value — a long-standing shape existing tooling depends on).                                                                          |
+| `kopiur-meta: {…}`        | key `tag:kopiur-meta`, value compact JSON        | The **resolved mover identity** the backup ran as — `uid`/`gid` (absent = image-determined), pod `fsGroup`, and `src` (whether the identity was `inherited` from the workload, pinned by the recipe's `explicit` context, or came from `defaults`). |
+
+The `kopiur-meta` value is mirrored to `status.recorded` at launch, and the catalog scan decodes it back onto **discovered** rows (and backfills pre-existing rows that lack it) — so the identity your data expects survives cluster rebuilds with the repository itself. See [Security context](security-context.md) for how the identity is resolved.
+
 ### `deletionPolicy` — what happens to the snapshot
 
 A `Snapshot` CR **owns** its kopia snapshot via a finalizer. What happens to the snapshot when the CR is deleted is governed by `deletionPolicy`:

@@ -61,6 +61,10 @@ fn snapshot_from_result(r: &SnapshotCreateResult) -> SnapshotInfo {
             hostname: r.source.host.clone(),
             source_path: Some(r.source.path.clone()),
         },
+        // Surface the kopia description (`snapshot create --description`) so a
+        // produced run's `status.snapshot.description` reflects what was stored.
+        // Empty = none recorded = elided from the PATCH.
+        description: (!r.description.is_empty()).then(|| r.description.clone()),
     }
 }
 
@@ -1004,6 +1008,26 @@ mod tests {
         assert_eq!(u.stats.as_ref().unwrap().files_failed, None);
         assert!(u.timing.is_some());
         assert!(u.failure.is_none());
+        // No description recorded → the field is elided from the PATCH entirely.
+        assert!(snap.description.is_none());
+        assert!(body["status"]["snapshot"].get("description").is_none());
+    }
+
+    #[test]
+    fn succeeded_backup_surfaces_the_kopia_description() {
+        // `snapshot create --description` comes back on the create result; the
+        // status PATCH must carry it under the CRD's `status.snapshot.description`.
+        let json = r#"{
+            "id":"snap3","source":{"host":"h","userName":"u","path":"/p"},
+            "description":"pre-upgrade snapshot",
+            "startTime":"2026-06-02T03:13:59Z","endTime":"2026-06-02T03:14:00Z"
+        }"#;
+        let r: SnapshotCreateResult = serde_json::from_str(json).unwrap();
+        let u = StatusUpdate::succeeded_backup(&r, ts());
+        assert_eq!(
+            u.as_patch_body()["status"]["snapshot"]["description"],
+            "pre-upgrade snapshot"
+        );
     }
 
     #[test]
@@ -1044,6 +1068,7 @@ mod tests {
                 hostname: "home".into(),
                 source_path: Some("/pvc/wyoming-whisper".into()),
             },
+            description: None,
         };
         let u = StatusUpdate::succeeded_pin(info, ts());
         assert_eq!(u.phase.as_deref(), Some("Succeeded"));

@@ -924,6 +924,10 @@ async fn resolve_pinned_info(
             hostname: entry.source.host.clone(),
             source_path: Some(entry.source.path.clone()),
         },
+        // The pin restamp deliberately touches only id + identity; an absent
+        // description is elided from the Merge PATCH, so the create-time value
+        // (if any) is left untouched.
+        description: None,
     })
 }
 

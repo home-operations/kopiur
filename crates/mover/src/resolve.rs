@@ -132,6 +132,7 @@ mod tests {
             stats: Default::default(),
             root_entry: None,
             retention_reason: vec![],
+            tags: Default::default(),
         }
     }
 

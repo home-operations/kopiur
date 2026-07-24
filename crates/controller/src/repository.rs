@@ -1866,6 +1866,7 @@ mod tests {
             stats: SnapshotStats::default(),
             root_entry: None,
             retention_reason: vec![],
+            tags: Default::default(),
         }
     }
 

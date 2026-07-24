@@ -56,6 +56,17 @@ pub enum Error {
     #[error("blocked on an out-of-band grant: {0}")]
     BlockedOnGrant(String),
 
+    /// A restore's `inheritSecurityContextFrom.snapshot` cannot resolve a
+    /// recorded identity yet: the referenced `Snapshot` CR is missing, carries
+    /// no `status.recorded`, or no CR matching the source identity exists (the
+    /// catalog scan may still be running). Permanent-*shaped* — it clears only
+    /// when the scan lands, the status is backfilled, or the spec changes — so
+    /// it holds on the slow structural cadence (300s) instead of hot-looping;
+    /// the restore reconciler writes the `MissingRecordedIdentity` condition +
+    /// Warning Event before returning this, so the hold is never silent.
+    #[error("missing recorded identity: {0}")]
+    MissingRecordedIdentity(String),
+
     /// JSON (de)serialization of a spec/status/work-spec failed. Structural.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -160,6 +171,7 @@ impl Error {
             }
             Error::Validation(_)
             | Error::BlockedOnGrant(_)
+            | Error::MissingRecordedIdentity(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -184,6 +196,7 @@ impl Error {
             | Error::Validation(_)
             | Error::MissingDependency(_)
             | Error::BlockedOnGrant(_)
+            | Error::MissingRecordedIdentity(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -347,6 +360,21 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Structural);
         assert!(err.to_string().contains("out-of-band grant"));
         assert!(err.to_string().contains("namespace `app` has not opted in"));
+    }
+
+    #[test]
+    fn missing_recorded_identity_is_structural_not_a_hot_loop() {
+        // The `inheritSecurityContextFrom.snapshot` hold is permanent-shaped (it
+        // clears when the catalog scan lands or the spec changes), so it must
+        // requeue on the slow structural cadence (300s), never the fast transient
+        // one — the reconciler already wrote the condition + Event.
+        let err = Error::MissingRecordedIdentity(
+            "Snapshot `app/pg-b1` carries no recorded identity".into(),
+        );
+        assert_eq!(err.class(), ErrorClass::Structural);
+        assert!(err.to_string().contains("missing recorded identity"));
+        assert!(err.to_string().contains("app/pg-b1"));
+        assert!(!err.event_publish_futile());
     }
 
     #[test]

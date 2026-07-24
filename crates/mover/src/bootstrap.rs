@@ -10,9 +10,13 @@
 //! This module is **pure data + serde** plus the create-gate decision; the kopia
 //! subprocess calls and the kube `ConfigMap` PATCH live in `main.rs`.
 
+use kopiur_api::recorded::{
+    KOPIUR_META_TAG, MetaTagDecode, decode_meta_tag, encode_meta_tag, truncate_utf8,
+};
 use kopiur_api::{HostClass, classify_hostname};
 use kopiur_kopia::{KopiaError, KopiaErrorClass, SnapshotListEntry};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::status::{FailureBlock, failure_block_from_kopia};
 
@@ -79,28 +83,78 @@ pub fn prepare_catalog_entries(
     }
     // Slim each returned entry to only the fields the controller materializes.
     // The prefilter above needed `source.host`; nothing downstream needs the
-    // heavy `rootEntry`/`retentionReason`/`description`, so drop them here — this
-    // is what actually bounds the result ConfigMap size (see [`slim_catalog_entry`]).
+    // heavy `rootEntry`/`retentionReason`, so drop them here — this is what
+    // actually bounds the result ConfigMap size (see [`slim_catalog_entry`]).
     let listing = listing.into_iter().map(slim_catalog_entry).collect();
     (listing, truncated, dropped)
 }
 
+/// Byte cap on the `description` a returned entry carries on the result wire —
+/// the same cap the controller applies when copying it onto the CR
+/// (`catalog::DESCRIPTION_CAP_BYTES`), so the wire never carries bytes the CR
+/// would drop anyway. Foreign-writer-controlled input.
+pub const DESCRIPTION_WIRE_CAP_BYTES: usize = 1024;
+
+/// Byte cap on an UNDECODABLE `kopiur-meta` value carried bounded-verbatim on
+/// the wire (see [`normalize_meta_tags`]) so the controller can re-derive the
+/// UnsupportedSchema/Malformed classification and aggregate-count it, without a
+/// forged multi-MB tag inflating the ConfigMap.
+const META_TAG_WIRE_CAP_BYTES: usize = 4096;
+
 /// Strip the fields the controller never reads from a materialization entry,
-/// keeping only what `catalog::materialize_discovered` consumes (`id`, `source`,
-/// `startTime`, `endTime`, and `stats.totalSize`). Pure.
+/// keeping only what the catalog consumes (`id`, `source`, `startTime`,
+/// `endTime`, `stats.totalSize`, a CAPPED `description`, and the normalized
+/// `kopiur-meta` tag). Pure.
 ///
 /// This is what actually bounds the result `ConfigMap` under etcd's ~1 MiB object
 /// limit (issue #237): [`MAX_RETURNED_SNAPSHOTS`] caps the *count*, but a full
 /// [`SnapshotListEntry`] serializes to ~2 KB — its `rootEntry.summ` carries an
-/// **unbounded** per-file `errors` list, plus a `retentionReason` array and a
-/// free-form `description` — so ~500 real-world entries already blow past 1 MiB and
-/// wedge the repository at `Bootstrapped: False`. Slimmed, each entry is a few
-/// hundred bytes, so the 1000-entry cap is genuinely size-safe.
+/// **unbounded** per-file `errors` list, plus a `retentionReason` array, a
+/// free-form `description`, and (foreign-writer-controlled) `tags` — so ~500
+/// real-world entries already blow past 1 MiB and wedge the repository at
+/// `Bootstrapped: False`. Slimmed, each entry is a few hundred bytes (+ a
+/// bounded description/meta payload), so the 1000-entry cap is size-safe.
 fn slim_catalog_entry(mut e: SnapshotListEntry) -> SnapshotListEntry {
-    e.description = String::new();
+    if e.description.len() > DESCRIPTION_WIRE_CAP_BYTES {
+        e.description = truncate_utf8(&e.description, DESCRIPTION_WIRE_CAP_BYTES).to_string();
+    }
     e.root_entry = None;
     e.retention_reason = Vec::new();
+    e.tags = normalize_meta_tags(&e.tags);
     e
+}
+
+/// Normalize a raw manifest `tags` map for the result wire: raw user tags never
+/// ride the ConfigMap — only the `kopiur-meta` payload survives, O(1) per entry.
+///
+/// - Decodable meta is RE-ENCODED canonically under the bare [`KOPIUR_META_TAG`]
+///   key (compact, bounded by construction), which
+///   [`kopiur_api::decode_meta_tag`] accepts on the controller side exactly like
+///   the raw `tag:`-prefixed key an in-process listing carries — one decoder,
+///   two wires.
+/// - An undecodable value (newer schema / malformed) rides bounded-verbatim
+///   ([`META_TAG_WIRE_CAP_BYTES`]) so the controller re-derives the same
+///   classification and aggregate-counts it in its scan summary.
+/// - Everything else (user tags, the legacy `tag:kopiur` config tag) is
+///   dropped: the catalog never reads them, and they are unbounded input.
+fn normalize_meta_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    match decode_meta_tag(tags) {
+        MetaTagDecode::Absent => BTreeMap::new(),
+        MetaTagDecode::Decoded(meta) => {
+            BTreeMap::from([(KOPIUR_META_TAG.to_string(), encode_meta_tag(&meta))])
+        }
+        MetaTagDecode::UnsupportedSchema { .. } | MetaTagDecode::Malformed { .. } => {
+            let raw = tags
+                .get(&format!("tag:{KOPIUR_META_TAG}"))
+                .or_else(|| tags.get(KOPIUR_META_TAG))
+                .map(String::as_str)
+                .unwrap_or_default();
+            BTreeMap::from([(
+                KOPIUR_META_TAG.to_string(),
+                truncate_utf8(raw, META_TAG_WIRE_CAP_BYTES).to_string(),
+            )])
+        }
+    }
 }
 
 /// Conservative byte budget for the serialized `result.json` value the mover
@@ -486,6 +540,7 @@ mod tests {
             stats: kopiur_kopia::SnapshotStats::default(),
             root_entry: None,
             retention_reason: vec![],
+            tags: Default::default(),
         }
     }
 
@@ -594,6 +649,16 @@ mod tests {
                 }),
             }),
             retention_reason: vec!["latest-1".into(), "daily-1".into(), "weekly-1".into()],
+            // Raw manifest tags: the reserved config tag, the kopiur-meta
+            // payload, and an unbounded user tag — only the meta may survive.
+            tags: BTreeMap::from([
+                ("tag:kopiur".to_string(), "config:nightly".to_string()),
+                (
+                    "tag:kopiur-meta".to_string(),
+                    r#"{"schema":1,"src":"explicit","uid":3001,"extra":true}"#.to_string(),
+                ),
+                ("tag:team".to_string(), "x".repeat(4096)),
+            ]),
         }
     }
 
@@ -603,14 +668,70 @@ mod tests {
         // Dropped (never read by the controller).
         assert!(slim.root_entry.is_none());
         assert!(slim.retention_reason.is_empty());
-        assert!(slim.description.is_empty());
-        // Preserved (materialize_discovered reads exactly these).
+        // Preserved (the catalog reads exactly these).
         assert_eq!(slim.id, "k1");
         assert_eq!(
             slim.source.identity(),
             "app-config@some-namespace:/pvc/app-config"
         );
         assert_eq!(slim.stats.total_size, 4096);
+        // The description rides CAPPED (the catalog copies it onto the CR).
+        assert_eq!(
+            slim.description,
+            "a fairly wordy free-form snapshot description that nobody reads"
+        );
+        // Tags are normalized: ONLY the canonical kopiur-meta payload survives —
+        // raw user tags and the legacy config tag never ride the wire.
+        assert_eq!(slim.tags.len(), 1, "{:?}", slim.tags);
+        assert_eq!(
+            slim.tags.get(KOPIUR_META_TAG).map(String::as_str),
+            Some(r#"{"schema":1,"src":"explicit","uid":3001}"#),
+            "canonical re-encode (unknown extras dropped, key bare)"
+        );
+    }
+
+    #[test]
+    fn slim_catalog_entry_caps_a_foreign_sized_description() {
+        let mut e = fat_entry("k1");
+        e.description = "é".repeat(DESCRIPTION_WIRE_CAP_BYTES); // 2 bytes/char
+        let slim = slim_catalog_entry(e);
+        assert!(slim.description.len() <= DESCRIPTION_WIRE_CAP_BYTES);
+        assert!(slim.description.is_char_boundary(slim.description.len()));
+    }
+
+    #[test]
+    fn normalize_meta_tags_keeps_undecodable_values_bounded_verbatim() {
+        // A newer schema must reach the controller intact so it classifies
+        // UnsupportedSchema (and counts it) — normalization must not eat it.
+        let newer = BTreeMap::from([(
+            "tag:kopiur-meta".to_string(),
+            r#"{"schema":2,"src":"quantum","qbit":1}"#.to_string(),
+        )]);
+        let out = normalize_meta_tags(&newer);
+        assert_eq!(
+            out.get(KOPIUR_META_TAG).map(String::as_str),
+            Some(r#"{"schema":2,"src":"quantum","qbit":1}"#)
+        );
+        assert!(matches!(
+            decode_meta_tag(&out),
+            MetaTagDecode::UnsupportedSchema { schema: 2 }
+        ));
+
+        // A forged multi-MB malformed value is truncated to the wire cap.
+        let forged = BTreeMap::from([(
+            "tag:kopiur-meta".to_string(),
+            format!("{{{}", "x".repeat(1_000_000)),
+        )]);
+        let out = normalize_meta_tags(&forged);
+        assert!(out.get(KOPIUR_META_TAG).unwrap().len() <= META_TAG_WIRE_CAP_BYTES);
+        assert!(matches!(
+            decode_meta_tag(&out),
+            MetaTagDecode::Malformed { .. }
+        ));
+
+        // No meta at all → an EMPTY map (no `kopiur-meta` key minted from nothing).
+        let none = BTreeMap::from([("tag:team".to_string(), "billing".to_string())]);
+        assert!(normalize_meta_tags(&none).is_empty());
     }
 
     #[test]

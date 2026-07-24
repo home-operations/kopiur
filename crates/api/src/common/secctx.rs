@@ -65,6 +65,66 @@ pub fn effective_run_as_user(
         .or_else(|| psc.and_then(|p| p.run_as_user))
 }
 
+/// The **effective** `runAsGroup` following kubelet precedence — the gid peer of
+/// [`effective_run_as_user`]: container `securityContext.runAsGroup` if set, else the
+/// pod one. `None` when neither pins a group (image-determined).
+pub fn effective_run_as_group(
+    sc: Option<&SecurityContext>,
+    psc: Option<&PodSecurityContext>,
+) -> Option<i64> {
+    sc.and_then(|s| s.run_as_group)
+        .or_else(|| psc.and_then(|p| p.run_as_group))
+}
+
+/// THE layer merge: overlay one `(container, pod)` security-context layer pair onto
+/// another. Every layer fold — `resolve_mover`'s `hardened ⊂ moverDefaults ⊂ recipe`
+/// and the controller's `inherited ⊂ explicit` pre-fold — MUST go through this
+/// function; a lone per-dimension [`merge_security_context`]/[`merge_pod_security_context`]
+/// reintroduces cross-dimension identity shadowing.
+///
+/// Two steps:
+/// 1. Field-wise merge per dimension (the exhaustive-literal primitives above).
+/// 2. **Identity promotion to canonical form**: the kubelet resolves the effective
+///    UID/GID as `container ?? pod` ACROSS the two dimensions, so a lower layer's
+///    container-level `runAsUser` would silently shadow a higher layer's pod-level one —
+///    inverting the layer ladder (the matter-server bug). The merged pair therefore
+///    keeps its container context, when one exists, carrying the pair's **effective**
+///    UID/GID: the `over` layer's pinned identity wins, else the base's (hoisted from
+///    the pod level when that's where the winning layer wrote it). When no layer
+///    supplied a container context there is nothing to shadow, and the field-wise pod
+///    result already carries the `over` layer's identity.
+///
+/// The canonical form is what makes the merge **associative** (so the controller's
+/// pre-fold + `resolve_mover`'s fold equals a flat four-layer merge): with `E(L)` =
+/// layer `L`'s own effective UID, the merged container `runAsUser` is exactly
+/// `E(over).or(E(base))`, so any grouping of `hardened ⊂ moverDefaults ⊂ inherited ⊂
+/// explicit` resolves the identity of the **highest layer that pins one**. (A promotion
+/// keyed only on `over`'s own identity is NOT associative: once `over` is itself a
+/// merged pair, its pod-level identity — contributed by a lower layer — would be
+/// re-promoted in one grouping and not the other.) Identically for the GID. Within a
+/// single layer, container still beats pod — exactly the kubelet's own rule.
+pub fn merge_context_pair(
+    base_sc: Option<&SecurityContext>,
+    base_psc: Option<&PodSecurityContext>,
+    over_sc: Option<&SecurityContext>,
+    over_psc: Option<&PodSecurityContext>,
+) -> (Option<SecurityContext>, Option<PodSecurityContext>) {
+    let mut sc = merge_security_context_opt(base_sc, over_sc);
+    let psc = merge_pod_security_context_opt(base_psc, over_psc);
+    if let Some(merged) = sc.as_mut() {
+        // `E(over).or(E(base))`: `merged.run_as_user` already holds
+        // `over.sc.or(base.sc)`, so overriding with `E(over)` and falling through to
+        // the merged pod value yields `over.sc.or(over.psc).or(base.sc).or(base.psc)`.
+        merged.run_as_user = effective_run_as_user(over_sc, over_psc)
+            .or(merged.run_as_user)
+            .or_else(|| psc.as_ref().and_then(|p| p.run_as_user));
+        merged.run_as_group = effective_run_as_group(over_sc, over_psc)
+            .or(merged.run_as_group)
+            .or_else(|| psc.as_ref().and_then(|p| p.run_as_group));
+    }
+    (sc, psc)
+}
+
 /// The restricted-PSA-compatible **hardened** container security context (§4.11/G16):
 /// non-root, no privilege escalation, drop ALL caps, seccomp `RuntimeDefault`.
 ///

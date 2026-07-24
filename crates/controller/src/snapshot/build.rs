@@ -110,7 +110,7 @@ pub(super) fn build_backup_run(
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
             source_path: source_path.clone(),
-            tags: tags_for(config),
+            tags: tags_for(backup, config),
             // Flattened SnapshotPolicy policy knobs → kopia `policy set` flags
             // (compression / files / errorHandling / upload / extraArgs). Wired so
             // these never stay inert (ADR-0005 §13(b)/§13(f), ADR-0004 §4b).
@@ -292,11 +292,121 @@ pub(super) fn repository_not_ready_message(repo_name: &str) -> String {
     )
 }
 
-/// Snapshot tags from the config + run metadata.
-fn tags_for(config: &SnapshotPolicy) -> BTreeMap<String, String> {
+/// Snapshot tags for a run: the user's `Snapshot.spec.tags` (invalid keys
+/// defensively SKIPPED with a warning — a stored pre-validator object must
+/// never fail its backup over a tag), then the reserved operator tags inserted
+/// LAST so they always win. Admission ([`kopiur_api::validate::validate_snapshot_tags`])
+/// rejects the same keys on new objects; this skip is the defensive layer for
+/// already-persisted ones.
+pub(super) fn tags_for(backup: &Snapshot, config: &SnapshotPolicy) -> BTreeMap<String, String> {
     let mut tags = BTreeMap::new();
+    if let Some(user) = &backup.spec.tags {
+        for (key, value) in user {
+            if tags.len() >= kopiur_api::validate::MAX_SNAPSHOT_TAGS {
+                tracing::warn!(
+                    backup = %backup.name_any(),
+                    dropped = user.len() - tags.len(),
+                    "Snapshot.spec.tags exceeds the {} tag bound; the remainder is skipped",
+                    kopiur_api::validate::MAX_SNAPSHOT_TAGS
+                );
+                break;
+            }
+            match kopiur_api::validate::snapshot_tag_error(key, value) {
+                None => {
+                    tags.insert(key.clone(), value.clone());
+                }
+                Some(reason) => tracing::warn!(
+                    backup = %backup.name_any(),
+                    tag = %key,
+                    "skipping invalid Snapshot.spec.tags entry (stored pre-validation): {reason}"
+                ),
+            }
+        }
+    }
+    // Reserved operator tags go in LAST so they always win over user tags.
+    // The legacy CLI string `kopiur:config:<name>` keeps being written
+    // byte-for-byte (kopia stores it as manifest key `tag:kopiur`, value
+    // `config:<name>` — the first-colon split); tooling depends on that shape.
     tags.insert("kopiur:config".to_string(), config.name_any());
     tags
+}
+
+/// The metadata recorded on the kopia snapshot (the `kopiur-meta` tag) for one
+/// run: the RESOLVED effective mover identity plus its provenance. Pure — the
+/// same value feeds both the tag and the launch `status.recorded` patch, so the
+/// two can never diverge.
+///
+/// `src` derivation:
+/// - `Inherited` iff the inherited layer pinned an identity with a concrete UID
+///   AND that UID survived the merge as the resolved effective UID — only then
+///   did the identity actually track the workload.
+/// - else `Explicit` iff the recipe's explicit `mover.securityContext`/
+///   `podSecurityContext` pins the winning effective UID (this covers the
+///   inherit-Fallback-proceeded-on-explicit case).
+/// - else `Defaults` (moverDefaults/hardened pinned it, or nothing did — then
+///   `uid` is `None` and the mover's UID was image-determined).
+pub(super) fn recorded_meta(
+    resolved: &kopiur_api::common::ResolvedMover,
+    outcome: &crate::io::InheritOutcome,
+    explicit: Option<&kopiur_api::common::MoverSpec>,
+) -> kopiur_api::RecordedSnapshotMeta {
+    use crate::io::InheritOutcome;
+    use kopiur_api::common::{effective_run_as_group, effective_run_as_user};
+    use kopiur_api::{KOPIUR_META_SCHEMA_V1, RecordedSnapshotMeta, RecordedSrc};
+
+    let uid = effective_run_as_user(
+        Some(&resolved.security_context),
+        resolved.pod_security_context.as_ref(),
+    );
+    let gid = effective_run_as_group(
+        Some(&resolved.security_context),
+        resolved.pod_security_context.as_ref(),
+    );
+    let fs_group = resolved
+        .pod_security_context
+        .as_ref()
+        .and_then(|p| p.fs_group);
+
+    // Did the inherited layer's own pinned UID survive as the resolved one?
+    // Exhaustive over the outcome so a new variant must be classified here.
+    let inherited_won = match outcome {
+        InheritOutcome::Inherited {
+            pins_identity: true,
+            uid: Some(u),
+            ..
+        } => uid == Some(*u),
+        InheritOutcome::Inherited { .. }
+        | InheritOutcome::Fallback { .. }
+        | InheritOutcome::NotRequested => false,
+        // Restore-only outcome (`inheritSecurityContextFrom.snapshot`); a backup —
+        // the only producer of recorded metadata — can never carry it (the variant
+        // is admission-rejected on SnapshotPolicy). Classified defensively as
+        // not-workload-tracked: replaying a recorded identity is NOT reading the
+        // live workload, so it must never be re-recorded as `src: inherited`.
+        InheritOutcome::InheritedFromSnapshot { .. } => false,
+    };
+    // Does the recipe's explicit context pin the winning effective UID? Covers
+    // the Fallback-proceeded-on-explicit case (the explicit context IS the run's
+    // identity source then).
+    let explicit_uid = explicit.and_then(|m| {
+        effective_run_as_user(m.security_context.as_ref(), m.pod_security_context.as_ref())
+    });
+    let explicit_won = explicit_uid.is_some() && explicit_uid == uid;
+
+    let src = if inherited_won {
+        RecordedSrc::Inherited
+    } else if explicit_won {
+        RecordedSrc::Explicit
+    } else {
+        RecordedSrc::Defaults
+    };
+    RecordedSnapshotMeta {
+        schema: KOPIUR_META_SCHEMA_V1,
+        src,
+        uid,
+        gid,
+        fs_group,
+    }
 }
 
 /// Resolve the kopia `policy set` knobs the mover applies before snapshotting

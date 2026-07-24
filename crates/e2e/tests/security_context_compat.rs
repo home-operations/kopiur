@@ -16,6 +16,10 @@
 //!   6. `sources[].readOnly: false` (#254) reaches BOTH the pod's PVC volume source and the
 //!      container volumeMount — the kubelet needs both false before it will apply `fsGroup` —
 //!      and `copyMethod: Direct` without `acknowledgeLiveMutation` is denied at admission.
+//!   7. A `moverDefaults.securityContext.runAsUser` (container level) cannot shadow a
+//!      workload uid inherited from the POD level — the mover runs as the workload's uid and
+//!      reports `InheritApplied`. **The regression guard for the cross-dimension
+//!      shadowing bug (the matter-server report).**
 //!
 //! Why these are e2e rather than unit tests: the defect behind (3) was not in the compat
 //! engine — that engine was always right — but in the controller never *calling* it. Only a
@@ -33,6 +37,12 @@
 //! lingering pod leaks its UID into the next scenario's verdict.
 
 #![cfg(all(unix, feature = "e2e"))]
+
+// Shared ADR-0004/0005 helpers — used here for the ISOLATED per-scenario repo fixtures
+// (`common::ensure_repo` + `common::repository_json`). Scenario (g) must NOT share this
+// file's common `/repo` PVC: its `moverDefaults` pins uid 1000, and a repo bootstrapped
+// by one uid poisons the shared kopia repo (0600 control files) for every 65532 sibling.
+mod common;
 
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
@@ -722,6 +732,183 @@ async fn inherit_plus_explicit_merges_with_explicit_winning_and_says_so() {
         "e2e-scc-ovr-consumer",
     )
     .await;
+}
+
+/// Scenario (g) — **the moverDefaults-shadowing regression (the matter-server report).**
+/// The workload pins root ONLY at the pod level (`spec.securityContext.runAsUser: 0`, no
+/// container-level context); the Repository's `moverDefaults.securityContext` pins uid 1000
+/// at the container level. The inherited identity is the higher merge layer and must win:
+/// the mover Job runs as uid 0 (with `runAsNonRoot` cleared by INV-1, since
+/// `runAsNonRoot: true` + uid 0 is a kubelet-rejected contradiction) and inheritance reports
+/// the healthy `InheritApplied`. Pre-fix, the moverDefaults container value shadowed the
+/// inherited pod-level uid across dimensions (the kubelet's `container ?? pod` rule), the
+/// mover silently ran as 1000, and the condition blamed moverDefaults "by design".
+///
+/// A root mover needs the privileged-movers namespace opt-in, so this scenario annotates the
+/// e2e namespace up front and removes the annotation in cleanup. No sibling in this file
+/// asserts gate-refusal behavior, so the temporary opt-in cannot change their outcomes.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn moverdefaults_uid_cannot_shadow_an_inherited_pod_level_root() {
+    use kube::api::{Patch, PatchParams};
+
+    const PRIVILEGED_ANNOTATION: &str = "kopiur.home-operations.com/privileged-movers";
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    kopiur_e2e::annotate_namespace(&client, E2E_NAMESPACE, PRIVILEGED_ANNOTATION, "true")
+        .await
+        .expect("annotate namespace for privileged movers");
+
+    // PRECONDITION: no leftover consumer on `e2e-src`. pvcConsumer picks Running-first
+    // then by name, and a lingering sibling pod (they all sort before
+    // `e2e-scc-shadow-consumer`) would displace this scenario's pod as the inherit
+    // source, turning the assertions below into noise about the wrong workload.
+    wait_no_consumer_of_source(&client).await;
+
+    // The matter-server shape: identity pinned ONLY at the pod level, container context absent.
+    let workload = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "e2e-scc-shadow-consumer",
+            "namespace": E2E_NAMESPACE,
+            "labels": { "app": "e2e-scc-shadow-consumer" }
+        },
+        "spec": {
+            "securityContext": { "runAsUser": 0, "runAsGroup": 0 },
+            "containers": [{
+                "name": "app",
+                "image": "registry.k8s.io/pause:3.9",
+                "volumeMounts": [{ "name": "src", "mountPath": "/data" }]
+            }],
+            "volumes": [{ "name": "src", "persistentVolumeClaim": { "claimName": "e2e-src" } }]
+        }
+    });
+    pods.create(&PostParams::default(), &cr(workload))
+        .await
+        .expect("create pod-level-root workload pod");
+    wait_pod_running(&pods, "e2e-scc-shadow-consumer").await;
+
+    // The reported repository shape: moverDefaults pins uid/gid 1000 at the container
+    // level. Over an ISOLATED repo dir (`scc-shadow`) — not this file's shared `/repo`
+    // PVC — because every mover of THIS repository (bootstrap included) runs as 1000,
+    // and a kopia repo's 0600 control files are only readable by the uid that wrote
+    // them: pointing this at the shared repo would poison it for the 65532 siblings
+    // (and their 65532-owned files would fail this repo's bootstrap right back).
+    common::ensure_repo(&client, "scc-shadow").await;
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(common::repository_json(
+                "e2e-scc-shadow-repo",
+                "scc-shadow",
+                serde_json::json!({
+                    "moverDefaults": {
+                        "securityContext": { "runAsUser": 1000, "runAsGroup": 1000 }
+                    }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository with moverDefaults uid");
+
+    let policy = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "e2e-scc-shadow-policy", "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "e2e-scc-shadow-repo" },
+            "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            "copyMethod": "Direct",
+            "retention": { "keepLatest": 5 },
+            // Inherit only — no explicit securityContext anywhere in the recipe.
+            "mover": { "inheritSecurityContextFrom": { "pvcConsumer": {} } }
+        }
+    });
+    policies
+        .create(&PostParams::default(), &cr(policy))
+        .await
+        .expect("create SnapshotPolicy");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(backup_json(
+                "e2e-scc-shadow-backup",
+                "e2e-scc-shadow-policy",
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+
+    let job = wait_until(
+        "mover Job created",
+        default_timeout(),
+        poll_interval(),
+        || async { jobs.get_opt("e2e-scc-shadow-backup").await },
+    )
+    .await
+    .expect("mover Job should be created — a root inherit with the namespace opt-in must run");
+
+    let sc = job
+        .spec
+        .and_then(|s| s.template.spec)
+        .and_then(|p| p.containers.first().cloned())
+        .and_then(|c| c.security_context);
+    let uid = sc.as_ref().and_then(|s| s.run_as_user);
+    assert_eq!(
+        uid,
+        Some(0),
+        "the workload's pod-level uid 0 is the higher merge layer and must win over \
+         moverDefaults' container-level 1000; got {uid:?}"
+    );
+    assert_eq!(
+        sc.as_ref().and_then(|s| s.run_as_non_root),
+        Some(false),
+        "INV-1 must clear the hardened runAsNonRoot:true for a root mover, or the kubelet \
+         wedges the pod in CreateContainerConfigError"
+    );
+
+    let (status, reason) = wait_inherited_condition(&backups, "e2e-scc-shadow-backup").await;
+    assert_eq!(
+        (status.as_str(), reason.as_str()),
+        ("True", "InheritApplied"),
+        "the inherited identity survived every layer, so inheritance must report the \
+         healthy verdict — not InheritOverridden blaming moverDefaults"
+    );
+
+    cleanup(
+        &client,
+        "e2e-scc-shadow-repo",
+        "e2e-scc-shadow-policy",
+        "e2e-scc-shadow-backup",
+        "e2e-scc-shadow-consumer",
+    )
+    .await;
+    // Remove the privileged-movers opt-in so the namespace returns to its default posture.
+    let nss: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client.clone());
+    let _ = nss
+        .patch(
+            E2E_NAMESPACE,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "annotations": { PRIVILEGED_ANNOTATION: serde_json::Value::Null } }
+            })),
+        )
+        .await;
 }
 
 /// Scenario (e) — **§3 fallback.** With NO workload pod mounting the source, inheritance

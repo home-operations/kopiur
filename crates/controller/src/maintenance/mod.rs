@@ -613,6 +613,9 @@ async fn spawn_maintenance_job(
         namespace,
         maint.spec.mover.as_ref(),
         None,
+        // `inheritSecurityContextFrom.snapshot` is restore-only (admission-rejected
+        // on Maintenance), so there is never a recorded source here either.
+        None,
     )
     .await?
     .contexts;

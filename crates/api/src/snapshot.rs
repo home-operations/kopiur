@@ -36,7 +36,12 @@ pub struct SnapshotSpec {
     /// The `SnapshotPolicy` recipe to run; absent for `discovered` backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<PolicyRef>,
-    /// Arbitrary kopia snapshot tags (e.g. `reason: scheduled-nightly`).
+    /// Free-form tags attached to the kopia snapshot manifest itself
+    /// (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the
+    /// repository, independent of this CR. Keys must be non-empty, colon-free
+    /// (kopia splits on the first colon), and must not start with the reserved
+    /// `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes
+    /// (webhook-enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
     /// Mover Job retry and deadline limits for this run.
@@ -232,6 +237,14 @@ pub struct SnapshotStatus {
     /// Post-run cleanup bookkeeping, so each cleanup runs at most once per Snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupStatus>,
+    /// The mover identity recorded on the kopia snapshot itself (the
+    /// `kopiur-meta` tag): the resolved effective uid/gid/fsGroup the backup ran
+    /// as, plus its provenance. Produced runs stamp this at launch (from the
+    /// same value written into the tag); discovered rows decode it from the tag
+    /// during the catalog scan. Absent for pre-feature snapshots, foreign
+    /// backups without the tag, or a tag this operator version cannot decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<crate::recorded::RecordedSnapshotMeta>,
 }
 
 /// One-shot markers for the cleanups a terminal `Snapshot` performs, mirroring
@@ -307,6 +320,12 @@ pub struct SnapshotInfo {
     pub kopia_snapshot_id: String,
     /// The `username@hostname:path` identity recorded for this snapshot.
     pub identity: ResolvedIdentity,
+    /// The kopia snapshot description (`snapshot create --description`), when
+    /// one is recorded and non-empty. For discovered rows this is copied from
+    /// the repository listing TRUNCATED to 1024 bytes (char-boundary-safe) —
+    /// the value is foreign-writer-controlled and must never fail the CR write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Timing of a snapshot run.
@@ -711,5 +730,63 @@ logTail: "Snapshot created: k1f1ec0a8"
         let json = serde_json::to_value(&status).unwrap();
         let reparsed: SnapshotStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status, reparsed);
+    }
+
+    #[test]
+    fn backup_status_recorded_and_description_roundtrip() {
+        use crate::recorded::{RecordedSnapshotMeta, RecordedSrc};
+        let yaml = r#"
+phase: Succeeded
+snapshot:
+  kopiaSnapshotID: k1
+  identity:
+    username: u
+    hostname: h
+    sourcePath: /data
+  description: "pre-upgrade snapshot"
+recorded:
+  schema: 1
+  src: inherited
+  uid: 3001
+  gid: 3001
+  fsGroup: 65532
+"#;
+        let status: SnapshotStatus = from_yaml(yaml);
+        assert_eq!(
+            status.recorded,
+            Some(RecordedSnapshotMeta {
+                schema: 1,
+                src: RecordedSrc::Inherited,
+                uid: Some(3001),
+                gid: Some(3001),
+                fs_group: Some(65532),
+            })
+        );
+        assert_eq!(
+            status.snapshot.as_ref().unwrap().description.as_deref(),
+            Some("pre-upgrade snapshot")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["recorded"]["fsGroup"], 65532, "camelCase wire key");
+        let reparsed: SnapshotStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Absent stays absent — no null/{} noise on old rows.
+        let bare: SnapshotStatus = from_yaml("phase: Succeeded\n");
+        assert!(bare.recorded.is_none());
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(wire.get("recorded").is_none());
+    }
+
+    #[test]
+    fn stored_recorded_with_future_src_decodes_gracefully() {
+        // A newer operator wrote `src: workload` onto status; this version's
+        // typed watcher must decode it (graceful-decode convention), not error.
+        use crate::recorded::RecordedSrc;
+        let status: SnapshotStatus =
+            from_yaml("recorded:\n  schema: 1\n  src: workload\n  uid: 7\n");
+        let rec = status.recorded.expect("decoded");
+        assert_eq!(rec.src, RecordedSrc::Unknown);
+        assert_eq!(rec.uid, Some(7));
     }
 }

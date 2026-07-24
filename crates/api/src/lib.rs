@@ -24,6 +24,7 @@ pub mod identity;
 pub mod invariants;
 pub mod jitter;
 pub mod preflight;
+pub mod recorded;
 pub mod retention;
 pub mod schema;
 pub mod secctx_compat;
@@ -39,8 +40,9 @@ pub use common::{
     CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, IdentityDefaults,
     InheritSecurityContextFrom, MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel,
     PodSelector, PolicyRef, PvcConsumerInherit, ResolvedMover, SourceColocation,
-    SourceColocationMode, effective_run_as_user, hardened_security_context,
-    merge_pod_security_context, merge_resources, merge_security_context, resolve_mover,
+    SourceColocationMode, effective_run_as_group, effective_run_as_user, hardened_security_context,
+    merge_context_pair, merge_pod_security_context, merge_resources, merge_security_context,
+    resolve_mover,
 };
 pub use maintenance::{
     LeaseAction, Maintenance, MaintenanceSchedule, MaintenanceSpec, MaintenanceStatus,
@@ -82,6 +84,10 @@ pub use identity::{
 pub use jitter::{offset as jitter_offset, substitute_h};
 pub use preflight::{
     PreflightCheck, PreflightInputs, PreflightSpec, eval_preflight_expr, validate_preflight_expr,
+};
+pub use recorded::{
+    KOPIUR_META_SCHEMA_V1, KOPIUR_META_TAG, MetaTagDecode, RecordedSnapshotMeta, RecordedSrc,
+    decode_meta_tag, encode_meta_tag,
 };
 pub use retention::{KeptSet, SnapshotLike, select_kept};
 pub use success_expr::{

@@ -1819,16 +1819,42 @@ fn merge_explicit_over_inherited(
     Option<k8s_openapi::api::core::v1::SecurityContext>,
     Option<k8s_openapi::api::core::v1::PodSecurityContext>,
 ) {
-    (
-        kopiur_api::common::merge_security_context_opt(
-            inherited.0.as_ref(),
-            explicit.security_context.as_ref(),
-        ),
-        kopiur_api::common::merge_pod_security_context_opt(
-            inherited.1.as_ref(),
-            explicit.pod_security_context.as_ref(),
-        ),
+    kopiur_api::common::merge_context_pair(
+        inherited.0.as_ref(),
+        inherited.1.as_ref(),
+        explicit.security_context.as_ref(),
+        explicit.pod_security_context.as_ref(),
     )
+}
+
+#[test]
+fn explicit_pod_level_uid_displaces_an_inherited_container_level_uid() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+
+    // Cross-dimension precedence at the fold itself: the workload pins uid 1000 at the
+    // container level, the recipe pins uid 2000 at the POD level. Explicit is the higher
+    // layer, so the effective identity must be 2000 — the pair merge promotes it into the
+    // container context so the inherited container value cannot shadow it.
+    let inherited = (
+        Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        None,
+    );
+    let explicit = kopiur_api::common::MoverSpec {
+        pod_security_context: Some(PodSecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sc, psc) = merge_explicit_over_inherited(inherited, &explicit);
+    assert_eq!(
+        kopiur_api::common::effective_run_as_user(sc.as_ref(), psc.as_ref()),
+        Some(2000),
+        "the explicit pod-level uid is the higher layer and must win"
+    );
 }
 
 #[test]
@@ -2897,5 +2923,170 @@ mod bounded_failure_publish {
             2,
             "a stalled publish must release its permit at the deadline"
         );
+    }
+}
+
+// --- `inheritSecurityContextFrom.snapshot`: the recorded identity IS the inherited layer ---
+
+mod resolved_from_recorded_meta {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+    use kopiur_api::common::MoverSpec;
+    use kopiur_api::recorded::{KOPIUR_META_SCHEMA_V1, RecordedSnapshotMeta, RecordedSrc};
+
+    use crate::io::{InheritOutcome, resolved_from_recorded};
+
+    fn meta(
+        uid: Option<i64>,
+        gid: Option<i64>,
+        fs: Option<i64>,
+        src: RecordedSrc,
+    ) -> RecordedSnapshotMeta {
+        RecordedSnapshotMeta {
+            schema: KOPIUR_META_SCHEMA_V1,
+            src,
+            uid,
+            gid,
+            fs_group: fs,
+        }
+    }
+
+    #[test]
+    fn recorded_identity_synthesizes_the_inherited_layer_and_outcome() {
+        let m = MoverSpec::default();
+        let r = resolved_from_recorded(
+            &m,
+            "app/pg-b1",
+            &meta(Some(3001), Some(3001), Some(2000), RecordedSrc::Inherited),
+        );
+        let (sc, psc) = &r.contexts;
+        assert_eq!(
+            kopiur_api::common::effective_run_as_user(sc.as_ref(), psc.as_ref()),
+            Some(3001)
+        );
+        assert_eq!(
+            kopiur_api::common::effective_run_as_group(sc.as_ref(), psc.as_ref()),
+            Some(3001)
+        );
+        assert_eq!(psc.as_ref().and_then(|p| p.fs_group), Some(2000));
+        assert_eq!(
+            r.outcome,
+            InheritOutcome::InheritedFromSnapshot {
+                snapshot: "app/pg-b1".into(),
+                uid: Some(3001),
+                src: RecordedSrc::Inherited,
+            }
+        );
+        assert!(r.unfiltered_pods.is_none(), "no pod list on this path");
+    }
+
+    #[test]
+    fn explicit_context_is_the_higher_layer_over_the_recorded_one() {
+        // Exactly like live-pod inherit: what the recipe writes wins, the record
+        // fills in the rest — including cross-dimension (explicit POD-level uid
+        // beats the recorded container-level one via the pair-merge promotion).
+        let m = MoverSpec {
+            pod_security_context: Some(PodSecurityContext {
+                run_as_user: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = resolved_from_recorded(
+            &m,
+            "app/pg-b1",
+            &meta(Some(3001), Some(3001), Some(3001), RecordedSrc::Explicit),
+        );
+        let (sc, psc) = &r.contexts;
+        assert_eq!(
+            kopiur_api::common::effective_run_as_user(sc.as_ref(), psc.as_ref()),
+            Some(2000),
+            "the explicit uid is the higher layer"
+        );
+        // Fields the recipe leaves blank still come from the record.
+        assert_eq!(
+            kopiur_api::common::effective_run_as_group(sc.as_ref(), psc.as_ref()),
+            Some(3001)
+        );
+        assert_eq!(psc.as_ref().and_then(|p| p.fs_group), Some(3001));
+        // The outcome still names the RECORDED uid (the layer's own contribution),
+        // so reporting can detect a displaced record.
+        assert!(matches!(
+            r.outcome,
+            InheritOutcome::InheritedFromSnapshot {
+                uid: Some(3001),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recorded_root_uid_lands_in_the_contexts_for_the_privileged_gate() {
+        // A forged/legit uid-0 record must flow into the resolved contexts so the
+        // downstream `requires_privilege_resolved` gate sees it — identical to an
+        // inherited-from-a-live-root-pod context.
+        let r = resolved_from_recorded(
+            &MoverSpec::default(),
+            "app/pg-b1",
+            &meta(Some(0), None, None, RecordedSrc::Explicit),
+        );
+        let (sc, psc) = &r.contexts;
+        assert_eq!(
+            kopiur_api::common::effective_run_as_user(sc.as_ref(), psc.as_ref()),
+            Some(0)
+        );
+        assert!(kopiur_api::common::requires_privilege_resolved(
+            sc.as_ref(),
+            psc.as_ref(),
+            None
+        ));
+    }
+
+    #[test]
+    fn empty_record_contributes_nothing_and_invents_no_identity() {
+        // uid/gid/fsGroup all absent: the synthesized layer must not conjure an
+        // identity out of thin air (promotion never invents one).
+        let r = resolved_from_recorded(
+            &MoverSpec::default(),
+            "app/pg-b1",
+            &meta(None, None, None, RecordedSrc::Defaults),
+        );
+        let (sc, psc) = &r.contexts;
+        assert_eq!(
+            kopiur_api::common::effective_run_as_user(sc.as_ref(), psc.as_ref()),
+            None
+        );
+        assert_eq!(psc.as_ref().and_then(|p| p.fs_group), None);
+        assert!(matches!(
+            r.outcome,
+            InheritOutcome::InheritedFromSnapshot { uid: None, .. }
+        ));
+    }
+
+    // The full SecurityContext type carries no Eq; comparing the whole
+    // ResolvedMoverSecurity works because it derives PartialEq.
+    #[test]
+    fn contexts_match_a_hand_built_pair_merge() {
+        let m = MoverSpec {
+            security_context: Some(SecurityContext {
+                run_as_non_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rec = meta(Some(3001), None, Some(65532), RecordedSrc::Inherited);
+        let r = resolved_from_recorded(&m, "app/pg-b1", &rec);
+        let expected = kopiur_api::common::merge_context_pair(
+            Some(&SecurityContext {
+                run_as_user: Some(3001),
+                ..Default::default()
+            }),
+            Some(&PodSecurityContext {
+                fs_group: Some(65532),
+                ..Default::default()
+            }),
+            m.security_context.as_ref(),
+            m.pod_security_context.as_ref(),
+        );
+        assert_eq!(r.contexts, expected);
     }
 }
