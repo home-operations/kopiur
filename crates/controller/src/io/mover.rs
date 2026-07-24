@@ -115,10 +115,13 @@ pub enum LegacyReapStep {
 ///
 /// `owner_uid` scopes the reap to Jobs actually owned by the reconciled
 /// repository: every operator version that could have created the legacy Job
-/// stamped it with the CR's `OwnerReference` (that is how GC ties the Job to
-/// the CR), so a Job that merely COLLIDES on the name — a user's unrelated
-/// `{name}-bootstrap` — is `Clear`: never deleted, never waited on (the
-/// successor's `-discovery` name cannot collide with it).
+/// stamped it with the CR's CONTROLLER `OwnerReference` (`owner_ref_for`,
+/// `controller: true` — that is how GC ties the Job to the CR), so the match
+/// requires the controller flag, not just the UID. A Job that merely COLLIDES
+/// on the name — a user's unrelated `{name}-bootstrap`, including one carrying
+/// a NON-controller ownerRef to this repository purely for GC-with-the-CR —
+/// is `Clear`: never deleted, never waited on (the successor's `-discovery`
+/// name cannot collide with it).
 pub fn legacy_reap_step(legacy: Option<&Job>, owner_uid: &str) -> LegacyReapStep {
     let owned = |job: &Job| {
         job.metadata
@@ -126,7 +129,7 @@ pub fn legacy_reap_step(legacy: Option<&Job>, owner_uid: &str) -> LegacyReapStep
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .any(|or| or.uid == owner_uid)
+            .any(|or| or.uid == owner_uid && or.controller == Some(true))
     };
     match legacy {
         None => LegacyReapStep::Clear,
@@ -1241,22 +1244,24 @@ mod legacy_reap_tests {
 
     const REPO_UID: &str = "repo-uid-1234";
 
-    fn job(deleting: bool, owner_uids: &[&str]) -> Job {
+    fn ownref(uid: &str, controller: bool) -> OwnerReference {
+        OwnerReference {
+            api_version: "kopiur.home-operations.com/v1alpha1".to_string(),
+            kind: "Repository".to_string(),
+            name: "repo".to_string(),
+            uid: uid.to_string(),
+            // The operator's own stamp (`owner_ref_for`) always sets
+            // `controller: true`; a user-added GC-only ref leaves it unset.
+            controller: controller.then_some(true),
+            ..Default::default()
+        }
+    }
+
+    fn job_with_refs(deleting: bool, refs: Vec<OwnerReference>) -> Job {
         Job {
             metadata: ObjectMeta {
                 name: Some("repo-bootstrap".to_string()),
-                owner_references: Some(
-                    owner_uids
-                        .iter()
-                        .map(|uid| OwnerReference {
-                            api_version: "kopiur.home-operations.com/v1alpha1".to_string(),
-                            kind: "Repository".to_string(),
-                            name: "repo".to_string(),
-                            uid: (*uid).to_string(),
-                            ..Default::default()
-                        })
-                        .collect(),
-                ),
+                owner_references: Some(refs),
                 deletion_timestamp: deleting.then(|| {
                     Time(k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap())
                 }),
@@ -1264,6 +1269,15 @@ mod legacy_reap_tests {
             },
             ..Default::default()
         }
+    }
+
+    /// A legacy Job as every prior operator version actually built it: a
+    /// controller ownerRef back to the reconciled CR.
+    fn job(deleting: bool, owner_uids: &[&str]) -> Job {
+        job_with_refs(
+            deleting,
+            owner_uids.iter().map(|uid| ownref(uid, true)).collect(),
+        )
     }
 
     /// The no-mover-overlap invariant: a visible legacy Job of OURS — deleting
@@ -1304,12 +1318,32 @@ mod legacy_reap_tests {
         );
     }
 
-    /// Ownership matches on ANY ownerRef carrying the CR's UID, wherever it
-    /// sits in the list.
+    /// A user Job carrying a NON-controller ownerRef to the repository (a
+    /// legitimate GC-with-the-CR tie, allowed in any number per object) is
+    /// NOT ours: only the operator's `controller: true` stamp counts.
+    #[test]
+    fn non_controller_owner_reference_does_not_count_as_ours() {
+        assert_eq!(
+            legacy_reap_step(
+                Some(&job_with_refs(false, vec![ownref(REPO_UID, false)])),
+                REPO_UID
+            ),
+            LegacyReapStep::Clear
+        );
+    }
+
+    /// Ownership matches on ANY controller ownerRef carrying the CR's UID,
+    /// wherever it sits in the list.
     #[test]
     fn ownership_matches_any_owner_reference_with_the_repo_uid() {
         assert_eq!(
-            legacy_reap_step(Some(&job(false, &["unrelated", REPO_UID])), REPO_UID),
+            legacy_reap_step(
+                Some(&job_with_refs(
+                    false,
+                    vec![ownref("unrelated", false), ownref(REPO_UID, true)]
+                )),
+                REPO_UID
+            ),
             LegacyReapStep::StartDelete
         );
     }
