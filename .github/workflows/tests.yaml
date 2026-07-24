@@ -31,6 +31,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Full debuginfo overflows the standard runner disk: the all-features
+  # compile-check links every gated e2e/integration test binary against the
+  # whole dep tree, and with debug=2 that plus the restored cache exceeds the
+  # ~14GB free ("No space left on device" → ld SIGBUS, 2026-07-24 twice).
+  # line-tables-only keeps file:line backtraces for test failures.
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
   HELM_UNITTEST_VERSION: "v1.1.1"
 
@@ -55,7 +61,9 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: tests
+          # -v2: the debuginfo profile changed (CARGO_PROFILE_DEV_DEBUG above);
+          # a restored full-debug cache would double disk during the rebuild.
+          shared-key: tests-v2
 
       - name: Build workspace
         run: mise run build
@@ -86,7 +94,8 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: integration
+          # -v2: see the tests cache note — debuginfo profile changed.
+          shared-key: integration-v2
 
       - name: Create kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
