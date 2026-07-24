@@ -74,13 +74,89 @@ pub async fn delete_mover_run(
     namespace: &str,
     job_name: &str,
 ) -> Result<()> {
+    delete_mover_run_with(client, namespace, job_name, &DeleteParams::background()).await
+}
+
+async fn delete_mover_run_with(
+    client: &kube::Client,
+    namespace: &str,
+    job_name: &str,
+    dp: &DeleteParams,
+) -> Result<()> {
     let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
-    match job_api.delete(job_name, &DeleteParams::background()).await {
+    match job_api.delete(job_name, dp).await {
         Ok(_) => {}
         Err(kube::Error::Api(ae)) if ae.code == 404 => {}
         Err(e) => return Err(Error::Kube(e)),
     }
     delete_work_spec_cm(client, namespace, job_name).await
+}
+
+/// What one pass of the `{name}-bootstrap` → `{name}-discovery` upgrade reap
+/// must do, decided purely from the observed legacy Job. The reap uses
+/// FOREGROUND deletion precisely so this decision can key on plain visibility:
+/// a foreground-deleting Job stays readable (deletionTimestamp set) until every
+/// pod it owns is fully gone, so "the Job is still visible" is exactly "a
+/// legacy mover pod may still be running".
+#[derive(Debug, PartialEq, Eq)]
+pub enum LegacyReapStep {
+    /// Legacy Job present and not yet deleting: start a foreground delete,
+    /// then wait — the successor must not be created this pass.
+    StartDelete,
+    /// A foreground delete is already in flight (deletionTimestamp set); its
+    /// pod may still be terminating. Keep waiting.
+    AwaitGone,
+    /// No legacy Job remains: safe to create the renamed successor.
+    Clear,
+}
+
+/// Pure decision for [`legacy_bootstrap_cleared`]; split out so the
+/// no-mover-overlap invariant is unit-testable without a cluster.
+pub fn legacy_reap_step(legacy: Option<&Job>) -> LegacyReapStep {
+    match legacy {
+        None => LegacyReapStep::Clear,
+        Some(job) => match job.metadata.deletion_timestamp {
+            None => LegacyReapStep::StartDelete,
+            Some(_) => LegacyReapStep::AwaitGone,
+        },
+    }
+}
+
+/// Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` Job rename:
+/// reap a previous operator version's Job before its renamed successor is
+/// created. Returns `true` when the caller may proceed to create the
+/// successor; `false` means a legacy Job (and possibly its pod) still exists —
+/// requeue shortly and retry, so two mover pods never touch the same
+/// repository concurrently mid-upgrade. Removable once no supported upgrade
+/// path predates the rename.
+pub async fn legacy_bootstrap_cleared(
+    client: &kube::Client,
+    namespace: &str,
+    repo_name: &str,
+) -> Result<bool> {
+    let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let legacy_job = format!("{repo_name}-bootstrap");
+    match legacy_reap_step(job_api.get_opt(&legacy_job).await?.as_ref()) {
+        LegacyReapStep::StartDelete => {
+            tracing::info!(
+                repository = %repo_name,
+                job = %legacy_job,
+                "reaping the pre-rename bootstrap Job (foreground) before creating its discovery successor"
+            );
+            delete_mover_run_with(client, namespace, &legacy_job, &DeleteParams::foreground())
+                .await?;
+            Ok(false)
+        }
+        LegacyReapStep::AwaitGone => {
+            tracing::debug!(
+                repository = %repo_name,
+                job = %legacy_job,
+                "waiting for the pre-rename bootstrap Job to finish terminating"
+            );
+            Ok(false)
+        }
+        LegacyReapStep::Clear => Ok(true),
+    }
 }
 
 /// Labels marking the per-namespace mover RBAC objects as kopiur-managed.
@@ -1136,5 +1212,47 @@ mod wedged_tests {
             classify_wedged_pods(&[], 300, 600),
             WedgedVerdict::Progressing
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_reap_tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    fn job(deleting: bool) -> Job {
+        Job {
+            metadata: ObjectMeta {
+                name: Some("repo-bootstrap".to_string()),
+                deletion_timestamp: deleting.then(|| {
+                    Time(k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap())
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The no-mover-overlap invariant: a visible legacy Job — deleting or not —
+    /// must never let the discovery successor be created this pass.
+    #[test]
+    fn visible_legacy_job_starts_a_foreground_delete() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(false))),
+            LegacyReapStep::StartDelete
+        );
+    }
+
+    #[test]
+    fn deleting_legacy_job_keeps_waiting_until_fully_gone() {
+        assert_eq!(
+            legacy_reap_step(Some(&job(true))),
+            LegacyReapStep::AwaitGone
+        );
+    }
+
+    #[test]
+    fn absent_legacy_job_clears_the_successor_to_launch() {
+        assert_eq!(legacy_reap_step(None), LegacyReapStep::Clear);
     }
 }

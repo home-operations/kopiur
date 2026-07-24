@@ -948,18 +948,16 @@ async fn bootstrap_via_mover(
     // Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` rename: the
     // Job name is the lookup key, so a previous operator version's Job is
     // invisible to the match above. Reap it here — reached only when we are
-    // about to create the renamed Job — so two movers never run against this
-    // repository concurrently mid-upgrade. (A finished old Job is TTL-reaped
-    // regardless; this covers the in-flight one. Removable once no supported
-    // upgrade path predates the rename.)
-    let legacy_job = format!("{name}-bootstrap");
-    if job_api.get_opt(&legacy_job).await?.is_some() {
-        tracing::info!(
-            repository = %name,
-            job = %legacy_job,
-            "reaping the pre-rename bootstrap Job before creating its discovery successor"
-        );
-        io::delete_mover_run(&ctx.client, namespace, &legacy_job).await?;
+    // about to create the renamed Job — and hold off creating the successor
+    // until the legacy Job is fully GONE (foreground delete keeps it visible
+    // while its pod terminates), so two movers never run against this
+    // repository concurrently mid-upgrade. The scan-request attempt stamp only
+    // lands with the successor's creation, so the pending token re-fires this
+    // path after the requeue. (A finished old Job is TTL-reaped regardless;
+    // this covers the in-flight one. Removable once no supported upgrade path
+    // predates the rename.)
+    if !io::legacy_bootstrap_cleared(&ctx.client, namespace, name).await? {
+        return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
     // Whether we are about to launch a Job BECAUSE OF a pending scan-request
