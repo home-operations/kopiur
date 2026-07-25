@@ -278,10 +278,10 @@ mod shard_coverage {
             .collect()
     }
 
-    /// Every binary named in a `bins: "..."` value in the e2e workflow matrix.
+    /// Every binary named in a `bins: "..."` value in the e2e job's matrix.
     /// The values are single-line and double-quoted, so this needs no YAML parser.
     fn sharded_binaries() -> BTreeSet<String> {
-        let path = repo_root().join(".github/workflows/e2e.yaml");
+        let path = repo_root().join(".github/workflows/ci.yaml");
         let yaml = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         yaml.lines()
@@ -308,8 +308,8 @@ mod shard_coverage {
             orphans.is_empty(),
             "these e2e test binaries are in NO shard's `bins:`, so CI never runs them \
              — they are dead code and cannot catch a regression: {orphans:?}\n\
-             Fix: add each to a `matrix.include` entry's `bins:` in \
-             .github/workflows/e2e.yaml. Set `backends: true` if the binary uses \
+             Fix: add each to a `matrix.include` entry's `bins:` in the e2e job \
+             in .github/workflows/ci.yaml. Set `backends: true` if the binary uses \
              Need::Minio/WorkloadNs/ProjectionNs (WorkloadNs and ProjectionNs imply \
              Minio), and `csi: true` if it needs VolumeSnapshots. Give it its own \
              shard if it restarts or reshapes the operator."

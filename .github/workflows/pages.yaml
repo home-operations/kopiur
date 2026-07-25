@@ -1,0 +1,34 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      # The release workflow's krew step pushes plugins/kopiur.yaml to main with
+      # the bot app token, which (unlike GITHUB_TOKEN) retriggers workflows —
+      # the docs site doesn't render plugins/, so skip the rebuild.
+      - "plugins/**"
+  workflow_dispatch:
+
+# Serialize Pages deploys (matches the official GitHub Pages flow); never cancel
+# an in-flight deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Docs
+    uses: ./.github/workflows/docs.yaml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    with:
+      deploy: true
