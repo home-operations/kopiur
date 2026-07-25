@@ -6,11 +6,6 @@
       description: "Auto-merge non-major updates, but only after every CI check passes",
       matchUpdateTypes: ["minor", "patch", "digest", "lockFileMaintenance"],
       automerge: true,
-      // Build Success is not a *required* check on main yet, so GitHub's native
-      // auto-merge would merge as soon as the PR is mergeable. Disable it so
-      // Renovate merges only once every check on the PR is green, not just the
-      // required ones. Revisit if Build Success becomes required.
-      platformAutomerge: false,
     },
   ],
 }
