@@ -6,16 +6,11 @@
       description: "Auto-merge non-major updates, but only after every CI check passes",
       matchUpdateTypes: ["minor", "patch", "digest", "lockFileMaintenance"],
       automerge: true,
-      // CI only runs on pull_request (and push to main), so the shared preset's
-      // branch automerge would merge without any checks having run — go via PR.
-      automergeType: "pr",
-      // main has no *required* status checks, so GitHub's native auto-merge
-      // would merge immediately; disable it so Renovate itself merges only once
-      // ALL checks on the PR are green.
+      // Build Success is not a *required* check on main yet, so GitHub's native
+      // auto-merge would merge as soon as the PR is mergeable. Disable it so
+      // Renovate merges only once every check on the PR is green, not just the
+      // required ones. Revisit if Build Success becomes required.
       platformAutomerge: false,
-      // Override the shared preset's ignoreTests: true on its github-actions
-      // rules — a later rule must reset it or actions updates skip the CI gate.
-      ignoreTests: false,
     },
   ],
 }
