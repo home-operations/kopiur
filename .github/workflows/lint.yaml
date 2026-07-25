@@ -33,6 +33,9 @@ env:
 
 jobs:
   rust-lint:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Rust Lint
     runs-on: ubuntu-24.04
     permissions:
@@ -64,6 +67,9 @@ jobs:
         run: mise run clippy
 
   helm-lint:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Helm Lint
     runs-on: ubuntu-24.04
     permissions:
@@ -87,6 +93,9 @@ jobs:
         run: mise run helm-docs-check
 
   cargo-audit:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Cargo Audit
     runs-on: ubuntu-24.04
     continue-on-error: true

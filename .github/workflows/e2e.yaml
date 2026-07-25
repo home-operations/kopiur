@@ -18,19 +18,6 @@ on:
     paths-ignore:
       - "**.md"
       - ".release-please-manifest.json"
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**.md"
-      - ".release-please-manifest.json"
-      # The release workflow's krew step pushes plugins/kopiur.yaml to main with
-      # the bot app token, which (unlike GITHUB_TOKEN) retriggers workflows —
-      # ignore it so a release doesn't re-run this workflow for a manifest bump.
-      - "plugins/**"
-  schedule:
-    # 07:00 UTC nightly.
-    - cron: "0 7 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -51,6 +38,9 @@ jobs:
   # shards to load. Per-image Rust cache keys keep the legs from contending on one
   # shared cache.
   build:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Build ${{ matrix.image }} image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -104,6 +94,9 @@ jobs:
   # binaries via KOPIUR_E2E_BINS. The discrete mise tasks are individual steps, so
   # the CI UI shows per-phase timing and a failure points straight at the shard.
   test:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: E2E (${{ matrix.shard }})
     needs: build
     runs-on: ubuntu-24.04
