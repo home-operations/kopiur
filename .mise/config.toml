@@ -15,6 +15,7 @@ experimental = true
 config_roots = ["crates/e2e"]
 
 [tools]
+actionlint = "1.7.12"
 rust = { version = "1.97.1", components = "rustfmt,clippy,llvm-tools-preview" }
 lefthook = "2.1.10"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
