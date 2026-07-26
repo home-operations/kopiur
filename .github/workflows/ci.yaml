@@ -23,8 +23,6 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
   # Full debuginfo overflows the standard runner disk: the all-features
   # compile-check links every gated e2e/integration test binary against the
   # whole dep tree, and with debug=2 that plus the restored cache exceeds the

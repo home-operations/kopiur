@@ -54,6 +54,10 @@ yq = "4.53.3"
 # tier that pins alert BEHAVIOR (issue #280), not just the rendered text.
 promtool = "3.13.1"
 
+[env]
+CARGO_TERM_COLOR = "always"
+RUST_BACKTRACE = "1"
+
 [tasks.build]
 description = "Compile the whole workspace (debug, locked deps)"
 run = "cargo build --workspace --locked"

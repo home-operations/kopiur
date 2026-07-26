@@ -15,10 +15,6 @@ on:
 # id-token: write. publish inherits the caller's grant instead; build declares
 # its own reduction below, which is valid from either caller.
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
   build:
     name: Build docs site
