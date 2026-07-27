@@ -24,7 +24,7 @@ lefthook = "2.1.10"
 # `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
 node = "24.18.0"
-oxfmt = "0.60.0"
+oxfmt = "0.61.0"
 zizmor = "1.28.0"
 helm = "4.2.3"
 cosign = "3.1.2"
