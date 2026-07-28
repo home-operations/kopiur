@@ -124,6 +124,6 @@ libc = "0.2"
 mimalloc = "0.1"
 
 # Dev / test
-serial_test = "3"
+serial_test = "4"
 insta = { version = "1", features = ["yaml"] }
 assert-json-diff = "2"
