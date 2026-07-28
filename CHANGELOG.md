@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.9.0](https://github.com/home-operations/kopiur/compare/0.8.1...0.9.0) (2026-07-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rust:** Update crate serial_test (3.5.0 → 4.0.1) ([#307](https://github.com/home-operations/kopiur/issues/307))
+* **secctx:** identity-aware mover merge, recorded snapshot identity, restore inherit-from-snapshot ([#304](https://github.com/home-operations/kopiur/issues/304))
+
+### Features
+
+* **rust:** Update crate serial_test (3.5.0 → 4.0.1) ([#307](https://github.com/home-operations/kopiur/issues/307)) ([4392e4a](https://github.com/home-operations/kopiur/commit/4392e4a8e286df589f4f5ba12149fa8d4ce1e2de))
+* **secctx:** identity-aware mover merge, recorded snapshot identity, restore inherit-from-snapshot ([#304](https://github.com/home-operations/kopiur/issues/304)) ([0632a29](https://github.com/home-operations/kopiur/commit/0632a2914e90e703a67f912167551f81ae873b07))
+
+
+### Bug Fixes
+
+* **rust:** update crate cel (0.14.0 → 0.14.1) ([#317](https://github.com/home-operations/kopiur/issues/317)) ([00cf539](https://github.com/home-operations/kopiur/commit/00cf539af433b11b1d0cf395bd5294feb6a9f5e8))
+* **rust:** update crate schemars (1.2.1 → 1.2.2) ([#313](https://github.com/home-operations/kopiur/issues/313)) ([b6e6268](https://github.com/home-operations/kopiur/commit/b6e62688ff7ebac47bbce0cd04b123173115217d))
+
+
+### Build System
+
+* **mise:** add actionlint and refresh the lockfile ([#309](https://github.com/home-operations/kopiur/issues/309)) ([e74c9b3](https://github.com/home-operations/kopiur/commit/e74c9b37891f51ad8c1b47bf9ae993d0f657bf0d))
+
+
+### Continuous Integration
+
+* adopt the shared workflow-lint and docs-build actions ([#310](https://github.com/home-operations/kopiur/issues/310)) ([7d4b329](https://github.com/home-operations/kopiur/commit/7d4b3297341c16ec2a7d0c6b57e3db1c40363842))
+* gate pull requests on Build Success and share the docs build ([#306](https://github.com/home-operations/kopiur/issues/306)) ([1b693aa](https://github.com/home-operations/kopiur/commit/1b693aa6670e771b3676a509c106f74215e5f3f4))
+* **github-action:** Update action docker/login-action (v4.5.0 → v4.5.1) ([#312](https://github.com/home-operations/kopiur/issues/312)) ([29d00b1](https://github.com/home-operations/kopiur/commit/29d00b1a3a02b84efbcc2b2f5723544e24e84ce5))
+* **github-action:** Update action jdx/mise-action (v4.2.1 → v4.2.2) ([#311](https://github.com/home-operations/kopiur/issues/311)) ([65bbca4](https://github.com/home-operations/kopiur/commit/65bbca419d6d01471efcd231a4b55ecb7713eaae))
+* **github-action:** Update action jdx/mise-action (v4.2.2 → v4.2.3) ([#315](https://github.com/home-operations/kopiur/issues/315)) ([5f517d4](https://github.com/home-operations/kopiur/commit/5f517d4184df71486684695b82c8b205058a638a))
+* skip release-please PRs in checks and drop nightly e2e ([#305](https://github.com/home-operations/kopiur/issues/305)) ([ee6d4f5](https://github.com/home-operations/kopiur/commit/ee6d4f57b935e1c9d160cb3161878047fd490146))
+
+
+### Miscellaneous Chores
+
+* **krew:** kopiur 0.8.1 manifest ([84df757](https://github.com/home-operations/kopiur/commit/84df7575c9c0c139f0199b530236052b082b422e))
+* **mise:** Update tool aqua:astral-sh/uv (0.11.32 → 0.11.33) ([#318](https://github.com/home-operations/kopiur/issues/318)) ([f63bc3a](https://github.com/home-operations/kopiur/commit/f63bc3a33ad1ee96876889e5078648922cc0bd3f))
+* **mise:** Update tool oxfmt (0.60.0 → 0.61.0) ([#314](https://github.com/home-operations/kopiur/issues/314)) ([bdbf6c6](https://github.com/home-operations/kopiur/commit/bdbf6c6bb50cfca0dc18f3e074422e108ebc6c9f))
+* **renovate:** drop the stale automerge overrides ([#308](https://github.com/home-operations/kopiur/issues/308)) ([c13a3d5](https://github.com/home-operations/kopiur/commit/c13a3d5d4d0aa507de2c2b24769b83029d1b9ca2))
+* standardize release-please changelog sections ([#316](https://github.com/home-operations/kopiur/issues/316)) ([273d0f8](https://github.com/home-operations/kopiur/commit/273d0f833b52b04652bc7fd4bc10844d4a5c4881))
+
 ## [0.8.1](https://github.com/home-operations/kopiur/compare/0.8.0...0.8.1) (2026-07-24)
 
 
