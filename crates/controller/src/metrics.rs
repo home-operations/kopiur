@@ -98,6 +98,13 @@ pub struct Metrics {
     // Restore + maintenance.
     restore_duration_seconds: Gauge<i64>,
     maintenance_reclaimed_bytes: Gauge<i64>,
+
+    // Leader election. #319 was invisible on /metrics — it could only be found
+    // by grepping logs — so the election now reports its own health.
+    leader_is_leader: Gauge<i64>,
+    leader_transitions: Counter<u64>,
+    leader_renew_failures: Counter<u64>,
+    leader_renew_duration: Histogram<f64>,
 }
 
 /// Outcome of a `Snapshot`'s finalizer resolving its kopia snapshot lifecycle,
@@ -260,6 +267,47 @@ impl Metrics {
                     observer.observe(rss, &[]);
                 }
             })
+            .build();
+
+        // --- leader election ---
+        //
+        // Issue #319 (the controller abdicating ~15×/day off ordinary API
+        // latency) was diagnosable only by grepping logs for "abdicating": there
+        // was no /metrics signal at all. `leader_renew_duration` is the one that
+        // would have shown it in a single panel — a p99 pinned at the renew
+        // deadline is the whole story — and the others make flapping alertable.
+        let leader_is_leader = m
+            .i64_gauge("kopiur_leader_is_leader")
+            .with_description(
+                "1 if this replica currently holds the election Lease, 0 otherwise. Also the \
+                 flag to filter dashboards by: the store-backed resource gauges are \
+                 leader-only, so a standby's /metrics legitimately omits them.",
+            )
+            .build();
+        let leader_transitions = m
+            .u64_counter("kopiur_leader_transitions")
+            .with_description(
+                "Total times this replica acquired the election Lease. A healthy single-leader \
+                 deployment increments this once per process start; a climbing rate is \
+                 election flapping.",
+            )
+            .build();
+        let leader_renew_failures = m
+            .u64_counter("kopiur_leader_renew_failures")
+            .with_description(
+                "Failed Lease renew attempts by reason (stalled|transport|conflict). These are \
+                 retried inside the renew window and are NOT by themselves leadership loss — \
+                 a sustained nonzero rate is the early warning that used to be invisible.",
+            )
+            .build();
+        let leader_renew_duration = m
+            .f64_histogram("kopiur_leader_renew_duration_seconds")
+            .with_description(
+                "Wall time of one Lease renew attempt, successful or not. Healthy is single-digit \
+                 milliseconds; a p99 approaching the renew deadline means the election is one \
+                 hiccup away from abdicating.",
+            )
+            .with_boundaries(vec![0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
             .build();
 
         let backup_verified_timestamp = m
@@ -502,6 +550,10 @@ impl Metrics {
             repo_foreign_snapshots,
             repo_maintenance_configured,
             restore_duration_seconds,
+            leader_is_leader,
+            leader_transitions,
+            leader_renew_failures,
+            leader_renew_duration,
             maintenance_reclaimed_bytes,
         }
     }
@@ -1127,6 +1179,28 @@ impl Metrics {
     pub fn set_restore_duration(&self, ns: &str, name: &str, seconds: i64) {
         self.restore_duration_seconds
             .record(seconds, &ns_name(ns, name));
+    }
+
+    /// Record whether this replica currently holds the election Lease, bumping
+    /// the transition counter on each acquisition.
+    pub fn set_leader(&self, leading: bool) {
+        self.leader_is_leader.record(leading as i64, &[]);
+        if leading {
+            self.leader_transitions.add(1, &[]);
+        }
+    }
+
+    /// Record one renew attempt: how long it took, and why it failed if it did.
+    ///
+    /// `reason` is `None` on success. Kept as a closed set of `&'static str`
+    /// at the call sites rather than free-form text — this is a metric label,
+    /// and unbounded cardinality here would be a footgun on a busy cluster.
+    pub fn record_leader_renew(&self, seconds: f64, reason: Option<&'static str>) {
+        self.leader_renew_duration.record(seconds, &[]);
+        if let Some(reason) = reason {
+            self.leader_renew_failures
+                .add(1, &[KeyValue::new("reason", reason)]);
+        }
     }
 
     /// Set the last full-maintenance reclaimed-bytes gauge.

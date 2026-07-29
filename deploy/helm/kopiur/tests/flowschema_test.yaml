@@ -1,0 +1,61 @@
+suite: leader-election flowschema
+templates:
+  - flowschema-leader-election.tpl
+tests:
+  - it: ships the guaranteed-lane FlowSchema by default
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: FlowSchema
+      - equal:
+          path: spec.priorityLevelConfiguration.name
+          value: leader-election
+      - equal:
+          path: spec.matchingPrecedence
+          value: 200
+
+  - it: scopes the lane to lease traffic only
+    # A blanket grant would let bulk reconcile traffic borrow the guaranteed
+    # concurrency that exists to keep the Lease renewable under load.
+    asserts:
+      - equal:
+          path: spec.rules[0].resourceRules[0].apiGroups
+          value: ["coordination.k8s.io"]
+      - equal:
+          path: spec.rules[0].resourceRules[0].resources
+          value: ["leases"]
+      - equal:
+          path: spec.rules[0].resourceRules[0].verbs
+          value: ["get", "create", "update"]
+
+  - it: binds to the operator ServiceAccount in the release namespace
+    release:
+      name: kopiur
+      namespace: kopiur-system
+    asserts:
+      - equal:
+          path: spec.rules[0].subjects[0].serviceAccount.name
+          value: kopiur
+      - equal:
+          path: spec.rules[0].subjects[0].serviceAccount.namespace
+          value: kopiur-system
+      - equal:
+          path: spec.rules[0].resourceRules[0].namespaces
+          value: ["kopiur-system"]
+
+  - it: renders nothing when the FlowSchema is opted out
+    # APF can be disabled cluster-wide, and some installers cannot create
+    # cluster-scoped flowcontrol objects.
+    set:
+      leaderElection.flowSchema.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing when leader election itself is off
+    set:
+      leaderElection.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

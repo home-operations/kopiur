@@ -178,6 +178,31 @@
           "default": true,
           "title": "enabled",
           "type": "boolean"
+        },
+        "flowSchema": {
+          "description": " leaseDurationSeconds: 15\n renewDeadlineSeconds: 10\n renewPeriodSeconds: 2\n retryPeriodSeconds: 2",
+          "properties": {
+            "enabled": {
+              "default": true,
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "matchingPrecedence": {
+              "default": 200,
+              "description": "Ordering against other FlowSchemas; lower wins. Must stay above the\nbuilt-in `system-leader-election` (100) so kube's own controllers keep\npriority, and below `service-accounts` (9000) or this has no effect.",
+              "title": "matchingPrecedence",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "flowSchema",
+          "type": "object"
+        },
+        "timings": {
+          "description": "API Priority and Fairness lane for the election Lease. Kubernetes' own\n`system-leader-election` FlowSchema covers only kube-system ServiceAccounts,\nso an operator in its own namespace has its lease renewals queued behind all\nother ServiceAccount traffic in `workload-low` — the congestion behind the\ncontroller restart storms in #319. This puts Kopiur's `leases` calls (and\nonly those) into the built-in guaranteed `leader-election` priority level.\nTurn off if APF is disabled on the cluster or you cannot create\ncluster-scoped flowcontrol.apiserver.k8s.io objects.\nLeader-election protocol timings, in seconds. Leave unset to use the\nclient-go defaults (lease 15 / renewDeadline 10 / renewPeriod 2 / retry 2).\n`renewDeadline` is a budget for a whole ROUND of renew attempts, not one\nattempt's timeout, and `renewPeriod + renewDeadline` must stay strictly\nunder `leaseDuration` — the operator rejects any other combination at\nstartup rather than risk two replicas both believing they lead. Widen these\nonly if your control plane genuinely cannot answer a lease write inside the\ndefault window; prefer leaving `flowSchema` enabled instead.",
+          "required": [],
+          "title": "timings",
+          "type": "object"
         }
       },
       "required": [],

@@ -31,6 +31,38 @@ use crate::{
     snapshot_policy, snapshot_schedule, watch,
 };
 
+/// The watcher config EVERY informer in the process shares — the controller
+/// fan-out here and the standalone Maintenance reflector in `startup.rs`.
+///
+/// One function so a watch-tuning decision cannot apply to only some of the
+/// watchers: the Maintenance informer used to build its own
+/// `WatcherConfig::default()` and silently opted out of `streamingLists`.
+pub(crate) fn watcher_config(streaming_lists: bool) -> WatcherConfig {
+    let mut cfg = WatcherConfig::default();
+    // Stream the initial list via the WatchList API to cut peak memory on the
+    // cluster-wide resync. Version-gated at startup — kube's watcher cannot
+    // self-degrade on a pre-1.32 apiserver.
+    if streaming_lists {
+        cfg = cfg.streaming_lists();
+    }
+    // Serve initial LISTs from the apiserver's watch cache instead of forcing a
+    // quorum read straight through to etcd.
+    //
+    // kube-runtime defaults to `ListSemantic::MostRecent`, whose own doc comment
+    // names "congested Controller cases" as the reason to prefer `Any`. Kopiur
+    // registers ~50 independent watchers (kube-rs shares no informers between
+    // Controllers), so on a cold start the default meant ~50 simultaneous etcd
+    // quorum reads — load that lands precisely when the control plane is already
+    // struggling, which is how #319's restart storms fed themselves.
+    //
+    // Safe here because reconcilers are level-triggered and idempotent: a
+    // slightly stale initial list is corrected by the watch stream that
+    // immediately follows it, and no reconcile draws a conclusion from absence
+    // alone. This is also what client-go's informers do by default.
+    cfg = cfg.list_semantic(kube::runtime::watcher::ListSemantic::Any);
+    cfg
+}
+
 /// A namespaced-kind `Api` matching the install scope: cluster-wide for
 /// `installScope: cluster`, single-namespace for `installScope: namespaced`
 /// (where Role-only RBAC makes a cluster-wide LIST a 403 — the bug that used
@@ -138,12 +170,7 @@ pub(crate) async fn spawn_all(
     // has Role-only RBAC, where a cluster-wide LIST/WATCH 403s forever — the
     // failure mode that used to leave namespaced installs Ready-but-inert.
     let cluster_wide = matches!(scope, config::WatchScope::Cluster);
-    let mut cfg = WatcherConfig::default();
-    // Opt-in (off by default for older-apiserver safety): stream the initial list
-    // via the WatchList API to cut peak memory on the cluster-wide resync.
-    if streaming_lists {
-        cfg = cfg.streaming_lists();
-    }
+    let cfg = watcher_config(streaming_lists);
     // Owned children (mover Jobs, work-spec ConfigMaps) ALWAYS carry the managed-by
     // label (io::finalizer::child_labels), so scope their watches server-side to
     // ours — the controller then lists/watches only kopiur's Jobs/ConfigMaps, not

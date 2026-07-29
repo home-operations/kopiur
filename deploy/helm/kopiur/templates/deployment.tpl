@@ -58,6 +58,26 @@ spec:
             # sharing a namespace never contend on the same Lease.
             - name: KOPIUR_LEASE_NAME
               value: {{ include "kopiur.fullname" . | quote }}
+            {{- with .Values.leaderElection.timings }}
+            # Protocol timings. Unset fields keep the client-go defaults; any
+            # combination that could split-brain is rejected at startup.
+            {{- with .leaseDurationSeconds }}
+            - name: KOPIUR_LEASE_DURATION_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .renewDeadlineSeconds }}
+            - name: KOPIUR_RENEW_DEADLINE_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .renewPeriodSeconds }}
+            - name: KOPIUR_RENEW_PERIOD_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .retryPeriodSeconds }}
+            - name: KOPIUR_RETRY_PERIOD_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             # The mover image the controller stamps into every Backup/Restore Job.
             - name: KOPIUR_MOVER_IMAGE

@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context as _;
 use futures::StreamExt;
 use kube::runtime::events::{Recorder, Reporter};
-use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::{WatchStreamExt, reflector, watcher};
 use kube::{Api, Client};
 
@@ -16,7 +16,7 @@ use kopiur_api::Maintenance;
 
 use crate::config;
 use crate::context::{Context, KopiaClientFactory};
-use crate::controllers::{scoped_api, spawn_all};
+use crate::controllers::{scoped_api, spawn_all, watcher_config};
 use crate::http::serve_http;
 use crate::leader;
 use crate::metrics::Metrics;
@@ -30,28 +30,48 @@ use crate::webhook_tls;
 /// immediately when streaming was not requested; otherwise probes the apiserver
 /// version and downgrades (with a warning) on a server that predates WatchList.
 ///
-/// A probe FAILURE fails **closed** (paged lists): with no version evidence at
-/// all — e.g. booting mid-outage — enabling streaming against a pre-1.32
-/// server would leave every watcher retrying an unsupported verb forever (an
-/// inert controller that also hammers the apiserver), while the cost on a
-/// modern server is only one process-lifetime without the optimization. An
-/// UNPARSEABLE version from a live apiserver still honors the request
-/// ([`watchlist_supported`]) — that's evidence of a server too new/odd to
-/// second-guess, not absence of evidence.
+/// A probe that ANSWERS with a pre-1.32 version fails **closed** (paged lists):
+/// kube cannot self-degrade from WatchList, so streaming against such a server
+/// would leave every watcher retrying an unsupported verb forever — an inert
+/// controller that also hammers the apiserver. An UNPARSEABLE version from a
+/// live apiserver still honors the request ([`watchlist_supported`]) — evidence
+/// of a server too new/odd to second-guess, not absence of evidence.
+///
+/// A probe that FAILS TO ANSWER fails **open** (honor the configured value).
+/// This used to fail closed too, and that was backwards: the probe runs moments
+/// after winning the Lease, so the restart most likely to hit it is one caused
+/// by control-plane congestion — and the fail-closed answer put ~50 watchers on
+/// the strictly more expensive paged path at exactly the wrong moment (#319's
+/// self-reinforcing restart loop). A transport failure is not evidence about the
+/// server's version, and a cluster whose chart floor is 1.32 is far likelier to
+/// support WatchList than not.
 async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     if !configured {
         return false;
     }
-    let (major, minor) = match client.apiserver_version().await {
-        Ok(info) => (info.major, info.minor),
-        Err(e) => {
+    // Bounded: this sits between acquiring the Lease and starting the watchers,
+    // so an unbounded probe against a stalled apiserver would hold the whole
+    // fan-out for the client's read timeout.
+    let probe = tokio::time::timeout(VERSION_PROBE_TIMEOUT, client.apiserver_version());
+    let (major, minor) = match probe.await {
+        Ok(Ok(info)) => (info.major, info.minor),
+        transport_failure => {
+            let why: Box<dyn std::fmt::Display> = match transport_failure {
+                Ok(Err(e)) => Box::new(e),
+                _ => Box::new(format!(
+                    "no response within {}s",
+                    VERSION_PROBE_TIMEOUT.as_secs()
+                )),
+            };
             tracing::warn!(
-                error = %e,
-                "apiserver version probe failed; using paged lists this run (fail closed — kube \
-                 cannot self-degrade from WatchList on a pre-1.32 server). Restart once the API \
-                 server is reachable to re-probe, or set streamingLists: false to silence this."
+                error = %why,
+                "apiserver version probe failed; keeping the configured streamingLists value \
+                 (fail open — a transport failure is not evidence about the server's version, \
+                 and downgrading ~50 watchers to paged lists is most expensive exactly when the \
+                 control plane is already struggling). Set streamingLists: false if your \
+                 apiserver predates 1.32."
             );
-            return false;
+            return configured;
         }
     };
     let supported = watchlist_supported(&major, &minor);
@@ -65,6 +85,10 @@ async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
     }
     supported
 }
+
+/// Bound on the startup `GET /version` probe. Short: it gates the watcher
+/// fan-out, and its answer is an optimization, not a correctness input.
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether a Kubernetes apiserver of the given `major.minor` version ships the
 /// WatchList feature (beta and on by default from 1.32). The version strings come
@@ -162,21 +186,31 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // if a provider is already installed (e.g. the webhook installed it).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // One inferred config, two clients (`Client::try_default` is exactly
-    // infer + try_from, so behavior is otherwise identical):
+    // One inferred config, three clients (`Client::try_default` is exactly
+    // infer + try_from, so behavior is otherwise identical). Each `Client` gets
+    // its own hyper connection pool, which is the whole point of splitting them:
     // - `client`: read/connect timeouts hardened (see the config consts — the
-    //   apiserver-outage fd fix). Everything rides this one.
+    //   apiserver-outage fd fix). Every watch and reconcile rides this one.
     // - `exec_client`: same connect timeout but NO read timeout, used ONLY for
     //   the hooks `workloadExec` attach — the exec WebSocket rides the same
     //   timeout-wrapped connector as unary calls, and a read timeout would
     //   kill any quiesce command that stays silent longer than the window.
+    // - `election_client`: SHORT read timeout, used ONLY for the Lease. Keeping
+    //   it off the shared pool means lease renewals do not multiplex over the
+    //   same HTTP/2 connection as 51 watches, and the short idle timeout turns a
+    //   wedged connection into a fast transport error (which evicts it) instead
+    //   of a five-minute silent stall. This is the load-bearing half of the #319
+    //   fix — see KUBE_CLIENT_ELECTION_READ_TIMEOUT.
     let mut kube_config = kube::Config::infer().await?;
     kube_config.connect_timeout = Some(config::KUBE_CLIENT_CONNECT_TIMEOUT);
     kube_config.read_timeout = Some(config::KUBE_CLIENT_READ_TIMEOUT);
     let client = Client::try_from(kube_config.clone())?;
-    let mut exec_config = kube_config;
+    let mut exec_config = kube_config.clone();
     exec_config.read_timeout = None;
     let exec_client = Client::try_from(exec_config)?;
+    let mut election_config = kube_config;
+    election_config.read_timeout = Some(config::KUBE_CLIENT_ELECTION_READ_TIMEOUT);
+    let election_client = Client::try_from(election_config)?;
     let metrics = Metrics::new();
 
     // The HTTP server (probes + /metrics) starts BEFORE the leader-election
@@ -196,16 +230,21 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     let leadership = match &config.leader_election {
         Some(le) => {
             let identity = leader_identity();
-            match leader::acquire(&client, le, &identity).await {
+            match leader::acquire(&election_client, le, &identity, Some(&metrics)).await {
                 leader::Acquired::Leading => Some((le.clone(), identity)),
                 leader::Acquired::Degraded => None,
             }
         }
         None => None,
     };
-    let leadership_lost = leadership
-        .as_ref()
-        .map(|(le, id)| leader::spawn_renewal(client.clone(), le.clone(), id.clone()));
+    let leadership_lost = leadership.as_ref().map(|(le, id)| {
+        leader::spawn_renewal(
+            election_client.clone(),
+            le.clone(),
+            id.clone(),
+            Some(metrics.clone()),
+        )
+    });
 
     let reporter = Reporter::from("kopiur-controller");
     let recorder = Recorder::new(client.clone(), reporter);
@@ -240,6 +279,14 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         None => KopiaClientFactory::new(),
     };
 
+    // Gate WatchList streaming lists on the apiserver version. kube's watcher does
+    // NOT fall back from WatchList to paged lists on its own — if streaming is on
+    // and the server lacks the feature, the initial `sendInitialEvents` watch fails
+    // and the watcher retries the streaming path forever instead of degrading. So
+    // resolve it here: on a server that predates WatchList (beta, on by default
+    // from 1.32) we force paged lists regardless of config.
+    let streaming_lists = effective_streaming_lists(&client, config.streaming_lists).await;
+
     // Shared Maintenance informer: a single reflector-backed cache the
     // Repository/ClusterRepository reconcilers read to answer "is a Maintenance
     // configured for me?" without an `Api::list` per reconcile. We drive the
@@ -254,6 +301,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         let reader = maintenance_store.clone();
         let synced = maintenance_synced.clone();
         let api: Api<Maintenance> = scoped_api(&client, &config.watch_scope);
+        let informer_cfg = watcher_config(streaming_lists);
         tokio::spawn(async move {
             // Flip the flag as soon as the reflector reports its first sync.
             let mark_ready = async move {
@@ -266,7 +314,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
             };
             // Drive the watch → reflector store forever (with backoff on errors).
             let drive = async move {
-                let stream = reflector(maintenance_writer, watcher(api, WatcherConfig::default()))
+                let stream = reflector(maintenance_writer, watcher(api, informer_cfg))
                     .default_backoff()
                     .touched_objects();
                 futures::pin_mut!(stream);
@@ -322,14 +370,6 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
 
     tracing::info!("starting kopiur controllers");
 
-    // Gate WatchList streaming lists on the apiserver version. kube's watcher does
-    // NOT fall back from WatchList to paged lists on its own — if streaming is on
-    // and the server lacks the feature, the initial `sendInitialEvents` watch fails
-    // and the watcher retries the streaming path forever instead of degrading. So
-    // resolve it here: on a server that predates WatchList (beta, on by default
-    // from 1.32) we force paged lists regardless of config.
-    let streaming_lists = effective_streaming_lists(&client, config.streaming_lists).await;
-
     // Backstop GC for mover work-spec ConfigMaps whose Job is already gone
     // (TTL-reaped before the reconciler observed it, or left behind by operator
     // versions that never deleted them). Leader-only, like everything below the
@@ -354,30 +394,92 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         "per-controller reconcile concurrency configured (None = unbounded)"
     );
 
-    match leadership_lost {
-        Some(lost) => {
-            tokio::select! {
-                _ = controllers => tracing::warn!("all controllers exited"),
-                r = http_srv => tracing::warn!(?r, "http server exited"),
-                _ = lost => {
-                    // Continuing to reconcile without the Lease would be a
-                    // split-brain double-reconcile; exit non-zero so the pod
-                    // restarts and re-enters the election.
-                    anyhow::bail!("leader lease lost; exiting to re-elect");
-                }
-                _ = shutdown_signal() => {
-                    // Graceful shutdown while leading: release the Lease so
-                    // the successor claims it immediately, instead of every
-                    // rolling upgrade stalling reconciliation for the full
-                    // lease duration while the dead holder's Lease ages out.
-                    tracing::info!("shutdown signal received; releasing leader lease");
-                    if let Some((le, id)) = &leadership {
-                        leader::release(&client, le, id).await;
+    match (leadership_lost, &leadership) {
+        (Some(renewal), Some((le, id))) => {
+            // Pinned, not moved into `select!`: on a survivable loss we re-enter
+            // the select rather than returning, and dropping these would tear
+            // down every informer — the cold-start re-LIST this path exists to
+            // avoid.
+            tokio::pin!(controllers);
+            tokio::pin!(http_srv);
+            let mut renewal = renewal;
+
+            loop {
+                let joined = tokio::select! {
+                    _ = &mut controllers => { tracing::warn!("all controllers exited"); break; }
+                    r = &mut http_srv => { tracing::warn!(?r, "http server exited"); break; }
+                    joined = &mut renewal => joined,
+                    _ = shutdown_signal() => {
+                        // Graceful shutdown while leading: release the Lease so
+                        // the successor claims it immediately, instead of every
+                        // rolling upgrade stalling reconciliation for the full
+                        // lease duration while the dead holder's Lease ages out.
+                        tracing::info!("shutdown signal received; releasing leader lease");
+                        leader::release(&election_client, le, id).await;
+                        break;
+                    }
+                };
+                let lost = joined.context("the leader renewal task panicked")?;
+
+                match lost {
+                    // A peer verifiably holds the Lease. There is nothing to
+                    // re-take and continuing would be a split-brain
+                    // double-reconcile; exit non-zero and let the pod restart
+                    // into the standby path.
+                    leader::LeadershipLost::ToPeer { holder } => anyhow::bail!(
+                        "leader lease lost to {}; exiting to re-elect",
+                        holder.as_deref().unwrap_or("another replica")
+                    ),
+
+                    // We only lost CONTACT. If a peer exists it may already have
+                    // claimed the Lease, so exiting is the only safe move. If we
+                    // are provably alone there is nobody to split-brain with, and
+                    // restarting would cost a full cluster-wide re-LIST for
+                    // nothing — re-campaign in place instead.
+                    leader::LeadershipLost::RenewFailed {
+                        attempts,
+                        last_error,
+                        safe_until,
+                    } => {
+                        tracing::warn!(
+                            attempts,
+                            last_error = %last_error,
+                            "leader lease renewal failed; re-confirming our hold within the \
+                             remaining margin instead of restarting outright"
+                        );
+                        // NOT `acquire`. The reconcilers are still running, so
+                        // standing by behind a peer — which is what acquire does
+                        // — would reconcile underneath whoever now leads, and do
+                        // it indefinitely. `reconfirm` instead PROVES the Lease
+                        // never left our hands (any takeover overwrites
+                        // holderIdentity, and we wrote nothing meanwhile).
+                        //
+                        // `safe_until` is the instant a standby may first claim,
+                        // measured from our last SUCCESSFUL renew — NOT a fresh
+                        // interval from now. The failed round already spent most
+                        // of it, so only the const-asserted margin is left. A
+                        // fresh interval would run past the point the invariant
+                        // protects, which is the whole thing it exists to stop.
+                        match leader::reconfirm(&election_client, le, id, safe_until).await {
+                            leader::Reconfirmed::StillOurs => {
+                                renewal = leader::spawn_renewal(
+                                    election_client.clone(),
+                                    le.clone(),
+                                    id.clone(),
+                                    Some(metrics.clone()),
+                                );
+                            }
+                            leader::Reconfirmed::Lost(why) => anyhow::bail!(
+                                "leader lease renewal failed after {attempts} attempt(s) \
+                                 ({last_error}), and our hold could not be re-confirmed: \
+                                 {why} — exiting to re-elect"
+                            ),
+                        }
                     }
                 }
             }
         }
-        None => {
+        _ => {
             tokio::select! {
                 _ = controllers => tracing::warn!("all controllers exited"),
                 r = http_srv => tracing::warn!(?r, "http server exited"),
@@ -604,10 +706,20 @@ mod tests {
             )
         });
         let client = kube::Client::new(svc, "test-ns");
+        // DELIBERATE REVERSAL (#319). This used to assert fail-closed. The probe
+        // runs moments after winning the Lease, so the restart most likely to hit
+        // a failing probe is one caused by control-plane congestion — and the old
+        // answer put every watcher on the strictly more expensive paged path at
+        // exactly that moment, feeding the restart loop. A transport failure says
+        // nothing about the server's VERSION, which is the only thing being
+        // decided here.
         assert!(
-            !super::effective_streaming_lists(&client, true).await,
-            "a failed version probe must downgrade to paged lists (fail closed)"
+            super::effective_streaming_lists(&client, true).await,
+            "a probe that fails to ANSWER must keep the configured value (fail open)"
         );
-        assert!(!super::effective_streaming_lists(&client, false).await);
+        assert!(
+            !super::effective_streaming_lists(&client, false).await,
+            "an explicit streamingLists: false is still honored"
+        );
     }
 }

@@ -135,8 +135,47 @@ pub async fn reconcile(restore: Arc<Restore>, ctx: Arc<Context>) -> Result<Actio
     // The Restore lifecycle phase is a store-backed observable gauge
     // (`kopiur_resource_phase`, see
     // [`crate::metrics::Metrics::register_resource_observers`]); nothing to mirror
-    // here. Restore *duration* is still recorded at the Job-completion site.
+    // here.
+    //
+    // Duration is a different story, and was the one gauge in the whole crate
+    // that could never survive a restart: it is an imperative gauge written once
+    // at the Job-completion site, and a finished Restore never re-runs its mover,
+    // so the series vanished for good on every process restart. Re-derive it from
+    // the pinned status timing instead.
+    reseed_restore_duration(&restore, &ctx);
     result
+}
+
+/// Re-derive `kopiur_restore_duration_seconds` from `status.timing` so the series
+/// survives a controller restart.
+///
+/// Mirrors how the policy reconciler re-seeds
+/// `kopiur_snapshot_verified_timestamp_seconds` from `status.lastVerified`: the
+/// CR is the durable record, the gauge is just a projection of it. Silent on
+/// anything missing or malformed — an absent series is honest, a wrong one is not.
+fn reseed_restore_duration(restore: &Restore, ctx: &Context) {
+    let Some(namespace) = restore.namespace() else {
+        return;
+    };
+    let Some(timing) = restore.status.as_ref().and_then(|s| s.timing.as_ref()) else {
+        return;
+    };
+    let (Some(start), Some(end)) = (timing.start_time.as_deref(), timing.end_time.as_deref())
+    else {
+        return;
+    };
+    let (Some(start), Some(end)) = (
+        crate::snapshot_policy::rfc3339_unix_secs(start),
+        crate::snapshot_policy::rfc3339_unix_secs(end),
+    ) else {
+        return;
+    };
+    // A negative duration means clock skew between the mover pod and whatever
+    // wrote startTime; publishing it would be worse than publishing nothing.
+    if let Some(secs) = end.checked_sub(start).filter(|s| *s >= 0) {
+        ctx.metrics
+            .set_restore_duration(&namespace, &restore.name_any(), secs);
+    }
 }
 
 async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {

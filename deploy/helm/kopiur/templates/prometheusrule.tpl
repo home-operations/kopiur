@@ -122,4 +122,29 @@ spec:
           annotations:
             summary: "High reconcile error rate for {{`{{ $labels.kind }}`}}"
             description: "kopiur controller is erroring on {{`{{ $labels.kind }}`}} reconciles (>0.2/s over 10m)."
+        # Leader-election health (issue #319). A leader that keeps losing and
+        # re-taking the Lease reconciles almost nothing: each transition costs a
+        # full informer resync, and while it resyncs, schedules do not fire.
+        # Before these metrics existed this was only visible by grepping logs.
+        - alert: KopiurLeaderElectionFlapping
+          # One transition per process start is normal; more than two in an hour
+          # is not a rolling upgrade, it is a leader that cannot hold the Lease.
+          expr: increase(kopiur_leader_transitions_total[1h]) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "kopiur leader election is flapping"
+            description: "The kopiur controller has acquired the leader Lease {{`{{ $value }}`}} times in the last hour. Each transition costs a full informer resync, so reconciliation is stalling repeatedly. Check kopiur_leader_renew_duration_seconds and kopiur_leader_renew_failures_total for whether the API server, the network, or APF queueing is the cause."
+        - alert: KopiurLeaderRenewSlow
+          # The renew window is 10s. A p99 above 2s means the election is running
+          # on a quarter of its budget — the leading indicator of the flapping
+          # alert above, and the one worth catching first.
+          expr: histogram_quantile(0.99, sum by (le) (rate(kopiur_leader_renew_duration_seconds_bucket[10m]))) > 2
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "kopiur leader Lease renewals are slow"
+            description: "p99 Lease renew latency is {{`{{ $value }}`}}s against a 10s renew window. Healthy is single-digit milliseconds. If the API server is otherwise fine, the operator's lease traffic is most likely queueing in API Priority and Fairness — check that the kopiur FlowSchema exists (leaderElection.flowSchema.enabled)."
 {{- end }}

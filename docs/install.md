@@ -214,9 +214,30 @@ top-level values tune the controller's runtime footprint and API-server load
 | Value | Default | What it does |
 |---|---|---|
 | `workerThreads` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
-| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists on a pre-1.32 apiserver — or when the startup version probe fails. |
+| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
 | `reconcileConcurrency` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
 | `maxConcurrentDeleteJobs` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
+| `leaderElection.flowSchema.enabled` | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |
+
+/// note | Why the chart ships a FlowSchema
+
+Kubernetes' built-in `system-leader-election` FlowSchema routes lease renewals
+into a guaranteed priority level whose concurrency is never lent away — but it
+matches only `kube-controller-manager`, `kube-scheduler`, and ServiceAccounts in
+`kube-system`. An operator in its own namespace falls through to
+`service-accounts` → `workload-low`, where its lease renewals queue behind every
+other ServiceAccount's bulk traffic in the cluster. On one production cluster the
+p99 queue wait differed by ~360× between the two lanes, and the controller was
+restarting roughly fifteen times a day as a result.
+
+The chart therefore ships a `FlowSchema` scoping **only** the operator's
+`leases` get/create/update calls into the built-in `leader-election` level.
+Set `leaderElection.flowSchema.enabled: false` if APF is disabled on your
+cluster, or if you cannot create cluster-scoped
+`flowcontrol.apiserver.k8s.io` objects. Kopiur runs correctly without it — the
+renew loop tolerates a congested lane, it just has less headroom.
+
+///
 
 /// note | Why reconcileConcurrency is bounded by default
 

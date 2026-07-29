@@ -382,12 +382,140 @@ transient requeue; 5s connect / 305s read client timeouts (exec streams exempt);
 a deadline on each leader renew attempt; a fail-closed streamingLists probe; and
 an `RLIMIT_NOFILE` soft→hard raise.
 
-**Deliberately unchanged:** exit-on-lost-lease (abdicating and restarting beats a
-split-brain double-reconcile; bounded concurrency makes each restart's re-list
-cheap); hooks staying inline on the reconcile slot (detaching them would stretch
-the app's quiesce window across requeues — the slot-hold is bounded by the hook
-timeout, the kopia timeout, and cap sizing); and the axum accept loop (axum 0.8
-already sleeps 1s and retries on `EMFILE`, matching the incident logs' cadence).
+**Deliberately unchanged:** hooks staying inline on the reconcile slot (detaching
+them would stretch the app's quiesce window across requeues — the slot-hold is
+bounded by the hook timeout, the kopia timeout, and cap sizing); and the axum
+accept loop (axum 0.8 already sleeps 1s and retries on `EMFILE`, matching the
+incident logs' cadence).
+
+`exit-on-lost-lease` was also listed here as deliberately unchanged. Issue #319
+showed why that was too broad — see below.
+
+## Leader election: the renew budget (#319)
+
+The "deadline on each leader renew attempt" above was necessary but wrong on its
+own, and the follow-up is worth recording because the failure was subtle.
+
+`RENEW_DEADLINE` was used as **both** the per-attempt `timeout` **and** the
+abdication budget, with the inter-attempt `sleep(RENEW_PERIOD)` charged against
+that same budget. A stalled attempt therefore tripped its timeout at
+`RENEW_PERIOD + RENEW_DEADLINE`, which is unconditionally past the budget — so
+the `delay = RETRY_PERIOD` retry branch was **dead code for every slow failure**.
+Fast failures (403, connection refused) retried; slow ones abdicated on the first
+occurrence. The failure mode the loop handled worst was the common one.
+
+In production that was ~15 process suicides a day off ordinary API latency, each
+costing a full cluster-wide informer re-LIST — which is itself load, making the
+next stall likelier.
+
+Two fixes, and **both are required**:
+
+1. **The budget is a window, not an attempt timeout.** A round opens a
+   `RENEW_DEADLINE` window, retries every `RETRY_PERIOD` inside it, and bounds
+   each attempt by `min(RENEW_ATTEMPT_TIMEOUT, remaining)` so no attempt can
+   outspend the budget it draws from nor swallow it whole. The inter-round sleep
+   sits outside the window. This is client-go's `wait.Until(renewRound,
+   RetryPeriod)` shape. `RENEW_PERIOD` dropped 5s → 2s so worst-case abdication
+   (12s) has real margin under `LEASE_DURATION` (15s); a `const` assertion now
+   enforces that rather than a test.
+
+2. **Election traffic gets its own client.** This is the load-bearing half, and
+   the non-obvious one: `tokio::time::timeout` only drops the request *future* —
+   it does **not** evict the wedged HTTP/2 connection from hyper's pool, so
+   retries would go straight back onto it. Only a *transport* error evicts a
+   connection. Lease traffic now rides a dedicated `kube::Client` whose short
+   `read_timeout` (5s, vs the shared client's watch-sized 305s) produces exactly
+   that error. `RENEW_ATTEMPT_TIMEOUT` is deliberately larger so the transport
+   error wins the race.
+
+Supporting evidence for (2): during the incident the operator logged 90 "the API
+server accepted the connection but never answered" abdications in six days, while
+the apiserver's own APF wait histogram showed **zero** requests waiting >5s in any
+priority level over the same window. The requests never reached it. The log
+message has been reworded accordingly — it was blaming the wrong component.
+
+Separately, Kopiur's ServiceAccount lives outside `kube-system`, so the built-in
+`system-leader-election` FlowSchema does not match it and its lease renewals fall
+into `workload-low` alongside every other ServiceAccount's bulk traffic. The
+chart now ships an opt-out `FlowSchema` putting `leases` get/create/update into
+the guaranteed `leader-election` priority level.
+
+**Exit-on-lost-lease, revisited.** Losing the Lease is now two cases, not one.
+`LeadershipLost::ToPeer` — a foreign holder was *observed* — still exits; there is
+nothing to re-take. `LeadershipLost::RenewFailed` means only that contact was
+lost, and the process may keep its informer caches warm instead of paying a full
+cold start. The chart default is `replicaCount: 1`, where the old unconditional
+exit bought no split-brain protection at all.
+
+What makes that safe is `leader::reconfirm`, and it is a proof rather than an
+inference: any takeover must overwrite `holderIdentity`, and this replica writes
+nothing between losing contact and re-confirming — so observing our own identity
+still on the Lease *proves* no peer claimed in the interval. Identity is the pod
+name, so two live pods cannot collide on it. A foreign holder, an unheld Lease or
+a deleted Lease are all unprovable and therefore fatal. Because the proof does not
+depend on how many replicas exist, this is correct under HA too.
+
+**The budget is the margin, not a fresh interval.** `reconfirm` is bounded by the
+instant a standby may FIRST claim — one `lease_duration` after our last
+*successful* renew. The failed renew round already spent `renew_period +
+renew_deadline` of that, so what is left is exactly the const-asserted margin
+(~3s at the defaults). An earlier revision measured a fresh `lease_duration` from
+*now*, which ran ~12s past the point the invariant protects: the const assertion
+guarantees abdication at 12s precisely BECAUSE a peer cannot claim until 15s, and
+restarting the clock discarded that guarantee while the reconcilers kept running.
+Three seconds is small, but it is the honest number, and it is enough for the
+failure this exists to absorb — a poisoned connection whose replacement connects
+in milliseconds.
+
+A revision in between gated all of this on a "sole replica" pod count. That was
+both weaker and actively harmful: weaker because it is point-in-time (a peer can
+start the instant after it answers — a rollout does exactly that), and harmful
+because its GET + LIST spent the very margin that is the safety property. The
+proof above supersedes it entirely.
+
+This is deliberately not `acquire`. Acquire stands by when a peer leads, which is
+right for a process that holds nothing and runs nothing — but on this path the
+reconcilers are still running, so standing by would reconcile underneath the new
+leader indefinitely. `reconfirm` is bounded by one lease duration and then gives
+up; the residual exposure is that bound, during which reconciles keep running as
+they already did through the failed renew window.
+
+### Breaking the restart→re-LIST→restart loop
+
+Each abdication cost a full cold start, and a cold start is itself the load that
+makes the next stall likelier. kube-rs shares no informers between `Controller`s,
+so every `.owns`/`.watches` is its own LIST+WATCH — Kopiur registers ~50 of them
+in cluster scope, all firing at once, with no client-side rate limiting anywhere
+(kube-rs ships none). Three changes cut what a restart costs:
+
+- **`ListSemantic::Any` on every watcher config** (`controllers::watcher_config`).
+  kube-runtime defaults to `MostRecent`, so with streaming off each initial LIST
+  was an etcd quorum read rather than a watch-cache read — ~50 of them at once.
+  Safe because reconcilers are level-triggered and idempotent and the watch
+  stream immediately corrects any staleness; this is what client-go's informers
+  do by default.
+- **The apiserver version probe now fails OPEN on a transport failure.** It ran
+  moments after winning the Lease, so the restart most likely to hit a failing
+  probe was one caused by congestion — and failing closed put every watcher on
+  the *more* expensive paged path at exactly that moment. A pre-1.32 ANSWER still
+  fails closed; that is a real version fact, a timeout is not. The probe is also
+  bounded now.
+- **The sweep's Snapshot read is paginated** (`sweep::list_all_snapshots`). It was
+  one unbounded, unpaginated, cluster-wide full-object LIST running 60s after
+  every start. Paginated rather than `.limit()`ed on purpose: completeness is
+  load-bearing (`finalizer_holding_snapshot_uids` SPARES batch delete Jobs, so a
+  silently truncated read would reap Jobs that are still needed).
+
+Also fixed: the standalone Maintenance informer built its own
+`WatcherConfig::default()` and so silently opted out of `streamingLists`. Both it
+and the controller fan-out now share `controllers::watcher_config`.
+
+**Not done, deliberately.** Deduplicating the watchers themselves (7× `Repository`,
+7× `ClusterRepository`) needs kube's shared streams, which are behind the
+`unstable-runtime-subscribe` feature. Opting a backup operator into an explicitly
+unstable API is a decision worth taking on its own merits, not as a rider on an
+availability fix. `ListSemantic::Any` removes the dominant per-LIST cost in the
+meantime.
 
 ## See also
 

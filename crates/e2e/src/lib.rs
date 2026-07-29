@@ -162,6 +162,54 @@ pub async fn flap_apiserver(kills: u32, gap: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SIGSTOP the kind node's kube-apiserver for `hold`, then SIGCONT it.
+///
+/// Deliberately a different disruption from [`flap_apiserver`], which is why
+/// both exist. Killing the apiserver drops connections, so the client sees a
+/// FAST error — that path always worked. A stopped apiserver keeps every TCP
+/// connection open and simply stops answering, which is the shape of #319: the
+/// controller abdicated on the first slow renew because the renew budget was
+/// spent by a single attempt, and the log ("the API server accepted the
+/// connection but never answered") described exactly this.
+///
+/// `hold` should sit between the renew retry cadence and the renew window, so a
+/// correct leader rides it out and a regressed one abdicates.
+pub async fn stall_apiserver(hold: Duration) -> anyhow::Result<()> {
+    let node = consts::KIND_CONTROL_PLANE_CONTAINER;
+    let signal = |sig: &'static str| async move {
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", node, "pkill", sig, "-f", "kube-apiserver"])
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "could not run `docker exec {node} pkill {sig}`: {e} — the apiserver-stall \
+                     scenario needs host docker access to the kind node (is this the e2e \
+                     harness host?)"
+                )
+            })?;
+        // 1 = no matching process. On SIGCONT that would mean we just stranded a
+        // stopped apiserver, so treat it as fatal rather than press on.
+        match out.status.code() {
+            Some(0) => Ok(()),
+            code => anyhow::bail!(
+                "`docker exec {node} pkill {sig} -f kube-apiserver` failed (exit {code:?}): {} \
+                 — is the kind cluster `kopiur-e2e` running?",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        }
+    };
+
+    eprintln!("[stall_apiserver] SIGSTOP for {hold:?}");
+    signal("-STOP").await?;
+    tokio::time::sleep(hold).await;
+    // Resume even if something above went wrong mid-hold: leaving the control
+    // plane stopped would break every scenario that follows in this shard.
+    let resumed = signal("-CONT").await;
+    eprintln!("[stall_apiserver] SIGCONT");
+    resumed
+}
+
 /// Ensure a `Namespace` named `ns` exists (idempotent: a 409 Conflict is treated
 /// as success). Used by the cross-namespace scenarios that run a workload + Snapshot
 /// in a namespace separate from the operator's.
