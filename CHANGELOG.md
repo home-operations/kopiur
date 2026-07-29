@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.1](https://github.com/home-operations/kopiur/compare/0.9.0...0.9.1) (2026-07-29)
+
+
+### Features
+
+* **rust:** update crate http (1.4.2 → 1.5.0) ([#323](https://github.com/home-operations/kopiur/issues/323)) ([cf0b149](https://github.com/home-operations/kopiur/commit/cf0b14938c6d0f34e7c0dfd0e7520a6c5f1d0fbf))
+
+
+### Bug Fixes
+
+* **controller:** survive a slow API server instead of abdicating on the first one ([#319](https://github.com/home-operations/kopiur/issues/319)) ([#324](https://github.com/home-operations/kopiur/issues/324)) ([df7e90c](https://github.com/home-operations/kopiur/commit/df7e90cbef115f95e6d3ea5cef9d2de1d118d8f6))
+* **rust:** update crate rustls (0.23.42 → 0.23.43) ([#326](https://github.com/home-operations/kopiur/issues/326)) ([2f5123e](https://github.com/home-operations/kopiur/commit/2f5123ee7576e5d07a23373d0d47f2161342b95b))
+
+
+### Tests
+
+* **e2e:** retry flaky tests with cargo-nextest ([#322](https://github.com/home-operations/kopiur/issues/322)) ([558ac85](https://github.com/home-operations/kopiur/commit/558ac85d837148381c19bdbae1ff1cb1c4470156))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update tool aqua:astral-sh/uv (0.11.33 → 0.12.0) ([#320](https://github.com/home-operations/kopiur/issues/320)) ([66ec350](https://github.com/home-operations/kopiur/commit/66ec350e349a54c4d8c7abaf9cb5a3844e18566c))
+* **mise:** Update tool node (24.18.0 → v24.18.1) ([#325](https://github.com/home-operations/kopiur/issues/325)) ([1c833a4](https://github.com/home-operations/kopiur/commit/1c833a4e5eed2816445b102b5e1003a0d470357e))
+
 ## [0.9.0](https://github.com/home-operations/kopiur/compare/0.8.1...0.9.0) (2026-07-28)
 
 
