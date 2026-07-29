@@ -218,12 +218,20 @@ jobs:
           - shard: leader-election
             bins: "leader_election"
             backends: false
-          # API-server-flap resilience (the 2026-07 EMFILE incident): kills the
-          # kind kube-apiserver process repeatedly under a seeded fleet, then
-          # asserts the controller survives (no EMFILE in logs, bounded
-          # restarts/lease transitions) and converges (a post-flap backup
-          # Succeeds). Own shard: it takes the control plane down, which no
-          # other test may race.
+          # API-server disruption resilience, two scenarios:
+          #   flap  (the 2026-07 EMFILE incident) — kills the kind
+          #         kube-apiserver repeatedly under a seeded fleet; the
+          #         controller must survive (no EMFILE in logs, bounded
+          #         restarts/lease transitions) and converge (a post-flap
+          #         backup Succeeds).
+          #   stall (#319) — SIGSTOPs the apiserver for a hold inside the renew
+          #         window; leadership must be RETAINED with zero abdications,
+          #         transitions or restarts. A killed apiserver gives fast
+          #         errors, which the pre-fix renew loop handled — only a STALL
+          #         reproduces #319, which is why flap ran green all through
+          #         that incident.
+          # Own shard: it takes the control plane down, which no other test may
+          # race.
           - shard: apiserver-flap
             bins: "apiserver_flap"
             backends: false

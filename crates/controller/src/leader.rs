@@ -17,12 +17,15 @@
 //!   against ours — inter-node clock skew must not let a standby steal a live
 //!   leader's Lease. The cost: a fresh process waits out one full lease
 //!   duration before claiming a stale Lease (client-go does the same).
-//! - **Renew deadline < lease duration.** A leader that cannot renew abdicates
-//!   once [`RENEW_DEADLINE`] (10s) passes without a successful write — always
-//!   BEFORE any standby may consider the 15s Lease expired, so the "both sides
-//!   reconcile" window cannot exist. Renew attempts retry on the short
-//!   [`RETRY_PERIOD`] within that deadline, so one transient blip never
-//!   abdicates.
+//! - **Renew window < lease duration.** [`RENEW_DEADLINE`] (10s) is a budget
+//!   for a whole ROUND of attempts, not one attempt's timeout: a round retries
+//!   on [`RETRY_PERIOD`] until it succeeds or the window closes, and each
+//!   attempt is bounded by what is LEFT of the window so it can never outspend
+//!   the budget it draws from. Only a full window with no successful write
+//!   abdicates — always BEFORE any standby may consider the 15s Lease expired,
+//!   so the "both sides reconcile" window cannot exist. The `RENEW_PERIOD`
+//!   sleep between successful rounds sits deliberately OUTSIDE the budget;
+//!   folding it in is what made one 10s hiccup fatal in #319.
 //! - **Loss is verified, not inferred.** A rejected renew (CAS 409) re-observes
 //!   the Lease before concluding anything: if the holder is still us it was a
 //!   spurious concurrent write (someone `kubectl annotate`d the Lease) and the
@@ -36,10 +39,16 @@
 //!   every already-released chart stamps `--leader-elect=true` while granting
 //!   no leases RBAC, so a fatal 403 would break plain image-only upgrades —
 //!   and degrading is exactly the previous release's (no-election) behavior.
-//! - [`spawn_renewal`]'s task completes **only when leadership is lost**; the
-//!   caller treats that as fatal and exits (restart re-enters the election).
-//!   Failing fast beats a split-brain double-reconcile: a duplicated mover Job
-//!   is a real cost, a pod restart is not.
+//! - [`spawn_renewal`]'s task completes **only when leadership is lost**, and
+//!   reports WHICH way via [`LeadershipLost`]. The caller must stop reconciling
+//!   immediately either way; what it does next depends on the variant.
+//!   [`LeadershipLost::ToPeer`] means a peer verifiably leads, so the only
+//!   correct move is to exit. [`LeadershipLost::RenewFailed`] means we merely
+//!   lost contact — if this replica is provably alone there is nobody to
+//!   split-brain with, so it re-campaigns in process and keeps its informer
+//!   caches warm instead of paying a full cold-start re-LIST (see
+//!   `startup.rs`). A duplicated mover Job is a real cost; so is a restart
+//!   storm that re-LISTs the whole cluster fifteen times a day.
 //! - [`release`] clears the holder on graceful shutdown so the successor
 //!   claims the Lease immediately instead of waiting out the full duration on
 //!   every rolling upgrade.
@@ -56,20 +65,66 @@ use k8s_openapi::jiff::Timestamp;
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 
-use crate::config::LeaderElection;
+use crate::config::{LeaderElection, LeaseTimings};
 
 /// How long a held Lease is honored without an observed change before another
 /// replica may claim it. Upstream (client-go / controller-runtime) default.
 pub const LEASE_DURATION: Duration = Duration::from_secs(15);
-/// How long the leader tolerates failed renews before abdicating. Strictly
-/// less than [`LEASE_DURATION`]: the deposed leader must stop reconciling
-/// BEFORE any standby may consider the Lease expired.
+/// The renew WINDOW: how long a leader keeps retrying a failed renew before
+/// abdicating. Strictly less than [`LEASE_DURATION`] — the deposed leader must
+/// stop reconciling BEFORE any standby may consider the Lease expired.
+///
+/// This is a budget for a whole round of attempts, NOT a single attempt's
+/// timeout. See [`renew_round`] for why conflating the two is a bug.
 pub const RENEW_DEADLINE: Duration = Duration::from_secs(10);
-/// Cadence at which a healthy leader re-stamps `renewTime`. Comfortably inside
-/// [`RENEW_DEADLINE`] so a single missed tick still leaves retry room.
-pub const RENEW_PERIOD: Duration = Duration::from_secs(5);
-/// Cadence for standby re-checks and for renew retries after a failure.
+/// Cadence at which a healthy leader re-stamps `renewTime`, slept BETWEEN
+/// successful rounds and deliberately outside the [`RENEW_DEADLINE`] budget.
+pub const RENEW_PERIOD: Duration = Duration::from_secs(2);
+/// Cadence for standby re-checks and for renew retries inside a round.
 pub const RETRY_PERIOD: Duration = Duration::from_secs(2);
+/// Cap on ONE renew attempt, independent of how much of the window is left.
+///
+/// Without it a hung attempt swallows the entire [`RENEW_DEADLINE`] budget and
+/// the round makes exactly one connection attempt — useless precisely when it
+/// matters, because replacing a wedged connection requires trying again.
+///
+/// Must exceed [`crate::config::KUBE_CLIENT_ELECTION_READ_TIMEOUT`] so a real
+/// transport error wins this race: a transport error EVICTS the poisoned
+/// connection from hyper's pool, whereas this timeout only drops the request
+/// future and leaves the connection sitting there to swallow the retry too.
+pub const RENEW_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+/// Bound on one campaign attempt in [`acquire`]. Not a correctness bound the
+/// way [`RENEW_DEADLINE`] is — nothing is at risk while we are not leading —
+/// but without it a stalled apiserver holds the pod not-ready for the client's
+/// full read timeout (minutes) instead of retrying on the standby cadence.
+pub const CAMPAIGN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the best-effort [`release`]. Deliberately short: release runs in the
+/// SIGTERM path, and overrunning `terminationGracePeriodSeconds` gets the
+/// process SIGKILLed with the Lease still held — the successor then waits out a
+/// full [`LEASE_DURATION`], which is the exact stall release exists to prevent.
+pub const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The no-split-brain invariant, enforced at compile time rather than left to a
+// test: worst-case abdication is one full RENEW_PERIOD sleep plus one full
+// RENEW_DEADLINE window, and that must land strictly inside LEASE_DURATION or a
+// standby could claim the Lease while the old leader is still reconciling.
+const _: () = assert!(
+    RENEW_PERIOD.as_millis() + RENEW_DEADLINE.as_millis() < LEASE_DURATION.as_millis(),
+    "RENEW_PERIOD + RENEW_DEADLINE must be < LEASE_DURATION (see the module docs)"
+);
+const _: () = assert!(
+    RETRY_PERIOD.as_millis() < RENEW_DEADLINE.as_millis(),
+    "RETRY_PERIOD must fit inside the renew window or a round gets one attempt"
+);
+const _: () = assert!(
+    RENEW_ATTEMPT_TIMEOUT.as_millis() < RENEW_DEADLINE.as_millis(),
+    "one attempt must not be able to consume the whole renew window"
+);
+const _: () = assert!(
+    RENEW_ATTEMPT_TIMEOUT.as_millis()
+        > crate::config::KUBE_CLIENT_ELECTION_READ_TIMEOUT.as_millis(),
+    "a transport error must beat this timeout — only the former evicts the connection"
+);
 
 /// What this replica should do about the Lease it just observed. Pure output
 /// of [`decide`]; the IO layer maps it onto create/replace calls.
@@ -145,6 +200,7 @@ async fn act_on_observation(
     identity: &str,
     observed: Option<Lease>,
     observed_unchanged_for: Duration,
+    timings: LeaseTimings,
 ) -> kube::Result<bool> {
     let now = Timestamp::now();
     match observed {
@@ -154,7 +210,7 @@ async fn act_on_observation(
                     name: Some(lease_name.to_string()),
                     ..Default::default()
                 },
-                spec: Some(claimed_spec(identity, now, 1)),
+                spec: Some(claimed_spec(identity, now, 1, timings.lease_duration)),
             };
             match api.create(&PostParams::default(), &lease).await {
                 Ok(_) => Ok(true),
@@ -166,7 +222,12 @@ async fn act_on_observation(
         Some(mut lease) => {
             let spec = lease.spec.clone().unwrap_or_default();
             let holder = spec.holder_identity.as_deref();
-            match decide(holder, identity, observed_unchanged_for, LEASE_DURATION) {
+            match decide(
+                holder,
+                identity,
+                observed_unchanged_for,
+                timings.lease_duration,
+            ) {
                 Decision::Standby => Ok(false),
                 Decision::Renew => {
                     let mut renewed = spec;
@@ -183,7 +244,12 @@ async fn act_on_observation(
                 }
                 Decision::Claim => {
                     let transitions = spec.lease_transitions.unwrap_or(0) + 1;
-                    lease.spec = Some(claimed_spec(identity, now, transitions));
+                    lease.spec = Some(claimed_spec(
+                        identity,
+                        now,
+                        transitions,
+                        timings.lease_duration,
+                    ));
                     match api
                         .replace(lease_name, &PostParams::default(), &lease)
                         .await
@@ -218,10 +284,15 @@ fn lease_view(lease: &Option<Lease>) -> (Option<String>, Option<Timestamp>) {
     }
 }
 
-fn claimed_spec(identity: &str, now: Timestamp, transitions: i32) -> LeaseSpec {
+fn claimed_spec(
+    identity: &str,
+    now: Timestamp,
+    transitions: i32,
+    lease_duration: Duration,
+) -> LeaseSpec {
     LeaseSpec {
         holder_identity: Some(identity.to_string()),
-        lease_duration_seconds: Some(LEASE_DURATION.as_secs() as i32),
+        lease_duration_seconds: Some(lease_duration.as_secs() as i32),
         acquire_time: Some(MicroTime(now)),
         renew_time: Some(MicroTime(now)),
         lease_transitions: Some(transitions),
@@ -245,7 +316,12 @@ pub enum Acquired {
 /// Block until this replica holds the election Lease (or the RBAC to elect is
 /// missing — see [`Acquired::Degraded`]). Other API errors are transient (API
 /// server restart, network) and retried on the standby cadence.
-pub async fn acquire(client: &Client, cfg: &LeaderElection, identity: &str) -> Acquired {
+pub async fn acquire(
+    client: &Client,
+    cfg: &LeaderElection,
+    identity: &str,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Acquired {
     let api: Api<Lease> = Api::namespaced(client.clone(), &cfg.namespace);
     tracing::info!(
         lease = %cfg.lease_name,
@@ -253,17 +329,49 @@ pub async fn acquire(client: &Client, cfg: &LeaderElection, identity: &str) -> A
         identity,
         "leader election enabled; campaigning"
     );
+    // Publish 0 while campaigning so a standby reports "not leader" rather than
+    // an absent series — `absent()` cannot tell a standby from a dead pod.
+    if let Some(metrics) = metrics {
+        metrics.set_leader(false);
+    }
     let mut observation = Observation::new();
     let mut standby_logged = false;
     loop {
         let attempt = async {
             let observed = api.get_opt(&cfg.lease_name).await?;
             let unchanged_for = observation.track(lease_view(&observed));
-            act_on_observation(&api, &cfg.lease_name, identity, observed, unchanged_for).await
+            act_on_observation(
+                &api,
+                &cfg.lease_name,
+                identity,
+                observed,
+                unchanged_for,
+                cfg.timings,
+            )
+            .await
         };
-        match attempt.await {
+        // Bounded like the renew attempts: an unbounded await here inherits the
+        // shared client's watch-sized read timeout, so a stalled apiserver would
+        // pin a starting replica in not-ready for minutes rather than letting it
+        // retry on the standby cadence.
+        let outcome = match tokio::time::timeout(CAMPAIGN_TIMEOUT, attempt).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    lease = %cfg.lease_name,
+                    timeout_secs = CAMPAIGN_TIMEOUT.as_secs(),
+                    "lease check produced no response before the attempt deadline; retrying"
+                );
+                tokio::time::sleep(cfg.timings.retry_period).await;
+                continue;
+            }
+        };
+        match outcome {
             Ok(true) => {
                 tracing::info!(lease = %cfg.lease_name, identity, "elected leader");
+                if let Some(metrics) = metrics {
+                    metrics.set_leader(true);
+                }
                 return Acquired::Leading;
             }
             Ok(false) => {
@@ -291,104 +399,341 @@ pub async fn acquire(client: &Client, cfg: &LeaderElection, identity: &str) -> A
                 tracing::warn!(error = %e, lease = %cfg.lease_name, "lease check failed; retrying");
             }
         }
-        tokio::time::sleep(RETRY_PERIOD).await;
+        tokio::time::sleep(cfg.timings.retry_period).await;
+    }
+}
+
+/// Why leadership ended. The two cases have genuinely different remedies —
+/// a peer is already leading (nothing to re-take) versus we simply lost contact
+/// (the Lease may well still be ours) — so they are separate variants and the
+/// caller matches exhaustively rather than treating "not leading" as one blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeadershipLost {
+    /// The Lease verifiably no longer names us: a foreign `holderIdentity` was
+    /// OBSERVED, or another replica won the create race on a deleted Lease.
+    /// Someone else leads; this replica must stop and stay stopped.
+    ToPeer {
+        /// The observed foreign `holderIdentity`, or `None` when the Lease was
+        /// recreated by a peer we never got to see.
+        holder: Option<String>,
+    },
+    /// A full [`RENEW_DEADLINE`] window closed without a successful write. We
+    /// do not know who holds the Lease — only that we can no longer PROVE we
+    /// do, which is reason enough to stop reconciling.
+    RenewFailed {
+        /// How many attempts the round made before the window closed.
+        attempts: u32,
+        /// The last failure seen, for the abdication log.
+        last_error: String,
+    },
+}
+
+/// Outcome of one [`renew_round`].
+enum RoundOutcome {
+    /// `renewTime` was re-stamped; leadership continues.
+    Renewed,
+    Lost(LeadershipLost),
+}
+
+/// One renew round: keep attempting until the Lease is re-stamped or the
+/// [`RENEW_DEADLINE`] window closes. Mirrors client-go's
+/// `PollImmediateUntil(RetryPeriod, tryAcquireOrRenew, timeoutCtx(RenewDeadline))`.
+///
+/// **The window is a budget for the round, and each attempt is bounded by what
+/// is LEFT of it.** Getting this wrong is how #319 happened: the previous
+/// implementation used `RENEW_DEADLINE` as both the per-attempt timeout and the
+/// abdication budget, and charged the inter-attempt sleep against that same
+/// budget — so a stalled attempt tripped the timeout at `RENEW_PERIOD +
+/// RENEW_DEADLINE`, which is unconditionally past the budget. The retry branch
+/// was unreachable for every slow failure, and one 10-second hiccup killed the
+/// process. Fast failures retried; slow ones never did.
+///
+/// Note what this alone does NOT fix: dropping a request future (which is all a
+/// `tokio::time::timeout` does) leaves a wedged HTTP/2 connection sitting in
+/// hyper's pool, so a retry would go straight back onto it. Retrying only helps
+/// because the election rides a dedicated client whose short `read_timeout`
+/// turns a stalled connection into a transport error, and a transport error is
+/// what actually evicts the connection. See `startup.rs`.
+async fn renew_round(
+    api: &Api<Lease>,
+    lease_name: &str,
+    identity: &str,
+    observation: &mut Observation,
+    timings: LeaseTimings,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> RoundOutcome {
+    let window_closes = Instant::now() + timings.renew_deadline;
+    let mut attempts: u32 = 0;
+    let mut last_error = String::from("no attempt completed");
+
+    loop {
+        let remaining = window_closes.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return RoundOutcome::Lost(LeadershipLost::RenewFailed {
+                attempts,
+                last_error,
+            });
+        }
+        attempts += 1;
+
+        match renew_attempt(
+            api,
+            lease_name,
+            identity,
+            observation,
+            remaining,
+            timings,
+            metrics,
+        )
+        .await
+        {
+            AttemptOutcome::Renewed => return RoundOutcome::Renewed,
+            AttemptOutcome::LostToPeer { holder } => {
+                return RoundOutcome::Lost(LeadershipLost::ToPeer { holder });
+            }
+            AttemptOutcome::Retryable(why) => {
+                tracing::warn!(lease = %lease_name, reason = %why, "lease renew failed; retrying");
+                last_error = why;
+            }
+        }
+
+        // Retry cadence, clamped so a sleep can never overrun the window.
+        let remaining = window_closes.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(timings.retry_period.min(remaining)).await;
+        }
+    }
+}
+
+/// What one renew attempt concluded. Separated from [`renew_round`] so the
+/// per-attempt classification is a flat, exhaustive match instead of nested
+/// arms inside the retry loop.
+enum AttemptOutcome {
+    /// `renewTime` re-stamped; the round is done.
+    Renewed,
+    /// The Lease verifiably names someone else — terminal, not retryable.
+    LostToPeer { holder: Option<String> },
+    /// Anything the round should try again inside its window, carrying the
+    /// description for the abdication log.
+    Retryable(String),
+}
+
+/// One bounded GET-then-CAS attempt at re-stamping the Lease, timed for
+/// `kopiur_leader_renew_duration_seconds`.
+async fn renew_attempt(
+    api: &Api<Lease>,
+    lease_name: &str,
+    identity: &str,
+    observation: &mut Observation,
+    remaining: Duration,
+    timings: LeaseTimings,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> AttemptOutcome {
+    let attempt = async {
+        let observed = api.get_opt(lease_name).await?;
+        let unchanged_for = observation.track(lease_view(&observed));
+        let holder = observed
+            .as_ref()
+            .and_then(|l| l.spec.as_ref())
+            .and_then(|s| s.holder_identity.clone());
+        let won =
+            act_on_observation(api, lease_name, identity, observed, unchanged_for, timings).await?;
+        Ok::<_, kube::Error>((won, holder))
+    };
+
+    // Two bounds, and both matter. `remaining` stops an attempt outspending the
+    // budget it draws from; RENEW_ATTEMPT_TIMEOUT stops a single hung attempt
+    // swallowing the whole budget, which would leave the round with one
+    // connection attempt and no way to replace a wedged connection.
+    let bound = RENEW_ATTEMPT_TIMEOUT.min(remaining);
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(bound, attempt).await;
+
+    // Every attempt is timed, successful or not: a renew-latency histogram
+    // creeping toward the deadline is the leading indicator #319 had no way to
+    // surface. `reason` is a closed set — it is a metric label.
+    let reason = match &outcome {
+        Ok(Ok((true, _))) => None,
+        Ok(Ok((false, _))) => Some("conflict"),
+        Ok(Err(_)) => Some("transport"),
+        Err(_) => Some("stalled"),
+    };
+    if let Some(metrics) = metrics {
+        metrics.record_leader_renew(started.elapsed().as_secs_f64(), reason);
+    }
+
+    match outcome {
+        Ok(Ok((true, _))) => AttemptOutcome::Renewed,
+        // Rejected write. Loss is VERIFIED, not inferred: only an observed
+        // foreign holder ends leadership — a CAS 409 while the Lease still names
+        // us is a spurious concurrent write (someone `kubectl annotate`d it).
+        Ok(Ok((false, holder))) => match holder.as_deref() {
+            Some(h) if h == identity => {
+                AttemptOutcome::Retryable("concurrent write while we still hold the Lease".into())
+            }
+            _ => AttemptOutcome::LostToPeer { holder },
+        },
+        Ok(Err(e)) => AttemptOutcome::Retryable(e.to_string()),
+        Err(_elapsed) => AttemptOutcome::Retryable(format!(
+            "no response within {}s",
+            bound.as_secs_f32().round()
+        )),
     }
 }
 
 /// Keep renewing the Lease we hold. The returned task completes **only when
-/// leadership is lost** — a verified foreign holder, or [`RENEW_DEADLINE`]
-/// elapsing without a successful renew (we can no longer prove we are sole
-/// leader, and must stop BEFORE the 15s Lease can expire for anyone else).
-/// The caller must treat completion as fatal (exit and re-elect on restart) —
-/// continuing to reconcile without the Lease is a split-brain.
+/// leadership is lost**, and says which way (see [`LeadershipLost`]).
+///
+/// The caller must stop reconciling the moment this resolves — continuing
+/// without the Lease is a split-brain double-reconcile.
 pub fn spawn_renewal(
     client: Client,
     cfg: LeaderElection,
     identity: String,
-) -> tokio::task::JoinHandle<()> {
+    metrics: Option<crate::metrics::Metrics>,
+) -> tokio::task::JoinHandle<LeadershipLost> {
     tokio::spawn(async move {
         let api: Api<Lease> = Api::namespaced(client, &cfg.namespace);
         let mut observation = Observation::new();
-        let mut last_ok = Instant::now();
-        let mut delay = RENEW_PERIOD;
         loop {
-            tokio::time::sleep(delay).await;
-            let attempt = async {
-                let observed = api.get_opt(&cfg.lease_name).await?;
-                let unchanged_for = observation.track(lease_view(&observed));
-                let holder = observed
-                    .as_ref()
-                    .and_then(|l| l.spec.as_ref())
-                    .and_then(|s| s.holder_identity.clone());
-                let won =
-                    act_on_observation(&api, &cfg.lease_name, &identity, observed, unchanged_for)
-                        .await?;
-                Ok::<_, kube::Error>((won, holder))
-            };
-            // The attempt itself is deadline-bounded: against a
-            // connected-but-STALLED apiserver (the OOM-flap signature) an
-            // unbounded await would wedge here forever — never reaching the
-            // deadline check below — while in HA a standby claims the expired
-            // Lease after LEASE_DURATION: split-brain double-reconcile. A
-            // stalled attempt is a failed renew; by the time the timeout fires
-            // (sleep + RENEW_DEADLINE since last_ok) the deadline has
-            // necessarily passed, so the Err arm abdicates.
-            let attempt = tokio::time::timeout(RENEW_DEADLINE, attempt);
-            match attempt.await.unwrap_or_else(|_elapsed| {
-                Err(kube::Error::Service(
-                    format!(
-                        "lease renew attempt stalled past the renew deadline ({}s) — the API \
-                         server accepted the connection but never answered",
-                        RENEW_DEADLINE.as_secs()
-                    )
-                    .into(),
-                ))
-            }) {
-                Ok((true, _)) => {
-                    last_ok = Instant::now();
-                    delay = RENEW_PERIOD;
-                }
-                // Rejected write. Loss is VERIFIED, not inferred: only an
-                // observed foreign holder ends leadership — a CAS 409 while the
-                // Lease still names us is a spurious concurrent write (e.g. a
-                // `kubectl annotate` on the Lease) and the renew just retries.
-                Ok((false, holder)) => match holder.as_deref() {
-                    Some(h) if h == identity => {
-                        tracing::warn!(
-                            lease = %cfg.lease_name,
-                            "lease renew hit a concurrent write while we still hold it; retrying"
-                        );
-                        delay = RETRY_PERIOD;
+            // Between SUCCESSFUL rounds only, and deliberately OUTSIDE the
+            // renew window: charging this sleep against the abdication budget
+            // is precisely what made the previous implementation abdicate on
+            // its first slow attempt.
+            tokio::time::sleep(cfg.timings.renew_period).await;
+
+            match renew_round(
+                &api,
+                &cfg.lease_name,
+                &identity,
+                &mut observation,
+                cfg.timings,
+                metrics.as_ref(),
+            )
+            .await
+            {
+                RoundOutcome::Renewed => {}
+                RoundOutcome::Lost(lost) => {
+                    if let Some(metrics) = &metrics {
+                        metrics.set_leader(false);
                     }
-                    _ => {
-                        tracing::error!(
+                    match &lost {
+                        LeadershipLost::ToPeer { holder } => tracing::error!(
                             lease = %cfg.lease_name,
                             identity = %identity,
                             holder = holder.as_deref().unwrap_or("<none>"),
                             "leader lease lost to another replica"
-                        );
-                        return;
-                    }
-                },
-                Err(e) => {
-                    // Transient renew failures are tolerated only inside the
-                    // renew deadline; past it we abdicate — strictly before any
-                    // standby may consider the (longer) lease duration expired.
-                    if last_ok.elapsed() > RENEW_DEADLINE {
-                        tracing::error!(
-                            error = %e,
+                        ),
+                        LeadershipLost::RenewFailed {
+                            attempts,
+                            last_error,
+                        } => tracing::error!(
                             lease = %cfg.lease_name,
-                            "could not renew the leader lease within the renew deadline; \
-                             abdicating"
-                        );
-                        return;
+                            identity = %identity,
+                            attempts,
+                            window_secs = cfg.timings.renew_deadline.as_secs(),
+                            last_error = %last_error,
+                            "could not renew the leader lease within the renew window; abdicating"
+                        ),
                     }
-                    tracing::warn!(error = %e, lease = %cfg.lease_name, "lease renew failed; retrying");
-                    delay = RETRY_PERIOD;
+                    return lost;
                 }
             }
         }
     })
+}
+
+/// Label that differs between a Deployment's ReplicaSets. Excluded from the
+/// peer selector so a rolling update's incoming pod still counts as a peer.
+const POD_TEMPLATE_HASH_LABEL: &str = "pod-template-hash";
+
+/// Is this replica provably the ONLY live controller pod?
+///
+/// Used on the [`LeadershipLost::RenewFailed`] path to decide whether losing
+/// contact with the Lease is worth a process restart. With no peer there is
+/// nobody to split-brain with, so re-campaigning in process is strictly better
+/// than exiting: the informer caches stay warm instead of every abdication
+/// paying a full cluster-wide re-LIST (the amplification loop in #319).
+///
+/// The selector is derived from OUR OWN pod's labels rather than hard-coded, so
+/// it stays correct whatever the chart stamps, minus
+/// [`POD_TEMPLATE_HASH_LABEL`] so a mid-rollout peer is not missed.
+///
+/// **Fails closed.** Any error, any ambiguity — no `HOSTNAME`, pod not found,
+/// list rejected, no labels to select on — returns `false`, and the caller
+/// exits. Exiting is the behavior this exists to improve on, never a wrong one.
+pub async fn sole_replica(client: &Client, namespace: &str, identity: &str) -> bool {
+    match count_live_replicas(client, namespace, identity).await {
+        Ok(alive) => {
+            tracing::info!(
+                alive_replicas = alive,
+                "checked for peer controller replicas"
+            );
+            alive == 1
+        }
+        Err(why) => {
+            tracing::warn!(
+                reason = %why,
+                pod = identity,
+                namespace,
+                "could not establish whether this is the only controller replica; assuming it \
+                 is not (a restart is always safe; skipping one is not)"
+            );
+            false
+        }
+    }
+}
+
+/// Count controller pods that could still be reconciling, this one included.
+/// Every failure is one `Err(String)` so [`sole_replica`] has a single, obvious
+/// fail-closed path rather than a `return false` per API call.
+async fn count_live_replicas(
+    client: &Client,
+    namespace: &str,
+    identity: &str,
+) -> Result<usize, String> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let me = pods
+        .get(identity)
+        .await
+        .map_err(|e| format!("could not read our own Pod: {e}"))?;
+    let selector = peer_selector(me.metadata.labels.as_ref())
+        .ok_or_else(|| "our Pod carries no labels to select peers by".to_string())?;
+    let peers = pods
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .map_err(|e| format!("could not list peers matching {selector}: {e}"))?;
+    Ok(peers.items.iter().filter(|p| pod_is_alive(p)).count())
+}
+
+/// Build the label selector that matches this pod's PEERS from its own labels.
+///
+/// Self-derived so it stays correct whatever labels the chart stamps, minus
+/// [`POD_TEMPLATE_HASH_LABEL`] — that one differs between a Deployment's
+/// ReplicaSets, and a rolling update's incoming pod is very much a peer.
+/// `None` when there is nothing to select on, which the caller treats as
+/// "cannot prove we are alone".
+fn peer_selector(labels: Option<&std::collections::BTreeMap<String, String>>) -> Option<String> {
+    let selector = labels?
+        .iter()
+        .filter(|(k, _)| k.as_str() != POD_TEMPLATE_HASH_LABEL)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    (!selector.is_empty()).then_some(selector)
+}
+
+/// Could this pod still be reconciling? Terminating pods cannot start, and a
+/// pod in a terminal phase has stopped — neither can contend for the Lease.
+fn pod_is_alive(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    pod.metadata.deletion_timestamp.is_none()
+        && !matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
+        )
 }
 
 /// Best-effort graceful release on shutdown: clear `holderIdentity` (CAS) so
@@ -417,12 +762,20 @@ pub async fn release(client: &Client, cfg: &LeaderElection, identity: &str) {
             .await?;
         Ok(true)
     };
-    match released.await {
-        Ok(true) => tracing::info!(lease = %cfg.lease_name, "released leader lease on shutdown"),
-        Ok(false) => {}
-        Err(e) => {
+    match tokio::time::timeout(RELEASE_TIMEOUT, released).await {
+        Ok(Ok(true)) => {
+            tracing::info!(lease = %cfg.lease_name, "released leader lease on shutdown")
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, lease = %cfg.lease_name, "could not release leader lease")
         }
+        Err(_elapsed) => tracing::warn!(
+            lease = %cfg.lease_name,
+            timeout_secs = RELEASE_TIMEOUT.as_secs(),
+            "releasing the leader lease timed out; leaving it to age out (the successor waits \
+             out the lease duration instead of taking over immediately)"
+        ),
     }
 }
 
@@ -489,12 +842,95 @@ mod tests {
 
     #[test]
     fn renew_deadline_leaves_a_margin_before_lease_expiry() {
-        // The no-split-brain invariant: a leader abdicates (RENEW_DEADLINE)
-        // strictly before any standby may claim (LEASE_DURATION), with room
-        // for at least one retry cycle in between.
+        // The no-split-brain invariant. The composed WORST CASE is the one that
+        // matters and the one the old assertions missed: a leader can sleep a
+        // full RENEW_PERIOD and then burn a full RENEW_DEADLINE window before
+        // abdicating, so it is that SUM — not RENEW_DEADLINE alone — that has to
+        // land inside LEASE_DURATION. At the old 5s RENEW_PERIOD the sum was
+        // exactly 15s, i.e. zero margin against a standby's claim.
+        let worst_case_abdication = RENEW_PERIOD + RENEW_DEADLINE;
+        assert!(
+            worst_case_abdication < LEASE_DURATION,
+            "worst-case abdication {worst_case_abdication:?} must be < {LEASE_DURATION:?}"
+        );
+        // (also enforced at compile time by the const assertions on the
+        // constants — this test states the reasoning the assertions encode.)
         assert!(RENEW_DEADLINE < LEASE_DURATION);
-        assert!(RENEW_DEADLINE.as_secs() + RETRY_PERIOD.as_secs() <= LEASE_DURATION.as_secs());
-        assert!(RENEW_PERIOD < RENEW_DEADLINE);
+        assert!(RETRY_PERIOD < RENEW_DEADLINE);
+        // A round must fit more than one attempt, or the window is decorative.
+        assert!(
+            RENEW_DEADLINE.as_secs_f64() / RETRY_PERIOD.as_secs_f64() >= 4.0,
+            "the renew window must allow at least ~4 attempts"
+        );
+    }
+
+    #[test]
+    fn peer_selector_is_self_derived_and_rollout_safe() {
+        use std::collections::BTreeMap;
+        let labels: BTreeMap<String, String> = [
+            ("app.kubernetes.io/name", "kopiur"),
+            ("app.kubernetes.io/component", "controller"),
+            // Differs between a Deployment's ReplicaSets: including it would
+            // hide a rolling update's incoming pod, and we would then wrongly
+            // conclude we are alone at exactly the moment we are not.
+            (POD_TEMPLATE_HASH_LABEL, "794467765b"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let selector = peer_selector(Some(&labels)).expect("labels yield a selector");
+        assert!(!selector.contains(POD_TEMPLATE_HASH_LABEL));
+        assert!(selector.contains("app.kubernetes.io/name=kopiur"));
+        assert!(selector.contains("app.kubernetes.io/component=controller"));
+    }
+
+    #[test]
+    fn peer_selector_is_none_when_there_is_nothing_to_select_on() {
+        use std::collections::BTreeMap;
+        // Fails closed at the caller: no selector means we cannot prove we are
+        // alone, so the caller must exit rather than re-campaign.
+        assert_eq!(peer_selector(None), None);
+        assert_eq!(peer_selector(Some(&BTreeMap::new())), None);
+        let only_hash: BTreeMap<String, String> =
+            [(POD_TEMPLATE_HASH_LABEL.to_string(), "abc".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(peer_selector(Some(&only_hash)), None);
+    }
+
+    #[test]
+    fn only_pods_that_could_still_reconcile_count_as_peers() {
+        use k8s_openapi::api::core::v1::{Pod, PodStatus};
+        let pod = |phase: Option<&str>, deleting: bool| Pod {
+            metadata: ObjectMeta {
+                deletion_timestamp: deleting
+                    .then(|| MicroTime(Timestamp::now()).0)
+                    .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time),
+                ..Default::default()
+            },
+            status: phase.map(|p| PodStatus {
+                phase: Some(p.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(pod_is_alive(&pod(Some("Running"), false)));
+        assert!(
+            pod_is_alive(&pod(Some("Pending"), false)),
+            "a Pending peer is about to start"
+        );
+        assert!(
+            pod_is_alive(&pod(None, false)),
+            "no status yet is not proof of death"
+        );
+        assert!(!pod_is_alive(&pod(Some("Succeeded"), false)));
+        assert!(!pod_is_alive(&pod(Some("Failed"), false)));
+        assert!(
+            !pod_is_alive(&pod(Some("Running"), true)),
+            "a terminating pod cannot start contending for the Lease"
+        );
     }
 
     #[test]
@@ -563,6 +999,65 @@ mod tests {
             Client::new(svc, "test-ns")
         }
 
+        /// Like [`mock_client`], but the responses listed for a given method are
+        /// consumed IN ORDER, the last one repeating forever — and each response
+        /// may be preceded by a stall.
+        ///
+        /// [`mock_client`] can only express a permanent condition ("every PUT
+        /// 409s"). The interesting cases for a renew loop are the transient ones:
+        /// a conflict that clears, or an apiserver that goes quiet for a few
+        /// seconds and then answers. Those are exactly the failures the loop is
+        /// supposed to ride out, and they are unrepresentable without ordering.
+        fn scripted_client(
+            responses: Vec<(&'static str, Duration, StatusCode, serde_json::Value)>,
+            log: Arc<Mutex<Vec<Recorded>>>,
+        ) -> Client {
+            let responses = Arc::new(responses);
+            let calls: Arc<Mutex<std::collections::HashMap<String, usize>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let svc = tower::service_fn(move |req: Request<Body>| {
+                let responses = responses.clone();
+                let calls = calls.clone();
+                let log = log.clone();
+                async move {
+                    let method = req.method().as_str().to_string();
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .expect("collect request body")
+                        .to_bytes();
+                    let body_json: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                    log.lock().unwrap().push((method.clone(), body_json));
+
+                    let for_method: Vec<_> =
+                        responses.iter().filter(|(m, ..)| *m == method).collect();
+                    assert!(
+                        !for_method.is_empty(),
+                        "unexpected {method} request in scripted mock"
+                    );
+                    let nth = {
+                        let mut calls = calls.lock().unwrap();
+                        let n = calls.entry(method).or_insert(0);
+                        let this = *n;
+                        *n += 1;
+                        this
+                    };
+                    let (_, stall, status, body) = for_method[nth.min(for_method.len() - 1)];
+
+                    if !stall.is_zero() {
+                        tokio::time::sleep(*stall).await;
+                    }
+                    let resp = Response::builder()
+                        .status(*status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(body).unwrap()))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            Client::new(svc, "test-ns")
+        }
+
         fn lease_json(holder: &str, renewed_secs_ago: i64, transitions: i32) -> serde_json::Value {
             let renew = Timestamp::now() - SignedDuration::from_secs(renewed_secs_ago);
             serde_json::json!({
@@ -607,6 +1102,7 @@ mod tests {
                 ME,
                 Some(typed_lease(held)),
                 Duration::from_secs(0),
+                LeaseTimings::default(),
             )
             .await
             .expect("renew must not error");
@@ -650,6 +1146,7 @@ mod tests {
                 Some(typed_lease(stale)),
                 // Observed unchanged past the lease duration → claimable.
                 LEASE_DURATION + Duration::from_secs(1),
+                LeaseTimings::default(),
             )
             .await
             .expect("claim must not error");
@@ -674,6 +1171,7 @@ mod tests {
                 ME,
                 Some(typed_lease(lease_json(OTHER, 1, 1))),
                 Duration::from_secs(1),
+                LeaseTimings::default(),
             )
             .await
             .expect("standby must not error");
@@ -703,6 +1201,7 @@ mod tests {
                 ME,
                 None,
                 Duration::from_secs(0),
+                LeaseTimings::default(),
             )
             .await
             .expect("a lost create race must not error");
@@ -724,6 +1223,7 @@ mod tests {
                 ME,
                 Some(typed_lease(lease_json(OTHER, 60, 4))),
                 LEASE_DURATION + Duration::from_secs(1),
+                LeaseTimings::default(),
             )
             .await
             .expect("a lost CAS race must not error");
@@ -741,26 +1241,58 @@ mod tests {
                 vec![("GET", StatusCode::OK, lease_json(OTHER, 1, 7))],
                 log.clone(),
             );
-            let handle = spawn_renewal(
-                client,
-                LeaderElection {
-                    lease_name: "kopiur-leader".to_string(),
-                    namespace: "test-ns".to_string(),
-                },
-                ME.to_string(),
-            );
+            let handle = spawn_renewal(client, election_cfg(), ME.to_string(), None);
             tokio::time::timeout(Duration::from_secs(60), handle)
                 .await
                 .expect("renewal task must complete once the lease is foreign-held")
                 .expect("renewal task must not panic");
         }
 
+        fn election_cfg() -> LeaderElection {
+            LeaderElection {
+                lease_name: "kopiur-leader".to_string(),
+                namespace: "test-ns".to_string(),
+                timings: LeaseTimings::default(),
+            }
+        }
+
         #[tokio::test(start_paused = true)]
         async fn renewal_survives_a_spurious_conflict_while_still_holding() {
             // A CAS 409 while the Lease still names US (someone touched the
             // object between our GET and PUT) must NOT depose the leader — the
-            // loop retries. Proven by the task still running after several
-            // renew cycles of GET→409.
+            // round retries inside its window and the next attempt succeeds.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = scripted_client(
+                vec![
+                    ("GET", Duration::ZERO, StatusCode::OK, lease_json(ME, 1, 7)),
+                    // The first PUT conflicts; every later one succeeds.
+                    (
+                        "PUT",
+                        Duration::ZERO,
+                        StatusCode::CONFLICT,
+                        status_json(409, "Conflict"),
+                    ),
+                    ("PUT", Duration::ZERO, StatusCode::OK, lease_json(ME, 0, 7)),
+                ],
+                log.clone(),
+            );
+            let handle = spawn_renewal(client, election_cfg(), ME.to_string(), None);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(120), handle)
+                    .await
+                    .is_err(),
+                "a conflict that clears must not depose the leader"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn renewal_abdicates_when_conflicts_never_let_us_re_stamp() {
+            // The other half of the conflict story, and a DELIBERATE behavior
+            // change: an unending 409 loop is not survivable. While every CAS is
+            // rejected our `renewTime` never advances, so a standby will claim
+            // the Lease at LEASE_DURATION — retrying forever (the old behavior)
+            // meant reconciling straight into the split brain the deadline
+            // exists to prevent. Abdicate inside the window instead.
             let log = Arc::new(Mutex::new(Vec::new()));
             let client = mock_client(
                 vec![
@@ -769,18 +1301,14 @@ mod tests {
                 ],
                 log.clone(),
             );
-            let handle = spawn_renewal(
-                client,
-                LeaderElection {
-                    lease_name: "kopiur-leader".to_string(),
-                    namespace: "test-ns".to_string(),
-                },
-                ME.to_string(),
-            );
-            let outcome = tokio::time::timeout(Duration::from_secs(120), handle).await;
+            let handle = spawn_renewal(client, election_cfg(), ME.to_string(), None);
+            let lost = tokio::time::timeout(Duration::from_secs(60), handle)
+                .await
+                .expect("an unending conflict must abdicate, not spin forever")
+                .expect("renewal task must not panic");
             assert!(
-                outcome.is_err(),
-                "the renewal task must keep retrying (not abdicate) while the Lease names us"
+                matches!(lost, LeadershipLost::RenewFailed { .. }),
+                "an unending conflict is a failed renew, not a verified peer takeover: {lost:?}"
             );
         }
 
@@ -799,29 +1327,100 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
+        async fn renewal_survives_a_stall_shorter_than_the_renew_window() {
+            // THE #319 REGRESSION TEST. A single slow-but-recoverable API call
+            // must not depose the leader.
+            //
+            // The pre-fix loop used RENEW_DEADLINE as both the per-attempt
+            // timeout and the abdication budget, and charged the inter-attempt
+            // sleep against that same budget — so a stalled attempt tripped the
+            // timeout at RENEW_PERIOD + RENEW_DEADLINE, which is unconditionally
+            // past the budget, and the retry branch was dead code for every slow
+            // failure. In production that meant ~15 process suicides a day off
+            // ordinary API latency.
+            //
+            // The scenario, timed against the OLD constants (RENEW_PERIOD 5s,
+            // one 10s attempt, budget measured from `last_ok`):
+            //   t=5   attempt starts, 5s after the last success
+            //   t=12  the slow call finally fails
+            //         last_ok.elapsed() = 12 > RENEW_DEADLINE(10) -> ABDICATE
+            //   t=14  ...the retry that would have succeeded never happened
+            // and against the fixed loop (window opened at the round start,
+            // per-attempt cap, sleep outside the budget):
+            //   t=2   round opens, window [2,12]
+            //   t=8   attempt 1 hits RENEW_ATTEMPT_TIMEOUT, still 4s of budget
+            //   t=10  attempt 2 succeeds -> leadership retained
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = scripted_client(
+                vec![
+                    // One slow failure...
+                    (
+                        "GET",
+                        Duration::from_secs(7),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        status_json(500, "InternalError"),
+                    ),
+                    // ...then a healthy apiserver again.
+                    ("GET", Duration::ZERO, StatusCode::OK, lease_json(ME, 1, 7)),
+                    ("PUT", Duration::ZERO, StatusCode::OK, lease_json(ME, 0, 7)),
+                ],
+                log.clone(),
+            );
+            let handle = spawn_renewal(client, election_cfg(), ME.to_string(), None);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(120), handle)
+                    .await
+                    .is_err(),
+                "a stall shorter than the renew window must be retried, not abdicated"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn renewal_abdicates_when_the_apiserver_stalls_instead_of_hanging() {
             // regression (apiserver-outage incident): the renew ATTEMPT itself
             // had no timeout — against a connected-but-stalled apiserver the
             // `attempt.await` wedged forever, so the deadline check after it
             // never ran. Leadership was never abdicated while, in HA, a
             // standby claimed the expired Lease after 15s: split-brain
-            // double-reconcile. A stalled attempt must count as a failed renew
-            // and abdicate at the deadline.
-            let handle = spawn_renewal(
-                hanging_client(),
-                LeaderElection {
-                    lease_name: "kopiur-leader".to_string(),
-                    namespace: "test-ns".to_string(),
-                },
-                ME.to_string(),
+            // double-reconcile. A permanently stalled attempt must count as a
+            // failed renew and abdicate when the window closes.
+            //
+            // The bound is TIGHT on both sides. The old 60s ceiling would have
+            // sat quietly through a regression to 50s — and abdicating EARLY is
+            // its own bug (it throws away leadership the window was meant to
+            // protect), so the floor matters just as much.
+            let start = Instant::now();
+            let handle = spawn_renewal(hanging_client(), election_cfg(), ME.to_string(), None);
+            let lost = tokio::time::timeout(
+                RENEW_PERIOD + RENEW_DEADLINE + Duration::from_secs(1),
+                handle,
+            )
+            .await
+            .expect(
+                "a stalled renew attempt must abdicate when the renew window closes, not \
+                     hang leadership forever",
+            )
+            .expect("renewal task must not panic");
+            let took = start.elapsed();
+            assert!(
+                took >= RENEW_DEADLINE,
+                "abdicated after {took:?} — earlier than the {RENEW_DEADLINE:?} window it is \
+                 supposed to spend retrying first"
             );
-            tokio::time::timeout(Duration::from_secs(60), handle)
-                .await
-                .expect(
-                    "a stalled renew attempt must abdicate at the renew deadline, not hang \
-                     leadership forever",
-                )
-                .expect("renewal task must not panic");
+            assert!(
+                matches!(lost, LeadershipLost::RenewFailed { .. }),
+                "a stall is a failed renew, not a verified peer takeover: {lost:?}"
+            );
+            // And the window must have been SPENT retrying, not burned in one
+            // attempt that happened to be bounded by the whole budget.
+            let LeadershipLost::RenewFailed { attempts, .. } = lost else {
+                unreachable!("asserted above")
+            };
+            assert!(
+                attempts >= 2,
+                "only {attempts} attempt in a {RENEW_DEADLINE:?} window — one hung attempt \
+                 swallowed the whole budget, so nothing ever gets a second connection"
+            );
         }
 
         #[tokio::test]
@@ -835,15 +1434,7 @@ mod tests {
                 ],
                 log.clone(),
             );
-            release(
-                &client,
-                &LeaderElection {
-                    lease_name: "kopiur-leader".to_string(),
-                    namespace: "test-ns".to_string(),
-                },
-                ME,
-            )
-            .await;
+            release(&client, &election_cfg(), ME).await;
             let log = log.lock().unwrap();
             let (_, put_body) = log
                 .iter()
@@ -862,15 +1453,7 @@ mod tests {
                 vec![("GET", StatusCode::OK, lease_json(OTHER, 1, 3))],
                 log.clone(),
             );
-            release(
-                &client,
-                &LeaderElection {
-                    lease_name: "kopiur-leader".to_string(),
-                    namespace: "test-ns".to_string(),
-                },
-                ME,
-            )
-            .await;
+            release(&client, &election_cfg(), ME).await;
             assert!(
                 !log.lock().unwrap().iter().any(|(m, _)| m == "PUT"),
                 "we must never clear a Lease another replica holds"

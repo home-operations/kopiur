@@ -114,6 +114,19 @@ pub const LEASE_NAME_ENV: &str = "KOPIUR_LEASE_NAME";
 /// Fallback leader-election `Lease` name when [`LEASE_NAME_ENV`] is unset.
 pub const DEFAULT_LEASE_NAME: &str = "kopiur-leader";
 
+/// Seconds a held Lease is honored without an observed change. See
+/// [`LeaseTimings`]; unset uses [`crate::leader::LEASE_DURATION`].
+pub const LEASE_DURATION_ENV: &str = "KOPIUR_LEASE_DURATION_SECONDS";
+/// Seconds in the renew WINDOW (a budget for a round of attempts, not one
+/// attempt's timeout). Unset uses [`crate::leader::RENEW_DEADLINE`].
+pub const RENEW_DEADLINE_ENV: &str = "KOPIUR_RENEW_DEADLINE_SECONDS";
+/// Seconds between SUCCESSFUL renew rounds. Unset uses
+/// [`crate::leader::RENEW_PERIOD`].
+pub const RENEW_PERIOD_ENV: &str = "KOPIUR_RENEW_PERIOD_SECONDS";
+/// Seconds between retries inside a renew window, and the standby poll
+/// interval. Unset uses [`crate::leader::RETRY_PERIOD`].
+pub const RETRY_PERIOD_ENV: &str = "KOPIUR_RETRY_PERIOD_SECONDS";
+
 // --- Self-managed webhook TLS (`webhook.tls.mode: self`) --------------------
 //
 // In `self` mode the controller — not cert-manager — owns the webhook serving
@@ -223,6 +236,28 @@ pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
 /// [`crate::context::Context::exec_client`], which carries no read timeout) —
 /// a quiesce command that is silent for >305s is legitimate there.
 pub const KUBE_CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(305);
+
+/// Read timeout for the DEDICATED leader-election client.
+///
+/// Election traffic must not ride [`KUBE_CLIENT_READ_TIMEOUT`]. That value is
+/// sized for watch long-polls (305s), and `read_timeout` in hyper-timeout is an
+/// IDLE timeout on the connection — so on the shared client a wedged HTTP/2
+/// connection stays in hyper's pool, silently swallowing requests, for five
+/// minutes. Every kopiur request multiplexes over that one connection, lease
+/// renewals included: issue #319's "stalled past the renew deadline" storms were
+/// renewals queued onto a connection the apiserver had already stopped
+/// answering, which is why a FRESH process re-elected in ~12ms.
+///
+/// Wrapping the renew in a `tokio::time::timeout` cannot fix that — dropping the
+/// request future leaves the poisoned connection in the pool, so the retry lands
+/// right back on it. Only a TRANSPORT error evicts a connection, and this
+/// timeout is what produces one.
+///
+/// 5s: lease ops are single small round trips and never long-poll, and the
+/// renew cadence (`leader::RENEW_PERIOD`, 2s) keeps a healthy connection well
+/// inside the idle window. Must stay > RENEW_PERIOD or healthy connections churn.
+pub const KUBE_CLIENT_ELECTION_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Connect timeout for the shared kube client (kube 4.0 default: 30s). During
 /// the apiserver outage each blackholed connect pinned an fd for the full 30s
@@ -385,6 +420,22 @@ pub struct ControllerArgs {
     #[arg(long, env = LEASE_NAME_ENV)]
     pub lease_name: Option<String>,
 
+    /// Leader-election protocol timings, in seconds. Unset uses the client-go
+    /// defaults; any set that could split-brain is rejected at startup by
+    /// [`LeaseTimings::validate`]. Widen these only on a control plane where the
+    /// default 10s renew window is genuinely too tight.
+    #[arg(long, env = LEASE_DURATION_ENV)]
+    pub lease_duration_seconds: Option<u64>,
+    /// See [`RENEW_DEADLINE_ENV`].
+    #[arg(long, env = RENEW_DEADLINE_ENV)]
+    pub renew_deadline_seconds: Option<u64>,
+    /// See [`RENEW_PERIOD_ENV`].
+    #[arg(long, env = RENEW_PERIOD_ENV)]
+    pub renew_period_seconds: Option<u64>,
+    /// See [`RETRY_PERIOD_ENV`].
+    #[arg(long, env = RETRY_PERIOD_ENV)]
+    pub retry_period_seconds: Option<u64>,
+
     /// Cadence (seconds) of the orphaned work-spec ConfigMap sweep; 0 disables.
     #[arg(long, env = WORK_SPEC_SWEEP_INTERVAL_ENV,
           default_value_t = DEFAULT_WORK_SPEC_SWEEP_INTERVAL_SECS,
@@ -456,6 +507,77 @@ pub struct LeaderElection {
     pub lease_name: String,
     /// Namespace the Lease lives in (the operator's own namespace).
     pub namespace: String,
+    /// Protocol timings. Defaults match client-go; see [`LeaseTimings`].
+    pub timings: LeaseTimings,
+}
+
+/// The four leader-election durations, kept together because they are only
+/// meaningful as a set — the no-split-brain property is a relationship BETWEEN
+/// them, not a property of any one.
+///
+/// Configurable because a congested control plane is a cluster property, not a
+/// Kopiur one: an operator on a cluster where a 10s renew window is genuinely
+/// too tight should be able to widen it without a rebuild (#319). Validated by
+/// [`LeaseTimings::validate`] at startup, so no combination that could
+/// split-brain is reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTimings {
+    /// How long a held Lease is honored without an observed change before
+    /// another replica may claim it.
+    pub lease_duration: std::time::Duration,
+    /// The renew WINDOW — a budget for a whole round of attempts.
+    pub renew_deadline: std::time::Duration,
+    /// Cadence between SUCCESSFUL renew rounds (outside the window).
+    pub renew_period: std::time::Duration,
+    /// Retry cadence inside a renew window, and the standby poll interval.
+    pub retry_period: std::time::Duration,
+}
+
+impl Default for LeaseTimings {
+    fn default() -> Self {
+        Self {
+            lease_duration: crate::leader::LEASE_DURATION,
+            renew_deadline: crate::leader::RENEW_DEADLINE,
+            renew_period: crate::leader::RENEW_PERIOD,
+            retry_period: crate::leader::RETRY_PERIOD,
+        }
+    }
+}
+
+impl LeaseTimings {
+    /// Reject any set that could let two replicas both believe they lead.
+    ///
+    /// The load-bearing check is the first one: worst-case abdication is one
+    /// full `renew_period` sleep plus one full `renew_deadline` window, and that
+    /// sum — not `renew_deadline` alone — must land inside `lease_duration`.
+    /// Getting exactly this wrong is what #319 was.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let worst_case = self.renew_period + self.renew_deadline;
+        if worst_case >= self.lease_duration {
+            return Err(ConfigError::LeaseTimings(format!(
+                "renewPeriod ({:?}) + renewDeadline ({:?}) = {:?} must be strictly less than \
+                 leaseDuration ({:?}): a leader can sleep a full renew period and then spend a \
+                 full renew window before abdicating, and if that exceeds the lease duration a \
+                 standby may claim the Lease while this replica is still reconciling",
+                self.renew_period, self.renew_deadline, worst_case, self.lease_duration
+            )));
+        }
+        if self.retry_period >= self.renew_deadline {
+            return Err(ConfigError::LeaseTimings(format!(
+                "retryPeriod ({:?}) must be less than renewDeadline ({:?}), or a renew window \
+                 fits only one attempt and a single slow call ends leadership",
+                self.retry_period, self.renew_deadline
+            )));
+        }
+        if self.renew_period.is_zero() || self.retry_period.is_zero() {
+            return Err(ConfigError::LeaseTimings(
+                "renewPeriod and retryPeriod must be non-zero (a zero cadence busy-loops the \
+                 API server)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `roleRef.kind` for the minted mover `RoleBinding`. A closed two-value set,
@@ -584,6 +706,11 @@ pub enum ConfigError {
          so the election Lease has a home, or disable leader election"
     )]
     LeaderElectionNeedsNamespace,
+
+    /// A leader-election timing set that could let two replicas both believe
+    /// they lead. Rejected at startup rather than discovered during an outage.
+    #[error("invalid leader-election timings: {0}")]
+    LeaseTimings(String),
 }
 
 /// The resolved controller configuration: defaults applied, empty strings
@@ -687,12 +814,26 @@ impl ControllerArgs {
         // Leader election needs a namespace for its Lease; guessing one could
         // split-brain two replicas onto different Leases, so fail loudly.
         let leader_election = if self.leader_elect {
+            let defaults = LeaseTimings::default();
+            let secs = |v: Option<u64>, d: std::time::Duration| {
+                v.map(std::time::Duration::from_secs).unwrap_or(d)
+            };
+            let timings = LeaseTimings {
+                lease_duration: secs(self.lease_duration_seconds, defaults.lease_duration),
+                renew_deadline: secs(self.renew_deadline_seconds, defaults.renew_deadline),
+                renew_period: secs(self.renew_period_seconds, defaults.renew_period),
+                retry_period: secs(self.retry_period_seconds, defaults.retry_period),
+            };
+            // Fail at startup, not at the first stalled renew: a set that
+            // violates the margin cannot be allowed to run at all.
+            timings.validate()?;
             Some(LeaderElection {
                 lease_name: nonempty(self.lease_name)
                     .unwrap_or_else(|| DEFAULT_LEASE_NAME.to_string()),
                 namespace: operator_namespace
                     .clone()
                     .ok_or(ConfigError::LeaderElectionNeedsNamespace)?,
+                timings,
             })
         } else {
             None
@@ -976,6 +1117,7 @@ mod tests {
             Some(LeaderElection {
                 lease_name: DEFAULT_LEASE_NAME.to_string(),
                 namespace: "kopiur-system".to_string(),
+                timings: LeaseTimings::default(),
             })
         );
     }
@@ -1240,6 +1382,96 @@ mod tests {
     // implicit unbounded reconcile concurrency is what let a post-outage re-list
     // dispatch every object at once and exhaust the fd table (EMFILE) while the
     // apiserver flapped; `0` is the explicit unbounded escape hatch. ---
+
+    #[test]
+    fn default_lease_timings_are_valid() {
+        LeaseTimings::default()
+            .validate()
+            .expect("the shipped defaults must satisfy the no-split-brain margin");
+    }
+
+    #[test]
+    fn lease_timings_reject_a_set_that_could_split_brain() {
+        use std::time::Duration;
+        let secs = Duration::from_secs;
+        // The #319 shape exactly: renewPeriod + renewDeadline == leaseDuration,
+        // i.e. ZERO margin — a leader can still be reconciling at the instant a
+        // standby becomes entitled to claim. (These were the shipped constants.)
+        let zero_margin = LeaseTimings {
+            lease_duration: secs(15),
+            renew_deadline: secs(10),
+            renew_period: secs(5),
+            retry_period: secs(2),
+        };
+        let err = zero_margin
+            .validate()
+            .expect_err("zero margin must be rejected");
+        assert!(
+            err.to_string().contains("strictly less than"),
+            "the error must explain the margin: {err}"
+        );
+
+        // A window that fits only one attempt is the other half of #319: one
+        // slow call ends leadership with no retry.
+        assert!(
+            LeaseTimings {
+                retry_period: secs(10),
+                ..LeaseTimings::default()
+            }
+            .validate()
+            .is_err()
+        );
+
+        // A zero cadence would busy-loop the API server.
+        assert!(
+            LeaseTimings {
+                renew_period: Duration::ZERO,
+                ..LeaseTimings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lease_timings_are_env_configurable_and_validated_at_startup() {
+        use std::time::Duration;
+        let timings = resolve(&[
+            "--leader-elect",
+            "--operator-namespace",
+            "kopiur-system",
+            "--lease-duration-seconds",
+            "30",
+            "--renew-deadline-seconds",
+            "20",
+            "--renew-period-seconds",
+            "5",
+            "--retry-period-seconds",
+            "3",
+        ])
+        .leader_election
+        .expect("leader election is on")
+        .timings;
+        assert_eq!(timings.lease_duration, Duration::from_secs(30));
+        assert_eq!(timings.renew_deadline, Duration::from_secs(20));
+        assert_eq!(timings.renew_period, Duration::from_secs(5));
+        assert_eq!(timings.retry_period, Duration::from_secs(3));
+
+        // An invalid set must fail at STARTUP, not at the first stalled renew.
+        let err = parse(&[
+            "--leader-elect",
+            "--operator-namespace",
+            "kopiur-system",
+            "--lease-duration-seconds",
+            "10",
+            "--renew-deadline-seconds",
+            "10",
+        ])
+        .resolve()
+        .expect_err("renewDeadline >= leaseDuration must not start");
+        assert!(matches!(err, ConfigError::LeaseTimings(_)), "{err}");
+    }
 
     #[test]
     #[serial]

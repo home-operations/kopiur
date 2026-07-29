@@ -1,24 +1,44 @@
-//! API-server-flap resilience e2e (the 2026-07 EMFILE incident): the control
-//! plane gets OOM-killed repeatedly, and the operator must SURVIVE it — no fd
-//! exhaustion, no runaway crash/lease churn — and converge once it returns.
+//! API-server disruption resilience e2e. Two scenarios, and the difference
+//! between them is the point:
+//!
+//! 1. **Flap** (the 2026-07 EMFILE incident) — the control plane gets OOM-killed
+//!    repeatedly. Connections DROP, so the client sees fast errors. The operator
+//!    must survive it (no fd exhaustion, no runaway crash/lease churn) and
+//!    converge once it returns. Some disruption is legal here.
+//! 2. **Stall** (issue #319) — the apiserver is SIGSTOPped: connections stay
+//!    open and nothing is answered. Leadership must be **retained**, with zero
+//!    abdications, zero lease transitions and zero restarts.
+//!
+//! Scenario 2 exists because scenario 1 structurally cannot catch #319. A killed
+//! apiserver produces fast errors, and the pre-fix renew loop retried those
+//! correctly; it was *slow* failures it could not survive, because the
+//! per-attempt timeout and the abdication budget were the same number. The flap
+//! scenario ran green throughout the entire production incident.
 //!
 //! ## What this is (and is not)
 //!
-//! This is a resilience guard, not a strict fail-without-fix reproducer: a
-//! kind-scale fleet may not reach EMFILE at the default NOFILE limit even on
-//! the pre-fix code. The strict regression tests are hermetic (the reconcile
-//! concurrency cap, transport-error Event suppression, bounded publishes,
-//! requeue jitter, client timeouts, the renew-attempt deadline). What this
-//! scenario DOES catch is a reintroduced crash-loop, any `Too many open files`
-//! in the controller log, runaway lease transitions, and a controller that
-//! fails to reconcile after recovery.
+//! The flap scenario is a resilience guard, not a strict fail-without-fix
+//! reproducer: a kind-scale fleet may not reach EMFILE at the default NOFILE
+//! limit even on the pre-fix code. The strict regression tests are hermetic (the
+//! reconcile concurrency cap, transport-error Event suppression, bounded
+//! publishes, requeue jitter, client timeouts, the renew window). What it DOES
+//! catch is a reintroduced crash-loop, any `Too many open files` in the
+//! controller log, runaway lease transitions, and a controller that fails to
+//! reconcile after recovery. The stall scenario, by contrast, IS a strict
+//! reproducer — it fails on the pre-#319 renew loop.
 //!
 //! ## Shard isolation (load-bearing)
 //!
-//! One sequential scenario; the binary OWNS its CI shard — it kills the
-//! kube-apiserver process on the kind node (via `kopiur_e2e::flap_apiserver`),
-//! which no other test may race. Host-side disruption from a scenario has
-//! precedent (mass_deletion flips its repo dir read-only mid-test).
+//! Sequential scenarios; the binary OWNS its CI shard — it kills
+//! (`kopiur_e2e::flap_apiserver`) and stops (`kopiur_e2e::stall_apiserver`) the
+//! kube-apiserver process on the kind node, which no other test may race.
+//! Host-side disruption from a scenario has precedent (mass_deletion flips its
+//! repo dir read-only mid-test).
+//!
+//! The two scenarios must not interleave — a SIGSTOP during the flap's recovery
+//! would make both unreadable — so the shard runs single-threaded. `stall`
+//! reads its own baseline after the controller is settled, so it tolerates
+//! running after `flap` in the same shard.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -383,4 +403,99 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
         "post-flap Snapshot Succeeded but carries no kopiaSnapshotID"
     );
     eprintln!("[flap] converged: post-flap backup {snap_id}; restarts+transitions bounded");
+}
+
+/// The apiserver STALLS (SIGSTOP) rather than dying, for a hold that fits inside
+/// the renew window — leadership must be RETAINED.
+///
+/// This is the #319 reproducer the kill-based scenario above structurally cannot
+/// be. Killing the apiserver drops connections, so the client sees a fast error,
+/// and the pre-fix renew loop retried fast errors correctly. A *stalled*
+/// apiserver keeps the connection open and answers nothing, and the pre-fix loop
+/// spent its entire abdication budget on that one attempt — every occurrence was
+/// fatal. In production that was ~15 process suicides a day off ordinary API
+/// latency.
+///
+/// Unlike the flap scenario, this one asserts **zero** disruption: no
+/// abdication, no lease transition, no restart. A hold of `STALL_HOLD` is longer
+/// than the retry cadence and than any healthy call, but inside the renew
+/// window, so a correct leader rides it out with retries to spare.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn controller_retains_leadership_across_an_apiserver_stall() {
+    /// Long enough that a single attempt cannot span it, short enough to sit
+    /// inside the 10s renew window with retry room.
+    const STALL_HOLD: Duration = Duration::from_secs(7);
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    let client = world.client();
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let leases: Api<Lease> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Baseline AFTER the controller is settled and leading, so a transition
+    // from an unrelated earlier restart is not attributed to the stall.
+    let (pod, restarts_before) = wait_until(
+        "a controller pod is Running before the stall",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(controller_pod(&pods)
+                .await
+                .ok()
+                .flatten()
+                .filter(|(name, _)| name.starts_with(CONTROLLER_POD_PREFIX)))
+        },
+    )
+    .await
+    .expect("a controller pod must be Running before the stall");
+    let transitions_before = lease_transitions(&leases)
+        .await
+        .expect("read baseline lease transitions");
+    eprintln!(
+        "[stall] baseline: pod={pod} restarts={restarts_before} \
+         lease_transitions={transitions_before}"
+    );
+
+    kopiur_e2e::stall_apiserver(STALL_HOLD)
+        .await
+        .expect("SIGSTOP/SIGCONT the kind node's kube-apiserver");
+
+    // Give the election a few renew rounds on the far side of the stall, so a
+    // late abdication cannot slip past the assertions below.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let transitions_after = lease_transitions(&leases)
+        .await
+        .expect("read lease transitions after the stall");
+    assert_eq!(
+        transitions_after, transitions_before,
+        "the leader Lease changed hands across a {STALL_HOLD:?} stall that fits inside the \
+         renew window — the renew round is not retrying (this is #319: the abdication budget \
+         being spent by a single attempt)"
+    );
+
+    let (pod_after, restarts_after) = controller_pod(&pods)
+        .await
+        .expect("read controller pod after the stall")
+        .expect("a controller pod must still be Running after the stall");
+    assert_eq!(
+        pod_after, pod,
+        "the controller pod was replaced across a survivable apiserver stall"
+    );
+    assert_eq!(
+        restarts_after, restarts_before,
+        "the controller restarted across a {STALL_HOLD:?} stall it should have ridden out"
+    );
+
+    let logs = controller_logs(&pods, &pod)
+        .await
+        .expect("read controller logs after the stall");
+    assert!(
+        !logs.contains("abdicating"),
+        "the controller abdicated across a survivable stall; log tail:\n{}",
+        logs.lines().rev().take(40).collect::<Vec<_>>().join("\n")
+    );
+    eprintln!("[stall] leadership retained across a {STALL_HOLD:?} apiserver stall");
 }

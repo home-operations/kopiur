@@ -345,6 +345,38 @@ fn terminal_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
 // only logs — double-counting a Job the dispatcher already counted would corrupt
 // the outcome series.
 
+/// Page size for the sweep's full `Snapshot` read.
+const SWEEP_LIST_PAGE_SIZE: u32 = 500;
+
+/// LIST every `Snapshot` in scope, following `continue` tokens to completion.
+///
+/// This was a single unbounded, unpaginated, cluster-wide LIST — a full-object
+/// dump of every Snapshot CR in the cluster in one response, 60s after every
+/// controller start. During #319's restart storms that was fifteen extra
+/// full-fleet dumps a day, landing in the tail of the startup watch burst.
+///
+/// Paginated rather than merely `.limit()`ed, because **completeness is
+/// load-bearing here**: [`finalizer_holding_snapshot_uids`] SPARES batch delete
+/// Jobs, so a silently truncated read would look like "no Snapshot holds a
+/// finalizer" and reap Jobs that are still needed. A partial page is an error
+/// that aborts the pass, exactly like a failed list.
+async fn list_all_snapshots(api: &Api<Snapshot>) -> kube::Result<Vec<Snapshot>> {
+    let mut all = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut lp = ListParams::default().limit(SWEEP_LIST_PAGE_SIZE);
+        if let Some(t) = &token {
+            lp = lp.continue_token(t);
+        }
+        let page = api.list(&lp).await?;
+        token = page.metadata.continue_.clone().filter(|t| !t.is_empty());
+        all.extend(page.items);
+        if token.is_none() {
+            return Ok(all);
+        }
+    }
+}
+
 /// The UIDs of `Snapshot`s (from the sweep's OWN list) still holding the cleanup
 /// finalizer — the "delete still pending" set that SPARES a batch Job. Because the
 /// sweep LISTs Snapshots directly (a complete read, not the possibly-cold reflector
@@ -571,7 +603,7 @@ pub async fn run_sweep(
         .await?
         .items;
     let snapshot_api: Api<Snapshot> = scoped_api(client, scope);
-    let snapshots = snapshot_api.list(&ListParams::default()).await?.items;
+    let snapshots = list_all_snapshots(&snapshot_api).await?;
     let job_api: Api<Job> = scoped_api(client, scope);
     let jobs = job_api
         .list(&ListParams::default().labels(&managed))

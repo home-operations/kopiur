@@ -435,7 +435,10 @@ pub fn consecutive_failures(backups: &[Snapshot]) -> i64 {
 /// Parse an RFC3339 timestamp (e.g. `status.lastVerified`) to Unix seconds for
 /// the `kopiur_snapshot_verified_timestamp_seconds` gauge. `None` on a malformed
 /// value so a bad timestamp simply leaves the gauge unset rather than crashing.
-fn rfc3339_unix_secs(s: &str) -> Option<i64> {
+///
+/// Shared with the Restore reconciler, which re-derives
+/// `kopiur_restore_duration_seconds` from its pinned status timing the same way.
+pub(crate) fn rfc3339_unix_secs(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp())
