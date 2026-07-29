@@ -447,20 +447,31 @@ lost, and the process may keep its informer caches warm instead of paying a full
 cold start. The chart default is `replicaCount: 1`, where the old unconditional
 exit bought no split-brain protection at all.
 
-What makes that safe is **not** the replica count. A sole-replica check is
-point-in-time: a peer can start the instant after it answers, which is exactly
-what a rollout does and exactly what an operator reaching for `kubectl scale`
-during an incident does. Worse, #319's own mechanism makes a peer *more* likely to
-be healthy — a wedged client means the API server is fine for everybody else. So
-the check is a precondition (don't even attempt this in an HA deployment), not
-the safety property.
-
-The safety property is `leader::reconfirm`, and it is a proof rather than an
+What makes that safe is `leader::reconfirm`, and it is a proof rather than an
 inference: any takeover must overwrite `holderIdentity`, and this replica writes
 nothing between losing contact and re-confirming — so observing our own identity
 still on the Lease *proves* no peer claimed in the interval. Identity is the pod
 name, so two live pods cannot collide on it. A foreign holder, an unheld Lease or
-a deleted Lease are all unprovable and therefore fatal.
+a deleted Lease are all unprovable and therefore fatal. Because the proof does not
+depend on how many replicas exist, this is correct under HA too.
+
+**The budget is the margin, not a fresh interval.** `reconfirm` is bounded by the
+instant a standby may FIRST claim — one `lease_duration` after our last
+*successful* renew. The failed renew round already spent `renew_period +
+renew_deadline` of that, so what is left is exactly the const-asserted margin
+(~3s at the defaults). An earlier revision measured a fresh `lease_duration` from
+*now*, which ran ~12s past the point the invariant protects: the const assertion
+guarantees abdication at 12s precisely BECAUSE a peer cannot claim until 15s, and
+restarting the clock discarded that guarantee while the reconcilers kept running.
+Three seconds is small, but it is the honest number, and it is enough for the
+failure this exists to absorb — a poisoned connection whose replacement connects
+in milliseconds.
+
+A revision in between gated all of this on a "sole replica" pod count. That was
+both weaker and actively harmful: weaker because it is point-in-time (a peer can
+start the instant after it answers — a rollout does exactly that), and harmful
+because its GET + LIST spent the very margin that is the safety property. The
+proof above supersedes it entirely.
 
 This is deliberately not `acquire`. Acquire stands by when a peer leads, which is
 right for a process that holds nothing and runs nothing — but on this path the

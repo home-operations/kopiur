@@ -44,11 +44,11 @@
 //!   immediately either way; what it does next depends on the variant.
 //!   [`LeadershipLost::ToPeer`] means a peer verifiably leads, so the only
 //!   correct move is to exit. [`LeadershipLost::RenewFailed`] means we merely
-//!   lost contact — if this replica is provably alone there is nobody to
-//!   split-brain with, so it re-campaigns in process and keeps its informer
-//!   caches warm instead of paying a full cold-start re-LIST (see
-//!   `startup.rs`). A duplicated mover Job is a real cost; so is a restart
-//!   storm that re-LISTs the whole cluster fifteen times a day.
+//!   lost contact, so [`reconfirm`] gets one chance — inside the remaining
+//!   margin, never past it — to PROVE the Lease never left our hands, and the
+//!   process keeps its informer caches warm instead of paying a full cold-start
+//!   re-LIST. Failing that it exits. A duplicated mover Job is a real cost; so
+//!   is a restart storm that re-LISTs the whole cluster fifteen times a day.
 //! - [`release`] clears the holder on graceful shutdown so the successor
 //!   claims the Lease immediately instead of waiting out the full duration on
 //!   every rolling upgrade.
@@ -431,6 +431,17 @@ pub enum LeadershipLost {
         attempts: u32,
         /// The last failure seen, for the abdication log.
         last_error: String,
+        /// The instant a standby could FIRST claim this Lease: one
+        /// `lease_duration` after our last successful renew, because that renew
+        /// reset every observer's staleness clock.
+        ///
+        /// This is the hard edge of the no-split-brain invariant. Everything
+        /// this replica does before it — including [`reconfirm`] — is provably
+        /// exclusive; anything after it is not. Note how little is left: the
+        /// renew round already spent `renew_period + renew_deadline` of the
+        /// budget, so the remainder is only the const-asserted MARGIN (~3s at
+        /// the defaults), not a fresh interval.
+        safe_until: Instant,
     },
 }
 
@@ -466,6 +477,7 @@ async fn renew_round(
     identity: &str,
     observation: &mut Observation,
     timings: LeaseTimings,
+    safe_until: Instant,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> RoundOutcome {
     let window_closes = Instant::now() + timings.renew_deadline;
@@ -478,6 +490,7 @@ async fn renew_round(
             return RoundOutcome::Lost(LeadershipLost::RenewFailed {
                 attempts,
                 last_error,
+                safe_until,
             });
         }
         attempts += 1;
@@ -601,6 +614,10 @@ pub fn spawn_renewal(
     tokio::spawn(async move {
         let api: Api<Lease> = Api::namespaced(client, &cfg.namespace);
         let mut observation = Observation::new();
+        // We were just elected, so the Lease is fresh as of now. Every observer's
+        // staleness clock resets on each successful renew, so this is what the
+        // "earliest a peer may claim" edge is measured from.
+        let mut last_renewed = Instant::now();
         loop {
             // Between SUCCESSFUL rounds only, and deliberately OUTSIDE the
             // renew window: charging this sleep against the abdication budget
@@ -614,11 +631,12 @@ pub fn spawn_renewal(
                 &identity,
                 &mut observation,
                 cfg.timings,
+                last_renewed + cfg.timings.lease_duration,
                 metrics.as_ref(),
             )
             .await
             {
-                RoundOutcome::Renewed => {}
+                RoundOutcome::Renewed => last_renewed = Instant::now(),
                 RoundOutcome::Lost(lost) => {
                     if let Some(metrics) = &metrics {
                         metrics.set_leader(false);
@@ -633,6 +651,7 @@ pub fn spawn_renewal(
                         LeadershipLost::RenewFailed {
                             attempts,
                             last_error,
+                            ..
                         } => tracing::error!(
                             lease = %cfg.lease_name,
                             identity = %identity,
@@ -669,12 +688,6 @@ pub enum Reconfirmed {
 /// underneath whoever now holds the Lease, an unbounded split brain rather than
 /// a transient one.
 ///
-/// [`sole_replica`] cannot provide the safety property either: it is a
-/// point-in-time answer, and a peer can start the instant after it returns —
-/// which is exactly what a rollout does, and exactly what an operator reaching
-/// for `kubectl scale` during an incident does. It stays as a cheap precondition
-/// (don't even attempt this in an HA deployment); the proof lives here.
-///
 /// **The proof.** Any takeover must overwrite `holderIdentity`, and this replica
 /// writes nothing between losing contact and this call. So observing our own
 /// identity still on the Lease *proves* no peer claimed in the interval — it is
@@ -682,22 +695,37 @@ pub enum Reconfirmed {
 /// name, so two live pods cannot collide on it. Anything else — a foreign
 /// holder, an unheld Lease, a deleted Lease — is unprovable and therefore fatal.
 ///
-/// Bounded by one `lease_duration`: past that a peer could have claimed, and
-/// while the holder check would still catch it, there is no value in reconciling
-/// blind for longer. Residual exposure is that bound — reconciles kept running
-/// during it, as they already did through the failed renew window.
-pub async fn reconfirm(client: &Client, cfg: &LeaderElection, identity: &str) -> Reconfirmed {
+/// Because the proof does not depend on how many replicas exist, this is correct
+/// under HA too; it needs no replica-count precondition. An earlier revision
+/// gated it on a "sole replica" pod count, which was both weaker (point-in-time:
+/// a peer can start the instant after it answers) and actively harmful (its GET
+/// + LIST spent the very margin below).
+///
+/// **`safe_until` is a hard edge, not a budget to restart.** It is the instant a
+/// standby could first claim — one `lease_duration` after our last SUCCESSFUL
+/// renew. The failed renew round already consumed `renew_period +
+/// renew_deadline` of that, so what remains is only the const-asserted margin
+/// (~3s at the defaults). Measuring a fresh `lease_duration` from *now* instead
+/// would run ~12s past the point the invariant protects — reconciling while a
+/// peer legitimately leads, which is precisely what the whole margin exists to
+/// make impossible.
+pub async fn reconfirm(
+    client: &Client,
+    cfg: &LeaderElection,
+    identity: &str,
+    safe_until: Instant,
+) -> Reconfirmed {
     let api: Api<Lease> = Api::namespaced(client.clone(), &cfg.namespace);
-    let give_up_at = Instant::now() + cfg.timings.lease_duration;
+    let give_up_at = safe_until;
     let mut last_error = String::from("no attempt completed");
 
     loop {
         let remaining = give_up_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Reconfirmed::Lost(format!(
-                "could not re-reach the Lease within {:?} of losing contact ({last_error}); \
-                 cannot prove a peer has not taken over",
-                cfg.timings.lease_duration
+                "ran out of margin before the Lease could be re-reached ({last_error}); past \
+                 this point a standby may legitimately claim it, so continuing to reconcile \
+                 could not be proven exclusive"
             ));
         }
 
@@ -747,99 +775,6 @@ pub async fn reconfirm(client: &Client, cfg: &LeaderElection, identity: &str) ->
         }
         tokio::time::sleep(cfg.timings.retry_period.min(remaining)).await;
     }
-}
-
-/// Label that differs between a Deployment's ReplicaSets. Excluded from the
-/// peer selector so a rolling update's incoming pod still counts as a peer.
-const POD_TEMPLATE_HASH_LABEL: &str = "pod-template-hash";
-
-/// Is this replica provably the ONLY live controller pod?
-///
-/// Used on the [`LeadershipLost::RenewFailed`] path to decide whether losing
-/// contact with the Lease is worth a process restart. With no peer there is
-/// nobody to split-brain with, so re-campaigning in process is strictly better
-/// than exiting: the informer caches stay warm instead of every abdication
-/// paying a full cluster-wide re-LIST (the amplification loop in #319).
-///
-/// The selector is derived from OUR OWN pod's labels rather than hard-coded, so
-/// it stays correct whatever the chart stamps, minus
-/// [`POD_TEMPLATE_HASH_LABEL`] so a mid-rollout peer is not missed.
-///
-/// **Fails closed.** Any error, any ambiguity — no `HOSTNAME`, pod not found,
-/// list rejected, no labels to select on — returns `false`, and the caller
-/// exits. Exiting is the behavior this exists to improve on, never a wrong one.
-pub async fn sole_replica(client: &Client, namespace: &str, identity: &str) -> bool {
-    match count_live_replicas(client, namespace, identity).await {
-        Ok(alive) => {
-            tracing::info!(
-                alive_replicas = alive,
-                "checked for peer controller replicas"
-            );
-            alive == 1
-        }
-        Err(why) => {
-            tracing::warn!(
-                reason = %why,
-                pod = identity,
-                namespace,
-                "could not establish whether this is the only controller replica; assuming it \
-                 is not (a restart is always safe; skipping one is not)"
-            );
-            false
-        }
-    }
-}
-
-/// Count controller pods that could still be reconciling, this one included.
-/// Every failure is one `Err(String)` so [`sole_replica`] has a single, obvious
-/// fail-closed path rather than a `return false` per API call.
-async fn count_live_replicas(
-    client: &Client,
-    namespace: &str,
-    identity: &str,
-) -> Result<usize, String> {
-    use k8s_openapi::api::core::v1::Pod;
-    use kube::api::ListParams;
-
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let me = pods
-        .get(identity)
-        .await
-        .map_err(|e| format!("could not read our own Pod: {e}"))?;
-    let selector = peer_selector(me.metadata.labels.as_ref())
-        .ok_or_else(|| "our Pod carries no labels to select peers by".to_string())?;
-    let peers = pods
-        .list(&ListParams::default().labels(&selector))
-        .await
-        .map_err(|e| format!("could not list peers matching {selector}: {e}"))?;
-    Ok(peers.items.iter().filter(|p| pod_is_alive(p)).count())
-}
-
-/// Build the label selector that matches this pod's PEERS from its own labels.
-///
-/// Self-derived so it stays correct whatever labels the chart stamps, minus
-/// [`POD_TEMPLATE_HASH_LABEL`] — that one differs between a Deployment's
-/// ReplicaSets, and a rolling update's incoming pod is very much a peer.
-/// `None` when there is nothing to select on, which the caller treats as
-/// "cannot prove we are alone".
-fn peer_selector(labels: Option<&std::collections::BTreeMap<String, String>>) -> Option<String> {
-    let selector = labels?
-        .iter()
-        .filter(|(k, _)| k.as_str() != POD_TEMPLATE_HASH_LABEL)
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    (!selector.is_empty()).then_some(selector)
-}
-
-/// Could this pod still be reconciling? Terminating pods cannot start, and a
-/// pod in a terminal phase has stopped — neither can contend for the Lease.
-fn pod_is_alive(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
-    pod.metadata.deletion_timestamp.is_none()
-        && !matches!(
-            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-            Some("Succeeded" | "Failed")
-        )
 }
 
 /// Best-effort graceful release on shutdown: clear `holderIdentity` (CAS) so
@@ -967,75 +902,6 @@ mod tests {
         assert!(
             RENEW_DEADLINE.as_secs_f64() / RETRY_PERIOD.as_secs_f64() >= 4.0,
             "the renew window must allow at least ~4 attempts"
-        );
-    }
-
-    #[test]
-    fn peer_selector_is_self_derived_and_rollout_safe() {
-        use std::collections::BTreeMap;
-        let labels: BTreeMap<String, String> = [
-            ("app.kubernetes.io/name", "kopiur"),
-            ("app.kubernetes.io/component", "controller"),
-            // Differs between a Deployment's ReplicaSets: including it would
-            // hide a rolling update's incoming pod, and we would then wrongly
-            // conclude we are alone at exactly the moment we are not.
-            (POD_TEMPLATE_HASH_LABEL, "794467765b"),
-        ]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-
-        let selector = peer_selector(Some(&labels)).expect("labels yield a selector");
-        assert!(!selector.contains(POD_TEMPLATE_HASH_LABEL));
-        assert!(selector.contains("app.kubernetes.io/name=kopiur"));
-        assert!(selector.contains("app.kubernetes.io/component=controller"));
-    }
-
-    #[test]
-    fn peer_selector_is_none_when_there_is_nothing_to_select_on() {
-        use std::collections::BTreeMap;
-        // Fails closed at the caller: no selector means we cannot prove we are
-        // alone, so the caller must exit rather than re-campaign.
-        assert_eq!(peer_selector(None), None);
-        assert_eq!(peer_selector(Some(&BTreeMap::new())), None);
-        let only_hash: BTreeMap<String, String> =
-            [(POD_TEMPLATE_HASH_LABEL.to_string(), "abc".to_string())]
-                .into_iter()
-                .collect();
-        assert_eq!(peer_selector(Some(&only_hash)), None);
-    }
-
-    #[test]
-    fn only_pods_that_could_still_reconcile_count_as_peers() {
-        use k8s_openapi::api::core::v1::{Pod, PodStatus};
-        let pod = |phase: Option<&str>, deleting: bool| Pod {
-            metadata: ObjectMeta {
-                deletion_timestamp: deleting
-                    .then(|| MicroTime(Timestamp::now()).0)
-                    .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time),
-                ..Default::default()
-            },
-            status: phase.map(|p| PodStatus {
-                phase: Some(p.to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert!(pod_is_alive(&pod(Some("Running"), false)));
-        assert!(
-            pod_is_alive(&pod(Some("Pending"), false)),
-            "a Pending peer is about to start"
-        );
-        assert!(
-            pod_is_alive(&pod(None, false)),
-            "no status yet is not proof of death"
-        );
-        assert!(!pod_is_alive(&pod(Some("Succeeded"), false)));
-        assert!(!pod_is_alive(&pod(Some("Failed"), false)));
-        assert!(
-            !pod_is_alive(&pod(Some("Running"), true)),
-            "a terminating pod cannot start contending for the Lease"
         );
     }
 
@@ -1354,6 +1220,13 @@ mod tests {
                 .expect("renewal task must not panic");
         }
 
+        /// The edge `reconfirm` is really given in production: our last
+        /// successful renew was one `RENEW_PERIOD + RENEW_DEADLINE` round ago,
+        /// so only the const-asserted MARGIN is left — not a fresh interval.
+        fn margin_edge() -> Instant {
+            Instant::now() + (LEASE_DURATION - (RENEW_PERIOD + RENEW_DEADLINE))
+        }
+
         fn election_cfg() -> LeaderElection {
             LeaderElection {
                 lease_name: "kopiur-leader".to_string(),
@@ -1543,7 +1416,7 @@ mod tests {
                 log.clone(),
             );
             assert_eq!(
-                reconfirm(&client, &election_cfg(), ME).await,
+                reconfirm(&client, &election_cfg(), ME, margin_edge()).await,
                 Reconfirmed::StillOurs
             );
             // And it must actually re-stamp, not just look: a reconfirm that
@@ -1567,7 +1440,7 @@ mod tests {
                 vec![("GET", StatusCode::OK, lease_json(OTHER, 1, 8))],
                 log.clone(),
             );
-            let outcome = reconfirm(&client, &election_cfg(), ME).await;
+            let outcome = reconfirm(&client, &election_cfg(), ME, margin_edge()).await;
             assert!(
                 matches!(outcome, Reconfirmed::Lost(_)),
                 "a foreign holder must be fatal, never a standby: {outcome:?}"
@@ -1593,7 +1466,7 @@ mod tests {
             });
             let client = mock_client(vec![("GET", StatusCode::OK, unheld)], log.clone());
             assert!(matches!(
-                reconfirm(&client, &election_cfg(), ME).await,
+                reconfirm(&client, &election_cfg(), ME, margin_edge()).await,
                 Reconfirmed::Lost(_)
             ));
 
@@ -1602,27 +1475,56 @@ mod tests {
                 Arc::new(Mutex::new(Vec::new())),
             );
             assert!(matches!(
-                reconfirm(&client, &election_cfg(), ME).await,
+                reconfirm(&client, &election_cfg(), ME, margin_edge()).await,
                 Reconfirmed::Lost(_)
             ));
         }
 
         #[tokio::test(start_paused = true)]
-        async fn reconfirm_is_bounded_and_gives_up_against_a_stalled_apiserver() {
-            // Reconciles keep running while this retries, so it must not be able
-            // to spin forever: bounded by one lease duration, then fatal.
+        async fn reconfirm_never_outlives_the_margin() {
+            // THE SECOND REVIEW FIX (#324). An earlier revision gave reconfirm a
+            // FRESH lease_duration measured from now. That runs ~12s past the
+            // point a standby may legitimately claim — the const-asserted margin
+            // guarantees abdication at RENEW_PERIOD + RENEW_DEADLINE precisely
+            // BECAUSE a peer cannot claim until LEASE_DURATION, and restarting
+            // the clock threw that guarantee away while reconcilers kept running.
+            //
+            // What is actually left is the margin, and nothing more.
+            let margin = LEASE_DURATION - (RENEW_PERIOD + RENEW_DEADLINE);
             let start = Instant::now();
             let outcome = tokio::time::timeout(
-                LEASE_DURATION + Duration::from_secs(5),
-                reconfirm(&hanging_client(), &election_cfg(), ME),
+                LEASE_DURATION,
+                reconfirm(&hanging_client(), &election_cfg(), ME, start + margin),
             )
             .await
             .expect("reconfirm must be bounded, not hang while reconcilers run");
             assert!(matches!(outcome, Reconfirmed::Lost(_)), "{outcome:?}");
+
+            let spent = start.elapsed();
             assert!(
-                start.elapsed() >= LEASE_DURATION,
-                "gave up after {:?}, before spending its {LEASE_DURATION:?} budget",
-                start.elapsed()
+                spent >= margin,
+                "gave up after {spent:?} without spending its {margin:?} margin"
+            );
+            assert!(
+                spent < LEASE_DURATION - (RENEW_PERIOD + RENEW_DEADLINE) + RETRY_PERIOD,
+                "reconfirm ran {spent:?}, past the {margin:?} margin — a standby may already \
+                 have claimed the Lease while our reconcilers were still running"
+            );
+        }
+
+        #[test]
+        fn the_margin_is_what_reconfirm_may_spend() {
+            // Pin the relationship the fix rests on, so a future timing change
+            // cannot silently hand reconfirm a budget it is not entitled to.
+            let worst_case_abdication = RENEW_PERIOD + RENEW_DEADLINE;
+            let margin = LEASE_DURATION - worst_case_abdication;
+            assert!(
+                !margin.is_zero(),
+                "no margin left for reconfirm; it must then never run at all"
+            );
+            assert!(
+                worst_case_abdication + margin <= LEASE_DURATION,
+                "renew round + reconfirm must not outlive the lease duration"
             );
         }
 

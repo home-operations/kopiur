@@ -439,30 +439,28 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                     leader::LeadershipLost::RenewFailed {
                         attempts,
                         last_error,
+                        safe_until,
                     } => {
-                        if !leader::sole_replica(&election_client, &le.namespace, id).await {
-                            anyhow::bail!(
-                                "leader lease renewal failed after {attempts} attempt(s) \
-                                 ({last_error}); another replica may have taken over — exiting \
-                                 to re-elect"
-                            );
-                        }
                         tracing::warn!(
                             attempts,
                             last_error = %last_error,
-                            "leader lease renewal failed, but this is the only controller \
-                             replica; re-confirming our hold instead of restarting"
+                            "leader lease renewal failed; re-confirming our hold within the \
+                             remaining margin instead of restarting outright"
                         );
                         // NOT `acquire`. The reconcilers are still running, so
                         // standing by behind a peer — which is what acquire does
-                        // — would reconcile underneath whoever now leads, and
-                        // do it indefinitely. `reconfirm` instead PROVES the
-                        // Lease never left our hands (any takeover overwrites
-                        // holderIdentity, and we wrote nothing meanwhile) and
-                        // otherwise gives up. The sole-replica check above is a
-                        // precondition, not the safety property: it is
-                        // point-in-time, and a peer can start right after it.
-                        match leader::reconfirm(&election_client, le, id).await {
+                        // — would reconcile underneath whoever now leads, and do
+                        // it indefinitely. `reconfirm` instead PROVES the Lease
+                        // never left our hands (any takeover overwrites
+                        // holderIdentity, and we wrote nothing meanwhile).
+                        //
+                        // `safe_until` is the instant a standby may first claim,
+                        // measured from our last SUCCESSFUL renew — NOT a fresh
+                        // interval from now. The failed round already spent most
+                        // of it, so only the const-asserted margin is left. A
+                        // fresh interval would run past the point the invariant
+                        // protects, which is the whole thing it exists to stop.
+                        match leader::reconfirm(&election_client, le, id, safe_until).await {
                             leader::Reconfirmed::StillOurs => {
                                 renewal = leader::spawn_renewal(
                                     election_client.clone(),
