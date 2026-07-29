@@ -356,8 +356,8 @@ set -eu
 mkdir -p target/e2e; rm -f target/e2e/.diag-done
 trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "==> e2e tests FAILED (rc=$rc) — dumping cluster diagnostics" >&2; mise run //crates/e2e:diagnostics || true; touch target/e2e/.diag-done; fi; exit $rc' EXIT
 # KOPIUR_E2E_BINS — space-separated test-binary (file) names, expanded to repeated
-# `--test <name>` flags BEFORE `--`, so a CI shard runs only its files. Empty ⇒ all.
-# KOPIUR_E2E_TESTFILTER — libtest name-substring filter, kept AFTER `--`.
+# `--test <name>` target flags, so a CI shard runs only its files. Empty ⇒ all.
+# KOPIUR_E2E_TESTFILTER — name-substring filter (nextest positional filter).
 BINS=""
 for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
 # The CLI e2e (tests/cli.rs) runs the compiled plugin binary (`kopiur`) as a
@@ -365,11 +365,16 @@ for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
 echo "==> building kopiur CLI (e2e subject)"
 cargo build -p kopiur-cli --locked
 echo "==> running e2e tests${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
-# `--no-fail-fast`: run EVERY test binary even when one fails, so a single flaky bin
+# nextest instead of `cargo test` for the `e2e` profile's per-test retries
+# (see .config/nextest.toml): a transient failure retries in place instead of
+# failing the CI shard and evicting the PR from the merge queue.
+# `--no-fail-fast`: run EVERY test even when one fails, so a single flaky bin
 # (e.g. the heavyweight NFS/server backend test) can't hide the pass/fail of the rest.
-# cargo still exits non-zero overall, so the trap + CI failure are unaffected.
-cargo test -p kopiur-e2e --features e2e $BINS --no-fail-fast -- \
-  --include-ignored --test-threads=1 --nocapture ${KOPIUR_E2E_TESTFILTER:-}
+# nextest still exits non-zero overall, so the trap + CI failure are unaffected.
+# `--run-ignored all` ≙ libtest `--include-ignored`; `--no-capture` streams
+# output live and keeps execution serial, like the old `--test-threads=1 --nocapture`.
+cargo nextest run --profile e2e -p kopiur-e2e --features e2e $BINS --no-fail-fast \
+  --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
 echo "==> e2e tests passed"
 '''
 
