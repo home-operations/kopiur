@@ -1,0 +1,17 @@
+# Nextest is used only by the e2e harness (crates/e2e/mise.toml `run` task,
+# always with `--profile e2e`); the hermetic unit suite stays on plain
+# `cargo test`, which compile-checks feature-gated targets in a way nextest
+# does not replace.
+
+[profile.e2e]
+# Retry a failed test up to 2 more times before counting it as failed. The e2e
+# suite occasionally flakes on GitHub runners (kind/apiserver hiccups), and a
+# failed required check evicts the PR from the merge queue with no automatic
+# requeue — so absorb the transient failure inside the check run instead.
+# A retried-then-passed test is reported as FLAKY, keeping the flake visible
+# in the job log rather than silently swallowed.
+retries = 2
+# The suite is stateful against one shared kind cluster and was previously run
+# with libtest `--test-threads=1`; keep it serial. (`--no-capture` on the CLI
+# also forces this, but state it here so the profile stands on its own.)
+test-threads = 1

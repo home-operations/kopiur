@@ -36,6 +36,9 @@ kind = "0.32.0"
 kopia = "v0.23.1"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "aqua:taiki-e/cargo-llvm-cov" = "0.8.7"
+# Runs the e2e suite (crates/e2e `run` task) so individual flaky tests retry
+# in-process-tree instead of failing the whole CI shard; see .config/nextest.toml.
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.140"
 # Docs site toolchain. The docs are an MkDocs Material site (see `mise run docs`);
 # the MkDocs + Material + pymdown-extensions versions are pinned in pyproject.toml
 # / uv.lock and run via uv, so the only mise-managed tool here is uv itself (which
