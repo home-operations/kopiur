@@ -443,13 +443,31 @@ the guaranteed `leader-election` priority level.
 **Exit-on-lost-lease, revisited.** Losing the Lease is now two cases, not one.
 `LeadershipLost::ToPeer` — a foreign holder was *observed* — still exits; there is
 nothing to re-take. `LeadershipLost::RenewFailed` means only that contact was
-lost, and the process now checks whether it is the sole live controller pod
-(self-derived label selector, `pod-template-hash` excluded so a mid-rollout peer
-counts). If it is provably alone there is nobody to split-brain with, so it
-re-campaigns in place and keeps its informer caches warm. Anything ambiguous —
-more than one pod, a failed list, no labels — exits. The chart default is
-`replicaCount: 1`, where the old unconditional exit bought no split-brain
-protection and cost a full cold start every time.
+lost, and the process may keep its informer caches warm instead of paying a full
+cold start. The chart default is `replicaCount: 1`, where the old unconditional
+exit bought no split-brain protection at all.
+
+What makes that safe is **not** the replica count. A sole-replica check is
+point-in-time: a peer can start the instant after it answers, which is exactly
+what a rollout does and exactly what an operator reaching for `kubectl scale`
+during an incident does. Worse, #319's own mechanism makes a peer *more* likely to
+be healthy — a wedged client means the API server is fine for everybody else. So
+the check is a precondition (don't even attempt this in an HA deployment), not
+the safety property.
+
+The safety property is `leader::reconfirm`, and it is a proof rather than an
+inference: any takeover must overwrite `holderIdentity`, and this replica writes
+nothing between losing contact and re-confirming — so observing our own identity
+still on the Lease *proves* no peer claimed in the interval. Identity is the pod
+name, so two live pods cannot collide on it. A foreign holder, an unheld Lease or
+a deleted Lease are all unprovable and therefore fatal.
+
+This is deliberately not `acquire`. Acquire stands by when a peer leads, which is
+right for a process that holds nothing and runs nothing — but on this path the
+reconcilers are still running, so standing by would reconcile underneath the new
+leader indefinitely. `reconfirm` is bounded by one lease duration and then gives
+up; the residual exposure is that bound, during which reconciles keep running as
+they already did through the failed renew window.
 
 ### Breaking the restart→re-LIST→restart loop
 

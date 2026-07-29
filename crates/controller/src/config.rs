@@ -533,6 +533,12 @@ pub struct LeaseTimings {
     pub retry_period: std::time::Duration,
 }
 
+/// Ceiling on [`LeaseTimings::lease_duration`]. Generous — 5 minutes is already
+/// far beyond any sane election — while keeping the published
+/// `leaseDurationSeconds` well inside `i32`, which is the type the Lease API
+/// uses and which an unchecked cast would wrap.
+pub const MAX_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl Default for LeaseTimings {
     fn default() -> Self {
         Self {
@@ -575,6 +581,21 @@ impl LeaseTimings {
                  API server)"
                     .to_string(),
             ));
+        }
+        // Absolute ceiling, not just a relationship. `leaseDurationSeconds` is
+        // an i32 on the wire, so an absurd value would silently WRAP to a
+        // negative or unrelated duration when serialized — the Lease would then
+        // advertise expiry semantics different from the ones this process
+        // enforces. Reject it loudly here instead. The bound is also just
+        // sanity: leader election measured in hours means a failover takes
+        // hours, which no deployment wants.
+        if self.lease_duration > MAX_LEASE_DURATION {
+            return Err(ConfigError::LeaseTimings(format!(
+                "leaseDuration ({:?}) exceeds the {:?} ceiling: a longer lease means a failover \
+                 waits that long before any replica may take over, and the value must stay \
+                 representable as the i32 `leaseDurationSeconds` the Lease publishes",
+                self.lease_duration, MAX_LEASE_DURATION
+            )));
         }
         Ok(())
     }
@@ -1430,6 +1451,34 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+
+        // An absurd lease duration must be rejected on MAGNITUDE, not just on
+        // its relationships. `leaseDurationSeconds` is an i32 on the wire, so a
+        // value past that wraps silently and the Lease would advertise expiry
+        // semantics this process does not enforce — to every other client
+        // reading it, not just to us.
+        let oversized = LeaseTimings {
+            lease_duration: Duration::from_secs(u32::MAX as u64),
+            renew_deadline: Duration::from_secs(u32::MAX as u64 - 100),
+            renew_period: secs(2),
+            retry_period: secs(2),
+        };
+        // Relationally consistent — the ONLY thing rejecting it is the ceiling.
+        assert!(oversized.renew_period + oversized.renew_deadline < oversized.lease_duration);
+        let err = oversized
+            .validate()
+            .expect_err("an i32-overflowing lease duration must be rejected");
+        assert!(err.to_string().contains("ceiling"), "{err}");
+
+        assert!(
+            LeaseTimings {
+                lease_duration: MAX_LEASE_DURATION,
+                ..LeaseTimings::default()
+            }
+            .validate()
+            .is_ok(),
+            "the ceiling itself must be allowed"
         );
     }
 

@@ -214,7 +214,7 @@ top-level values tune the controller's runtime footprint and API-server load
 | Value | Default | What it does |
 |---|---|---|
 | `workerThreads` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
-| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists on a pre-1.32 apiserver — or when the startup version probe fails. |
+| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
 | `reconcileConcurrency` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
 | `maxConcurrentDeleteJobs` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
 | `leaderElection.flowSchema.enabled` | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |

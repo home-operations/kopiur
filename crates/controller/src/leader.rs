@@ -292,7 +292,13 @@ fn claimed_spec(
 ) -> LeaseSpec {
     LeaseSpec {
         holder_identity: Some(identity.to_string()),
-        lease_duration_seconds: Some(lease_duration.as_secs() as i32),
+        // Saturating, never `as`: an unchecked cast of an oversized duration
+        // wraps to a negative or unrelated value, and the Lease would then
+        // advertise expiry semantics this process does not enforce.
+        // `LeaseTimings::validate` already caps this well inside i32 — belt and
+        // braces, because the failure is silent and the field is a safety input
+        // for every OTHER client reading the Lease.
+        lease_duration_seconds: Some(i32::try_from(lease_duration.as_secs()).unwrap_or(i32::MAX)),
         acquire_time: Some(MicroTime(now)),
         renew_time: Some(MicroTime(now)),
         lease_transitions: Some(transitions),
@@ -641,6 +647,106 @@ pub fn spawn_renewal(
             }
         }
     })
+}
+
+/// Outcome of [`reconfirm`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconfirmed {
+    /// The Lease still named us and has been re-stamped. Our exclusive hold was
+    /// never broken, so the reconcilers that kept running were never concurrent
+    /// with a peer.
+    StillOurs,
+    /// Continuous ownership could NOT be proven. The caller must exit.
+    Lost(String),
+}
+
+/// After a failed renew round, re-confirm that this replica **never stopped**
+/// holding the Lease, and re-stamp it.
+///
+/// Deliberately NOT [`acquire`]. Acquire is for a process that holds nothing and
+/// runs nothing, so standing by when a peer leads is correct there. On this path
+/// the reconcilers are STILL RUNNING — standing by would mean reconciling
+/// underneath whoever now holds the Lease, an unbounded split brain rather than
+/// a transient one.
+///
+/// [`sole_replica`] cannot provide the safety property either: it is a
+/// point-in-time answer, and a peer can start the instant after it returns —
+/// which is exactly what a rollout does, and exactly what an operator reaching
+/// for `kubectl scale` during an incident does. It stays as a cheap precondition
+/// (don't even attempt this in an HA deployment); the proof lives here.
+///
+/// **The proof.** Any takeover must overwrite `holderIdentity`, and this replica
+/// writes nothing between losing contact and this call. So observing our own
+/// identity still on the Lease *proves* no peer claimed in the interval — it is
+/// not an inference from replica counts or elapsed time. Identity is the pod
+/// name, so two live pods cannot collide on it. Anything else — a foreign
+/// holder, an unheld Lease, a deleted Lease — is unprovable and therefore fatal.
+///
+/// Bounded by one `lease_duration`: past that a peer could have claimed, and
+/// while the holder check would still catch it, there is no value in reconciling
+/// blind for longer. Residual exposure is that bound — reconciles kept running
+/// during it, as they already did through the failed renew window.
+pub async fn reconfirm(client: &Client, cfg: &LeaderElection, identity: &str) -> Reconfirmed {
+    let api: Api<Lease> = Api::namespaced(client.clone(), &cfg.namespace);
+    let give_up_at = Instant::now() + cfg.timings.lease_duration;
+    let mut last_error = String::from("no attempt completed");
+
+    loop {
+        let remaining = give_up_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Reconfirmed::Lost(format!(
+                "could not re-reach the Lease within {:?} of losing contact ({last_error}); \
+                 cannot prove a peer has not taken over",
+                cfg.timings.lease_duration
+            ));
+        }
+
+        let attempt = async {
+            let observed = api.get_opt(&cfg.lease_name).await?;
+            let Some(mut lease) = observed else {
+                return Ok::<_, kube::Error>(Some(Reconfirmed::Lost(
+                    "the Lease no longer exists; a peer may have recreated and claimed it"
+                        .to_string(),
+                )));
+            };
+            let mut spec = lease.spec.clone().unwrap_or_default();
+            match spec.holder_identity.as_deref() {
+                Some(h) if h == identity => {}
+                other => {
+                    return Ok(Some(Reconfirmed::Lost(format!(
+                        "the Lease now names {}; it left our hands while we were out of contact",
+                        other.unwrap_or("<nobody>")
+                    ))));
+                }
+            }
+            // Still ours: re-stamp under the observed resourceVersion. A 409
+            // means someone wrote concurrently — re-observe rather than assume.
+            spec.renew_time = Some(MicroTime(Timestamp::now()));
+            lease.spec = Some(spec);
+            match api
+                .replace(&cfg.lease_name, &PostParams::default(), &lease)
+                .await
+            {
+                Ok(_) => Ok(Some(Reconfirmed::StillOurs)),
+                Err(kube::Error::Api(e)) if e.code == 409 => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+
+        match tokio::time::timeout(RENEW_ATTEMPT_TIMEOUT.min(remaining), attempt).await {
+            Ok(Ok(Some(outcome))) => return outcome,
+            // 409: re-observe on the next pass.
+            Ok(Ok(None)) => last_error = "concurrent write on the Lease".to_string(),
+            Ok(Err(e)) => last_error = e.to_string(),
+            Err(_elapsed) => last_error = "no response".to_string(),
+        }
+
+        let remaining = give_up_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
+        tokio::time::sleep(cfg.timings.retry_period.min(remaining)).await;
+    }
 }
 
 /// Label that differs between a Deployment's ReplicaSets. Excluded from the
@@ -1420,6 +1526,103 @@ mod tests {
                 attempts >= 2,
                 "only {attempts} attempt in a {RENEW_DEADLINE:?} window — one hung attempt \
                  swallowed the whole budget, so nothing ever gets a second connection"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconfirm_accepts_only_a_lease_that_still_names_us() {
+            // The proof the re-campaign path rests on: a takeover must overwrite
+            // holderIdentity, and we write nothing while out of contact, so our
+            // own identity still being there means no peer claimed.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = mock_client(
+                vec![
+                    ("GET", StatusCode::OK, lease_json(ME, 12, 7)),
+                    ("PUT", StatusCode::OK, lease_json(ME, 0, 7)),
+                ],
+                log.clone(),
+            );
+            assert_eq!(
+                reconfirm(&client, &election_cfg(), ME).await,
+                Reconfirmed::StillOurs
+            );
+            // And it must actually re-stamp, not just look: a reconfirm that
+            // reads without writing leaves the Lease ageing out underneath us.
+            let log = log.lock().unwrap();
+            assert!(
+                log.iter().any(|(m, _)| m == "PUT"),
+                "reconfirm must re-stamp renewTime, not merely observe: {log:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconfirm_gives_up_when_a_peer_holds_the_lease() {
+            // THE REVIEW FIX (#324). `sole_replica` is point-in-time, so a peer
+            // can start right after it answers — a rollout does exactly that.
+            // The old path called `acquire`, which STANDS BY behind a peer, so
+            // the deposed leader would have sat in standby while its reconcilers
+            // kept running: an unbounded split brain, not a transient one.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = mock_client(
+                vec![("GET", StatusCode::OK, lease_json(OTHER, 1, 8))],
+                log.clone(),
+            );
+            let outcome = reconfirm(&client, &election_cfg(), ME).await;
+            assert!(
+                matches!(outcome, Reconfirmed::Lost(_)),
+                "a foreign holder must be fatal, never a standby: {outcome:?}"
+            );
+            // Read-only: it must not try to steal the Lease back.
+            let log = log.lock().unwrap();
+            assert!(
+                !log.iter().any(|(m, _)| m == "PUT"),
+                "reconfirm must never write over a peer's Lease: {log:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconfirm_gives_up_on_an_unheld_or_absent_lease() {
+            // Unheld is just as unprovable as foreign-held: someone could have
+            // claimed AND released while we were blind.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let unheld = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "metadata": { "name": "kopiur-leader", "namespace": "test-ns",
+                              "resourceVersion": "42" },
+                "spec": { "leaseDurationSeconds": 15, "leaseTransitions": 9 }
+            });
+            let client = mock_client(vec![("GET", StatusCode::OK, unheld)], log.clone());
+            assert!(matches!(
+                reconfirm(&client, &election_cfg(), ME).await,
+                Reconfirmed::Lost(_)
+            ));
+
+            let client = mock_client(
+                vec![("GET", StatusCode::NOT_FOUND, status_json(404, "NotFound"))],
+                Arc::new(Mutex::new(Vec::new())),
+            );
+            assert!(matches!(
+                reconfirm(&client, &election_cfg(), ME).await,
+                Reconfirmed::Lost(_)
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconfirm_is_bounded_and_gives_up_against_a_stalled_apiserver() {
+            // Reconciles keep running while this retries, so it must not be able
+            // to spin forever: bounded by one lease duration, then fatal.
+            let start = Instant::now();
+            let outcome = tokio::time::timeout(
+                LEASE_DURATION + Duration::from_secs(5),
+                reconfirm(&hanging_client(), &election_cfg(), ME),
+            )
+            .await
+            .expect("reconfirm must be bounded, not hang while reconcilers run");
+            assert!(matches!(outcome, Reconfirmed::Lost(_)), "{outcome:?}");
+            assert!(
+                start.elapsed() >= LEASE_DURATION,
+                "gave up after {:?}, before spending its {LEASE_DURATION:?} budget",
+                start.elapsed()
             );
         }
 

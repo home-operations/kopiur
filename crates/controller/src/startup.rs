@@ -451,10 +451,19 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                             attempts,
                             last_error = %last_error,
                             "leader lease renewal failed, but this is the only controller \
-                             replica; re-campaigning in place instead of restarting"
+                             replica; re-confirming our hold instead of restarting"
                         );
-                        match leader::acquire(&election_client, le, id, Some(&metrics)).await {
-                            leader::Acquired::Leading => {
+                        // NOT `acquire`. The reconcilers are still running, so
+                        // standing by behind a peer — which is what acquire does
+                        // — would reconcile underneath whoever now leads, and
+                        // do it indefinitely. `reconfirm` instead PROVES the
+                        // Lease never left our hands (any takeover overwrites
+                        // holderIdentity, and we wrote nothing meanwhile) and
+                        // otherwise gives up. The sole-replica check above is a
+                        // precondition, not the safety property: it is
+                        // point-in-time, and a peer can start right after it.
+                        match leader::reconfirm(&election_client, le, id).await {
+                            leader::Reconfirmed::StillOurs => {
                                 renewal = leader::spawn_renewal(
                                     election_client.clone(),
                                     le.clone(),
@@ -462,10 +471,10 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                                     Some(metrics.clone()),
                                 );
                             }
-                            // RBAC vanished under us mid-run; the degraded path
-                            // is a startup-only accommodation, not a steady state.
-                            leader::Acquired::Degraded => anyhow::bail!(
-                                "lost access to the leader Lease while leading; exiting"
+                            leader::Reconfirmed::Lost(why) => anyhow::bail!(
+                                "leader lease renewal failed after {attempts} attempt(s) \
+                                 ({last_error}), and our hold could not be re-confirmed: \
+                                 {why} — exiting to re-elect"
                             ),
                         }
                     }
