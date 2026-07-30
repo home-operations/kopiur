@@ -259,6 +259,14 @@ jobs:
           experimental: true
           install_args: --locked
 
+      # Booting the node container and restoring the cache + image artifacts
+      # share no inputs, so they overlap: the cluster is not needed until the
+      # images are in the local daemon and ready to side-load.
+      - name: Create kind cluster
+        id: cluster
+        background: true
+        run: mise run //crates/e2e:cluster-create
+
       # Separate key from the build job: the shards compile the e2e *test* crate
       # (debug), not the release images, so they shouldn't thrash that cache.
       - name: Setup Rust cache
@@ -276,10 +284,9 @@ jobs:
       - name: Load images into docker
         run: |
           set -eu
-          for tar in image-*.tar; do docker load -i "$tar"; done
+          for tar in image-*.tar.gz; do docker load -i "$tar"; done
 
-      - name: Create kind cluster
-        run: mise run //crates/e2e:cluster-create
+      - wait: [cluster]
 
       - name: Load images into kind
         run: mise run //crates/e2e:images-load
@@ -377,14 +384,22 @@ jobs:
           KOPIUR_IMAGE_TAG: e2e
         run: mise run //:${{ matrix.task }}
 
+      # Every shard downloads all three images, so the tarballs cross the
+      # artifact store dozens of times per run and are worth compressing. gzip
+      # because the daemon may export layers uncompressed depending on its image
+      # store, and docker load reads either. shell: bash for the pipefail the
+      # implicit `bash -e` default lacks -- a failed save would otherwise leave
+      # gzip's exit status to pass the step and hand every shard a truncated
+      # tarball.
       - name: Save image
-        run: docker save kopiur/${{ matrix.image }}:e2e -o image-${{ matrix.image }}.tar
+        shell: bash
+        run: docker save kopiur/${{ matrix.image }}:e2e | gzip -1 > image-${{ matrix.image }}.tar.gz
 
       - name: Upload image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-image-${{ matrix.image }}
-          path: image-${{ matrix.image }}.tar
+          path: image-${{ matrix.image }}.tar.gz
           retention-days: 1
 
   helm-lint:
@@ -599,12 +614,17 @@ jobs:
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
+      # cancelled counts as failed: !cancelled() above still runs this job when
+      # individual needs were cancelled but the run was not, and a required job
+      # that never reached a verdict must not clear the merge gate. The e2e
+      # matrix is fail-fast: false across seventeen shards, so a superseded push
+      # cancelling them is the common case, not a corner one.
       - name: Any jobs failed?
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
           exit 1
 
       - name: All jobs passed or skipped?
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
         run: |
           echo "All jobs passed or skipped" && echo "${{ toJSON(needs.*.result) }}"
