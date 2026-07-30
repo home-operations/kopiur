@@ -563,43 +563,43 @@ version = "0.61.0"
 backend = "npm:oxfmt"
 
 [[tools.promtool]]
-version = "3.13.1"
+version = "3.13.2"
 backend = "aqua:prometheus/prometheus"
 
 [tools.promtool."platforms.linux-arm64"]
-checksum = "sha256:fbd8e5e0f6ad2e7d053e717739186caee4fd0cab2cf9335bfc86c292fe2a2bfe"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472288105"
+checksum = "sha256:7cecb17a6f41d59814e1a0581a1f81f79051ad5973d1ecf39e23a9f747d6572a"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495312527"
 
 [tools.promtool."platforms.linux-arm64-musl"]
-checksum = "sha256:fbd8e5e0f6ad2e7d053e717739186caee4fd0cab2cf9335bfc86c292fe2a2bfe"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472288105"
+checksum = "sha256:7cecb17a6f41d59814e1a0581a1f81f79051ad5973d1ecf39e23a9f747d6572a"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495312527"
 
 [tools.promtool."platforms.linux-x64"]
-checksum = "sha256:962b812371aff838d152b6ff2d56fdb7a6396f5542f48ebf73421b9721f0d103"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.linux-amd64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472288071"
+checksum = "sha256:0e8c4d46101bd025ea8265e377d2caabc57f488fc1be1c367f37db69ea41be6f"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.linux-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495312468"
 
 [tools.promtool."platforms.linux-x64-musl"]
-checksum = "sha256:962b812371aff838d152b6ff2d56fdb7a6396f5542f48ebf73421b9721f0d103"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.linux-amd64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472288071"
+checksum = "sha256:0e8c4d46101bd025ea8265e377d2caabc57f488fc1be1c367f37db69ea41be6f"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.linux-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495312468"
 
 [tools.promtool."platforms.macos-arm64"]
-checksum = "sha256:28d1f1224b2a22f84c801487fad4b3bd58f94a8cb58cf9340557e787030c9703"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.darwin-arm64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472287588"
+checksum = "sha256:f68ca4f1dbedd6366bbfdd8ac5d2c0b7ba1f273474acc8d38eb33202fbeec7a4"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495311912"
 
 [tools.promtool."platforms.macos-x64"]
-checksum = "sha256:bc6cef4bdbeb3d0974ac161684dd2a0c4d4e341a13a4a634917b1c09d0f33fc5"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.darwin-amd64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472287538"
+checksum = "sha256:e57095aed0b69e10edaee28b92718d4a65f46d466bf93aeda54075e901d15c2a"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.darwin-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495311854"
 
 [tools.promtool."platforms.windows-x64"]
-checksum = "sha256:612dd4729d3b6b851bb240b96955d6c3d652c91833c7f74ecea7b8e834f583a3"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.windows-amd64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/472289099"
+checksum = "sha256:ec54940b61af8342e0d413a4457d8b772fe6717cc9fa3abaeb83af81bc020184"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.13.2/prometheus-3.13.2.windows-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/495313830"
 
 [[tools.rust]]
 version = "1.97.1"
