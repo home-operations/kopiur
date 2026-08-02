@@ -2194,6 +2194,7 @@ mod bootstrap_outcomes {
             index_blob_count: None,
             epoch: None,
             epoch_error: None,
+            blob_retention: None,
             failure: None,
         }
     }

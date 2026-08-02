@@ -2178,6 +2178,68 @@ spec:
                 description: Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
                 nullable: true
                 properties:
+                  blobRetention:
+                    description: |-
+                      Object-lock blob retention (S3/Azure/GCS) — ransomware protection. Absent means
+                      "don't touch it"; use `disabled: true` to actively turn it off.
+                    nullable: true
+                    oneOf:
+                    - required:
+                      - governance
+                    - required:
+                      - compliance
+                    - required:
+                      - disabled
+                    properties:
+                      compliance:
+                        description: |-
+                          `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including
+                          the account root. An oversized period is an unfixable storage-cost commitment; there
+                          is no recovery path short of deleting the bucket after expiry.
+                        properties:
+                          period:
+                            description: |-
+                              Go-style duration; kopia's minimum is `24h` and there is no maximum.
+
+                              Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
+                              CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
+                              write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
+                              CRD field rather than matching kopia's per-flag variations.
+                            type: string
+                        required:
+                        - period
+                        type: object
+                      disabled:
+                        description: |-
+                          Actively disable retention (`--retention-mode=none`). Must be `true`.
+
+                          A `bool` rather than a unit variant because an externally-tagged unit variant
+                          serializes as the bare string `"Disabled"`, mixing string and object forms in one
+                          `oneOf` and breaking the structural schema. Same shape, and same reason, as
+                          [`crate::cluster_repository::AllowedNamespaces::All`].
+
+                          This is distinct from omitting `blobRetention` entirely: absent means "leave the
+                          repository alone", so deleting the block from a manifest can never silently strip
+                          ransomware protection someone configured deliberately.
+                        type: boolean
+                      governance:
+                        description: |-
+                          `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged
+                          identity can still shorten or remove the lock. The safe default for most clusters.
+                        properties:
+                          period:
+                            description: |-
+                              Go-style duration; kopia's minimum is `24h` and there is no maximum.
+
+                              Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
+                              CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
+                              write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
+                              CRD field rather than matching kopia's per-flag variations.
+                            type: string
+                        required:
+                        - period
+                        type: object
+                    type: object
                   epoch:
                     description: |-
                       Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
@@ -2751,6 +2813,30 @@ spec:
                   against `spec.parameters` to see whether a declared value landed.
                 nullable: true
                 properties:
+                  blobRetention:
+                    description: The blob retention the repository reports.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Whether the repository currently has blob retention in force (kopia's
+                          `IsRetentionEnabled()`: a non-empty mode AND a non-zero period).
+                        type: boolean
+                      mode:
+                        description: |-
+                          Observed retention mode exactly as kopia reports it (`GOVERNANCE`, `COMPLIANCE`, or
+                          empty when off).
+                        type: string
+                      period:
+                        description: |-
+                          Observed retention period, as a Go-style duration (`720h`). Empty-equivalent (`0s`)
+                          when retention is off.
+                        type: string
+                    required:
+                    - enabled
+                    - mode
+                    - period
+                    type: object
                   epoch:
                     description: The epoch parameters the repository reports.
                     nullable: true
@@ -5132,6 +5218,68 @@ spec:
                 description: Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
                 nullable: true
                 properties:
+                  blobRetention:
+                    description: |-
+                      Object-lock blob retention (S3/Azure/GCS) — ransomware protection. Absent means
+                      "don't touch it"; use `disabled: true` to actively turn it off.
+                    nullable: true
+                    oneOf:
+                    - required:
+                      - governance
+                    - required:
+                      - compliance
+                    - required:
+                      - disabled
+                    properties:
+                      compliance:
+                        description: |-
+                          `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including
+                          the account root. An oversized period is an unfixable storage-cost commitment; there
+                          is no recovery path short of deleting the bucket after expiry.
+                        properties:
+                          period:
+                            description: |-
+                              Go-style duration; kopia's minimum is `24h` and there is no maximum.
+
+                              Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
+                              CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
+                              write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
+                              CRD field rather than matching kopia's per-flag variations.
+                            type: string
+                        required:
+                        - period
+                        type: object
+                      disabled:
+                        description: |-
+                          Actively disable retention (`--retention-mode=none`). Must be `true`.
+
+                          A `bool` rather than a unit variant because an externally-tagged unit variant
+                          serializes as the bare string `"Disabled"`, mixing string and object forms in one
+                          `oneOf` and breaking the structural schema. Same shape, and same reason, as
+                          [`crate::cluster_repository::AllowedNamespaces::All`].
+
+                          This is distinct from omitting `blobRetention` entirely: absent means "leave the
+                          repository alone", so deleting the block from a manifest can never silently strip
+                          ransomware protection someone configured deliberately.
+                        type: boolean
+                      governance:
+                        description: |-
+                          `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged
+                          identity can still shorten or remove the lock. The safe default for most clusters.
+                        properties:
+                          period:
+                            description: |-
+                              Go-style duration; kopia's minimum is `24h` and there is no maximum.
+
+                              Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
+                              CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
+                              write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
+                              CRD field rather than matching kopia's per-flag variations.
+                            type: string
+                        required:
+                        - period
+                        type: object
+                    type: object
                   epoch:
                     description: |-
                       Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index
@@ -5716,6 +5864,30 @@ spec:
                   against `spec.parameters` to see whether a declared value landed.
                 nullable: true
                 properties:
+                  blobRetention:
+                    description: The blob retention the repository reports.
+                    nullable: true
+                    properties:
+                      enabled:
+                        description: |-
+                          Whether the repository currently has blob retention in force (kopia's
+                          `IsRetentionEnabled()`: a non-empty mode AND a non-zero period).
+                        type: boolean
+                      mode:
+                        description: |-
+                          Observed retention mode exactly as kopia reports it (`GOVERNANCE`, `COMPLIANCE`, or
+                          empty when off).
+                        type: string
+                      period:
+                        description: |-
+                          Observed retention period, as a Go-style duration (`720h`). Empty-equivalent (`0s`)
+                          when retention is off.
+                        type: string
+                    required:
+                    - enabled
+                    - mode
+                    - period
+                    type: object
                   epoch:
                     description: The epoch parameters the repository reports.
                     nullable: true
@@ -7130,7 +7302,10 @@ spec:
                     type: integer
                 type: object
               volumeSnapshotClassName:
-                description: '`VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source.'
+                description: |-
+                  `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. Absent or
+                  empty both mean auto-select the default class for the source PVC's CSI driver, so a
+                  GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset.
                 nullable: true
                 type: string
             required:

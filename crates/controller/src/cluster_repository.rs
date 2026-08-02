@@ -1321,6 +1321,7 @@ fn cluster_bootstrap_work_spec(
             // Shares `epoch_parameters_for` with the Repository twin so the gate has one
             // definition rather than two that can drift apart.
             epoch_parameters: crate::repository::epoch_parameters_for(read_only, parameters),
+            blob_retention: crate::repository::blob_retention_for(read_only, parameters),
             // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
             // every connect-to-existing when stale (`maintenance_restamp_target`);
             // `None` means neither ever happens — see the doc above.
@@ -1557,11 +1558,25 @@ async fn finalize_cluster_bootstrap(
         "storageStats": storage_stats,
         "conditions": conditions,
     });
-    // Mirror the epoch parameters the repository actually reports (#258). The apply is
-    // best-effort in the mover, so this is what keeps it honest: a `spec.parameters.epoch`
-    // that failed to land stays visible here as drift from spec, rather than as silence.
-    if let Some(epoch) = &result.epoch {
-        status_patch["parameters"] = serde_json::json!({ "epoch": epoch });
+    // Mirror the parameters the repository actually reports (#258 epoch, #332 blob
+    // retention). The apply is best-effort in the mover, so this is what keeps it honest: a
+    // `spec.parameters` that failed to land stays visible here as drift from spec, rather
+    // than as silence.
+    //
+    // Built as ONE map and assigned once. `status_patch` is a local Value assembled
+    // key-by-key before a single patch, so two `status_patch["parameters"] = json!(..)`
+    // statements would not merge — the second would drop the first outright, silently.
+    {
+        let mut params = serde_json::Map::new();
+        if let Some(epoch) = &result.epoch {
+            params.insert("epoch".into(), serde_json::json!(epoch));
+        }
+        if let Some(retention) = &result.blob_retention {
+            params.insert("blobRetention".into(), serde_json::json!(retention));
+        }
+        if !params.is_empty() {
+            status_patch["parameters"] = serde_json::Value::Object(params);
+        }
     }
     // The apply is best-effort (see the mover), so a failure leaves the repository Ready
     // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —

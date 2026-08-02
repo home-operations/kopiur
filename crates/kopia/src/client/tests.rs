@@ -1235,6 +1235,10 @@ fn set_parameters_args_render_every_epoch_flag_in_a_stable_order() {
         epoch_advance_on_size_mb: Some(10),
         epoch_checkpoint_frequency: Some(7),
         epoch_delete_parallelism: Some(4),
+        // Exhaustive on purpose (no `..Default::default()`): this test is the change-detector
+        // that forces a new set-parameters flag to be positioned deliberately in `args()`.
+        retention_mode: None,
+        retention_period: None,
     };
     assert_eq!(
         opts.args(),
@@ -1280,6 +1284,8 @@ fn set_parameters_durations_always_carry_a_unit() {
     let opts = SetParametersArgs {
         epoch_min_duration: Some("6h".into()),
         epoch_refresh_frequency: Some("20m".into()),
+        retention_period: Some("720h".into()),
+        retention_mode: None,
         ..Default::default()
     };
     for v in opts.args().iter().filter(|a| !a.starts_with("--")) {
@@ -1288,6 +1294,66 @@ fn set_parameters_durations_always_carry_a_unit() {
             "a duration passed to kopia must carry a unit, got {v:?}"
         );
     }
+}
+
+#[test]
+fn set_parameters_renders_the_blob_retention_flags() {
+    let opts = SetParametersArgs {
+        retention_mode: Some("GOVERNANCE".into()),
+        retention_period: Some("720h".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        opts.args(),
+        vec![
+            "--retention-mode",
+            "GOVERNANCE",
+            "--retention-period",
+            "720h"
+        ]
+    );
+
+    // Retention rides the SAME invocation as the epoch flags — `set-parameters` rewrites
+    // the format blob and invalidates every other client's cached copy, so the two must
+    // never be applied as two separate commands.
+    let both = SetParametersArgs {
+        epoch_min_duration: Some("6h".into()),
+        retention_mode: Some("COMPLIANCE".into()),
+        retention_period: Some("8760h".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        both.args(),
+        vec![
+            "--epoch-min-duration",
+            "6h",
+            "--retention-mode",
+            "COMPLIANCE",
+            "--retention-period",
+            "8760h"
+        ],
+        "epoch flags stay first so the existing positional assertions keep holding"
+    );
+}
+
+#[test]
+fn set_parameters_disable_emits_the_mode_alone_and_is_not_empty() {
+    // Disabling is mode-only: kopia's `--retention-mode=none` path clears mode AND period
+    // and short-circuits before its own validation, so sending a period would be noise.
+    let off = SetParametersArgs {
+        retention_mode: Some("none".into()),
+        ..Default::default()
+    };
+    assert_eq!(off.args(), vec!["--retention-mode", "none"]);
+    // Load-bearing: `repository_set_parameters` early-returns on `is_empty()`. If disabling
+    // read as empty, turning retention OFF would silently no-op forever.
+    assert!(
+        !off.is_empty(),
+        "a disable must still invoke set-parameters"
+    );
+
+    // And the genuinely-inert case still skips the invocation entirely.
+    assert!(SetParametersArgs::default().is_empty());
 }
 
 // --- timed-out subprocess reaping (Greptile P1 on PR #287): the timeout branch

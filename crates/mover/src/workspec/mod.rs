@@ -612,6 +612,15 @@ pub struct BootstrapRepositoryOp {
     /// `set-parameters` hard-errors on a read-only connection.
     #[serde(default, skip_serializing_if = "EpochParametersSpec::is_empty")]
     pub epoch_parameters: EpochParametersSpec,
+    /// Object-lock blob retention (#332), applied through the same `set-parameters` call as
+    /// `epoch_parameters`.
+    ///
+    /// An `Option`, NOT an `is_empty()` sentinel like its sibling above — see
+    /// [`BlobRetentionSpec`] for why. `None` means "leave the repository's retention alone";
+    /// disabling is the explicit `Some(mode: "none")`. Also `None` for a `mode: ReadOnly`
+    /// repository, for the same reason `epoch_parameters` is empty there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_retention: Option<BlobRetentionSpec>,
     /// This cluster's `identityDefaults.cluster` (multi-cluster shared repo),
     /// carried ONLY when the controller determined cluster identity is on AND the
     /// effective `catalog.foreignSnapshots` policy is `Ignore` — never under
@@ -818,6 +827,9 @@ pub fn epoch_drift(
             epoch_advance_on_size_mb: desired.advance_on_size_mb,
             epoch_checkpoint_frequency: desired.checkpoint_frequency,
             epoch_delete_parallelism: desired.delete_parallelism,
+            // Epoch drift never touches retention; `parameters_drift` merges the two.
+            retention_mode: None,
+            retention_period: None,
         });
     };
     // Compare a desired duration against an observed nanosecond count.
@@ -847,6 +859,9 @@ pub fn epoch_drift(
         ),
         epoch_checkpoint_frequency: num_drift(desired.checkpoint_frequency, o.checkpoint_frequency),
         epoch_delete_parallelism: num_drift(desired.delete_parallelism, o.delete_parallelism),
+        // Epoch drift never touches retention; `parameters_drift` merges the two.
+        retention_mode: None,
+        retention_period: None,
     };
     (!args.is_empty()).then_some(args)
 }
@@ -868,6 +883,141 @@ pub fn observed_epoch(
         advance_on_size_mb: o.advance_on_total_size_bytes / MIB,
         checkpoint_frequency: o.checkpoint_frequency,
         delete_parallelism: o.delete_parallelism,
+    }
+}
+
+/// Object-lock blob retention for the work spec (#332).
+///
+/// **Deliberately has no `Default` impl**, and rides `BootstrapRepositoryOp` as an
+/// `Option<_>` rather than as an `is_empty()` sentinel the way [`EpochParametersSpec`] does.
+/// That difference is load-bearing: `mode` is mandatory, so *some* value would have to be the
+/// default, and whichever one it was would make "the user never mentioned blobRetention"
+/// indistinguishable from "the user asked to disable it". A repository that never declares
+/// retention would then issue `--retention-mode none` and silently strip a lock configured by
+/// hand. `None` = unmanaged, `Some(mode: "none")` = disable, and the absent `Default` is what
+/// stops the sentinel pattern being reintroduced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobRetentionSpec {
+    /// kopia's argv value: `"none"`, `"GOVERNANCE"`, or `"COMPLIANCE"`.
+    pub mode: String,
+    /// Go-style duration, already rendered with a unit for kopia's CLI. `None` when
+    /// disabling — kopia ignores a period on the `none` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
+}
+
+impl BlobRetentionSpec {
+    /// Build from the api crate's `BlobRetention`, rendering the period through
+    /// [`kopiur_api::render_go_duration`] for the same reason [`EpochParametersSpec::from_api`]
+    /// does — what reaches kopia's argv is never the user's raw text.
+    ///
+    /// Returns `None` for `disabled: false`. That is not "enable": there is nothing to enable
+    /// without a mode and a period, so it reads as "leave the repository alone", exactly like
+    /// omitting the block. Erring toward doing nothing is the only safe reading for a
+    /// ransomware control.
+    pub fn from_api(r: &kopiur_api::repository::BlobRetention) -> Option<Self> {
+        use kopiur_api::repository::BlobRetention as B;
+        let render = |w: &kopiur_api::repository::RetentionWindow| {
+            kopiur_api::parse_go_duration(&w.period).map(kopiur_api::render_go_duration)
+        };
+        match r {
+            B::Governance(w) => Some(Self {
+                mode: "GOVERNANCE".into(),
+                period: render(w),
+            }),
+            B::Compliance(w) => Some(Self {
+                mode: "COMPLIANCE".into(),
+                period: render(w),
+            }),
+            B::Disabled(true) => Some(Self {
+                mode: "none".into(),
+                period: None,
+            }),
+            B::Disabled(false) => None,
+        }
+    }
+}
+
+/// The `set-parameters` flags needed to bring observed blob retention in line with `desired`,
+/// or `None` when they already agree.
+///
+/// Same doctrine as [`epoch_drift`]: compare in kopia's OWN units (nanoseconds), never on the
+/// rendered strings, and mutate only on drift because `set-parameters` invalidates every other
+/// client's cached format blob.
+pub fn blob_retention_drift(
+    desired: Option<&BlobRetentionSpec>,
+    observed: Option<&kopiur_kopia::model::BlobRetention>,
+) -> Option<kopiur_kopia::client::SetParametersArgs> {
+    // Unmanaged: the repository is never touched. This is the inert case that makes adding
+    // the feature a no-op for every existing repository.
+    let desired = desired?;
+
+    if desired.mode == "none" {
+        // Only disable what is actually on. When nothing was observed we cannot tell whether
+        // there is anything to disable, and a blind `--retention-mode=none` against a backend
+        // that cannot object-lock hard-fails — so do nothing. This asymmetry with the enable
+        // path below (which DOES apply on no observation) is deliberate.
+        let currently_on = observed.is_some_and(|o| o.is_enabled());
+        return currently_on.then(|| kopiur_kopia::client::SetParametersArgs {
+            retention_mode: Some("none".into()),
+            ..Default::default()
+        });
+    }
+
+    // `try_from`, never `as` — see `epoch_drift`: a wrapping cast reports drift against every
+    // observation and re-applies on every bootstrap forever.
+    let want_period = desired.period.as_deref()?;
+    let want_ns = i64::try_from(kopiur_api::parse_go_duration(want_period)?.as_nanos()).ok()?;
+    let converged = observed.is_some_and(|o| o.mode == desired.mode && o.period_ns == want_ns);
+    // Emit BOTH flags whenever either drifts: kopia validates the merged blobcfg, and sending
+    // the pair unconditionally is one fewer invariant to keep true.
+    (!converged).then(|| kopiur_kopia::client::SetParametersArgs {
+        retention_mode: Some(desired.mode.clone()),
+        retention_period: Some(want_period.to_string()),
+        ..Default::default()
+    })
+}
+
+/// Every `set-parameters` flag needed this bootstrap, in ONE invocation.
+///
+/// Epoch tuning and blob retention are independent settings that share a single kopia
+/// command, and that command rewrites the repository-global format blob — forcing every other
+/// kopia client to reconnect. Applying them as two commands would pay that cost twice, so the
+/// two drift results are merged here rather than dispatched separately.
+pub fn parameters_drift(
+    epoch_desired: &EpochParametersSpec,
+    epoch_observed: Option<&kopiur_kopia::model::EpochParameters>,
+    retention_desired: Option<&BlobRetentionSpec>,
+    retention_observed: Option<&kopiur_kopia::model::BlobRetention>,
+) -> Option<kopiur_kopia::client::SetParametersArgs> {
+    let epoch = epoch_drift(epoch_desired, epoch_observed);
+    let retention = blob_retention_drift(retention_desired, retention_observed);
+    match (epoch, retention) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        // Disjoint field sets, so the merge is total: retention's two fields over epoch's six.
+        (Some(a), Some(b)) => Some(kopiur_kopia::client::SetParametersArgs {
+            retention_mode: b.retention_mode,
+            retention_period: b.retention_period,
+            ..a
+        }),
+    }
+}
+
+/// Mirror kopia's reported blob retention into the api crate's status type, rendering the
+/// nanosecond period back to a Go-style string so `status.parameters.blobRetention` is
+/// directly comparable to `spec.parameters.blobRetention`.
+pub fn observed_blob_retention(
+    o: &kopiur_kopia::model::BlobRetention,
+) -> kopiur_api::repository::ObservedBlobRetention {
+    kopiur_api::repository::ObservedBlobRetention {
+        enabled: o.is_enabled(),
+        mode: o.mode.clone(),
+        period: kopiur_api::render_go_duration(std::time::Duration::from_nanos(
+            o.period_ns.max(0) as u64
+        )),
     }
 }
 

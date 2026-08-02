@@ -44,7 +44,9 @@ pub struct SnapshotPolicySpec {
     #[serde(default = "default_copy_method")]
     #[schemars(default = "default_copy_method")]
     pub copy_method: CopyMethod,
-    /// `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source.
+    /// `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. Absent or
+    /// empty both mean auto-select the default class for the source PVC's CSI driver, so a
+    /// GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_snapshot_class_name: Option<String>,
     /// Staging knobs for `copyMethod: Snapshot`/`Clone` (e.g. how long to wait for

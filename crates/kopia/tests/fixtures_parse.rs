@@ -65,6 +65,53 @@ fn parse_repository_status() {
         s.storage.config.get("path").and_then(|v| v.as_str()),
         Some("/tmp/claude-0/tmp.xo1UiqvExG")
     );
+    // This fixture is REAL kopia output from a filesystem repo, which cannot object-lock —
+    // so kopia emits a bare `"blobRetention": {}` (both inner keys are omitempty). That is
+    // the "retention is off" observation, and it must decode as such rather than as absent.
+    // The enabled shape is covered by `blob_retention_enabled_shape` below with inline JSON,
+    // because no local backend can produce it and faking it in the fixture would falsify a
+    // file whose whole contract is "verbatim kopia output".
+    let retention = s
+        .blob_retention
+        .expect("kopia 0.23 always emits blobRetention");
+    assert!(!retention.is_enabled());
+    assert_eq!(retention.mode, "");
+    assert_eq!(retention.period_ns, 0);
+}
+
+#[test]
+fn blob_retention_enabled_shape() {
+    // 720h == 30 days == 2_592_000_000_000_000ns. kopia reports the period as a Go
+    // time.Duration, so the unit is NANOSECONDS — reading it as seconds would understate
+    // the window by a factor of a billion and make the drift comparator re-apply forever.
+    let s: RepositoryStatus = serde_json::from_str(
+        r#"{
+            "configFile": "/config/repository.config",
+            "uniqueIDHex": "deadbeef",
+            "clientOptions": {"hostname": "h", "username": "u"},
+            "storage": {"type": "s3", "config": {"bucket": "b"}},
+            "contentFormat": {"hash": "BLAKE2B-256-128", "encryption": "AES256-GCM-HMAC-SHA256", "version": 3},
+            "blobRetention": {"retentionMode": "GOVERNANCE", "retentionPeriod": 2592000000000000}
+        }"#,
+    )
+    .unwrap();
+    let r = s.blob_retention.expect("blobRetention present");
+    assert!(r.is_enabled());
+    assert_eq!(r.mode, "GOVERNANCE");
+    assert_eq!(r.period_ns, 2_592_000_000_000_000);
+
+    // kopia treats a half-set config as OFF (`IsRetentionEnabled` requires both) — mirror
+    // that exactly, or kopiur would report protection that does not exist.
+    let half = kopiur_kopia::BlobRetention {
+        mode: "GOVERNANCE".into(),
+        period_ns: 0,
+    };
+    assert!(!half.is_enabled());
+    let half = kopiur_kopia::BlobRetention {
+        mode: String::new(),
+        period_ns: 2_592_000_000_000_000,
+    };
+    assert!(!half.is_enabled());
 }
 
 #[test]

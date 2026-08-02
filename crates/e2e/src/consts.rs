@@ -86,6 +86,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "colocation-off",
     "copymethod",
     "copymethod-csi",
+    "copymethod-explicit",
     "idxhealth",
     // #258: two scenarios, each needing its OWN kopia repository — the first MUTATES
     // epoch params, so sharing one repo would leak that into the defaults assertion.

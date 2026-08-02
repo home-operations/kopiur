@@ -49,6 +49,19 @@ primary   Failed    S3        2m
 $ kubectl describe repository primary -n <ns>   # the condition message names the exact cause
 ```
 
+### `Ready`, but a recurring Warning event about `set-parameters`
+
+The repository is healthy — connect, backups and restores all work — but every reconcile emits a `Warning` event saying `kopia repository set-parameters failed`. `spec.parameters` is not landing, and `status.parameters` shows what the repository actually has, which disagrees with your manifest.
+
+The apply is deliberately best-effort: a bad parameter must not take an otherwise-healthy repository to `Failed`. But it repeats until you fix the cause.
+
+| Message contains | Cause | Fix |
+| --- | --- | --- |
+| `blob-retention: unsupported put-blob option` | `spec.parameters.blobRetention` on a bucket **without object lock enabled at creation**. Object lock cannot be added to an existing bucket. | Recreate the bucket with object lock (`aws s3api create-bucket --object-lock-enabled-for-bucket`, or `mc mb --with-lock`) and migrate, or remove `blobRetention`. See [Object lock](backends/s3.md#object-lock-ransomware-protection). |
+| `storage is read-only` | The repository is connected `mode: ReadOnly`. | Declare `spec.parameters` on the cluster that owns the repository. Admission normally rejects this pairing, so seeing it means the mode changed after the fact. |
+
+A backend that has no object lock at all (filesystem, sftp, webdav, rclone, b2, gdrive) is rejected at admission instead, so it never reaches this state.
+
 ## Backup (or Restore) stuck in `Pending` with no Job
 
 The mover is blocked on a precondition. The common ones, all surfaced as conditions and `Warning` Events:
@@ -287,7 +300,7 @@ $ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.conditions[?(@.type=
 | Reason | Cause | Fix |
 | --- | --- | --- |
 | `SnapshotStackMissing` | The cluster has no `VolumeSnapshotClass` API — the external-snapshotter (snapshot-controller + CRDs) isn't installed. | Install the CSI snapshot stack + a `VolumeSnapshotClass` ([Copy methods → What it requires](copy-methods.md#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
-| `NoVolumeSnapshotClass` | No `VolumeSnapshotClass` matches the source PVC's driver, several match with no single default, or an explicit `volumeSnapshotClassName` doesn't exist. | Create/annotate a class for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
+| `NoVolumeSnapshotClass` | No `VolumeSnapshotClass` matches the source PVC's driver, several match with no single default, or an explicit `volumeSnapshotClassName` doesn't exist. An **empty** `volumeSnapshotClassName` never causes this — it is treated as unset. | Create/annotate a class for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
 | `VolumeSnapshotFailed` | The VolumeSnapshot was still reporting an error when the staging deadline passed (`spec.staging.timeout`, default `10m`); transient snapshot-controller errors (e.g. a benign 409 conflict) during the wait are retried, never fatal on their own. | Fix the class/driver issue named in the message, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run (or a new `Snapshot`) retries. |
 | `StagingTimedOut` | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported no error — the driver/snapshot-controller is stuck or very slow. | Check the CSI driver and snapshot-controller; raise `spec.staging.timeout` (`"0"` waits indefinitely) for slow backends. |
 | `SourceNotCSIProvisioned` | The source PVC has no `StorageClass` (static/hostPath) — nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |

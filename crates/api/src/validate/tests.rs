@@ -5117,3 +5117,206 @@ fn cluster_repository_gets_the_identical_parameters_rules() {
     ));
     assert!(validate_cluster_repository(&spec).is_empty());
 }
+
+// --- #332: object-lock blob retention -------------------------------------------------
+
+/// An object-lock-capable base. `REPO_BASE` is `filesystem`, which blob retention rejects.
+const S3_REPO_BASE: &str = "backend: { s3: { bucket: b } }\n\
+                            encryption: { passwordSecretRef: { name: s, key: KOPIA_PASSWORD } }\n";
+
+#[test]
+fn blob_retention_accepts_both_modes_and_disable() {
+    // The inert case: no blobRetention at all changes nothing about the repository.
+    assert!(validate_repository(&repo_yaml(S3_REPO_BASE)).is_empty());
+
+    for mode in ["governance", "compliance"] {
+        let spec = repo_yaml(&format!(
+            "{S3_REPO_BASE}parameters:\n  blobRetention:\n    {mode}:\n      period: 720h\n"
+        ));
+        assert!(
+            validate_repository(&spec).is_empty(),
+            "{mode}/720h must be accepted"
+        );
+    }
+
+    // Disabling carries no period at all — the type has nowhere to put one.
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  blobRetention:\n    disabled: true\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+
+    // blobRetention alongside epoch, and blobRetention with NO epoch — the second is the
+    // regression guard: validate_repository_parameters used to early-return when `epoch`
+    // was absent, which would have made every rule below dead code.
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  epoch:\n    minDuration: 6h\n  \
+         blobRetention:\n    governance:\n      period: 720h\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  blobRetention:\n    governance:\n      period: 1h\n"
+    ));
+    assert!(
+        !validate_repository(&spec).is_empty(),
+        "blobRetention must be validated even when spec.parameters.epoch is absent"
+    );
+}
+
+#[test]
+fn a_retention_period_below_kopias_one_day_floor_is_rejected() {
+    // kopia's own Validate(): "invalid retention-period, the minimum required is 1-day and
+    // there is no maximum limit". Catching it here turns a hard set-parameters failure on
+    // every reconcile into one admission error.
+    // Quoted, because YAML parses a bare `3600` as an integer and `period` is a string —
+    // that shape is rejected by the CRD's own `type: string` before it ever reaches here.
+    for period in ["1h", "23h", "60m", "\"3600\""] {
+        let spec = repo_yaml(&format!(
+            "{S3_REPO_BASE}parameters:\n  blobRetention:\n    governance:\n      period: {period}\n"
+        ));
+        let errs = validate_repository(&spec);
+        assert!(
+            !errs.is_empty(),
+            "{period} is under 24h and must be rejected"
+        );
+        assert!(
+            format!("{errs:?}").contains("1-day"),
+            "must quote kopia's own wording so the two are searchable together: {errs:?}"
+        );
+    }
+    // Exactly the floor is allowed.
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  blobRetention:\n    governance:\n      period: 24h\n"
+    ));
+    assert!(validate_repository(&spec).is_empty(), "24h is the boundary");
+}
+
+#[test]
+fn a_retention_period_in_days_is_rejected_with_the_hours_hint() {
+    // kopia's CLI DOES accept `30d` (it extends Go's parser), but kopiur's duration grammar
+    // is deliberately narrower — h/m/s only, one grammar across every CRD field. `30d` is
+    // therefore the single most likely thing a user copying from kopia's docs will write,
+    // so the message has to name the fix rather than just say "invalid".
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  blobRetention:\n    governance:\n      period: 30d\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "30d must be rejected");
+    assert!(
+        msg.contains("720h"),
+        "must name the replacement value: {msg}"
+    );
+
+    // And the same i64-nanosecond ceiling the epoch durations carry.
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}parameters:\n  blobRetention:\n    governance:\n      \
+         period: \"999999999999999999\"\n"
+    ));
+    let errs = validate_repository(&spec);
+    assert!(
+        !errs.is_empty(),
+        "a period beyond i64 nanoseconds is rejected"
+    );
+    assert!(format!("{errs:?}").contains("292 years"), "{errs:?}");
+}
+
+#[test]
+fn blob_retention_is_rejected_on_backends_without_object_lock() {
+    // On an unsupported backend `set-parameters` does NOT no-op — it hard-fails with
+    // `blob-retention: unsupported put-blob option`, and the bootstrap re-runs it every
+    // reconcile. Rejecting at admission is what stops that becoming a permanent Warning loop.
+    let supported = [
+        ("s3", "backend: { s3: { bucket: b } }\n"),
+        (
+            "azure",
+            "backend: { azure: { container: c, storageAccount: a } }\n",
+        ),
+        ("gcs", "backend: { gcs: { bucket: b } }\n"),
+    ];
+    let unsupported = [
+        ("filesystem", "backend: { filesystem: { path: /repo } }\n"),
+        ("b2", "backend: { b2: { bucket: b } }\n"),
+        (
+            "sftp",
+            "backend: { sftp: { host: h, path: /p, username: u } }\n",
+        ),
+        ("webdav", "backend: { webDav: { url: 'https://w/dav' } }\n"),
+        ("rclone", "backend: { rclone: { remotePath: 'r:/p' } }\n"),
+        ("gdrive", "backend: { gdrive: { folderId: fid } }\n"),
+    ];
+    let enc = "encryption: { passwordSecretRef: { name: s, key: KOPIA_PASSWORD } }\n";
+    let params = "parameters:\n  blobRetention:\n    governance:\n      period: 720h\n";
+
+    for (name, backend) in supported {
+        let spec = repo_yaml(&format!("{backend}{enc}{params}"));
+        assert!(
+            validate_repository(&spec).is_empty(),
+            "{name} supports object lock and must be accepted"
+        );
+    }
+    for (name, backend) in unsupported {
+        let spec = repo_yaml(&format!("{backend}{enc}{params}"));
+        let errs = validate_repository(&spec);
+        assert!(
+            !errs.is_empty(),
+            "{name} cannot object-lock and must be rejected"
+        );
+        assert!(
+            format!("{errs:?}").contains("unsupported put-blob option"),
+            "the message must carry kopia's verbatim error so a user can grep for it: {errs:?}"
+        );
+        // ...but the same backend WITHOUT blobRetention stays perfectly valid.
+        let spec = repo_yaml(&format!("{backend}{enc}"));
+        assert!(
+            validate_repository(&spec).is_empty(),
+            "{name} without blobRetention must not be taxed"
+        );
+    }
+}
+
+#[test]
+fn a_read_only_repository_cannot_declare_blob_retention() {
+    let spec = repo_yaml(&format!(
+        "{S3_REPO_BASE}mode: ReadOnly\nparameters:\n  blobRetention:\n    \
+         governance:\n      period: 720h\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(
+        !errs.is_empty(),
+        "ReadOnly + blobRetention must be rejected"
+    );
+    assert!(msg.contains("set-parameters"), "must say WHY: {msg}");
+}
+
+#[test]
+fn cluster_repository_gets_the_identical_blob_retention_rules() {
+    // The two kinds have fully duplicated reconcilers; a rule landing on only one of them
+    // is how half an API surface ships as a silent no-op.
+    let base = "backend: { s3: { bucket: b } }\n\
+                encryption: { passwordSecretRef: { name: s, namespace: kopiur-system, key: KOPIA_PASSWORD } }\n\
+                allowedNamespaces: { all: true }\n";
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  blobRetention:\n    governance:\n      period: 1h\n"
+    ));
+    assert!(
+        format!("{:?}", validate_cluster_repository(&spec)).contains("1-day"),
+        "ClusterRepository must enforce the retention floor too"
+    );
+
+    let fs_base = "backend: { filesystem: { path: /repo } }\n\
+                   encryption: { passwordSecretRef: { name: s, namespace: kopiur-system, key: KOPIA_PASSWORD } }\n\
+                   allowedNamespaces: { all: true }\n";
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{fs_base}parameters:\n  blobRetention:\n    governance:\n      period: 720h\n"
+    ));
+    assert!(
+        !validate_cluster_repository(&spec).is_empty(),
+        "the backend gate must apply to ClusterRepository as well"
+    );
+
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  blobRetention:\n    governance:\n      period: 720h\n"
+    ));
+    assert!(validate_cluster_repository(&spec).is_empty());
+}

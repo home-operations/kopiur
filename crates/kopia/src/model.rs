@@ -537,6 +537,40 @@ pub struct RepositoryStatus {
     pub storage: StorageInfo,
     /// Content format (hash/encryption/version).
     pub content_format: ContentFormat,
+    /// Object-lock blob retention, from kopia's `kopia.blobcfg` blob.
+    ///
+    /// **Top-level**, unlike the epoch parameters nested under `contentFormat` — do not
+    /// follow that pattern here. `omitempty` on both inner keys means kopia emits `{}` when
+    /// retention is off, so an all-default value is the "disabled" observation, not a
+    /// missing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_retention: Option<BlobRetention>,
+}
+
+/// Blob retention as reported by `kopia repository status --json` → `blobRetention`.
+///
+/// Mirrors kopia's `format.BlobStorageConfiguration`. Unlike the sibling [`EpochParameters`],
+/// the keys here **are** camelCase (kopia gives that struct explicit JSON tags), and unlike
+/// it this type cannot be `Copy` — it carries a `String`.
+///
+/// `retentionPeriod` is a Go `time.Duration`, so the unit is **nanoseconds** (the same
+/// convention as [`MaintenanceCadence::interval`]), not seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRetention {
+    /// `GOVERNANCE`, `COMPLIANCE`, or empty when retention is off.
+    #[serde(rename = "retentionMode", default)]
+    pub mode: String,
+    /// Retention period in **nanoseconds**; `0` when retention is off.
+    #[serde(rename = "retentionPeriod", default)]
+    pub period_ns: i64,
+}
+
+impl BlobRetention {
+    /// Whether retention is actually in force. Mirrors kopia's own `IsRetentionEnabled()`:
+    /// a non-empty mode AND a non-zero period — kopia treats a half-set config as off.
+    pub fn is_enabled(&self) -> bool {
+        !self.mode.is_empty() && self.period_ns != 0
+    }
 }
 
 /// A maintenance cadence block (`quick` / `full`) from `maintenance info`.

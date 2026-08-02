@@ -269,6 +269,8 @@ Three things worth knowing:
 - **`mode: ReadOnly` repositories cannot declare parameters.** `set-parameters` is a repository-wide write and kopia refuses it on a read-only connection, so the combination is rejected at admission. In a multi-cluster layout, declare them on the cluster that owns the repository — they describe the repository, not each consumer. Two clusters declaring *different* values for one repository will fight over it.
 - **`cleanupSafetyMargin` is reported but not settable.** It is the grace window that stops kopia deleting index blobs a concurrent writer still needs, and there is no safe generic advice for lowering it.
 
+`spec.parameters` has a second key, `blobRetention`, which turns on S3/Azure/GCS **object lock** so a compromised credential cannot delete your backups. It rides the same `set-parameters` call as `epoch` — one invocation, applied only on drift — and it changes what maintenance can reclaim: deletes are still issued, but the storage layer refuses them until locks expire, so the repository grows for at least the retention period. See [Object lock](backends/s3.md#object-lock-ransomware-protection).
+
 /// warning | A high index-blob count means maintenance isn't running
 
 The warning is a symptom; the fix is to get maintenance compacting again. Check that a `Maintenance` exists and is `Ready`, that it isn't yielding (`LeaseOwned=False`, reason `LeaseHeldByOther`), and that its owner is the stable lease owner — not an ephemeral `…-bootstrap-…` identity. The operator self-heals a stale owner on the next bootstrap; to recover **now**, set `spec.maintenance.takeoverPolicy: Force` once. Raising or zeroing `indexBlobWarnThreshold` only silences the warning — it does not compact the index.

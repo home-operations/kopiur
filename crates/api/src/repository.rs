@@ -145,6 +145,103 @@ pub struct RepositoryParameters {
     /// blobs get compacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<EpochParameters>,
+    /// Object-lock blob retention (S3/Azure/GCS) — ransomware protection. Absent means
+    /// "don't touch it"; use `disabled: true` to actively turn it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_retention: Option<BlobRetention>,
+}
+
+/// Object-lock blob retention (`kopia repository set-parameters --retention-mode/--retention-period`).
+///
+/// Externally tagged, so exactly one variant exists by construction. That is load-bearing
+/// rather than stylistic: kopia rejects a mode without a period and a period without a mode
+/// ("both retention mode and period must be provided when setting blob retention
+/// properties"), and pairing the period *with* the mode in the type makes that error
+/// unrepresentable instead of merely validated.
+///
+/// Requires a backend that supports object lock — S3, Azure, or GCS — **and** a bucket with
+/// object lock enabled at creation time (it cannot be turned on afterwards). kopia's flags do
+/// not create it. On an unsupported backend `set-parameters` hard-fails with
+/// `blob-retention: unsupported put-blob option`, so admission rejects those backends.
+///
+/// # What this does and does not protect
+///
+/// The lock is applied when a blob is **written**. Kopiur does not enable kopia's
+/// `maintenance set --extend-object-locks`, so locks on blobs that are still needed are never
+/// extended: a blob written today under `period: 720h` becomes deletable again in 30 days.
+/// Treat it as a rolling floor, not cumulative immutability, and size the period to exceed
+/// your longest recovery window. Blobs written *before* retention was enabled — including the
+/// repository format blob — are never retroactively locked.
+///
+/// ```
+/// use kopiur_api::repository::{BlobRetention, RetentionWindow};
+///
+/// // Externally tagged: the wire form is `{ "governance": { "period": "720h" } }`.
+/// let r: BlobRetention = serde_json::from_value(serde_json::json!({
+///     "governance": { "period": "720h" }
+/// }))
+/// .unwrap();
+/// assert_eq!(r, BlobRetention::Governance(RetentionWindow { period: "720h".into() }));
+/// assert_eq!(r.kind_str(), "Governance");
+///
+/// // Disabling carries no period — kopia ignores it, and the type says so.
+/// let off: BlobRetention = serde_json::from_value(serde_json::json!({ "disabled": true }))
+///     .unwrap();
+/// assert_eq!(off.kind_str(), "Disabled");
+/// ```
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BlobRetention {
+    /// `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged
+    /// identity can still shorten or remove the lock. The safe default for most clusters.
+    Governance(RetentionWindow),
+    /// `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including
+    /// the account root. An oversized period is an unfixable storage-cost commitment; there
+    /// is no recovery path short of deleting the bucket after expiry.
+    Compliance(RetentionWindow),
+    /// Actively disable retention (`--retention-mode=none`). Must be `true`.
+    ///
+    /// A `bool` rather than a unit variant because an externally-tagged unit variant
+    /// serializes as the bare string `"Disabled"`, mixing string and object forms in one
+    /// `oneOf` and breaking the structural schema. Same shape, and same reason, as
+    /// [`crate::cluster_repository::AllowedNamespaces::All`].
+    ///
+    /// This is distinct from omitting `blobRetention` entirely: absent means "leave the
+    /// repository alone", so deleting the block from a manifest can never silently strip
+    /// ransomware protection someone configured deliberately.
+    Disabled(bool),
+}
+
+impl BlobRetention {
+    /// Stable discriminant string for status/metrics/printcolumns.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            BlobRetention::Governance(_) => "Governance",
+            BlobRetention::Compliance(_) => "Compliance",
+            BlobRetention::Disabled(_) => "Disabled",
+        }
+    }
+
+    /// The declared retention window, or `None` when retention is being disabled.
+    pub fn window(&self) -> Option<&RetentionWindow> {
+        match self {
+            BlobRetention::Governance(w) | BlobRetention::Compliance(w) => Some(w),
+            BlobRetention::Disabled(_) => None,
+        }
+    }
+}
+
+/// How long a blob stays locked once written.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionWindow {
+    /// Go-style duration; kopia's minimum is `24h` and there is no maximum.
+    ///
+    /// Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
+    /// CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
+    /// write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
+    /// CRD field rather than matching kopia's per-flag variations.
+    pub period: String,
 }
 
 /// kopia epoch-manager parameters. Absent fields are left at whatever the repository
@@ -238,6 +335,33 @@ pub struct ObservedRepositoryParameters {
     /// The epoch parameters the repository reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<ObservedEpochParameters>,
+    /// The blob retention the repository reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_retention: Option<ObservedBlobRetention>,
+}
+
+/// The blob retention the repository ACTUALLY reports, mirrored into `status` from
+/// `kopia repository status` at the last bootstrap.
+///
+/// A separate type from [`BlobRetention`] for the same reasons [`ObservedEpochParameters`] is
+/// separate from [`EpochParameters`]: the spec type is a closed union that cannot express
+/// "kopia reported nothing", and non-`Option` fields encode "observed means complete".
+///
+/// `mode` is a plain `String`, not the spec enum, because kopia reports an empty mode when
+/// retention is off — a value the union deliberately cannot hold. Reporting kopia's own word
+/// verbatim also keeps the mirror honest if kopia ever adds a mode kopiur doesn't model.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedBlobRetention {
+    /// Whether the repository currently has blob retention in force (kopia's
+    /// `IsRetentionEnabled()`: a non-empty mode AND a non-zero period).
+    pub enabled: bool,
+    /// Observed retention mode exactly as kopia reports it (`GOVERNANCE`, `COMPLIANCE`, or
+    /// empty when off).
+    pub mode: String,
+    /// Observed retention period, as a Go-style duration (`720h`). Empty-equivalent (`0s`)
+    /// when retention is off.
+    pub period: String,
 }
 
 /// Repository health thresholds, shared by `Repository` and `ClusterRepository`.

@@ -75,6 +75,12 @@ snapshot stack. See [Copy methods](../../copy-methods.md).
 
 The `VolumeSnapshotClass` used when `copyMethod` is `Snapshot` or `Clone`.
 
+Absent **and empty** both mean the same thing: auto-select the default class for the
+source PVC's CSI driver. That matters when the field is templated — a Flux/Kustomize
+post-build substitution like `volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS}` renders
+empty whenever the variable is undefined, and is treated as unset rather than as a class
+whose name happens to be blank.
+
 ### `staging`
 
 Knobs for the CSI capture (`copyMethod: Snapshot`/`Clone`) that runs before the
