@@ -264,6 +264,7 @@ you touching the `Repository` object.
 
 ## See also
 
+- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection) — `spec.parameters.blobRetention` works on Azure Blob too; the S3 page documents it in full.
 - [Repositories & backends](../repositories.md) — concepts: scope, encryption, creation.
 - [Movers, RBAC & credentials](../movers.md) — where the credential Secret must live.
 - Sibling backends: [S3](s3.md) · [GCS](gcs.md) · [B2](b2.md).

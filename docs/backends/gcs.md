@@ -241,6 +241,7 @@ block). The mover writes that body to the credentials file for you.
 
 ## See also
 
+- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection) — `spec.parameters.blobRetention` works on GCS too; the S3 page documents it in full.
 - [Repositories & backends](../repositories.md) — concepts: scope, encryption, creation.
 - [Movers, RBAC & credentials](../movers.md) — where the credential Secret must live.
 - Sibling backends: [S3](s3.md) · [Azure](azure.md) · [rclone](rclone.md) (for Google Drive).

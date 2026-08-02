@@ -275,11 +275,21 @@ pub enum ClassDecision {
 /// classes (the cluster read is the caller's). Precedence: an explicit name wins (if it
 /// exists); otherwise the single class whose driver matches; otherwise — among several
 /// matches — the unique default-annotated one; otherwise `Ambiguous`/`NoneForDriver`.
+///
+/// An absent, empty, or whitespace-only `explicit` all mean the same thing: **unset** —
+/// fall through to auto-selection. `Option<&str>` alone is a leaky representation here,
+/// because `Some("")` is not a nameable Kubernetes object, and GitOps templating produces
+/// it routinely: a Flux/Kustomize `volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS}`
+/// post-build substitution renders empty whenever the variable is undefined. Normalizing
+/// here rather than at the call site makes the invalid state unreachable for every caller,
+/// and keeps the behavior provable in unit tests (the one production call site is async and
+/// `kube::Client`-bound, so only the e2e tier reaches it).
 pub fn decide_class(
     classes: &[ClassInfo],
     provisioner: &str,
     explicit: Option<&str>,
 ) -> ClassDecision {
+    let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
     if let Some(name) = explicit {
         return if classes.iter().any(|c| c.name == name) {
             ClassDecision::Use(name.to_string())
@@ -1325,6 +1335,46 @@ mod tests {
         );
         assert_eq!(
             decide_class(&classes, "ebs.csi.aws.com", Some("nope")),
+            ClassDecision::ExplicitNotFound("nope".into())
+        );
+    }
+
+    #[test]
+    fn decide_class_treats_a_blank_explicit_name_as_unset() {
+        let driver = "ebs.csi.aws.com";
+        let classes = [class("csi-a", driver, false)];
+
+        // A GitOps-templated `volumeSnapshotClassName: ${VAR}` renders empty when the
+        // variable is undefined. No VolumeSnapshotClass can be named "", so an empty or
+        // whitespace-only value is "unset", not "an explicit class that is missing" —
+        // otherwise the user gets the nonsense message "volumeSnapshotClassName `` does
+        // not exist" instead of the auto-selection they asked for.
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                decide_class(&classes, driver, Some(blank)),
+                ClassDecision::Use("csi-a".into()),
+                "blank name {blank:?} should auto-select, not report a missing class"
+            );
+        }
+
+        // Blank normalizes *before* the explicit branch, so the genuinely-useful
+        // "name one explicitly" diagnostic still wins over ExplicitNotFound("").
+        let ambiguous = [class("a", driver, false), class("b", driver, false)];
+        assert!(matches!(
+            decide_class(&ambiguous, driver, Some("")),
+            ClassDecision::Ambiguous { .. }
+        ));
+
+        // A padded name still resolves, and the padding never reaches the
+        // VolumeSnapshot's spec.volumeSnapshotClassName.
+        assert_eq!(
+            decide_class(&classes, driver, Some("  csi-a  ")),
+            ClassDecision::Use("csi-a".into())
+        );
+
+        // Regression guard: a real, genuinely-absent name is still reported as missing.
+        assert_eq!(
+            decide_class(&classes, driver, Some("nope")),
             ClassDecision::ExplicitNotFound("nope".into())
         );
     }

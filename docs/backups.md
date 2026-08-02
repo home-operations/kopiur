@@ -148,7 +148,7 @@ When a selector matches several PVCs, `groupBy` defaults to `VolumeGroupSnapshot
 | `Clone`                | CSI clone of the source PVC → kopia reads the clone.          | A CSI driver that supports volume **cloning**.                       |
 | `Direct`               | Read the **live** PVC directly (co-located on its node).     | Nothing — works on any storage.                                      |
 
-`volumeSnapshotClassName` selects the snapshot class when `Snapshot`/`Clone` is used; leave it unset to auto-pick your driver's **default** class.
+`volumeSnapshotClassName` selects the snapshot class when `Snapshot`/`Clone` is used; leave it unset — or empty, which means the same thing — to auto-pick your driver's **default** class.
 
 /// note | `Direct` is opt-in; non-CSI sources must set it explicitly
 

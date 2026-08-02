@@ -415,6 +415,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             scan_catalog: true,
             create_options: Default::default(),
             epoch_parameters: Default::default(),
+            blob_retention: None,
             maintenance_owner: Some("kopiur@kopiur-ns-repo".into()),
             catalog_foreign_prefilter_cluster: Some("east".into()),
             restamp_policy: RestampPolicy::OwnFormatsOnly,
@@ -499,6 +500,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         scan_catalog: true,
         create_options: Default::default(),
         epoch_parameters: Default::default(),
+        blob_retention: None,
         maintenance_owner: None,
         catalog_foreign_prefilter_cluster: None,
         restamp_policy: RestampPolicy::AnyStale,
@@ -1818,4 +1820,226 @@ fn observed_epoch_renders_nanoseconds_back_to_go_durations() {
     assert_eq!(o.advance_on_size_mb, 10, "bytes → MiB");
     assert_eq!(o.checkpoint_frequency, 7);
     assert_eq!(o.delete_parallelism, 4);
+}
+
+// --- #332: object-lock blob retention -------------------------------------------------
+
+fn retention_on(mode: &str, ns: i64) -> kopiur_kopia::model::BlobRetention {
+    kopiur_kopia::model::BlobRetention {
+        mode: mode.into(),
+        period_ns: ns,
+    }
+}
+/// What kopia reports for a repository with retention off: `{}` — both keys omitempty.
+fn retention_off() -> kopiur_kopia::model::BlobRetention {
+    kopiur_kopia::model::BlobRetention::default()
+}
+/// 720h == 30 days, in the nanoseconds kopia reports.
+const NS_720H: i64 = 2_592_000_000_000_000;
+
+fn want(mode: &str, period: Option<&str>) -> BlobRetentionSpec {
+    BlobRetentionSpec {
+        mode: mode.into(),
+        period: period.map(str::to_string),
+    }
+}
+
+#[test]
+fn blob_retention_drift_is_none_when_nothing_is_declared() {
+    // THE inert case. A repository that never mentions blobRetention must never have
+    // `set-parameters` run against it — adding this feature has to be a no-op for every
+    // existing repository, and `set-parameters` invalidates every client's cached format
+    // blob. Checked against all three observation shapes.
+    assert!(blob_retention_drift(None, None).is_none());
+    assert!(blob_retention_drift(None, Some(&retention_off())).is_none());
+    assert!(blob_retention_drift(None, Some(&retention_on("GOVERNANCE", NS_720H))).is_none());
+}
+
+#[test]
+fn blob_retention_drift_is_none_when_already_converged() {
+    let desired = want("GOVERNANCE", Some("720h"));
+    assert!(
+        blob_retention_drift(Some(&desired), Some(&retention_on("GOVERNANCE", NS_720H))).is_none()
+    );
+}
+
+#[test]
+fn blob_retention_drift_compares_periods_by_value_not_by_string() {
+    // "720h", "43200m" and "2592000s" are the same period. A string compare would report
+    // drift forever and rewrite the format blob on every single bootstrap.
+    for equivalent in ["720h", "43200m", "2592000s", "2592000"] {
+        let desired = want("GOVERNANCE", Some(equivalent));
+        assert!(
+            blob_retention_drift(Some(&desired), Some(&retention_on("GOVERNANCE", NS_720H)))
+                .is_none(),
+            "{equivalent} is 720h and must not read as drift"
+        );
+    }
+}
+
+#[test]
+fn blob_retention_drift_emits_both_flags_when_either_changes() {
+    // Period changed.
+    let args = blob_retention_drift(
+        Some(&want("GOVERNANCE", Some("1440h"))),
+        Some(&retention_on("GOVERNANCE", NS_720H)),
+    )
+    .expect("a longer period is drift");
+    assert_eq!(
+        args.args(),
+        vec![
+            "--retention-mode",
+            "GOVERNANCE",
+            "--retention-period",
+            "1440h"
+        ]
+    );
+
+    // Mode changed — the period is re-sent even though it did not.
+    let args = blob_retention_drift(
+        Some(&want("COMPLIANCE", Some("720h"))),
+        Some(&retention_on("GOVERNANCE", NS_720H)),
+    )
+    .expect("a mode change is drift");
+    assert_eq!(
+        args.args(),
+        vec![
+            "--retention-mode",
+            "COMPLIANCE",
+            "--retention-period",
+            "720h"
+        ]
+    );
+
+    // Turning it ON from off.
+    assert!(
+        blob_retention_drift(
+            Some(&want("GOVERNANCE", Some("720h"))),
+            Some(&retention_off())
+        )
+        .is_some()
+    );
+    // No observation at all → apply what is declared (set-parameters is idempotent),
+    // matching epoch_drift's behavior.
+    assert!(blob_retention_drift(Some(&want("GOVERNANCE", Some("720h"))), None).is_some());
+}
+
+#[test]
+fn blob_retention_drift_disables_only_what_is_actually_on() {
+    // Disabling is mode-only.
+    let args = blob_retention_drift(
+        Some(&want("none", None)),
+        Some(&retention_on("GOVERNANCE", NS_720H)),
+    )
+    .expect("retention is on, so disabling is drift");
+    assert_eq!(args.args(), vec!["--retention-mode", "none"]);
+
+    // Already off → nothing to do. Re-applying would churn the format blob every bootstrap.
+    assert!(blob_retention_drift(Some(&want("none", None)), Some(&retention_off())).is_none());
+
+    // Deliberately asymmetric with the enable path: with NO observation we cannot tell
+    // whether there is anything to disable, and a blind `--retention-mode=none` against a
+    // backend that cannot object-lock hard-fails. Do nothing.
+    assert!(blob_retention_drift(Some(&want("none", None)), None).is_none());
+}
+
+#[test]
+fn blob_retention_spec_renders_durations_for_kopias_cli_and_drops_garbage() {
+    use kopiur_api::repository::{BlobRetention as B, RetentionWindow};
+    let s = BlobRetentionSpec::from_api(&B::Governance(RetentionWindow {
+        period: "2592000".into(), // bare seconds — kopia REJECTS this form
+    }))
+    .unwrap();
+    assert_eq!(s.mode, "GOVERNANCE");
+    assert_eq!(
+        s.period.as_deref(),
+        Some("720h"),
+        "must reach kopia with a unit"
+    );
+
+    // `30d` is valid for kopia's own CLI but not for kopiur's grammar; admission rejects it,
+    // and if one ever slipped through it is dropped rather than forwarded as garbage.
+    let s = BlobRetentionSpec::from_api(&B::Compliance(RetentionWindow {
+        period: "30d".into(),
+    }))
+    .unwrap();
+    assert_eq!(s.period, None);
+
+    // `disabled: true` is a real instruction; `disabled: false` is not "enable" — there is
+    // nothing to enable without a mode and period — so it reads as "leave it alone".
+    assert_eq!(
+        BlobRetentionSpec::from_api(&B::Disabled(true)),
+        Some(want("none", None))
+    );
+    assert_eq!(BlobRetentionSpec::from_api(&B::Disabled(false)), None);
+}
+
+#[test]
+fn parameters_drift_merges_epoch_and_retention_into_one_invocation() {
+    // `set-parameters` rewrites the repository-global format blob and forces every other
+    // kopia client to reconnect. Epoch tuning and retention must therefore ride ONE command.
+    let epoch = EpochParametersSpec {
+        min_duration: Some("6h".into()),
+        ..Default::default()
+    };
+    let args = parameters_drift(
+        &epoch,
+        None,
+        Some(&want("GOVERNANCE", Some("720h"))),
+        Some(&retention_off()),
+    )
+    .expect("both drifted");
+    assert_eq!(
+        args.args(),
+        vec![
+            "--epoch-min-duration",
+            "6h",
+            "--retention-mode",
+            "GOVERNANCE",
+            "--retention-period",
+            "720h"
+        ],
+        "one invocation carrying both settings"
+    );
+
+    // Either alone still works...
+    assert!(parameters_drift(&epoch, None, None, None).is_some());
+    assert!(
+        parameters_drift(
+            &EpochParametersSpec::default(),
+            None,
+            Some(&want("GOVERNANCE", Some("720h"))),
+            None
+        )
+        .is_some()
+    );
+    // ...and declaring neither runs no command at all.
+    assert!(parameters_drift(&EpochParametersSpec::default(), None, None, None).is_none());
+}
+
+#[test]
+fn observed_blob_retention_renders_nanoseconds_back_to_go_durations() {
+    let o = observed_blob_retention(&retention_on("GOVERNANCE", NS_720H));
+    assert!(o.enabled);
+    assert_eq!(o.mode, "GOVERNANCE");
+    assert_eq!(o.period, "720h", "status must be comparable to spec");
+
+    let off = observed_blob_retention(&retention_off());
+    assert!(!off.enabled);
+    assert_eq!(off.mode, "");
+}
+
+#[test]
+fn a_work_spec_without_blob_retention_decodes_as_unmanaged() {
+    // Old work-spec JSON (and every repository that never declares retention) must decode
+    // to None — "leave it alone" — and NOT to a default that would read as "disable".
+    let op: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(op.blob_retention.is_none());
+    assert!(
+        blob_retention_drift(
+            op.blob_retention.as_ref(),
+            Some(&retention_on("GOVERNANCE", NS_720H))
+        )
+        .is_none()
+    );
 }

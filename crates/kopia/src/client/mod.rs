@@ -736,6 +736,16 @@ pub struct SetParametersArgs {
     pub epoch_checkpoint_frequency: Option<i64>,
     /// `--epoch-delete-parallelism`.
     pub epoch_delete_parallelism: Option<i64>,
+    /// `--retention-mode`. kopia declares this as an ENUM flag accepting exactly
+    /// `"none"`, `"GOVERNANCE"`, or `"COMPLIANCE"` — note the lowercase `none` against the
+    /// uppercase modes, which is kopia's own inconsistency, not a typo here. Anything else
+    /// is rejected by kopia's flag parser before the command runs.
+    pub retention_mode: Option<String>,
+    /// `--retention-period` (e.g. `"720h"`). Pre-rendered like the epoch durations. kopia's
+    /// own parser also accepts `d`, but kopiur never emits it — `render_go_duration` only
+    /// produces `h`/`m`/`s`. Omitted when `retention_mode` is `"none"`: kopia short-circuits
+    /// the disable path before validating, so a period there is meaningless.
+    pub retention_period: Option<String>,
 }
 
 impl SetParametersArgs {
@@ -766,6 +776,16 @@ impl SetParametersArgs {
         if let Some(v) = self.epoch_delete_parallelism {
             a.push("--epoch-delete-parallelism".into());
             a.push(v.to_string());
+        }
+        // Appended AFTER the epoch flags so the existing positional order assertions in
+        // `tests.rs` keep holding.
+        if let Some(v) = &self.retention_mode {
+            a.push("--retention-mode".into());
+            a.push(v.clone());
+        }
+        if let Some(v) = &self.retention_period {
+            a.push("--retention-period".into());
+            a.push(v.clone());
         }
         a
     }

@@ -1169,12 +1169,14 @@ async fn run_bootstrap(
         // Defense in depth: admission rejects `mode: ReadOnly` + `spec.parameters`, and the
         // controller does not send them — but `set-parameters` HARD-ERRORS on a read-only
         // connection (`storage is read-only`), so never risk it.
-        if !op.epoch_parameters.is_empty() {
+        if !op.epoch_parameters.is_empty() || op.blob_retention.is_some() {
             warn!("skipping repository set-parameters: this repository is connected read-only");
         }
-    } else if let Some(args) = kopiur_mover::workspec::epoch_drift(
+    } else if let Some(args) = kopiur_mover::workspec::parameters_drift(
         &op.epoch_parameters,
         status.content_format.epoch_parameters.as_ref(),
+        op.blob_retention.as_ref(),
+        status.blob_retention.as_ref(),
     ) {
         match client.repository_set_parameters(&args).await {
             Ok(()) => {
@@ -1203,13 +1205,19 @@ async fn run_bootstrap(
                 warn!(
                     class = %e.class(),
                     "could not apply repository set-parameters; continuing bootstrap — \
-                     status.parameters.epoch will show the drift"
+                     status.parameters will show the drift"
                 );
+                // ONE error channel, because it is one command: epoch tuning and blob
+                // retention ride the same `set-parameters` invocation, so they succeed or
+                // fail together and splitting the reason would invent a distinction kopia
+                // does not make. The message names both so the reader knows what to check.
                 epoch_error = Some(format!(
-                    "kopia repository set-parameters failed ({}): {}. spec.parameters.epoch \
-                     was NOT applied — status.parameters.epoch reports what the repository \
-                     actually has. The bootstrap re-runs on the next spec change; edit \
-                     spec.parameters.epoch to retry.",
+                    "kopia repository set-parameters failed ({}): {}. spec.parameters was NOT \
+                     applied — status.parameters reports what the repository actually has. \
+                     If you set spec.parameters.blobRetention, check that the backend and \
+                     bucket support object lock (kopia reports `blob-retention: unsupported \
+                     put-blob option` when they do not). The bootstrap re-runs on the next \
+                     spec change; edit spec.parameters to retry.",
                     e.class(),
                     e
                 ));
@@ -1221,6 +1229,12 @@ async fn run_bootstrap(
         .epoch_parameters
         .as_ref()
         .map(kopiur_mover::workspec::observed_epoch);
+    // Note the different nesting: epoch parameters live under `contentFormat`, blob
+    // retention is a TOP-LEVEL key of `repository status --json`.
+    let observed_blob_retention = status
+        .blob_retention
+        .as_ref()
+        .map(kopiur_mover::workspec::observed_blob_retention);
 
     // Always list to report an authoritative snapshot count (unaffected by either
     // the foreign-suffix prefilter or the cap below); return the entries for
@@ -1277,6 +1291,7 @@ async fn run_bootstrap(
         index_blob_count,
     )
     .with_epoch(observed_epoch, epoch_error)
+    .with_blob_retention(observed_blob_retention)
 }
 
 /// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning

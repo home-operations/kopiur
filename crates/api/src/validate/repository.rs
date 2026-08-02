@@ -146,10 +146,23 @@ pub fn validate_backup_deletion_policy(
 pub fn validate_repository_parameters(
     parameters: Option<&crate::repository::RepositoryParameters>,
     mode: crate::common::RepositoryMode,
+    backend: &crate::backend::Backend,
     context: &str,
 ) -> Vec<ValidationError> {
     let mut errs = Vec::new();
-    let Some(epoch) = parameters.and_then(|p| p.epoch.as_ref()) else {
+    let Some(parameters) = parameters else {
+        return errs;
+    };
+    // `epoch` and `blobRetention` are validated as INDEPENDENT blocks. Returning early when
+    // one is absent would make the other's rules dead code — declaring only blobRetention
+    // must still be checked.
+    errs.extend(validate_blob_retention(
+        parameters.blob_retention.as_ref(),
+        mode,
+        backend,
+        context,
+    ));
+    let Some(epoch) = parameters.epoch.as_ref() else {
         return errs;
     };
     if !mode.allows_writes() {
@@ -215,6 +228,120 @@ pub fn validate_repository_parameters(
     positive("advanceOnSizeMiB", epoch.advance_on_size_mb);
     positive("checkpointFrequency", epoch.checkpoint_frequency);
     positive("deleteParallelism", epoch.delete_parallelism);
+    errs
+}
+
+/// kopia's minimum blob-retention period, straight from its own `Validate()`:
+/// "invalid retention-period, the minimum required is 1-day and there is no maximum limit".
+const MIN_RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// `spec.parameters.blobRetention` rules (#332).
+///
+/// Three classes of rule, all of which turn a guaranteed *runtime* failure into an admission
+/// error:
+///
+/// - **Backend applicability.** On a backend without object lock, `set-parameters` does not
+///   no-op — it hard-fails with `blob-retention: unsupported put-blob option`. Since the
+///   bootstrap re-runs it on every reconcile, declaring retention on such a backend would
+///   produce a recurring Warning event and permanently diverged status, forever.
+/// - **Grammar and range.** The period must parse and clear kopia's 1-day floor.
+/// - **Applicability to `mode: ReadOnly`**, exactly as for `epoch`.
+///
+/// Deliberately NOT checked: whether the period exceeds the full-maintenance interval. kopia
+/// only enforces that when `--extend-object-locks` is on (`CheckExtendRetention` returns
+/// early otherwise), and kopiur does not set that flag — so such a guard would reject
+/// configurations kopia accepts.
+fn validate_blob_retention(
+    retention: Option<&crate::repository::BlobRetention>,
+    mode: crate::common::RepositoryMode,
+    backend: &crate::backend::Backend,
+    context: &str,
+) -> Vec<ValidationError> {
+    use crate::backend::Backend;
+    let mut errs = Vec::new();
+    let Some(retention) = retention else {
+        return errs;
+    };
+    let field = format!("{context} spec.parameters.blobRetention");
+
+    if !mode.allows_writes() {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: field.clone(),
+            reason: "a ReadOnly repository cannot apply blob retention: \
+                     `kopia repository set-parameters` rewrites the repository-global format \
+                     blob and fails outright on a read-only connection. Declare \
+                     blobRetention on the cluster that owns this repository (mode: ReadWrite) \
+                     — object lock is a property of the repository, not of each consumer"
+                .to_string(),
+        });
+    }
+
+    // Exhaustive on purpose: a new Backend variant must be classified here before it
+    // compiles, rather than silently inheriting "supported" and hard-failing at runtime.
+    let supported = match backend {
+        Backend::S3(_) | Backend::Azure(_) | Backend::Gcs(_) => true,
+        Backend::B2(_)
+        | Backend::Filesystem(_)
+        | Backend::Sftp(_)
+        | Backend::WebDav(_)
+        | Backend::Rclone(_)
+        | Backend::Gdrive(_) => false,
+    };
+    if !supported {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: field.clone(),
+            reason: format!(
+                "the {} backend does not support object lock, so kopia cannot apply blob \
+                 retention to it — `kopia repository set-parameters` fails with \
+                 `blob-retention: unsupported put-blob option`, and would keep failing on \
+                 every reconcile. Remove spec.parameters.blobRetention, or use an S3, Azure, \
+                 or GCS repository whose bucket had object lock enabled AT CREATION (it \
+                 cannot be turned on later)",
+                backend.kind_str()
+            ),
+        });
+    }
+
+    // Only the window variants carry a period; `Disabled` has nothing to check, and kopia
+    // short-circuits `--retention-mode=none` before its own validation.
+    let Some(window) = retention.window() else {
+        return errs;
+    };
+    let period_field = format!("{field}.{}.period", retention.kind_str().to_lowercase());
+    match crate::duration::parse_go_duration(&window.period) {
+        None => errs.push(ValidationError::InvalidFieldValue {
+            field: period_field,
+            reason: format!(
+                "{:?} is not a valid duration. Kopiur accepts a Go-style duration with a \
+                 single unit of h, m, or s — write 30 days as 720h, not 30d. (kopia's own CLI \
+                 does accept `30d`; kopiur keeps one duration grammar across every CRD field.)",
+                window.period
+            ),
+        }),
+        // Same 292-year ceiling as the epoch durations, and for the same reason: kopia stores
+        // this as an i64 nanosecond count, and the drift comparator compares in those units.
+        Some(d) if i64::try_from(d.as_nanos()).is_err() => {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: period_field,
+                reason: format!(
+                    "{:?} is too large: kopia stores the retention period as a 64-bit \
+                     nanosecond count, so the maximum is roughly 292 years",
+                    window.period
+                ),
+            });
+        }
+        Some(d) if d < MIN_RETENTION_PERIOD => {
+            errs.push(ValidationError::InvalidFieldValue {
+                field: period_field,
+                reason: format!(
+                    "{:?} is below kopia's minimum: \"the minimum required is 1-day and there \
+                     is no maximum limit\". Use 24h or more",
+                    window.period
+                ),
+            });
+        }
+        Some(_) => {}
+    }
     errs
 }
 
@@ -503,6 +630,7 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     errs.extend(validate_repository_parameters(
         spec.parameters.as_ref(),
         spec.mode,
+        &spec.backend,
         "Repository",
     ));
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "Repository") {
@@ -994,6 +1122,7 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
     errs.extend(validate_repository_parameters(
         spec.parameters.as_ref(),
         spec.mode,
+        &spec.backend,
         "ClusterRepository",
     ));
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "ClusterRepository") {

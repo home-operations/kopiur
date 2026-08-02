@@ -152,6 +152,18 @@ spec:
 - **Leave it unset** and Kopiur picks the **default `VolumeSnapshotClass` for your source's driver** (the one annotated `snapshot.storage.kubernetes.io/is-default-class: "true"`). If exactly one class exists for the driver it's used even without the annotation.
 - If **no** class matches your driver, or **several** match with no single default, the backup fails asking you to create/annotate a class or name one explicitly.
 
+/// tip | Templating this field with Flux or Kustomize?
+
+An **empty** value counts as unset, exactly like omitting the field. That makes the field safe to template unconditionally — a Kustomize component can always emit the line and let a Flux post-build substitution fill it in:
+
+```yaml
+volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS:=}
+```
+
+With the variable undefined this renders empty and Kopiur auto-selects the driver's default class; with it set, the named class is used. You do not need conditional templating to keep the field optional.
+
+///
+
 ### How long staging may wait (`spec.staging.timeout`)
 
 Staging has a **deadline budget** that bounds each of its phases:
@@ -327,7 +339,7 @@ If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapsho
 | Condition / symptom | Cause | Fix |
 | --- | --- | --- |
 | `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API — the external-snapshotter isn't installed. | Install the snapshot-controller and a `VolumeSnapshotClass` ([What it requires](#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
-| `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver (or several do with no single default). | Create/annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
+| `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver, or several do with no single default. (An **empty** `volumeSnapshotClassName` is not a cause — it counts as unset.) | Create/annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
 | `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The VolumeSnapshot was **still reporting an error when the staging deadline passed** (`spec.staging.timeout`, default `10m`) — transient errors during the wait are retried, never fatal on their own. | Read the message (it includes the driver's last error); fix the class/driver, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run (or a new `Snapshot`) retries. |
 | `SourceStaged=False`, reason **`StagingTimedOut`** | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported **no error** — the CSI driver / snapshot-controller is stuck or very slow. | Check the driver and the snapshot-controller; raise `spec.staging.timeout` (or set it to `"0"` to wait indefinitely) if the backend is just slow. |
 | `SourceStaged=False`, reason **`SourceNotCSIProvisioned`** | The source PVC has no `StorageClass` (a static/hostPath volume) — nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |

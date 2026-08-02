@@ -20,6 +20,7 @@ use common::*;
 
 use kube::Api;
 use kube::api::{DeleteParams, PostParams};
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
@@ -29,6 +30,17 @@ use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wai
 
 /// The storage class + snapshot class the `snapshot-stack` mise task installs.
 const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
+/// The `VolumeSnapshotClass` from `manifests/csi-snapshot/30-hostpath-snapshotclass.yaml`
+/// (driver `hostpath.csi.k8s.io`, annotated as the cluster default).
+const CSI_SNAPSHOT_CLASS: &str = "csi-hostpath-snapclass";
+
+fn volume_snapshots(client: &kube::Client) -> Api<DynamicObject> {
+    let ar = ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot"),
+        "volumesnapshots",
+    );
+    Api::namespaced_with(client.clone(), E2E_NAMESPACE, &ar)
+}
 
 /// FAIL-LOUD: a `Snapshot`-mode backup of a non-CSI (static hostPath) source PVC must
 /// fail with an actionable `SourceStaged=False` condition, not silently read the live
@@ -334,6 +346,246 @@ async fn snapshot_mode_stages_a_csi_volumesnapshot_and_cleans_up() {
         .await;
     let _ = pods
         .delete("e2e-cm-csi-seed", &DeleteParams::default())
+        .await;
+    let _ = pvcs.delete(src, &DeleteParams::default()).await;
+}
+
+/// EXPLICIT CLASS: `volumeSnapshotClassName` set by name lands verbatim on the
+/// `VolumeSnapshot`, and a BLANK value means "unset" (auto-select) rather than "a class
+/// named `` that does not exist".
+///
+/// The sibling test above only covers the field *unset*, so it cannot prove an explicitly
+/// named class is honored — it would pass identically if the name were dropped on the floor.
+///
+/// The blank case is the #332-adjacent regression: Flux/Kustomize post-build substitution
+/// renders `volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS}` as an empty value whenever the
+/// variable is undefined, which used to fail the Snapshot with
+/// ``volumeSnapshotClassName `` does not exist``.
+#[tokio::test]
+#[ignore = "requires the e2e harness + the CSI snapshot stack (mise run //crates/e2e:snapshot-stack)"]
+async fn explicit_volume_snapshot_class_is_honored_and_blank_means_unset() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    // Hard requirement, same as the sibling test: a missing harness must fail loudly
+    // rather than masquerade as a pass.
+    let scs: Api<StorageClass> = Api::all(client.clone());
+    assert!(
+        scs.get_opt(CSI_STORAGE_CLASS)
+            .await
+            .expect("list storageclasses")
+            .is_some(),
+        "storageclass {CSI_STORAGE_CLASS} not found — run `mise run //crates/e2e:snapshot-stack` \
+         (or set KOPIUR_E2E_SKIP_SNAPSHOT_STACK=1 only for shards excluding copy_methods.rs)"
+    );
+
+    ensure_repo(&client, "copymethod-explicit").await;
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let vs_api = volume_snapshots(&client);
+
+    let src = "e2e-cm-explicit-src";
+    pvcs.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": { "name": src, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": CSI_STORAGE_CLASS,
+                "resources": { "requests": { "storage": "64Mi" } },
+            },
+        })),
+    )
+    .await
+    .expect("create CSI source PVC");
+    pods.create(
+        &PostParams::default(),
+        &cr(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "e2e-cm-explicit-seed", "namespace": E2E_NAMESPACE },
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{
+                    "name": "seed", "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["sh", "-c", "echo kopiur-explicit > /data/marker.txt"],
+                    "volumeMounts": [{ "name": "d", "mountPath": "/data" }],
+                }],
+                "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": src } }],
+            },
+        })),
+    )
+    .await
+    .expect("create seed pod");
+    wait_until(
+        "CSI source PVC Bound",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let bound = pvcs
+                .get_opt(src)
+                .await?
+                .and_then(|p| p.status.and_then(|s| s.phase))
+                .as_deref()
+                == Some("Bound");
+            Ok(bound.then_some(()))
+        },
+    )
+    .await
+    .expect("source PVC should bind");
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                "e2e-cm-explicit-repo",
+                "copymethod-explicit",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Repository");
+
+    // --- Case 1: an explicitly named class must reach the VolumeSnapshot verbatim. ---
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                "e2e-cm-explicit-policy",
+                "Repository",
+                "e2e-cm-explicit-repo",
+                serde_json::json!({
+                    "copyMethod": "Snapshot",
+                    "volumeSnapshotClassName": CSI_SNAPSHOT_CLASS,
+                    "sources": [ { "pvc": { "name": src } } ],
+                }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy with an explicit class");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-cm-explicit-backup",
+                "e2e-cm-explicit-policy",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+
+    // Read the class off the live VolumeSnapshot. Staging happens before the mover Job, and
+    // the staged objects are reaped once the Snapshot succeeds — so capture it in the same
+    // poll that discovers the name, rather than racing the reaper with a second lookup.
+    let observed_class = wait_until(
+        "VolumeSnapshot created with the explicit class",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let Some(name) = status_json(&backups, "e2e-cm-explicit-backup")
+                .await
+                .get("staged")
+                .and_then(|s| s.get("volumeSnapshotName"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                return Ok(None);
+            };
+            Ok(vs_api.get_opt(&name).await?.and_then(|vs| {
+                vs.data
+                    .get("spec")
+                    .and_then(|s| s.get("volumeSnapshotClassName"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }))
+        },
+    )
+    .await
+    .expect("the VolumeSnapshot should exist and carry a class");
+    assert_eq!(
+        observed_class, CSI_SNAPSHOT_CLASS,
+        "spec.volumeSnapshotClassName must land on the VolumeSnapshot verbatim"
+    );
+
+    wait_phase(&backups, "e2e-cm-explicit-backup", "Succeeded")
+        .await
+        .expect("Snapshot with an explicit VolumeSnapshotClass should Succeed");
+
+    // --- Case 2: a BLANK class means unset — auto-select, not ExplicitNotFound(""). ---
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                "e2e-cm-blank-policy",
+                "Repository",
+                "e2e-cm-explicit-repo",
+                serde_json::json!({
+                    "copyMethod": "Snapshot",
+                    "volumeSnapshotClassName": "",
+                    "sources": [ { "pvc": { "name": src } } ],
+                }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy with a blank class");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-cm-blank-backup",
+                "e2e-cm-blank-policy",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+
+    wait_phase(&backups, "e2e-cm-blank-backup", "Succeeded")
+        .await
+        .expect(
+            "a blank volumeSnapshotClassName must auto-select the default class, not fail with \
+             NoVolumeSnapshotClass",
+        );
+    let blank_status = status_json(&backups, "e2e-cm-blank-backup").await;
+    let staged_reason = blank_status
+        .get("conditions")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("SourceStaged"))
+        .and_then(|c| c.get("reason"))
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_ne!(
+        staged_reason, "NoVolumeSnapshotClass",
+        "a blank class must never be reported as a missing explicit class: {blank_status}"
+    );
+
+    // Cleanup.
+    for name in ["e2e-cm-explicit-backup", "e2e-cm-blank-backup"] {
+        let _ = backups.delete(name, &DeleteParams::default()).await;
+    }
+    for name in ["e2e-cm-explicit-policy", "e2e-cm-blank-policy"] {
+        let _ = policies.delete(name, &DeleteParams::default()).await;
+    }
+    let _ = repos
+        .delete("e2e-cm-explicit-repo", &DeleteParams::default())
+        .await;
+    let _ = pods
+        .delete("e2e-cm-explicit-seed", &DeleteParams::default())
         .await;
     let _ = pvcs.delete(src, &DeleteParams::default()).await;
 }

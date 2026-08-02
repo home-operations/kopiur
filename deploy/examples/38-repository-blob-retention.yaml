@@ -1,0 +1,96 @@
+# Example 38 — object-lock blob retention / ransomware protection
+# (spec.parameters.blobRetention)
+#
+# THE SYMPTOM: nothing, until the day it matters. If the Kopiur container, the Helm
+# release, or the cluster itself is compromised, an attacker holding the repository
+# credentials can delete every backup you have. Backups that a single stolen
+# credential can erase are not a recovery plan.
+#
+# THE FIX: have the object store refuse the delete. S3 (and Azure/GCS) can lock a
+# blob for a fixed period at the moment it is written; until that period expires the
+# storage layer rejects deletion, no matter who asks. kopia drives this through
+# `repository set-parameters --retention-mode/--retention-period`, and this field
+# declares it so kopiur re-applies it whenever it drifts.
+#
+# PREREQUISITE THAT KOPIUR CANNOT DO FOR YOU: the bucket must have Object Lock
+# ENABLED AT CREATION TIME. It cannot be turned on afterwards, and these flags do not
+# create it. On AWS that is `aws s3api create-bucket --object-lock-enabled-for-bucket`;
+# on MinIO/RustFS, `mc mb --with-lock`. Without it, kopia fails with
+# `blob-retention: unsupported put-blob option`.
+#
+# SUPPORTED BACKENDS: s3, azure, gcs. Anything else (filesystem, sftp, webdav,
+# rclone, b2, gdrive) is rejected at admission — those protocols have no object lock,
+# and kopia would hard-fail on every single reconcile rather than quietly ignoring it.
+#
+# ABSENT MEANS "DON'T TOUCH", exactly like spec.parameters.epoch. Deleting this block
+# from your manifest does NOT turn retention off — it leaves the repository at
+# whatever you last applied, so a stray `kubectl apply` can never silently strip
+# ransomware protection. To actually turn it off, say so:
+#
+#   parameters:
+#     blobRetention:
+#       disabled: true
+#
+# READ THE RESULT at status.parameters.blobRetention, which mirrors what the
+# repository actually reports — so a failed apply shows up as drift from spec rather
+# than as silence.
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ LIMITATION — protection is a ROLLING WINDOW, not cumulative immutability.     │
+# │                                                                              │
+# │ The lock is applied when a blob is WRITTEN. Kopiur does not enable kopia's    │
+# │ `maintenance set --extend-object-locks`, so locks on blobs that are still     │
+# │ needed are never extended: a blob written today under `period: 720h` becomes  │
+# │ deletable again in 30 days. Size the period to comfortably exceed your        │
+# │ longest recovery window, and run `kopia maintenance set                       │
+# │ --extend-object-locks=true` by hand if you need durable protection.           │
+# │                                                                              │
+# │ Blobs written BEFORE you enabled retention — including the repository format  │
+# │ blob — are never retroactively locked.                                        │
+# └──────────────────────────────────────────────────────────────────────────────┘
+#
+# GOVERNANCE vs COMPLIANCE — choose deliberately:
+#
+#   governance: locked against ordinary deletes, but a sufficiently privileged
+#               identity can still shorten or remove the lock. Start here.
+#
+#   compliance: NOBODY can shorten or remove the lock before it expires — not you,
+#               not the account root, not support. A mistyped period is an unfixable
+#               storage-cost commitment for its full duration. Only choose this if
+#               you specifically need protection against an attacker who has your
+#               cloud admin credentials, and only after testing the period on a
+#               throwaway bucket.
+#
+# PERIOD GRAMMAR: kopiur accepts h/m/s (or a bare number of seconds) — write 30 days
+# as `720h`. Note that kopia's own CLI *does* accept `30d`; kopiur deliberately keeps
+# one duration grammar across every CRD field, so a period copied from kopia's
+# documentation is rejected at admission with a message naming the fix. kopia's
+# minimum is 1 day; there is no maximum.
+#
+# EXPECT THE REPOSITORY TO GROW. Maintenance still issues deletes, but the storage
+# layer refuses them until the lock expires, so reclaim lags your retention period.
+# That is the cost of the guarantee, not a bug.
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: s3-locked
+  namespace: kopiur-system
+spec:
+  backend:
+    s3:
+      bucket: my-kopiur-backups # MUST have been created with object lock enabled
+      region: us-east-1
+      auth:
+        secretRef:
+          name: s3-credentials
+  encryption:
+    passwordSecretRef:
+      name: kopiur-repo-password
+      key: KOPIA_PASSWORD
+  parameters:
+    blobRetention:
+      # Exactly one of governance / compliance / disabled — the CRD's own schema
+      # enforces it, so "a mode without a period" is not expressible.
+      governance:
+        period: 720h # 30 days. NOT `30d` — see PERIOD GRAMMAR above.

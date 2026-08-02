@@ -287,6 +287,15 @@ pub struct BootstrapResult {
     /// with `spec`. The controller turns this into a Warning event on the repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch_error: Option<String>,
+    /// The blob retention the repository reports (`repository status`), for the controller
+    /// to mirror into `status.parameters.blobRetention` (#332). Same best-effort contract as
+    /// `epoch`: `None` when the status could not be read.
+    ///
+    /// There is deliberately no `blob_retention_error` sibling — epoch tuning and blob
+    /// retention are applied by ONE `set-parameters` command, so they fail together and
+    /// `epoch_error` carries the single reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_retention: Option<kopiur_api::repository::ObservedBlobRetention>,
     /// Structured failure block on `success == false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureBlock>,
@@ -314,6 +323,7 @@ impl BootstrapResult {
             index_blob_count,
             epoch: None,
             epoch_error: None,
+            blob_retention: None,
             failure: None,
         }
     }
@@ -331,6 +341,17 @@ impl BootstrapResult {
         self
     }
 
+    /// Attach the blob retention observed at the end of the bootstrap (#332). A sibling of
+    /// [`BootstrapResult::with_epoch`] rather than two more positional arguments to it, for
+    /// the same reason that one exists.
+    pub fn with_blob_retention(
+        mut self,
+        blob_retention: Option<kopiur_api::repository::ObservedBlobRetention>,
+    ) -> Self {
+        self.blob_retention = blob_retention;
+        self
+    }
+
     /// A terminal-failure outcome carrying the kopia error class + stderr tail.
     pub fn failed(err: &KopiaError) -> Self {
         BootstrapResult {
@@ -344,6 +365,7 @@ impl BootstrapResult {
             index_blob_count: None,
             epoch: None,
             epoch_error: None,
+            blob_retention: None,
             failure: Some(failure_block_from_kopia(err)),
         }
     }
@@ -367,6 +389,7 @@ impl BootstrapResult {
             index_blob_count: None,
             epoch: None,
             epoch_error: None,
+            blob_retention: None,
             failure: Some(FailureBlock {
                 kopia_error_class: REPOSITORY_NOT_INITIALIZED_CLASS.to_string(),
                 message: REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),

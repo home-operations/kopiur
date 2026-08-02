@@ -1244,6 +1244,24 @@ pub(crate) fn epoch_parameters_for(
         .unwrap_or_default()
 }
 
+/// The blob retention to send to a bootstrap mover, or `None` when there is nothing to apply
+/// (#332). Pure; shared by both repository kinds, exactly like [`epoch_parameters_for`].
+///
+/// `None` here means "leave the repository's retention alone" — it is NOT "disable". A
+/// `ReadOnly` repository always sends `None`, for the same reason it sends no epoch
+/// parameters: `set-parameters` hard-errors on a read-only connection.
+pub(crate) fn blob_retention_for(
+    read_only: bool,
+    parameters: Option<&kopiur_api::repository::RepositoryParameters>,
+) -> Option<kopiur_mover::workspec::BlobRetentionSpec> {
+    if read_only {
+        return None;
+    }
+    parameters
+        .and_then(|p| p.blob_retention.as_ref())
+        .and_then(kopiur_mover::workspec::BlobRetentionSpec::from_api)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_work_spec(
     backend: &Backend,
@@ -1287,6 +1305,7 @@ fn bootstrap_work_spec(
             // this is the belt to its braces, and the same hazard shape as the
             // consumer-clobbers-the-primary's-maintenance-owner bug M6 fixed.)
             epoch_parameters: epoch_parameters_for(read_only, parameters),
+            blob_retention: blob_retention_for(read_only, parameters),
             // Stamped on CREATE unconditionally (elsewhere) AND re-stamped on
             // every connect-to-existing when stale (`maintenance_restamp_target`);
             // `None` means neither ever happens — see the doc above.
@@ -1482,12 +1501,25 @@ async fn finalize_bootstrap(
         // re-reporting the old repository's identity forever.
         "observedGeneration": repo.metadata.generation,
     });
-    // Mirror the epoch parameters the repository actually reports (#258). The apply is
-    // best-effort in the mover, so this is what keeps it honest: a `spec.parameters.epoch`
-    // that failed to land stays visible here as drift from spec, rather than as silence.
-    // Merge-patch, so this key does not disturb the rest of status.
-    if let Some(epoch) = &result.epoch {
-        status_patch["parameters"] = serde_json::json!({ "epoch": epoch });
+    // Mirror the parameters the repository actually reports (#258 epoch, #332 blob
+    // retention). The apply is best-effort in the mover, so this is what keeps it honest: a
+    // `spec.parameters` that failed to land stays visible here as drift from spec, rather
+    // than as silence.
+    //
+    // Built as ONE map and assigned once. `status_patch` is a local Value assembled
+    // key-by-key before a single patch, so two `status_patch["parameters"] = json!(..)`
+    // statements would not merge — the second would drop the first outright, silently.
+    {
+        let mut params = serde_json::Map::new();
+        if let Some(epoch) = &result.epoch {
+            params.insert("epoch".into(), serde_json::json!(epoch));
+        }
+        if let Some(retention) = &result.blob_retention {
+            params.insert("blobRetention".into(), serde_json::json!(retention));
+        }
+        if !params.is_empty() {
+            status_patch["parameters"] = serde_json::Value::Object(params);
+        }
     }
     // The apply is best-effort (see the mover), so a failure leaves the repository Ready
     // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —

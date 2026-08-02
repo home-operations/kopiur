@@ -524,7 +524,30 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `blobRetention` | [union](#repository-spec-parameters-blobretention) | — | Object-lock blob retention (S3/Azure/GCS) — ransomware protection. Absent means "don't touch it"; use `disabled: true` to actively turn it off. |
 | `epoch` | [object](#repository-spec-parameters-epoch) | — | Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index blobs get compacted. |
+
+##### `spec.parameters.blobRetention` { #repository-spec-parameters-blobretention }
+
+Externally tagged — set **exactly one** of: `compliance` · `disabled` · `governance`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `compliance` | [object](#repository-spec-parameters-blobretention-compliance) | — | `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including the account root. An oversized period is an unfixable storage-cost commitment; there is no recovery path short of deleting the bucket after expiry. |
+| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `crate::cluster_repository::AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
+| `governance` | [object](#repository-spec-parameters-blobretention-governance) | — | `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged identity can still shorten or remove the lock. The safe default for most clusters. |
+
+###### `spec.parameters.blobRetention.compliance` { #repository-spec-parameters-blobretention-compliance }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `period` | string | **required** | Go-style duration; kopia's minimum is `24h` and there is no maximum.<br>Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here; write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every CRD field rather than matching kopia's per-flag variations. |
+
+###### `spec.parameters.blobRetention.governance` { #repository-spec-parameters-blobretention-governance }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `period` | string | **required** | Go-style duration; kopia's minimum is `24h` and there is no maximum.<br>Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here; write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every CRD field rather than matching kopia's per-flag variations. |
 
 ##### `spec.parameters.epoch` { #repository-spec-parameters-epoch }
 
@@ -644,7 +667,16 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `blobRetention` | [object](#repository-status-parameters-blobretention) | — | The blob retention the repository reports. |
 | `epoch` | [object](#repository-status-parameters-epoch) | — | The epoch parameters the repository reports. |
+
+##### `status.parameters.blobRetention` { #repository-status-parameters-blobretention }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | **required** | Whether the repository currently has blob retention in force (kopia's `IsRetentionEnabled()`: a non-empty mode AND a non-zero period). |
+| `mode` | string | **required** | Observed retention mode exactly as kopia reports it (`GOVERNANCE`, `COMPLIANCE`, or empty when off). |
+| `period` | string | **required** | Observed retention period, as a Go-style duration (`720h`). Empty-equivalent (`0s`) when retention is off. |
 
 ##### `status.parameters.epoch` { #repository-status-parameters-epoch }
 
@@ -1211,7 +1243,30 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `blobRetention` | [union](#clusterrepository-spec-parameters-blobretention) | — | Object-lock blob retention (S3/Azure/GCS) — ransomware protection. Absent means "don't touch it"; use `disabled: true` to actively turn it off. |
 | `epoch` | [object](#clusterrepository-spec-parameters-epoch) | — | Epoch-manager tuning — how fast kopia closes epochs and therefore how fast index blobs get compacted. |
+
+##### `spec.parameters.blobRetention` { #clusterrepository-spec-parameters-blobretention }
+
+Externally tagged — set **exactly one** of: `compliance` · `disabled` · `governance`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `compliance` | [object](#clusterrepository-spec-parameters-blobretention-compliance) | — | `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including the account root. An oversized period is an unfixable storage-cost commitment; there is no recovery path short of deleting the bucket after expiry. |
+| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `crate::cluster_repository::AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
+| `governance` | [object](#clusterrepository-spec-parameters-blobretention-governance) | — | `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged identity can still shorten or remove the lock. The safe default for most clusters. |
+
+###### `spec.parameters.blobRetention.compliance` { #clusterrepository-spec-parameters-blobretention-compliance }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `period` | string | **required** | Go-style duration; kopia's minimum is `24h` and there is no maximum.<br>Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here; write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every CRD field rather than matching kopia's per-flag variations. |
+
+###### `spec.parameters.blobRetention.governance` { #clusterrepository-spec-parameters-blobretention-governance }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `period` | string | **required** | Go-style duration; kopia's minimum is `24h` and there is no maximum.<br>Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here; write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every CRD field rather than matching kopia's per-flag variations. |
 
 ##### `spec.parameters.epoch` { #clusterrepository-spec-parameters-epoch }
 
@@ -1333,7 +1388,16 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `blobRetention` | [object](#clusterrepository-status-parameters-blobretention) | — | The blob retention the repository reports. |
 | `epoch` | [object](#clusterrepository-status-parameters-epoch) | — | The epoch parameters the repository reports. |
+
+##### `status.parameters.blobRetention` { #clusterrepository-status-parameters-blobretention }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | **required** | Whether the repository currently has blob retention in force (kopia's `IsRetentionEnabled()`: a non-empty mode AND a non-zero period). |
+| `mode` | string | **required** | Observed retention mode exactly as kopia reports it (`GOVERNANCE`, `COMPLIANCE`, or empty when off). |
+| `period` | string | **required** | Observed retention period, as a Go-style duration (`720h`). Empty-equivalent (`0s`) when retention is off. |
 
 ##### `status.parameters.epoch` { #clusterrepository-status-parameters-epoch }
 
@@ -1406,7 +1470,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `suspend` | boolean | — | Pause this recipe declaratively (schedules and reconcile skip a suspended policy). |
 | `upload` | [object](#snapshotpolicy-spec-upload) | — | Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`). |
 | `verification` | [object](#snapshotpolicy-spec-verification) | — | First-class backup verification; opt-in (absent ⇒ no verification runs). |
-| `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. |
+| `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. Absent or empty both mean auto-select the default class for the source PVC's CSI driver, so a GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset. |
 
 #### `spec.repository` { #snapshotpolicy-spec-repository }
 
