@@ -26,7 +26,7 @@ jobs:
     name: Binaries
     permissions:
       contents: read
-    uses: ./.github/workflows/plugin-binaries.yaml
+    uses: $/.github/workflows/plugin-binaries.yaml
 
   snapshot:
     name: Snapshot

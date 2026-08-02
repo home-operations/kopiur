@@ -246,7 +246,7 @@ jobs:
     if: ${{ github.event_name == 'release' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/plugin-binaries.yaml
+    uses: $/.github/workflows/plugin-binaries.yaml
     with:
       version: ${{ github.event.release.tag_name }}
 
