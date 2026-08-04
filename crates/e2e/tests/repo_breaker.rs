@@ -243,6 +243,43 @@ async fn breaker_pauses_backups_during_outage_and_recovers() {
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
 
+    // --- 0. Re-entrancy: nextest's e2e profile RETRIES a failed test in the
+    // same cluster, and a mid-arc panic can leave the selector broken and the
+    // CRs behind — a retry must start from a clean slate, not fail fast on
+    // AlreadyExists against half-dead state. Heal the selector first (Snapshot
+    // finalizers need a reachable backend to drain), then drain any prior
+    // attempt's CRs. All best-effort + wait-gone; a fresh cluster no-ops.
+    set_minio_selector(&client, "minio")
+        .await
+        .expect("reset the minio Service selector");
+    let _ = schedules.delete(SCHEDULE, &Default::default()).await;
+    let _ = policies.delete(POLICY, &Default::default()).await;
+    if let Ok(list) = backups.list(&Default::default()).await {
+        for b in list.items {
+            if let Some(n) = b.metadata.name.as_deref()
+                && n.starts_with(SCHEDULE)
+            {
+                let _ = backups.delete(n, &Default::default()).await;
+            }
+        }
+    }
+    let _ = repos.delete(REPO, &Default::default()).await;
+    let _ = repos.delete(ALERT_REPO, &Default::default()).await;
+    wait_until(
+        "prior-attempt CRs fully drained",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = repos.get_opt(REPO).await?.is_none()
+                && repos.get_opt(ALERT_REPO).await?.is_none()
+                && policies.get_opt(POLICY).await?.is_none()
+                && schedules.get_opt(SCHEDULE).await?.is_none();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .expect("prior-attempt CRs should drain before the fresh run");
+
     // --- 1. Baseline: repos Ready, one scheduled backup Succeeded. ------------
     repos
         .create(
@@ -330,11 +367,13 @@ async fn breaker_pauses_backups_during_outage_and_recovers() {
         // 2. The breaker must OPEN: BackendReachable=False, then phase Degraded
         //    with Ready=False. Condition-gated first, phase second (two-pass
         //    heal discipline). While the breaker trips, the Failed population
-        //    may grow by AT MOST ONE: a backup already in flight (or launched
-        //    before the probe hits its threshold) legitimately fails — the
-        //    documented one-doomed-Job detection window. What must NEVER happen
-        //    is one failure per schedule tick (the 53-Failed-CRs incident).
-        let allowed_failed_during_trip = baseline.failed + 1;
+        //    may grow by AT MOST `failureThreshold` (2 here): the debounce is
+        //    real — every sensor tick below the threshold keeps the repository
+        //    Ready, and one Forbid-bounded backup can legitimately fail inside
+        //    each ~30-60s tick window. That bounded cost IS the design ("a
+        //    few, not 53"); what must NEVER happen is one failure per schedule
+        //    tick for the whole outage (the 53-Failed-CRs incident).
+        let allowed_failed_during_trip = baseline.failed + 2;
         wait_until(
             &format!("{REPO} BackendReachable=False"),
             default_timeout(),
@@ -361,7 +400,7 @@ async fn breaker_pauses_backups_during_outage_and_recovers() {
                 if counts.failed > allowed_failed_during_trip {
                     return Ok(Some(Err(format!(
                         "Failed Snapshots piled up while the breaker was tripping: \
-                         {} > allowed {} (baseline {} + the one-doomed-Job window) — \
+                         {} > allowed {} (baseline {} + the failureThreshold debounce window) — \
                          the #345 failure-per-tick regression",
                         counts.failed, allowed_failed_during_trip, baseline.failed
                     ))));

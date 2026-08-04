@@ -1793,26 +1793,60 @@ async fn recycle_bootstrap_outage(
         health::ProbeFailureKind::Unreachable
     };
     let now = chrono::Utc::now().to_rfc3339();
-    // Bootstrapped=False with the kopia-class reason (the existing recycle
-    // discipline), then the unified sensor folds BackendReachable + the streak
-    // on top — one conditions array, one writer.
-    let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let existing = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let threshold = kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
+        repo.spec.health.as_ref(),
+    );
+    // A strict connect failure is a SENSOR TICK, not an automatic phase flip:
+    // the unified sensor folds BackendReachable + the streak, and the SAME
+    // `breaker_verdict` as the probe path decides the phase. Below the
+    // threshold (or under `onFailure: Alert`) the repository stays `Ready` —
+    // hard-coding `Degraded` here bypassed the threshold, broke the Alert
+    // contract, and skipped the trip metric/event, since the reverify-nudged
+    // strict retry (not the probe timer) is the dominant real-world path into
+    // the breaker (found by the repo_breaker e2e: trips_total stayed 0).
     let upd = health::reconcile_probe_failure(
-        &conditions,
+        &existing,
         repo.status.as_ref().and_then(|s| s.health.as_ref()),
         kind,
-        kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
-            repo.spec.health.as_ref(),
-        ),
+        threshold,
         &now,
         repo.metadata.generation,
     );
+    let verdict = health::breaker_verdict(
+        upd.health.consecutive_probe_failures.unwrap_or(0),
+        threshold,
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_on_failure(
+            repo.spec.health.as_ref(),
+        ),
+    );
+    let p = health::probe_failure_phase(verdict, kind, probe_aware_reconcile_interval(repo));
+    // Only an OPEN verdict records the failed re-bootstrap on `Bootstrapped`
+    // (the recycle discipline); while the verdict keeps the repository `Ready`,
+    // the `BackendReachable` sensor condition alone carries the story — a
+    // `Ready` phase with `Bootstrapped=False` would contradict itself.
+    let conditions = if p.opened {
+        io::upsert_condition(
+            &upd.conditions,
+            crate::consts::REPOSITORY_BOOTSTRAPPED_CONDITION,
+            false,
+            reason,
+            &failure.condition_message(),
+            repo.metadata.generation,
+        )
+    } else {
+        upd.conditions.clone()
+    };
     let conditions = io::set_ready(
-        &upd.conditions,
+        &conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(RepositoryPhase::Degraded),
-        reason,
-        &failure.condition_message(),
+        io::ready_outcome_for_phase(p.phase),
+        p.ready_reason,
+        p.ready_message,
     );
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
@@ -1820,7 +1854,7 @@ async fn recycle_bootstrap_outage(
         name,
         current.as_ref(),
         serde_json::json!({
-            "phase": "Degraded",
+            "phase": p.phase_str,
             "backend": backend.kind_str(),
             "observedGeneration": repo.metadata.generation,
             // Explicit-null patch (never `upd.health` directly): the merge must
@@ -1830,29 +1864,56 @@ async fn recycle_bootstrap_outage(
         }),
     )
     .await?;
-    // The class Event (with the volatile stderr detail) fires on the transition
-    // into this state only — the streak++ makes `wrote` true on EVERY retry, so
-    // gating on `wrote` alone would publish once per cycle for a multi-day outage.
-    if wrote && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded) {
-        failure.publish(ctx, &io::event_ref(repo), name).await;
-        tracing::warn!(
-            repo = %name,
-            reason,
-            "strict bootstrap hit a backend outage on a bootstrapped repository; \
-             recycled the Job to retry as Degraded"
-        );
-    }
     // The unified sensor's own alert (threshold crossing / reason change) is
     // already once-per-episode by construction.
     if let Some(w) = upd.event {
         ctx.metrics
             .inc_health_probe_failure(namespace, name, "Repository", kind.label());
-        io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+        if wrote {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+        }
+    }
+    // The breaker-trip Event + metric + the class Event (volatile stderr
+    // detail) fire on the Open TRANSITION only — the streak++ makes `wrote`
+    // true on EVERY retry, so gating on `wrote` alone would publish once per
+    // cycle for a multi-day outage.
+    if p.opened
+        && wrote
+        && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded)
+    {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        ctx.metrics
+            .inc_breaker_trip("Repository", namespace, name, kind.label());
+        io::publish_warning_event(
+            ctx,
+            repo,
+            health::breaker_reason(kind),
+            health::breaker_action(kind),
+            &format!(
+                "{} Last error: {}",
+                health::breaker_open_message(kind),
+                failure.condition_message()
+            ),
+        )
+        .await;
+        tracing::warn!(
+            repo = %name,
+            reason,
+            "strict bootstrap hit a backend outage on a bootstrapped repository; \
+             circuit breaker opened (Degraded) and the Job was recycled to retry"
+        );
     }
     let streak = upd.health.consecutive_probe_failures.unwrap_or(1);
-    Ok(Action::requeue(health::strict_retry_backoff(
-        streak.saturating_sub(1),
-    )))
+    // Open: hop straight back into the strict retry loop, whose launch cadence
+    // `strict_retry_holdoff` governs. StayReady: the probe timer / reverify
+    // nudges drive the next sensor tick on `p.requeue`'s steady cadence; the
+    // backoff keeps a floor under a rapid retry storm either way.
+    let requeue = if p.opened {
+        health::strict_retry_backoff(streak.saturating_sub(1))
+    } else {
+        p.requeue
+    };
+    Ok(Action::requeue(requeue))
 }
 
 /// Health-probe failure on an already-`Ready` `Repository` — the breaker's
