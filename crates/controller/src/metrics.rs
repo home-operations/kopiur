@@ -87,6 +87,7 @@ pub struct Metrics {
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
     health_probe_failures: Counter<u64>,
+    breaker_trips: Counter<u64>,
 
     // Repository business metrics.
     repo_size_bytes: Gauge<i64>,
@@ -478,6 +479,17 @@ impl Metrics {
                  stays Ready — these are alerts, not outages, and kopiur never auto-recreates.",
             )
             .build();
+        let breaker_trips = m
+            .u64_counter("kopiur_repository_breaker_trips")
+            .with_description(
+                "Total repository circuit-breaker openings: the backend health probe exceeded \
+                 spec.health.probe.failureThreshold under onFailure: Degrade, moving the \
+                 repository to Degraded (backups, maintenance, and replication pause until a \
+                 connect succeeds; recovery is automatic). Labeled by kind \
+                 (Repository/ClusterRepository), namespace, name, and probe_kind \
+                 (vanished/unreachable — matching the health-probe-failure outcome label).",
+            )
+            .build();
 
         let repo_size_bytes = m
             .i64_gauge("kopiur_repo_size_bytes")
@@ -544,6 +556,7 @@ impl Metrics {
             secrets_projected,
             backups_refused,
             health_probe_failures,
+            breaker_trips,
             repo_size_bytes,
             repo_snapshot_count,
             repo_discovered_backups,
@@ -1122,6 +1135,25 @@ impl Metrics {
                 KeyValue::new("name", name.to_string()),
                 KeyValue::new("kind", kind.to_string()),
                 KeyValue::new("outcome", outcome.to_string()),
+            ],
+        );
+    }
+
+    /// Count a circuit-breaker opening (#345 M4): the repository transitioned to
+    /// `Degraded` because the backend probe exceeded `failureThreshold` under
+    /// `onFailure: Degrade`. Fired on the TRANSITION only (never on re-confirmed
+    /// failures while already open). `kind` is `Repository`/`ClusterRepository`
+    /// (`ns` empty for the latter); `probe_kind` is `vanished`/`unreachable`
+    /// ([`crate::health::ProbeFailureKind::label`]), matching the
+    /// health-probe-failure `outcome` label so the two counters join.
+    pub fn inc_breaker_trip(&self, kind: &str, ns: &str, name: &str, probe_kind: &str) {
+        self.breaker_trips.add(
+            1,
+            &[
+                KeyValue::new("kind", kind.to_string()),
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("name", name.to_string()),
+                KeyValue::new("probe_kind", probe_kind.to_string()),
             ],
         );
     }

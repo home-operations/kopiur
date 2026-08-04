@@ -602,6 +602,46 @@ impl BootstrapFailure {
         }
     }
 
+    /// Whether this failed strict-bootstrap verdict should recycle-and-retry as
+    /// `Degraded` instead of parking terminal `Failed` — ONLY a backend verdict
+    /// of class `RepositoryUnavailable` on a repository that has bootstrapped
+    /// before (`status.uniqueId` pinned). This is the strict-verdict half of the
+    /// #345 circuit breaker: without it, a breaker-opened `Degraded` repository
+    /// is overwritten to terminal `Failed` one pass later by its own strict
+    /// retry's `Backend` verdict.
+    ///
+    /// Deliberately NOT `class.is_retryable()`: `Locked` (a stale kopia lock)
+    /// and `SourceError` are not outages — they previously parked visibly at
+    /// `Failed`/Stalled with an actionable condition, and looping them
+    /// `Degraded` forever would hide them (audit 3c). A never-bootstrapped repo
+    /// (`bootstrapped == false`) keeps fail-fast terminal `Failed` so a
+    /// first-bootstrap misconfiguration still fails loudly for GitOps. The
+    /// `RepositoryNotInitialized` sentinel never recycles either: while
+    /// `Degraded` the strict retry runs with auto-create forbidden, so that
+    /// verdict is how a *real* wipe escalates out of the retry loop to a
+    /// visible terminal `Failed` (see `health::breaker_verdict`). Exhaustive
+    /// over both the variants and `KopiaErrorClass` — no `_ =>` — so a new
+    /// class/variant must choose.
+    pub fn retryable_outage_for_bootstrapped(&self, bootstrapped: bool) -> bool {
+        match self {
+            BootstrapFailure::Backend { class, .. } => {
+                bootstrapped
+                    && match class {
+                        KopiaErrorClass::RepositoryUnavailable => true,
+                        KopiaErrorClass::AuthFailure
+                        | KopiaErrorClass::AccessDenied
+                        | KopiaErrorClass::PermissionDenied
+                        | KopiaErrorClass::NotFound
+                        | KopiaErrorClass::Locked
+                        | KopiaErrorClass::SourceError
+                        | KopiaErrorClass::Unknown => false,
+                    }
+            }
+            BootstrapFailure::JobFailedWithoutResult { .. }
+            | BootstrapFailure::RepositoryNotInitialized => false,
+        }
+    }
+
     /// The stable, actionable condition message (what failed / why / how to find
     /// the cause). Volatile-free so the guarded status write stays a no-op across
     /// repeated identical failures (no hot-loop — see [`crate::io::patch_status_if_changed`]).
