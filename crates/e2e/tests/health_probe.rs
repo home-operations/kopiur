@@ -1,11 +1,14 @@
-//! e2e: the opt-in backend health probe (`spec.health.probe`).
+//! e2e: the backend health probe (`spec.health.probe`, default-on since #345).
 //!
-//! Proves the headline behavior the feature exists for: after a `Repository` is
-//! `Ready`, WIPING its backend out-of-band makes the probe raise a
-//! `RepositoryVanished` alert — while the repository **stays `Ready`** (backups
-//! are never paused) and is **never auto-recreated** (the pinned `uniqueId` is
-//! unchanged and the backend stays empty). This is the data-safety invariant the
-//! whole design is built around.
+//! The wipe scenario proves the **`onFailure: Alert` opt-out contract**: after a
+//! `Repository` is `Ready`, WIPING its backend out-of-band makes the probe raise
+//! a `RepositoryVanished` alert — while the Alert-mode repository **stays
+//! `Ready`** and is **never auto-recreated** (the pinned `uniqueId` is unchanged
+//! and the backend stays empty). Never-recreate is the data-safety invariant the
+//! whole design is built around, and it holds under EITHER `onFailure` mode —
+//! under the default `Degrade` the same wipe instead opens the circuit breaker
+//! (`Degraded`, then terminal `Failed` once the strict re-check confirms the
+//! repository is gone); that arc is `crates/e2e/tests/repo_breaker.rs`.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -26,10 +29,15 @@ use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait, wait_until,
 };
 
-/// A `Repository` on a dedicated MinIO bucket with the health probe enabled at a
-/// fast cadence (`interval: 30s`, `failureThreshold: 1`) so the alert fires within
-/// the e2e timeout. `create.enabled: true` to prove Part A: even with create on,
-/// a once-`Ready` repo is NEVER recreated on a vanish.
+/// A `Repository` on a dedicated MinIO bucket with the health probe at a fast
+/// cadence (`interval: 30s`, `failureThreshold: 1`) so the alert fires within
+/// the e2e timeout, and `onFailure: Alert` — the wipe scenario tests the
+/// alert-only OPT-OUT (the default is the `Degrade` circuit breaker since #345;
+/// under it a wipe would escalate to terminal `Failed`, which
+/// `repo_breaker.rs` covers). The churn guards below replace the whole
+/// `health` block via [`churn_health_spec`], so this `onFailure` only shapes
+/// the wipe scenario. `create.enabled: true` to prove Part A: even with create
+/// on, a once-`Ready` repo is NEVER recreated on a vanish.
 fn probe_repository_json(name: &str, bucket: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
@@ -50,7 +58,12 @@ fn probe_repository_json(name: &str, bucket: &str) -> serde_json::Value {
             // The managed Maintenance is irrelevant here; keep the test focused.
             "maintenance": { "enabled": false },
             "health": {
-                "probe": { "enabled": true, "interval": "30s", "failureThreshold": 1 }
+                "probe": {
+                    "enabled": true,
+                    "interval": "30s",
+                    "failureThreshold": 1,
+                    "onFailure": "Alert"
+                }
             }
         }
     })
@@ -73,9 +86,13 @@ fn condition(status: &serde_json::Value, type_: &str, field: &str) -> Option<Str
         .map(str::to_string)
 }
 
+/// The `onFailure: Alert` opt-out: a wiped backend raises `RepositoryVanished`
+/// while the repository stays `Ready` (backups keep running) and is never
+/// auto-recreated. Under the default `Degrade` mode the same wipe opens the
+/// circuit breaker instead — see `repo_breaker.rs`.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
+async fn alert_mode_probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -181,7 +198,7 @@ async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
     assert_eq!(
         final_status.get("phase").and_then(|p| p.as_str()),
         Some("Ready"),
-        "phase must stay Ready (alert-only) — a vanish must not halt backups"
+        "phase must stay Ready under onFailure: Alert — the opt-out means a vanish never halts backups"
     );
     assert_eq!(
         final_status.get("uniqueId").and_then(|u| u.as_str()),

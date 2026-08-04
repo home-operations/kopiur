@@ -246,5 +246,6 @@ nav:
       - ADR-0004 — Breaking CRD & field renames: adr/0004-breaking-crd-and-field-renames.md
       - ADR-0005 — CRD feature improvements: adr/0005-crd-feature-improvements.md
       - ADR-0006 — Mass-deletion protection: adr/0006-mass-deletion-protection.md
+      - ADR-0007 — Repository circuit breaker: adr/0007-repository-circuit-breaker.md
       - ADR-0001 — onedr0p draft (superseded): adr/0001-onedr0p-kopia-operator.md
       - ADR-0002 — bo0tzz draft (superseded): adr/0002-bo0tzz-kopia-operator.md

@@ -235,6 +235,13 @@ jobs:
           - shard: apiserver-flap
             bins: "apiserver_flap"
             backends: false
+          # Repository circuit breaker (#345): patches the shared minio Service's
+          # selector to a non-matching label mid-test, taking the S3 backend down
+          # for the whole cluster until the scenario heals it — no other binary
+          # may race that outage, so this shard owns its cluster.
+          - shard: repo-breaker
+            bins: "repo_breaker"
+            backends: true
           # Namespaced install (installScope=namespaced, Role-only RBAC): the
           # operator must reconcile its release namespace (the pre-scoping
           # controller sat Ready-but-inert on 403'd cluster-wide watches) and
