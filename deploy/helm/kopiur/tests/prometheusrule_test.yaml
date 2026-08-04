@@ -26,3 +26,35 @@ tests:
       - matchRegex:
           path: spec.groups[0].rules[4].expr
           pattern: unless on \(namespace, policy\) \(min by \(namespace, policy\)
+  - it: ships a breaker-open alert keyed on the stable Degraded phase (#345)
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[9].alert
+          value: KopiurRepositoryBreakerOpen
+      - matchRegex:
+          path: spec.groups[0].rules[9].expr
+          pattern: max by \(kind, namespace, name\) \(kopiur_resource_phase\{kind=~"Repository\|ClusterRepository", phase="Degraded"\}\) == 1
+      - equal:
+          path: spec.groups[0].rules[9].for
+          value: 15m
+      - equal:
+          path: spec.groups[0].rules[9].labels.severity
+          value: warning
+  - it: ships a sustained parked-backups alert on the gated gauge (#345)
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[10].alert
+          value: KopiurSnapshotsGated
+      - matchRegex:
+          path: spec.groups[0].rules[10].expr
+          pattern: sum by \(namespace\) \(kopiur_snapshot_gated\) > 0
+      - equal:
+          path: spec.groups[0].rules[10].for
+          value: 30m
+      - equal:
+          path: spec.groups[0].rules[10].labels.severity
+          value: info

@@ -153,3 +153,58 @@ tests:
             exp_annotations:
               summary: "Snapshot apps/daily-y failed"
               description: "Snapshot apps/daily-y is Failed and its policy has not completed a newer successful backup."
+  # 7. Repository circuit breaker open (#345): the Degraded phase is STABLE while
+  #    the breaker is open (M4), so the series holds 1 continuously and `for: 15m`
+  #    completes. Before the window it is pending, not firing; after recovery
+  #    (store-backed phase series flips to Ready — the Degraded series VANISHES,
+  #    it is never a 0) the alert resolves.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_resource_phase{kind="Repository", namespace="apps", name="nas", phase="Degraded"}'
+        values: "1x59 stale"
+      - series: 'kopiur_resource_phase{kind="Repository", namespace="apps", name="nas", phase="Ready"}'
+        values: "_x60 1x60"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KopiurRepositoryBreakerOpen
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KopiurRepositoryBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              kind: Repository
+              namespace: apps
+              name: nas
+              severity: warning
+            exp_annotations:
+              summary: "Repository circuit breaker open for Repository apps/nas"
+              description: "The backend health probe kept failing past its threshold, so kopiur opened the circuit breaker: backups, maintenance, and replication against this repository are paused (Snapshots park Pending, they are not lost). Recovery is automatic once a connect succeeds — nothing needs restarting. Run `kubectl describe Repository nas` and check the BackendReachable condition for the cause."
+      - eval_time: 90m
+        alertname: KopiurRepositoryBreakerOpen
+        exp_alerts: []
+  # 8. Sustained parked backups (#345): kopiur_snapshot_gated is store-backed, so
+  #    a parked population is a present series > 0 and recovery removes the series
+  #    (never a lingering 0). Fires only after 30m of sustained parking; a brief
+  #    park never pages.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshot_gated{namespace="apps", policy="daily"}'
+        values: "2x59 stale"
+      - series: 'kopiur_snapshot_gated{namespace="apps", policy="hourly"}'
+        values: "1x59 stale"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KopiurSnapshotsGated
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: KopiurSnapshotsGated
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              severity: info
+            exp_annotations:
+              summary: "Backups in apps are parked behind a not-Ready repository"
+              description: "3 Snapshot(s) in apps have been held Pending for 30m because their repository is not Ready (see KopiurRepositoryBreakerOpen / the repository's BackendReachable condition). They will launch automatically once the repository recovers."
+      - eval_time: 90m
+        alertname: KopiurSnapshotsGated
+        exp_alerts: []
