@@ -2224,6 +2224,7 @@ mod bootstrap_outcomes {
             stderr_tail: None,
             exit_code: Some(1),
             retry_recommended: false,
+            op: None,
         });
         match bootstrap_outcome(Some(bad), false, "boot-x") {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
@@ -2281,6 +2282,7 @@ mod bootstrap_outcomes {
             stderr_tail: None,
             exit_code: Some(1),
             retry_recommended: false,
+            op: None,
         });
         match bootstrap_outcome(Some(bad), false, "boot-x") {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, .. }) => {

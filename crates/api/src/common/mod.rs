@@ -289,6 +289,14 @@ pub struct FailureBlock {
     pub exit_code: Option<i32>,
     /// Whether retrying the same operation unchanged could succeed.
     pub retry_recommended: bool,
+    /// The mover operation that failed, as a stable label (e.g.
+    /// `repository connect`, `snapshot create`) — the values of the mover's
+    /// `KopiaOp::as_str()`. Distinguishes a repository-level connect failure
+    /// from a source-level failure (a broken PVC), which share
+    /// `kopiaErrorClass` values (e.g. `NotFound`). Absent on failures that
+    /// occurred outside a kopia invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
 }
 
 /// CEL expressions evaluated at admission to derive consumer identity when a

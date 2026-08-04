@@ -1937,6 +1937,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `message` | string | **required** | A short human-readable message: what failed, why, and how to fix it. |
 | `retryRecommended` | boolean | **required** | Whether retrying the same operation unchanged could succeed. |
 | `exitCode` | integer | — | The process exit code, if one was reported. |
+| `op` | string | — | The mover operation that failed, as a stable label (e.g. `repository connect`, `snapshot create`) — the values of the mover's `KopiaOp::as_str()`. Distinguishes a repository-level connect failure from a source-level failure (a broken PVC), which share `kopiaErrorClass` values (e.g. `NotFound`). Absent on failures that occurred outside a kopia invocation. |
 | `stderrTail` | string | — | The last lines of kopia's stderr, if any were captured (bounded by `MAX_LOG_TAIL_BYTES`). |
 
 #### `status.hooks` { #snapshot-status-hooks }
@@ -2359,6 +2360,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `message` | string | **required** | A short human-readable message: what failed, why, and how to fix it. |
 | `retryRecommended` | boolean | **required** | Whether retrying the same operation unchanged could succeed. |
 | `exitCode` | integer | — | The process exit code, if one was reported. |
+| `op` | string | — | The mover operation that failed, as a stable label (e.g. `repository connect`, `snapshot create`) — the values of the mover's `KopiaOp::as_str()`. Distinguishes a repository-level connect failure from a source-level failure (a broken PVC), which share `kopiaErrorClass` values (e.g. `NotFound`). Absent on failures that occurred outside a kopia invocation. |
 | `stderrTail` | string | — | The last lines of kopia's stderr, if any were captured (bounded by `MAX_LOG_TAIL_BYTES`). |
 
 #### `status.progress` { #restore-status-progress }

@@ -29,7 +29,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
+use kopiur_api::common::{FailureBlock, NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
 use kopiur_api::snapshot::SnapshotPhase;
 use kopiur_api::{DeletionPolicy, Origin, Snapshot, SnapshotPolicy, SnapshotSchedule};
 
@@ -117,6 +117,52 @@ fn snapshot_stalled(backup: &Snapshot) -> bool {
             .iter()
             .any(|c| c.type_ == crate::consts::STALLED_CONDITION && c.status == "True")
     })
+}
+
+/// Whether a Snapshot's failure looks repository-shaped (the backend, not the
+/// source, is the likely culprit) — the gate for nudging the repository to
+/// re-probe. True when the failing op was the repository connect, or the
+/// error class is RepositoryUnavailable whatever the op. A source-level
+/// failure (bad PVC path → NotFound on `snapshot create`) must NOT nudge:
+/// the probe would succeed anyway, but the nudge churn is pointless (#345).
+///
+/// `None` (no `status.failure` at all — e.g. a controller-stamped
+/// `MoverJobFailed` where the mover never PATCHed a failure block) is
+/// fail-safe **true**: with no evidence the failure was source-level, still
+/// nudge — the nudge is cheap, rate-limited, and Ready-gated internally.
+pub(crate) fn repository_shaped_failure(failure: Option<&FailureBlock>) -> bool {
+    let Some(f) = failure else {
+        return true;
+    };
+    // Both comparisons reference the producing enums' stable labels
+    // (`kopiur_mover::error::KopiaOp::as_str`, `KopiaErrorClass::as_str`)
+    // rather than string literals, so a label rename breaks compilation here
+    // instead of silently disabling the gate.
+    f.op.as_deref() == Some(kopiur_mover::error::KopiaOp::RepositoryConnect.as_str())
+        || f.kopia_error_class == kopiur_kopia::KopiaErrorClass::RepositoryUnavailable.as_str()
+}
+
+/// The heal message for a mover-stamped terminal failure. Derived ONLY from
+/// `status.failure` fields (op + class — never timestamps or stderr), so
+/// repeated reconciles of the same outcome produce a byte-identical message
+/// and the `patch_status_if_changed` guard stays a true no-op.
+fn mover_failed_message(failure: Option<&FailureBlock>) -> String {
+    match failure {
+        Some(f) => {
+            let class = &f.kopia_error_class;
+            match f.op.as_deref() {
+                Some(op) => format!(
+                    "the backup failed ({op}, {class}): see status.failure and the mover \
+                     Job/pod logs"
+                ),
+                None => format!(
+                    "the backup failed ({class}): see status.failure and the mover \
+                     Job/pod logs"
+                ),
+            }
+        }
+        None => "the backup failed; see status.failure and the mover Job/pod logs".to_string(),
+    }
 }
 
 /// `Origin::Discovered` steady-state pin: catalog rows, not runs — never spawn a
@@ -364,6 +410,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // bounded duplicate count, never an under-count. The controller-stamped
             // paths count at their own write site instead.
             if !snapshot_stalled(backup) {
+                // The mover-written failure block (if any) drives both the heal
+                // message (byte-stable, derived only from op + class) and the
+                // repository-shaped gate on the reverify nudge below.
+                let failure = backup.status.as_ref().and_then(|s| s.failure.as_ref());
                 let current = serde_json::to_value(&backup.status).ok();
                 let wrote = io::patch_status_if_changed(
                     &api,
@@ -373,7 +423,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         backup,
                         SnapshotPhase::Failed,
                         "SnapshotFailed",
-                        "the backup failed; see status.failure and the mover Job/pod logs",
+                        &mover_failed_message(failure),
                     ),
                 )
                 .await?;
@@ -385,8 +435,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // away, but this branch never nudged — so an outage first surfaced
                     // by a mover-stamped failure didn't accelerate the repository's
                     // re-probe (#345). Guarded by `wrote` (once per terminal
-                    // transition), same best-effort semantics.
-                    nudge_repository_reverify(ctx, backup, &name, &namespace).await;
+                    // transition), same best-effort semantics — and gated on the
+                    // failure actually looking repository-shaped (a broken PVC's
+                    // NotFound on `snapshot create` proves nothing about the
+                    // backend, so nudging would be pointless churn).
+                    if repository_shaped_failure(failure) {
+                        nudge_repository_reverify(ctx, backup, &name, &namespace).await;
+                    }
                 }
             }
             // Reap any CSI staging objects the run created. The primary reap runs
@@ -516,7 +571,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // A failed backup may mean the backend went away: nudge the repository
                     // to re-probe now so the gate engages without waiting for the catalog
                     // refresh. Best-effort — a nudge error must not mask the failure above.
-                    nudge_repository_reverify(ctx, backup, &name, &namespace).await;
+                    // Gated on the failure looking repository-shaped; the mover wrote no
+                    // `Failed` phase here but may still have PATCHed a failure block
+                    // before the Job gave up, and an absent block is fail-safe true.
+                    if repository_shaped_failure(
+                        backup.status.as_ref().and_then(|s| s.failure.as_ref()),
+                    ) {
+                        nudge_repository_reverify(ctx, backup, &name, &namespace).await;
+                    }
                 }
                 // The run is terminal (the Job exhausted its retries) — reap any CSI
                 // staging objects. No-op for Direct.

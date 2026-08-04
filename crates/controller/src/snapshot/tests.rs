@@ -3462,3 +3462,107 @@ mod inherit_verdict_tests {
         assert!(v.message.contains("uid 1000") && v.message.contains("not tracking the workload"));
     }
 }
+
+// --- repository_shaped_failure: the gate on the terminal-failure reverify
+// nudge (#345). Truth table: only a repository-shaped failure (the connect op,
+// or a RepositoryUnavailable class whatever the op) — or NO failure block at
+// all (fail-safe) — may nudge; a source-level failure must not.
+
+mod repository_shaped_failure_gate {
+    use super::*;
+
+    fn fb(op: Option<&str>, class: &str) -> FailureBlock {
+        FailureBlock {
+            kopia_error_class: class.to_string(),
+            message: "boom".into(),
+            stderr_tail: None,
+            exit_code: Some(1),
+            retry_recommended: false,
+            op: op.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_failure_block_is_fail_safe_true() {
+        // A controller-stamped MoverJobFailed with no mover-written failure:
+        // no evidence it was source-level, so still nudge.
+        assert!(repository_shaped_failure(None));
+    }
+
+    #[test]
+    fn repository_connect_op_nudges_whatever_the_class() {
+        // The connect op is repository-level by definition — even a class the
+        // gate wouldn't otherwise care about (NotFound: missing repo path).
+        assert!(repository_shaped_failure(Some(&fb(
+            Some("repository connect"),
+            "NotFound"
+        ))));
+        assert!(repository_shaped_failure(Some(&fb(
+            Some("repository connect"),
+            "RepositoryUnavailable"
+        ))));
+    }
+
+    #[test]
+    fn repository_unavailable_class_nudges_whatever_the_op() {
+        // A backend that went away mid-backup surfaces on `snapshot create`.
+        assert!(repository_shaped_failure(Some(&fb(
+            Some("snapshot create"),
+            "RepositoryUnavailable"
+        ))));
+    }
+
+    #[test]
+    fn source_level_failures_do_not_nudge() {
+        // A broken PVC path (NotFound on `snapshot create`) proves nothing
+        // about the backend: the probe would succeed anyway (#345).
+        assert!(!repository_shaped_failure(Some(&fb(
+            Some("snapshot create"),
+            "NotFound"
+        ))));
+        assert!(!repository_shaped_failure(Some(&fb(
+            Some("snapshot create"),
+            "SourceError"
+        ))));
+    }
+
+    #[test]
+    fn gate_labels_match_the_producing_enums() {
+        // The gate compares against the enums' stable labels; pin the exact
+        // strings the mover persists so a label rename cannot silently
+        // decouple the gate from what lands in status.failure.
+        assert_eq!(
+            kopiur_mover::error::KopiaOp::RepositoryConnect.as_str(),
+            "repository connect"
+        );
+        assert_eq!(
+            kopiur_kopia::KopiaErrorClass::RepositoryUnavailable.as_str(),
+            "RepositoryUnavailable"
+        );
+    }
+
+    #[test]
+    fn mover_failed_message_is_byte_stable_and_names_op_and_class() {
+        // Derived only from status.failure fields — repeated reconciles of the
+        // same outcome must produce byte-identical text (no status churn).
+        let f = fb(Some("repository connect"), "RepositoryUnavailable");
+        let msg = mover_failed_message(Some(&f));
+        assert_eq!(
+            msg,
+            "the backup failed (repository connect, RepositoryUnavailable): see \
+             status.failure and the mover Job/pod logs"
+        );
+        assert_eq!(msg, mover_failed_message(Some(&f)), "must be deterministic");
+        // No op recorded (a non-kopia mover failure): class only.
+        let msg = mover_failed_message(Some(&fb(None, "Unknown")));
+        assert_eq!(
+            msg,
+            "the backup failed (Unknown): see status.failure and the mover Job/pod logs"
+        );
+        // No failure block at all: the original generic text.
+        assert_eq!(
+            mover_failed_message(None),
+            "the backup failed; see status.failure and the mover Job/pod logs"
+        );
+    }
+}

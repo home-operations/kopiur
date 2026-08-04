@@ -465,6 +465,11 @@ mod tests {
             assert!(!label.is_empty());
             assert!(seen.insert(label), "duplicate op label {label}");
         }
+        // Pin the EXACT connect label: it is persisted into
+        // `status.failure.op` and the controller's repository-shaped nudge
+        // gate compares against it (#345) — silent drift would also orphan the
+        // op values already written into existing CR statuses.
+        assert_eq!(KopiaOp::RepositoryConnect.as_str(), "repository connect");
     }
 
     #[test]

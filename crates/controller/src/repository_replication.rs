@@ -156,6 +156,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
                     Some("Failed"),
                 )
                 .await?;
+                nudge_repository_reverify(ctx, repl, &name, &namespace).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
             None => Ok(Action::requeue(REQUEUE_RUNNING)),
@@ -168,6 +169,32 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             tracing::info!(replication = %name, slot = %slot.to_rfc3339(), "spawned replication Job");
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
+    }
+}
+
+/// Best-effort nudge asking this replication's SOURCE repository to re-verify
+/// its backend now (rather than on the next catalog refresh). Called from the
+/// Job-failed arm unconditionally: the replication mover writes no
+/// `status.failure` block (condition-message-only), so there is no op/class to
+/// gate on — and the nudge is cheap, rate-limited (60s per repo), and
+/// Ready-gated inside `request_repository_reverify` (#345). Best-effort by
+/// contract: an error here is logged and swallowed — a nudge failure must
+/// never mask the replication failure that triggered it.
+async fn nudge_repository_reverify(
+    ctx: &Context,
+    repl: &RepositoryReplication,
+    name: &str,
+    namespace: &str,
+) {
+    if let Err(e) =
+        io::request_repository_reverify(&ctx.client, &repl.spec.source_ref, namespace, Utc::now())
+            .await
+    {
+        tracing::debug!(
+            replication = %name,
+            error = %e,
+            "repository reverify nudge failed (ignored)"
+        );
     }
 }
 

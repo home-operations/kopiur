@@ -1,6 +1,5 @@
 ---
 source: crates/xtask/tests/snapshots_test.rs
-assertion_line: 30
 expression: "body(&artifacts, \"snapshots\")"
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -194,6 +193,16 @@ spec:
                     type: string
                   message:
                     description: 'A short human-readable message: what failed, why, and how to fix it.'
+                    type: string
+                  op:
+                    description: |-
+                      The mover operation that failed, as a stable label (e.g.
+                      `repository connect`, `snapshot create`) — the values of the mover's
+                      `KopiaOp::as_str()`. Distinguishes a repository-level connect failure
+                      from a source-level failure (a broken PVC), which share
+                      `kopiaErrorClass` values (e.g. `NotFound`). Absent on failures that
+                      occurred outside a kopia invocation.
+                    nullable: true
                     type: string
                   retryRecommended:
                     description: Whether retrying the same operation unchanged could succeed.

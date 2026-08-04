@@ -118,6 +118,11 @@ pub fn failure_block_from_kopia(err: &KopiaError) -> FailureBlock {
         stderr_tail: err.stderr_tail().map(str::to_string),
         exit_code,
         retry_recommended: class.is_retryable(),
+        // No `KopiaOp` in scope here — the bare `KopiaError` carries only its
+        // raw argv string, not the mover's stable op label. Callers that know
+        // the op wrap the error in `MoverError::Kopia` first (see the
+        // `From<&MoverError>` impl below, which does populate `op`).
+        op: None,
     }
 }
 
@@ -130,8 +135,11 @@ impl From<&crate::error::MoverError> for FailureBlock {
     /// message.
     fn from(err: &crate::error::MoverError) -> Self {
         use crate::error::MoverError;
-        let (stderr_tail, exit_code) = match err {
-            MoverError::Kopia { source, .. } => (
+        // `op` is the stable label of the kopia invocation that failed
+        // ([`KopiaOp::as_str`](crate::error::KopiaOp::as_str)); everything
+        // else failed outside a kopia invocation, so there is no op to record.
+        let (stderr_tail, exit_code, op) = match err {
+            MoverError::Kopia { op, source } => (
                 source.stderr_tail().map(str::to_string),
                 match source {
                     KopiaError::NonZeroExit { code, .. } => *code,
@@ -140,6 +148,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     | KopiaError::EmptyOutput { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
+                Some(op.as_str().to_string()),
             ),
             MoverError::BootstrapFailed { .. }
             | MoverError::WorkSpecPathMissing
@@ -162,7 +171,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
             | MoverError::Telemetry(_)
-            | MoverError::BatchDeleteIncomplete { .. } => (None, None),
+            | MoverError::BatchDeleteIncomplete { .. } => (None, None, None),
         };
         FailureBlock {
             kopia_error_class: err.kopia_class().as_str().to_string(),
@@ -170,6 +179,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             stderr_tail,
             exit_code,
             retry_recommended: err.retry_recommended(),
+            op,
         }
     }
 }
@@ -955,6 +965,45 @@ mod tests {
         assert_eq!(wrapped.exit_code, bare.exit_code);
         assert_eq!(wrapped.retry_recommended, bare.retry_recommended);
         assert!(wrapped.message.starts_with("snapshot create failed"));
+        // The wrapper is the one place the op label is known — the bare kopia
+        // path has no KopiaOp in scope, so its block carries no op.
+        assert_eq!(wrapped.op.as_deref(), Some("snapshot create"));
+        assert_eq!(bare.op, None);
+    }
+
+    #[test]
+    fn failure_block_op_is_the_stable_kopia_op_label() {
+        // The controller's repository-shaped gate keys on the persisted op
+        // label (#345): a repository-connect failure must land as EXACTLY
+        // `repository connect` — the value of KopiaOp::as_str() — and its
+        // serialized field name must be the CRD's `op` (a drifting name is
+        // silently pruned by the API server).
+        use crate::error::{KopiaOp, MoverError};
+        let err = MoverError::Kopia {
+            op: KopiaOp::RepositoryConnect,
+            source: KopiaError::NonZeroExit {
+                args: "repository connect".into(),
+                code: Some(1),
+                class: KopiaErrorClass::RepositoryUnavailable,
+                stderr_tail: "dial tcp: connection refused".into(),
+            },
+        };
+        let fb = FailureBlock::from(&err);
+        assert_eq!(fb.op.as_deref(), Some("repository connect"));
+        let body = StatusUpdate::failed_mover(&err, ts()).as_patch_body();
+        assert_eq!(body["status"]["failure"]["op"], "repository connect");
+    }
+
+    #[test]
+    fn failure_block_from_non_kopia_mover_error_carries_no_op() {
+        // Failures outside a kopia invocation have no op to record — the field
+        // must stay absent (None serializes to nothing), never a bogus label.
+        use crate::error::MoverError;
+        let fb = FailureBlock::from(&MoverError::WorkSpecPathMissing);
+        assert_eq!(fb.op, None);
+        let body =
+            StatusUpdate::failed_mover(&MoverError::WorkSpecPathMissing, ts()).as_patch_body();
+        assert!(body["status"]["failure"].get("op").is_none());
     }
 
     #[test]

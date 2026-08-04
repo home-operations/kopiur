@@ -1199,3 +1199,44 @@ fn pvc_access_mode_legacy_value_decodes_to_unknown_and_roundtrips() {
     assert_eq!(m.mode_str(), "ReadWriteOnze");
     assert_eq!(serde_json::to_value(&m).unwrap(), "ReadWriteOnze");
 }
+
+#[test]
+fn failure_block_roundtrips_with_op_via_the_api_server_path() {
+    // YAML → JSON → typed (the cluster's decode path — never serde_yaml direct).
+    let fb: FailureBlock = crate::testutil::from_yaml(
+        r#"
+kopiaErrorClass: RepositoryUnavailable
+message: "repository connect failed"
+stderrTail: "dial tcp: connection refused"
+exitCode: 1
+retryRecommended: true
+op: repository connect
+"#,
+    );
+    assert_eq!(fb.kopia_error_class, "RepositoryUnavailable");
+    assert_eq!(fb.op.as_deref(), Some("repository connect"));
+    // Structural round-trip: serialize → reparse must be identical, and the
+    // wire field name must be the camelCase `op` the CRD schema declares.
+    let v = serde_json::to_value(&fb).unwrap();
+    assert_eq!(v["op"], "repository connect");
+    let back: FailureBlock = serde_json::from_value(v).unwrap();
+    assert_eq!(back, fb);
+}
+
+#[test]
+fn failure_block_op_absent_stays_none_and_is_omitted_when_none() {
+    // Every pre-M2 status block in the wild lacks `op`: it must decode to None
+    // (no default-materialized value) …
+    let fb: FailureBlock = crate::testutil::from_yaml(
+        r#"
+kopiaErrorClass: NotFound
+message: "no such file or directory"
+retryRecommended: false
+"#,
+    );
+    assert_eq!(fb.op, None);
+    // … and a None must serialize to NOTHING (skip_serializing_if), so a
+    // re-PATCH of an old block can never write an explicit null.
+    let v = serde_json::to_value(&fb).unwrap();
+    assert!(v.get("op").is_none(), "op: None must be omitted, got {v}");
+}
