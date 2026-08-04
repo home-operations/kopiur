@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.9.2](https://github.com/home-operations/kopiur/compare/0.9.1...0.9.2) (2026-08-02)
+
+
+### Features
+
+* **repository:** object-lock blob retention ([#332](https://github.com/home-operations/kopiur/issues/332)); fix blank volumeSnapshotClassName ([#344](https://github.com/home-operations/kopiur/issues/344)) ([dab8fdd](https://github.com/home-operations/kopiur/commit/dab8fdd84ca35514640a6c76eb473689d9a0c6b8))
+
+
+### Bug Fixes
+
+* **ci:** fail the merge gate on cancelled jobs, and cut e2e artifact time ([#330](https://github.com/home-operations/kopiur/issues/330)) ([1847a8a](https://github.com/home-operations/kopiur/commit/1847a8a61e050e44af6a574b10555a2b2df96cda))
+* **rust:** update crate time (0.3.54 → 0.3.55) ([#337](https://github.com/home-operations/kopiur/issues/337)) ([ee1b951](https://github.com/home-operations/kopiur/commit/ee1b951c12799f9b09f32ad0e26b8a707ca3fb48))
+
+
+### Continuous Integration
+
+* **github-action:** Update action docker/github-builder (v1.14.0 → v1.15.0) ([#327](https://github.com/home-operations/kopiur/issues/327)) ([f5514fc](https://github.com/home-operations/kopiur/commit/f5514fcb93b70a71e1a495d69fbcc4585e5cb7f6))
+* **github-action:** Update action docker/login-action (v4.5.1 → v4.5.2) ([#331](https://github.com/home-operations/kopiur/issues/331)) ([d90efdf](https://github.com/home-operations/kopiur/commit/d90efdfcefee8afe55ebcb7292952db4cdb995f0))
+* **github-action:** Update action docker/login-action (v4.5.2 → v4.6.0) ([#339](https://github.com/home-operations/kopiur/issues/339)) ([b783bcc](https://github.com/home-operations/kopiur/commit/b783bcc175d05ce225156aa36fedbf0c20a90db3))
+* **github-action:** Update action home-operations/.github/actions/workflow-lint (v1.0.2 → v1.0.3) ([#343](https://github.com/home-operations/kopiur/issues/343)) ([4af16d5](https://github.com/home-operations/kopiur/commit/4af16d5b3863fb97537840a74db14e504f960ec1))
+* update shared actions and use self-repository syntax ([#341](https://github.com/home-operations/kopiur/issues/341)) ([559e23f](https://github.com/home-operations/kopiur/commit/559e23f02e26895ed4f0d58346c9d19123824f42))
+
+
+### Miscellaneous Chores
+
+* **deps:** lock file maintenance (pep621) ([#334](https://github.com/home-operations/kopiur/issues/334)) ([e19ae0e](https://github.com/home-operations/kopiur/commit/e19ae0e65728496caa378e846fc7168b0c6a3198))
+* **mise:** Lock file maintenance tool (mise) ([#335](https://github.com/home-operations/kopiur/issues/335)) ([666afb5](https://github.com/home-operations/kopiur/commit/666afb5af1abe1f42b9f006c2c953bf67a5f5060))
+* **mise:** prune lockfile to used platforms ([#342](https://github.com/home-operations/kopiur/issues/342)) ([741d6a4](https://github.com/home-operations/kopiur/commit/741d6a4bf6dd7aba99f4b46178c4faf3643d4698))
+* **mise:** Update tool aqua:astral-sh/uv (0.12.0 → 0.12.1) ([#333](https://github.com/home-operations/kopiur/issues/333)) ([3ed2766](https://github.com/home-operations/kopiur/commit/3ed276634bac7609b7a2e04146912cbfff10942e))
+* **mise:** Update tool promtool (3.13.1 → 3.13.2) ([#329](https://github.com/home-operations/kopiur/issues/329)) ([ac1752e](https://github.com/home-operations/kopiur/commit/ac1752e296328fd41b178f76905930fd0b6b9258))
+* **mise:** Update tool zizmor (1.28.0 → 1.29.0) ([#340](https://github.com/home-operations/kopiur/issues/340)) ([410dc26](https://github.com/home-operations/kopiur/commit/410dc2671ddd46000cb17057460ca15f7c55ddce))
+* **release-please:** standardize the release pull request title pattern ([#338](https://github.com/home-operations/kopiur/issues/338)) ([21013a3](https://github.com/home-operations/kopiur/commit/21013a318c7ef16f0685798c12d6357e671a8ff2))
+* **rust:** lock file maintenance crate (cargo) ([#336](https://github.com/home-operations/kopiur/issues/336)) ([8606177](https://github.com/home-operations/kopiur/commit/8606177aa55ed4e46a87e238410f306120e60b92))
+
 ## [0.9.1](https://github.com/home-operations/kopiur/compare/0.9.0...0.9.1) (2026-07-29)
 
 
