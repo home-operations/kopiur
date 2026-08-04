@@ -16,6 +16,7 @@ use std::sync::Arc;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
+use kopiur_api::common::RepositoryRef;
 use kopiur_api::restore::ResolvedRestore;
 use kopiur_api::snapshot::Snapshot;
 use kopiur_api::{
@@ -231,6 +232,24 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             serde_json::json!({ "sourceKind": source_kind }),
         )
         .await?;
+    }
+
+    // Repository-readiness gate (the Restore peer of the Snapshot reconciler's,
+    // #345): don't act on a restore whose repository is not `Ready` (backend
+    // unreachable — the breaker is open). It runs HERE — after the terminal guard
+    // (so terminal restores are untouched) and BEFORE the resolution/`waitTimeout`
+    // machinery and any mover dispatch — because everything past this point either
+    // applies `onMissingSnapshot` once the wait window closes (for `fromPolicy`
+    // that defaults to `Continue`, which would provision an EMPTY volume off the
+    // back of an outage) or fans out a mover Job that can only fail
+    // `kopia repository connect` — and a Failed Restore is terminal (one-shot),
+    // so a transient outage would permanently fail it. A not-Ready repository
+    // therefore DEFERS (requeue); it never fakes a missing-snapshot outcome and
+    // never launches a doomed Job.
+    if let Some(action) =
+        gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await?
+    {
+        return Ok(action);
     }
 
     let on_missing = effective_on_missing(
@@ -3259,6 +3278,124 @@ async fn resolve_restore_repository(
          sources derive it; a raw identity has nothing to derive from)"
             .into(),
     ))
+}
+
+/// The [`RepositoryRef`] a restore's mover will connect to, plus the namespace the
+/// ref resolves relative to — WITHOUT resolving the repository object itself. The
+/// readiness gate's cheap peer of [`resolve_restore_repository`], sharing its
+/// derivation rule (explicit `spec.repository` wins; `snapshotRef`/`fromPolicy`
+/// derive from the referent; a raw `identity` source has nothing to derive from).
+///
+/// Returns `Ok(None)` whenever the ref cannot be determined: a missing
+/// `snapshotRef`/`fromPolicy` referent, a Snapshot with neither pin nor repository
+/// owner, or `identity` without the (required) explicit `spec.repository`.
+/// Deliberately NON-FATAL — a `snapshotRef` whose Snapshot CR does not exist yet is
+/// a supported shape (`resolve_snapshot` parks it on the `waitTimeout` window), so
+/// erroring here would break it; the other absences produce their canonical
+/// `MissingDependency`/`Validation` surfaces downstream. The gate simply does not
+/// engage until the repository is known.
+async fn restore_repository_ref(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+) -> Result<Option<(RepositoryRef, String)>> {
+    if let Some(rref) = &restore.spec.repository {
+        return Ok(Some((rref.clone(), namespace.to_string())));
+    }
+    match &restore.spec.source {
+        RestoreSource::SnapshotRef(sref) => {
+            // Resolved relative to the SNAPSHOT's namespace (an absent ref
+            // namespace means "same as the snapshot", not "same as the restore")
+            // — the same base `resolve_restore_repository` uses.
+            let snap_ns = sref.namespace.as_deref().unwrap_or(namespace);
+            let snap_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), snap_ns);
+            Ok(snap_api
+                .get_opt(&sref.name)
+                .await?
+                .as_ref()
+                .and_then(repository_ref_from_snapshot)
+                .map(|rref| (rref, snap_ns.to_string())))
+        }
+        RestoreSource::FromPolicy(c) => {
+            use kopiur_api::SnapshotPolicy;
+            let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
+            let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
+            Ok(cfg_api
+                .get_opt(&c.name)
+                .await?
+                .map(|cfg| (cfg.spec.repository.clone(), cfg_ns.to_string())))
+        }
+        RestoreSource::Identity(_) => Ok(None),
+    }
+}
+
+/// The Restore peer of the Snapshot reconciler's repository-readiness gate: hold a
+/// not-yet-launched restore in `Pending` (`Ready=False`/`RepositoryNotReady`,
+/// non-terminal) while its repository is not `Ready`, and requeue on the same 15s
+/// cadence. Returns `Some(requeue)` while gated, `None` to proceed.
+///
+/// Two semantic notes, both deliberate:
+/// - **`spec.mode: ReadOnly` is a different axis.** The Snapshot reconciler's mode
+///   gate refuses backups on a read-only repository and explicitly says "Restores
+///   remain allowed (the Restore reconciler does not gate on mode)" — that stays
+///   true; a read-only repo serves restores. Readiness (`status.phase == Ready`)
+///   is REACHABILITY: an unreachable backend fails restores exactly like backups,
+///   hence this gate.
+/// - **`waitTimeout` interaction.** The wait window is anchored at the Restore's
+///   creation as an ABSOLUTE deadline (see `resolve_snapshot` — spec'd so the
+///   in-Job wait is stable across pod retries), so wall-clock time parked on this
+///   gate DOES consume it. What running BEFORE the resolution machinery guarantees
+///   is that the window is only ever EVALUATED against a Ready repository: an
+///   outage can at worst make the post-recovery pass apply `onMissingSnapshot`
+///   immediately (window already elapsed); it can never fail the restore — or fake
+///   a `Continue` empty-volume outcome — while the repository is down.
+///
+/// Only a restore that has NOT launched its mover Job is gated
+/// ([`restore_awaiting_launch`]); a `Restoring` restore's live Job is tracked to
+/// terminal, never re-gated, mirroring the Snapshot reconciler's ordering. (Narrow
+/// crash window: a Job created moments before the controller died — before the
+/// `Restoring` patch landed — is re-gated as `Pending`/`Resolving`; harmless, the
+/// Job runs to terminal on its own and is observed once the gate opens.)
+async fn gate_on_repository_readiness(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<Action>> {
+    if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase)) {
+        return Ok(None);
+    }
+    let Some((rref, base_ns)) = restore_repository_ref(ctx, restore, namespace).await? else {
+        return Ok(None);
+    };
+    match io::repository_ready(&ctx.client, &rref, &base_ns).await {
+        Ok(true) => Ok(None),
+        Ok(false) => {
+            // patch-if-changed for byte-stability: the parked status is identical
+            // across the 15s requeues, so a re-park is a server-side no-op — no
+            // watch event, no self-trigger (the reconcile hot-loop rule).
+            let current = serde_json::to_value(&restore.status).ok();
+            io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                restore_ready_status(
+                    restore,
+                    RestorePhase::Pending,
+                    crate::consts::REPOSITORY_NOT_READY_REASON,
+                    &repository_not_ready_restore_message(&rref.name),
+                ),
+            )
+            .await?;
+            Ok(Some(Action::requeue(std::time::Duration::from_secs(15))))
+        }
+        // The repository OBJECT is missing (not merely unreachable): not this
+        // gate's call — fall through so the resolve/dispatch paths surface their
+        // canonical `MissingDependency` hold, exactly as before the gate existed.
+        Err(Error::MissingDependency(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Map a resolved repository backend to the mover connect spec for a restore.

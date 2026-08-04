@@ -107,6 +107,37 @@ fn wait_remaining_counts_down_from_creation_and_closes() {
 }
 
 #[test]
+fn readiness_gate_holds_only_pre_launch_phases() {
+    use RestorePhase::{Completed, Failed, Pending, Resolving, Restoring};
+    // Not yet launched (no status, Pending, or resolved-but-undispatched): the
+    // repository-readiness gate may hold these.
+    assert!(restore_awaiting_launch(None));
+    assert!(restore_awaiting_launch(Some(Pending)));
+    assert!(restore_awaiting_launch(Some(Resolving)));
+    // A live (or just-terminal) mover Job must be observed, never re-gated —
+    // and a populator's non-terminal `Completed` heartbeat must not be flipped
+    // back to `Pending`.
+    assert!(!restore_awaiting_launch(Some(Restoring)));
+    assert!(!restore_awaiting_launch(Some(Completed)));
+    assert!(!restore_awaiting_launch(Some(Failed)));
+}
+
+#[test]
+fn repository_not_ready_restore_message_says_what_why_how() {
+    let msg = repository_not_ready_restore_message("nas");
+    // What is being waited on, why, and that it self-resolves.
+    assert!(msg.contains("`nas`"));
+    assert!(msg.contains("`Ready`"));
+    assert!(msg.contains("restore"));
+    assert!(msg.contains("reconnect"));
+    // Mirrors the Snapshot gate's reason constant.
+    assert_eq!(
+        crate::consts::REPOSITORY_NOT_READY_REASON,
+        "RepositoryNotReady"
+    );
+}
+
+#[test]
 fn populator_state_depends_on_target_variant() {
     use kopiur_api::PopulatorTarget;
     use kopiur_api::common::ObjectRef;

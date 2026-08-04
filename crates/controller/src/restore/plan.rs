@@ -89,6 +89,33 @@ pub fn populator_needs_cluster_scope_message() -> String {
      installScope=cluster to use the populator."
         .to_string()
 }
+/// Whether a `Restore` in `phase` has NOT yet launched its mover Job — the set the
+/// repository-readiness gate may hold in `Pending` (mirrors the Snapshot
+/// reconciler's ordering, where a Job that already exists is tracked to terminal
+/// and never re-gated). `Restoring` means a Job is (or moments ago was) live and
+/// its outcome must be observed; `Completed`/`Failed` are settled (a populator's
+/// non-terminal `Completed` heartbeat must not be flipped back to `Pending` by the
+/// gate). Pure + exhaustive over [`RestorePhase`], so a new phase must decide its
+/// gate membership before it compiles.
+pub(super) fn restore_awaiting_launch(phase: Option<RestorePhase>) -> bool {
+    match phase {
+        None | Some(RestorePhase::Pending | RestorePhase::Resolving) => true,
+        Some(RestorePhase::Restoring | RestorePhase::Completed | RestorePhase::Failed) => false,
+    }
+}
+
+/// Message for a restore held in `Pending` because its repository is not `Ready`
+/// (backend unreachable). Mirrors the Snapshot reconciler's
+/// `repository_not_ready_message` wording (that helper is module-private to
+/// `snapshot` and backup-worded, so the restore carries its own). Pure so the
+/// text is unit-asserted.
+pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
+    format!(
+        "waiting for repository `{repo_name}` to become `Ready` before launching the restore \
+         (its backend is unreachable); the restore proceeds once the repository reconnects."
+    )
+}
+
 /// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
 /// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
 /// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
