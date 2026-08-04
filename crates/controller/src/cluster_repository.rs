@@ -1495,30 +1495,48 @@ async fn finalize_cluster_bootstrap(
         index_blob_event = upd.event;
         storage_stats["indexBlobCount"] = serde_json::json!(count);
     }
-    // A successful health probe: clear any prior failure debounce and stamp
-    // `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally — a probe run
-    // consumes its Job exactly once (deleted below), so this never re-runs.
+    // Unified success fold (#345): ANY successful finalize — probe or strict —
+    // is a fresh backend verdict, so fold probe-success health (stamp
+    // `lastProbeAt`/`lastHealthyAt`, clear the failure debounce, set
+    // `BackendReachable=True`) into the patch. CONDITIONALLY: this arm re-runs
+    // on every reconcile while the finished strict Job lingers (~1h TTL) and
+    // the guarded write below depends on the steady-state pass being a
+    // byte-stable no-op, so `health::success_fold` refuses when nothing would
+    // change (seeded, healthy, not a probe). The seed case stops
+    // `health_probe_due` (which fires on `lastProbeAt == None`) from launching
+    // a redundant probe Job fleet-wide right after the default-on upgrade; the
+    // heal case is what closes the breaker after a re-connect succeeds.
     let mut health_status = serde_json::Value::Null;
-    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned `uniqueId` so
-    // a backend re-initialized at the old location by another party (same password)
-    // can't silently overwrite it on a successful connect.
-    let mut pinned_unique_id: Option<String> = None;
-    if probe_run {
-        let now = chrono::Utc::now().to_rfc3339();
+    let existing_conditions = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(fold) = health::success_fold(
+        probe_run,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        health::backend_reachable_true(existing_conditions),
+        &now,
+    ) {
         let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
         conditions = upd.conditions;
         // Explicit-null patch so the merge clears the failure counters (a `None`
         // would be elided and leave the prior streak, re-firing on the next failure).
-        health_status = health::probe_success_health_patch(&now);
-        if let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
-            if result.unique_id.as_deref() != Some(pinned) {
-                tracing::warn!(
-                    repo = %name, pinned, observed = ?result.unique_id,
-                    "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
-                );
-            }
-            pinned_unique_id = Some(pinned.to_string());
+        health_status = fold.health_patch;
+    }
+    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned `uniqueId` so
+    // a backend re-initialized at the old location by another party (same password)
+    // can't silently overwrite it on a successful connect.
+    let mut pinned_unique_id: Option<String> = None;
+    if probe_run && let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
+        if result.unique_id.as_deref() != Some(pinned) {
+            tracing::warn!(
+                repo = %name, pinned, observed = ?result.unique_id,
+                "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+            );
         }
+        pinned_unique_id = Some(pinned.to_string());
     }
     // Non-blocking MassDeletionHeld condition from the live Snapshot store,
     // folded into the conditions array before the kstatus set_ready.

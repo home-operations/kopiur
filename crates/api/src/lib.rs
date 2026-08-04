@@ -50,7 +50,9 @@ pub use maintenance::{
     TakeoverPolicy, default_maintenance_schedule, kopia_lease_identity, kopia_owner_for_lease,
     lease_action, lease_held_by_other, managed_lease, parse_run_annotations,
 };
-pub use repository::{Repository, RepositoryPhase, RepositorySpec, RepositoryStatus};
+pub use repository::{
+    ProbeOnFailure, Repository, RepositoryPhase, RepositorySpec, RepositoryStatus,
+};
 pub use repository_replication::{
     RepositoryReplication, RepositoryReplicationPhase, RepositoryReplicationSpec,
     RepositoryReplicationStatus,

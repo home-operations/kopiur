@@ -372,8 +372,11 @@ pub struct RepositoryHealthSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_index_blob_warn_threshold")]
     pub index_blob_warn_threshold: Option<i64>,
-    /// Opt-in periodic backend health probe: re-connect a `Ready` repository on a
-    /// timer to confirm the kopia repository still exists at the backend.
+    /// Periodic backend health probe (on by default): re-connect the repository
+    /// on a timer to confirm the kopia repository still exists at the backend.
+    /// With the default `onFailure: Degrade` it doubles as the repository
+    /// circuit breaker — see `probe.onFailure`. Disable with
+    /// `probe.enabled: false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<RepositoryHealthProbeSpec>,
 }
@@ -388,38 +391,99 @@ fn default_index_blob_warn_threshold() -> Option<i64> {
     Some(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
 }
 
-/// Opt-in backend health probe, shared by `Repository` and `ClusterRepository`.
+/// Backend health probe, shared by `Repository` and `ClusterRepository`. On by
+/// default.
 ///
 /// Once a repository reaches `Ready`, the operator trusts that pinned status and
 /// — for object-store / volume-backed backends — never re-checks the backend on
 /// its steady-state heartbeat. If the kopia repository is wiped or becomes
-/// unreachable, nothing notices until a backup runs and fails. Enabling this
-/// probe re-connects the backend every [`interval`](Self::interval) and surfaces
-/// the result as a condition + Warning event (the repository **stays `Ready`** —
-/// this is alert-only; it never auto-recreates and never pauses backups).
+/// unreachable, nothing notices until a backup runs and fails. The probe
+/// re-connects the backend every [`interval`](Self::interval) and surfaces the
+/// result as the `BackendReachable` condition + a Warning event.
 ///
-/// **Alert-only by design.** A wiped repository and a transient outage look alike,
+/// What happens past [`failureThreshold`](Self::failure_threshold) consecutive
+/// failures depends on [`onFailure`](Self::on_failure): with the default
+/// `Degrade`, the repository moves to `Degraded` and backups, maintenance, and
+/// replication are **paused** until a re-connect succeeds (the repository
+/// circuit breaker); with `Alert`, the repository stays `Ready` and only the
+/// condition + event + metric fire.
+///
+/// **Never destructive.** A wiped repository and a transient outage look alike,
 /// and silently recreating an empty repository over a real one destroys
-/// restorability — so the probe only *reports*. Acting on the alert (a deliberate
-/// re-create) is a human decision.
+/// restorability — so the probe never auto-recreates. Acting on a
+/// `RepositoryVanished` alert (a deliberate re-create) is a human decision.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryHealthProbeSpec {
-    /// Turn the probe on. Off by default — existing repositories keep their
-    /// current behavior until a user opts in.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub enabled: bool,
+    /// Whether the probe runs (default `true`). `false` disables probing — and
+    /// with it the circuit breaker, since the probe is its only sensor: a wiped
+    /// or unreachable backend then goes unnoticed until the next backup fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_health_probe_enabled")]
+    pub enabled: Option<bool>,
     /// How often to re-probe the backend (Go-style duration like `30m` or `1h`;
-    /// minimum `30s`, default `30m`). Inert unless `enabled`.
+    /// minimum `30s`, default `30m`). Inert when `enabled: false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_health_probe_interval")]
     pub interval: Option<String>,
-    /// How many *consecutive* failing probes to require before raising the loud
-    /// condition + event (default `3`). Debounces a single transient blip from
-    /// alarming or nudging a destructive manual recreate. Any success resets it.
+    /// How many *consecutive* failing probes to require before the failure is
+    /// acted on (default `3`): the loud `BackendReachable=False` condition +
+    /// event fire, and — under `onFailure: Degrade` — the repository moves to
+    /// `Degraded`. Debounces a single transient blip from alarming, tripping
+    /// the breaker, or nudging a destructive manual recreate. Any success
+    /// resets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_health_probe_failure_threshold")]
     pub failure_threshold: Option<i64>,
+    /// What sustained probe failure (past `failureThreshold`) does to the
+    /// repository (default `Degrade`). `Degrade` moves it to `Degraded`,
+    /// pausing backups, maintenance, and replication until a re-connect
+    /// succeeds — recovery is automatic. `Alert` keeps the repository `Ready`
+    /// and only raises the condition + Warning event + metric (the pre-breaker
+    /// behavior); backups keep running against the failing backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_probe_on_failure")]
+    pub on_failure: Option<ProbeOnFailure>,
+}
+
+/// What sustained backend-probe failure (past `failureThreshold`) does to the
+/// repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
+/// backups, maintenance, and replication until a re-connect succeeds —
+/// recovery is automatic. `Alert` keeps the repository `Ready` and only raises
+/// the `BackendReachable` condition + Warning event + metric; backups keep
+/// running against the failing backend. Neither ever auto-recreates.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum ProbeOnFailure {
+    /// Past `failureThreshold` consecutive failing probes, move the repository
+    /// to `Degraded` and pause backups, maintenance, and replication until a
+    /// re-connect succeeds (the repository circuit breaker). Recovery is
+    /// automatic — any successful connect returns the repository to `Ready`.
+    #[default]
+    Degrade,
+    /// Alert-only: the repository stays `Ready` and only the `BackendReachable`
+    /// condition, a Warning event, and the failure metric are raised. Backups
+    /// keep running (and failing) against the unhealthy backend.
+    Alert,
+}
+
+/// schemars default for [`RepositoryHealthProbeSpec::enabled`] —
+/// [`DEFAULT_HEALTH_PROBE_ENABLED`](crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+/// (`true`, #345). Returns the field's `Option` type so schemars 1 emits the
+/// schema `default:`. Safe to materialize server-side because
+/// [`RepositoryHealthProbeSpec::enabled`] resolves an absent field to exactly
+/// this constant. Note the schema default only materializes when the
+/// `health.probe` object is *present*; the absent-parent case is resolved by
+/// the same `enabled()` seam, so the two paths agree.
+fn default_health_probe_enabled() -> Option<bool> {
+    Some(crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+}
+
+/// schemars default for [`RepositoryHealthProbeSpec::on_failure`] —
+/// [`ProbeOnFailure::Degrade`], matching `effective_on_failure`'s absent →
+/// `Degrade` resolution. Returns the field's `Option` type so schemars 1 emits
+/// the schema `default:` (`"Degrade"` on the wire).
+fn default_probe_on_failure() -> Option<ProbeOnFailure> {
+    Some(ProbeOnFailure::Degrade)
 }
 
 /// schemars default for [`RepositoryHealthProbeSpec::interval`] — the string
@@ -439,12 +503,31 @@ fn default_health_probe_failure_threshold() -> Option<i64> {
 }
 
 impl RepositoryHealthProbeSpec {
-    /// Whether the backend health probe is opted in (`spec.health.probe.enabled`).
-    /// Off by default, so an existing `Ready` repository keeps its behavior.
+    /// Whether the backend health probe runs (`spec.health.probe.enabled`).
+    ///
+    /// **This resolver is the load-bearing default (#345), not the CRD schema
+    /// `default:`** — a nested schema default only materializes when its parent
+    /// object is present, and most specs omit `spec.health`/`probe` entirely.
+    /// Absent spec/probe/field ⇒
+    /// [`DEFAULT_HEALTH_PROBE_ENABLED`](crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+    /// (`true`); an explicit `Some(v)` ⇒ `v`. Every caller resolves through this
+    /// single seam, so `enabled: false` is the one way to opt out.
     pub fn enabled(health: Option<&RepositoryHealthSpec>) -> bool {
         health
             .and_then(|h| h.probe.as_ref())
-            .is_some_and(|p| p.enabled)
+            .and_then(|p| p.enabled)
+            .unwrap_or(crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+    }
+
+    /// The effective `onFailure` policy: `spec.health.probe.onFailure` when set,
+    /// else [`ProbeOnFailure::Degrade`] — the circuit breaker is the default,
+    /// matching the schema `default:` (which only materializes when the `probe`
+    /// object is present; this resolver covers the absent-parent case).
+    pub fn effective_on_failure(health: Option<&RepositoryHealthSpec>) -> ProbeOnFailure {
+        health
+            .and_then(|h| h.probe.as_ref())
+            .and_then(|p| p.on_failure)
+            .unwrap_or_default()
     }
 
     /// The effective probe cadence used **when the probe is enabled**:
@@ -510,7 +593,11 @@ pub enum RepositoryPhase {
     Initializing,
     /// Connected and healthy.
     Ready,
-    /// Reachable, but a sub-operation (e.g. maintenance) is failing; see conditions.
+    /// Temporarily not fully operational, and self-healing: a retryable
+    /// bootstrap/connect failure is being retried, or the backend health probe
+    /// exceeded its `failureThreshold` (the circuit breaker is open — backups,
+    /// maintenance, and replication are paused until a re-connect succeeds).
+    /// See the `BackendReachable` and `Ready` conditions for the cause.
     Degraded,
     /// Connect/create failed; see conditions for the actionable reason.
     Failed,
@@ -695,12 +782,22 @@ mod tests {
             serde_json::json!(1000)
         );
         assert_eq!(
+            spec["properties"]["health"]["properties"]["probe"]["properties"]["enabled"]["default"],
+            serde_json::json!(crate::consts::DEFAULT_HEALTH_PROBE_ENABLED),
+            "the probe must be default-ON in the schema (#345)"
+        );
+        assert_eq!(
             spec["properties"]["health"]["properties"]["probe"]["properties"]["interval"]["default"],
             serde_json::json!("30m")
         );
         assert_eq!(
             spec["properties"]["health"]["properties"]["probe"]["properties"]["failureThreshold"]["default"],
             serde_json::json!(3)
+        );
+        assert_eq!(
+            spec["properties"]["health"]["properties"]["probe"]["properties"]["onFailure"]["default"],
+            serde_json::json!("Degrade"),
+            "the breaker (Degrade) must be the schema default for onFailure (#345)"
         );
         assert_eq!(
             spec["properties"]["catalog"]["properties"]["refreshInterval"]["default"],
@@ -732,6 +829,11 @@ mod tests {
             default_index_blob_warn_threshold(),
             Some(crate::consts::DEFAULT_INDEX_BLOB_WARN_THRESHOLD)
         );
+        assert_eq!(
+            default_health_probe_enabled(),
+            Some(crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+        );
+        assert_eq!(default_probe_on_failure(), Some(ProbeOnFailure::Degrade));
     }
 
     #[test]
@@ -1087,8 +1189,11 @@ health:
         use crate::consts::{
             DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD, DEFAULT_HEALTH_PROBE_INTERVAL,
         };
-        // Absent spec / absent probe ⇒ disabled, defaults.
-        assert!(!RepositoryHealthProbeSpec::enabled(None));
+        // Absent spec / absent probe ⇒ ENABLED (#345: the probe is default-on;
+        // this resolver — not the nested schema default, which cannot fire when
+        // the parent object is absent — is the load-bearing default), with the
+        // interval/threshold defaults.
+        assert!(RepositoryHealthProbeSpec::enabled(None));
         assert_eq!(
             RepositoryHealthProbeSpec::effective_interval(None),
             DEFAULT_HEALTH_PROBE_INTERVAL
@@ -1096,6 +1201,23 @@ health:
         assert_eq!(
             RepositoryHealthProbeSpec::effective_failure_threshold(None),
             DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD
+        );
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_on_failure(None),
+            ProbeOnFailure::Degrade,
+            "absent onFailure must resolve to the breaker default"
+        );
+
+        // A present-but-empty probe object resolves identically (the `Option`
+        // layers must agree with the absent-parent path).
+        let empty = RepositoryHealthSpec {
+            probe: Some(RepositoryHealthProbeSpec::default()),
+            ..Default::default()
+        };
+        assert!(RepositoryHealthProbeSpec::enabled(Some(&empty)));
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_on_failure(Some(&empty)),
+            ProbeOnFailure::Degrade
         );
 
         // Parses Go-duration string from the wire, NOT a {secs,nanos} object.
@@ -1113,19 +1235,103 @@ health:
             RepositoryHealthProbeSpec::effective_failure_threshold(spec.health.as_ref()),
             5
         );
-        // `enabled: false` is skip-serialized (no stored-object churn).
+
+        // An explicit `enabled: false` is THE opt-out: it resolves false and
+        // SURVIVES serialization (an Option<bool> elides only None — eliding
+        // false would silently re-enable the probe on the next round-trip).
         let disabled: RepositorySpec = from_yaml(
             "backend: { filesystem: { path: /repo } }\n\
              encryption: { passwordSecretRef: { name: s } }\n\
-             health:\n  probe:\n    interval: 1h\n",
+             health:\n  probe:\n    enabled: false\n    interval: 1h\n",
         );
         assert!(!RepositoryHealthProbeSpec::enabled(
             disabled.health.as_ref()
         ));
         let json = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(
+            json["health"]["probe"]["enabled"],
+            serde_json::json!(false),
+            "enabled: false must survive serialization"
+        );
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(disabled, reparsed);
+        assert!(!RepositoryHealthProbeSpec::enabled(
+            reparsed.health.as_ref()
+        ));
+
+        // Absent `enabled` inside a present probe stays None and is elided.
+        let tuned_only: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    interval: 1h\n",
+        );
+        assert!(RepositoryHealthProbeSpec::enabled(
+            tuned_only.health.as_ref()
+        ));
         assert!(
-            json["health"]["probe"].get("enabled").is_none(),
-            "enabled: false must be elided"
+            serde_json::to_value(&tuned_only).unwrap()["health"]["probe"]
+                .get("enabled")
+                .is_none(),
+            "absent enabled must be elided (no stored-object churn)"
+        );
+    }
+
+    #[test]
+    fn probe_on_failure_round_trips_and_rejects_unknown_variants() {
+        // Explicit `Alert` parses the cluster's way and round-trips as a string.
+        let alert: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    onFailure: Alert\n",
+        );
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_on_failure(alert.health.as_ref()),
+            ProbeOnFailure::Alert
+        );
+        let json = serde_json::to_value(&alert).unwrap();
+        assert_eq!(json["health"]["probe"]["onFailure"], "Alert");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(alert, reparsed);
+
+        // Explicit `Degrade` round-trips too.
+        let degrade: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    onFailure: Degrade\n",
+        );
+        assert_eq!(
+            serde_json::to_value(&degrade).unwrap()["health"]["probe"]["onFailure"],
+            "Degrade"
+        );
+
+        // Absent onFailure stays None (elided; the resolver supplies Degrade).
+        let absent: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    enabled: true\n",
+        );
+        assert!(
+            serde_json::to_value(&absent).unwrap()["health"]["probe"]
+                .get("onFailure")
+                .is_none(),
+            "absent onFailure must be elided"
+        );
+        assert_eq!(
+            RepositoryHealthProbeSpec::effective_on_failure(absent.health.as_ref()),
+            ProbeOnFailure::Degrade
+        );
+
+        // Unknown variant is rejected at decode (the closed enum IS the
+        // validator; the CRD schema enforces the same set at admission).
+        let v: serde_json::Value = serde_yaml::from_str(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             health:\n  probe:\n    onFailure: Recreate\n",
+        )
+        .unwrap();
+        assert!(
+            serde_json::from_value::<RepositorySpec>(v).is_err(),
+            "unknown onFailure variant must be rejected"
         );
     }
 

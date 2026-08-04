@@ -1,17 +1,26 @@
-# Example 27 — Opt-in backend health probe (detect a wiped/unreachable repository)
+# Example 27 — Backend health probe (default-ON) and the repository circuit breaker
 #
-# Once a Repository reaches `Ready`, an object-store / volume-backed backend is
-# NOT re-checked on the steady-state heartbeat — so a repository that is wiped or
-# becomes unreachable between backups goes unnoticed until the next backup fails.
-# `spec.health.probe` opts that Repository into a periodic backend re-connect.
+# Without a probe, an object-store / volume-backed backend is NOT re-checked on
+# the steady-state heartbeat once a Repository reaches `Ready` — a repository
+# that is wiped or becomes unreachable between backups would go unnoticed until
+# the next backup fails. So the probe is ON BY DEFAULT: every Repository
+# re-connects its backend periodically (default every 30m). You only write
+# `spec.health.probe` to TUNE it or to OPT OUT.
 #
-# It is ALERT-ONLY by design:
-#   * the Repository stays `Ready` (backups & replication keep running) — the
-#     result surfaces as the `BackendReachable` condition + a Warning Event +
-#     the `kopiur_repository_health_probe_failures` metric;
-#   * kopiur NEVER auto-recreates a once-`Ready` repository — a wipe and a
-#     transient outage look alike, and recreating an empty repo over a real one
-#     destroys restorability. Re-creating is always a deliberate human action.
+# What sustained failure does is `probe.onFailure`:
+#   * Degrade (the default) — past `failureThreshold` consecutive failures the
+#     Repository moves to `Degraded` and backups, maintenance, and replication
+#     are PAUSED until a re-connect succeeds (the circuit breaker; recovery is
+#     automatic). Better one missed backup window than a stream of failing Jobs
+#     against a dead backend.
+#   * Alert — the Repository stays `Ready` and only the `BackendReachable`
+#     condition + a Warning Event + the
+#     `kopiur_repository_health_probe_failures` metric fire; backups keep
+#     running (and failing) against the unhealthy backend.
+#
+# Under EITHER policy kopiur NEVER auto-recreates a once-`Ready` repository — a
+# wipe and a transient outage look alike, and recreating an empty repo over a
+# real one destroys restorability. Re-creating is always a deliberate human action.
 #
 # Two distinct alerts are raised (after the debounce):
 #   * RepositoryVanished   — backend reachable, but the kopia repository is gone.
@@ -56,15 +65,24 @@ spec:
     # it does not act (the data-safety invariant).
     enabled: true
   # --8<-- [start:health]
+  # The probe runs by default — `spec.health.probe` is only needed to tune it
+  # or opt out. Everything below shows the defaults plus the two opt-outs.
   health:
-    # Opt-in backend health probe. Off by default; everything below is inert
-    # until `enabled: true`.
     probe:
+      # Default true. `false` disables probing entirely — and with it the
+      # circuit breaker, since the probe is its only sensor: a wiped or
+      # unreachable backend then goes unnoticed until the next backup fails.
       enabled: true
       # How often to re-connect the backend (Go-style duration; min 30s, default 30m).
       interval: 30m
-      # Consecutive failing probes required before the alert fires (default 3).
-      # Debounces a single transient blip (an S3 list-after-delete race, a NAS
-      # reboot) from alarming or nudging a destructive manual recreate.
+      # Consecutive failing probes required before the failure is acted on
+      # (default 3). Debounces a single transient blip (an S3 list-after-delete
+      # race, a NAS reboot) from alarming, tripping the breaker, or nudging a
+      # destructive manual recreate.
       failureThreshold: 3
+      # What sustained failure does (default Degrade — the circuit breaker:
+      # phase `Degraded`, backups paused, auto-resumes on re-connect). Set
+      # `Alert` to keep the pre-breaker alert-only behavior: the Repository
+      # stays `Ready` and backups keep running against the failing backend.
+      onFailure: Degrade
   # --8<-- [end:health]

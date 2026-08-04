@@ -1546,29 +1546,46 @@ async fn finalize_bootstrap(
         // Merge-patch: setting storageStats.indexBlobCount preserves snapshotCount.
         status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
     }
-    // A successful health probe: clear any prior `BackendReachable=False`/failure
-    // debounce and stamp `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally
-    // here because a probe run consumes its Job exactly once (deleted below), so this
-    // never re-runs on the same result — no status churn.
-    if probe_run {
-        let now = chrono::Utc::now().to_rfc3339();
+    // Unified success fold (#345): ANY successful finalize — probe or strict —
+    // is a fresh backend verdict, so fold probe-success health (stamp
+    // `lastProbeAt`/`lastHealthyAt`, clear the failure debounce, set
+    // `BackendReachable=True`) into the patch. CONDITIONALLY: this arm re-runs
+    // on every reconcile while the finished strict Job lingers (~1h TTL) and
+    // the guarded write below depends on the steady-state pass being a
+    // byte-stable no-op, so `health::success_fold` refuses when nothing would
+    // change (seeded, healthy, not a probe). The seed case stops
+    // `health_probe_due` (which fires on `lastProbeAt == None`) from launching
+    // a redundant probe Job fleet-wide right after the default-on upgrade; the
+    // heal case is what closes the breaker after a re-connect succeeds.
+    let existing_conditions = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(fold) = health::success_fold(
+        probe_run,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        health::backend_reachable_true(existing_conditions),
+        &now,
+    ) {
         let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
         conditions = upd.conditions;
         // Explicit-null patch so the merge clears the failure counters (a `None`
         // would be elided and leave the prior streak, re-firing on the next failure).
-        status_patch["health"] = health::probe_success_health_patch(&now);
-        // Part A invariant: a probe NEVER rebinds identity. Keep the pinned
-        // `uniqueId` so a backend re-initialized at the old location by another party
-        // (same password) can't silently overwrite `status.uniqueId` on connect.
-        if let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
-            if result.unique_id.as_deref() != Some(pinned) {
-                tracing::warn!(
-                    repo = %name, pinned, observed = ?result.unique_id,
-                    "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
-                );
-            }
-            status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
+        status_patch["health"] = fold.health_patch;
+    }
+    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned
+    // `uniqueId` so a backend re-initialized at the old location by another party
+    // (same password) can't silently overwrite `status.uniqueId` on connect.
+    if probe_run && let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
+        if result.unique_id.as_deref() != Some(pinned) {
+            tracing::warn!(
+                repo = %name, pinned, observed = ?result.unique_id,
+                "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+            );
         }
+        status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
     }
     // Non-blocking MassDeletionHeld condition from the live Snapshot store
     // (mirrors IndexBlobHealth), folded into the same conditions array before the

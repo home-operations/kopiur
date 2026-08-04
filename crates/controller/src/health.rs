@@ -179,12 +179,15 @@ pub fn reconcile_index_blob_health(
 }
 
 // ---------------------------------------------------------------------------
-// Backend health probe (`spec.health.probe`) — opt-in, alert-only.
+// Backend health probe (`spec.health.probe`) — default-on since #345.
 //
-// Part A (always-on safety invariant) + Part B (the opt-in periodic probe).
-// Both keep the repository `Ready`: a vanished/unreachable backend is surfaced
-// as the `BackendReachable` condition + a Warning event, NEVER a phase flip
-// (which would halt backups/replication) and NEVER an auto-recreate.
+// Part A (always-on safety invariant) + Part B (the periodic probe).
+// A vanished/unreachable backend is surfaced as the `BackendReachable`
+// condition + a Warning event; what happens past `failureThreshold` is the
+// spec's `onFailure` policy (default `Degrade` — the circuit breaker moves the
+// repository to `Degraded` and pauses backups until a re-connect succeeds;
+// `Alert` keeps the pre-#345 alert-only contract). NEVER an auto-recreate,
+// under either policy.
 // ---------------------------------------------------------------------------
 
 /// **Part A — the data-safety invariant.** kopiur auto-creates a kopia
@@ -470,6 +473,101 @@ pub fn probe_attempt_health_patch(launched_at: Option<&str>) -> serde_json::Valu
             Some(now) => serde_json::Value::String(now.to_string()),
             None => serde_json::Value::Null,
         },
+    })
+}
+
+/// Whether the repository's `BackendReachable` condition is currently `True`.
+/// An absent condition reads as *not* True — the unified success fold then
+/// writes it once (converging to True), so absence never persists past one
+/// successful finalize.
+pub fn backend_reachable_true(conditions: &[Condition]) -> bool {
+    conditions
+        .iter()
+        .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+        .is_some_and(|c| c.status == "True")
+}
+
+/// Why [`success_fold`] decided a successful bootstrap finalize must write
+/// probe-health state. A closed enum so tests (and log lines) can name the
+/// exact trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessFoldReason {
+    /// This finalize is a probe run's own result. Always written — a probe
+    /// consumes (deletes) its Job exactly once, so this can never re-run on the
+    /// same result.
+    Probe,
+    /// First successful strict finalize with no `lastProbeAt` on record: seed
+    /// the stamp so `health_probe_due` (which fires when `lastProbeAt` is
+    /// `None`) does not launch a redundant probe Job fleet-wide right after the
+    /// default-on upgrade — the strict connect that just succeeded IS a fresh
+    /// backend verdict.
+    Seed,
+    /// A failure streak is recorded (or the `BackendReachable` condition is not
+    /// `True`): any successful strict connect is proof the backend is healthy
+    /// again, so heal the stale state. This is what closes the breaker after a
+    /// `Degraded` repository re-connects (M4).
+    Heal,
+}
+
+/// The pieces a successful finalize folds into its status patch when
+/// [`success_fold`] says a write is warranted.
+pub struct SuccessFold {
+    /// Why the write is happening (probe result / seeding / healing).
+    pub reason: SuccessFoldReason,
+    /// The `status.health` merge-patch fragment — [`probe_success_health_patch`],
+    /// which stamps `lastProbeAt`/`lastHealthyAt` and emits the explicit RFC 7386
+    /// nulls that clear the failure debounce and retire `probeAttemptAt`.
+    pub health_patch: serde_json::Value,
+}
+
+/// Decide whether a **successful** bootstrap finalize (probe or strict) should
+/// fold probe-success health state into its status patch — and refuse when it
+/// would change nothing.
+///
+/// **The refusal is the load-bearing part.** The strict-bootstrap success arm
+/// re-runs on EVERY reconcile while the finished bootstrap Job lingers (~1h
+/// TTL), and its status write is guarded by `patch_status_if_changed`: the
+/// steady-state pass must be a byte-stable no-op or the write bumps
+/// `resourceVersion`, re-triggers the reconciler through its own primary
+/// watch, and hot-loops. A naive "stamp `lastProbeAt: now` on every success"
+/// would differ on every pass. So the fold fires only when:
+///
+/// * `probe_run` — a probe's own result; safe to stamp unconditionally because
+///   the probe deletes its Job after finalizing (once-only), or
+/// * `lastProbeAt` was never stamped — one-time seeding (see
+///   [`SuccessFoldReason::Seed`]), or
+/// * a failure streak / non-`True` `BackendReachable` needs healing (see
+///   [`SuccessFoldReason::Heal`]).
+///
+/// In the steady state (strict re-read, seeded, healthy) it returns `None` and
+/// the fold contributes NOTHING to the patch.
+pub fn success_fold(
+    probe_run: bool,
+    health: Option<&RepositoryHealthStatus>,
+    backend_reachable_true: bool,
+    now: &str,
+) -> Option<SuccessFold> {
+    let reason = if probe_run {
+        SuccessFoldReason::Probe
+    } else if health.and_then(|h| h.last_probe_at.as_deref()).is_none() {
+        SuccessFoldReason::Seed
+    } else if health
+        .and_then(|h| h.consecutive_probe_failures)
+        .unwrap_or(0)
+        > 0
+        || health.and_then(|h| h.first_failure_at.as_deref()).is_some()
+        || !backend_reachable_true
+    {
+        SuccessFoldReason::Heal
+    } else {
+        // Steady state: healthy, seeded, not a probe. Writing anything here
+        // (even an identical value with a fresh timestamp) defeats the
+        // byte-stable no-op the finalize arm depends on.
+        return None;
+    };
+    Some(SuccessFold {
+        reason,
+        health_patch: probe_success_health_patch(now),
     })
 }
 
@@ -1226,6 +1324,119 @@ mod tests {
         assert_eq!(upd.health.first_failure_at, None);
         assert_eq!(upd.health.last_healthy_at.as_deref(), Some(now.as_str()));
         assert!(upd.event.is_none());
+    }
+
+    // ---- #345 M3: the unified success fold --------------------------------
+
+    /// A fully-seeded, healthy `status.health` — the steady state.
+    fn seeded_healthy() -> RepositoryHealthStatus {
+        RepositoryHealthStatus {
+            last_probe_at: Some(t(100).to_rfc3339()),
+            last_healthy_at: Some(t(100).to_rfc3339()),
+            consecutive_probe_failures: None,
+            first_failure_at: None,
+            probe_attempt_at: None,
+        }
+    }
+
+    #[test]
+    fn success_fold_truth_table() {
+        let now = t(200).to_rfc3339();
+
+        // Probe run → always folds (the probe deletes its Job, so once-only).
+        let probe = success_fold(true, Some(&seeded_healthy()), true, &now).expect("probe folds");
+        assert_eq!(probe.reason, SuccessFoldReason::Probe);
+
+        // Strict + lastProbeAt None (fresh repo or pre-#345 upgrade) → seed, so
+        // health_probe_due does not fire a redundant probe Job fleet-wide.
+        let seed = success_fold(false, None, false, &now).expect("seeding folds");
+        assert_eq!(seed.reason, SuccessFoldReason::Seed);
+        let seed2 = success_fold(false, Some(&RepositoryHealthStatus::default()), false, &now)
+            .expect("empty health seeds too");
+        assert_eq!(seed2.reason, SuccessFoldReason::Seed);
+
+        // Strict + a recorded failing streak → heal (clears the streak; this is
+        // what closes the breaker on a successful re-connect in M4).
+        let heal = success_fold(false, Some(&health_with_failures(2)), false, &now)
+            .expect("a failing streak heals");
+        assert_eq!(heal.reason, SuccessFoldReason::Heal);
+
+        // Strict + firstFailureAt lingering (streak count already cleared) → heal.
+        let lingering = RepositoryHealthStatus {
+            first_failure_at: Some(t(80).to_rfc3339()),
+            ..seeded_healthy()
+        };
+        assert_eq!(
+            success_fold(false, Some(&lingering), true, &now)
+                .expect("lingering firstFailureAt heals")
+                .reason,
+            SuccessFoldReason::Heal
+        );
+
+        // Strict + seeded + healthy counters but BackendReachable not True
+        // (stale False, or the condition is absent) → heal the condition.
+        assert_eq!(
+            success_fold(false, Some(&seeded_healthy()), false, &now)
+                .expect("a non-True BackendReachable heals")
+                .reason,
+            SuccessFoldReason::Heal
+        );
+
+        // THE no-op case: strict + seeded + healthy + condition True → None.
+        // This is what keeps the lingering-Job re-read byte-stable (no hot loop).
+        assert!(
+            success_fold(false, Some(&seeded_healthy()), true, &now).is_none(),
+            "the steady-state pass must contribute NOTHING to the status patch"
+        );
+    }
+
+    #[test]
+    fn success_fold_converges_after_one_write() {
+        // Apply a Seed write's effect (lastProbeAt stamped, condition True) and
+        // assert the next lingering-Job re-read folds nothing — the whole point
+        // of the conditional fold is that pass 2..N are byte-stable no-ops.
+        let now = t(200).to_rfc3339();
+        let fold = success_fold(false, None, false, &now).expect("pass 1 seeds");
+        assert_eq!(fold.reason, SuccessFoldReason::Seed);
+        let after = RepositoryHealthStatus {
+            last_probe_at: Some(now.clone()),
+            last_healthy_at: Some(now.clone()),
+            consecutive_probe_failures: None,
+            first_failure_at: None,
+            probe_attempt_at: None,
+        };
+        assert!(
+            success_fold(false, Some(&after), true, &t(210).to_rfc3339()).is_none(),
+            "pass 2 must be a no-op"
+        );
+    }
+
+    #[test]
+    fn success_fold_patch_reuses_the_explicit_null_clears() {
+        // The fold's patch must be probe_success_health_patch's shape: a heal
+        // that omitted the RFC 7386 nulls would leave the failing streak in the
+        // stored object and re-fire the loud alert on the next single failure.
+        let now = t(200).to_rfc3339();
+        let fold = success_fold(false, Some(&health_with_failures(3)), false, &now).unwrap();
+        assert_eq!(fold.health_patch, probe_success_health_patch(&now));
+        assert!(fold.health_patch["consecutiveProbeFailures"].is_null());
+        assert!(fold.health_patch["firstFailureAt"].is_null());
+        assert!(fold.health_patch["probeAttemptAt"].is_null());
+    }
+
+    #[test]
+    fn backend_reachable_true_reads_only_the_true_state() {
+        assert!(!backend_reachable_true(&[]), "absent is not True");
+        assert!(!backend_reachable_true(&[reachable_cond(
+            "False",
+            REPOSITORY_VANISHED_REASON
+        )]));
+        assert!(backend_reachable_true(&[reachable_cond(
+            "True",
+            BACKEND_REACHABLE_REASON
+        )]));
+        // Other condition types are ignored.
+        assert!(!backend_reachable_true(&[cond("True")]));
     }
 
     #[test]

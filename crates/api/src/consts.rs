@@ -179,10 +179,18 @@ pub const DEFAULT_CATALOG_REFRESH_INTERVAL: std::time::Duration =
 /// this is Job churn with no operational value.
 pub const MIN_CATALOG_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Default `spec.health.probe.interval` when unset: how often an opt-in backend
+/// Default `spec.health.probe.enabled` when unset: the periodic backend health
+/// probe is ON by default (#345). The probe is the sensor for the repository
+/// circuit breaker — with the default `onFailure: Degrade`, a sustained backend
+/// failure moves the repository to `Degraded` and pauses backups until a
+/// re-connect succeeds — so it must run unless the user explicitly opts out with
+/// `enabled: false`. Part of the documented API contract, so it lives here, not
+/// in the controller.
+pub const DEFAULT_HEALTH_PROBE_ENABLED: bool = true;
+
+/// Default `spec.health.probe.interval` when unset: how often the backend
 /// health probe re-connects a `Ready` repository to confirm the kopia repository
-/// still exists at the backend. Off by default; only meaningful once
-/// `spec.health.probe.enabled: true`. Conservative — a vanished/unreachable
+/// still exists at the backend. Conservative — a vanished/unreachable
 /// repository is rare and the probe runs a short mover Job — so it leans long.
 /// Part of the documented API contract, so it lives here, not in the controller.
 pub const DEFAULT_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -195,9 +203,11 @@ pub const MIN_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::
 
 /// Default `spec.health.probe.failureThreshold`: how many *consecutive* failing
 /// probes must accumulate before the loud `RepositoryVanished` / `BackendReachable=False`
-/// condition is raised and an event fired. Debounces a single transient blip
-/// (an S3 list-after-delete race, a NAS reboot, a credential-rotation moment)
-/// from alarming on-call or nudging a destructive manual recreate.
+/// condition is raised, an event fired, and — under the default
+/// `onFailure: Degrade` — the repository moved to `Degraded` (pausing backups).
+/// Debounces a single transient blip (an S3 list-after-delete race, a NAS
+/// reboot, a credential-rotation moment) from alarming on-call, tripping the
+/// breaker, or nudging a destructive manual recreate.
 pub const DEFAULT_HEALTH_PROBE_FAILURE_THRESHOLD: i64 = 3;
 
 /// Default `SnapshotSchedule.spec.failedJobsHistoryLimit` when unset: how many
