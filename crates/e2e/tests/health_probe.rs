@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
 
 use kopiur_api::{ClusterRepository, Repository};
@@ -335,8 +335,13 @@ async fn assert_probe_finalizes_without_churn(
 
     // ... and it must be a probe that actually RAN, not a probe switched off. Both of
     // these are written only by the finalize path, which is unreachable on buggy code.
+    // Wait specifically for a POST-Ready stamp: since #345 M3 the bootstrap
+    // success SEEDS `lastProbeAt` (so a fresh repo doesn't probe immediately),
+    // and the caller backdates that seed to arm the timer — both of those
+    // values predate `ready_at`, so "first value present" would read the seed,
+    // not the probe. Only a probe that connected after Ready satisfies this.
     let probed_at = wait_until(
-        "status.health.lastProbeAt is stamped",
+        "status.health.lastProbeAt is stamped by a post-Ready probe",
         default_timeout(),
         poll_interval(),
         || async {
@@ -344,17 +349,16 @@ async fn assert_probe_finalizes_without_churn(
                 .await
                 .pointer("/health/lastProbeAt")
                 .and_then(|v| v.as_str())
-                .map(str::to_string))
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .filter(|d| *d >= ready_at))
         },
     )
     .await
     .expect(
-        "a probe must FINALIZE and stamp status.health.lastProbeAt — it is the only input \
-         to the probe timer, so an unstamped probe re-fires forever (#273)",
+        "a probe must FINALIZE and stamp status.health.lastProbeAt past Ready — it is the \
+         only input to the probe timer, so an unstamped probe re-fires forever (#273)",
     );
-    let probed_at = chrono::DateTime::parse_from_rfc3339(&probed_at)
-        .expect("lastProbeAt is RFC 3339")
-        .with_timezone(&chrono::Utc);
     assert!(
         probed_at >= ready_at,
         "lastProbeAt {probed_at} predates Ready ({ready_at}) — that is the initial \
@@ -416,6 +420,25 @@ async fn probe_finalizes_instead_of_recreating_the_bootstrap_job() {
     .await
     .expect("repository becomes Ready");
     let ready_at = chrono::Utc::now();
+
+    // #345 M3 seeds `lastProbeAt` at bootstrap success, so a freshly-Ready
+    // repository deliberately does NOT probe immediately (no fleet-wide
+    // probe-Job storm at upgrade) — but this guard needs a probe to actually
+    // run inside CHURN_WINDOW. Backdate the seed past the 10m interval so the
+    // timer is due NOW; the probe must then launch, finalize, and re-stamp a
+    // post-Ready `lastProbeAt` (the #273 contract this test pins).
+    let backdated =
+        (ready_at - chrono::Duration::seconds(CHURN_PROBE_INTERVAL_SECS as i64 + 60)).to_rfc3339();
+    repos
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "status": { "health": { "lastProbeAt": backdated } } }),
+            ),
+        )
+        .await
+        .expect("backdate the seeded lastProbeAt to arm the probe timer");
 
     assert_probe_finalizes_without_churn(&jobs, &job_name, ready_at, async || {
         status_value(&repos.get(name).await.expect("get Repository"))
@@ -493,6 +516,21 @@ async fn cluster_repository_probe_finalizes_instead_of_recreating_the_bootstrap_
     .await
     .expect("cluster repository becomes Ready");
     let ready_at = chrono::Utc::now();
+
+    // Same seed-backdating as the namespaced twin: arm the probe timer so a
+    // probe actually runs inside CHURN_WINDOW (see the comment there).
+    let backdated =
+        (ready_at - chrono::Duration::seconds(CHURN_PROBE_INTERVAL_SECS as i64 + 60)).to_rfc3339();
+    repos
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "status": { "health": { "lastProbeAt": backdated } } }),
+            ),
+        )
+        .await
+        .expect("backdate the seeded lastProbeAt to arm the probe timer");
 
     assert_probe_finalizes_without_churn(&jobs, &job_name, ready_at, async || {
         cluster_status_value(&repos.get(name).await.expect("get ClusterRepository"))
