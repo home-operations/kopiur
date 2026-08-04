@@ -380,6 +380,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 if wrote {
                     ctx.metrics
                         .inc_snapshot_completed("failed", &namespace, backup_policy(backup));
+                    // Mirror the controller-stamped branch's reverify nudge: a
+                    // mover-stamped Failed is just as likely to mean the backend went
+                    // away, but this branch never nudged — so an outage first surfaced
+                    // by a mover-stamped failure didn't accelerate the repository's
+                    // re-probe (#345). Guarded by `wrote` (once per terminal
+                    // transition), same best-effort semantics.
+                    nudge_repository_reverify(ctx, backup, &name, &namespace).await;
                 }
             }
             // Reap any CSI staging objects the run created. The primary reap runs
@@ -509,21 +516,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // A failed backup may mean the backend went away: nudge the repository
                     // to re-probe now so the gate engages without waiting for the catalog
                     // refresh. Best-effort — a nudge error must not mask the failure above.
-                    if let Some(repo_ref) = backup
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.resolved.as_ref())
-                        .and_then(|r| r.repository.as_ref())
-                        && let Err(e) = io::request_repository_reverify(
-                            &ctx.client,
-                            repo_ref,
-                            &namespace,
-                            chrono::Utc::now(),
-                        )
-                        .await
-                    {
-                        tracing::debug!(backup = %name, error = %e, "repository reverify nudge failed (ignored)");
-                    }
+                    nudge_repository_reverify(ctx, backup, &name, &namespace).await;
                 }
                 // The run is terminal (the Job exhausted its retries) — reap any CSI
                 // staging objects. No-op for Direct.
@@ -1510,6 +1503,30 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     tracing::info!(backup = %name, "created mover Job for backup");
 
     Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+/// Best-effort nudge asking this backup's pinned repository to re-verify its
+/// backend now (rather than on the next catalog refresh). Called from BOTH
+/// terminal-failure stamp sites — controller-stamped `MoverJobFailed` and the
+/// mover-stamped `Failed` heal — so an outage accelerates the repository
+/// re-probe regardless of who stamped the phase (#345). Best-effort by
+/// contract: `request_repository_reverify` is rate-limited (60s per repo) and
+/// an error here is logged and swallowed — a nudge failure must never mask the
+/// backup failure that triggered it.
+async fn nudge_repository_reverify(ctx: &Context, backup: &Snapshot, name: &str, namespace: &str) {
+    let Some(repo_ref) = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved.as_ref())
+        .and_then(|r| r.repository.as_ref())
+    else {
+        return;
+    };
+    if let Err(e) =
+        io::request_repository_reverify(&ctx.client, repo_ref, namespace, chrono::Utc::now()).await
+    {
+        tracing::debug!(backup = %name, error = %e, "repository reverify nudge failed (ignored)");
+    }
 }
 
 /// Fetch the Snapshot's recipe and run its `afterSnapshot` hooks exactly once,

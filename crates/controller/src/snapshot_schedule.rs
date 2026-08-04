@@ -200,24 +200,60 @@ pub fn concurrency_allows(policy: ConcurrencyPolicy, run_active: bool) -> bool {
     }
 }
 
-/// Whether the schedule should produce any `Snapshot` at all right now, combining
-/// `suspend`, the slot being due, the deadline, and concurrency. Pure decision.
+/// The three-way outcome for a pinned slot. An exhaustive `match` on this is what
+/// keeps the reconciler honest: the old boolean `should_create_backup` collapsed
+/// "expired past `startingDeadlineSeconds`" into "don't fire", and the caller's
+/// wait branch then computed `(slot - now)` for a PAST slot — a 1-second requeue
+/// loop, forever, with `nextSchedule` stuck on the expired slot (#345 / M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotDisposition {
+    /// The slot is due and may fire now.
+    Fire,
+    /// The slot is due but expired past `startingDeadlineSeconds`: skip it and
+    /// re-pin `nextSchedule` forward (mirrors CronJob missed-slot semantics).
+    /// Deadline expiry deliberately wins over `Forbid`+active: a slot a long
+    /// run pushed past its deadline is skipped, not queued.
+    SkipExpired,
+    /// Not due yet, suspended, or held by `concurrencyPolicy: Forbid` — keep the
+    /// pin and wait. A `Forbid`-held due slot (no deadline) stays pinned and
+    /// fires when the active run finishes: the one-shot catch-up.
+    Wait,
+}
+
+/// What to do with the pinned slot right now, combining `suspend`, the slot being
+/// due, the deadline, and concurrency. Pure decision.
+pub fn slot_disposition(
+    schedule: &ScheduleSpec,
+    slot: DateTime<Utc>,
+    now: DateTime<Utc>,
+    run_active: bool,
+) -> SlotDisposition {
+    if schedule.suspend {
+        return SlotDisposition::Wait;
+    }
+    if !should_fire_now(slot, now) {
+        return SlotDisposition::Wait;
+    }
+    if missed_deadline(slot, now, schedule.starting_deadline_seconds) {
+        return SlotDisposition::SkipExpired;
+    }
+    if concurrency_allows(schedule.concurrency_policy, run_active) {
+        SlotDisposition::Fire
+    } else {
+        SlotDisposition::Wait
+    }
+}
+
+/// Whether the schedule should produce any `Snapshot` at all right now. Thin
+/// boolean view over [`slot_disposition`] (kept for call sites and tests that
+/// only care about the fire decision).
 pub fn should_create_backup(
     schedule: &ScheduleSpec,
     slot: DateTime<Utc>,
     now: DateTime<Utc>,
     run_active: bool,
 ) -> bool {
-    if schedule.suspend {
-        return false;
-    }
-    if !should_fire_now(slot, now) {
-        return false;
-    }
-    if missed_deadline(slot, now, schedule.starting_deadline_seconds) {
-        return false;
-    }
-    concurrency_allows(schedule.concurrency_policy, run_active)
+    slot_disposition(schedule, slot, now, run_active) == SlotDisposition::Fire
 }
 
 /// Whether a `SnapshotPolicy` with the given `labels` matches a `policySelector`
@@ -454,7 +490,46 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         }
         // Is a run currently active (an unfinished Snapshot owned by this schedule)?
         let run_active = active_run_exists(ctx, &namespace, &sched_name).await?;
-        if should_create_backup(&schedule.spec.schedule, slot, now, run_active) {
+        let disposition = slot_disposition(&schedule.spec.schedule, slot, now, run_active);
+        // A slot expired past `startingDeadlineSeconds` must re-pin forward, or the
+        // wait branch below computes `(slot - now)` for a past instant and requeues
+        // at the 1s floor forever with the pin stuck on the expired slot. Skip it
+        // (CronJob missed-slot semantics), record the skip as a Normal event, and
+        // pin the next upcoming slot.
+        if disposition == SlotDisposition::SkipExpired {
+            let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
+            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            io::patch_status(
+                &api,
+                &sched_name,
+                serde_json::json!({
+                    "nextSchedule": { "at": next.to_rfc3339(), "timezone": tz.name() },
+                    "observedGeneration": generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+            io::publish_normal_event(
+                ctx,
+                schedule,
+                "MissedSchedule",
+                "SkipExpiredSlot",
+                &format!(
+                    "slot {} expired past startingDeadlineSeconds ({}s) and was skipped; next slot pinned at {}",
+                    slot.to_rfc3339(),
+                    schedule.spec.schedule.starting_deadline_seconds.unwrap_or(0),
+                    next.to_rfc3339(),
+                ),
+            )
+            .await;
+            tracing::info!(
+                schedule = %sched_name, slot = %slot.to_rfc3339(), next = %next.to_rfc3339(),
+                "skipped an expired slot (startingDeadlineSeconds); re-pinned forward"
+            );
+            let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
+            return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
+        }
+        if disposition == SlotDisposition::Fire {
             // Fire one Snapshot per resolved policy (single policyRef, or each
             // policySelector match — ADR-0005 §10). The single-ref form keeps the
             // slot-stamped name for lastSchedule.snapshotRef.
@@ -1056,6 +1131,70 @@ mod tests {
             concurrency_policy: policy,
             starting_deadline_seconds: deadline,
         }
+    }
+
+    #[test]
+    fn slot_disposition_truth_table() {
+        use ConcurrencyPolicy::{Allow, Forbid};
+        let spec =
+            |suspend, policy, deadline| schedule_spec("0 3 * * *", suspend, policy, deadline);
+        let slot = at(2026, 8, 4, 3, 0);
+        let before = at(2026, 8, 4, 2, 59);
+        let soon_after = at(2026, 8, 4, 3, 5); // 300s past the slot
+        let long_after = at(2026, 8, 4, 4, 0); // 3600s past the slot
+
+        // Not yet due → Wait.
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, None), slot, before, false),
+            SlotDisposition::Wait
+        );
+        // Due, no deadline → Fire (this is also the fire-once-on-recovery path:
+        // a stale pin from an outage window fires exactly once).
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, None), slot, long_after, false),
+            SlotDisposition::Fire
+        );
+        // Suspended → Wait, even when due (and even when expired: the pin is
+        // frozen while suspended; unsuspending an expired slot skips it below).
+        assert_eq!(
+            slot_disposition(&spec(true, Forbid, Some(600)), slot, long_after, false),
+            SlotDisposition::Wait
+        );
+        // Forbid + active run → Wait: the pinned slot is the single catch-up.
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, None), slot, soon_after, true),
+            SlotDisposition::Wait
+        );
+        // Allow + active run → Fire (declared overlap contract).
+        assert_eq!(
+            slot_disposition(&spec(false, Allow, None), slot, soon_after, true),
+            SlotDisposition::Fire
+        );
+        // Within the deadline → still fires.
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, Some(600)), slot, soon_after, false),
+            SlotDisposition::Fire
+        );
+        // Expired past the deadline → SkipExpired (the #345 M1 regression: the
+        // old boolean collapsed this into "don't fire", and the caller then
+        // waited on a PAST slot at a 1s requeue floor forever).
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, Some(600)), slot, long_after, false),
+            SlotDisposition::SkipExpired
+        );
+        // Deadline expiry wins over Forbid+active: a slot a long run pushed past
+        // its deadline is skipped, not queued behind the run.
+        assert_eq!(
+            slot_disposition(&spec(false, Forbid, Some(600)), slot, long_after, true),
+            SlotDisposition::SkipExpired
+        );
+        // The boolean view never fires an expired slot.
+        assert!(!should_create_backup(
+            &spec(false, Forbid, Some(600)),
+            slot,
+            long_after,
+            false
+        ));
     }
 
     #[test]
