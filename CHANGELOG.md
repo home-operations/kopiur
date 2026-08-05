@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.3](https://github.com/home-operations/kopiur/compare/0.9.2...0.9.3) (2026-08-05)
+
+
+### Features
+
+* repository-level circuit breaker — stop fanning out doomed Jobs when the backend is unreachable ([#350](https://github.com/home-operations/kopiur/issues/350)) ([5d787b9](https://github.com/home-operations/kopiur/commit/5d787b98eb606ed8410f57db26cfc1004cd35ce9))
+
+
+### Bug Fixes
+
+* **rust:** update crate base64 (0.23.0 → 0.23.1) ([#349](https://github.com/home-operations/kopiur/issues/349)) ([11e7aa8](https://github.com/home-operations/kopiur/commit/11e7aa83b324418102537e0f7355aafff4063abb))
+
+
+### Continuous Integration
+
+* **github-action:** Update action jdx/mise-action (v4.2.3 → v4.2.4) ([#347](https://github.com/home-operations/kopiur/issues/347)) ([1c9cf3b](https://github.com/home-operations/kopiur/commit/1c9cf3b5b31690792bd0e0ff645c2607c7dfaec2))
+
+
+### Miscellaneous Chores
+
+* **renovate:** keep 0.x minors out of automerge ([#352](https://github.com/home-operations/kopiur/issues/352)) ([95d672a](https://github.com/home-operations/kopiur/commit/95d672af7d97a0b1b539610c208a316316b77e0a))
+
 ## [0.9.2](https://github.com/home-operations/kopiur/compare/0.9.1...0.9.2) (2026-08-02)
 
 
