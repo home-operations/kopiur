@@ -1522,7 +1522,15 @@ fn parse_unix_seconds(ts: &str) -> Option<i64> {
 /// unix seconds, but only when `phase == Succeeded`. `None` otherwise.
 fn snapshot_success_unix(s: &Snapshot) -> Option<i64> {
     let status = s.status.as_ref()?;
-    if status.phase != Some(SnapshotPhase::Succeeded) {
+    // `Unchanged` counts. It means the source WAS read and hashed and is
+    // protected — by the previous snapshot rather than a new one. Gating on
+    // `Succeeded` alone freezes this timestamp for any policy with
+    // `ignoreIdenticalSnapshots` over static data, and `KopiurBackupStale`
+    // then pages for the healthy case (#351).
+    if !matches!(
+        status.phase,
+        Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged)
+    ) {
         return None;
     }
     status
@@ -1560,6 +1568,13 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
         let Some(status) = s.status.as_ref() else {
             continue;
         };
+        // Succeeded ONLY, unlike `snapshot_success_unix` above — and the
+        // difference is deliberate. These gauges report the size, duration and
+        // file count of a snapshot; an `Unchanged` run has none of those,
+        // because it produced no manifest. Letting it win "latest" would blank
+        // out the size/duration/file series for a policy whose data simply
+        // stopped changing. The last snapshot that actually exists stays the
+        // one described here; liveness is the other function's job.
         if status.phase != Some(SnapshotPhase::Succeeded) {
             continue;
         }
@@ -1628,7 +1643,11 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
             continue;
         };
         let healthy = match s.status.as_ref().and_then(|st| st.phase) {
-            Some(SnapshotPhase::Succeeded) => true,
+            // `Unchanged` is a healthy terminal outcome. Skipping it (the old
+            // `_ => continue`) would leave the LAST FAILED run as the winning
+            // observation forever, pinning the policy unhealthy and making
+            // `KopiurSnapshotFailed`'s recovery gate unable to ever clear.
+            Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged) => true,
             Some(SnapshotPhase::Failed) => false,
             // Non-terminal / Discovered / Deleting never define "last backup".
             _ => continue,
@@ -1866,6 +1885,15 @@ mod tests {
         .expect("valid Snapshot")
     }
 
+    /// What the mover writes for a deduped run: terminal, with real timing from
+    /// its own clock, but NO `snapshot` and NO `stats` — it owns no manifest.
+    fn unchanged_status(end_time: &str) -> serde_json::Value {
+        serde_json::json!({
+            "phase": "Unchanged",
+            "timing": { "endTime": end_time, "durationSeconds": 2 },
+        })
+    }
+
     /// A Succeeded status with stats + timing.
     fn succeeded_status(size: i64, dur: i64, end_time: &str) -> serde_json::Value {
         serde_json::json!({
@@ -2048,6 +2076,71 @@ mod tests {
     /// A live Succeeded Snapshot emits exactly one phase line (value 1,
     /// phase="Succeeded", policy=…), never a 0-valued phase series, plus the stat
     /// series carrying the policy label.
+    #[test]
+    fn unchanged_advances_last_success_but_not_the_size_gauges() {
+        // #351, and the single most user-visible half of it: without this the
+        // last-success timestamp freezes and `KopiurBackupStale` pages for a
+        // source that simply is not changing.
+        let dedup = snapshot_cr(
+            "ns",
+            "b2",
+            Some("p"),
+            unchanged_status("2026-08-05T02:00:00Z"),
+        );
+        assert!(
+            snapshot_success_unix(&dedup).is_some(),
+            "an Unchanged run must advance the last-backup-success timestamp"
+        );
+
+        // But it must NOT win `latest_per_policy`, which drives the size /
+        // duration / file gauges: it has no stats, so letting it win would blank
+        // those series out for a healthy policy.
+        let real = snapshot_cr(
+            "ns",
+            "b1",
+            Some("p"),
+            succeeded_status(4096, 7, "2026-08-05T01:00:00Z"),
+        );
+        let latest = latest_per_policy(&[Arc::new(real), Arc::new(dedup)]);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            latest[0].size_bytes,
+            Some(4096),
+            "the size gauge must keep describing the last snapshot that exists"
+        );
+    }
+
+    #[test]
+    fn unchanged_keeps_the_policy_healthy() {
+        // Skipping Unchanged here (the old `_ => continue`) left the last FAILED
+        // run as the winning terminal observation forever, so the policy stayed
+        // pinned unhealthy and `KopiurSnapshotFailed`'s recovery gate could never
+        // clear.
+        let failed = snapshot_cr(
+            "ns",
+            "older",
+            Some("p"),
+            serde_json::json!({ "phase": "Failed" }),
+        );
+        let mut dedup = snapshot_cr(
+            "ns",
+            "newer",
+            Some("p"),
+            unchanged_status("2026-08-05T02:00:00Z"),
+        );
+        // `policy_backup_health` picks the winner by creationTimestamp.
+        dedup.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        let health = policy_backup_health(&[Arc::new(failed), Arc::new(dedup)]);
+        assert_eq!(health.len(), 1);
+        assert!(
+            health[0].healthy,
+            "a policy whose newest terminal run is Unchanged is healthy"
+        );
+    }
+
     #[test]
     fn succeeded_snapshot_emits_single_active_phase_and_stats() {
         let m = Metrics::new();

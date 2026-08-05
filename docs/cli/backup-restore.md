@@ -10,7 +10,9 @@ Run a SnapshotPolicy immediately: the plugin creates a manual `Snapshot` CR
 (the same thing a `SnapshotSchedule` does on a cron slot, labeled
 `origin: manual`) and, with `--wait`, follows it to its terminal phase —
 exit 0 on `Succeeded` with a one-line stats summary, exit 1 on `Failed` with
-the failure class, kopia stderr tail, and log tail on stderr.
+the failure class, kopia stderr tail, and log tail on stderr. `Unchanged`
+(nothing had changed, so kopia created no new snapshot) is also exit 0, with a
+line saying so instead of the stats — it is a successful run, not a failure.
 
 ```console
 $ kubectl kopiur snapshot now --policy nightly -n media --tag reason=pre-upgrade --wait

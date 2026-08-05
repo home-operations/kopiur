@@ -76,7 +76,11 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
 pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapshot>>> {
     match snapshot.status.as_ref().and_then(|s| s.phase)? {
         SnapshotPhase::Pending | SnapshotPhase::Running => None,
-        SnapshotPhase::Succeeded => Some(Ok(Box::new(snapshot.clone()))),
+        // `Unchanged` is a SUCCESS: the source was read and hashed, and kopia
+        // declined to write a second identical manifest. Exiting non-zero here
+        // would fail every `kubectl kopiur snapshot now --wait` in a CI/GitOps
+        // job the moment a source stopped changing — the healthy case.
+        SnapshotPhase::Succeeded | SnapshotPhase::Unchanged => Some(Ok(Box::new(snapshot.clone()))),
         SnapshotPhase::Failed => Some(Err(Box::new(snapshot.clone()))),
         // A manual Snapshot can only be Deleting if someone deleted it mid-run;
         // surface that as the failure path (the wait also catches the delete
@@ -89,8 +93,19 @@ pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapsho
 }
 
 /// One-line success summary from the terminal object's status.
+///
+/// An `Unchanged` run gets its own line rather than the usual one: it has no
+/// kopia id, no size and no duration to report, so the shared formatter would
+/// print `kopia id ?, ?, took ?` and read like something went wrong.
 pub fn success_summary(snapshot: &Snapshot) -> String {
     let status = snapshot.status.as_ref();
+    if status.and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged) {
+        let name = snapshot.metadata.name.as_deref().unwrap_or("?");
+        return format!(
+            "snapshot {name}: no files changed since the previous snapshot, so no new \
+             snapshot was created (the previous one is still the restore point)\n"
+        );
+    }
     let id = status
         .and_then(|s| s.snapshot.as_ref())
         .map(|i| i.kopia_snapshot_id.as_str())

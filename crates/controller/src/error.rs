@@ -427,6 +427,7 @@ mod tests {
         // EmptyOutput maps to Unknown, which is non-retryable → Terminal.
         let unknown = KopiaError::EmptyOutput {
             context: "x".into(),
+            stderr_tail: String::new(),
         };
         assert_eq!(Error::Kopia(unknown).class(), ErrorClass::Terminal);
     }

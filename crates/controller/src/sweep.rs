@@ -326,7 +326,15 @@ fn terminal_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
         .filter(|s| {
             matches!(
                 s.status.as_ref().and_then(|st| st.phase),
-                Some(SnapshotPhase::Succeeded) | Some(SnapshotPhase::Failed)
+                // `Unchanged` is terminal too — no further mover Job will ever
+                // launch for it — so its projected credential copy is dead
+                // weight the moment it lands. Omitting it leaks one Secret per
+                // deduped run, forever, on exactly the workload this phase
+                // exists for (a frequent schedule over static data): #240 all
+                // over again.
+                Some(SnapshotPhase::Succeeded)
+                    | Some(SnapshotPhase::Failed)
+                    | Some(SnapshotPhase::Unchanged)
             )
         })
         .filter_map(|s| s.uid())

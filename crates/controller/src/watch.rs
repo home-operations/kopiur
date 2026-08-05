@@ -536,7 +536,8 @@ fn snapshot_awaiting_launch(s: &Snapshot) -> bool {
             | SnapshotPhase::Succeeded
             | SnapshotPhase::Failed
             | SnapshotPhase::Deleting
-            | SnapshotPhase::Discovered,
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
         ) => false,
     }
 }

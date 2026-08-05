@@ -150,7 +150,8 @@ fn snapshot_in_flight(phase: Option<SnapshotPhase>) -> bool {
             SnapshotPhase::Succeeded
             | SnapshotPhase::Failed
             | SnapshotPhase::Deleting
-            | SnapshotPhase::Discovered,
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
         ) => false,
     }
 }

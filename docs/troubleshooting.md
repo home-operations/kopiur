@@ -362,6 +362,34 @@ $ kubectl describe restore <name> -n <ns>
 | Mover pod `Pending`: cache PVC **unbound** | `mover.cache.mode: Persistent` (or a sized `Ephemeral` cache) requested a `storageClassName` the cluster can't provision (or `ReadWriteOnce` contention with an overlapping run). | Use a valid `cache.storageClassName`, or drop `mover.cache` to fall back to an `emptyDir`. Persistent cache assumes non-overlapping runs per owner. |
 | Mover `Failed`: `mkdir /var/cache/kopia/logs: permission denied` (any op, incl. maintenance) | The PVC-backed cache is owned `root:root` and the mover's default `fsGroup: 65532` couldn't chown it — almost always an **NFS** cache StorageClass with **root-squash** (e.g. TrueNAS / democratic-csi), where the kubelet's `fsGroup` chown is denied. | Don't put a kopia cache on NFS: drop `moverDefaults.cache` for a node-local `emptyDir` (always writable), or set `cache.storageClass` to a block class (e.g. Ceph RBD) that honors `fsGroup`. See [Security context → default](security-context.md#the-default-hardened-context). |
 
+## A backup failed with `no JSON output found on stdout`
+
+Fixed in 0.10.0. On older versions a `Snapshot` could fail terminally with:
+
+```text
+snapshot create failed (class Unknown): no JSON output found on stdout for `snapshot create result`
+```
+
+This was **not** a real failure. `kopia snapshot create` exits 0 and writes
+nothing to stdout when its retention policy has `ignoreIdenticalSnapshots`
+enabled and nothing has changed since the previous snapshot — it says so only on
+stderr, which the operator discarded on a successful exit. Any repository whose
+*global* kopia policy had that knob set hit it, whether or not the
+`SnapshotPolicy` asked for it.
+
+Now that case is the [`Unchanged`](reference/crds/snapshot.md#status) phase, and
+the knob is reachable only through
+[`files.ignoreIdenticalSnapshots`](reference/crds/snapshot-policy.md#files) —
+the mover pins it off otherwise. To confirm which you are seeing:
+
+```bash
+kubectl get snapshot -n <ns> <name> -o jsonpath='{.status.phase}{"\n"}'
+```
+
+`Unchanged` means the source has not changed and the previous snapshot is still
+your restore point. A genuine empty-output failure now carries kopia's stderr in
+`status.failure.stderrTail`, so there is something to read either way.
+
 ## Schedule isn't firing
 
 ```console

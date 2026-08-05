@@ -437,8 +437,12 @@ async fn run_operation(
                 )
                 .await
                 .map_err(kopia(KopiaOp::PolicySet))?;
-            let result = client
-                .snapshot_create_with(
+            // Captured before the create so an `Unchanged` run can still report a
+            // real duration — kopia hashes the whole tree even when it decides
+            // not to write a manifest, so this is not free and is worth showing.
+            let started_at = chrono::Utc::now();
+            let outcome = client
+                .snapshot_create_outcome_with(
                     &op.source_path,
                     &op.tags,
                     Some(&override_source),
@@ -446,6 +450,32 @@ async fn run_operation(
                 )
                 .await
                 .map_err(kopia(KopiaOp::SnapshotCreate))?;
+            // Exhaustive: a deduped run and a real one are BOTH successes but are
+            // not interchangeable, and the difference is invisible in the happy
+            // path. Matching here is what stops a run that owns no manifest from
+            // being reported as one that does (#351).
+            let result = match outcome {
+                kopiur_kopia::SnapshotCreateOutcome::Created(r) => *r,
+                kopiur_kopia::SnapshotCreateOutcome::Unchanged => {
+                    // kopia declined to write a manifest: the source is
+                    // byte-identical to the previous snapshot. Nothing failed and
+                    // nothing new exists — the previous snapshot is still the live
+                    // restore point, and it belongs to the PREVIOUS Snapshot CR.
+                    // Report the outcome without a snapshot id, so this CR never
+                    // claims a manifest it does not own.
+                    info!(
+                        source = %op.source_path,
+                        identity = %override_source,
+                        "no files changed since the previous snapshot; kopia wrote no new \
+                         manifest (files.ignoreIdenticalSnapshots is enabled). The previous \
+                         snapshot remains the restore point for this source."
+                    );
+                    return Ok(StatusUpdate::unchanged_backup(
+                        started_at,
+                        chrono::Utc::now(),
+                    ));
+                }
+            };
             // kopia exits non-zero (→ a classified `PermissionDenied` failure above) when
             // unreadable files are FATAL. But under an `ignoreFileErrors`/`ignoreDirErrors`
             // policy it completes (exit 0) while still recording every skipped entry in
@@ -1004,6 +1034,20 @@ fn identity_retention_policy(
         keep_weekly: Some(KOPIA_KEEP_MAX),
         keep_monthly: Some(KOPIA_KEEP_MAX),
         keep_annual: Some(KOPIA_KEEP_MAX),
+        // Floor, same shape and same reasoning as the six `keep_*` pins above:
+        // a kopia-side retention setting Kopiur did not choose must not silently
+        // change what a backup run produces. With `ignoreIdenticalSnapshots` on,
+        // kopia writes NO manifest for an unchanged source — so a `Snapshot` CR
+        // that expected to own one owns nothing, and the whole
+        // finalizer/retention/restore model rests on that 1:1. kopia's own
+        // default is `false`, but a repository's global policy or a third-party
+        // `extraArgs` can flip it out of band, which is how #351 was reachable
+        // without the CRD field ever having been wired.
+        //
+        // Explicitly `false`, not unset: unset INHERITS, and inheriting is the
+        // bug. An opt-in (`files.ignoreIdenticalSnapshots: true`) overrides this
+        // from the more specific path scope.
+        ignore_identical_snapshots: Some(false),
         max_parallel_snapshots: user_identity_policy.and_then(|p| p.max_parallel_snapshots),
         ..Default::default()
     }
@@ -2066,6 +2110,29 @@ mod tests {
     use super::*;
 
     // --- M0b: identity-scope retention pin (KOPIA_KEEP_MAX) is mandatory ---
+
+    #[test]
+    fn identity_retention_policy_pins_ignore_identical_snapshots_off() {
+        // #351. kopia's own default is already `false`, but UNSET inherits — and
+        // a repository's global policy or a third-party `extraArgs` can set it
+        // `true` out of band, at which point kopia writes no manifest for an
+        // unchanged source and the Snapshot CR that expected to own one owns
+        // nothing. The pin makes that unreachable for any policy that did not
+        // explicitly opt in.
+        let p = identity_retention_policy(None);
+        assert_eq!(p.ignore_identical_snapshots, Some(false));
+
+        // A user identity policy must not be able to lift the pin: only the
+        // more specific PATH scope (from `files.ignoreIdenticalSnapshots`) may.
+        let user = kopiur_kopia::PolicyArgs {
+            ignore_identical_snapshots: Some(true),
+            max_parallel_snapshots: Some(4),
+            ..Default::default()
+        };
+        let p = identity_retention_policy(Some(user));
+        assert_eq!(p.ignore_identical_snapshots, Some(false));
+        assert_eq!(p.max_parallel_snapshots, Some(4));
+    }
 
     #[test]
     fn identity_retention_policy_always_pins_keep_max_with_no_user_policy() {

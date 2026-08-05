@@ -109,6 +109,27 @@ pub enum SnapshotPhase {
     Deleting,
     /// Catalog-materialized backup kopiur didn't produce.
     Discovered,
+    /// The backup ran to completion but kopia wrote **no new manifest**: the
+    /// source was byte-identical to the previous snapshot, and this policy has
+    /// [`files.ignoreIdenticalSnapshots`](crate::snapshot_policy::Files::ignore_identical_snapshots)
+    /// enabled.
+    ///
+    /// Terminal, and a **success**: the source was read and hashed, and it is
+    /// protected — by the *previous* snapshot, which remains the live restore
+    /// point. So an `Unchanged` run advances every liveness signal (last-backup
+    /// timestamp, policy health, failure-streak reset) exactly like `Succeeded`.
+    ///
+    /// What it does NOT do is own a kopia manifest. `status.snapshot` is absent,
+    /// the finalizer has nothing to reclaim, and it takes no GFS retention slot
+    /// — a restore point that does not exist must not displace one that does.
+    /// Recording it as `Succeeded` instead would make the controller resolve
+    /// "its" snapshot and find its predecessor's, leaving two CRs claiming one
+    /// manifest and the first prune deleting it out from under the second.
+    ///
+    /// Unreachable unless the policy opts in: the mover pins
+    /// `--ignore-identical-snapshots=false` at the identity scope on every run.
+    /// See #351.
+    Unchanged,
 }
 
 impl Origin {
@@ -168,6 +189,7 @@ impl crate::common::PhaseLabel for SnapshotPhase {
         Self::Failed,
         Self::Deleting,
         Self::Discovered,
+        Self::Unchanged,
     ];
     fn label(&self) -> &'static str {
         match self {
@@ -177,6 +199,7 @@ impl crate::common::PhaseLabel for SnapshotPhase {
             Self::Failed => "Failed",
             Self::Deleting => "Deleting",
             Self::Discovered => "Discovered",
+            Self::Unchanged => "Unchanged",
         }
     }
 }
@@ -481,7 +504,7 @@ mod tests {
         // a unique, non-empty label. A new variant added without updating ALL
         // makes this fail (and `label`'s exhaustive match won't compile at all).
         let labels: Vec<&str> = SnapshotPhase::ALL.iter().map(|p| p.label()).collect();
-        assert_eq!(SnapshotPhase::ALL.len(), 6);
+        assert_eq!(SnapshotPhase::ALL.len(), 7);
         assert!(labels.iter().all(|l| !l.is_empty()));
         let mut sorted = labels.clone();
         sorted.sort_unstable();

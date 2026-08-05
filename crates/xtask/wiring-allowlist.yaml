@@ -180,10 +180,6 @@ allow:
   #     milestones that implement them; the entries fail the check the moment
   #     the field becomes wired, so they cannot outlive the work.
   # ==========================================================================
-  - path: SnapshotPolicy.spec.files.ignoreIdenticalSnapshots
-    reason: >-
-      #351 — declared and documented but never mapped to kopia's
-      `--ignore-identical-snapshots`, so the knob does nothing. Wired in M2.
   - path: SnapshotPolicy.spec.sources.pvcSelector
     reason: >-
       #346 — no expansion code exists; a policy using it hits

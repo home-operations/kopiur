@@ -273,6 +273,7 @@ spec:
                 - Failed
                 - Deleting
                 - Discovered
+                - Unchanged
                 nullable: true
                 type: string
               pinned:

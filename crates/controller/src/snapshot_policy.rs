@@ -102,6 +102,54 @@ pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String
     select_kept(&views, policy).delete
 }
 
+/// **Pure.** The `Unchanged` Snapshots to prune: everything past the newest
+/// `limit`, newest first.
+///
+/// These rows are bounded by NOTHING else. GFS retention skips them —
+/// [`retention_view`] requires `Succeeded` *and* a recorded `status.snapshot`,
+/// and an `Unchanged` run has neither, which is correct: a restore point that
+/// does not exist must never displace one that does. But
+/// `failedJobsHistoryLimit` only counts `Failed`, so without this an hourly
+/// schedule over a static PVC accrues 24 `Unchanged` CRs a day, forever (#351).
+///
+/// They carry no kopia manifest, so deleting one reclaims nothing and risks
+/// nothing; their only value is the observability of "the schedule ran and
+/// found nothing to do". Bounded by the flat `failedJobsHistoryLimit` default
+/// rather than a new knob, and applied here — over the policy's `CONFIG_LABEL`
+/// children — so manual `kubectl kopiur snapshot now` runs are bounded too, not
+/// just scheduled ones.
+pub fn unchanged_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<String> {
+    use kopiur_api::SnapshotPhase;
+    let mut rows: Vec<&Snapshot> = backups
+        .iter()
+        .filter(|s| {
+            s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Unchanged)
+                && s.metadata.deletion_timestamp.is_none()
+        })
+        .collect();
+    // Newest first; an unknown terminal time sorts last (oldest) → pruned first.
+    rows.sort_by_key(|s| std::cmp::Reverse(snapshot_end_or_creation(s)));
+    rows.into_iter()
+        .skip(limit as usize)
+        .filter_map(|s| s.metadata.name.clone())
+        .collect()
+}
+
+/// The terminal ordering key for a Snapshot: `status.timing.endTime`, falling
+/// back to `metadata.creationTimestamp`.
+fn snapshot_end_or_creation(b: &Snapshot) -> Option<DateTime<Utc>> {
+    b.status
+        .as_ref()
+        .and_then(|s| s.timing.as_ref())
+        .and_then(|t| t.end_time.as_deref())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|| {
+            b.creation_timestamp()
+                .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
+        })
+}
+
 /// **Pure.** Split the GFS-`selected` deletion set against the LIVE objects into
 /// `(to_delete, to_stamp_only)`:
 ///
@@ -403,7 +451,10 @@ pub fn consecutive_failures<'a>(backups: impl IntoIterator<Item = &'a Snapshot>)
     let terminal_time = |b: &Snapshot| -> Option<(DateTime<Utc>, SnapshotPhase)> {
         let status = b.status.as_ref()?;
         let phase = status.phase?;
-        if !matches!(phase, SnapshotPhase::Succeeded | SnapshotPhase::Failed) {
+        if !matches!(
+            phase,
+            SnapshotPhase::Succeeded | SnapshotPhase::Failed | SnapshotPhase::Unchanged
+        ) {
             return None;
         }
         let t = status
@@ -426,7 +477,12 @@ pub fn consecutive_failures<'a>(backups: impl IntoIterator<Item = &'a Snapshot>)
     for (_, phase) in terminal {
         match phase {
             SnapshotPhase::Failed => n += 1,
-            SnapshotPhase::Succeeded => break,
+            // `Unchanged` breaks the streak exactly like `Succeeded`: a run that
+            // read the source and found it identical is proof the backup path
+            // works. Letting it fall through to `_ => {}` would leave the streak
+            // frozen at its last value, so `KopiurBackupFailing` could never
+            // clear for a policy that recovered and then went quiet.
+            SnapshotPhase::Succeeded | SnapshotPhase::Unchanged => break,
             // Non-terminal already filtered out.
             _ => {}
         }
@@ -598,6 +654,21 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     //    governs the kopia snapshot itself). The LIST happens above the
     //    repository-readiness gate — only the prune is conditional. `retention: None`
     //    deliberately means "never prune" (see `validate::snapshot`).
+    // Bound the `Unchanged` rows FIRST and unconditionally: they accumulate
+    // whether or not `spec.retention` is configured, because GFS never sees
+    // them (no manifest, so no retention view). `retention: None` means "never
+    // prune real restore points" — it does not mean "hoard empty ones".
+    for cr_name in unchanged_snapshots_to_prune(
+        &backups,
+        kopiur_api::consts::effective_failed_jobs_history_limit(None),
+    ) {
+        // Stamp `pruned-by` THEN delete, exactly like every other operator
+        // prune, so the finalizer classifies it as ours and the mass-deletion
+        // breaker stays out of the way.
+        io::annotate_then_delete_snapshot(&backup_api, &cr_name, PrunedBy::FailedHistory).await?;
+        tracing::info!(config = %name, backup = %cr_name, "pruned Unchanged Snapshot (history limit)");
+    }
+
     if let Some(retention) = config.spec.retention.as_ref() {
         let selected = backups_to_delete(&backups, retention);
         // Split the selected set: normal (live) prunes get stamp-then-delete;
@@ -1314,12 +1385,101 @@ mod tests {
         b
     }
 
+    fn unchanged_backup(name: &str, end: DateTime<Utc>) -> Snapshot {
+        // What the mover actually writes for a deduped run: a terminal phase and
+        // real timing, but NO `status.snapshot` — it owns no kopia manifest.
+        let mut b = succeeded_backup(name, end);
+        if let Some(s) = b.status.as_mut() {
+            s.phase = Some(SnapshotPhase::Unchanged);
+            s.snapshot = None;
+        }
+        b
+    }
+
     fn policy(latest: Option<u32>, daily: Option<u32>) -> Retention {
         Retention {
             keep_latest: latest,
             keep_daily: daily,
             ..Default::default()
         }
+    }
+
+    // --- #351: Unchanged is a success that owns nothing --------------------
+
+    #[test]
+    fn unchanged_breaks_the_consecutive_failure_streak() {
+        // A run that read the source and found it identical is proof the backup
+        // path works, so it must reset the streak exactly like a Succeeded run.
+        // Without this the streak freezes at its last value and
+        // `KopiurBackupFailing` can never clear for a policy that recovered and
+        // then went quiet.
+        let t = |h: u32| Utc.with_ymd_and_hms(2026, 8, 5, h, 0, 0).unwrap();
+        let backups = [
+            unchanged_backup("newest", t(6)),
+            failed_backup("f2", t(5)),
+            failed_backup("f1", t(4)),
+        ];
+        assert_eq!(consecutive_failures(backups.iter()), 0);
+
+        // ...and failures AFTER the unchanged run still count.
+        let backups = [
+            failed_backup("f3", t(7)),
+            unchanged_backup("u", t(6)),
+            failed_backup("f2", t(5)),
+        ];
+        assert_eq!(consecutive_failures(backups.iter()), 1);
+    }
+
+    #[test]
+    fn unchanged_never_participates_in_gfs_retention() {
+        // It holds no restore point, so it must not occupy a GFS slot and evict
+        // one that does. `retention_view` already gates on Succeeded + a
+        // recorded status.snapshot; this pins that behavior against the new phase.
+        let t = |d: u32| Utc.with_ymd_and_hms(2026, 8, d, 2, 0, 0).unwrap();
+        let real = succeeded_backup("real", t(1));
+        let dedup = unchanged_backup("dedup", t(2));
+        assert!(retention_view(&dedup).is_none());
+
+        // keepLatest: 1 with one real + one unchanged must keep the REAL one.
+        let del = backups_to_delete(&[real, dedup], &policy(Some(1), None));
+        assert!(
+            del.is_empty(),
+            "the only real snapshot must survive keepLatest=1, got {del:?}"
+        );
+    }
+
+    #[test]
+    fn unchanged_rows_are_bounded_by_the_history_limit() {
+        // Neither GFS (no manifest) nor failedJobsHistoryLimit (only counts
+        // Failed) bounds these, so an hourly schedule over static data would
+        // accrue them forever.
+        let t = |h: u32| Utc.with_ymd_and_hms(2026, 8, 5, h, 0, 0).unwrap();
+        let rows: Vec<Snapshot> = (0..5)
+            .map(|i| unchanged_backup(&format!("u{i}"), t(i)))
+            .collect();
+        let pruned = unchanged_snapshots_to_prune(&rows, 2);
+        // Newest two kept (u4, u3); the three oldest pruned.
+        assert_eq!(pruned.len(), 3);
+        assert!(!pruned.contains(&"u4".to_string()));
+        assert!(!pruned.contains(&"u3".to_string()));
+        assert!(pruned.contains(&"u0".to_string()));
+    }
+
+    #[test]
+    fn the_history_bound_ignores_other_phases_and_terminating_rows() {
+        let t = |h: u32| Utc.with_ymd_and_hms(2026, 8, 5, h, 0, 0).unwrap();
+        let mut terminating = unchanged_backup("draining", t(0));
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        let rows = vec![
+            succeeded_backup("real", t(3)),
+            failed_backup("bad", t(2)),
+            terminating,
+        ];
+        // Limit 0 would prune every Unchanged row — but none of these qualify.
+        assert!(unchanged_snapshots_to_prune(&rows, 0).is_empty());
     }
 
     #[test]

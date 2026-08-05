@@ -868,12 +868,19 @@ pub(super) fn backfill_patch_body(
 /// `kubectl wait --for=condition=Ready` and Flux/Argo health work uniformly. Pure +
 /// exhaustive: a new phase cannot compile until its Ready mapping is decided.
 ///
-/// - `Succeeded`/`Discovered` → `Ready` (the snapshot exists / is catalogued).
+/// - `Succeeded`/`Discovered`/`Unchanged` → `Ready`. `Unchanged` is Ready for the
+///   same reason the others are: the source IS protected. It is covered by the
+///   previous snapshot rather than one of its own, which is a fact about which
+///   manifest holds the bytes, not about whether the backup worked. Reporting it
+///   as anything else would make `kubectl wait --for=condition=Ready` and every
+///   Flux/Argo health check fail on a healthy dedupe.
 /// - `Failed` → `Stalled` (terminal: won't progress without a spec change/retry).
 /// - `Pending`/`Running`/`Deleting` → `Reconciling` (in flight).
 pub fn snapshot_ready_outcome(phase: SnapshotPhase) -> io::ReadyOutcome {
     match phase {
-        SnapshotPhase::Succeeded | SnapshotPhase::Discovered => io::ReadyOutcome::Ready,
+        SnapshotPhase::Succeeded | SnapshotPhase::Discovered | SnapshotPhase::Unchanged => {
+            io::ReadyOutcome::Ready
+        }
         SnapshotPhase::Failed => io::ReadyOutcome::Stalled,
         SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Deleting => {
             io::ReadyOutcome::Reconciling
@@ -913,7 +920,14 @@ pub enum RunDecision {
 pub fn run_decision(phase: Option<SnapshotPhase>) -> RunDecision {
     match phase {
         None | Some(SnapshotPhase::Pending) | Some(SnapshotPhase::Running) => RunDecision::Run,
-        Some(SnapshotPhase::Succeeded) => RunDecision::SucceededSteadyState,
+        // `Unchanged` is terminal exactly like `Succeeded` — the mover ran, the
+        // source was read, and no further Job may launch for this CR. It takes
+        // the same steady-state path so staged-source teardown and the
+        // re-issue guard behave identically; the two differ only in what they
+        // OWN, which is a status question, not a run-decision one.
+        Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged) => {
+            RunDecision::SucceededSteadyState
+        }
         Some(SnapshotPhase::Failed) => RunDecision::TerminalFailed,
         Some(SnapshotPhase::Deleting) | Some(SnapshotPhase::Discovered) => RunDecision::Wait,
     }

@@ -665,6 +665,7 @@ mod tests {
             op: KopiaOp::SnapshotCreate,
             source: KopiaError::EmptyOutput {
                 context: "snapshot create".into(),
+                stderr_tail: String::new(),
             },
         };
         assert!(

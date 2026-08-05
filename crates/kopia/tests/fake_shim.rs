@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use kopiur_kopia::{
     ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, PolicyArgs, RestoreOptions,
-    VerifyOptions,
+    SnapshotCreateOptions, SnapshotCreateOutcome, VerifyOptions,
 };
 
 /// Write an executable shell script to a tempdir and return its path. The
@@ -35,6 +35,98 @@ fn shim(script: &str) -> Shim {
 
 fn client_for(shim: &Shim) -> KopiaClient {
     KopiaClient::builder().binary(shim.path.clone()).build()
+}
+
+// --- #351: kopia exits 0 and writes NO manifest ---------------------------
+
+/// The exact shape of #351, reproduced byte-for-byte from the reporter's
+/// capture: `kopia snapshot create --json` exits **0**, stdout is empty, and
+/// the only explanation is one stderr line.
+///
+/// Before the fix this became `EmptyOutput` → class `Unknown` → non-retryable →
+/// the `Snapshot` CR failed terminally, for a source that was simply not
+/// changing.
+#[tokio::test]
+async fn snapshot_create_reports_unchanged_when_kopia_deduped() {
+    let s = shim(
+        r#"#!/bin/sh
+echo "Snapshotting actual@default:/pvc/actual ..." 1>&2
+echo " Not saving snapshot because no files have been changed since previous snapshot" 1>&2
+exit 0
+"#,
+    );
+    let client = client_for(&s);
+    let outcome = client
+        .snapshot_create_outcome_with(
+            "/data",
+            &BTreeMap::new(),
+            Some("actual@default:/pvc/actual"),
+            &SnapshotCreateOptions::default(),
+        )
+        .await
+        .expect("a deduped create is a SUCCESS, not an error");
+    assert_eq!(outcome, SnapshotCreateOutcome::Unchanged);
+}
+
+/// The other half of the contract: an exit-0-with-no-JSON that kopia did NOT
+/// explain as a dedupe is still a hard failure. Only the one known-benign
+/// message is special-cased — everything else stays loud.
+#[tokio::test]
+async fn snapshot_create_empty_stdout_without_the_marker_still_fails() {
+    let s = shim(
+        r#"#!/bin/sh
+echo "Snapshotting root@host:/data ..." 1>&2
+echo "something entirely unexpected happened" 1>&2
+exit 0
+"#,
+    );
+    let client = client_for(&s);
+    let err = client
+        .snapshot_create_outcome_with(
+            "/data",
+            &BTreeMap::new(),
+            None,
+            &SnapshotCreateOptions::default(),
+        )
+        .await
+        .expect_err("an unexplained empty stdout must not be silently swallowed");
+    match err {
+        KopiaError::EmptyOutput { stderr_tail, .. } => {
+            // The whole point of carrying the tail: the operator can see WHY.
+            assert!(
+                stderr_tail.contains("something entirely unexpected"),
+                "stderr must ride the error, got: {stderr_tail:?}"
+            );
+        }
+        other => panic!("expected EmptyOutput, got {other:?}"),
+    }
+}
+
+/// A normal create still returns `Created` through the outcome API, so the
+/// enum is not a special-case-only path.
+#[tokio::test]
+async fn snapshot_create_outcome_returns_created_on_a_normal_run() {
+    let s = shim(
+        r#"#!/bin/sh
+echo "Snapshotting root@host:/data ..." 1>&2
+echo '{"id":"deadbeef","source":{"host":"h","userName":"u","path":"/data"},"description":"","startTime":"2026-06-02T03:13:59Z","endTime":"2026-06-02T03:14:00Z"}'
+exit 0
+"#,
+    );
+    let client = client_for(&s);
+    let outcome = client
+        .snapshot_create_outcome_with(
+            "/data",
+            &BTreeMap::new(),
+            None,
+            &SnapshotCreateOptions::default(),
+        )
+        .await
+        .expect("normal create");
+    match outcome {
+        SnapshotCreateOutcome::Created(r) => assert_eq!(r.id, "deadbeef"),
+        SnapshotCreateOutcome::Unchanged => panic!("a run that wrote a manifest is not Unchanged"),
+    }
 }
 
 #[tokio::test]

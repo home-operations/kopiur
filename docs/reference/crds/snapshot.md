@@ -42,7 +42,9 @@ The status is rich; `discovered` snapshots populate it without any spec.
 
 ### `phase`
 
-Current lifecycle phase — one of `Pending` (admitted, not started), `Running` (mover Job in flight), `Succeeded`, `Failed` (retries exhausted), `Deleting` (finalizer reclaiming the kopia snapshot), or `Discovered` (catalog-materialized).
+Current lifecycle phase — one of `Pending` (admitted, not started), `Running` (mover Job in flight), `Succeeded`, `Failed` (retries exhausted), `Deleting` (finalizer reclaiming the kopia snapshot), `Discovered` (catalog-materialized), or `Unchanged` (the backup ran, but nothing had changed since the previous snapshot so kopia created none — see [`files.ignoreIdenticalSnapshots`](snapshot-policy.md#files)).
+
+`Unchanged` is a **success**: the source was read and hashed, and it is protected by the previous snapshot. It advances the policy's last-backup timestamp and health, and `kubectl wait --for=condition=Ready` passes. What it does *not* have is a `status.snapshot` — there is no new kopia manifest, so you cannot restore *from this CR*; restore from the previous one, which is still the live restore point. It also takes no retention slot, so it can never displace a real restore point.
 
 ### `origin`
 

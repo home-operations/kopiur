@@ -107,6 +107,28 @@ fn run_decision_covers_every_phase() {
         run_decision(Some(SnapshotPhase::Discovered)),
         RunDecision::Wait
     );
+    // Unchanged → terminal steady state, same as Succeeded: the mover ran and
+    // no further Job may launch. The two differ in what they OWN, which the
+    // steady-state arm decides — not here. Crucially it must NOT be `Run`, or a
+    // deduped Snapshot would mint a fresh mover Job on every reconcile.
+    assert_eq!(
+        run_decision(Some(SnapshotPhase::Unchanged)),
+        RunDecision::SucceededSteadyState
+    );
+}
+
+#[test]
+fn unchanged_is_ready_not_stalled() {
+    use crate::io::ReadyOutcome;
+    use crate::snapshot::plan::snapshot_ready_outcome;
+    use kopiur_api::snapshot::SnapshotPhase;
+    // The source IS protected — by the previous snapshot. Anything but Ready
+    // would fail `kubectl wait --for=condition=Ready` and every Flux/Argo health
+    // check on a perfectly healthy dedupe (#351).
+    assert_eq!(
+        snapshot_ready_outcome(SnapshotPhase::Unchanged),
+        ReadyOutcome::Ready
+    );
 }
 
 #[test]

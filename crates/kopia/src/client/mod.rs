@@ -24,8 +24,8 @@ use tokio::process::Command;
 
 use crate::error::{KopiaError, KopiaErrorClass, tail_lines};
 use crate::model::{
-    IndexBlobEntry, MaintenanceInfo, RepositoryStatus, SnapshotCreateResult, SnapshotListEntry,
-    SnapshotSource,
+    IndexBlobEntry, MaintenanceInfo, RepositoryStatus, SnapshotCreateOutcome, SnapshotCreateResult,
+    SnapshotListEntry, SnapshotSource,
 };
 
 /// Which maintenance pass to run.
@@ -587,6 +587,21 @@ pub struct PolicyArgs {
     pub never_compress: Vec<String>,
     /// `--ignore-cache-dirs` tri-state (honor `CACHEDIR.TAG`). `None` leaves kopia's default.
     pub ignore_cache_dirs: Option<bool>,
+    /// `--ignore-identical-snapshots` tri-state: skip writing a manifest when
+    /// the source is byte-identical to the previous snapshot.
+    ///
+    /// This is a kopia **retention** knob, not a files one, despite living
+    /// beside `ignore-cache-dirs` on the `policy set` command line.
+    ///
+    /// Kopiur pins it explicitly rather than inheriting: kopia's own default is
+    /// `false`, but a repository's global policy (or a third-party `extraArgs`)
+    /// can turn it on out of band, and a deduped run writes no manifest — which
+    /// breaks the one-`Snapshot`-CR-owns-one-manifest invariant the finalizer,
+    /// retention and restore all rest on. The mover therefore pins `false` at
+    /// the identity scope on every run, and only an explicit
+    /// `files.ignoreIdenticalSnapshots: true` raises it at the (more specific)
+    /// path scope. See #351.
+    pub ignore_identical_snapshots: Option<bool>,
     /// Backup-side error handling (`--ignore-file-errors`) tri-state. ADR-0005 §13(b).
     pub ignore_file_errors: Option<bool>,
     /// `--ignore-dir-errors` tri-state. ADR-0005 §13(b).
@@ -1144,9 +1159,29 @@ impl KopiaClient {
         args: &[String],
         env_overlay: &BTreeMap<String, Option<String>>,
     ) -> Result<String, KopiaError> {
+        self.run_ok_full(args, env_overlay).await.map(|o| o.stdout)
+    }
+
+    /// [`Self::run_ok_with_env`] keeping **stderr on success**.
+    ///
+    /// The plain `run_ok` shape — `Ok(out.stdout)`, dropping `out.stderr` —
+    /// made a whole class of failure undiagnosable: kopia can exit **0**,
+    /// print nothing on stdout, and explain itself only on stderr. That is
+    /// exactly what `snapshot create` does when its retention policy has
+    /// `ignoreIdenticalSnapshots` on and nothing changed, and it surfaced as
+    /// `no JSON output found on stdout (class Unknown)` with no reason
+    /// attached anywhere (#351).
+    ///
+    /// Callers that genuinely only want stdout keep using `run_ok`; the two
+    /// that need to reason about a silent success use this.
+    async fn run_ok_full(
+        &self,
+        args: &[String],
+        env_overlay: &BTreeMap<String, Option<String>>,
+    ) -> Result<RawOutput, KopiaError> {
         let out = self.run_with_env(args, env_overlay).await?;
         if out.code == Some(0) {
-            Ok(out.stdout)
+            Ok(out)
         } else {
             Err(KopiaError::NonZeroExit {
                 args: args.join(" "),
@@ -1160,14 +1195,19 @@ impl KopiaClient {
     /// Run kopia, require success, and parse the trailing JSON value on stdout
     /// into `T`. Kopia prints the result as the *last* JSON value on stdout
     /// (progress goes to stderr), so we parse from the first `{`/`[`.
+    ///
+    /// An empty stdout carries kopia's stderr tail into the error, so
+    /// "kopia said nothing" is never again indistinguishable from "kopia said
+    /// why, and we threw it away" (#351).
     async fn run_json<T: DeserializeOwned>(
         &self,
         args: &[String],
         context: &str,
     ) -> Result<T, KopiaError> {
-        let stdout = self.run_ok(args).await?;
-        let json = extract_json(&stdout).ok_or_else(|| KopiaError::EmptyOutput {
+        let out = self.run_ok_full(args, &BTreeMap::new()).await?;
+        let json = extract_json(&out.stdout).ok_or_else(|| KopiaError::EmptyOutput {
             context: context.to_string(),
+            stderr_tail: tail_lines(&out.stderr),
         })?;
         serde_json::from_str::<T>(json).map_err(|source| KopiaError::Json {
             context: context.to_string(),
@@ -1341,6 +1381,50 @@ impl KopiaClient {
     ) -> Result<SnapshotCreateResult, KopiaError> {
         let args = snapshot_create_args(source_path, tags, override_source, opts);
         self.run_json(&args, "snapshot create result").await
+    }
+
+    /// [`Self::snapshot_create_with`], but able to say "kopia deliberately
+    /// wrote no manifest".
+    ///
+    /// `snapshot create` has exactly one legitimate silent success: with the
+    /// retention knob `ignoreIdenticalSnapshots` on and the source
+    /// byte-identical to the previous snapshot, kopia exits **0**, prints
+    /// nothing on stdout, and says so only on stderr. Through `run_json` that
+    /// was a hard `EmptyOutput` error and terminally failed the `Snapshot` CR
+    /// (#351).
+    ///
+    /// Returning an enum rather than an `Option`/sentinel is deliberate: a
+    /// deduped run owns **no kopia manifest**, and callers that quietly treated
+    /// it as an ordinary success would go looking for one — which is how a CR
+    /// ends up claiming its predecessor's manifest and deleting it on prune.
+    /// The variant forces every caller to decide.
+    ///
+    /// Any *other* empty stdout still fails, loudly and now with kopia's own
+    /// stderr attached.
+    pub async fn snapshot_create_outcome_with(
+        &self,
+        source_path: &str,
+        tags: &BTreeMap<String, String>,
+        override_source: Option<&str>,
+        opts: &SnapshotCreateOptions,
+    ) -> Result<SnapshotCreateOutcome, KopiaError> {
+        let args = snapshot_create_args(source_path, tags, override_source, opts);
+        let out = self.run_ok_full(&args, &BTreeMap::new()).await?;
+        match extract_json(&out.stdout) {
+            Some(json) => serde_json::from_str::<SnapshotCreateResult>(json)
+                .map(|r| SnapshotCreateOutcome::Created(Box::new(r)))
+                .map_err(|source| KopiaError::Json {
+                    context: "snapshot create result".to_string(),
+                    source,
+                }),
+            None if crate::error::snapshot_skipped_unchanged(&out.stderr) => {
+                Ok(SnapshotCreateOutcome::Unchanged)
+            }
+            None => Err(KopiaError::EmptyOutput {
+                context: "snapshot create result".to_string(),
+                stderr_tail: tail_lines(&out.stderr),
+            }),
+        }
     }
 
     /// List snapshots, optionally filtered by source identity. With no filter
@@ -1955,6 +2039,11 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
         args.push(pat.clone());
     }
     push_valued_tristate(&mut args, "ignore-cache-dirs", policy.ignore_cache_dirs);
+    push_valued_tristate(
+        &mut args,
+        "ignore-identical-snapshots",
+        policy.ignore_identical_snapshots,
+    );
     push_valued_tristate(&mut args, "ignore-file-errors", policy.ignore_file_errors);
     push_valued_tristate(&mut args, "ignore-dir-errors", policy.ignore_dir_errors);
     push_valued_tristate(

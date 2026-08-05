@@ -142,8 +142,24 @@ uncompressed (e.g. already-compressed media).
 
 File-ignore policy. `ignoreRules` are filename/path globs to exclude from the
 snapshot (e.g. `*.tmp`, `*/cache/*`); `ignoreCacheDirs` honors `CACHEDIR.TAG`;
-`ignoreIdenticalSnapshots` skips taking a new snapshot when the source is
-identical to the previous one.
+`ignoreIdenticalSnapshots` (default `false`) tells kopia not to write a new
+manifest when the source is byte-identical to the previous snapshot. The run
+still reads and hashes the whole source — the saving is a manifest, not the
+work — and the `Snapshot` CR ends in the [`Unchanged`](snapshot.md#status)
+phase instead of `Succeeded`.
+
+!!! warning "It changes what a backup run produces"
+
+    An `Unchanged` run owns **no kopia snapshot**, so you cannot restore from
+    that CR — the previous snapshot is still the restore point, and it belongs
+    to the previous CR. It is a success for every liveness purpose (last-backup
+    timestamp, policy health, `Ready` condition, `snapshot now --wait` exit
+    code) and it takes no retention slot, so it can never displace a real
+    restore point. Leave it off unless you specifically want fewer manifests.
+
+    Kopiur pins `--ignore-identical-snapshots=false` at the kopia identity
+    scope on every run, so a repository-global kopia policy cannot turn this on
+    behind your back. Only this field enables it.
 
 `ignoreRules` defaults to a 5-entry OS-artifact exclude set — `/lost+found`,
 `System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot` — applied even
