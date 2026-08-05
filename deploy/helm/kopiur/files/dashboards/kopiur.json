@@ -1233,12 +1233,242 @@
     },
     {
       "type": "row",
-      "title": "Controller, Mover & Webhook",
+      "title": "Repository Health & Breaker",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 63
+      },
+      "id": 70
+    },
+    {
+      "id": 71,
+      "type": "stat",
+      "title": "Breakers Open",
+      "description": "Repositories whose circuit breaker is currently open (phase Degraded): backups, maintenance, and replication to them are paused. Recovery is automatic once a connect succeeds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 64
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(kopiur_resource_phase{kind=~\"Repository|ClusterRepository\", phase=\"Degraded\"}) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 72,
+      "type": "stat",
+      "title": "Breaker Trips",
+      "description": "Circuit-breaker openings (the backend health probe exceeded failureThreshold under onFailure: Degrade) within the selected dashboard time range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 64
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kopiur_repository_breaker_trips_total[$__range])) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 73,
+      "type": "stat",
+      "title": "Time since breaker opened",
+      "description": "How long each open breaker has been open (from status.health.firstFailureAt). The series exists only while a breaker is open, so 'No data' means every breaker is closed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 16,
+        "x": 8,
+        "y": 64
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "all closed",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 900
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "time() - kopiur_repository_breaker_open_since_timestamp_seconds",
+          "legendFormat": "{{kind}}/{{namespace}}/{{name}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Consecutive backend failures",
+      "description": "status.health.consecutiveProbeFailures per repository \u2014 every failed backend connect (probe + strict retries). Emitted whenever the health probe has run; 0 means the last connect succeeded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "kopiur_repository_consecutive_backend_failures",
+          "legendFormat": "{{kind}}/{{namespace}}/{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Snapshots gated (parked behind not-Ready repo)",
+      "description": "Snapshots held Pending with Ready reason RepositoryNotReady \u2014 deferrals, not refusals; they launch automatically once the repository recovers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace) (kopiur_snapshot_gated{namespace=~\"$namespace\"})",
+          "legendFormat": "{{namespace}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "Health probe failures (rate by outcome)",
+      "description": "Backend health-probe alerts after the consecutive-failure debounce: vanished = backend reachable but the repository is absent; unreachable = backend/mount/auth failure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (name, outcome) (rate(kopiur_repository_health_probe_failures_total[1h]))",
+          "legendFormat": "{{name}}/{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Controller, Mover & Webhook",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 75
       },
       "id": 60
     },
@@ -1259,7 +1489,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 64
+        "y": 76
       },
       "targets": [
         {
@@ -1286,7 +1516,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 64
+        "y": 76
       },
       "targets": [
         {
@@ -1313,7 +1543,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 64
+        "y": 76
       },
       "targets": [
         {
@@ -1340,7 +1570,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 71
+        "y": 83
       },
       "targets": [
         {
@@ -1368,7 +1598,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 71
+        "y": 83
       },
       "targets": [
         {
@@ -1396,7 +1626,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 71
+        "y": 83
       },
       "targets": [
         {
@@ -1423,7 +1653,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 90
       },
       "targets": [
         {

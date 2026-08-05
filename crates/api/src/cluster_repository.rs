@@ -399,6 +399,26 @@ identityDefaults:
     }
 
     #[test]
+    fn health_probe_schema_defaults_mirror_the_repository_twin() {
+        // #345: the ClusterRepository CRD must carry the same context-free
+        // probe defaults as the namespaced Repository — default-ON and the
+        // breaker (`Degrade`) as the onFailure default. The resolvers
+        // (`RepositoryHealthProbeSpec::enabled` / `effective_on_failure`) are
+        // shared, so only the schema emission needs its own guard here.
+        let crd = ClusterRepository::crd();
+        let json = serde_json::to_value(&crd).unwrap();
+        let probe = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["health"]["properties"]["probe"]["properties"];
+        assert_eq!(
+            probe["enabled"]["default"],
+            serde_json::json!(crate::consts::DEFAULT_HEALTH_PROBE_ENABLED)
+        );
+        assert_eq!(probe["onFailure"]["default"], serde_json::json!("Degrade"));
+        assert_eq!(probe["interval"]["default"], serde_json::json!("30m"));
+        assert_eq!(probe["failureThreshold"]["default"], serde_json::json!(3));
+    }
+
+    #[test]
     fn deletion_protection_round_trips_on_cluster_repository() {
         let yaml = r#"
 backend: { filesystem: { path: /repo } }

@@ -57,8 +57,9 @@ pub struct Metrics {
 
     // Snapshot business metrics.
     //
-    // Per-resource phase (`kopiur_resource_phase`) and the per-Snapshot
-    // size/files/duration/last-success gauges are NOT held here: they are
+    // Per-resource phase (`kopiur_resource_phase`), the per-Snapshot
+    // size/files/duration/last-success gauges, and the per-policy
+    // consecutive-failures/live-count/gated gauges are NOT held here: they are
     // store-backed i64 *observable* gauges registered in
     // [`Metrics::register_resource_observers`], whose callbacks enumerate the
     // controllers' reflector stores at collection time. A series exists iff its CR
@@ -67,7 +68,6 @@ pub struct Metrics {
     // set, and a deleted CR's series genuinely disappears from `/metrics` (the
     // #172/#175 fix; a sync gauge could only zero a series, never remove it).
     backup_verified_timestamp: Gauge<i64>,
-    backup_consecutive_failures: Gauge<i64>,
     snapshots_completed: Counter<u64>,
     snapshot_deletion_failures: Counter<u64>,
     orphaned_snapshots: Counter<u64>,
@@ -81,12 +81,12 @@ pub struct Metrics {
     projected_secrets_swept: Counter<u64>,
     creds_secrets_reaped: Counter<u64>,
     projected_secrets_live: Gauge<i64>,
-    snapshots_live: Gauge<i64>,
     snapshots_adopted: Counter<u64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
     backups_refused: Counter<u64>,
     health_probe_failures: Counter<u64>,
+    breaker_trips: Counter<u64>,
 
     // Repository business metrics.
     repo_size_bytes: Gauge<i64>,
@@ -317,10 +317,6 @@ impl Metrics {
                  (quick or deep), from status.lastVerified.",
             )
             .build();
-        let backup_consecutive_failures = m
-            .i64_gauge("kopiur_snapshot_consecutive_failures")
-            .with_description("Number of consecutive backup failures.")
-            .build();
         let snapshots_completed = m
             .u64_counter("kopiur_snapshots_completed")
             .with_description(
@@ -431,14 +427,6 @@ impl Metrics {
                  (#240) ran unseen. Alert on deriv() > 0 over a day.",
             )
             .build();
-        let snapshots_live = m
-            .i64_gauge("kopiur_snapshots_live")
-            .with_description(
-                "Snapshot CRs currently alive per SnapshotPolicy. Bounded by GFS retention \
-                 when `spec.retention` is set; a policy WITHOUT it never prunes (a \
-                 deliberate safe default) and this is the only thing that will tell you so.",
-            )
-            .build();
         let snapshots_adopted = m
             .u64_counter("kopiur_snapshots_adopted")
             .with_description(
@@ -476,6 +464,17 @@ impl Metrics {
                  debounce), labeled by kind and outcome (vanished = backend reachable but the \
                  repository is absent; unreachable = backend/mount/auth failure). The repository \
                  stays Ready — these are alerts, not outages, and kopiur never auto-recreates.",
+            )
+            .build();
+        let breaker_trips = m
+            .u64_counter("kopiur_repository_breaker_trips")
+            .with_description(
+                "Total repository circuit-breaker openings: the backend health probe exceeded \
+                 spec.health.probe.failureThreshold under onFailure: Degrade, moving the \
+                 repository to Degraded (backups, maintenance, and replication pause until a \
+                 connect succeeds; recovery is automatic). Labeled by kind \
+                 (Repository/ClusterRepository), namespace, name, and probe_kind \
+                 (vanished/unreachable — matching the health-probe-failure outcome label).",
             )
             .build();
 
@@ -524,7 +523,6 @@ impl Metrics {
             failure_events_dropped,
             reconcile_duration,
             backup_verified_timestamp,
-            backup_consecutive_failures,
             snapshots_completed,
             snapshot_deletion_failures,
             orphaned_snapshots,
@@ -538,12 +536,12 @@ impl Metrics {
             projected_secrets_swept,
             creds_secrets_reaped,
             projected_secrets_live,
-            snapshots_live,
             snapshots_adopted,
             schedule_backups_created,
             secrets_projected,
             backups_refused,
             health_probe_failures,
+            breaker_trips,
             repo_size_bytes,
             repo_snapshot_count,
             repo_discovered_backups,
@@ -931,6 +929,182 @@ impl Metrics {
                 })
                 .build();
         }
+        // Per-policy consecutive-failure streak + live-CR count (M6, #345). These
+        // were sync gauges written from the SnapshotPolicy reconcile, which left a
+        // deleted policy's series behind forever (the #172/#175 defect class) and
+        // froze the streak whenever the reconcile stopped running. Store-backed,
+        // they are re-derived from the Snapshot store each collection: a series
+        // exists iff the policy currently has >= 1 Snapshot CR carrying its
+        // `spec.policyRef` (the same policy attribution as `kopiur_resource_phase`),
+        // and it vanishes with the last CR. Labels stay {namespace, name} with
+        // `name` = the SnapshotPolicy name, for series continuity with the old
+        // sync gauges.
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshot_consecutive_failures")
+                .with_description(
+                    "Consecutive Failed backups since the latest Succeeded one, per \
+                     SnapshotPolicy (labels namespace/name, name = the policy name). \
+                     Store-backed: the series exists iff the policy currently has at \
+                     least one Snapshot CR (spec.policyRef attribution), and is \
+                     re-derived from those CRs each collection.",
+                )
+                .with_callback(move |o| {
+                    for p in policy_snapshot_counts(&snapshots.state()) {
+                        o.observe(p.consecutive_failures, &ns_name(&p.namespace, &p.policy));
+                    }
+                })
+                .build();
+        }
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshots_live")
+                .with_description(
+                    "Snapshot CRs currently alive per SnapshotPolicy (labels \
+                     namespace/name, name = the policy name). Bounded by GFS retention \
+                     when `spec.retention` is set; a policy WITHOUT it never prunes (a \
+                     deliberate safe default) and this is the only thing that will tell \
+                     you so. Store-backed: the series exists iff the policy currently \
+                     has at least one Snapshot CR (spec.policyRef attribution).",
+                )
+                .with_callback(move |o| {
+                    for p in policy_snapshot_counts(&snapshots.state()) {
+                        o.observe(p.live, &ns_name(&p.namespace, &p.policy));
+                    }
+                })
+                .build();
+        }
+        // Snapshots parked behind a not-Ready repository (M6, #345): the circuit
+        // breaker holds them Pending (Ready reason `RepositoryNotReady`) rather
+        // than refusing them, so this is the "deferred work" population that
+        // drains automatically once the repository recovers.
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshot_gated")
+                .with_description(
+                    "Snapshots parked behind a not-Ready repository (deferrals, not \
+                     refusals): phase Pending with Ready reason RepositoryNotReady, \
+                     counted per (namespace, policy); the policy label is omitted for \
+                     Snapshots without a policyRef. Store-backed: the series drains \
+                     to absence as the parked Snapshots launch or disappear.",
+                )
+                .with_callback(move |o| {
+                    for g in gated_snapshot_counts(&snapshots.state()) {
+                        let mut attrs = vec![KeyValue::new("namespace", g.namespace.clone())];
+                        if let Some(policy) = g.policy.as_ref() {
+                            attrs.push(KeyValue::new("policy", policy.clone()));
+                        }
+                        o.observe(g.count, &attrs);
+                    }
+                })
+                .build();
+        }
+        // Repository circuit-breaker observability (M6, #345), over BOTH
+        // repository stores. `kind`/`namespace`/`name` labeling matches
+        // `kopiur_resource_phase`: a ClusterRepository carries namespace="".
+        //
+        // The consecutive-failures gauge is emitted whenever `status.health`
+        // exists (the probe has run at least once): a 0 after recovery is the
+        // informative "streak cleared" signal, and the store-backed philosophy —
+        // a series exists iff it is meaningful, and dies with the CR — is
+        // preserved because absence of health status (probe disabled / never
+        // ran) is genuinely "unknown", not a healthy 0.
+        {
+            let repositories = stores.repositories.clone();
+            let cluster_repositories = stores.cluster_repositories.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_repository_consecutive_backend_failures")
+                .with_description(
+                    "Consecutive failed backend connects (health probe + strict \
+                     retries) from status.health.consecutiveProbeFailures, per \
+                     repository (kind/namespace/name; namespace is empty for a \
+                     ClusterRepository). Emitted whenever health status exists — a 0 \
+                     after recovery is informative — and absent when the probe has \
+                     never run; the series dies with the CR.",
+                )
+                .with_callback(move |o| {
+                    for r in repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(n) = repo_consecutive_backend_failures(st.health.as_ref()) {
+                            o.observe(
+                                n,
+                                &repo_health_attrs(
+                                    "Repository",
+                                    &r.namespace().unwrap_or_default(),
+                                    &r.name_any(),
+                                ),
+                            );
+                        }
+                    }
+                    for r in cluster_repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(n) = repo_consecutive_backend_failures(st.health.as_ref()) {
+                            o.observe(
+                                n,
+                                &repo_health_attrs("ClusterRepository", "", &r.name_any()),
+                            );
+                        }
+                    }
+                })
+                .build();
+        }
+        // Breaker-open marker: the series EXISTS only while the breaker is open
+        // (phase Degraded + BackendReachable=False) and its value is the episode
+        // start (status.health.firstFailureAt), so `time() - metric` is "how long
+        // has this breaker been open" and recovery removes the series entirely.
+        {
+            let repositories = stores.repositories.clone();
+            let cluster_repositories = stores.cluster_repositories.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_repository_breaker_open_since_timestamp_seconds")
+                .with_description(
+                    "Unix timestamp of status.health.firstFailureAt, emitted ONLY \
+                     while the repository circuit breaker is open (phase Degraded \
+                     with BackendReachable=False), per repository (kind/namespace/ \
+                     name; namespace is empty for a ClusterRepository). The series \
+                     disappears when the breaker closes.",
+                )
+                .with_callback(move |o| {
+                    for r in repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(ts) =
+                            breaker_open_since(st.phase, st.health.as_ref(), &st.conditions)
+                        {
+                            o.observe(
+                                ts,
+                                &repo_health_attrs(
+                                    "Repository",
+                                    &r.namespace().unwrap_or_default(),
+                                    &r.name_any(),
+                                ),
+                            );
+                        }
+                    }
+                    for r in cluster_repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(ts) =
+                            breaker_open_since(st.phase, st.health.as_ref(), &st.conditions)
+                        {
+                            o.observe(
+                                ts,
+                                &repo_health_attrs("ClusterRepository", "", &r.name_any()),
+                            );
+                        }
+                    }
+                })
+                .build();
+        }
     }
 
     // ---- backup business metrics -------------------------------------------
@@ -958,12 +1132,6 @@ impl Metrics {
     pub fn set_snapshot_verified(&self, ns: &str, name: &str, ts: i64) {
         self.backup_verified_timestamp
             .record(ts, &ns_name(ns, name));
-    }
-
-    /// Set the consecutive-failure count for a SnapshotPolicy.
-    pub fn set_backup_consecutive_failures(&self, ns: &str, name: &str, n: i64) {
-        self.backup_consecutive_failures
-            .record(n, &ns_name(ns, name));
     }
 
     /// Count `n` credential Secrets projected into mover namespace `ns` (opt-in
@@ -1073,11 +1241,6 @@ impl Metrics {
         self.projected_secrets_live.record(n, &[]);
     }
 
-    /// Record the `Snapshot` CRs alive for one SnapshotPolicy.
-    pub fn set_snapshots_live(&self, ns: &str, name: &str, n: i64) {
-        self.snapshots_live.record(n, &ns_name(ns, name));
-    }
-
     /// Count a Snapshot CR created by a SnapshotSchedule.
     pub fn inc_schedule_backup_created(&self, ns: &str, name: &str) {
         self.schedule_backups_created.add(1, &ns_name(ns, name));
@@ -1122,6 +1285,25 @@ impl Metrics {
                 KeyValue::new("name", name.to_string()),
                 KeyValue::new("kind", kind.to_string()),
                 KeyValue::new("outcome", outcome.to_string()),
+            ],
+        );
+    }
+
+    /// Count a circuit-breaker opening (#345 M4): the repository transitioned to
+    /// `Degraded` because the backend probe exceeded `failureThreshold` under
+    /// `onFailure: Degrade`. Fired on the TRANSITION only (never on re-confirmed
+    /// failures while already open). `kind` is `Repository`/`ClusterRepository`
+    /// (`ns` empty for the latter); `probe_kind` is `vanished`/`unreachable`
+    /// ([`crate::health::ProbeFailureKind::label`]), matching the
+    /// health-probe-failure `outcome` label so the two counters join.
+    pub fn inc_breaker_trip(&self, kind: &str, ns: &str, name: &str, probe_kind: &str) {
+        self.breaker_trips.add(
+            1,
+            &[
+                KeyValue::new("kind", kind.to_string()),
+                KeyValue::new("namespace", ns.to_string()),
+                KeyValue::new("name", name.to_string()),
+                KeyValue::new("probe_kind", probe_kind.to_string()),
             ],
         );
     }
@@ -1480,6 +1662,151 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
     out
 }
 
+/// Per-(namespace, policy) Snapshot population figures for the store-backed
+/// `kopiur_snapshots_live` / `kopiur_snapshot_consecutive_failures` gauges.
+#[derive(Debug, Clone, PartialEq)]
+struct PolicySnapshots {
+    namespace: String,
+    policy: String,
+    /// Snapshot CRs currently carrying this policy's `spec.policyRef`.
+    live: i64,
+    /// Trailing Failed streak before the latest Succeeded terminal backup
+    /// ([`crate::snapshot_policy::consecutive_failures`]).
+    consecutive_failures: i64,
+}
+
+/// Group a Snapshot set per (namespace, policy) — the same `spec.policyRef`
+/// attribution as `kopiur_resource_phase` (Snapshots without a `policyRef` never
+/// participate) — and reduce each group to its live count + consecutive-failure
+/// streak. Pure so the store-derivation is unit-tested off-OTel; output sorted
+/// for deterministic tests.
+fn policy_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<PolicySnapshots> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<(String, String), Vec<&Snapshot>> = HashMap::new();
+    for s in snapshots {
+        let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
+            continue;
+        };
+        groups
+            .entry((s.namespace().unwrap_or_default(), policy))
+            .or_default()
+            .push(s.as_ref());
+    }
+    let mut out: Vec<PolicySnapshots> = groups
+        .into_iter()
+        .map(|((namespace, policy), group)| PolicySnapshots {
+            namespace,
+            policy,
+            live: group.len() as i64,
+            consecutive_failures: crate::snapshot_policy::consecutive_failures(
+                group.iter().copied(),
+            ),
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
+    });
+    out
+}
+
+/// Per-(namespace, policy) count of gated Snapshots for `kopiur_snapshot_gated`;
+/// `policy` is `None` (label omitted) for Snapshots without a `policyRef`.
+#[derive(Debug, Clone, PartialEq)]
+struct GatedSnapshots {
+    namespace: String,
+    policy: Option<String>,
+    count: i64,
+}
+
+/// Whether a `Snapshot` is currently parked behind a not-Ready repository:
+/// phase `Pending` (or unset — a just-created CR defaults to `Pending`) AND the
+/// `Ready` condition carries reason `RepositoryNotReady`. Pure so the gating
+/// predicate is unit-tested off-OTel.
+fn snapshot_gated(s: &Snapshot) -> bool {
+    let phase = s.status.as_ref().and_then(|st| st.phase);
+    if !matches!(phase, None | Some(SnapshotPhase::Pending)) {
+        return false;
+    }
+    s.status.as_ref().is_some_and(|st| {
+        st.conditions.iter().any(|c| {
+            c.type_ == crate::consts::READY_CONDITION
+                && c.reason == crate::consts::REPOSITORY_NOT_READY_REASON
+        })
+    })
+}
+
+/// Reduce a Snapshot set to the gated population per (namespace, policy). Pure;
+/// output sorted for deterministic tests.
+fn gated_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<GatedSnapshots> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(String, Option<String>), i64> = HashMap::new();
+    for s in snapshots {
+        if !snapshot_gated(s) {
+            continue;
+        }
+        let policy = s.spec.policy_ref.as_ref().map(|p| p.name.clone());
+        *counts
+            .entry((s.namespace().unwrap_or_default(), policy))
+            .or_default() += 1;
+    }
+    let mut out: Vec<GatedSnapshots> = counts
+        .into_iter()
+        .map(|((namespace, policy), count)| GatedSnapshots {
+            namespace,
+            policy,
+            count,
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.namespace, &a.policy).cmp(&(&b.namespace, &b.policy)));
+    out
+}
+
+/// `kind`/`namespace`/`name` attributes for the repository breaker gauges,
+/// matching `kopiur_resource_phase` (a `ClusterRepository` gets `namespace=""`).
+fn repo_health_attrs(kind: &'static str, ns: &str, name: &str) -> [KeyValue; 3] {
+    [
+        KeyValue::new("kind", kind),
+        KeyValue::new("namespace", ns.to_string()),
+        KeyValue::new("name", name.to_string()),
+    ]
+}
+
+/// Value for `kopiur_repository_consecutive_backend_failures`: `Some` whenever
+/// health status exists (the probe has run), defaulting an unset counter to 0 —
+/// a recovered repository's explicit 0 is informative, while a repository whose
+/// probe never ran is genuinely unknown and gets no series. Pure so the
+/// emission rule is unit-tested off-OTel.
+fn repo_consecutive_backend_failures(
+    health: Option<&kopiur_api::repository::RepositoryHealthStatus>,
+) -> Option<i64> {
+    health.map(|h| h.consecutive_probe_failures.unwrap_or(0))
+}
+
+/// Value for `kopiur_repository_breaker_open_since_timestamp_seconds`: `Some`
+/// (the `firstFailureAt` unix seconds) ONLY while the breaker is open — phase
+/// `Degraded` AND `BackendReachable=False` — so the series exists exactly for
+/// the open window and disappears on recovery. Pure so the open-window rule is
+/// unit-tested off-OTel.
+fn breaker_open_since(
+    phase: Option<kopiur_api::RepositoryPhase>,
+    health: Option<&kopiur_api::repository::RepositoryHealthStatus>,
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Option<i64> {
+    if phase != Some(kopiur_api::RepositoryPhase::Degraded) {
+        return None;
+    }
+    let backend_unreachable = conditions
+        .iter()
+        .any(|c| c.type_ == crate::consts::BACKEND_REACHABLE_CONDITION && c.status == "False");
+    if !backend_unreachable {
+        return None;
+    }
+    health?
+        .first_failure_at
+        .as_deref()
+        .and_then(parse_unix_seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,6 +1876,10 @@ mod tests {
     }
 
     fn repository_cr(ns: &str, name: &str, phase: &str) -> Repository {
+        repository_cr_with_status(ns, name, serde_json::json!({ "phase": phase }))
+    }
+
+    fn repository_cr_with_status(ns: &str, name: &str, status: serde_json::Value) -> Repository {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "kopiur.home-operations.com/v1alpha1",
             "kind": "Repository",
@@ -1557,12 +1888,19 @@ mod tests {
                 "backend": { "filesystem": { "path": "/repo" } },
                 "encryption": { "passwordSecretRef": { "name": "s" } },
             },
-            "status": { "phase": phase },
+            "status": status,
         }))
         .expect("valid Repository")
     }
 
     fn cluster_repository_cr(name: &str, phase: &str) -> ClusterRepository {
+        cluster_repository_cr_with_status(name, serde_json::json!({ "phase": phase }))
+    }
+
+    fn cluster_repository_cr_with_status(
+        name: &str,
+        status: serde_json::Value,
+    ) -> ClusterRepository {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "kopiur.home-operations.com/v1alpha1",
             "kind": "ClusterRepository",
@@ -1572,7 +1910,7 @@ mod tests {
                 "encryption": { "passwordSecretRef": { "name": "s" } },
                 "allowedNamespaces": { "all": true },
             },
-            "status": { "phase": phase },
+            "status": status,
         }))
         .expect("valid ClusterRepository")
     }
@@ -2302,5 +2640,456 @@ mod tests {
             text.contains("repo_kind=\"unknown\"") && text.contains("repo_name=\"unknown\""),
             "{text}"
         );
+    }
+
+    // --- M6 (#345): migrated per-policy gauges + breaker observability ---
+
+    /// Extract the value of the first series of `metric` whose labels contain
+    /// every `contains` fragment; `None` when no such series exists.
+    fn series_value(text: &str, metric: &str, contains: &[&str]) -> Option<String> {
+        text.lines()
+            .find(|l| {
+                l.starts_with(&format!("{metric}{{")) && contains.iter().all(|c| l.contains(c))
+            })
+            .map(|l| l.rsplit(' ').next().unwrap().to_string())
+    }
+
+    /// The migrated `kopiur_snapshot_consecutive_failures` / `kopiur_snapshots_live`
+    /// gauges derive from the Snapshot store per (namespace, policy) — labels stay
+    /// {namespace, name} with name = the policy name — and their series disappear
+    /// with the last Snapshot CR (the #172/#175 property the old sync gauges lacked).
+    #[test]
+    fn migrated_policy_gauges_derive_from_store_and_disappear() {
+        let m = Metrics::new();
+        let succeeded = snapshot_cr(
+            "apps",
+            "db-1",
+            Some("daily"),
+            succeeded_status(100, 10, "2026-05-24T00:00:00Z"),
+        );
+        let failed = snapshot_cr(
+            "apps",
+            "db-2",
+            Some("daily"),
+            serde_json::json!({
+                "phase": "Failed",
+                "timing": { "endTime": END_TIME },
+            }),
+        );
+        // Non-terminal: counts toward live, never toward the streak.
+        let running = snapshot_cr(
+            "apps",
+            "db-3",
+            Some("daily"),
+            serde_json::json!({ "phase": "Running" }),
+        );
+        // A discovered Snapshot (no policyRef) participates in NEITHER gauge.
+        let discovered = snapshot_cr(
+            "apps",
+            "disc",
+            None,
+            serde_json::json!({ "phase": "Discovered" }),
+        );
+
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        for cr in [&succeeded, &failed, &running, &discovered] {
+            writer.apply_watcher_event(&watcher::Event::Apply(cr.clone()));
+        }
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert_eq!(
+            series_value(
+                &text,
+                "kopiur_snapshot_consecutive_failures",
+                &["namespace=\"apps\"", "name=\"daily\""],
+            )
+            .as_deref(),
+            Some("1"),
+            "trailing Failed after the Succeeded one: {text}"
+        );
+        assert_eq!(
+            series_value(
+                &text,
+                "kopiur_snapshots_live",
+                &["namespace=\"apps\"", "name=\"daily\""],
+            )
+            .as_deref(),
+            Some("3"),
+            "all three policyRef'd CRs count as live: {text}"
+        );
+        // The policy-less Snapshot minted no series of its own.
+        assert!(
+            series_value(&text, "kopiur_snapshots_live", &["name=\"disc\""]).is_none(),
+            "{text}"
+        );
+
+        // Delete every Snapshot of the policy: both series vanish (no lingering
+        // 0 — the defect class the sync gauges had).
+        for cr in [succeeded, failed, running] {
+            writer.apply_watcher_event(&watcher::Event::Delete(cr));
+        }
+        let after = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            series_value(
+                &after,
+                "kopiur_snapshot_consecutive_failures",
+                &["name=\"daily\""]
+            )
+            .is_none(),
+            "{after}"
+        );
+        assert!(
+            series_value(&after, "kopiur_snapshots_live", &["name=\"daily\""]).is_none(),
+            "{after}"
+        );
+    }
+
+    /// A Snapshot parked behind a not-Ready repository: Pending with the Ready
+    /// condition carrying reason `RepositoryNotReady`.
+    fn gated_snapshot(ns: &str, name: &str, policy: Option<&str>) -> Snapshot {
+        snapshot_cr(
+            ns,
+            name,
+            policy,
+            serde_json::json!({
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "RepositoryNotReady",
+                    "message": "waiting for the repository",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        )
+    }
+
+    #[test]
+    fn gated_predicate_requires_pending_and_the_repository_not_ready_reason() {
+        assert!(snapshot_gated(&gated_snapshot("apps", "a", Some("daily"))));
+        // A Pending Snapshot held for a DIFFERENT reason (e.g. preflight) is not gated.
+        let preflight = snapshot_cr(
+            "apps",
+            "b",
+            None,
+            serde_json::json!({
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "PreflightFailed",
+                    "message": "check failed",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        );
+        assert!(!snapshot_gated(&preflight));
+        // A Running Snapshot with a stale RepositoryNotReady condition is not gated:
+        // the phase gate keeps a launched backup out of the parked count.
+        let mut launched = gated_snapshot("apps", "c", None);
+        launched.status.as_mut().unwrap().phase = Some(SnapshotPhase::Running);
+        assert!(!snapshot_gated(&launched));
+        // No status at all: nothing to read, not gated.
+        let mut bare = gated_snapshot("apps", "d", None);
+        bare.status = None;
+        assert!(!snapshot_gated(&bare));
+    }
+
+    #[test]
+    fn gated_gauge_counts_per_policy_and_omits_the_policy_label_when_unset() {
+        let m = Metrics::new();
+        let g1 = gated_snapshot("apps", "g1", Some("daily"));
+        let g2 = gated_snapshot("apps", "g2", Some("daily"));
+        let adhoc = gated_snapshot("apps", "adhoc", None);
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        for cr in [&g1, &g2, &adhoc] {
+            writer.apply_watcher_event(&watcher::Event::Apply(cr.clone()));
+        }
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert_eq!(
+            series_value(&text, "kopiur_snapshot_gated", &["policy=\"daily\""]).as_deref(),
+            Some("2"),
+            "{text}"
+        );
+        // The policy-less parked Snapshot lands in a series WITHOUT a policy label.
+        let no_policy_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("kopiur_snapshot_gated{")
+                    && l.contains("namespace=\"apps\"")
+                    && !l.contains("policy=")
+            })
+            .unwrap_or_else(|| panic!("missing policy-less gated series: {text}"));
+        assert!(
+            !no_policy_line.trim_end().ends_with(" 2"),
+            "{no_policy_line}"
+        );
+        assert!(
+            no_policy_line.trim_end().ends_with(" 1"),
+            "{no_policy_line}"
+        );
+
+        // Recovery: the repository came back and one parked Snapshot launched —
+        // its updated (Running) copy leaves the gated population, and once every
+        // parked CR is gone the series disappears entirely.
+        let mut launched = g1.clone();
+        launched.status.as_mut().unwrap().phase = Some(SnapshotPhase::Running);
+        writer.apply_watcher_event(&watcher::Event::Apply(launched));
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert_eq!(
+            series_value(&text, "kopiur_snapshot_gated", &["policy=\"daily\""]).as_deref(),
+            Some("1"),
+            "{text}"
+        );
+        let mut launched2 = g2.clone();
+        launched2.status.as_mut().unwrap().phase = Some(SnapshotPhase::Running);
+        writer.apply_watcher_event(&watcher::Event::Apply(launched2));
+        writer.apply_watcher_event(&watcher::Event::Delete(adhoc));
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("kopiur_snapshot_gated{")),
+            "gated series must all disappear on recovery: {text}"
+        );
+    }
+
+    /// Health status for a repository with a failing-probe streak, the loud
+    /// condition, and the breaker open (phase supplied by the caller).
+    fn unreachable_health_status(phase: &str, failures: i64) -> serde_json::Value {
+        serde_json::json!({
+            "phase": phase,
+            "health": {
+                "consecutiveProbeFailures": failures,
+                "firstFailureAt": END_TIME,
+            },
+            "conditions": [{
+                "type": "BackendReachable",
+                "status": "False",
+                "reason": "BackendUnreachable",
+                "message": "connect failed",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            }],
+        })
+    }
+
+    #[test]
+    fn repository_backend_failure_gauges_cover_both_kinds_and_close_with_recovery() {
+        let m = Metrics::new();
+        let degraded =
+            repository_cr_with_status("apps", "nas", unreachable_health_status("Degraded", 4));
+        // Recovered ClusterRepository: health exists with the streak cleared —
+        // the 0 IS emitted (informative), but no breaker-open series.
+        let recovered = cluster_repository_cr_with_status(
+            "shared",
+            serde_json::json!({
+                "phase": "Ready",
+                "health": { "lastHealthyAt": END_TIME },
+                "conditions": [{
+                    "type": "BackendReachable",
+                    "status": "True",
+                    "reason": "Reachable",
+                    "message": "ok",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        );
+        // Probe never ran: no health status, no series at all.
+        let unprobed = repository_cr("apps", "cold", "Ready");
+
+        let (repo_reader, mut repo_writer) = reflector::store::<Repository>();
+        repo_writer.apply_watcher_event(&watcher::Event::Apply(degraded.clone()));
+        repo_writer.apply_watcher_event(&watcher::Event::Apply(unprobed));
+        let crepos = make_store(vec![recovered]);
+        let (snaps, _, _, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: snaps.0,
+            repositories: repo_reader,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert_eq!(
+            series_value(
+                &text,
+                "kopiur_repository_consecutive_backend_failures",
+                &["kind=\"Repository\"", "namespace=\"apps\"", "name=\"nas\""],
+            )
+            .as_deref(),
+            Some("4"),
+            "{text}"
+        );
+        // Cluster-scoped: namespace="" like kopiur_resource_phase; recovered → 0.
+        assert_eq!(
+            series_value(
+                &text,
+                "kopiur_repository_consecutive_backend_failures",
+                &[
+                    "kind=\"ClusterRepository\"",
+                    "namespace=\"\"",
+                    "name=\"shared\""
+                ],
+            )
+            .as_deref(),
+            Some("0"),
+            "{text}"
+        );
+        // No health status → no series (unknown, not a healthy 0).
+        assert!(
+            series_value(
+                &text,
+                "kopiur_repository_consecutive_backend_failures",
+                &["name=\"cold\""],
+            )
+            .is_none(),
+            "{text}"
+        );
+        // The breaker-open marker exists ONLY for the Degraded+unreachable repo,
+        // valued at firstFailureAt.
+        assert_eq!(
+            series_value(
+                &text,
+                "kopiur_repository_breaker_open_since_timestamp_seconds",
+                &["kind=\"Repository\"", "name=\"nas\""],
+            )
+            .as_deref(),
+            Some(END_UNIX.to_string().as_str()),
+            "{text}"
+        );
+        assert!(
+            series_value(
+                &text,
+                "kopiur_repository_breaker_open_since_timestamp_seconds",
+                &["name=\"shared\""],
+            )
+            .is_none(),
+            "no breaker-open series for a closed breaker: {text}"
+        );
+
+        // The breaker closes (a connect succeeded): phase back to Ready, condition
+        // True, streak 0 — the open-since series vanishes, the failures gauge drops
+        // to an explicit 0.
+        let healed = repository_cr_with_status(
+            "apps",
+            "nas",
+            serde_json::json!({
+                "phase": "Ready",
+                "health": { "consecutiveProbeFailures": 0, "lastHealthyAt": END_TIME },
+                "conditions": [{
+                    "type": "BackendReachable",
+                    "status": "True",
+                    "reason": "Reachable",
+                    "message": "ok",
+                    "lastTransitionTime": "2026-01-02T00:00:00Z",
+                }],
+            }),
+        );
+        repo_writer.apply_watcher_event(&watcher::Event::Apply(healed));
+        let after = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            series_value(
+                &after,
+                "kopiur_repository_breaker_open_since_timestamp_seconds",
+                &["name=\"nas\""],
+            )
+            .is_none(),
+            "open-since series must disappear when the breaker closes: {after}"
+        );
+        assert_eq!(
+            series_value(
+                &after,
+                "kopiur_repository_consecutive_backend_failures",
+                &["name=\"nas\""],
+            )
+            .as_deref(),
+            Some("0"),
+            "{after}"
+        );
+
+        // And the CR's deletion removes the remaining series entirely.
+        repo_writer.apply_watcher_event(&watcher::Event::Delete(degraded));
+        let gone = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            series_value(
+                &gone,
+                "kopiur_repository_consecutive_backend_failures",
+                &["name=\"nas\""],
+            )
+            .is_none(),
+            "{gone}"
+        );
+    }
+
+    #[test]
+    fn breaker_open_since_requires_degraded_phase_and_the_false_condition() {
+        use kopiur_api::RepositoryPhase;
+        let health: kopiur_api::repository::RepositoryHealthStatus = serde_json::from_value(
+            serde_json::json!({ "consecutiveProbeFailures": 3, "firstFailureAt": END_TIME }),
+        )
+        .unwrap();
+        let unreachable: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(serde_json::json!([{
+                "type": "BackendReachable",
+                "status": "False",
+                "reason": "BackendUnreachable",
+                "message": "down",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            }]))
+            .unwrap();
+
+        // Open: Degraded + BackendReachable=False → firstFailureAt.
+        assert_eq!(
+            breaker_open_since(Some(RepositoryPhase::Degraded), Some(&health), &unreachable),
+            Some(END_UNIX)
+        );
+        // Degraded for a NON-breaker reason (condition not False) → absent: a
+        // retryable bootstrap failure is Degraded too, but it is not an open breaker.
+        assert_eq!(
+            breaker_open_since(Some(RepositoryPhase::Degraded), Some(&health), &[]),
+            None
+        );
+        // Not Degraded → absent even with a stale False condition.
+        assert_eq!(
+            breaker_open_since(Some(RepositoryPhase::Ready), Some(&health), &unreachable),
+            None
+        );
+        // Open but no firstFailureAt recorded → no fabricated timestamp.
+        let no_first: kopiur_api::repository::RepositoryHealthStatus =
+            serde_json::from_value(serde_json::json!({ "consecutiveProbeFailures": 3 })).unwrap();
+        assert_eq!(
+            breaker_open_since(
+                Some(RepositoryPhase::Degraded),
+                Some(&no_first),
+                &unreachable
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn repo_consecutive_backend_failures_emits_iff_health_exists() {
+        assert_eq!(repo_consecutive_backend_failures(None), None);
+        let empty: kopiur_api::repository::RepositoryHealthStatus =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(repo_consecutive_backend_failures(Some(&empty)), Some(0));
+        let failing: kopiur_api::repository::RepositoryHealthStatus =
+            serde_json::from_value(serde_json::json!({ "consecutiveProbeFailures": 7 })).unwrap();
+        assert_eq!(repo_consecutive_backend_failures(Some(&failing)), Some(7));
     }
 }

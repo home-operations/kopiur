@@ -184,6 +184,67 @@ fn only_result_less_job_failures_recycle_for_retry() {
     assert!(!BootstrapFailure::RepositoryNotInitialized.recycles_for_retry());
 }
 
+// --- #345 M4: the strict-verdict reroute. A `RepositoryUnavailable` verdict on
+// a once-bootstrapped repository recycles-and-retries as `Degraded` (feeding the
+// unified backend sensor) instead of parking terminal `Failed` — without it, a
+// breaker-opened `Degraded` repository is overwritten to `Failed` one pass later
+// by its own strict retry. Everything else keeps its pre-M4 route. ---
+#[test]
+fn only_a_bootstrapped_backend_outage_reroutes_to_degraded() {
+    let backend = |class: KopiaErrorClass| BootstrapFailure::Backend {
+        class,
+        message: "boom".to_string(),
+    };
+
+    // THE reroute: RepositoryUnavailable + bootstrapped.
+    assert!(
+        backend(KopiaErrorClass::RepositoryUnavailable).retryable_outage_for_bootstrapped(true),
+        "an outage on a once-bootstrapped repo must retry as Degraded, not park Failed"
+    );
+    // A never-bootstrapped repo keeps fail-fast terminal Failed: a
+    // first-bootstrap misconfiguration must still fail loudly for GitOps.
+    assert!(
+        !backend(KopiaErrorClass::RepositoryUnavailable).retryable_outage_for_bootstrapped(false)
+    );
+
+    // Deliberately NOT `class.is_retryable()`: Locked (a stale kopia lock) and
+    // SourceError are not outages — looping them Degraded forever would hide
+    // them (audit 3c). Every other class needs a config change anyway.
+    for class in [
+        KopiaErrorClass::Locked,
+        KopiaErrorClass::SourceError,
+        KopiaErrorClass::AuthFailure,
+        KopiaErrorClass::AccessDenied,
+        KopiaErrorClass::PermissionDenied,
+        KopiaErrorClass::NotFound,
+        KopiaErrorClass::Unknown,
+    ] {
+        assert!(
+            !backend(class).retryable_outage_for_bootstrapped(true),
+            "{class:?} must keep its pre-M4 terminal park"
+        );
+        assert!(!backend(class).retryable_outage_for_bootstrapped(false));
+    }
+
+    // The create-disabled / wiped-backend sentinel NEVER reroutes: while
+    // Degraded the strict retry runs with auto-create forbidden, so this
+    // verdict is exactly how a real wipe escalates out of the retry loop to a
+    // visible terminal Failed.
+    assert!(!BootstrapFailure::RepositoryNotInitialized.retryable_outage_for_bootstrapped(true));
+    assert!(!BootstrapFailure::RepositoryNotInitialized.retryable_outage_for_bootstrapped(false));
+
+    // A result-less Job failure is JobFailedWithoutResult's own route
+    // (recycles_for_retry, flat 120s) — unaffected by M4.
+    let result_less = BootstrapFailure::JobFailedWithoutResult {
+        job_name: "repo-discovery".to_string(),
+    };
+    assert!(!result_less.retryable_outage_for_bootstrapped(true));
+    assert!(
+        result_less.recycles_for_retry(),
+        "the result-less recycle route must survive M4 untouched"
+    );
+}
+
 #[test]
 fn bootstrap_failure_job_without_result_has_its_own_reason_and_actionable_message() {
     let f = BootstrapFailure::JobFailedWithoutResult {
@@ -2224,6 +2285,7 @@ mod bootstrap_outcomes {
             stderr_tail: None,
             exit_code: Some(1),
             retry_recommended: false,
+            op: None,
         });
         match bootstrap_outcome(Some(bad), false, "boot-x") {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
@@ -2281,6 +2343,7 @@ mod bootstrap_outcomes {
             stderr_tail: None,
             exit_code: Some(1),
             retry_recommended: false,
+            op: None,
         });
         match bootstrap_outcome(Some(bad), false, "boot-x") {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, .. }) => {

@@ -515,6 +515,80 @@ pub fn cluster_repository_to_deleting_snapshots(
     })
 }
 
+// --- M5 (#345): repository -> PENDING Snapshots (readiness-gate resume) ------
+
+/// Whether a `Snapshot` is parked BEFORE its mover Job launched — the set the
+/// repository-readiness gate (`io::repository_ready`, snapshot reconciler) can be
+/// holding, which must re-reconcile promptly when its repository recovers instead
+/// of waiting out the gate's 15s requeue. Phase `Pending` (or none at all: freshly
+/// created), and not deleting (a terminating Snapshot is the ack-drain mappers'
+/// business). Exhaustive over [`kopiur_api::snapshot::SnapshotPhase`], so a new
+/// phase must decide its membership here before it compiles.
+fn snapshot_awaiting_launch(s: &Snapshot) -> bool {
+    use kopiur_api::snapshot::SnapshotPhase;
+    if s.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    match s.status.as_ref().and_then(|st| st.phase) {
+        None | Some(SnapshotPhase::Pending) => true,
+        Some(
+            SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered,
+        ) => false,
+    }
+}
+
+/// [`snapshot_awaiting_launch`] scoped to one namespace — the per-object predicate
+/// behind [`repository_to_pending_snapshots`], split out so the matching is
+/// unit-testable without a reflector store.
+fn pending_snapshot_in_namespace(s: &Snapshot, ns: &str) -> bool {
+    snapshot_awaiting_launch(s) && s.namespace().as_deref() == Some(ns)
+}
+
+/// PENDING (not-yet-launched) Snapshots potentially gated on the changed namespaced
+/// `Repository`, so a repository flipping back to `Ready` resumes them at once
+/// instead of on their 15s requeue.
+///
+/// **Namespace-broadcast (deliberate — precise matching is impossible here).** A
+/// gated Snapshot carries NO repository reference of any kind: its spec has only
+/// `policyRef` (the repository comes from the policy's `spec.repository`, a
+/// two-hop join needing a `SnapshotPolicy` reflector this mapper does not have —
+/// same constraint [`repository_to_schedules`] documents), and
+/// `status.resolved.repository` is pinned only at mover-Job launch — which is
+/// exactly what the readiness gate prevented. Discovered Snapshots do carry a
+/// repository ownerRef, but they are never pre-launch (`Discovered` phase) and are
+/// excluded by the pending filter anyway. So, mirroring the schedule mapper:
+/// policies (and thus their namespace-defaulted repositories) live in the
+/// Snapshot's own namespace by construction, so enqueue every pre-launch Snapshot
+/// in the changed repository's namespace. Pending Snapshots are few and transient,
+/// and a spurious reconcile is one repository GET + a byte-stable no-op patch; the
+/// only miss is a policy whose repository ref crosses namespaces, still covered by
+/// the gate's own 15s requeue.
+pub fn repository_to_pending_snapshots(
+    store: &Store<Snapshot>,
+    repo: &Repository,
+) -> Vec<ObjectRef<Snapshot>> {
+    let Some(ns) = repo.namespace() else {
+        return Vec::new();
+    };
+    select(store, |s: &Snapshot| pending_snapshot_in_namespace(s, &ns))
+}
+
+/// PENDING Snapshots potentially gated on the changed `ClusterRepository`. A
+/// `ClusterRepository` can be referenced from any namespace, so — as with
+/// [`cluster_repository_to_schedules`] — the affected namespaces are unbounded and
+/// every pre-launch Snapshot cluster-wide is enqueued (same cost/idempotence
+/// rationale as [`repository_to_pending_snapshots`]).
+pub fn cluster_repository_to_pending_snapshots(
+    store: &Store<Snapshot>,
+    _repo: &ClusterRepository,
+) -> Vec<ObjectRef<Snapshot>> {
+    select(store, snapshot_awaiting_launch)
+}
+
 // --- Namespace -> privileged-mover-blocked Snapshot / Restore ----------------
 
 /// Whether `conditions` carry a `MoverPermitted != True` entry — the marker a
@@ -700,6 +774,88 @@ mod tests {
         let cpin = rref(RepositoryKind::ClusterRepository, "nas", None);
         let s = snap("f", true, true, Some(cpin));
         assert!(!deleting_snapshot_targets_repository(&s, "backups", "nas"));
+    }
+
+    // --- M5 (#345): repository -> pending Snapshots (readiness-gate resume) ---
+
+    fn snap_in_phase(
+        name: &str,
+        phase: Option<kopiur_api::snapshot::SnapshotPhase>,
+        deleting: bool,
+    ) -> Snapshot {
+        use kopiur_api::snapshot::{SnapshotSpec, SnapshotStatus};
+        let mut s = Snapshot::new(
+            name,
+            SnapshotSpec {
+                policy_ref: None,
+                tags: None,
+                failure_policy: None,
+                deletion_policy: None,
+                on_schedule_delete: None,
+                pin: false,
+                description: None,
+            },
+        );
+        s.metadata.namespace = Some("media".into());
+        if deleting {
+            s.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ));
+        }
+        s.status = phase.map(|p| SnapshotStatus {
+            phase: Some(p),
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn pending_snapshot_mapper_matches_only_pre_launch_non_deleting() {
+        use kopiur_api::snapshot::SnapshotPhase;
+        // Pending — and a freshly created Snapshot with no status at all — are
+        // the readiness gate's parking set: matched.
+        assert!(snapshot_awaiting_launch(&snap_in_phase(
+            "a",
+            Some(SnapshotPhase::Pending),
+            false
+        )));
+        assert!(snapshot_awaiting_launch(&snap_in_phase("b", None, false)));
+        // Launched / settled phases are never re-gated: skipped.
+        for phase in [
+            SnapshotPhase::Running,
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+        ] {
+            assert!(
+                !snapshot_awaiting_launch(&snap_in_phase("c", Some(phase), false)),
+                "{phase:?} must not map as pending"
+            );
+        }
+        // Deleting (even while the phase still reads Pending) is the ack-drain
+        // mappers' business, not this one's.
+        assert!(!snapshot_awaiting_launch(&snap_in_phase(
+            "d",
+            Some(SnapshotPhase::Pending),
+            true
+        )));
+    }
+
+    #[test]
+    fn pending_snapshot_mapper_is_a_namespace_broadcast() {
+        use kopiur_api::snapshot::SnapshotPhase;
+        // A pre-launch Snapshot carries no repository reference (spec has only
+        // policyRef; status.resolved.repository is pinned at launch), so the
+        // namespaced mapper matches by NAMESPACE, not by ref.
+        let s = snap_in_phase("a", Some(SnapshotPhase::Pending), false);
+        assert!(pending_snapshot_in_namespace(&s, "media"));
+        // A repository in another namespace does not enqueue it.
+        assert!(!pending_snapshot_in_namespace(&s, "other"));
+        // Non-pending never matches regardless of namespace.
+        let s = snap_in_phase("b", Some(SnapshotPhase::Succeeded), false);
+        assert!(!pending_snapshot_in_namespace(&s, "media"));
     }
 
     #[test]

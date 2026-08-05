@@ -211,6 +211,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                     "maintenance Job failed; see the Job/pod logs",
                 )
                 .await?;
+                nudge_repository_reverify(ctx, maint, &name, &namespace).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
             // Still running — but a mover that can't START (impossible securityContext, bad
@@ -253,6 +254,28 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
             tracing::info!(maint = %name, ?mode, slot = %slot.to_rfc3339(), "spawned maintenance Job");
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
+    }
+}
+
+/// Best-effort nudge asking this Maintenance's repository to re-verify its
+/// backend now (rather than on the next catalog refresh). Called from the
+/// Job-failed arms (cron slot + manual run) unconditionally: the maintenance
+/// mover writes no `status.failure` block (condition-message-only), so there is
+/// no op/class to gate on — and the nudge is cheap, rate-limited (60s per
+/// repo), and Ready-gated inside `request_repository_reverify` (#345).
+/// Best-effort by contract: an error here is logged and swallowed — a nudge
+/// failure must never mask the maintenance failure that triggered it.
+async fn nudge_repository_reverify(
+    ctx: &Context,
+    maint: &Maintenance,
+    name: &str,
+    namespace: &str,
+) {
+    if let Err(e) =
+        io::request_repository_reverify(&ctx.client, &maint.spec.repository, namespace, Utc::now())
+            .await
+    {
+        tracing::debug!(maint = %name, error = %e, "repository reverify nudge failed (ignored)");
     }
 }
 
@@ -384,6 +407,7 @@ async fn handle_manual_run(
                     "manual maintenance Job failed; see the Job/pod logs",
                 )
                 .await?;
+                nudge_repository_reverify(ctx, maint, name, namespace).await;
                 Ok(None)
             }
             None => Ok(Some(Action::requeue(REQUEUE_RUNNING))),

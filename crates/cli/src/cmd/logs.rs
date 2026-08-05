@@ -482,6 +482,7 @@ mod tests {
             stderr_tail: Some("denied".into()),
             exit_code: Some(1),
             retry_recommended: false,
+            op: None,
         };
         let text = gone_fallback("snapshot", "s", Some("tail lines"), Some(&failure));
         assert!(text.contains("no longer exist"));

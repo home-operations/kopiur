@@ -396,6 +396,9 @@ impl BootstrapResult {
                 stderr_tail: None,
                 exit_code: None,
                 retry_recommended: false,
+                // A synthesized outcome, not a kopia invocation failure — the
+                // connect itself succeeded in reporting "no repository here".
+                op: None,
             }),
         }
     }

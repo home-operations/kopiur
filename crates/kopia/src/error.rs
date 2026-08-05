@@ -204,6 +204,22 @@ impl KopiaErrorClass {
             || s.contains("dial tcp")
             || s.contains("no route to host")
             || s.contains("timeout")
+            // DNS resolution failure (Go's net resolver: `lookup <host> …: no
+            // such host`). Deliberately AFTER the NotFound arm above: none of
+            // its substrings ("no such file or directory", "not found", …)
+            // match this phrasing, and keeping it here means it can never
+            // shadow a genuine missing-path classification.
+            || s.contains("no such host")
+            // TLS / certificate failures reaching the backend (Go: `tls: …`,
+            // `x509: certificate signed by unknown authority`, `certificate
+            // has expired`). The endpoint is unreachable-as-configured — the
+            // fix is the endpoint/CA/trust config, and the repository gate
+            // should engage. AFTER the AuthFailure/AccessDenied arms above so
+            // "certificate" can never capture a credential/authorization
+            // message (those arms match their own specific phrasings first).
+            || s.contains("tls:")
+            || s.contains("x509")
+            || s.contains("certificate")
         {
             KopiaErrorClass::RepositoryUnavailable
         } else if s.contains("upload error") || s.contains("failed to prepare source") {
@@ -396,6 +412,73 @@ mod tests {
         assert_eq!(
             KopiaErrorClass::classify("something totally unexpected"),
             KopiaErrorClass::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_dns_and_tls_failures_as_repository_unavailable() {
+        // DNS resolution failure (Go's net resolver phrasing): the backend
+        // hostname doesn't resolve — the backend is unreachable, the gate
+        // should engage (#345).
+        assert_eq!(
+            KopiaErrorClass::classify(
+                "unable to open repository: lookup minio.storage.svc on 10.96.0.10:53: \
+                 no such host"
+            ),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("dial tcp: lookup s3.example.com: no such host"),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        // TLS handshake / certificate trust failures: unreachable-as-configured.
+        assert_eq!(
+            KopiaErrorClass::classify("tls: failed to verify certificate"),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("x509: certificate signed by unknown authority"),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("certificate has expired or is not yet valid"),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        // All of these are transient/config-external → retryable.
+        assert!(KopiaErrorClass::RepositoryUnavailable.is_retryable());
+    }
+
+    #[test]
+    fn widened_arms_do_not_shadow_existing_classifications() {
+        // The new DNS/TLS substrings sit in the RepositoryUnavailable arm,
+        // AFTER every more-specific arm — existing classifications must be
+        // byte-for-byte unchanged.
+        assert_eq!(
+            KopiaErrorClass::classify("invalid repository password"),
+            KopiaErrorClass::AuthFailure
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("access denied"),
+            KopiaErrorClass::AccessDenied
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("no such file or directory"),
+            KopiaErrorClass::NotFound
+        );
+        // A certificate-flavored message that ALSO carries an auth/authz
+        // phrasing still classifies by the earlier, more specific arm.
+        assert_eq!(
+            KopiaErrorClass::classify("certificate auth: access denied"),
+            KopiaErrorClass::AccessDenied
+        );
+        // "not initialized" (empty backend) keeps winning over the connect
+        // prefix — the ordering the NotFound arm's comment documents.
+        assert_eq!(
+            KopiaErrorClass::classify(
+                "error connecting to repository: repository not initialized in the \
+                 provided storage"
+            ),
+            KopiaErrorClass::NotFound
         );
     }
 

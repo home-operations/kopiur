@@ -17,7 +17,8 @@
 use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
-use kopiur_api::repository::RepositoryHealthStatus;
+use kopiur_api::RepositoryPhase;
+use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus};
 
 use crate::consts::{
     BACKEND_REACHABLE_CONDITION, BACKEND_REACHABLE_REASON, BACKEND_UNREACHABLE_REASON,
@@ -179,12 +180,15 @@ pub fn reconcile_index_blob_health(
 }
 
 // ---------------------------------------------------------------------------
-// Backend health probe (`spec.health.probe`) — opt-in, alert-only.
+// Backend health probe (`spec.health.probe`) — default-on since #345.
 //
-// Part A (always-on safety invariant) + Part B (the opt-in periodic probe).
-// Both keep the repository `Ready`: a vanished/unreachable backend is surfaced
-// as the `BackendReachable` condition + a Warning event, NEVER a phase flip
-// (which would halt backups/replication) and NEVER an auto-recreate.
+// Part A (always-on safety invariant) + Part B (the periodic probe).
+// A vanished/unreachable backend is surfaced as the `BackendReachable`
+// condition + a Warning event; what happens past `failureThreshold` is the
+// spec's `onFailure` policy (default `Degrade` — the circuit breaker moves the
+// repository to `Degraded` and pauses backups until a re-connect succeeds;
+// `Alert` keeps the pre-#345 alert-only contract). NEVER an auto-recreate,
+// under either policy.
 // ---------------------------------------------------------------------------
 
 /// **Part A — the data-safety invariant.** kopiur auto-creates a kopia
@@ -364,8 +368,21 @@ pub enum ProbeFailureKind {
     /// a candidate *vanished* repository. Still only an alert.
     Vanished,
     /// Backend unreachable, mount/path missing, or auth/lock failed — NOT a
-    /// confirmed wipe. kopiur never acts on it.
+    /// confirmed wipe. kopiur never treats it as one.
     Unreachable,
+}
+
+impl ProbeFailureKind {
+    /// The stable metric-label value (`vanished` / `unreachable`), shared by the
+    /// `kopiur_repository_health_probe_failures` `outcome` label and the
+    /// `kopiur_repository_breaker_trips` `probe_kind` label so dashboards join
+    /// the two on identical values.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProbeFailureKind::Vanished => "vanished",
+            ProbeFailureKind::Unreachable => "unreachable",
+        }
+    }
 }
 
 /// A Warning event produced by the probe (machine `reason`, remediation `action`,
@@ -461,9 +478,9 @@ pub fn probe_failure_health_patch(health: &RepositoryHealthStatus) -> serde_json
 /// Clearing is not optional. A strict relaunch (spec change, reverify) that merely
 /// *left* a stale stamp alone would have its result re-read as a probe on the next
 /// pass — fabricating `lastHealthyAt` from a connect no probe requested, and (worse)
-/// routing a genuine bootstrap failure into the alert-only `finalize_probe_failure`,
-/// which hard-codes `phase: Ready`. Writing `now | null` at the single launch site
-/// kills that whole class at the source.
+/// routing a genuine bootstrap failure into `finalize_probe_failure`, which under
+/// `onFailure: Alert` (or below the threshold) writes `phase: Ready`. Writing
+/// `now | null` at the single launch site kills that whole class at the source.
 pub fn probe_attempt_health_patch(launched_at: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "probeAttemptAt": match launched_at {
@@ -473,11 +490,115 @@ pub fn probe_attempt_health_patch(launched_at: Option<&str>) -> serde_json::Valu
     })
 }
 
+/// Whether the repository's `BackendReachable` condition is currently `True`.
+/// An absent condition reads as *not* True — the unified success fold then
+/// writes it once (converging to True), so absence never persists past one
+/// successful finalize.
+pub fn backend_reachable_true(conditions: &[Condition]) -> bool {
+    conditions
+        .iter()
+        .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+        .is_some_and(|c| c.status == "True")
+}
+
+/// Why [`success_fold`] decided a successful bootstrap finalize must write
+/// probe-health state. A closed enum so tests (and log lines) can name the
+/// exact trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessFoldReason {
+    /// This finalize is a probe run's own result. Always written — a probe
+    /// consumes (deletes) its Job exactly once, so this can never re-run on the
+    /// same result.
+    Probe,
+    /// First successful strict finalize with no `lastProbeAt` on record: seed
+    /// the stamp so `health_probe_due` (which fires when `lastProbeAt` is
+    /// `None`) does not launch a redundant probe Job fleet-wide right after the
+    /// default-on upgrade — the strict connect that just succeeded IS a fresh
+    /// backend verdict.
+    Seed,
+    /// A failure streak is recorded (or the `BackendReachable` condition is not
+    /// `True`): any successful strict connect is proof the backend is healthy
+    /// again, so heal the stale state. This is what closes the breaker after a
+    /// `Degraded` repository re-connects (M4).
+    Heal,
+}
+
+/// The pieces a successful finalize folds into its status patch when
+/// [`success_fold`] says a write is warranted.
+pub struct SuccessFold {
+    /// Why the write is happening (probe result / seeding / healing).
+    pub reason: SuccessFoldReason,
+    /// The `status.health` merge-patch fragment — [`probe_success_health_patch`],
+    /// which stamps `lastProbeAt`/`lastHealthyAt` and emits the explicit RFC 7386
+    /// nulls that clear the failure debounce and retire `probeAttemptAt`.
+    pub health_patch: serde_json::Value,
+}
+
+/// Decide whether a **successful** bootstrap finalize (probe or strict) should
+/// fold probe-success health state into its status patch — and refuse when it
+/// would change nothing.
+///
+/// **The refusal is the load-bearing part.** The strict-bootstrap success arm
+/// re-runs on EVERY reconcile while the finished bootstrap Job lingers (~1h
+/// TTL), and its status write is guarded by `patch_status_if_changed`: the
+/// steady-state pass must be a byte-stable no-op or the write bumps
+/// `resourceVersion`, re-triggers the reconciler through its own primary
+/// watch, and hot-loops. A naive "stamp `lastProbeAt: now` on every success"
+/// would differ on every pass. So the fold fires only when:
+///
+/// * `probe_run` — a probe's own result; safe to stamp unconditionally because
+///   the probe deletes its Job after finalizing (once-only), or
+/// * `lastProbeAt` was never stamped — one-time seeding (see
+///   [`SuccessFoldReason::Seed`]), or
+/// * a failure streak / non-`True` `BackendReachable` needs healing (see
+///   [`SuccessFoldReason::Heal`]).
+///
+/// In the steady state (strict re-read, seeded, healthy) it returns `None` and
+/// the fold contributes NOTHING to the patch.
+pub fn success_fold(
+    probe_run: bool,
+    health: Option<&RepositoryHealthStatus>,
+    backend_reachable_true: bool,
+    now: &str,
+) -> Option<SuccessFold> {
+    let reason = if probe_run {
+        SuccessFoldReason::Probe
+    } else if health.and_then(|h| h.last_probe_at.as_deref()).is_none() {
+        SuccessFoldReason::Seed
+    } else if health
+        .and_then(|h| h.consecutive_probe_failures)
+        .unwrap_or(0)
+        > 0
+        || health.and_then(|h| h.first_failure_at.as_deref()).is_some()
+        || !backend_reachable_true
+    {
+        SuccessFoldReason::Heal
+    } else {
+        // Steady state: healthy, seeded, not a probe. Writing anything here
+        // (even an identical value with a fresh timestamp) defeats the
+        // byte-stable no-op the finalize arm depends on.
+        return None;
+    };
+    Some(SuccessFold {
+        reason,
+        health_patch: probe_success_health_patch(now),
+    })
+}
+
 /// Fold a **failing** probe into the health state, applying the consecutive-failure
 /// debounce: the loud `BackendReachable=False` condition (and its Warning event)
 /// is raised only once `failure_threshold` consecutive failures have accrued, so a
 /// single transient blip never alarms or nudges a destructive manual recreate.
-/// Phase stays `Ready` regardless — this is alert-only.
+///
+/// **Phase is the caller's concern** and is mode-dependent since M4: the caller
+/// feeds the post-fold streak into [`breaker_verdict`] — under `onFailure:
+/// Alert` (or below the threshold) the phase stays `Ready` (alert-only, the
+/// pre-#345 contract); under the default `Degrade` a threshold-crossing streak
+/// opens the circuit breaker and the caller moves the phase to `Degraded`.
+/// This fn also feeds the STRICT retry loop while the breaker is open (the
+/// recycle-to-`Degraded` path in both `finalize_bootstrap` twins folds it), so
+/// `consecutiveProbeFailures` keeps climbing across probe *and* strict connect
+/// failures — one unified backend sensor.
 ///
 /// The event fires on a *transition*: the first reconcile that crosses the
 /// threshold, or one where the failure *reason* changes (e.g. `BackendUnreachable`
@@ -546,8 +667,9 @@ pub fn reconcile_probe_failure(
             format!(
                 "the repository backend could not be confirmed healthy ({consecutive} consecutive \
                  failing health probes): it is unreachable, the path/mount is missing, or \
-                 credentials/lock failed. This is NOT treated as a wipe and kopiur takes no \
-                 action. Check the backend, credentials, and any mounted volume."
+                 credentials/lock failed. This is NOT treated as a wipe and kopiur never \
+                 auto-recreates (see the Ready condition for what kopiur is doing about it). \
+                 Check the backend, credentials, and any mounted volume."
             ),
         ),
     };
@@ -575,6 +697,238 @@ pub fn reconcile_probe_failure(
         conditions,
         health,
         event,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The repository circuit breaker (#345 M4).
+//
+// The probe (and the strict retry loop) is the sensor; `breaker_verdict` is the
+// switch. Open = phase `Degraded`, which every consumer gate (backups,
+// maintenance, replication) already reads as "paused". Closed again by any
+// successful strict connect via `success_fold`'s Heal case.
+// ---------------------------------------------------------------------------
+
+/// What a threshold-crossing check decides for the repository phase. A closed
+/// two-state enum so both reconcilers `match` exhaustively (CLAUDE.md
+/// "type-safety end-to-end") and a future variant cannot compile unhandled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerVerdict {
+    /// Keep the phase `Ready`: the streak is below the threshold, or the spec
+    /// chose `onFailure: Alert` (alert-only, the pre-#345 contract).
+    StayReady,
+    /// Open the circuit breaker: move the phase to `Degraded`, pausing backups,
+    /// maintenance, and replication until a connect succeeds (recovery is
+    /// automatic via the strict retry loop + `success_fold`).
+    Open,
+}
+
+/// Decide whether a failing backend sensor opens the circuit breaker: `Open`
+/// iff `consecutive >= threshold` (clamped to at least 1, mirroring
+/// [`reconcile_probe_failure`]) AND the effective policy is
+/// [`ProbeOnFailure::Degrade`]. Exhaustive over [`ProbeOnFailure`].
+///
+/// Deliberately does NOT take a [`ProbeFailureKind`]: BOTH kinds open the
+/// breaker. `Unreachable` is the obvious outage; a `Vanished` verdict (backend
+/// reachable, kopia format blob absent) ALSO makes every backup doomed, so
+/// pausing is equally right — and the breaker's own strict re-check escalates a
+/// *real* wipe to terminal `Failed` anyway: while `Degraded`, the strict retry
+/// bootstrap runs with auto-create forbidden (pinned `uniqueId`, see
+/// [`auto_create_allowed`]), so a truly absent repository comes back as the
+/// `RepositoryNotInitialized` verdict, which
+/// [`BootstrapFailure::retryable_outage_for_bootstrapped`](crate::io::BootstrapFailure::retryable_outage_for_bootstrapped)
+/// refuses to recycle — parking the repository visibly at `Failed` instead of
+/// looping `Degraded` forever over a backend that needs a human.
+pub fn breaker_verdict(
+    consecutive: i64,
+    threshold: i64,
+    on_failure: ProbeOnFailure,
+) -> BreakerVerdict {
+    match on_failure {
+        ProbeOnFailure::Alert => BreakerVerdict::StayReady,
+        ProbeOnFailure::Degrade => {
+            if consecutive >= threshold.max(1) {
+                BreakerVerdict::Open
+            } else {
+                BreakerVerdict::StayReady
+            }
+        }
+    }
+}
+
+/// The machine `reason` carried by the kstatus `Ready` condition (and the
+/// breaker-trip Warning event) while the breaker is open — reuses the
+/// `BackendReachable` reason vocabulary so status and event agree on the cause.
+pub fn breaker_reason(kind: ProbeFailureKind) -> &'static str {
+    match kind {
+        ProbeFailureKind::Vanished => REPOSITORY_VANISHED_REASON,
+        ProbeFailureKind::Unreachable => BACKEND_UNREACHABLE_REASON,
+    }
+}
+
+/// The remediation `action` for the breaker-trip Warning event, matching the
+/// probe alert's own kind→action mapping.
+pub fn breaker_action(kind: ProbeFailureKind) -> &'static str {
+    match kind {
+        ProbeFailureKind::Vanished => VERIFY_BACKEND_ACTION,
+        ProbeFailureKind::Unreachable => CHECK_BACKEND_ACTION,
+    }
+}
+
+/// The BYTE-STABLE condition message written while the breaker is open: names
+/// what is paused and that recovery is automatic, with no volatile detail (the
+/// stderr tail rides the Warning event only), so the guarded status write is a
+/// true no-op across repeated identical failures.
+pub fn breaker_open_message(kind: ProbeFailureKind) -> &'static str {
+    match kind {
+        ProbeFailureKind::Vanished => {
+            "the backend is reachable but the kopia repository is absent — the circuit breaker \
+             is open: backups, maintenance, and replication are paused until a connect succeeds; \
+             retrying with backoff (recovery is automatic; kopiur never auto-recreates)"
+        }
+        ProbeFailureKind::Unreachable => {
+            "the repository backend is unreachable — the circuit breaker is open: backups, \
+             maintenance, and replication are paused until a connect succeeds; retrying with \
+             backoff (recovery is automatic)"
+        }
+    }
+}
+
+/// Everything a probe-failure finalize writes that depends on the breaker
+/// verdict — computed purely (and unit-tested once for both repository kinds)
+/// so the finalize IO fns stay thin callers, the house pattern.
+pub struct ProbeFailurePhase {
+    /// Whether this verdict OPENS the breaker: drives the trip event/metric
+    /// (fired on the transition only) and the short requeue into the strict
+    /// retry loop.
+    pub opened: bool,
+    /// The typed phase, for [`crate::io::ready_outcome_for_phase`].
+    pub phase: RepositoryPhase,
+    /// The phase as written into the status merge patch.
+    pub phase_str: &'static str,
+    /// The kstatus `Ready` condition reason.
+    pub ready_reason: &'static str,
+    /// The kstatus `Ready` condition message — byte-stable (volatile detail
+    /// rides the Event only), so the guarded status write stays a no-op across
+    /// repeated identical failures.
+    pub ready_message: &'static str,
+    /// The requeue after finalizing: the caller's steady probe cadence while
+    /// the phase stays `Ready`, or a short hop into the strict retry loop
+    /// (whose cadence [`strict_retry_holdoff`] then governs) once opened.
+    pub requeue: std::time::Duration,
+}
+
+/// Map a [`BreakerVerdict`] + [`ProbeFailureKind`] to the phase/conditions/
+/// requeue a probe-failure finalize writes. `StayReady` keeps writing
+/// `phase: Ready` explicitly — so under `onFailure: Alert` (or below the
+/// threshold) a stray `Initializing`/`Degraded` from an earlier path still
+/// self-heals, the pre-#345 contract. `Open` writes `Degraded` with the
+/// byte-stable breaker message; it must NOT self-heal back — only a successful
+/// connect closes the breaker (via [`success_fold`]).
+pub fn probe_failure_phase(
+    verdict: BreakerVerdict,
+    kind: ProbeFailureKind,
+    steady_requeue: std::time::Duration,
+) -> ProbeFailurePhase {
+    match verdict {
+        BreakerVerdict::StayReady => ProbeFailurePhase {
+            opened: false,
+            phase: RepositoryPhase::Ready,
+            phase_str: "Ready",
+            ready_reason: "Bootstrapped",
+            ready_message: "repository connected; a health probe is failing (see \
+                            BackendReachable), backups continue",
+            requeue: steady_requeue,
+        },
+        BreakerVerdict::Open => ProbeFailurePhase {
+            opened: true,
+            phase: RepositoryPhase::Degraded,
+            phase_str: "Degraded",
+            ready_reason: breaker_reason(kind),
+            ready_message: breaker_open_message(kind),
+            requeue: std::time::Duration::from_secs(5),
+        },
+    }
+}
+
+/// The `status.phase` a bootstrap-Job LAUNCH (or a running-Job poll) writes for
+/// a repository that is not yet `Ready`.
+///
+/// A `Degraded` repository keeps `Degraded` while its strict retry Job runs:
+/// the breaker retries on a cycle, and flapping `Degraded`↔`Initializing` every
+/// cycle would break any phase-keyed alert or gauge (audit 3d) — and briefly
+/// misreport a paused repository as making first-bootstrap progress. Every
+/// other pre-`Ready` state (first bootstrap, a spec-change re-bootstrap of a
+/// `Ready`/`Failed` repo, a never-reconciled `Pending`) shows `Initializing` as
+/// before. Exhaustive over [`RepositoryPhase`] — no `_ =>` — so a new phase
+/// must choose.
+pub fn launch_phase(prior: Option<RepositoryPhase>) -> &'static str {
+    match prior {
+        Some(RepositoryPhase::Degraded) => "Degraded",
+        Some(
+            RepositoryPhase::Pending
+            | RepositoryPhase::Initializing
+            | RepositoryPhase::Ready
+            | RepositoryPhase::Failed,
+        )
+        | None => "Initializing",
+    }
+}
+
+/// Requeue for the strict recycle-retry loop while the backend is unavailable:
+/// exponential from 120s, doubling per consecutive failure, capped at 600s —
+/// `(120, 240, 480, 600, 600, …)` for inputs `0, 1, 2, 3, …` (negative/zero
+/// input → 120s). Bounds multi-day-outage Job churn (~144 Jobs/day worst case
+/// instead of 720) while keeping worst-case recovery detection ≤ 10m. The
+/// caller passes the number of failures *before* the retry being scheduled
+/// (post-fold streak minus one), so the first retry after a fresh failure
+/// waits the base 120s — matching the result-less recycle's flat cadence.
+pub fn strict_retry_backoff(consecutive_failures: i64) -> std::time::Duration {
+    const BASE_SECS: u64 = 120;
+    const CAP_SECS: u64 = 600;
+    // 2^3 * 120 = 960 already exceeds the cap, so clamping the exponent at 3
+    // keeps the shift small and overflow-free for any i64 input.
+    let exponent = consecutive_failures.clamp(0, 3) as u32;
+    std::time::Duration::from_secs((BASE_SECS << exponent).min(CAP_SECS))
+}
+
+/// How long a `Degraded` repository must still WAIT before relaunching its
+/// strict retry bootstrap Job: `Some(remaining)` to hold (requeue that long),
+/// `None` to launch now.
+///
+/// This launch-side gate is what makes [`strict_retry_backoff`] real. The
+/// finalize path's backoff *requeue* alone cannot bound Job churn: the status
+/// patch that records the failure (streak++) re-triggers the reconciler through
+/// its own primary watch immediately, and `bootstrap_create_due` is
+/// unconditionally true for any non-`Ready` phase — so without this gate every
+/// retry cycle relaunches the Job the moment the previous one is finalized,
+/// regardless of the requeue. Same launch-stamp discipline as
+/// [`crate::catalog::scan_requested_due`], keyed on `status.health.lastProbeAt`
+/// (which [`reconcile_probe_failure`] stamps on every failure fold, probe or
+/// strict).
+///
+/// **Fails OPEN** on every edge: not `Degraded`, no recorded failure streak, an
+/// absent or unparseable stamp, or an elapsed backoff all mean "launch now" —
+/// a malformed value can never wedge the retry loop (this controller is the
+/// only writer of the field). A spec change bypasses the gate at the call site
+/// (the user changed config and expects an immediate retry).
+pub fn strict_retry_holdoff(
+    phase_is_degraded: bool,
+    consecutive_failures: i64,
+    last_failure_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<std::time::Duration> {
+    if !phase_is_degraded || consecutive_failures <= 0 {
+        return None;
+    }
+    let last = DateTime::parse_from_rfc3339(last_failure_at?).ok()?;
+    let backoff = strict_retry_backoff(consecutive_failures - 1);
+    let backoff_chrono = chrono::Duration::from_std(backoff).ok()?;
+    let due = last.with_timezone(&Utc) + backoff_chrono;
+    if due <= now {
+        None
+    } else {
+        Some((due - now).to_std().unwrap_or(backoff))
     }
 }
 
@@ -825,8 +1179,9 @@ mod tests {
     /// this guard a spec change opens a second livelock — the generation arm recycles
     /// the fresh strict result before it can write `observedGeneration`. (2) A
     /// terminally-`Failed` repository's lingering Job must not be re-read as a probe:
-    /// `finalize_probe_failure` hard-codes `phase: Ready`, so that would silently
-    /// resurrect a failed repository and open every downstream `repository_ready` gate.
+    /// `finalize_probe_failure` writes `phase: Ready` under `onFailure: Alert` (or
+    /// below the failure threshold), so that would silently resurrect a failed
+    /// repository and open every downstream `repository_ready` gate.
     #[test]
     fn a_repository_that_is_not_ready_never_probes() {
         let interval = std::time::Duration::from_secs(1800);
@@ -1228,6 +1583,119 @@ mod tests {
         assert!(upd.event.is_none());
     }
 
+    // ---- #345 M3: the unified success fold --------------------------------
+
+    /// A fully-seeded, healthy `status.health` — the steady state.
+    fn seeded_healthy() -> RepositoryHealthStatus {
+        RepositoryHealthStatus {
+            last_probe_at: Some(t(100).to_rfc3339()),
+            last_healthy_at: Some(t(100).to_rfc3339()),
+            consecutive_probe_failures: None,
+            first_failure_at: None,
+            probe_attempt_at: None,
+        }
+    }
+
+    #[test]
+    fn success_fold_truth_table() {
+        let now = t(200).to_rfc3339();
+
+        // Probe run → always folds (the probe deletes its Job, so once-only).
+        let probe = success_fold(true, Some(&seeded_healthy()), true, &now).expect("probe folds");
+        assert_eq!(probe.reason, SuccessFoldReason::Probe);
+
+        // Strict + lastProbeAt None (fresh repo or pre-#345 upgrade) → seed, so
+        // health_probe_due does not fire a redundant probe Job fleet-wide.
+        let seed = success_fold(false, None, false, &now).expect("seeding folds");
+        assert_eq!(seed.reason, SuccessFoldReason::Seed);
+        let seed2 = success_fold(false, Some(&RepositoryHealthStatus::default()), false, &now)
+            .expect("empty health seeds too");
+        assert_eq!(seed2.reason, SuccessFoldReason::Seed);
+
+        // Strict + a recorded failing streak → heal (clears the streak; this is
+        // what closes the breaker on a successful re-connect in M4).
+        let heal = success_fold(false, Some(&health_with_failures(2)), false, &now)
+            .expect("a failing streak heals");
+        assert_eq!(heal.reason, SuccessFoldReason::Heal);
+
+        // Strict + firstFailureAt lingering (streak count already cleared) → heal.
+        let lingering = RepositoryHealthStatus {
+            first_failure_at: Some(t(80).to_rfc3339()),
+            ..seeded_healthy()
+        };
+        assert_eq!(
+            success_fold(false, Some(&lingering), true, &now)
+                .expect("lingering firstFailureAt heals")
+                .reason,
+            SuccessFoldReason::Heal
+        );
+
+        // Strict + seeded + healthy counters but BackendReachable not True
+        // (stale False, or the condition is absent) → heal the condition.
+        assert_eq!(
+            success_fold(false, Some(&seeded_healthy()), false, &now)
+                .expect("a non-True BackendReachable heals")
+                .reason,
+            SuccessFoldReason::Heal
+        );
+
+        // THE no-op case: strict + seeded + healthy + condition True → None.
+        // This is what keeps the lingering-Job re-read byte-stable (no hot loop).
+        assert!(
+            success_fold(false, Some(&seeded_healthy()), true, &now).is_none(),
+            "the steady-state pass must contribute NOTHING to the status patch"
+        );
+    }
+
+    #[test]
+    fn success_fold_converges_after_one_write() {
+        // Apply a Seed write's effect (lastProbeAt stamped, condition True) and
+        // assert the next lingering-Job re-read folds nothing — the whole point
+        // of the conditional fold is that pass 2..N are byte-stable no-ops.
+        let now = t(200).to_rfc3339();
+        let fold = success_fold(false, None, false, &now).expect("pass 1 seeds");
+        assert_eq!(fold.reason, SuccessFoldReason::Seed);
+        let after = RepositoryHealthStatus {
+            last_probe_at: Some(now.clone()),
+            last_healthy_at: Some(now.clone()),
+            consecutive_probe_failures: None,
+            first_failure_at: None,
+            probe_attempt_at: None,
+        };
+        assert!(
+            success_fold(false, Some(&after), true, &t(210).to_rfc3339()).is_none(),
+            "pass 2 must be a no-op"
+        );
+    }
+
+    #[test]
+    fn success_fold_patch_reuses_the_explicit_null_clears() {
+        // The fold's patch must be probe_success_health_patch's shape: a heal
+        // that omitted the RFC 7386 nulls would leave the failing streak in the
+        // stored object and re-fire the loud alert on the next single failure.
+        let now = t(200).to_rfc3339();
+        let fold = success_fold(false, Some(&health_with_failures(3)), false, &now).unwrap();
+        assert_eq!(fold.health_patch, probe_success_health_patch(&now));
+        assert!(fold.health_patch["consecutiveProbeFailures"].is_null());
+        assert!(fold.health_patch["firstFailureAt"].is_null());
+        assert!(fold.health_patch["probeAttemptAt"].is_null());
+    }
+
+    #[test]
+    fn backend_reachable_true_reads_only_the_true_state() {
+        assert!(!backend_reachable_true(&[]), "absent is not True");
+        assert!(!backend_reachable_true(&[reachable_cond(
+            "False",
+            REPOSITORY_VANISHED_REASON
+        )]));
+        assert!(backend_reachable_true(&[reachable_cond(
+            "True",
+            BACKEND_REACHABLE_REASON
+        )]));
+        // Other condition types are ignored.
+        assert!(!backend_reachable_true(&[cond("True")]));
+    }
+
     #[test]
     fn probe_success_health_patch_emits_explicit_nulls_to_clear_the_debounce() {
         // The patch MUST carry explicit JSON `null` for the two debounce fields:
@@ -1255,5 +1723,291 @@ mod tests {
             "must be explicit null so the merge retires the attempt, got {:?}",
             patch["probeAttemptAt"]
         );
+    }
+
+    // ---- #345 M4: the circuit breaker --------------------------------------
+
+    #[test]
+    fn breaker_verdict_truth_table() {
+        use ProbeOnFailure::{Alert, Degrade};
+        // Below the threshold: never open, either mode.
+        assert_eq!(breaker_verdict(0, 3, Degrade), BreakerVerdict::StayReady);
+        assert_eq!(breaker_verdict(2, 3, Degrade), BreakerVerdict::StayReady);
+        assert_eq!(breaker_verdict(2, 3, Alert), BreakerVerdict::StayReady);
+        // At the threshold: Degrade opens, Alert never does.
+        assert_eq!(breaker_verdict(3, 3, Degrade), BreakerVerdict::Open);
+        assert_eq!(breaker_verdict(3, 3, Alert), BreakerVerdict::StayReady);
+        // Above the threshold: same split — Alert keeps the pre-#345 contract
+        // no matter how long the outage runs.
+        assert_eq!(breaker_verdict(50, 3, Degrade), BreakerVerdict::Open);
+        assert_eq!(breaker_verdict(50, 3, Alert), BreakerVerdict::StayReady);
+        // A non-positive threshold clamps to 1 (mirroring reconcile_probe_failure),
+        // so a single failure opens under Degrade.
+        assert_eq!(breaker_verdict(1, 0, Degrade), BreakerVerdict::Open);
+        assert_eq!(breaker_verdict(0, 0, Degrade), BreakerVerdict::StayReady);
+    }
+
+    #[test]
+    fn both_probe_failure_kinds_open_the_breaker() {
+        // `breaker_verdict` takes no kind on purpose: a vanished backend dooms
+        // backups exactly like an unreachable one. The kind-mapped surfaces
+        // (reason/action/message) must still be distinct and stable.
+        assert_eq!(
+            breaker_reason(ProbeFailureKind::Vanished),
+            REPOSITORY_VANISHED_REASON
+        );
+        assert_eq!(
+            breaker_reason(ProbeFailureKind::Unreachable),
+            BACKEND_UNREACHABLE_REASON
+        );
+        assert_eq!(
+            breaker_action(ProbeFailureKind::Vanished),
+            VERIFY_BACKEND_ACTION
+        );
+        assert_eq!(
+            breaker_action(ProbeFailureKind::Unreachable),
+            CHECK_BACKEND_ACTION
+        );
+        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+            let msg = breaker_open_message(kind);
+            assert!(msg.contains("paused until a connect succeeds"), "{msg}");
+            assert!(msg.contains("retrying with backoff"), "{msg}");
+        }
+        // The vanished message must still refuse the destructive nudge.
+        assert!(breaker_open_message(ProbeFailureKind::Vanished).contains("never auto-recreates"));
+        assert_eq!(ProbeFailureKind::Vanished.label(), "vanished");
+        assert_eq!(ProbeFailureKind::Unreachable.label(), "unreachable");
+    }
+
+    #[test]
+    fn probe_failure_phase_maps_the_verdict_to_phase_and_requeue() {
+        let steady = std::time::Duration::from_secs(300);
+        // StayReady: the pre-#345 alert-only contract — phase Ready written
+        // explicitly (a stray Degraded self-heals), steady probe cadence.
+        let p = probe_failure_phase(
+            BreakerVerdict::StayReady,
+            ProbeFailureKind::Unreachable,
+            steady,
+        );
+        assert!(!p.opened);
+        assert_eq!(p.phase, RepositoryPhase::Ready);
+        assert_eq!(p.phase_str, "Ready");
+        assert_eq!(p.ready_reason, "Bootstrapped");
+        assert!(p.ready_message.contains("backups"));
+        assert_eq!(p.requeue, steady);
+        // Open: Degraded + the byte-stable breaker message + a short hop into
+        // the strict retry loop (which strict_retry_holdoff then governs).
+        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+            let p = probe_failure_phase(BreakerVerdict::Open, kind, steady);
+            assert!(p.opened);
+            assert_eq!(p.phase, RepositoryPhase::Degraded);
+            assert_eq!(p.phase_str, "Degraded");
+            assert_eq!(p.ready_reason, breaker_reason(kind));
+            assert_eq!(p.ready_message, breaker_open_message(kind));
+            assert!(p.requeue < steady);
+        }
+    }
+
+    #[test]
+    fn launch_phase_keeps_degraded_and_initializes_everything_else() {
+        // Audit 3d: a Degraded repo's strict retry must not flap the phase to
+        // Initializing every cycle (phase-keyed alerts/gauges would break).
+        assert_eq!(launch_phase(Some(RepositoryPhase::Degraded)), "Degraded");
+        // Every other pre-Ready state keeps the pre-M4 Initializing.
+        assert_eq!(launch_phase(None), "Initializing");
+        assert_eq!(launch_phase(Some(RepositoryPhase::Pending)), "Initializing");
+        assert_eq!(
+            launch_phase(Some(RepositoryPhase::Initializing)),
+            "Initializing"
+        );
+        assert_eq!(launch_phase(Some(RepositoryPhase::Ready)), "Initializing");
+        assert_eq!(launch_phase(Some(RepositoryPhase::Failed)), "Initializing");
+    }
+
+    #[test]
+    fn strict_retry_backoff_doubles_from_120s_and_caps_at_600s() {
+        let secs = |n: i64| strict_retry_backoff(n).as_secs();
+        assert_eq!(secs(0), 120);
+        assert_eq!(secs(1), 240);
+        assert_eq!(secs(2), 480);
+        assert_eq!(secs(3), 600, "960 saturates at the cap");
+        assert_eq!(secs(4), 600);
+        assert_eq!(secs(1_000_000), 600, "huge streaks must not overflow");
+        assert_eq!(secs(-1), 120, "negative input is the base");
+        assert_eq!(secs(i64::MIN), 120);
+    }
+
+    #[test]
+    fn strict_retry_holdoff_gates_the_relaunch_and_fails_open() {
+        let stamp = t(10_000).to_rfc3339();
+        // Degraded + streak 1 + fresh failure → hold for the remaining base 120s.
+        let held = strict_retry_holdoff(true, 1, Some(&stamp), t(10_030))
+            .expect("a fresh failure must hold the relaunch");
+        assert_eq!(held.as_secs(), 90);
+        // Streak 3 → backoff(2) = 480s from the last failure.
+        let held = strict_retry_holdoff(true, 3, Some(&stamp), t(10_030)).unwrap();
+        assert_eq!(held.as_secs(), 450);
+        // Elapsed → launch now.
+        assert!(strict_retry_holdoff(true, 1, Some(&stamp), t(10_200)).is_none());
+        // Fail OPEN on every edge: not Degraded, no streak, absent/garbage stamp.
+        assert!(strict_retry_holdoff(false, 5, Some(&stamp), t(10_030)).is_none());
+        assert!(strict_retry_holdoff(true, 0, Some(&stamp), t(10_030)).is_none());
+        assert!(strict_retry_holdoff(true, -2, Some(&stamp), t(10_030)).is_none());
+        assert!(strict_retry_holdoff(true, 5, None, t(10_030)).is_none());
+        assert!(strict_retry_holdoff(true, 5, Some("garbage"), t(10_030)).is_none());
+    }
+
+    /// The full breaker episode, driven through the pure fns in the order the
+    /// reconcilers compose them (the `probe_attempt_stamp_breaks_the_recycle_livelock`
+    /// style): Ready → probe failures to the threshold → the verdict opens →
+    /// the phase patch is `Degraded` → strict retry failures keep the phase
+    /// stable and grow the streak → a strict success heals everything.
+    #[test]
+    fn breaker_opens_on_threshold_holds_through_retries_and_heals_on_success() {
+        let threshold = 3;
+        let on_failure = ProbeOnFailure::Degrade;
+
+        // Probe failures 1 and 2: streak grows, verdict stays Ready — the
+        // finalize writes phase: Ready exactly as before (alert debounce).
+        let now = t(100).to_rfc3339();
+        let u1 = reconcile_probe_failure(
+            &[],
+            None,
+            ProbeFailureKind::Unreachable,
+            threshold,
+            &now,
+            Some(1),
+        );
+        assert_eq!(u1.health.consecutive_probe_failures, Some(1));
+        assert_eq!(
+            breaker_verdict(1, threshold, on_failure),
+            BreakerVerdict::StayReady,
+            "below the threshold the phase patch must stay Ready"
+        );
+        let u2 = reconcile_probe_failure(
+            &[],
+            Some(&u1.health),
+            ProbeFailureKind::Unreachable,
+            threshold,
+            &now,
+            Some(1),
+        );
+        assert_eq!(
+            breaker_verdict(2, threshold, on_failure),
+            BreakerVerdict::StayReady
+        );
+
+        // Probe failure 3: the threshold crossing. The loud condition + event
+        // fire AND the verdict opens — the finalize patches phase: Degraded
+        // with the stable breaker message on the Ready condition.
+        let u3 = reconcile_probe_failure(
+            &[],
+            Some(&u2.health),
+            ProbeFailureKind::Unreachable,
+            threshold,
+            &now,
+            Some(1),
+        );
+        assert_eq!(u3.health.consecutive_probe_failures, Some(3));
+        assert!(u3.event.is_some(), "the alert fires at the crossing");
+        assert_eq!(
+            breaker_verdict(3, threshold, on_failure),
+            BreakerVerdict::Open
+        );
+        let open_conditions = crate::io::set_ready(
+            &u3.conditions,
+            Some(1),
+            crate::io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+            breaker_reason(ProbeFailureKind::Unreachable),
+            breaker_open_message(ProbeFailureKind::Unreachable),
+        );
+        let ready = open_conditions
+            .iter()
+            .find(|c| c.type_ == crate::consts::READY_CONDITION)
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, BACKEND_UNREACHABLE_REASON);
+        assert!(ready.message.contains("paused until a connect succeeds"));
+        let reconciling = open_conditions
+            .iter()
+            .find(|c| c.type_ == crate::consts::RECONCILING_CONDITION)
+            .unwrap();
+        assert_eq!(
+            reconciling.status, "True",
+            "Degraded is kstatus-Reconciling (self-healing), never Stalled"
+        );
+        // The failure patch clears the attempt stamp and pins the streak.
+        let patch = probe_failure_health_patch(&u3.health);
+        assert_eq!(patch["consecutiveProbeFailures"].as_i64(), Some(3));
+        assert!(patch["probeAttemptAt"].is_null());
+
+        // While open: the strict retry launch keeps the phase Degraded (no
+        // Initializing flap) and is rate-limited by the holdoff...
+        assert_eq!(launch_phase(Some(RepositoryPhase::Degraded)), "Degraded");
+        let last_failure = u3.health.last_probe_at.clone().unwrap();
+        assert!(
+            strict_retry_holdoff(true, 3, Some(&last_failure), t(110)).is_some(),
+            "a fresh failure holds the relaunch for the backoff window"
+        );
+        // ... and a failed strict retry folds through the SAME sensor: the
+        // streak keeps climbing (the outage-duration counter) with no repeat
+        // event (same reason, already over threshold).
+        let retry_now = t(700).to_rfc3339();
+        let u4 = reconcile_probe_failure(
+            &u3.conditions,
+            Some(&u3.health),
+            ProbeFailureKind::Unreachable,
+            threshold,
+            &retry_now,
+            Some(1),
+        );
+        assert_eq!(u4.health.consecutive_probe_failures, Some(4));
+        assert!(u4.event.is_none(), "no event spam while steadily failing");
+        assert_eq!(
+            breaker_verdict(4, threshold, on_failure),
+            BreakerVerdict::Open,
+            "the breaker stays open while the streak persists"
+        );
+
+        // Strict success: the unified success fold heals — streak cleared,
+        // BackendReachable=True — which is what closes the breaker (the
+        // success arm writes phase: Ready alongside this fold).
+        let heal_now = t(1_300).to_rfc3339();
+        let fold = success_fold(false, Some(&u4.health), false, &heal_now)
+            .expect("a recorded streak must heal on any successful strict connect");
+        assert_eq!(fold.reason, SuccessFoldReason::Heal);
+        assert!(fold.health_patch["consecutiveProbeFailures"].is_null());
+        assert!(fold.health_patch["firstFailureAt"].is_null());
+        let healed = reconcile_probe_success(&u4.conditions, &heal_now, Some(1));
+        let c = healed
+            .conditions
+            .iter()
+            .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+            .unwrap();
+        assert_eq!(c.status, "True");
+        // After healing, the sensor state folds nothing more (byte-stable
+        // steady state) — the episode is over.
+        let after = RepositoryHealthStatus {
+            last_probe_at: Some(heal_now.clone()),
+            last_healthy_at: Some(heal_now.clone()),
+            consecutive_probe_failures: None,
+            first_failure_at: None,
+            probe_attempt_at: None,
+        };
+        assert!(success_fold(false, Some(&after), true, &t(1_400).to_rfc3339()).is_none());
+    }
+
+    /// `onFailure: Alert` preserves the OLD contract end-to-end: any streak,
+    /// however long, yields `StayReady` — the finalize keeps writing
+    /// `phase: Ready` and only the condition/event/metric fire.
+    #[test]
+    fn alert_mode_never_opens_the_breaker() {
+        for streak in [1, 3, 10, 1_000] {
+            assert_eq!(
+                breaker_verdict(streak, 3, ProbeOnFailure::Alert),
+                BreakerVerdict::StayReady,
+                "streak {streak} must stay Ready under Alert"
+            );
+        }
     }
 }

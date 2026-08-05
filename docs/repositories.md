@@ -504,7 +504,7 @@ primary   Ready   S3        4m
 $ kubectl describe repository primary -n demo # Conditions + Events explain Pending/Failed
 ```
 
-Phases: `Pending` → `Initializing` → **`Ready`** (healthy). `Degraded` means reachable but a sub-operation (e.g. maintenance) is failing; `Failed` means connect/create failed — the actionable reason is on the conditions. `SnapshotPolicy`/`Snapshot`/`Restore`/`Maintenance` all wait for `Ready` before doing anything, so this is the first thing to check when a backup won't start.
+Phases: `Pending` → `Initializing` → **`Ready`** (healthy). `Degraded` means the [circuit breaker](repository-health.md#backend-health-probe-default-on) is open — the backend stopped answering connects, work is paused, and kopiur keeps retrying with backoff (recovery is automatic; kstatus reads it as `Reconciling`, so `flux wait` waits rather than fails); `Failed` means connect/create failed terminally — the actionable reason is on the conditions. `SnapshotPolicy`/`Snapshot`/`Restore`/`Maintenance` all wait for `Ready` before doing anything, so this is the first thing to check when a backup won't start.
 
 ## ClusterRepository: a shared repository
 

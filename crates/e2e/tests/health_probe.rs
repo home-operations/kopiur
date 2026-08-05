@@ -1,11 +1,14 @@
-//! e2e: the opt-in backend health probe (`spec.health.probe`).
+//! e2e: the backend health probe (`spec.health.probe`, default-on since #345).
 //!
-//! Proves the headline behavior the feature exists for: after a `Repository` is
-//! `Ready`, WIPING its backend out-of-band makes the probe raise a
-//! `RepositoryVanished` alert — while the repository **stays `Ready`** (backups
-//! are never paused) and is **never auto-recreated** (the pinned `uniqueId` is
-//! unchanged and the backend stays empty). This is the data-safety invariant the
-//! whole design is built around.
+//! The wipe scenario proves the **`onFailure: Alert` opt-out contract**: after a
+//! `Repository` is `Ready`, WIPING its backend out-of-band makes the probe raise
+//! a `RepositoryVanished` alert — while the Alert-mode repository **stays
+//! `Ready`** and is **never auto-recreated** (the pinned `uniqueId` is unchanged
+//! and the backend stays empty). Never-recreate is the data-safety invariant the
+//! whole design is built around, and it holds under EITHER `onFailure` mode —
+//! under the default `Degrade` the same wipe instead opens the circuit breaker
+//! (`Degraded`, then terminal `Failed` once the strict re-check confirms the
+//! repository is gone); that arc is `crates/e2e/tests/repo_breaker.rs`.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -17,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
 
 use kopiur_api::{ClusterRepository, Repository};
@@ -26,10 +29,15 @@ use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait, wait_until,
 };
 
-/// A `Repository` on a dedicated MinIO bucket with the health probe enabled at a
-/// fast cadence (`interval: 30s`, `failureThreshold: 1`) so the alert fires within
-/// the e2e timeout. `create.enabled: true` to prove Part A: even with create on,
-/// a once-`Ready` repo is NEVER recreated on a vanish.
+/// A `Repository` on a dedicated MinIO bucket with the health probe at a fast
+/// cadence (`interval: 30s`, `failureThreshold: 1`) so the alert fires within
+/// the e2e timeout, and `onFailure: Alert` — the wipe scenario tests the
+/// alert-only OPT-OUT (the default is the `Degrade` circuit breaker since #345;
+/// under it a wipe would escalate to terminal `Failed`, which
+/// `repo_breaker.rs` covers). The churn guards below replace the whole
+/// `health` block via [`churn_health_spec`], so this `onFailure` only shapes
+/// the wipe scenario. `create.enabled: true` to prove Part A: even with create
+/// on, a once-`Ready` repo is NEVER recreated on a vanish.
 fn probe_repository_json(name: &str, bucket: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
@@ -50,7 +58,12 @@ fn probe_repository_json(name: &str, bucket: &str) -> serde_json::Value {
             // The managed Maintenance is irrelevant here; keep the test focused.
             "maintenance": { "enabled": false },
             "health": {
-                "probe": { "enabled": true, "interval": "30s", "failureThreshold": 1 }
+                "probe": {
+                    "enabled": true,
+                    "interval": "30s",
+                    "failureThreshold": 1,
+                    "onFailure": "Alert"
+                }
             }
         }
     })
@@ -73,9 +86,13 @@ fn condition(status: &serde_json::Value, type_: &str, field: &str) -> Option<Str
         .map(str::to_string)
 }
 
+/// The `onFailure: Alert` opt-out: a wiped backend raises `RepositoryVanished`
+/// while the repository stays `Ready` (backups keep running) and is never
+/// auto-recreated. Under the default `Degrade` mode the same wipe opens the
+/// circuit breaker instead — see `repo_breaker.rs`.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
+async fn alert_mode_probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
     let Some(world) = World::connect().await else {
         return;
     };
@@ -181,7 +198,7 @@ async fn probe_alerts_on_wipe_but_stays_ready_and_never_recreates() {
     assert_eq!(
         final_status.get("phase").and_then(|p| p.as_str()),
         Some("Ready"),
-        "phase must stay Ready (alert-only) — a vanish must not halt backups"
+        "phase must stay Ready under onFailure: Alert — the opt-out means a vanish never halts backups"
     );
     assert_eq!(
         final_status.get("uniqueId").and_then(|u| u.as_str()),
@@ -318,8 +335,13 @@ async fn assert_probe_finalizes_without_churn(
 
     // ... and it must be a probe that actually RAN, not a probe switched off. Both of
     // these are written only by the finalize path, which is unreachable on buggy code.
+    // Wait specifically for a POST-Ready stamp: since #345 M3 the bootstrap
+    // success SEEDS `lastProbeAt` (so a fresh repo doesn't probe immediately),
+    // and the caller backdates that seed to arm the timer — both of those
+    // values predate `ready_at`, so "first value present" would read the seed,
+    // not the probe. Only a probe that connected after Ready satisfies this.
     let probed_at = wait_until(
-        "status.health.lastProbeAt is stamped",
+        "status.health.lastProbeAt is stamped by a post-Ready probe",
         default_timeout(),
         poll_interval(),
         || async {
@@ -327,17 +349,16 @@ async fn assert_probe_finalizes_without_churn(
                 .await
                 .pointer("/health/lastProbeAt")
                 .and_then(|v| v.as_str())
-                .map(str::to_string))
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .filter(|d| *d >= ready_at))
         },
     )
     .await
     .expect(
-        "a probe must FINALIZE and stamp status.health.lastProbeAt — it is the only input \
-         to the probe timer, so an unstamped probe re-fires forever (#273)",
+        "a probe must FINALIZE and stamp status.health.lastProbeAt past Ready — it is the \
+         only input to the probe timer, so an unstamped probe re-fires forever (#273)",
     );
-    let probed_at = chrono::DateTime::parse_from_rfc3339(&probed_at)
-        .expect("lastProbeAt is RFC 3339")
-        .with_timezone(&chrono::Utc);
     assert!(
         probed_at >= ready_at,
         "lastProbeAt {probed_at} predates Ready ({ready_at}) — that is the initial \
@@ -399,6 +420,25 @@ async fn probe_finalizes_instead_of_recreating_the_bootstrap_job() {
     .await
     .expect("repository becomes Ready");
     let ready_at = chrono::Utc::now();
+
+    // #345 M3 seeds `lastProbeAt` at bootstrap success, so a freshly-Ready
+    // repository deliberately does NOT probe immediately (no fleet-wide
+    // probe-Job storm at upgrade) — but this guard needs a probe to actually
+    // run inside CHURN_WINDOW. Backdate the seed past the 10m interval so the
+    // timer is due NOW; the probe must then launch, finalize, and re-stamp a
+    // post-Ready `lastProbeAt` (the #273 contract this test pins).
+    let backdated =
+        (ready_at - chrono::Duration::seconds(CHURN_PROBE_INTERVAL_SECS as i64 + 60)).to_rfc3339();
+    repos
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "status": { "health": { "lastProbeAt": backdated } } }),
+            ),
+        )
+        .await
+        .expect("backdate the seeded lastProbeAt to arm the probe timer");
 
     assert_probe_finalizes_without_churn(&jobs, &job_name, ready_at, async || {
         status_value(&repos.get(name).await.expect("get Repository"))
@@ -476,6 +516,21 @@ async fn cluster_repository_probe_finalizes_instead_of_recreating_the_bootstrap_
     .await
     .expect("cluster repository becomes Ready");
     let ready_at = chrono::Utc::now();
+
+    // Same seed-backdating as the namespaced twin: arm the probe timer so a
+    // probe actually runs inside CHURN_WINDOW (see the comment there).
+    let backdated =
+        (ready_at - chrono::Duration::seconds(CHURN_PROBE_INTERVAL_SECS as i64 + 60)).to_rfc3339();
+    repos
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "status": { "health": { "lastProbeAt": backdated } } }),
+            ),
+        )
+        .await
+        .expect("backdate the seeded lastProbeAt to arm the probe timer");
 
     assert_probe_finalizes_without_churn(&jobs, &job_name, ready_at, async || {
         cluster_status_value(&repos.get(name).await.expect("get ClusterRepository"))

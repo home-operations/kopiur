@@ -272,15 +272,25 @@ pub(crate) async fn spawn_all(
             },
         );
     }
-    // Mass-deletion ack drain: when a Repository's `allow-mass-deletion` annotation
-    // (or `deletionProtection`) changes, re-reconcile the DELETING Snapshots that
-    // resolve to it so a held deletion proceeds at once, instead of waiting out its
-    // long `Held` requeue. ClusterRepository is cluster-scoped, so its watch is
-    // registered only in cluster scope (like the other kind-conditional watches).
+    // Repository -> Snapshot fan-in: one watch per repository kind (a single
+    // apiserver watch stream) serving two disjoint consumer sets:
+    // - Mass-deletion ack drain: when a Repository's `allow-mass-deletion`
+    //   annotation (or `deletionProtection`) changes, re-reconcile the DELETING
+    //   Snapshots that resolve to it so a held deletion proceeds at once, instead
+    //   of waiting out its long `Held` requeue.
+    // - Readiness-gate resume (#345): a Snapshot parked `Pending` behind the
+    //   `repository_ready` gate resumes the moment the repository flips back to
+    //   `Ready`, instead of on the gate's 15s requeue.
+    // ClusterRepository is cluster-scoped, so its watch is registered only in
+    // cluster scope (like the other kind-conditional watches).
     let mut snapshot_ctrl =
         snapshot_ctrl.watches(scoped_api::<Repository>(&client, &scope), cfg.clone(), {
             let store = snapshot_store.clone();
-            move |r: Repository| watch::repository_to_deleting_snapshots(&store, &r)
+            move |r: Repository| {
+                let mut refs = watch::repository_to_deleting_snapshots(&store, &r);
+                refs.extend(watch::repository_to_pending_snapshots(&store, &r));
+                refs
+            }
         });
     if cluster_wide {
         snapshot_ctrl = snapshot_ctrl.watches(
@@ -289,7 +299,9 @@ pub(crate) async fn spawn_all(
             {
                 let store = snapshot_store.clone();
                 move |r: ClusterRepository| {
-                    watch::cluster_repository_to_deleting_snapshots(&store, &r)
+                    let mut refs = watch::cluster_repository_to_deleting_snapshots(&store, &r);
+                    refs.extend(watch::cluster_repository_to_pending_snapshots(&store, &r));
+                    refs
                 }
             },
         );

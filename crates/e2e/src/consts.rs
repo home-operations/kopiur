@@ -328,6 +328,12 @@ pub const BUCKETS: &[&str] = &[
     // GFS-kept snapshot and then go quiet — no discovery-Job churn, no
     // discovered-row create/delete loop (the adopt/prune/rediscover livelock).
     "kopiur-adopt-retain",
+    // Repository circuit breaker (#345, crates/e2e/tests/repo_breaker.rs): one
+    // bucket per repository so the Degrade-mode breaker arc and the Alert-mode
+    // opt-out ride the same MinIO outage (a broken Service selector) without
+    // sharing a kopia repository with each other or any other scenario.
+    BUCKET_BREAKER_REPO,
+    BUCKET_BREAKER_ALERT,
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see
@@ -338,6 +344,12 @@ pub const WI_BUCKET: &str = "kopiur-wi";
 pub const BUCKET_PROBE_CHURN_REPO: &str = "kopiur-probe-churn-repo";
 /// Bucket for the `ClusterRepository` arm of the #273 bootstrap-Job churn guard.
 pub const BUCKET_PROBE_CHURN_CREPO: &str = "kopiur-probe-churn-crepo";
+/// Bucket for the circuit-breaker (`onFailure: Degrade`) arc of the #345 e2e
+/// (crates/e2e/tests/repo_breaker.rs).
+pub const BUCKET_BREAKER_REPO: &str = "kopiur-breaker-repo";
+/// Bucket for the Alert-mode opt-out repository riding the same outage window
+/// in crates/e2e/tests/repo_breaker.rs.
+pub const BUCKET_BREAKER_ALERT: &str = "kopiur-breaker-alert";
 
 // --- SFTP backend (in-cluster atmoz/sftp server, key-based auth) ---------------
 // kopia's SFTP backend has no env-var credential form, so the mover materializes

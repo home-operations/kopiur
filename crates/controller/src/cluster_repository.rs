@@ -852,10 +852,13 @@ async fn bootstrap_cluster_via_mover(
         repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
     );
 
-    // Backend health probe (`spec.health.probe`, opt-in) — mirrors the namespaced
-    // `Repository` path: a once-`Ready` ClusterRepository (pinned `uniqueId`) re-runs
-    // its bootstrap as a pure connect probe (Part A forces `auto_create=false`); the
-    // phase STAYS `Ready` and the outcome surfaces as the `BackendReachable` condition.
+    // Backend health probe (`spec.health.probe`, default-on) — mirrors the
+    // namespaced `Repository` path: a once-`Ready` ClusterRepository (pinned
+    // `uniqueId`) re-runs its bootstrap as a pure connect probe (Part A forces
+    // `auto_create=false`); the outcome surfaces as the `BackendReachable`
+    // condition, and past `failureThreshold` the `onFailure` policy decides the
+    // phase — `Alert` stays `Ready`, the default `Degrade` opens the circuit
+    // breaker to `Degraded` (see `finalize_cluster_probe_failure`).
     let bootstrapped_before = repo
         .status
         .as_ref()
@@ -863,7 +866,8 @@ async fn bootstrap_cluster_via_mover(
         .is_some();
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
-    let already_ready = repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready);
+    let prior_phase = repo.status.as_ref().and_then(|s| s.phase);
+    let already_ready = prior_phase == Some(RepositoryPhase::Ready);
     let probe_attempt_at = repo
         .status
         .as_ref()
@@ -896,8 +900,9 @@ async fn bootstrap_cluster_via_mover(
     // `probeAttemptAt`) — interpret it gently and consume it exactly once. Keying on
     // `awaits_result()` rather than `probe_enabled` alone stops a Job left by a STRICT
     // launch from being re-read as a probe, which fabricated `lastHealthyAt` and could
-    // route a real bootstrap failure into the alert-only `finalize_cluster_probe_failure`
-    // (hard-coded `phase: Ready`), resurrecting a terminally-`Failed` repository.
+    // route a real bootstrap failure into `finalize_cluster_probe_failure` (which
+    // writes `phase: Ready` in its StayReady arm), resurrecting a
+    // terminally-`Failed` repository.
     // `!reverify`: a reverify nudge keeps its strict semantics (flip to `Failed` on a
     // connect failure) and is never downgraded to an alert-only probe.
     let probe_run = probe.awaits_result() && !spec_changed && !reverify;
@@ -910,13 +915,14 @@ async fn bootstrap_cluster_via_mover(
         return match crate::snapshot::job_terminal_state(&job) {
             // Still running. A catalog-refresh re-run of an already-Ready repo
             // keeps its phase — flapping Ready→Initializing every refresh would
-            // be pure status churn.
+            // be pure status churn — and a Degraded repo's strict retry keeps
+            // `Degraded` for the same reason (`health::launch_phase`, audit 3d).
             None => {
                 if !already_ready {
                     io::patch_status(
                         api,
                         name,
-                        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() }),
+                        serde_json::json!({ "phase": health::launch_phase(prior_phase), "backend": backend.kind_str() }),
                     )
                     .await?;
                 }
@@ -1027,6 +1033,30 @@ async fn bootstrap_cluster_via_mover(
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
         )));
+    }
+
+    // Breaker retry backoff (#345 M4): while `Degraded` with a recorded failure
+    // streak, hold the strict-retry relaunch until the exponential backoff since
+    // the last failed connect has elapsed — the launch-side gate that makes
+    // `strict_retry_backoff` real (a finalize requeue alone is defeated by the
+    // watch-triggered reconcile its own status patch causes; see the Repository
+    // twin). A spec change bypasses it (immediate retry on new config).
+    if !spec_changed
+        && let Some(remaining) = health::strict_retry_holdoff(
+            prior_phase == Some(RepositoryPhase::Degraded),
+            repo.status
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.consecutive_probe_failures)
+                .unwrap_or(0),
+            repo.status
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.last_probe_at.as_deref()),
+            chrono::Utc::now(),
+        )
+    {
+        return Ok(Action::requeue(remaining));
     }
 
     // Upgrade shim for the `{name}-bootstrap` → `{name}-discovery` rename: the
@@ -1224,11 +1254,13 @@ async fn bootstrap_cluster_via_mover(
     let job = jobs::build_job(&inputs)?;
     io::apply_mover_objects(&ctx.client, &job_ns, &job_name, Some(&cm), &job).await?;
     // Stamp the reverify token (loop guard): this request is now honored. A
-    // health-probe re-run keeps the phase `Ready` so backups/replication aren't paused.
+    // health-probe re-run keeps the phase `Ready` so backups/replication aren't
+    // paused; a `Degraded` repo's strict retry keeps `Degraded`
+    // (`health::launch_phase` — no Initializing flap while the breaker is open).
     let mut create_status = if probe_style_launch {
         serde_json::json!({ "backend": backend.kind_str() })
     } else {
-        serde_json::json!({ "phase": "Initializing", "backend": backend.kind_str() })
+        serde_json::json!({ "phase": health::launch_phase(prior_phase), "backend": backend.kind_str() })
     };
     if let Some(token) = reverify_token {
         create_status["lastReverifyAt"] = serde_json::Value::String(token.to_string());
@@ -1363,8 +1395,10 @@ async fn finalize_cluster_bootstrap(
     backend: &Backend,
     job_succeeded: bool,
     // True when this is a health-probe re-run of an already-`Ready` ClusterRepository
-    // (same spec): interpret the result as a probe (phase stays `Ready`) and consume
-    // the Job exactly once (deleted after processing).
+    // (same spec): interpret the result as a probe (the phase follows
+    // `health::breaker_verdict` — `Ready` under Alert/below-threshold, `Degraded`
+    // once the breaker opens) and consume the Job exactly once (deleted after
+    // processing).
     probe_run: bool,
 ) -> Result<Action> {
     let result = read_cluster_bootstrap_result(ctx, job_ns, job_name).await?;
@@ -1380,88 +1414,10 @@ async fn finalize_cluster_bootstrap(
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
         io::BootstrapOutcome::Failed(failure) => {
-            // Health-probe failure on an already-`Ready` ClusterRepository: alert-only.
-            // Keep phase `Ready`, surface the debounced `BackendReachable` condition +
-            // Warning event, never auto-recreate.
-            if probe_run {
-                return finalize_cluster_probe_failure(
-                    ctx, repo, api, name, job_ns, job_name, &failure,
-                )
-                .await;
-            }
-            let reason = failure.reason();
-            // A result-less Job failure carries no backend verdict (mover
-            // crashed / evicted / deadline / result write hit a down apiserver
-            // — the outage incident): recycle the dead Job and retry as
-            // `Degraded` instead of parking `Failed` until the Job's TTL
-            // finally reaps it. Mirrors `repository.rs::finalize_bootstrap`.
-            if failure.recycles_for_retry() {
-                io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
-                let conditions =
-                    cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
-                let conditions = io::set_ready(
-                    &conditions,
-                    repo.metadata.generation,
-                    io::ready_outcome_for_phase(RepositoryPhase::Degraded),
-                    reason,
-                    &failure.condition_message(),
-                );
-                let current = serde_json::to_value(&repo.status).ok();
-                let wrote = io::patch_status_if_changed(
-                    api,
-                    name,
-                    current.as_ref(),
-                    serde_json::json!({
-                        "phase": "Degraded",
-                        "backend": backend.kind_str(),
-                        "observedGeneration": repo.metadata.generation,
-                        "conditions": conditions,
-                    }),
-                )
-                .await?;
-                if wrote {
-                    failure.publish(ctx, &io::event_ref(repo), name).await;
-                    tracing::warn!(
-                        repo = %name,
-                        reason,
-                        "ClusterRepository bootstrap Job failed without a result; recycled it \
-                         for retry"
-                    );
-                }
-                return Ok(Action::requeue(Duration::from_secs(120)));
-            }
-            let conditions =
-                cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
-            // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
-            // should fail its health check fast, not hang until timeout.
-            let conditions = io::set_ready(
-                &conditions,
-                repo.metadata.generation,
-                io::ready_outcome_for_phase(RepositoryPhase::Failed),
-                reason,
-                &failure.condition_message(),
-            );
-            // Guard the write so the Event + warn log fire only on the real transition,
-            // not on every 120 s re-read (the message is stable → a true no-op once
-            // written, so no reconcile hot-loop and no Event spam).
-            let current = serde_json::to_value(&repo.status).ok();
-            let wrote = io::patch_status_if_changed(
-                api,
-                name,
-                current.as_ref(),
-                serde_json::json!({
-                    "phase": "Failed",
-                    "backend": backend.kind_str(),
-                    "observedGeneration": repo.metadata.generation,
-                    "conditions": conditions,
-                }),
+            return finalize_cluster_bootstrap_failure(
+                ctx, repo, name, job_ns, job_name, api, backend, failure, probe_run,
             )
-            .await?;
-            if wrote {
-                failure.publish(ctx, &io::event_ref(repo), name).await;
-                tracing::warn!(repo = %name, reason, "ClusterRepository bootstrap failed");
-            }
-            return Ok(Action::requeue(Duration::from_secs(120)));
+            .await;
         }
         io::BootstrapOutcome::Succeeded(result) => result,
     };
@@ -1495,30 +1451,48 @@ async fn finalize_cluster_bootstrap(
         index_blob_event = upd.event;
         storage_stats["indexBlobCount"] = serde_json::json!(count);
     }
-    // A successful health probe: clear any prior failure debounce and stamp
-    // `lastProbeAt`/`lastHealthyAt`. Safe to stamp unconditionally — a probe run
-    // consumes its Job exactly once (deleted below), so this never re-runs.
+    // Unified success fold (#345): ANY successful finalize — probe or strict —
+    // is a fresh backend verdict, so fold probe-success health (stamp
+    // `lastProbeAt`/`lastHealthyAt`, clear the failure debounce, set
+    // `BackendReachable=True`) into the patch. CONDITIONALLY: this arm re-runs
+    // on every reconcile while the finished strict Job lingers (~1h TTL) and
+    // the guarded write below depends on the steady-state pass being a
+    // byte-stable no-op, so `health::success_fold` refuses when nothing would
+    // change (seeded, healthy, not a probe). The seed case stops
+    // `health_probe_due` (which fires on `lastProbeAt == None`) from launching
+    // a redundant probe Job fleet-wide right after the default-on upgrade; the
+    // heal case is what closes the breaker after a re-connect succeeds.
     let mut health_status = serde_json::Value::Null;
-    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned `uniqueId` so
-    // a backend re-initialized at the old location by another party (same password)
-    // can't silently overwrite it on a successful connect.
-    let mut pinned_unique_id: Option<String> = None;
-    if probe_run {
-        let now = chrono::Utc::now().to_rfc3339();
+    let existing_conditions = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(fold) = health::success_fold(
+        probe_run,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        health::backend_reachable_true(existing_conditions),
+        &now,
+    ) {
         let upd = health::reconcile_probe_success(&conditions, &now, repo.metadata.generation);
         conditions = upd.conditions;
         // Explicit-null patch so the merge clears the failure counters (a `None`
         // would be elided and leave the prior streak, re-firing on the next failure).
-        health_status = health::probe_success_health_patch(&now);
-        if let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
-            if result.unique_id.as_deref() != Some(pinned) {
-                tracing::warn!(
-                    repo = %name, pinned, observed = ?result.unique_id,
-                    "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
-                );
-            }
-            pinned_unique_id = Some(pinned.to_string());
+        health_status = fold.health_patch;
+    }
+    // Part A invariant: a probe NEVER rebinds identity. Keep the pinned `uniqueId` so
+    // a backend re-initialized at the old location by another party (same password)
+    // can't silently overwrite it on a successful connect.
+    let mut pinned_unique_id: Option<String> = None;
+    if probe_run && let Some(pinned) = repo.status.as_ref().and_then(|s| s.unique_id.as_deref()) {
+        if result.unique_id.as_deref() != Some(pinned) {
+            tracing::warn!(
+                repo = %name, pinned, observed = ?result.unique_id,
+                "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+            );
         }
+        pinned_unique_id = Some(pinned.to_string());
     }
     // Non-blocking MassDeletionHeld condition from the live Snapshot store,
     // folded into the conditions array before the kstatus set_ready.
@@ -1656,10 +1630,273 @@ async fn finalize_cluster_bootstrap(
     )))
 }
 
-/// Health-probe failure on an already-`Ready` `ClusterRepository`: alert-only.
-/// Keeps the phase `Ready`, folds the debounced `BackendReachable` condition + (on
-/// a transition) a Warning event + metric, deletes the consumed Job, and requeues
-/// on the probe cadence. NEVER changes the phase and NEVER auto-recreates.
+/// Reflect a FAILED bootstrap Job into the `ClusterRepository` status — the
+/// failed arm of [`finalize_cluster_bootstrap`], mirroring the namespaced
+/// [`crate::repository`] twin's four exhaustive routes: probe-run →
+/// [`finalize_cluster_probe_failure`]; result-less → recycle as `Degraded`
+/// (flat 120s, untouched by M4); a `RepositoryUnavailable` verdict on a
+/// once-bootstrapped repo → [`recycle_cluster_bootstrap_outage`] (the #345
+/// strict-verdict reroute); everything else → terminal `Failed`.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_cluster_bootstrap_failure(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    name: &str,
+    job_ns: &str,
+    job_name: &str,
+    api: &Api<ClusterRepository>,
+    backend: &Backend,
+    failure: io::BootstrapFailure,
+    probe_run: bool,
+) -> Result<Action> {
+    // Health-probe failure on an already-`Ready` ClusterRepository: the probe
+    // path folds the unified sensor itself (and applies the breaker verdict),
+    // so the strict fold below never double-counts a probe Job's failure.
+    if probe_run {
+        return finalize_cluster_probe_failure(ctx, repo, api, name, job_ns, job_name, &failure)
+            .await;
+    }
+    let reason = failure.reason();
+    // A result-less Job failure carries no backend verdict (mover
+    // crashed / evicted / deadline / result write hit a down apiserver
+    // — the outage incident): recycle the dead Job and retry as
+    // `Degraded` instead of parking `Failed` until the Job's TTL
+    // finally reaps it. Mirrors `repository.rs::finalize_bootstrap_failure`.
+    if failure.recycles_for_retry() {
+        io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
+        let conditions =
+            cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+        let conditions = io::set_ready(
+            &conditions,
+            repo.metadata.generation,
+            io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+            reason,
+            &failure.condition_message(),
+        );
+        let current = serde_json::to_value(&repo.status).ok();
+        let wrote = io::patch_status_if_changed(
+            api,
+            name,
+            current.as_ref(),
+            serde_json::json!({
+                "phase": "Degraded",
+                "backend": backend.kind_str(),
+                "observedGeneration": repo.metadata.generation,
+                "conditions": conditions,
+            }),
+        )
+        .await?;
+        if wrote {
+            failure.publish(ctx, &io::event_ref(repo), name).await;
+            tracing::warn!(
+                repo = %name,
+                reason,
+                "ClusterRepository bootstrap Job failed without a result; recycled it \
+                 for retry"
+            );
+        }
+        return Ok(Action::requeue(Duration::from_secs(120)));
+    }
+    // A backend-outage verdict on a once-bootstrapped repo (#345 M4): recycle
+    // and retry as `Degraded`, feeding the unified backend sensor.
+    let bootstrapped = repo
+        .status
+        .as_ref()
+        .and_then(|s| s.unique_id.as_deref())
+        .is_some();
+    if failure.retryable_outage_for_bootstrapped(bootstrapped) {
+        return recycle_cluster_bootstrap_outage(
+            ctx, repo, name, job_ns, job_name, api, backend, &failure,
+        )
+        .await;
+    }
+    let conditions = cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+    // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
+    // should fail its health check fast, not hang until timeout.
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(RepositoryPhase::Failed),
+        reason,
+        &failure.condition_message(),
+    );
+    // Guard the write so the Event + warn log fire only on the real transition,
+    // not on every 120 s re-read (the message is stable → a true no-op once
+    // written, so no reconcile hot-loop and no Event spam).
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({
+            "phase": "Failed",
+            "backend": backend.kind_str(),
+            "observedGeneration": repo.metadata.generation,
+            "conditions": conditions,
+        }),
+    )
+    .await?;
+    if wrote {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        tracing::warn!(repo = %name, reason, "ClusterRepository bootstrap failed");
+    }
+    Ok(Action::requeue(Duration::from_secs(120)))
+}
+
+/// The strict-verdict reroute (#345 M4) for a `ClusterRepository`: a failed
+/// strict bootstrap whose verdict is a retryable backend outage on a
+/// once-bootstrapped repo recycles the Job and retries as `Degraded` instead of
+/// parking terminal `Failed`, feeding the SAME unified backend sensor the probe
+/// path uses so the failure streak climbs across probe AND strict failures.
+/// See the namespaced twin (`repository.rs::recycle_bootstrap_outage`) for the
+/// full rationale; the launch-side `health::strict_retry_holdoff` in
+/// [`bootstrap_cluster_via_mover`] enforces the retry cadence.
+#[allow(clippy::too_many_arguments)]
+async fn recycle_cluster_bootstrap_outage(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    name: &str,
+    job_ns: &str,
+    job_name: &str,
+    api: &Api<ClusterRepository>,
+    backend: &Backend,
+    failure: &io::BootstrapFailure,
+) -> Result<Action> {
+    io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
+    let reason = failure.reason();
+    let kind = if failure.is_repository_absent() {
+        health::ProbeFailureKind::Vanished
+    } else {
+        health::ProbeFailureKind::Unreachable
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let existing = repo
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let threshold = kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
+        repo.spec.health.as_ref(),
+    );
+    // A strict connect failure is a SENSOR TICK, not an automatic phase flip —
+    // the same `breaker_verdict` as the probe path decides the phase (see the
+    // namespaced twin for the full rationale: hard-coding `Degraded` here
+    // bypassed the threshold, broke the Alert contract, and skipped the trip
+    // metric/event).
+    let upd = health::reconcile_probe_failure(
+        &existing,
+        repo.status.as_ref().and_then(|s| s.health.as_ref()),
+        kind,
+        threshold,
+        &now,
+        repo.metadata.generation,
+    );
+    let verdict = health::breaker_verdict(
+        upd.health.consecutive_probe_failures.unwrap_or(0),
+        threshold,
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_on_failure(
+            repo.spec.health.as_ref(),
+        ),
+    );
+    let p =
+        health::probe_failure_phase(verdict, kind, cluster_probe_aware_reconcile_interval(repo));
+    // Only an OPEN verdict records the failed re-bootstrap on `Bootstrapped`;
+    // while the verdict keeps the repository `Ready`, the `BackendReachable`
+    // sensor condition alone carries the story.
+    let conditions = if p.opened {
+        io::upsert_condition(
+            &upd.conditions,
+            crate::consts::REPOSITORY_BOOTSTRAPPED_CONDITION,
+            false,
+            reason,
+            &failure.condition_message(),
+            repo.metadata.generation,
+        )
+    } else {
+        upd.conditions.clone()
+    };
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(p.phase),
+        p.ready_reason,
+        p.ready_message,
+    );
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({
+            "phase": p.phase_str,
+            "backend": backend.kind_str(),
+            "observedGeneration": repo.metadata.generation,
+            // Explicit-null patch (never `upd.health` directly): the merge must
+            // retire `probeAttemptAt` — see `finalize_cluster_probe_failure`.
+            "health": health::probe_failure_health_patch(&upd.health),
+            "conditions": conditions,
+        }),
+    )
+    .await?;
+    // The unified sensor's own alert (threshold crossing / reason change) is
+    // already once-per-episode by construction.
+    if let Some(w) = upd.event {
+        ctx.metrics
+            .inc_health_probe_failure("", name, "ClusterRepository", kind.label());
+        if wrote {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+        }
+    }
+    // The breaker-trip Event + metric + the class Event (volatile stderr
+    // detail) fire on the Open TRANSITION only — the streak++ makes `wrote`
+    // true on EVERY retry, so gating on `wrote` alone would publish once per
+    // cycle for a multi-day outage.
+    if p.opened
+        && wrote
+        && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded)
+    {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        ctx.metrics
+            .inc_breaker_trip("ClusterRepository", "", name, kind.label());
+        io::publish_warning_event(
+            ctx,
+            repo,
+            health::breaker_reason(kind),
+            health::breaker_action(kind),
+            &format!(
+                "{} Last error: {}",
+                health::breaker_open_message(kind),
+                failure.condition_message()
+            ),
+        )
+        .await;
+        tracing::warn!(
+            repo = %name,
+            reason,
+            "strict bootstrap hit a backend outage on a bootstrapped ClusterRepository; \
+             circuit breaker opened (Degraded) and the Job was recycled to retry"
+        );
+    }
+    let streak = upd.health.consecutive_probe_failures.unwrap_or(1);
+    // Open: hop straight back into the strict retry loop (launch cadence
+    // governed by `strict_retry_holdoff`). StayReady: the probe timer /
+    // reverify nudges drive the next sensor tick on the steady cadence.
+    let requeue = if p.opened {
+        health::strict_retry_backoff(streak.saturating_sub(1))
+    } else {
+        p.requeue
+    };
+    Ok(Action::requeue(requeue))
+}
+
+/// Health-probe failure on an already-`Ready` `ClusterRepository` — the
+/// breaker's sensor path, mirroring the namespaced twin. Folds the debounced
+/// `BackendReachable` condition + (on a transition) a Warning event + metric,
+/// deletes the consumed Job, and applies [`health::breaker_verdict`] to the
+/// post-fold streak: `StayReady` keeps writing `phase: Ready` (alert-only, the
+/// pre-#345 contract); `Open` moves the phase to `Degraded`, pausing
+/// backups/maintenance/replication until a connect succeeds. NEVER
+/// auto-recreates, under either verdict.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_cluster_probe_failure(
     ctx: &Context,
@@ -1681,27 +1918,37 @@ async fn finalize_cluster_probe_failure(
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
     let now = chrono::Utc::now().to_rfc3339();
+    let threshold = kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
+        repo.spec.health.as_ref(),
+    );
     let upd = health::reconcile_probe_failure(
         &existing,
         repo.status.as_ref().and_then(|s| s.health.as_ref()),
         kind,
-        kopiur_api::repository::RepositoryHealthProbeSpec::effective_failure_threshold(
-            repo.spec.health.as_ref(),
-        ),
+        threshold,
         &now,
         repo.metadata.generation,
     );
-    // The repository stays kstatus-Ready during a probe failure (backups continue
-    // by design); the probe detail rides the `BackendReachable` condition folded
-    // into `upd.conditions`. Layer Ready on top so its observedGeneration stays
-    // current and a resumed-then-probe-flapping repo never shows a stale
-    // `Suspended` Ready reason (issue #245).
+    let verdict = health::breaker_verdict(
+        upd.health.consecutive_probe_failures.unwrap_or(0),
+        threshold,
+        kopiur_api::repository::RepositoryHealthProbeSpec::effective_on_failure(
+            repo.spec.health.as_ref(),
+        ),
+    );
+    // The phase/conditions/requeue the verdict dictates — the pure, tested
+    // `health::probe_failure_phase` mapping; see the namespaced twin for the
+    // full rationale (StayReady self-heals a stray phase back to Ready; Open
+    // writes the byte-stable breaker message and must NOT self-heal — only a
+    // successful connect closes the breaker).
+    let p =
+        health::probe_failure_phase(verdict, kind, cluster_probe_aware_reconcile_interval(repo));
     let conditions = io::set_ready(
         &upd.conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(RepositoryPhase::Ready),
-        "Bootstrapped",
-        "repository connected; a health probe is failing (see BackendReachable), backups continue",
+        io::ready_outcome_for_phase(p.phase),
+        p.ready_reason,
+        p.ready_message,
     );
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
@@ -1709,7 +1956,7 @@ async fn finalize_cluster_probe_failure(
         name,
         current.as_ref(),
         serde_json::json!({
-            "phase": "Ready",
+            "phase": p.phase_str,
             // NOT `upd.health` directly: `skip_serializing_if = "Option::is_none"` would
             // ELIDE the `None` for `probeAttemptAt`, leaving the launch stamp in the
             // stored object — so the repo would stay `AwaitingResult` and the next
@@ -1720,21 +1967,42 @@ async fn finalize_cluster_probe_failure(
     )
     .await?;
     if let Some(w) = upd.event {
-        let kind_label = match kind {
-            health::ProbeFailureKind::Vanished => "vanished",
-            health::ProbeFailureKind::Unreachable => "unreachable",
-        };
         ctx.metrics
-            .inc_health_probe_failure("", name, "ClusterRepository", kind_label);
+            .inc_health_probe_failure("", name, "ClusterRepository", kind.label());
         if wrote {
             io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
             tracing::warn!(repo = %name, reason = w.reason, "ClusterRepository health probe raised an alert");
         }
     }
+    // The breaker-trip Event + metric fire on the Open TRANSITION only (guarded
+    // by `wrote` + the prior phase, matching the event-on-transition
+    // discipline). The Event carries the volatile last-error detail the
+    // byte-stable condition message deliberately omits.
+    if p.opened
+        && wrote
+        && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded)
+    {
+        ctx.metrics
+            .inc_breaker_trip("ClusterRepository", "", name, kind.label());
+        io::publish_warning_event(
+            ctx,
+            repo,
+            health::breaker_reason(kind),
+            health::breaker_action(kind),
+            &format!(
+                "{} Last error: {}",
+                health::breaker_open_message(kind),
+                failure.condition_message()
+            ),
+        )
+        .await;
+        tracing::warn!(repo = %name, probe_kind = kind.label(), "ClusterRepository circuit breaker opened: backend unhealthy past failureThreshold");
+    }
+    // A probe consumes its Job exactly once, under either verdict; the requeue
+    // is the steady probe cadence (StayReady) or the short hop into the strict
+    // retry loop (Open — `health::strict_retry_holdoff` then governs it).
     delete_cluster_bootstrap_job(ctx, job_ns, job_name).await?;
-    Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
-        repo,
-    )))
+    Ok(Action::requeue(p.requeue))
 }
 
 /// Delete a finished cluster bootstrap Job + its result ConfigMap (in the creds

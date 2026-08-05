@@ -3614,9 +3614,8 @@ fn repository_health_probe_interval_and_threshold_are_validated() {
     // Unparseable interval → rejected, names the field.
     let bad = RepositoryHealthSpec {
         probe: Some(RepositoryHealthProbeSpec {
-            enabled: true,
             interval: Some("every-hour".to_string()),
-            failure_threshold: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -3626,9 +3625,8 @@ fn repository_health_probe_interval_and_threshold_are_validated() {
     // Below the 30s floor → rejected.
     let too_fast = RepositoryHealthSpec {
         probe: Some(RepositoryHealthProbeSpec {
-            enabled: true,
             interval: Some("5s".to_string()),
-            failure_threshold: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -3638,9 +3636,8 @@ fn repository_health_probe_interval_and_threshold_are_validated() {
     // failureThreshold < 1 → rejected.
     let bad_threshold = RepositoryHealthSpec {
         probe: Some(RepositoryHealthProbeSpec {
-            enabled: true,
-            interval: None,
             failure_threshold: Some(0),
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -3650,9 +3647,10 @@ fn repository_health_probe_interval_and_threshold_are_validated() {
     // Valid probe (or omitted interval/threshold) is accepted.
     let ok = RepositoryHealthSpec {
         probe: Some(RepositoryHealthProbeSpec {
-            enabled: true,
+            enabled: Some(true),
             interval: Some("30s".to_string()),
             failure_threshold: Some(3),
+            ..Default::default()
         }),
         ..Default::default()
     };

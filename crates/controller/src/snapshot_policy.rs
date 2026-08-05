@@ -393,10 +393,12 @@ async fn handle_policy_deletion(
 }
 
 /// Count the most-recent run of consecutive `Failed` backups before the latest
-/// `Succeeded` one (the `kopiur_snapshot_consecutive_failures` gauge). Only
-/// terminal backups (Succeeded/Failed) count; ordering is by `endTime` (falling
-/// back to the CR creation time). Pure. ADR §4.13.
-pub fn consecutive_failures(backups: &[Snapshot]) -> i64 {
+/// `Succeeded` one (the store-backed `kopiur_snapshot_consecutive_failures`
+/// gauge, derived per policy from the Snapshot store in
+/// `crate::metrics::Metrics::register_resource_observers`). Only terminal
+/// backups (Succeeded/Failed) count; ordering is by `endTime` (falling back to
+/// the CR creation time). Pure. ADR §4.13.
+pub fn consecutive_failures<'a>(backups: impl IntoIterator<Item = &'a Snapshot>) -> i64 {
     use kopiur_api::SnapshotPhase;
     let terminal_time = |b: &Snapshot| -> Option<(DateTime<Utc>, SnapshotPhase)> {
         let status = b.status.as_ref()?;
@@ -417,7 +419,7 @@ pub fn consecutive_failures(backups: &[Snapshot]) -> i64 {
         Some((t, phase))
     };
     let mut terminal: Vec<(DateTime<Utc>, SnapshotPhase)> =
-        backups.iter().filter_map(terminal_time).collect();
+        backups.into_iter().filter_map(terminal_time).collect();
     // Newest first.
     terminal.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     let mut n = 0;
@@ -550,6 +552,18 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     )
     .await?;
 
+    // LIST this policy's Snapshots BEFORE the repository-readiness gate below:
+    // retention (further down) needs the population even while the repository is
+    // not Ready. The `kopiur_snapshot_consecutive_failures` / `kopiur_snapshots_live`
+    // gauges are no longer written here — they are store-backed observables derived
+    // from the Snapshot reflector store at collection time (M6, #345), which is
+    // what freeze-proofs them: they keep updating even when this reconcile stops
+    // running (e.g. the repository left `Ready`, exactly when the streak matters
+    // most), and a deleted policy's series vanish instead of lingering (#172/#175).
+    let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
+    let backups = backup_api.list(&lp).await?.items;
+
     // §2 dependent gating: a SnapshotPolicy should not be Ready (and schedules
     // shouldn't fire it productively) until its Repository is Ready. Read readiness
     // from the existing helper and REQUEUE (not error) until then, surfacing a
@@ -580,24 +594,10 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // below (captured before `last_successful` is consumed by the status patch).
     let has_successful_snapshot = last_successful.is_some();
 
-    // 2. Observe this policy's Snapshots, then enforce GFS retention over them (the
-    //    Snapshot finalizer governs the kopia snapshot itself).
-    //
-    //    The LIST and the gauges are UNCONDITIONAL; only the prune is gated on
-    //    `spec.retention`. `retention: None` deliberately means "never prune" (see
-    //    `validate::snapshot`) — but it used to also skip these metrics, so a policy
-    //    whose `Snapshot` CRs grow without bound did so entirely invisibly, and its
-    //    consecutive-failure alert never armed either. The population is the signal;
-    //    emit it whatever the retention config says.
-    let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
-    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
-    let backups = backup_api.list(&lp).await?.items;
-    // Surface the consecutive-failure streak for alerting (ADR §4.13).
-    ctx.metrics
-        .set_backup_consecutive_failures(&namespace, &name, consecutive_failures(&backups));
-    ctx.metrics
-        .set_snapshots_live(&namespace, &name, backups.len() as i64);
-
+    // 2. Enforce GFS retention over this policy's Snapshots (the Snapshot finalizer
+    //    governs the kopia snapshot itself). The LIST happens above the
+    //    repository-readiness gate — only the prune is conditional. `retention: None`
+    //    deliberately means "never prune" (see `validate::snapshot`).
     if let Some(retention) = config.spec.retention.as_ref() {
         let selected = backups_to_delete(&backups, retention);
         // Split the selected set: normal (live) prunes get stamp-then-delete;
@@ -1346,7 +1346,7 @@ mod tests {
             2
         );
         // No terminal backups (e.g. only Running/Pending) → 0.
-        assert_eq!(consecutive_failures(&[]), 0);
+        assert_eq!(consecutive_failures(&[] as &[Snapshot]), 0);
     }
 
     #[test]

@@ -29,13 +29,23 @@ spec:
           # silent — no data, not an alert — for a policy that has never succeeded, or
           # whose Succeeded Snapshot CRs were all deleted (e.g. pruned by retention
           # while every recent run has been failing): exactly the case that most needs
-          # to page. kopiur_snapshot_consecutive_failures{namespace,name} is a sync
-          # gauge scoped to the SnapshotPolicy itself (not store-backed like the
-          # Snapshot-derived families), so it keeps reporting even when every one of
-          # the policy's Snapshot CRs is gone, making it the presence/liveness signal
-          # for the second branch. Its label is `name` (the SnapshotPolicy name); the
-          # new family labels the same value `policy`, hence the label_replace to join
+          # to page. kopiur_snapshot_consecutive_failures{namespace,name} is the
+          # liveness signal for the second branch: since #345 M6 it is store-backed
+          # too (derived from the policy's Snapshot CRs), which changes series
+          # PRESENCE (it now vanishes with the policy's last Snapshot CR) but not
+          # this branch's coverage — a streak > 0 was always computed from retained
+          # Failed Snapshot CRs (the old sync gauge LISTed the same population), so
+          # whenever the branch's `> 0` filter could match, the series exists. It
+          # keeps reporting after every SUCCEEDED CR was pruned, the case this
+          # branch is for. Its label is `name` (the SnapshotPolicy name); the new
+          # family labels the same value `policy`, hence the label_replace to join
           # on (namespace, policy) via `unless`.
+          #
+          # This alert stays THE loud staleness signal while a repository circuit
+          # breaker (#345) holds backups paused: gated Snapshots park Pending (no
+          # new terminal runs), so the last-success age keeps growing until it
+          # crosses the threshold. KopiurRepositoryBreakerOpen / KopiurSnapshotsGated
+          # below explain the pause earlier; they do not replace this alert.
           expr: >-
             (
               time() - kopiur_policy_last_backup_success_timestamp_seconds > {{ .Values.monitoring.prometheusRule.backupStaleAfterSeconds }}
@@ -147,4 +157,37 @@ spec:
           annotations:
             summary: "kopiur leader Lease renewals are slow"
             description: "p99 Lease renew latency is {{`{{ $value }}`}}s against a 10s renew window. Healthy is single-digit milliseconds. If the API server is otherwise fine, the operator's lease traffic is most likely queueing in API Priority and Fairness — check that the kopiur FlowSchema exists (leaderElection.flowSchema.enabled)."
+        - alert: KopiurRepositoryBreakerOpen
+          # The repository circuit breaker (#345) is open: the backend health probe
+          # exceeded spec.health.probe.failureThreshold under onFailure: Degrade, so
+          # the repository moved to Degraded and stays there STABLY while open (M4's
+          # launch-phase guarantee — no Initializing flap), which is what makes the
+          # `for:` clause meaningful. Narrower than KopiurRepositoryNotReady (which
+          # also matches Failed and pages critical): this one names the breaker
+          # specifically and explains that the pause is deliberate and self-healing.
+          # max-by for scrape-target-overlap identity hygiene, matching the other
+          # phase alerts; `kind` is kept so the description can point kubectl at the
+          # right resource.
+          expr: max by (kind, namespace, name) (kopiur_resource_phase{kind=~"Repository|ClusterRepository", phase="Degraded"}) == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Repository circuit breaker open for {{`{{ $labels.kind }}`}} {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}}"
+            description: "The backend health probe kept failing past its threshold, so kopiur opened the circuit breaker: backups, maintenance, and replication against this repository are paused (Snapshots park Pending, they are not lost). Recovery is automatic once a connect succeeds — nothing needs restarting. Run `kubectl describe {{`{{ $labels.kind }}`}} {{`{{ $labels.name }}`}}` and check the BackendReachable condition for the cause."
+        - alert: KopiurSnapshotsGated
+          # Sustained parked backups: Snapshots held Pending behind a not-Ready
+          # repository (Ready reason RepositoryNotReady). These are deferrals, not
+          # refusals — they launch automatically on recovery — so this is
+          # informational context alongside KopiurRepositoryBreakerOpen, and
+          # KopiurBackupStale remains the escalating signal if the pause drags on.
+          # kopiur_snapshot_gated is store-backed (series absent when nothing is
+          # parked), so > 0 is a pure presence-and-magnitude check.
+          expr: sum by (namespace) (kopiur_snapshot_gated) > 0
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "Backups in {{`{{ $labels.namespace }}`}} are parked behind a not-Ready repository"
+            description: "{{`{{ $value }}`}} Snapshot(s) in {{`{{ $labels.namespace }}`}} have been held Pending for 30m because their repository is not Ready (see KopiurRepositoryBreakerOpen / the repository's BackendReachable condition). They will launch automatically once the repository recovers."
 {{- end }}
