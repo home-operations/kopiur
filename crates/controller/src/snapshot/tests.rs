@@ -317,6 +317,7 @@ fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>
     let mut backup = Snapshot::new(
         "b1",
         kopiur_api::snapshot::SnapshotSpec {
+            source: None,
             policy_ref: Some(kopiur_api::common::PolicyRef {
                 name: "pg".into(),
                 namespace: None,
@@ -480,6 +481,7 @@ fn dummy_backup() -> Snapshot {
     Snapshot::new(
         "b1",
         kopiur_api::snapshot::SnapshotSpec {
+            source: None,
             policy_ref: None,
             tags: None,
             failure_policy: None,

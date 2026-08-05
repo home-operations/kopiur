@@ -1579,6 +1579,7 @@ fn backup_config_valid_spec_has_no_errors() {
 fn backup_aggregate_rejects_discovered_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        source: None,
         tags: None,
         failure_policy: None,
         description: None,
@@ -1694,6 +1695,7 @@ fn snapshot_tags_accumulate_every_problem() {
 fn backup_aggregate_rejects_reserved_tags() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        source: None,
         tags: Some(tags_of(&[("kopiur-meta", "{}")])),
         failure_policy: None,
         description: None,
@@ -1753,6 +1755,7 @@ fn scheduled_and_manual_accept_on_schedule_delete() {
 fn backup_aggregate_rejects_discovered_on_schedule_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        source: None,
         tags: None,
         failure_policy: None,
         description: None,

@@ -380,6 +380,7 @@ pub fn build_adopted_snapshot(
     let mut snapshot = Snapshot::new(
         &cr_name,
         SnapshotSpec {
+            source: None,
             policy_ref: Some(PolicyRef {
                 name: policy_name.clone(),
                 namespace: None,

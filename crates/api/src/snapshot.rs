@@ -29,6 +29,11 @@ use std::collections::BTreeMap;
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Origin","type":"string","jsonPath":".status.origin"}"#,
     printcolumn = r#"{"name":"Snapshot","type":"string","jsonPath":".status.snapshot.kopiaSnapshotID"}"#,
+    // The PVC this run covers. Blank for a single-source policy (the recipe's
+    // one source IS the answer); populated for every child of a `pvcSelector`
+    // expansion, where a bare `kubectl get snapshots` would otherwise show N
+    // rows with the same policy and no way to tell them apart.
+    printcolumn = r#"{"name":"Source","type":"string","jsonPath":".spec.source.target.pvc.name"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +41,19 @@ pub struct SnapshotSpec {
     /// The `SnapshotPolicy` recipe to run; absent for `discovered` backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<PolicyRef>,
+    /// The ONE concrete source this `Snapshot` covers, when `policyRef` names a
+    /// recipe whose `sources[]` expands to many — i.e. a
+    /// [`pvcSelector`](crate::snapshot_policy::PvcSelector).
+    ///
+    /// Stamped by whoever minted the CR: a `SnapshotSchedule` fire, or
+    /// `kubectl kopiur snapshot now`. Absent for the ordinary single-source
+    /// case, where the policy's own `sources[0]` is the target.
+    ///
+    /// Absent against a *selector* policy is refused rather than guessed. The
+    /// operator must never pick a PVC on the user's behalf: silently backing up
+    /// one arbitrary volume out of N looks exactly like success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SnapshotSourceRef>,
     /// Free-form tags attached to the kopia snapshot manifest itself
     /// (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the
     /// repository, independent of this CR. Keys must be non-empty, colon-free
@@ -69,6 +87,76 @@ pub struct SnapshotSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 1024))]
     pub description: Option<String>,
+}
+
+/// Which source of the referenced `SnapshotPolicy` this `Snapshot` covers, and
+/// what that source resolved to at expansion time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSourceRef {
+    /// Zero-based index into `policyRef`'s `spec.sources` this child expanded
+    /// from.
+    ///
+    /// Pins WHICH source's knobs (`readOnly`, `sourcePathOverride`,
+    /// `sourcePathStrategy`, `acknowledgeLiveMutation`) govern this run, so a
+    /// policy carrying several sources stays unambiguous. An index that is out
+    /// of range at reconcile time — the policy shrank mid-run — is a named
+    /// terminal failure, never a silent fallback to `sources[0]`.
+    pub source_index: u32,
+    /// What the expansion resolved to.
+    pub target: SnapshotSourceTarget,
+    /// The consistency group this child belongs to, present only when the
+    /// policy asked for one (`groupBy: VolumeGroupSnapshot`) AND the expansion
+    /// produced more than one member in this namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<SnapshotSourceGroup>,
+}
+
+/// The resolved target of one expanded source.
+///
+/// Externally tagged (`target: { pvc: {...} }`) per the repo's
+/// discriminated-union rule: internally-tagged enums break Kubernetes
+/// structural-schema generation. A future expandable source kind cannot compile
+/// until every handler accounts for it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SnapshotSourceTarget {
+    /// One `PersistentVolumeClaim`, fully qualified.
+    Pvc(PvcTargetRef),
+}
+
+/// A fully-qualified `PersistentVolumeClaim` reference.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PvcTargetRef {
+    /// Namespace of the matched `PersistentVolumeClaim`.
+    ///
+    /// Explicit rather than inferred from the `Snapshot`'s own namespace: a
+    /// `pvcSelector` under a `ClusterRepository` may match across namespaces.
+    pub namespace: String,
+    /// Name of the matched `PersistentVolumeClaim`.
+    pub name: String,
+}
+
+/// The shared CSI `VolumeGroupSnapshot` every member of one expansion stages
+/// from.
+///
+/// Pinned to the SPEC, not derived per reconcile, for the same reason
+/// `status.staged.stagingTimeoutSeconds` is pinned: the group is an
+/// *invocation*-time decision, and a policy edited or deleted mid-run must
+/// never move the object a live member is waiting on — or reaping.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSourceGroup {
+    /// Namespace the `VolumeGroupSnapshot` lives in.
+    ///
+    /// A `VolumeGroupSnapshot` is namespaced and its `source.selector` is
+    /// namespace-local, so a selector spanning namespaces yields ONE GROUP PER
+    /// NAMESPACE, not one group. The consistency guarantee is per-namespace and
+    /// this field is where that shows.
+    pub namespace: String,
+    /// Name of the shared `VolumeGroupSnapshot`.
+    pub volume_group_snapshot_name: String,
 }
 
 /// How a `Snapshot` came to exist. Canonical value mirrored from the

@@ -33,6 +33,24 @@ pub const CONFIG_LABEL: &str = "kopiur.home-operations.com/config";
 /// under `policySelector` fan-out).
 pub const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
 
+/// Label naming the shared CSI `VolumeGroupSnapshot` a fanned-out `Snapshot`
+/// stages from — carried by BOTH the member `Snapshot` CRs and the
+/// `VolumeGroupSnapshot` object itself.
+///
+/// This is the group's only join key, which makes it load-bearing rather than
+/// decorative. The `VolumeGroupSnapshot` deliberately has **no**
+/// ownerReferences (see `io::group_staging`): every candidate owner is either
+/// absent for a manual run, long-lived enough that GC never fires, or — for a
+/// "leader" member — liable to be pruned while siblings are still restoring
+/// from the group's member snapshots. So one label selector answers both "who
+/// are my siblings" and "does any live member still need this group", and the
+/// reaper fails CLOSED when that read fails.
+///
+/// Lives in `kopiur-api`, not `kopiur-controller`, because the CLI (to filter a
+/// fan-out) and the webhook (to stamp it on a hand-applied member) both need it
+/// and neither can depend on the controller crate.
+pub const GROUP_LABEL: &str = "kopiur.home-operations.com/group";
+
 /// Label naming the operation a mover `Job` performs, for Jobs whose owning CR
 /// doesn't record the Job name in status (e.g. `Restore`). Values:
 /// [`OP_RESTORE`], [`OP_RESTORE_TARGET`].
@@ -262,6 +280,7 @@ mod tests {
             REPOSITORY_UID_LABEL,
             CONFIG_LABEL,
             SCHEDULE_LABEL,
+            GROUP_LABEL,
             OP_LABEL,
             SESSION_LABEL,
             SESSION_REPO_LABEL,

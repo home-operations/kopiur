@@ -1448,6 +1448,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 SnapshotSpec {
+                    source: None,
                     policy_ref: None,
                     tags: None,
                     failure_policy: None,

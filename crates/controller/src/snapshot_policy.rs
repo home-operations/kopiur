@@ -1345,6 +1345,7 @@ mod tests {
         let mut b = Snapshot::new(
             name,
             SnapshotSpec {
+                source: None,
                 policy_ref: None,
                 tags: None,
                 failure_policy: None,
@@ -1602,6 +1603,7 @@ mod tests {
             let mut b = Snapshot::new(
                 "occupant",
                 SnapshotSpec {
+                    source: None,
                     policy_ref: None,
                     tags: None,
                     failure_policy: None,
@@ -1880,6 +1882,7 @@ mod tests {
         let mut running = Snapshot::new(
             "running",
             SnapshotSpec {
+                source: None,
                 policy_ref: None,
                 tags: None,
                 failure_policy: None,

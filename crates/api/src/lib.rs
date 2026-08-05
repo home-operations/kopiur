@@ -65,7 +65,8 @@ pub use server::{
     ClusterServerSpec, ServerAuth, ServerService, ServerSpec, ServerStatus, ServiceType,
 };
 pub use snapshot::{
-    Origin, Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStats, SnapshotStatus, SnapshotTiming,
+    Origin, PvcTargetRef, Snapshot, SnapshotPhase, SnapshotSourceGroup, SnapshotSourceRef,
+    SnapshotSourceTarget, SnapshotSpec, SnapshotStats, SnapshotStatus, SnapshotTiming,
     StagedSources,
 };
 pub use snapshot_policy::{

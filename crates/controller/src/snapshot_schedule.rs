@@ -918,6 +918,7 @@ fn scheduled_backup_spec(
     on_schedule_delete: ScheduleDeletePolicy,
 ) -> SnapshotSpec {
     SnapshotSpec {
+        source: None,
         policy_ref: Some(policy_ref.clone()),
         tags: None,
         failure_policy: None,
@@ -1776,6 +1777,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 SnapshotSpec {
+                    source: None,
                     policy_ref: None,
                     tags: None,
                     failure_policy: None,

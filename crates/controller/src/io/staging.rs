@@ -1007,6 +1007,53 @@ async fn staged_pvc_bind_gate(
     }
 }
 
+/// What a source's shape + `copyMethod` + install scope imply for staging,
+/// BEFORE any cluster read.
+///
+/// Pure so the ORDER is pinned by unit tests. The order was wrong: the
+/// namespaced-install refusal used to run *before* the source-shape checks, so
+/// an NFS-source policy under the defaulted `copyMethod: Snapshot` failed
+/// TERMINALLY on a namespaced install — when it should mount the live export
+/// and succeed. Nothing about an NFS source needs a cluster-scoped read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StagingApplicability<'a> {
+    /// `Direct`, or a non-PVC source (NFS, or a `pvcSelector` that produced no
+    /// concrete PVC): mount the live source, stage nothing.
+    NotApplicable,
+    /// A PVC source that wants staging, on an install whose Role RBAC cannot
+    /// read the cluster-scoped objects staging requires.
+    ClusterScopeRequired,
+    /// Stage this PVC.
+    Proceed {
+        /// The concrete source PVC name.
+        source_name: &'a str,
+    },
+}
+
+/// Decide [`StagingApplicability`]. See the enum for why the order matters.
+pub(crate) fn staging_applicability(
+    copy_method: CopyMethod,
+    source_pvc: Option<&str>,
+    namespaced_install: bool,
+) -> StagingApplicability<'_> {
+    // 1. Opted out entirely.
+    if copy_method == CopyMethod::Direct {
+        return StagingApplicability::NotApplicable;
+    }
+    // 2. Nothing to stage. Checked BEFORE the install-scope gate: every
+    //    cluster-scoped read staging performs (StorageClass, VolumeSnapshotClass,
+    //    the PersistentVolume reclaim patch) is on the PVC path only.
+    let Some(name) = source_pvc else {
+        return StagingApplicability::NotApplicable;
+    };
+    // 3. Now the gate is meaningful: this source really does need the
+    //    cluster-scoped reads a namespaced install's Role cannot make.
+    if namespaced_install {
+        return StagingApplicability::ClusterScopeRequired;
+    }
+    StagingApplicability::Proceed { source_name: name }
+}
+
 /// Resolve staging for a backup. Performs the cluster IO (preflight, create
 /// VolumeSnapshot, wait `readyToUse`, create staged PVC) and returns a [`StagingOutcome`]
 /// — **no** status side effects (the reconciler maps the outcome). Idempotent: every
@@ -1020,32 +1067,26 @@ pub async fn resolve_staging(
     owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
-    // Direct → never stage. Staging only applies to a single explicit `pvc` source; NFS
-    // and multi-PVC selectors mount the live source (the latter is already rejected
-    // downstream).
-    if copy_method == CopyMethod::Direct {
-        return Ok(StagingOutcome::NotApplicable);
-    }
-    // Staging reads StorageClasses/VolumeSnapshotClasses and deletes
-    // VolumeSnapshotContents — all cluster-scoped, all permanent 403s under a
-    // namespaced install's Role RBAC. Refuse up front with the fix instead of
-    // wedging the reconcile on retried 403s (and since copyMethod DEFAULTS to
-    // Snapshot, an untouched policy lands here — the message carries the
-    // default-changed note like every other staging refusal).
-    if matches!(scope, crate::config::WatchScope::Namespaced(_)) {
-        return Ok(StagingOutcome::Failed {
-            reason: REASON_SOURCE_NOT_CSI,
-            message: namespaced_install_cannot_stage_message(),
-        });
-    }
-    let Some(source) = policy.spec.sources.first() else {
-        return Ok(StagingOutcome::NotApplicable);
+    let source = policy.spec.sources.first();
+    // Decide, before touching the cluster, whether staging applies at all and
+    // whether this install can do it. Pure + unit-tested, because the ORDER is
+    // the load-bearing part and `resolve_staging` itself is async and
+    // Client-bound (so only the e2e tier reaches it).
+    let source_name = match staging_applicability(
+        copy_method,
+        source.and_then(|s| s.pvc.as_ref()).map(|p| p.name.as_str()),
+        matches!(scope, crate::config::WatchScope::Namespaced(_)),
+    ) {
+        StagingApplicability::NotApplicable => return Ok(StagingOutcome::NotApplicable),
+        StagingApplicability::ClusterScopeRequired => {
+            return Ok(StagingOutcome::Failed {
+                reason: REASON_SOURCE_NOT_CSI,
+                message: namespaced_install_cannot_stage_message(),
+            });
+        }
+        StagingApplicability::Proceed { source_name } => source_name.to_string(),
     };
-    let Some(pvc_ref) = source.pvc.as_ref() else {
-        // NFS / pvcSelector — nothing to snapshot.
-        return Ok(StagingOutcome::NotApplicable);
-    };
-    let source_name = &pvc_ref.name;
+    let source_name = &source_name;
 
     // Read the source PVC (needed for sizing + provisioner + shape).
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
@@ -1541,6 +1582,60 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    // --- staging applicability ordering ------------------------------------
+
+    #[test]
+    fn nfs_source_is_not_applicable_even_on_a_namespaced_install() {
+        // The bug this reorder fixes. The namespaced-install refusal used to run
+        // BEFORE the source-shape checks, so an NFS-source policy under the
+        // DEFAULTED `copyMethod: Snapshot` failed terminally on a namespaced
+        // install — for a source that never needed a cluster-scoped read.
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, None, true),
+            StagingApplicability::NotApplicable
+        );
+        assert_eq!(
+            staging_applicability(CopyMethod::Clone, None, true),
+            StagingApplicability::NotApplicable
+        );
+    }
+
+    #[test]
+    fn direct_is_not_applicable_regardless_of_scope_or_source() {
+        for namespaced in [true, false] {
+            assert_eq!(
+                staging_applicability(CopyMethod::Direct, Some("data"), namespaced),
+                StagingApplicability::NotApplicable
+            );
+            assert_eq!(
+                staging_applicability(CopyMethod::Direct, None, namespaced),
+                StagingApplicability::NotApplicable
+            );
+        }
+    }
+
+    #[test]
+    fn a_pvc_source_on_a_namespaced_install_still_needs_cluster_scope() {
+        // The gate is not removed, only moved: a source that genuinely needs the
+        // cluster-scoped StorageClass / VolumeSnapshotClass / PersistentVolume
+        // reads must still be refused with the actionable message rather than
+        // wedging the reconcile on retried 403s.
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, Some("data"), true),
+            StagingApplicability::ClusterScopeRequired
+        );
+    }
+
+    #[test]
+    fn a_pvc_source_on_a_cluster_install_proceeds() {
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, Some("data"), false),
+            StagingApplicability::Proceed {
+                source_name: "data"
+            }
+        );
     }
 
     #[test]

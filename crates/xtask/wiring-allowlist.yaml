@@ -192,6 +192,14 @@ allow:
     reason: >-
       #346 — only meaningful for pvcSelector expansion, so it is inert for the
       same reason. Wired in M4.
+  - path: Snapshot.spec.source.sourceIndex
+    reason: >-
+      #346 — `Snapshot.spec.source` lands inert in M3 so the CRD change is its
+      own reviewable step; the fan-out that stamps and reads it is M4.
+  - path: Snapshot.spec.source.group.volumeGroupSnapshotName
+    reason: >-
+      #346 — the pinned VolumeGroupSnapshot name is stamped by the expander and
+      read by group staging, both of which land in M5.
   - path: SnapshotPolicy.spec.groupBy
     reason: >-
       #346 — the VolumeGroupSnapshot consistency group was API-only; no

@@ -1359,6 +1359,7 @@ async fn materialize_discovered(
     let mut backup = Snapshot::new(
         &cr_name,
         SnapshotSpec {
+            source: None,
             policy_ref: None,
             tags: None,
             failure_policy: None,
@@ -2581,6 +2582,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 kopiur_api::snapshot::SnapshotSpec {
+                    source: None,
                     policy_ref: None,
                     tags: None,
                     failure_policy: None,

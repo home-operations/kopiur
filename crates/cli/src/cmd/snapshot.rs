@@ -40,6 +40,7 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
     let mut snapshot = Snapshot::new(
         &name,
         SnapshotSpec {
+            source: None,
             policy_ref: Some(PolicyRef {
                 name: args.policy.clone(),
                 namespace: None,
