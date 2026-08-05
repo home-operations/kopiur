@@ -18,6 +18,25 @@ Each subcommand also takes a `--check` mode (`mise run gen-check`) that re-rende
 everything in memory and compares it against the checked-in files **without
 writing**, so CI fails on drift instead of silently shipping stale YAML.
 
+It also hosts one non-generating gate:
+
+- `check-wiring` (`mise run wiring-check`) → fail if a CRD field is defined and
+  schema-generated but read by **no** consumer crate.
+
+That gate exists because `gen-check` answers the wrong question. It proves the
+checked-in YAML matches the Rust types; it says nothing about whether anything
+*reads* a field, and since every `kopiur-api` type is `pub`, `dead_code` can
+never fire on one either. Two bugs shipped through that gap — [#346] (`sources[].
+pvcSelector` had no implementation anywhere, so a policy using it died with
+`invariant violated … likely a bug in kopiur`) and [#351]
+(`files.ignoreIdenticalSnapshots` was never mapped to a kopia flag, so the knob
+silently did nothing). Exemptions live in `wiring-allowlist.yaml`, each with a
+written reason; see [`wiring`] for what counts as "read" and the deliberate
+limits of the search.
+
+[#346]: https://github.com/home-operations/kopiur/issues/346
+[#351]: https://github.com/home-operations/kopiur/issues/351
+
 The generation logic deliberately lives in the **library** (`xtask::`), not in
 `main.rs`: a binary crate's modules aren't importable, so keeping it in the lib
 lets the integration tests under `tests/` exercise it directly.
@@ -35,6 +54,7 @@ lets the integration tests under `tests/` exercise it directly.
 | [`artifact::write_all`] / [`artifact::check_all`] | Write every artifact to disk / compare against the checked-in files (the drift guard).                                      |
 | [`paths::workspace_root`] / [`paths::deploy_dir`] | Deterministic workspace-root resolution and the `deploy/` directory under it.                                               |
 | [`crds`] / [`rbac`] / [`dashboards`]              | The per-kind artifact generators.                                                                                           |
+| [`wiring`]                                        | The inert-field ratchet: walks the CRD schemas and asserts each field is read by a consumer crate or reviewed-and-allowlisted. |
 
 ## Example
 
@@ -64,8 +84,10 @@ From the command line:
 ```text
 cargo xtask gen-all           # regenerate deploy/crds + RBAC + dashboard
 cargo xtask gen-all --check   # CI drift guard: nonzero exit if artifacts are stale
+cargo xtask check-wiring      # inert-field gate (no --check; it never writes)
 mise run gen                  # the same, via the pinned task runner
 mise run gen-check
+mise run wiring-check
 ```
 
 ## See also

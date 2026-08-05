@@ -1,0 +1,202 @@
+# Reviewed exemptions for `cargo xtask check-wiring` (crates/xtask/src/wiring.rs).
+#
+# The ratchet asserts that every CRD spec/status field is READ by a consumer
+# crate (controller, mover, kopia, webhook, cli). A field that nothing reads is
+# INERT: users can set it, the apiserver accepts it, `docs/field-reference.md`
+# documents it, and nothing happens. Two shipped bugs came from exactly that —
+# #346 (`pvcSelector` had no implementation anywhere, so a policy using it died
+# with "invariant violated ... likely a bug in kopiur") and #351
+# (`files.ignoreIdenticalSnapshots` was never mapped to a kopia flag).
+#
+# Three lists, all load-bearing:
+#
+#   prune:  where the walk stops DESCENDING — upstream `k8s-openapi` types
+#           kopiur reuses as whole objects and never names field-by-field, so
+#           their leaves are not kopiur's to consume. The kopiur-owned field
+#           that HOLDS the type is still checked: pruning is not exemption.
+#
+#   rename: fields whose Rust identifier is not the camel→snake of the schema
+#           name, because `#[serde(rename)]` broke the correspondence.
+#
+#   allow:  kopiur-owned fields knowingly not read by a consumer crate. Every
+#           entry needs a reason a reviewer can check. An entry whose field
+#           BECOMES wired fails the check — that is what forces drainage
+#           instead of letting the list rot.
+#
+# A path may start with `*.` to match any path with that suffix.
+
+prune:
+  # --- upstream pod/container plumbing, applied verbatim -------------------
+  - path: "*.securityContext"
+    reason: >-
+      k8s-openapi SecurityContext. Resolved wholesale by
+      kopiur_api::common::resolve_mover (hardened ⊂ moverDefaults ⊂ recipe) and
+      applied verbatim by build_job; kopiur never reads its leaves.
+  - path: "*.podSecurityContext"
+    reason: >-
+      k8s-openapi PodSecurityContext, applied verbatim to the mover pod spec.
+      Only fsGroup/supplementalGroups matter to kopiur and they are passed
+      through as part of the whole object.
+  - path: "*.affinity"
+    reason: >-
+      k8s-openapi Affinity, passed straight into the mover Job pod spec. The
+      scheduler consumes it, not kopiur.
+  - path: "*.resources"
+    reason: >-
+      k8s-openapi ResourceRequirements, merged as a whole object and handed to
+      the mover container. kopiur never inspects requests/limits individually.
+  - path: "*.tolerations"
+    reason: >-
+      k8s-openapi Toleration list, passed straight into the mover Job pod spec.
+  - path: "*.workloadSelector"
+    reason: >-
+      k8s-openapi LabelSelector wrapper. Serialized as a whole by
+      io::label_selector_to_string to build the pod list query; its
+      matchLabels/matchExpressions leaves are upstream shape.
+  - path: "*.labelSelector"
+    reason: >-
+      k8s-openapi LabelSelector, converted as a whole object into a selector
+      string. matchLabels/matchExpressions are upstream shape, not kopiur fields.
+  - path: "*.policySelector"
+    reason: >-
+      k8s-openapi LabelSelector on SnapshotSchedule, matched as a whole object
+      by policy_matches_selector.
+  - path: "*.conditions"
+    reason: >-
+      k8s-openapi metav1.Condition list. Written and read through the shared
+      upsert_condition/patch_status_if_changed helpers, which operate on the
+      Condition type rather than naming its fields.
+
+rename:
+  - path: Repository.spec.parameters.epoch.advanceOnSizeMiB
+    ident: advance_on_size_mb
+    reason: >-
+      `#[serde(rename = "advanceOnSizeMiB")]` on `advance_on_size_mb` — kopia
+      documents the unit as MB but means MiB, so the wire name says MiB while
+      the Rust field keeps kopia's own `_mb` spelling.
+  - path: ClusterRepository.spec.parameters.epoch.advanceOnSizeMiB
+    ident: advance_on_size_mb
+    reason: Same renamed field as Repository.spec.parameters.epoch.advanceOnSizeMiB.
+  - path: Repository.status.parameters.epoch.advanceOnSizeMiB
+    ident: advance_on_size_mb
+    reason: Status mirror of the same renamed spec field.
+  - path: ClusterRepository.status.parameters.epoch.advanceOnSizeMiB
+    ident: advance_on_size_mb
+    reason: Status mirror of the same renamed spec field.
+
+allow:
+  # ==========================================================================
+  # (a) Read by a resolver that lives in `crates/api`, which consumer crates
+  #     call. `crates/api` is deliberately not part of the corpus (see the
+  #     module docs in wiring.rs: including it made the check miss #346), so
+  #     these are exempt permanently, with the reader named.
+  # ==========================================================================
+  - path: "*.identityDefaults.hostnameExpr"
+    reason: >-
+      Consumed by kopiur_api::identity (identity.rs:270), the CEL resolver the
+      Snapshot/Restore/verification reconcilers call to build a kopia identity.
+  - path: "*.identityDefaults.usernameExpr"
+    reason: >-
+      Consumed by kopiur_api::identity (identity.rs:278), same CEL resolver as
+      hostnameExpr.
+  - path: "*.health.indexBlobWarnThreshold"
+    reason: >-
+      Consumed by kopiur_api::repository::resolve_index_blob_warn_threshold,
+      called from controller/src/{repository,cluster_repository}.rs.
+  - path: "*.catalog.periodicRefresh"
+    reason: >-
+      Consumed by CatalogBounds::periodic_refresh_enabled
+      (api/src/common/cache.rs), called from controller/src/catalog.rs.
+  - path: "*.catalog.refreshInterval"
+    reason: >-
+      Consumed by CatalogBounds::effective_refresh_interval
+      (api/src/common/cache.rs), called from controller/src/catalog.rs.
+  - path: SnapshotPolicy.spec.deletion.onPolicyDelete
+    reason: >-
+      Consumed by kopiur_api::snapshot_policy::effective_on_policy_delete,
+      called from controller/src/snapshot_policy.rs.
+  - path: "*.gdrive.credentialsSecretRef"
+    reason: >-
+      Consumed by kopiur_api::creds::backend_auth_secret_ref, which the
+      controller calls to resolve every backend's credential Secret uniformly.
+  - path: "*.rclone.configSecretRef"
+    reason: >-
+      Consumed by kopiur_api::creds::backend_auth_secret_ref, same uniform
+      backend-credential resolution as gdrive.
+
+  # ==========================================================================
+  # (b) Admission-only acknowledgment gates. Having no runtime reader IS the
+  #     design: the field exists so a dangerous configuration must be opted
+  #     into explicitly at `kubectl apply` time.
+  # ==========================================================================
+  - path: "*.server.auth.insecure.acknowledgeInsecure"
+    reason: >-
+      Acknowledgment gate read only by validate/mod.rs — its whole purpose is to
+      make an unauthenticated repository server a deliberate admission-time
+      choice. There is nothing for a reconciler to do with it.
+  - path: SnapshotPolicy.spec.sources.acknowledgeLiveMutation
+    reason: >-
+      Acknowledgment gate read only by validate/snapshot.rs, for backing up a
+      writable live volume. Admission-time consent, no runtime behavior.
+
+  # ==========================================================================
+  # (c) Status fields declared but never written by any controller. Each is a
+  #     promise the API makes and the operator does not keep: `kubectl get -o
+  #     yaml` will never show them. Drained in M7 — wired or removed.
+  # ==========================================================================
+  - path: "*.storageStats.lastObservedAt"
+    reason: >-
+      Never written. Siblings snapshotCount/totalSizeBytes ARE written by
+      io/repo.rs; only the timestamp was left unwired. M7.
+  - path: Maintenance.status.full.nextScheduledAt
+    reason: Never written by the Maintenance reconciler. M7.
+  - path: Maintenance.status.quick.nextScheduledAt
+    reason: Never written by the Maintenance reconciler. M7.
+  - path: Maintenance.status.ownership.claimedAt
+    reason: >-
+      Never written; the lease's claim time is not recorded even though the
+      ownership block is. M7.
+  - path: RepositoryReplication.status.nextScheduledAt
+    reason: Never written by the replication reconciler. M7.
+  - path: RepositoryReplication.status.lastReplicatedBytes
+    reason: Never written; the mover reports no per-run byte count. M7.
+  - path: RepositoryReplication.status.lastReplicatedBlobs
+    reason: Never written; the mover reports no per-run blob count. M7.
+  - path: Restore.status.target.pvcPrime
+    reason: >-
+      Never written by the Restore reconciler, despite the in-place-mirror flow
+      that would populate it. M7.
+  - path: Snapshot.status.stats.bytesNew
+    reason: >-
+      Never written. Siblings filesNew/filesModified/filesUnchanged are read by
+      metrics.rs, but the byte counterpart was never populated. M7.
+  - path: SnapshotSchedule.status.lastSuccessfulSchedule
+    reason: >-
+      Never written; lastSchedule/nextSchedule ARE written and read, only the
+      success variant was left unwired. M7.
+
+  # ==========================================================================
+  # (d) The two shipped bugs this ratchet exists to prevent. Drained by the
+  #     milestones that implement them; the entries fail the check the moment
+  #     the field becomes wired, so they cannot outlive the work.
+  # ==========================================================================
+  - path: SnapshotPolicy.spec.files.ignoreIdenticalSnapshots
+    reason: >-
+      #351 — declared and documented but never mapped to kopia's
+      `--ignore-identical-snapshots`, so the knob does nothing. Wired in M2.
+  - path: SnapshotPolicy.spec.sources.pvcSelector
+    reason: >-
+      #346 — no expansion code exists; a policy using it hits
+      `Error::Invariant` in build_backup_run. Implemented in M4.
+  - path: SnapshotPolicy.spec.sources.pvcSelector.namespaceSelector
+    reason: "#346 — part of pvcSelector, likewise unimplemented. M4."
+  - path: SnapshotPolicy.spec.sources.pvcSelector.namespaceSelector.matchNames
+    reason: "#346 — part of pvcSelector, likewise unimplemented. M4."
+  - path: SnapshotPolicy.spec.sources.sourcePathStrategy
+    reason: >-
+      #346 — only meaningful for pvcSelector expansion, so it is inert for the
+      same reason. Wired in M4.
+  - path: SnapshotPolicy.spec.groupBy
+    reason: >-
+      #346 — the VolumeGroupSnapshot consistency group was API-only; no
+      controller code ever created one. Implemented in M5.

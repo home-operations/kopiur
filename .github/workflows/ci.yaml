@@ -572,6 +572,12 @@ jobs:
       - name: Check generated manifests
         run: mise run gen-check
 
+      # gen-check proves the YAML matches the Rust types; this proves something
+      # actually READS each field. See #346 / #351 — both shipped as fields that
+      # were schema-valid, documented, admission-accepted, and inert.
+      - name: Check CRD field wiring
+        run: mise run wiring-check
+
   workflow-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')

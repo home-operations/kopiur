@@ -7,6 +7,7 @@ pub mod dashboards;
 pub mod docs;
 pub mod paths;
 pub mod rbac;
+pub mod wiring;
 
 use anyhow::Result;
 
@@ -29,7 +30,11 @@ pub fn collect(cmd: &str) -> Result<Vec<Artifact>> {
     })
 }
 
-/// Run a subcommand. Returns the process exit code to use.
+/// Run an artifact-generating subcommand. Returns the process exit code to use.
+///
+/// `check-wiring` is deliberately NOT routed here: it produces no artifact and
+/// has no write mode, so it would have no meaning as a [`collect`] arm. It has
+/// its own entry point, [`wiring::run`].
 pub fn run(cmd: &str, check: bool) -> Result<i32> {
     let artifacts = collect(cmd)?;
     if check {
