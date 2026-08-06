@@ -1121,7 +1121,7 @@ async fn fire_for_targets(
         // with no selector yields `None` — mint exactly one unpinned child,
         // byte-for-byte the pre-#346 behavior.
         let policy = policies.get(&pref.name).await?;
-        let matched = crate::expand::match_pvcs(&ctx.client, &ctx.watch_scope, &policy).await?;
+        let matched = crate::expand::match_pvcs(&ctx.client, &policy).await?;
         let members = crate::expand::expand_sources(&policy, &base_name, &matched)
             .map_err(|e| Error::Validation(e.to_string()))?;
         match members {

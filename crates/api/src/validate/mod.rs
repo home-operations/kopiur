@@ -34,6 +34,80 @@ pub use repository::*;
 pub use restore::*;
 pub use snapshot::*;
 
+/// Validate a `pvcSelector`'s shape.
+///
+/// Two refusals, both structural rather than stylistic:
+///
+/// * **`namespaceSelector` is rejected outright.** A Pod can only mount
+///   PersistentVolumeClaims in its OWN namespace — that is a Kubernetes
+///   invariant, not a kopiur limitation. The mover Job runs in the `Snapshot`'s
+///   namespace, which is the policy's, so a PVC matched elsewhere could never be
+///   mounted. Accepting the field would mean either failing at reconcile with
+///   "source PVC not found" or, far worse, silently snapshotting a
+///   SAME-NAMED PVC in the policy's own namespace under the matched one's
+///   identity. Use one `SnapshotPolicy` per namespace.
+/// * **An unusable `matchExpressions` entry is rejected** rather than dropped.
+///   The generated schema does not enum-constrain `operator`, so a typo (`in`
+///   for `In`) would otherwise be silently discarded — WIDENING the selector, so
+///   PVCs the user meant to exclude get backed up. An `In`/`NotIn` with no
+///   values renders as `key in ()`, which the API server rejects with a 400 that
+///   would abort the whole schedule fire.
+fn validate_pvc_selector(selector: &crate::snapshot_policy::PvcSelector) -> ValidationResult {
+    if selector
+        .namespace_selector
+        .as_ref()
+        .is_some_and(|n| !n.match_names.is_empty())
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "spec.sources[].pvcSelector.namespaceSelector".to_string(),
+            reason: "a backup's mover Pod can only mount PersistentVolumeClaims in its own \
+                     namespace, so a selector cannot reach PVCs in another one. Use one \
+                     SnapshotPolicy per namespace (each may point at the same repository)"
+                .to_string(),
+        });
+    }
+    if let Some(ls) = selector.label_selector.as_ref()
+        && let Some(exprs) = ls.match_expressions.as_ref()
+    {
+        for e in exprs {
+            match e.operator.as_str() {
+                "In" | "NotIn" => {
+                    if e.values.as_ref().is_none_or(|v| v.is_empty()) {
+                        return Err(ValidationError::InvalidFieldValue {
+                            field: format!(
+                                "spec.sources[].pvcSelector.labelSelector.matchExpressions[{}]",
+                                e.key
+                            ),
+                            reason: format!(
+                                "operator `{}` requires at least one value; an empty list \
+                                 renders as `{} {} ()`, which the API server rejects",
+                                e.operator,
+                                e.key,
+                                e.operator.to_lowercase()
+                            ),
+                        });
+                    }
+                }
+                "Exists" | "DoesNotExist" => {}
+                other => {
+                    return Err(ValidationError::InvalidFieldValue {
+                        field: format!(
+                            "spec.sources[].pvcSelector.labelSelector.matchExpressions[{}].operator",
+                            e.key
+                        ),
+                        reason: format!(
+                            "`{other}` is not a label-selector operator (expected In, NotIn, \
+                             Exists or DoesNotExist). An unrecognized operator would be dropped, \
+                             WIDENING the selector so PVCs you meant to exclude get backed up"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A single backup `Source` is well-formed: **exactly one** of `pvc`,
 /// `pvcSelector`, or `nfs` is set (ADR §3.3 — modeled as sibling Options because
 /// the forms share `sourcePath*` keys, so it's a webhook check, not an enum). When
@@ -79,7 +153,10 @@ pub fn validate_source(source: &Source) -> ValidationResult {
                 }
                 validate_nfs_volume(nfs, "snapshot source")
             }
-            None => Ok(()),
+            None => match source.pvc_selector.as_ref() {
+                Some(selector) => validate_pvc_selector(selector),
+                None => Ok(()),
+            },
         },
     }
 }

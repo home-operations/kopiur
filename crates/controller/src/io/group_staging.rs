@@ -478,33 +478,74 @@ pub async fn resolve_group_members(
 // Lifetime
 // ---------------------------------------------------------------------------
 
+/// One sibling's state, as the reap gate sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiblingState {
+    /// Whether the member reached a terminal phase (no further Job can launch).
+    pub terminal: bool,
+    /// Whether its staged `-src` PVC still EXISTS in the cluster.
+    ///
+    /// Observed live, deliberately NOT read from `status.staged.ready`. That
+    /// field is set when staging succeeds and is never cleared on the success
+    /// path, so trusting it would make every member that ever staged look
+    /// permanently un-reapable — the group would then leak until the sweep's
+    /// min-age floor expired, on every single grouped run.
+    pub staged_pvc_present: bool,
+}
+
 /// **Pure.** Whether the shared group may be reaped, given its members.
 ///
-/// Reapable only when EVERY sibling is terminal (or gone) **and** none still
-/// holds a staged PVC restoring from a member snapshot. Deleting it earlier
-/// cascades onto the member `VolumeSnapshot`s and pulls the rug from under an
-/// in-flight CSI restore.
+/// Reapable only when EVERY sibling is terminal **and** none still holds a
+/// staged PVC restoring from a member snapshot. Deleting it earlier cascades
+/// onto the member `VolumeSnapshot`s and pulls the rug from under an in-flight
+/// CSI restore.
 ///
-/// Fails **closed**: the caller passes `None` when it could not list siblings,
-/// and a read it could not complete must never look like "nobody needs it".
-pub fn group_reapable(siblings: Option<&[Snapshot]>) -> bool {
+/// Fails **closed**: the caller passes `None` when it could not enumerate
+/// siblings, and a read it could not complete must never look like "nobody
+/// needs it".
+pub fn group_reapable(siblings: Option<&[SiblingState]>) -> bool {
     let Some(siblings) = siblings else {
         return false;
     };
-    siblings.iter().all(|s| {
-        let status = s.status.as_ref();
-        let terminal = matches!(
-            status.and_then(|st| st.phase),
-            Some(SnapshotPhase::Succeeded)
-                | Some(SnapshotPhase::Failed)
-                | Some(SnapshotPhase::Unchanged)
-        );
-        let staged_gone = status.and_then(|st| st.staged.as_ref()).is_none_or(|st| {
-            // `ready: false` means the stage was torn down (or never came up).
-            !st.ready.unwrap_or(false)
+    siblings.iter().all(|s| s.terminal && !s.staged_pvc_present)
+}
+
+/// Observe each member's terminal-ness and whether its staged PVC still exists.
+///
+/// `None` means a read failed — the caller must then leave the group alone.
+/// Split out of [`cleanup_group_if_unused`] so the reap path stays a short,
+/// readable sequence of gates.
+async fn sibling_states(
+    client: &kube::Client,
+    ns: &str,
+    group: &str,
+    members: &[&Snapshot],
+) -> Option<Vec<SiblingState>> {
+    let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        Api::namespaced(client.clone(), ns);
+    let mut states = Vec::with_capacity(members.len());
+    for m in members {
+        let staged = super::staging::staged_pvc_name(&m.name_any());
+        let staged_pvc_present = match pvc_api.get_opt(&staged).await {
+            Ok(p) => p.is_some(),
+            // Same fail-closed rule as the LIST: an unreadable PVC must never
+            // read as "gone", or the group is deleted under a live restore.
+            Err(e) => {
+                tracing::warn!(group = %group, snapshot = %m.name_any(), error = %e, "could not check a group member's staged PVC; leaving the VolumeGroupSnapshot in place");
+                return None;
+            }
+        };
+        states.push(SiblingState {
+            terminal: matches!(
+                m.status.as_ref().and_then(|st| st.phase),
+                Some(SnapshotPhase::Succeeded)
+                    | Some(SnapshotPhase::Failed)
+                    | Some(SnapshotPhase::Unchanged)
+            ),
+            staged_pvc_present,
         });
-        terminal && staged_gone
-    })
+    }
+    Some(states)
 }
 
 /// Reap the shared `VolumeGroupSnapshot` if no sibling still needs it.
@@ -515,17 +556,42 @@ pub fn group_reapable(siblings: Option<&[Snapshot]>) -> bool {
 /// `cleanup_staged_source` was written for.
 pub async fn cleanup_group_if_unused(client: &kube::Client, ns: &str, group: &str) -> Result<bool> {
     let snaps: Api<Snapshot> = Api::namespaced(client.clone(), ns);
-    let lp = ListParams::default().labels(&format!("{GROUP_LABEL}={group}"));
+    // Siblings are found by the SPEC field that pins the group, NOT by a label.
+    //
+    // A label would have to be stamped by three independent minting paths (the
+    // schedule, `kubectl kopiur snapshot now`, and a hand-applied CR), and
+    // missing it in any one is catastrophic rather than cosmetic: the list comes
+    // back empty, `group_reapable` is vacuously true, and the FIRST member to
+    // finish deletes the shared capture out from under its siblings — cascading
+    // onto their member VolumeSnapshots mid-restore. Reading `spec.source.group`
+    // cannot drift: it is the same field that told this member which group to
+    // wait on in the first place.
+    //
     // Fail closed on a list error: pretending "nobody needs it" would delete a
     // capture N live backups are restoring from.
-    let siblings = match snaps.list(&lp).await {
+    let all = match snaps.list(&ListParams::default()).await {
         Ok(list) => list.items,
         Err(e) => {
             tracing::warn!(group = %group, error = %e, "could not list group members; leaving the VolumeGroupSnapshot in place (the sweep is the backstop)");
             return Ok(false);
         }
     };
-    if !group_reapable(Some(&siblings)) {
+    let members: Vec<&Snapshot> = all
+        .iter()
+        .filter(|s| {
+            s.spec
+                .source
+                .as_ref()
+                .and_then(|src| src.group.as_ref())
+                .is_some_and(|g| g.volume_group_snapshot_name == group)
+        })
+        .collect();
+
+    // `None` = a read failed; the reap then fails closed.
+    let Some(states) = sibling_states(client, ns, group, &members).await else {
+        return Ok(false);
+    };
+    if !group_reapable(Some(&states)) {
         return Ok(false);
     }
     match vgs_api(client, ns)

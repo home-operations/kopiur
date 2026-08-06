@@ -228,77 +228,46 @@ fn a_content_with_no_volume_handle_is_omitted() {
 
 // --- reaping ----------------------------------------------------------------
 
-fn sibling(phase: Option<SnapshotPhase>, staged_ready: Option<bool>) -> Snapshot {
-    let mut s: Snapshot = serde_json::from_value(serde_json::json!({
-        "apiVersion": "kopiur.home-operations.com/v1alpha1",
-        "kind": "Snapshot",
-        "metadata": { "name": "m", "namespace": "ns" },
-        "spec": {},
-    }))
-    .expect("valid Snapshot");
-    let mut status = kopiur_api::SnapshotStatus {
-        phase,
-        ..Default::default()
-    };
-    if let Some(ready) = staged_ready {
-        status.staged = Some(kopiur_api::StagedSources {
-            ready: Some(ready),
-            ..Default::default()
-        });
+fn state(terminal: bool, staged_pvc_present: bool) -> SiblingState {
+    SiblingState {
+        terminal,
+        staged_pvc_present,
     }
-    s.status = Some(status);
-    s
 }
 
 #[test]
 fn the_group_is_reaped_only_when_every_sibling_is_done() {
-    let done = || sibling(Some(SnapshotPhase::Succeeded), None);
-    assert!(group_reapable(Some(&[done(), done()])));
+    let done = state(true, false);
+    assert!(group_reapable(Some(&[done, done])));
 
     // One still running: the group's member snapshots are what its staged PVC
     // is restoring from, so deleting the group now pulls the rug out.
-    assert!(!group_reapable(Some(&[
-        done(),
-        sibling(Some(SnapshotPhase::Running), None)
-    ])));
-    assert!(!group_reapable(Some(&[done(), sibling(None, None)])));
+    assert!(!group_reapable(Some(&[done, state(false, false)])));
 }
 
 #[test]
-fn a_terminal_sibling_that_still_holds_a_live_stage_blocks_the_reap() {
-    // #103's shape: terminal phase does not mean the staged PVC is gone. If it
-    // is still up, it may still be restoring from a member snapshot.
-    assert!(!group_reapable(Some(&[sibling(
-        Some(SnapshotPhase::Succeeded),
-        Some(true)
-    )])));
-    // A torn-down stage does not block.
-    assert!(group_reapable(Some(&[sibling(
-        Some(SnapshotPhase::Succeeded),
-        Some(false)
-    )])));
-}
-
-#[test]
-fn every_terminal_phase_counts_as_done_including_unchanged() {
-    for phase in [
-        SnapshotPhase::Succeeded,
-        SnapshotPhase::Failed,
-        SnapshotPhase::Unchanged,
-    ] {
-        assert!(
-            group_reapable(Some(&[sibling(Some(phase), None)])),
-            "{phase:?} is terminal and must not pin the group forever"
-        );
-    }
+fn a_terminal_sibling_that_still_holds_a_staged_pvc_blocks_the_reap() {
+    // #103's shape: a terminal phase does NOT mean the staged PVC is gone. It
+    // may still be restoring from a member snapshot.
+    assert!(!group_reapable(Some(&[state(true, true)])));
+    assert!(group_reapable(Some(&[state(true, false)])));
 }
 
 #[test]
 fn a_failed_sibling_read_fails_closed() {
-    // THE safety property. `None` means "could not list". Treating that as
-    // "nobody needs it" would delete a capture N live backups restore from,
-    // and the failure would be invisible until a restore came up empty.
+    // THE safety property. `None` means "could not enumerate". Treating that as
+    // "nobody needs it" would delete a capture N live backups restore from, and
+    // the failure would stay invisible until a restore came up empty.
     assert!(!group_reapable(None));
-    // An empty list is a real answer, not a failed read: nothing needs it.
+}
+
+#[test]
+fn an_empty_member_set_is_only_reapable_because_the_caller_proved_it() {
+    // An empty list is a real answer — nothing references the group — but ONLY
+    // when the caller actually enumerated. This is the exact shape that made the
+    // original label-based lookup catastrophic: GROUP_LABEL was never stamped on
+    // a Snapshot CR, so the list was ALWAYS empty and the first member to finish
+    // deleted the shared capture. The caller now filters on `spec.source.group`,
+    // which is the same field that pins the group and therefore cannot drift.
     assert!(group_reapable(Some(&[])));
 }

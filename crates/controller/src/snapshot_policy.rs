@@ -153,18 +153,28 @@ pub fn retention_group_key(b: &Snapshot) -> String {
 /// just scheduled ones.
 pub fn unchanged_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<String> {
     use kopiur_api::SnapshotPhase;
-    let mut rows: Vec<&Snapshot> = backups
-        .iter()
-        .filter(|s| {
-            s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Unchanged)
-                && s.metadata.deletion_timestamp.is_none()
+    // Bucketed by source, exactly like `backups_to_delete` above and for the
+    // same reason: a flat bound over a 20-PVC fan-out would keep 10 rows TOTAL,
+    // so most volumes would retain no record that the schedule ran at all, and
+    // every pass would churn ~10 finalizer-guarded deletes.
+    let mut buckets: BTreeMap<String, Vec<&Snapshot>> = BTreeMap::new();
+    for s in backups.iter().filter(|s| {
+        s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Unchanged)
+            && s.metadata.deletion_timestamp.is_none()
+    }) {
+        buckets.entry(retention_group_key(s)).or_default().push(s);
+    }
+    buckets
+        .into_values()
+        .flat_map(|mut rows| {
+            // Newest first; an unknown terminal time sorts last (oldest) →
+            // pruned first.
+            rows.sort_by_key(|s| std::cmp::Reverse(snapshot_end_or_creation(s)));
+            rows.into_iter()
+                .skip(limit as usize)
+                .filter_map(|s| s.metadata.name.clone())
+                .collect::<Vec<_>>()
         })
-        .collect();
-    // Newest first; an unknown terminal time sorts last (oldest) → pruned first.
-    rows.sort_by_key(|s| std::cmp::Reverse(snapshot_end_or_creation(s)));
-    rows.into_iter()
-        .skip(limit as usize)
-        .filter_map(|s| s.metadata.name.clone())
         .collect()
 }
 

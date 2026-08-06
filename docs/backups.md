@@ -129,11 +129,18 @@ Consequences worth knowing:
   selector policy: it does not say which PVC it covers, and the operator will
   not pick one of N on your behalf. Use `kubectl kopiur snapshot now` or a
   schedule; both expand for you.
+- **The selector only matches PVCs in the policy's own namespace.**
+  `namespaceSelector` is refused, because a mover Pod can only mount
+  PersistentVolumeClaims in its own namespace and the mover Job runs in the
+  `Snapshot`'s — which is the policy's. Use one `SnapshotPolicy` per namespace;
+  they can share a repository.
+- **Two selector sources may not match the same PVC.** Both would resolve to one
+  kopia source path and one `Snapshot` name, so one of the two backups would
+  silently overwrite the other. Narrow the selectors instead.
 - **`sourcePathStrategy` is part of your data identity.** `PvcName` gives each
-  PVC the kopia path `/pvc/<name>`; if your selector spans namespaces and two
-  PVCs share a name, those two volumes would land on one path — kopiur refuses
-  that and tells you to use `PvcNamespacedName`. Changing the strategy later
-  re-identifies every source, so it is guarded like any other identity change
+  PVC the kopia path `/pvc/<name>`; `PvcNamespacedName` qualifies it with the
+  namespace. Changing the strategy later re-identifies every source, so it is
+  guarded like any other identity change
   (see [Identity](#identity--what-kopia-records-usernamehostnamepath)).
 - **`groupBy`** decides whether the captures are crash-consistent with each
   other; see [copy methods → multi-PVC and consistency

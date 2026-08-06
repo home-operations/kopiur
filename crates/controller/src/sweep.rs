@@ -925,6 +925,20 @@ pub fn spawn_sweep(
                             "reaped leaked terminal batch delete Jobs (dispatcher backstop)"
                         );
                     }
+                    // A leaked group is invisible otherwise: it has no
+                    // ownerReferences, so nothing but this sweep and the
+                    // per-member reap can ever remove one.
+                    if outcome.group_snapshots > 0 {
+                        tracing::info!(
+                            deleted = outcome.group_snapshots,
+                            "swept leaked shared VolumeGroupSnapshots (no live Snapshot referenced them)"
+                        );
+                    }
+                    metrics.set_group_snapshots_live(
+                        outcome
+                            .group_snapshots_live
+                            .saturating_sub(outcome.group_snapshots) as i64,
+                    );
                     // The population gauge, not just the deltas: a rising gauge is
                     // the regression alarm this leak had no way to trip.
                     metrics.set_projected_secrets_live(

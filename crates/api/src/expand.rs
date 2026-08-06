@@ -218,8 +218,17 @@ pub fn label_selector_string(
 /// assert!(n.len() <= 63);
 /// ```
 pub fn fanout_child_name(base: &str, policy_ns: &str, pvc_ns: &str, pvc_name: &str) -> String {
+    // The tag hashes the BASE as well as the PVC. That is not belt-and-braces:
+    // `base` is `<schedule>-<YYYYMMDDHHMMSS>` and it is the part that gets
+    // CLIPPED when the name is too long, so a tag over the PVC alone leaves two
+    // different slots of the same schedule+PVC with byte-identical names. The
+    // schedule server-side-applies with force and only skips *terminating*
+    // twins, so the second fire would re-apply onto the already-`Succeeded`
+    // first Snapshot, `run_decision` would return `SucceededSteadyState`, and no
+    // mover Job would ever launch — a whole backup slot vanishing with no error
+    // anywhere.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in format!("{pvc_ns}/{pvc_name}").as_bytes() {
+    for b in format!("{base}\n{pvc_ns}/{pvc_name}").as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
@@ -299,10 +308,16 @@ pub struct ExpandedMember {
 ///
 /// Bounded to 63 chars for the same reason child names are — see
 /// [`fanout_child_name`].
-pub fn group_name(base: &str, namespace: &str) -> String {
+pub fn group_name(base: &str, namespace: &str, source_index: usize) -> String {
     let suffix = "-grp";
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in namespace.as_bytes() {
+    // The SOURCE INDEX is part of the key, not just the namespace. Two selector
+    // sources in one policy have DIFFERENT label selectors, and
+    // `resolve_group_stage` builds the VolumeGroupSnapshot's `source.selector`
+    // from `sources[sourceIndex]`. Sharing a name across them would have the two
+    // members force-SSA conflicting selectors onto one object, so the loser's
+    // PVC is never captured and it fails with `GroupMemberMissing`.
+    for b in format!("{namespace}#{source_index}").as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
@@ -343,21 +358,26 @@ pub fn expand_sources(
         return Ok(None);
     }
     let mut members: Vec<ExpandedMember> = Vec::new();
-    let mut paths: BTreeMap<String, PvcTargetRef> = BTreeMap::new();
+    // path -> (target, source index) that first produced it.
+    let mut paths: BTreeMap<String, (PvcTargetRef, usize)> = BTreeMap::new();
     let grouped =
         policy.spec.group_by == Some(crate::snapshot_policy::GroupBy::VolumeGroupSnapshot);
     // How many members land in each namespace, computed up front: a
     // VolumeGroupSnapshot is namespaced and its `source.selector` is
     // namespace-local, so a selector spanning namespaces yields ONE GROUP PER
     // NAMESPACE — the consistency guarantee is per-namespace, not global.
-    let mut per_namespace: BTreeMap<&str, usize> = BTreeMap::new();
+    // Keyed by SOURCE too, not just namespace: one VolumeGroupSnapshot is built
+    // from ONE source's label selector, so two selector sources in the same
+    // namespace are two separate captures, and counting them together would
+    // wrongly promote a pair of one-PVC sources into a "group".
+    let mut per_group: BTreeMap<(&str, usize), usize> = BTreeMap::new();
     if grouped {
         for (index, source) in policy.spec.sources.iter().enumerate() {
             if source.pvc_selector.is_none() {
                 continue;
             }
             for t in matched.get(&index).into_iter().flatten() {
-                *per_namespace.entry(t.namespace.as_str()).or_default() += 1;
+                *per_group.entry((t.namespace.as_str(), index)).or_default() += 1;
             }
         }
     }
@@ -379,23 +399,48 @@ pub fn expand_sources(
             let path = eff
                 .kopia_source_path(strategy)
                 .unwrap_or_else(|| "/data".to_string());
-            if let Some(prev) = paths.insert(path.clone(), target.clone())
-                && (prev.namespace != target.namespace || prev.name != target.name)
-            {
-                return Err(ValidationError::InvalidFieldValue {
-                    field: "spec.source.sourceIndex".to_string(),
-                    reason: format!(
-                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, which \
-                     resolve to the SAME kopia source path `{path}` under `sourcePathStrategy: \
-                     PvcName`. Their backups would merge into one snapshot history and prune each \
-                     other. Set `sourcePathStrategy: PvcNamespacedName` on that source, or narrow \
-                     the selector to one namespace.",
+            // ANY repeated path is refused, not just one produced by two
+            // DIFFERENT PVCs. Two selector sources that both match the same PVC
+            // land on one path AND one child name, so the second would
+            // force-server-side-apply over the first and one backup would
+            // vanish with no error — the same silent-overwrite class as a
+            // clipped slot stamp.
+            if let Some((prev, prev_index)) = paths.insert(path.clone(), (target.clone(), index)) {
+                let same_pvc = prev.namespace == target.namespace && prev.name == target.name;
+                // The same PVC listed twice by the SAME source is a listing
+                // artifact (`match_pvcs` already dedupes; this keeps
+                // `expand_sources` idempotent for any caller). Skip it rather
+                // than reporting a configuration error that isn't one.
+                if same_pvc && prev_index == index {
+                    continue;
+                }
+                let reason = if same_pvc {
+                    format!(
+                        "SnapshotPolicy `{}` has two `pvcSelector` sources that both match \
+                         `{}/{}`, so it would try to back that one volume up twice at the same \
+                         kopia source path `{path}`. Narrow the selectors so each PVC is matched \
+                         by exactly one source.",
+                        policy.name_any(),
+                        target.namespace,
+                        target.name,
+                    )
+                } else {
+                    format!(
+                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, \
+                         which resolve to the SAME kopia source path `{path}` under \
+                         `sourcePathStrategy: PvcName`. Their backups would merge into one \
+                         snapshot history and prune each other. Set `sourcePathStrategy: \
+                         PvcNamespacedName` on that source.",
                         policy.name_any(),
                         prev.namespace,
                         prev.name,
                         target.namespace,
                         target.name,
-                    ),
+                    )
+                };
+                return Err(ValidationError::InvalidFieldValue {
+                    field: "spec.sources[].pvcSelector".to_string(),
+                    reason,
                 });
             }
             members.push(ExpandedMember {
@@ -408,14 +453,14 @@ pub fn expand_sources(
                     // group many clusters do not serve), so it degrades to the
                     // ordinary per-PVC VolumeSnapshot path.
                     group: (grouped
-                        && per_namespace
-                            .get(target.namespace.as_str())
+                        && per_group
+                            .get(&(target.namespace.as_str(), index))
                             .copied()
                             .unwrap_or(0)
                             > 1)
                     .then(|| SnapshotSourceGroup {
                         namespace: target.namespace.clone(),
-                        volume_group_snapshot_name: group_name(base_name, &target.namespace),
+                        volume_group_snapshot_name: group_name(base_name, &target.namespace, index),
                     }),
                 },
             });

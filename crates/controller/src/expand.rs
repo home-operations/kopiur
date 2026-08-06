@@ -15,7 +15,6 @@ use kopiur_api::snapshot_policy;
 use kube::ResourceExt;
 use kube::api::{Api, ListParams};
 
-use crate::config::WatchScope;
 use crate::error::{Error, Result};
 
 pub use kopiur_api::expand::{
@@ -36,7 +35,6 @@ pub use kopiur_api::expand::{
 ///   would back up a subset while looking like success.
 pub async fn match_pvcs(
     client: &kube::Client,
-    scope: &WatchScope,
     policy: &SnapshotPolicy,
 ) -> Result<BTreeMap<usize, Vec<PvcTargetRef>>> {
     let policy_ns = policy.namespace().unwrap_or_default();
@@ -46,7 +44,7 @@ pub async fn match_pvcs(
         let Some(selector) = source.pvc_selector.as_ref() else {
             continue;
         };
-        let namespaces = selector_namespaces(scope, policy, selector, &policy_ns)?;
+        let namespaces = selector_namespaces(policy, selector, &policy_ns)?;
         let label_selector = selector
             .label_selector
             .as_ref()
@@ -78,32 +76,35 @@ pub async fn match_pvcs(
     Ok(out)
 }
 
-/// Which namespaces one selector covers. See [`match_pvcs`].
+/// Which namespaces one selector covers: always exactly the policy's own.
+///
+/// `namespaceSelector` is refused at admission ([`validate_pvc_selector`]) and
+/// again here, because a mover Pod can only mount PersistentVolumeClaims in its
+/// OWN namespace — a Kubernetes invariant, not a kopiur limitation. The Job runs
+/// in the `Snapshot`'s namespace, which is the policy's, so a PVC matched
+/// elsewhere could never be mounted. The failure mode of accepting it is not a
+/// clean error either: with a SAME-NAMED PVC present locally, the mover would
+/// silently snapshot the wrong volume under the matched one's identity.
 fn selector_namespaces(
-    scope: &WatchScope,
     policy: &SnapshotPolicy,
     selector: &snapshot_policy::PvcSelector,
     policy_ns: &str,
 ) -> Result<Vec<String>> {
-    let requested: Vec<String> = match selector.namespace_selector.as_ref() {
-        Some(ns_sel) if !ns_sel.match_names.is_empty() => ns_sel.match_names.clone(),
-        _ => vec![policy_ns.to_string()],
-    };
-    if let WatchScope::Namespaced(install_ns) = scope {
-        let outside: Vec<&String> = requested.iter().filter(|n| *n != install_ns).collect();
-        if !outside.is_empty() {
-            return Err(Error::Validation(format!(
-                "SnapshotPolicy `{}`'s pvcSelector asks for namespace(s) {:?}, but this is a \
-                 namespaced install watching only `{install_ns}` — its Role cannot list \
-                 PersistentVolumeClaims elsewhere. Backing up only the reachable subset would \
-                 look like success, so the run is refused. Drop `namespaceSelector`, or reinstall \
-                 with installScope=cluster.",
-                policy.name_any(),
-                outside,
-            )));
-        }
+    let requested: Vec<&String> = selector
+        .namespace_selector
+        .as_ref()
+        .map(|n| n.match_names.iter().filter(|n| *n != policy_ns).collect())
+        .unwrap_or_default();
+    if !requested.is_empty() {
+        return Err(Error::Validation(format!(
+            "SnapshotPolicy `{}`'s pvcSelector asks for namespace(s) {:?}, but a backup's mover \
+             Pod can only mount PersistentVolumeClaims in its own namespace (`{policy_ns}`). Use \
+             one SnapshotPolicy per namespace — each may point at the same repository.",
+            policy.name_any(),
+            requested,
+        )));
     }
-    Ok(requested)
+    Ok(vec![policy_ns.to_string()])
 }
 
 /// Best-effort check that a namespace exists, for a clearer message than an

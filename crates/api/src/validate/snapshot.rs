@@ -21,6 +21,26 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
+    // A CSI volume CLONE has no group counterpart — there is no
+    // "VolumeGroupClone" — so `copyMethod: Clone` can only ever capture each PVC
+    // independently. Since `groupBy` server-side-defaults to
+    // `VolumeGroupSnapshot`, an untouched selector policy with `Clone` would
+    // silently get N unrelated live-volume clones while every member CR still
+    // named a VolumeGroupSnapshot that is never created. Refuse instead: a
+    // consistency guarantee that is quietly not honored is worse than none.
+    if spec.sources.iter().any(|s| s.pvc_selector.is_some())
+        && spec.copy_method == crate::snapshot_policy::CopyMethod::Clone
+        && spec.group_by != Some(crate::snapshot_policy::GroupBy::None)
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.groupBy".to_string(),
+            reason: "`copyMethod: Clone` clones each PVC independently and has no group \
+                     equivalent, so it cannot honor `groupBy: VolumeGroupSnapshot` (the \
+                     default). Use `copyMethod: Snapshot` for a consistency group, or set \
+                     `groupBy: None` to accept independent clones"
+                .to_string(),
+        });
+    }
     // Identity shape (kopia's username@hostname:path contract). The explicit
     // overrides are validated here — client-free, so this runs on every admission
     // even when the webhook has no kube client. CEL-resolved values and the

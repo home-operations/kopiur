@@ -171,6 +171,34 @@ fn child_names_are_deterministic_legible_and_injective() {
 }
 
 #[test]
+fn two_slots_of_the_same_schedule_and_pvc_never_collide() {
+    // The clip budget eats `base` first, and `base` carries the slot stamp — so
+    // a tag hashing only the PVC leaves two runs with byte-identical names. The
+    // schedule force-SSAs and only skips *terminating* twins, so the second fire
+    // would re-apply onto the already-Succeeded first Snapshot, `run_decision`
+    // would say SucceededSteadyState, and no mover Job would ever launch: a
+    // whole backup slot vanishing with no error anywhere.
+    let long_schedule = "nightly-database-backups";
+    let a = fanout_child_name(
+        &format!("{long_schedule}-20260805020000"),
+        "db",
+        "db",
+        "postgres-data-vol",
+    );
+    let b = fanout_child_name(
+        &format!("{long_schedule}-20260805140000"),
+        "db",
+        "db",
+        "postgres-data-vol",
+    );
+    assert!(a.len() <= 63 && b.len() <= 63);
+    assert_ne!(
+        a, b,
+        "two slots must produce distinct names even when the stamp is clipped"
+    );
+}
+
+#[test]
 fn a_cross_namespace_pvc_gets_the_namespace_in_its_slug() {
     let same = fanout_child_name("n-1", "billing", "billing", "data");
     let other = fanout_child_name("n-1", "billing", "web", "data");
@@ -259,10 +287,13 @@ fn a_selector_that_matches_nothing_expands_to_an_empty_list() {
 
 #[test]
 fn same_named_pvcs_in_two_namespaces_are_refused_under_pvcname() {
-    // THE silent-data-loss case: both resolve to `/pvc/data`, so two volumes'
-    // histories merge into one kopia source and prune each other.
-    // `detect_identity_collision` cannot see it — it compares ACROSS policies
-    // and skips self.
+    // Defense in depth: a cross-namespace selector is now refused outright
+    // (`validate_source`), because a mover Pod cannot mount a PVC from another
+    // namespace anyway. This guard stays because the failure it prevents is
+    // silent data loss — both PVCs resolve to `/pvc/data`, so two volumes'
+    // histories would merge into one kopia source and prune each other — and
+    // `detect_identity_collision` cannot see it (it compares ACROSS policies
+    // and skips self).
     let p = policy_with(vec![selector_source(None, vec!["billing", "web"])]);
     let matched = BTreeMap::from([(0, vec![target("billing", "data"), target("web", "data")])]);
     let err = expand_sources(&p, "nightly-1", &matched).expect_err("must refuse");
@@ -381,9 +412,87 @@ fn group_by_none_never_pins_a_group() {
 
 #[test]
 fn group_names_are_deterministic_and_bounded() {
-    assert_eq!(group_name("base", "ns"), group_name("base", "ns"));
-    assert_ne!(group_name("base", "ns"), group_name("base", "other"));
-    let n = group_name(&"a".repeat(200), "ns");
+    assert_eq!(group_name("base", "ns", 0), group_name("base", "ns", 0));
+    assert_ne!(group_name("base", "ns", 0), group_name("base", "other", 0));
+    // Two selector sources in ONE namespace are two separate captures, built
+    // from two different label selectors — they must not share an object.
+    assert_ne!(group_name("base", "ns", 0), group_name("base", "ns", 1));
+    let n = group_name(&"a".repeat(200), "ns", 0);
     assert!(n.len() <= 63, "len {} for {n}", n.len());
     assert!(n.ends_with("-grp"), "{n}");
+}
+
+#[test]
+fn two_sources_matching_one_pvc_are_refused() {
+    // Both land on the same kopia path AND the same child name, so the second
+    // would force-server-side-apply over the first and one backup would vanish
+    // with no error — the same silent-overwrite class as a clipped slot stamp.
+    let p = policy_with(vec![
+        selector_source(None, vec![]),
+        selector_source(None, vec![]),
+    ]);
+    let matched = BTreeMap::from([
+        (0, vec![target("billing", "shared")]),
+        (1, vec![target("billing", "shared")]),
+    ]);
+    let err = expand_sources(&p, "n", &matched).expect_err("overlapping selectors must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("billing/shared"), "must name the PVC: {msg}");
+    assert!(
+        msg.contains("Narrow the selectors"),
+        "must name the fix: {msg}"
+    );
+}
+
+#[test]
+fn a_cross_namespace_namespace_selector_is_refused_at_admission() {
+    // Structural, not a kopiur limitation: a mover Pod can only mount PVCs in
+    // its OWN namespace, and the Job runs in the Snapshot's (= the policy's).
+    // Accepting it would either fail at reconcile with "source PVC not found"
+    // or — with a same-named PVC present locally — silently snapshot the WRONG
+    // volume under the matched one's identity.
+    let src = selector_source(None, vec!["other"]);
+    let err = crate::validate::validate_source(&src).expect_err("must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("own namespace"), "must say why: {msg}");
+    assert!(
+        msg.contains("one SnapshotPolicy per namespace"),
+        "must name the fix: {msg}"
+    );
+    // The policy's own namespace is fine (it is the only reachable one).
+    assert!(crate::validate::validate_source(&selector_source(None, vec![])).is_ok());
+}
+
+#[test]
+fn an_unusable_match_expression_is_refused_not_dropped() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
+    let with_expr = |op: &str, values: Option<Vec<String>>| {
+        let mut s = selector_source(None, vec![]);
+        s.pvc_selector = Some(PvcSelector {
+            namespace_selector: None,
+            label_selector: Some(LabelSelector {
+                match_labels: None,
+                match_expressions: Some(vec![LabelSelectorRequirement {
+                    key: "tier".into(),
+                    operator: op.into(),
+                    values,
+                }]),
+            }),
+        });
+        s
+    };
+    // A typo would otherwise be silently dropped — WIDENING the selector, so
+    // PVCs the user meant to exclude get backed up.
+    let err = crate::validate::validate_source(&with_expr("in", Some(vec!["db".into()])))
+        .expect_err("a bad operator must be refused");
+    assert!(err.to_string().contains("WIDENING"), "{err}");
+
+    // `In` with no values renders as `tier in ()`, which the API server rejects
+    // with a 400 that would abort the whole schedule fire.
+    let err = crate::validate::validate_source(&with_expr("In", Some(vec![])))
+        .expect_err("an empty value list must be refused");
+    assert!(err.to_string().contains("at least one value"), "{err}");
+
+    assert!(crate::validate::validate_source(&with_expr("Exists", None)).is_ok());
+    assert!(crate::validate::validate_source(&with_expr("NotIn", Some(vec!["db".into()]))).is_ok());
 }

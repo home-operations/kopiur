@@ -81,6 +81,7 @@ pub struct Metrics {
     projected_secrets_swept: Counter<u64>,
     creds_secrets_reaped: Counter<u64>,
     projected_secrets_live: Gauge<i64>,
+    group_snapshots_live: Gauge<i64>,
     snapshots_adopted: Counter<u64>,
     schedule_backups_created: Counter<u64>,
     secrets_projected: Counter<u64>,
@@ -427,6 +428,16 @@ impl Metrics {
                  (#240) ran unseen. Alert on deriv() > 0 over a day.",
             )
             .build();
+        let group_snapshots_live = m
+            .i64_gauge("kopiur_volume_group_snapshots_live")
+            .with_description(
+                "Shared CSI VolumeGroupSnapshots currently alive, observed each sweep pass. \
+                 These carry NO ownerReferences by design (a member Snapshot can be pruned \
+                 while its siblings still restore from the group), so ownerRef GC can never \
+                 reclaim one — kopiur's own reap is the only mechanism. The population is \
+                 therefore the signal: alert on deriv() > 0 over a day.",
+            )
+            .build();
         let snapshots_adopted = m
             .u64_counter("kopiur_snapshots_adopted")
             .with_description(
@@ -536,6 +547,7 @@ impl Metrics {
             projected_secrets_swept,
             creds_secrets_reaped,
             projected_secrets_live,
+            group_snapshots_live,
             snapshots_adopted,
             schedule_backups_created,
             secrets_projected,
@@ -1239,6 +1251,11 @@ impl Metrics {
     /// Record the projected credential Secrets alive after a sweep pass.
     pub fn set_projected_secrets_live(&self, n: i64) {
         self.projected_secrets_live.record(n, &[]);
+    }
+
+    /// Record the shared `VolumeGroupSnapshot`s alive after a sweep pass.
+    pub fn set_group_snapshots_live(&self, n: i64) {
+        self.group_snapshots_live.record(n, &[]);
     }
 
     /// Count a Snapshot CR created by a SnapshotSchedule.
