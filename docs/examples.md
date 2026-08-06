@@ -102,7 +102,7 @@ $ kubectl get snapshots -n billing \
 
 ## Example 04 — Multi-PVC selector
 
-Back up every PVC matching a label as one consistent group (one `VolumeGroupSnapshot` across all matched PVCs). A `Source` has mutually-exclusive `pvc` and `pvcSelector` (webhook-enforced).
+Back up every PVC matching a label as one consistent group (one `VolumeGroupSnapshot` across all matched PVCs). The selector expands to **one `Snapshot` per matched PVC**, each with its own kopia snapshot and its own retention bucket; `groupBy: None` captures them independently instead. A `Source` has mutually-exclusive `pvc` and `pvcSelector` (webhook-enforced).
 
 ```yaml
 --8<-- "deploy/examples/04-multi-pvc-selector.yaml"

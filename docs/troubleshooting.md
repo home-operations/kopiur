@@ -362,6 +362,35 @@ $ kubectl describe restore <name> -n <ns>
 | Mover pod `Pending`: cache PVC **unbound** | `mover.cache.mode: Persistent` (or a sized `Ephemeral` cache) requested a `storageClassName` the cluster can't provision (or `ReadWriteOnce` contention with an overlapping run). | Use a valid `cache.storageClassName`, or drop `mover.cache` to fall back to an `emptyDir`. Persistent cache assumes non-overlapping runs per owner. |
 | Mover `Failed`: `mkdir /var/cache/kopia/logs: permission denied` (any op, incl. maintenance) | The PVC-backed cache is owned `root:root` and the mover's default `fsGroup: 65532` couldn't chown it — almost always an **NFS** cache StorageClass with **root-squash** (e.g. TrueNAS / democratic-csi), where the kubelet's `fsGroup` chown is denied. | Don't put a kopia cache on NFS: drop `moverDefaults.cache` for a node-local `emptyDir` (always writable), or set `cache.storageClass` to a block class (e.g. Ceph RBD) that honors `fsGroup`. See [Security context → default](security-context.md#the-default-hardened-context). |
 
+## A `pvcSelector` policy failed with "invariant violated ... likely a bug in kopiur"
+
+Fixed in 0.10.0. On older versions, any `SnapshotPolicy` using a `pvcSelector`
+source failed with:
+
+```text
+invariant violated: backup mover path requires exactly one of source.pvc or
+source.nfs. This is likely a bug in kopiur — please report it together with
+this object's YAML.
+```
+
+It **was** a bug in kopiur, and the message was right to say so: `pvcSelector`
+was documented and admission-accepted but had no implementation at all, so every
+use of it hit that path. There was no workaround short of listing one `pvc:`
+source per volume.
+
+From 0.10.0 a selector expands to one `Snapshot` per matched PVC. If you are on
+an older version and cannot upgrade yet, replace the selector with explicit
+sources:
+
+```yaml
+sources:
+    - pvc: { name: data-a }
+    - pvc: { name: data-b }
+```
+
+Note that only `sources[0]` is backed up on those versions, so this needs one
+`SnapshotPolicy` per PVC.
+
 ## A backup failed with `no JSON output found on stdout`
 
 Fixed in 0.10.0. On older versions a `Snapshot` could fail terminally with:

@@ -229,7 +229,26 @@ spec:
 
 - **`storageClassName`** — stage on a different class of the **same CSI driver**, typically one with different *restore parameters*. Kopiur verifies the driver matches up front and fails fast with `StagedClassMismatch` if it doesn't (a foreign driver can never provision from your source's snapshot — without the check you'd get an opaque bind timeout instead).
 - **`accessModes`** — request different modes for the stage (e.g. `[ReadOnlyMany]` for a snapshot-backed read-only class). The mover mounts the staged source read-only unless the source sets [`readOnly: false`](#making-fsgroup-apply-to-the-source) — and `[ReadOnlyMany]` is rejected together with that, since a read-only stage cannot be mounted read-write.
-- Both are meaningless without a staged PVC, so they're **rejected at admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources.
+- Both are meaningless without a staged PVC, so they're **rejected at admission** for `copyMethod: Direct` and NFS sources. They *are* honored for `pvcSelector` sources: each matched PVC is staged like any single-PVC source, so the override applies to every member.
+
+### Multi-PVC and consistency groups
+
+A [`pvcSelector`](backups.md#sources--what-to-back-up) source expands to **one `Snapshot` CR per matched PVC**, and each of those stages exactly like a single-PVC backup — its own `VolumeSnapshot`, its own staged PVC, its own kopia source path. Everything on this page applies unchanged to each member.
+
+`groupBy` decides whether the *captures* are related:
+
+| `groupBy` | What happens |
+| --- | --- |
+| `VolumeGroupSnapshot` (default) | One CSI `VolumeGroupSnapshot` captures every matched PVC at the **same instant**, and each member stages from its own snapshot within that group. This is what you want for an application whose volumes must agree — a database and its write-ahead log. |
+| `None` | Each PVC is captured independently. Simpler, works on any snapshot-capable driver, but the volumes are captured at slightly different moments. |
+
+!!! warning "Group snapshots need more than a snapshot-capable driver"
+
+    `groupBy: VolumeGroupSnapshot` requires the `groupsnapshot.storage.k8s.io` API group (external-snapshotter **8.2+**, Beta as of Kubernetes 1.32), a `VolumeGroupSnapshotClass` for your CSI driver, and a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`. Many drivers support per-volume snapshots but not group snapshots. Kopiur tells you which is missing and names `groupBy: None` as the way forward; it never silently downgrades, because "we captured these at slightly different times" is exactly the fact a consistency group exists to rule out.
+
+    It also needs `installScope: cluster` — resolving a group class and mapping group members back to their PVCs are cluster-scoped reads a namespaced install's Role cannot make.
+
+Consistency is **per namespace**: a `VolumeGroupSnapshot` is a namespaced object whose selector is namespace-local, so a selector spanning namespaces produces one group per namespace. A group with a single member degrades to the ordinary per-PVC path, since a one-volume "group" buys nothing.
 
 ### The flagship use: CephFS shallow snapshots
 

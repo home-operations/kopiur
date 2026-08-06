@@ -126,6 +126,21 @@ observable effect.
 GFS (grandfather-father-son) retention, enforced by the operator pruning the
 `Snapshot` CRs produced from this recipe. See [Backups & schedules](../../backups.md).
 
+### `groupBy`
+
+Whether a [`pvcSelector`](#sources) expansion's PVCs are captured **together**.
+
+`VolumeGroupSnapshot` (the default) takes one CSI `VolumeGroupSnapshot` across
+every matched PVC, so they share an instant — what you want for an application
+whose volumes must agree. `None` captures each independently.
+
+Group capture needs the `groupsnapshot.storage.k8s.io` API group
+(external-snapshotter 8.2+), a `VolumeGroupSnapshotClass` for your driver, a
+driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`, and
+`installScope: cluster`. Kopiur fails with the missing piece named rather than
+downgrading to independent capture. See
+[copy methods](../../copy-methods.md#multi-pvc-and-consistency-groups).
+
 ### `defaultDeletionPolicy`
 
 The default `deletionPolicy` stamped onto `Snapshot` CRs created against this

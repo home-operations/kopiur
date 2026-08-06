@@ -3,10 +3,45 @@
 # Back up every PVC matching a label as one consistent group. Resolves volsync's
 # "one ReplicationSource = one PVC" limitation (G2).
 #
+# A `pvcSelector` expands to ONE Snapshot CR PER MATCHED PVC. Each is an
+# ordinary single-PVC backup from there: its own mover Job, its own kopia
+# snapshot, its own retention bucket — `keepDaily: 14` below keeps fourteen days
+# OF EACH volume, not fourteen snapshots in total.
+#
+# The expansion happens when a backup is INVOKED (a SnapshotSchedule fire, or
+# `kubectl kopiur snapshot now`), so a PVC that gains the label is picked up at
+# the next slot. A hand-written Snapshot carrying only a `policyRef` is rejected
+# against a selector policy: it does not say which PVC it covers, and kopiur
+# will not pick one of N for you.
+#
 # A Source has mutually-exclusive `pvc` and `pvcSelector` (webhook-enforced).
+#
 # `sourcePathStrategy` is a closed enum: `PvcName` | `PvcNamespacedName`
-# (note: PvcName, not "PVCName").
+# (note: PvcName, not "PVCName"). It is part of your data identity: `PvcName`
+# gives each PVC the kopia path `/pvc/<name>`, so a selector spanning namespaces
+# where two PVCs share a name is REFUSED — use PvcNamespacedName there. Changing
+# it later re-identifies every source, and is guarded like any identity change.
+#
 # `groupBy` is a closed enum: `VolumeGroupSnapshot` (default) | `None`.
+#
+#   VolumeGroupSnapshot — one CSI VolumeGroupSnapshot captures every matched PVC
+#     at the SAME INSTANT, and each member stages from its own snapshot within
+#     that group. Use it when the volumes must agree with each other (a database
+#     and its write-ahead log). Requires: the groupsnapshot.storage.k8s.io API
+#     group (external-snapshotter 8.2+, Beta as of Kubernetes 1.32), a
+#     VolumeGroupSnapshotClass for your CSI driver, a driver advertising
+#     CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT, and installScope: cluster.
+#     Consistency is PER NAMESPACE — a VolumeGroupSnapshot is namespaced.
+#
+#   None — capture each PVC independently. Works on any snapshot-capable driver
+#     (and with copyMethod: Direct), at the cost of the volumes being captured
+#     at slightly different moments. Use it when the PVCs are unrelated, or when
+#     your driver does not do group snapshots.
+#
+# Kopiur never silently downgrades one to the other: if a group capture cannot
+# be made it fails and names `groupBy: None` as the way forward, because
+# "captured at slightly different times" is precisely the fact a consistency
+# group exists to rule out.
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy

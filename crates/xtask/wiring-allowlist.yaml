@@ -148,38 +148,44 @@ allow:
   # ==========================================================================
   # (c) Status fields declared but never written by any controller. Each is a
   #     promise the API makes and the operator does not keep: `kubectl get -o
-  #     yaml` will never show them. Drained in M7 — wired or removed.
+  #     yaml` will never show them.
+  #
+  #     These predate the ratchet and are unrelated to #346/#351 — the ratchet
+  #     is how they became visible at all. Each is its own decision (populate
+  #     it, or remove it as a breaking CRD change), and none belongs in a PR
+  #     fixing two unrelated bugs. They are tracked here rather than silently
+  #     shipped, and the check now prevents the population from growing.
   # ==========================================================================
   - path: "*.storageStats.lastObservedAt"
     reason: >-
       Never written. Siblings snapshotCount/totalSizeBytes ARE written by
-      io/repo.rs; only the timestamp was left unwired. M7.
+      io/repo.rs; only the timestamp was left unwired..
   - path: Maintenance.status.full.nextScheduledAt
-    reason: Never written by the Maintenance reconciler. M7.
+    reason: Never written by the Maintenance reconciler..
   - path: Maintenance.status.quick.nextScheduledAt
-    reason: Never written by the Maintenance reconciler. M7.
+    reason: Never written by the Maintenance reconciler..
   - path: Maintenance.status.ownership.claimedAt
     reason: >-
       Never written; the lease's claim time is not recorded even though the
-      ownership block is. M7.
+      ownership block is..
   - path: RepositoryReplication.status.nextScheduledAt
-    reason: Never written by the replication reconciler. M7.
+    reason: Never written by the replication reconciler..
   - path: RepositoryReplication.status.lastReplicatedBytes
-    reason: Never written; the mover reports no per-run byte count. M7.
+    reason: Never written; the mover reports no per-run byte count..
   - path: RepositoryReplication.status.lastReplicatedBlobs
-    reason: Never written; the mover reports no per-run blob count. M7.
+    reason: Never written; the mover reports no per-run blob count..
   - path: Restore.status.target.pvcPrime
     reason: >-
       Never written by the Restore reconciler, despite the in-place-mirror flow
-      that would populate it. M7.
+      that would populate it..
   - path: Snapshot.status.stats.bytesNew
     reason: >-
       Never written. Siblings filesNew/filesModified/filesUnchanged are read by
-      metrics.rs, but the byte counterpart was never populated. M7.
+      metrics.rs, but the byte counterpart was never populated..
   - path: SnapshotSchedule.status.lastSuccessfulSchedule
     reason: >-
       Never written; lastSchedule/nextSchedule ARE written and read, only the
-      success variant was left unwired. M7.
+      success variant was left unwired..
 
   # ==========================================================================
   # (d) The two shipped bugs this ratchet exists to prevent. Drained by the

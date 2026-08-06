@@ -111,6 +111,34 @@ sources:
       sourcePathStrategy: PvcName # or PvcNamespacedName to disambiguate same-named PVCs
 ```
 
+A `pvcSelector` expands to **one `Snapshot` CR per matched PVC**. Each is an
+ordinary single-PVC backup from there on: its own mover Job, its own kopia
+snapshot, its own retention. That is deliberate — it keeps every other feature
+(restore, `deletionPolicy`, the catalog, GFS retention) working on a multi-PVC
+recipe without special cases.
+
+Consequences worth knowing:
+
+- **Retention is per PVC.** `keepDaily: 7` over a 5-PVC selector keeps seven
+  days *of each volume*, not seven snapshots in total.
+- **The expansion happens when a backup is invoked**, not when you write the
+  policy — a `SnapshotSchedule` fire, or `kubectl kopiur snapshot now`. A PVC
+  that gains the label is picked up at the next slot, and one that loses it
+  simply stops being backed up.
+- **A hand-written `Snapshot` with only a `policyRef` is rejected** against a
+  selector policy: it does not say which PVC it covers, and the operator will
+  not pick one of N on your behalf. Use `kubectl kopiur snapshot now` or a
+  schedule; both expand for you.
+- **`sourcePathStrategy` is part of your data identity.** `PvcName` gives each
+  PVC the kopia path `/pvc/<name>`; if your selector spans namespaces and two
+  PVCs share a name, those two volumes would land on one path — kopiur refuses
+  that and tells you to use `PvcNamespacedName`. Changing the strategy later
+  re-identifies every source, so it is guarded like any other identity change
+  (see [Identity](#identity--what-kopia-records-usernamehostnamepath)).
+- **`groupBy`** decides whether the captures are crash-consistent with each
+  other; see [copy methods → multi-PVC and consistency
+  groups](copy-methods.md#multi-pvc-and-consistency-groups).
+
 Or back up an **NFS export directly** — no PVC (see [example 10](examples.md#example-10--nfs-source-no-pvc)):
 
 ```yaml
