@@ -206,10 +206,20 @@ jobs:
             bins: "staging_deadline staging_overrides"
             backends: false
             csi: true
+          # #346 multi-PVC: pvcSelector fan-out + the shared VolumeGroupSnapshot
+          # capture. Its own shard because group snapshots need the
+          # `groupsnapshot.storage.k8s.io` CRDs AND the
+          # `--enable-volume-group-snapshots` flags on both the snapshot-controller
+          # and the csi-snapshotter sidecar — a stack shape no other shard uses,
+          # and one that would drag every CSI shard along if it regressed.
+          - shard: multi-pvc
+            bins: "multi_pvc_group"
+            backends: false
+            csi: true
           # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
           # SecurityContextCompatible reconcile condition. Filesystem only.
           - shard: security-context-compat
-            bins: "security_context_compat colocation preflight"
+            bins: "security_context_compat colocation preflight unchanged_snapshot"
             backends: false
           # Leader election (--leader-elect, chart default): Lease held by the
           # controller pod, single holder at 2 replicas, failover on holder

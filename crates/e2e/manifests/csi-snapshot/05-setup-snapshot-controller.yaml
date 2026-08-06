@@ -34,10 +34,16 @@ spec:
       serviceAccountName: snapshot-controller
       containers:
         - name: snapshot-controller
-          image: registry.k8s.io/sig-storage/snapshot-controller:v8.0.1
+          image: registry.k8s.io/sig-storage/snapshot-controller:v8.2.0
           args:
             - "--v=5"
             - "--leader-election=true"
+            # Group snapshots are Beta from external-snapshotter 8.2 /
+            # Kubernetes 1.32, but the controller still gates them behind this
+            # flag. Without it the VolumeGroupSnapshot CRDs are installed and
+            # inert, and kopiur's group-staging e2e would hang waiting for a
+            # readyToUse that nobody ever sets.
+            - "--enable-volume-group-snapshots=true"
             # Add a marker to the snapshot-controller manifests. This is needed to enable feature gates in CSI prow jobs.
             # For example, in https://github.com/kubernetes-csi/csi-release-tools/pull/209, the snapshot-controller YAML is updated to add --prevent-volume-mode-conversion=true so that the feature can be enabled for certain e2e tests.
             # end snapshot controller args

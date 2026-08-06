@@ -108,7 +108,7 @@ docker exec "$NODE" sh -c '
   # PVC ROOT is the kopia repo — a subdir under one shared PVC gives no isolation.
   # Each scenario binds its own PVC over one of these dirs. KEEP IN LOCKSTEP with
   # crates/e2e/src/consts.rs::REPO_SUBPATHS.
-  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src projgate hooks gfs errh colocation colocation-off copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore polcasc-retain polcasc-delete polcasc-simul recrestore; do
+  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src projgate hooks gfs errh colocation colocation-off copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore polcasc-retain polcasc-delete polcasc-simul recrestore multipvc-fanout multipvc-group unchanged-dedup unchanged-default; do
     mkdir -p "/kopiur-e2e/repos/$s"
   done
   # Source dir with one UNREADABLE file for the errorHandling.ignoreFileErrors
@@ -157,11 +157,11 @@ preload() {
     && echo "   preloaded $img" || echo "   warn: could not preload $img (will pull in-cluster)"
 }
 echo "==> preloading CSI snapshot-stack images"
-preload registry.k8s.io/sig-storage/snapshot-controller:v8.0.1
+preload registry.k8s.io/sig-storage/snapshot-controller:v8.2.0
 preload registry.k8s.io/sig-storage/hostpathplugin:v1.14.1
 preload registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
 preload registry.k8s.io/sig-storage/csi-attacher:v4.7.0
-preload registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+preload registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
 preload registry.k8s.io/sig-storage/csi-resizer:v1.12.0
 preload registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
 preload registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.13.0
@@ -170,11 +170,17 @@ preload registry.k8s.io/sig-storage/livenessprobe:v2.14.0
 echo "==> applying snapshot CRDs (vendored) + waiting for establishment"
 kubectl apply -f "$MANIFESTS/01-crd-volumesnapshotclasses.yaml" \\
               -f "$MANIFESTS/02-crd-volumesnapshotcontents.yaml" \\
-              -f "$MANIFESTS/03-crd-volumesnapshots.yaml"
+              -f "$MANIFESTS/03-crd-volumesnapshots.yaml" \\
+              -f "$MANIFESTS/06-crd-volumegroupsnapshotclasses.yaml" \\
+              -f "$MANIFESTS/07-crd-volumegroupsnapshotcontents.yaml" \\
+              -f "$MANIFESTS/08-crd-volumegroupsnapshots.yaml"
 kubectl wait --for=condition=established --timeout=60s \\
   crd/volumesnapshotclasses.snapshot.storage.k8s.io \\
   crd/volumesnapshotcontents.snapshot.storage.k8s.io \\
-  crd/volumesnapshots.snapshot.storage.k8s.io
+  crd/volumesnapshots.snapshot.storage.k8s.io \\
+  crd/volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io \\
+  crd/volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io \\
+  crd/volumegroupsnapshots.groupsnapshot.storage.k8s.io
 
 echo "==> applying snapshot-controller + csi-driver-host-path + classes (vendored)"
 kubectl apply -f "$MANIFESTS"
@@ -187,7 +193,7 @@ kubectl annotate volumesnapshotclass csi-hostpath-snapclass \\
 echo "==> waiting for snapshot-controller + csi-hostpathplugin"
 kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=150s
 kubectl -n default     rollout status statefulset/csi-hostpathplugin --timeout=180s
-echo "==> CSI snapshot stack ready (storageclasses csi-hostpath-sc + csi-hostpath-sc-wffc, snapclass csi-hostpath-snapclass)"
+echo "==> CSI snapshot stack ready (storageclasses csi-hostpath-sc + csi-hostpath-sc-wffc, snapclass csi-hostpath-snapclass, groupsnapclass csi-hostpath-groupsnapclass)"
 """
 
 [tasks.helm]
