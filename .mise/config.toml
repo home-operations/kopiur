@@ -23,7 +23,7 @@ lefthook = "2.1.10"
 # npm backend uses mise's own node+npm and never falls through to a system
 # `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
-node = "24.18.1"
+node = "24.19.0"
 oxfmt = "0.61.0"
 zizmor = "1.29.0"
 helm = "4.2.3"
