@@ -208,10 +208,12 @@ jobs:
             csi: true
           # #346 multi-PVC: pvcSelector fan-out + the shared VolumeGroupSnapshot
           # capture. Its own shard because group snapshots need the
-          # `groupsnapshot.storage.k8s.io` CRDs AND the
-          # `--enable-volume-group-snapshots` flags on both the snapshot-controller
-          # and the csi-snapshotter sidecar — a stack shape no other shard uses,
-          # and one that would drag every CSI shard along if it regressed.
+          # `groupsnapshot.storage.k8s.io` CRDs AND
+          # `--feature-gates=CSIVolumeGroupSnapshot=true` on both the
+          # snapshot-controller and the csi-snapshotter sidecar (Beta since
+          # external-snapshotter 8.2, but still default-OFF) — a stack shape no
+          # other shard uses, and one that would drag every CSI shard along if it
+          # regressed.
           - shard: multi-pvc
             bins: "multi_pvc_group"
             backends: false

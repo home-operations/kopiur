@@ -363,7 +363,12 @@ spec:
             # hostpathplugin implements the GroupController service and
             # advertises CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT, so this is
             # all that is needed to exercise kopiur's group staging in kind.
-            - --enable-volume-group-snapshots=true
+            #
+            # Same gate, same spelling, same reason as the snapshot-controller
+            # (see 05-setup-snapshot-controller.yaml): csi-snapshotter 8.2 has
+            # no `--enable-volume-group-snapshots` flag, only
+            # `--feature-gates`, and an unknown flag kills the container.
+            - --feature-gates=CSIVolumeGroupSnapshot=true
           securityContext:
             # This is necessary only for systems with SELinux, where
             # non-privileged sidecar containers cannot access unix domain socket

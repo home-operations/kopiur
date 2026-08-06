@@ -38,12 +38,19 @@ spec:
           args:
             - "--v=5"
             - "--leader-election=true"
-            # Group snapshots are Beta from external-snapshotter 8.2 /
-            # Kubernetes 1.32, but the controller still gates them behind this
-            # flag. Without it the VolumeGroupSnapshot CRDs are installed and
-            # inert, and kopiur's group-staging e2e would hang waiting for a
-            # readyToUse that nobody ever sets.
-            - "--enable-volume-group-snapshots=true"
+            # Group snapshots are Beta as of external-snapshotter 8.2, and Beta
+            # here still means DEFAULT OFF (pkg/features: {Default: false,
+            # PreRelease: Beta}). Without this the VolumeGroupSnapshot CRDs are
+            # installed and inert, and kopiur's group-staging e2e would hang
+            # waiting for a readyToUse that nobody ever sets.
+            #
+            # It is the generic feature gate, NOT the `--enable-volume-group-
+            # snapshots` flag: 8.2 removed that dedicated flag, and Go's `flag`
+            # package treats an unknown flag as fatal — so passing it makes the
+            # container exit at startup, CrashLoopBackOff, and every CSI e2e
+            # shard fail in `rollout status` with a bare "timed out waiting for
+            # the condition".
+            - "--feature-gates=CSIVolumeGroupSnapshot=true"
             # Add a marker to the snapshot-controller manifests. This is needed to enable feature gates in CSI prow jobs.
             # For example, in https://github.com/kubernetes-csi/csi-release-tools/pull/209, the snapshot-controller YAML is updated to add --prevent-volume-mode-conversion=true so that the feature can be enabled for certain e2e tests.
             # end snapshot controller args
