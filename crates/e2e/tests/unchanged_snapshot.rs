@@ -59,33 +59,45 @@ async fn a_second_run_over_unchanged_data_is_unchanged_not_failed() {
                 "Repository",
                 "e2e-repo-unchanged-dedup",
                 serde_json::json!({
-                    "spec": {
-                        // The opt-in. Without it the mover pins
-                        // `--ignore-identical-snapshots=false` at the identity
-                        // scope and kopia always writes a manifest — which the
-                        // sibling test below proves.
-                        "files": { "ignoreIdenticalSnapshots": true },
-                        "identity": { "username": "unchanged", "hostname": "e2e" }
-                    }
+                    // The opt-in. Without it the mover pins
+                    // `--ignore-identical-snapshots=false` at the identity
+                    // scope and kopia always writes a manifest — which the
+                    // sibling test below proves.
+                    "files": { "ignoreIdenticalSnapshots": true },
+                    "identity": { "username": "unchanged", "hostname": "e2e" }
                 }),
             )),
         )
         .await;
 
+    // The opt-in is the ENTIRE premise of this test: with it absent, kopia
+    // writes a manifest every time and the assertion below fails as "the
+    // feature does not work" while the real fault is that the field never
+    // reached the CR. Prove it landed before spending seven minutes waiting.
+    let created = policies.get(policy).await.expect("read back the policy");
+    assert!(
+        created
+            .spec
+            .files
+            .as_ref()
+            .is_some_and(|f| f.ignore_identical_snapshots),
+        "files.ignoreIdenticalSnapshots must be set on the created policy, got {:?}",
+        created.spec.files
+    );
+
     // First run: a real snapshot.
     let first = "e2e-unchanged-1";
-    backups
-        .create(
-            &PostParams::default(),
-            &cr(snapshot_json(
-                E2E_NAMESPACE,
-                first,
-                policy,
-                serde_json::json!({}),
-            )),
-        )
-        .await
-        .expect("create first Snapshot");
+    create_idempotent(
+        &backups,
+        &cr(snapshot_json(
+            E2E_NAMESPACE,
+            first,
+            policy,
+            serde_json::json!({}),
+        )),
+        "create first Snapshot",
+    )
+    .await;
     wait_phase(&backups, first, "Succeeded")
         .await
         .expect("the first run creates a snapshot");
@@ -97,18 +109,17 @@ async fn a_second_run_over_unchanged_data_is_unchanged_not_failed() {
 
     // Second run over byte-identical data: kopia dedupes it away.
     let second = "e2e-unchanged-2";
-    backups
-        .create(
-            &PostParams::default(),
-            &cr(snapshot_json(
-                E2E_NAMESPACE,
-                second,
-                policy,
-                serde_json::json!({}),
-            )),
-        )
-        .await
-        .expect("create second Snapshot");
+    create_idempotent(
+        &backups,
+        &cr(snapshot_json(
+            E2E_NAMESPACE,
+            second,
+            policy,
+            serde_json::json!({}),
+        )),
+        "create second Snapshot",
+    )
+    .await;
     wait_phase(&backups, second, "Unchanged")
         .await
         .expect("a deduped run is Unchanged — this is the #351 regression");
@@ -196,7 +207,7 @@ async fn without_the_opt_in_every_run_writes_a_distinct_manifest() {
                 "Repository",
                 "e2e-repo-unchanged-default",
                 serde_json::json!({
-                    "spec": { "identity": { "username": "unchangedoff", "hostname": "e2e" } }
+                    "identity": { "username": "unchangedoff", "hostname": "e2e" }
                 }),
             )),
         )
@@ -205,18 +216,17 @@ async fn without_the_opt_in_every_run_writes_a_distinct_manifest() {
     let mut ids = Vec::new();
     for n in 1..=2 {
         let name = format!("e2e-unchanged-off-{n}");
-        backups
-            .create(
-                &PostParams::default(),
-                &cr(snapshot_json(
-                    E2E_NAMESPACE,
-                    &name,
-                    policy,
-                    serde_json::json!({}),
-                )),
-            )
-            .await
-            .expect("create Snapshot");
+        create_idempotent(
+            &backups,
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                &name,
+                policy,
+                serde_json::json!({}),
+            )),
+            "create Snapshot",
+        )
+        .await;
         wait_phase(&backups, &name, "Succeeded")
             .await
             .expect("the default path always writes a manifest");

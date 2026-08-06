@@ -36,6 +36,25 @@ pub fn cr<T: DeserializeOwned>(v: serde_json::Value) -> T {
     serde_json::from_value(v).expect("CR JSON deserializes into typed object")
 }
 
+/// Create `obj`, tolerating one left behind by a previous attempt at this test.
+///
+/// The `e2e` nextest profile retries a failed test IN PLACE
+/// (`.config/nextest.toml`), and a failed attempt leaves its CRs in the cluster.
+/// A bare `.expect("create")` therefore turns every retry into an instant
+/// `AlreadyExists` panic whose message buries the real first failure. Every
+/// other API error still panics — this tolerates exactly one reason, not "any
+/// create problem".
+pub async fn create_idempotent<K>(api: &Api<K>, obj: &K, what: &str)
+where
+    K: Clone + std::fmt::Debug + DeserializeOwned + Serialize,
+{
+    match api.create(&PostParams::default(), obj).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.reason == "AlreadyExists" => {}
+        Err(e) => panic!("{what}: {e}"),
+    }
+}
+
 /// Provision the isolated per-`subpath` repo PV/PVC (idempotent), so a filesystem
 /// `Repository`/`ClusterRepository` over `subpath` gets its OWN kopia repo (the PVC
 /// root). See the module docs for why a shared PVC + `path` subdir does not isolate.
@@ -122,9 +141,25 @@ pub fn cluster_repository_json(
     )
 }
 
-/// Merge `extra` (an object) into `base["spec"]`.
+/// Merge `extra` (an object of **bare spec fields**) into `base["spec"]`.
+///
+/// `extra` is the CONTENTS of `spec`, not a `{"spec": {...}}` wrapper. Passing
+/// the wrapper is silently catastrophic and is rejected here on purpose: it
+/// lands as `spec.spec`, which serde drops on the way into the typed object
+/// (unknown fields are ignored) and which the apiserver would prune from a
+/// structural schema anyway. The CR is then created successfully carrying the
+/// BASE spec, so the test exercises the default policy while believing it
+/// configured something — the failure surfaces much later as "the feature does
+/// not work", with nothing in any log pointing at the overlay. That is exactly
+/// how the #351 e2e first failed in CI.
 pub fn merge_spec(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
     if let (Some(spec), serde_json::Value::Object(more)) = (base.get_mut("spec"), extra) {
+        assert!(
+            !more.contains_key("spec"),
+            "merge_spec takes the CONTENTS of spec, not a {{\"spec\": ...}} wrapper — \
+             a wrapped overlay is silently dropped and the test would run against the \
+             default spec"
+        );
         let serde_json::Value::Object(s) = spec else {
             panic!("spec must be an object");
         };

@@ -12,7 +12,8 @@
 //!   wherever the harness does and guards the reported bug directly;
 //! * group staging with `groupBy: VolumeGroupSnapshot` — needs the CSI stack
 //!   *and* the `groupsnapshot.storage.k8s.io` CRDs plus the
-//!   `--enable-volume-group-snapshots` flags the vendored manifests now set.
+//!   `--feature-gates=CSIVolumeGroupSnapshot=true` the vendored manifests now
+//!   set on both the snapshot-controller and the csi-snapshotter sidecar.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -27,8 +28,20 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 /// The storage class the `snapshot-stack` mise task installs.
 const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
 
-/// The label a `pvcSelector` matches on, mirroring example 04.
-const BACKUP_LABEL: (&str, &str) = ("backup", "include");
+/// The label KEY a `pvcSelector` matches on, mirroring example 04.
+const BACKUP_LABEL_KEY: &str = "backup";
+
+/// The two scenarios below use DIFFERENT label values on purpose.
+///
+/// They share one cluster (one shard, one namespace) and neither deletes its
+/// PVCs — the group scenario's `e2e-grp-*` outlive it. A shared value would make
+/// the fan-out scenario's selector match four PVCs instead of two, so it would
+/// fail on a count assertion that has nothing to do with what it tests, and only
+/// in whichever order nextest happened to pick. Distinct values also mean a
+/// crashed run cannot poison its sibling.
+const FANOUT_LABEL_VALUE: &str = "fanout";
+/// See [`FANOUT_LABEL_VALUE`].
+const GROUP_LABEL_VALUE: &str = "group";
 
 fn volume_group_snapshots(client: &kube::Client) -> Api<DynamicObject> {
     let ar = ApiResource::from_gvk_with_plural(
@@ -53,7 +66,7 @@ async fn csi_pvc_with_data(client: &kube::Client, name: &str, marker: &str) {
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {
                     "name": name, "namespace": E2E_NAMESPACE,
-                    "labels": { BACKUP_LABEL.0: BACKUP_LABEL.1 },
+                    "labels": { BACKUP_LABEL_KEY: GROUP_LABEL_VALUE },
                 },
                 "spec": {
                     "accessModes": ["ReadWriteOnce"],
@@ -100,6 +113,21 @@ async fn csi_pvc_with_data(client: &kube::Client, name: &str, marker: &str) {
     .unwrap_or_else(|e| panic!("PVC {name} should bind: {e}"));
 }
 
+/// Fail fast if the created policy is not actually a selector policy.
+///
+/// The whole test is about fan-out, so a policy that quietly kept the harness's
+/// default single-`pvc` source produces exactly ONE child and reports "fan-out
+/// is broken" — with nothing anywhere naming the real fault, which is that the
+/// selector never reached the CR. Cheaper to catch here than after a timeout.
+async fn assert_selector_landed(api: &Api<kopiur_api::SnapshotPolicy>, name: &str) {
+    let p = api.get(name).await.expect("read back the policy");
+    assert!(
+        p.spec.sources.iter().any(|s| s.pvc_selector.is_some()),
+        "the created policy must carry a pvcSelector source, got {:?}",
+        p.spec.sources
+    );
+}
+
 /// The `Snapshot` CRs a policy produced, by its config label.
 async fn children_of(client: &kube::Client, policy: &str) -> Vec<kopiur_api::Snapshot> {
     let api: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
@@ -140,15 +168,15 @@ async fn a_pvc_selector_fans_out_to_one_snapshot_per_matched_pvc() {
         apply_all(&client, &fixtures).await.expect("fan-out PVCs");
         // The selector matches on this label; the builder does not set it.
         let patch = serde_json::json!({
-            "metadata": { "labels": { BACKUP_LABEL.0: BACKUP_LABEL.1 } }
+            "metadata": { "labels": { BACKUP_LABEL_KEY: FANOUT_LABEL_VALUE } }
         });
-        pvcs.patch(
-            pvc,
-            &kube::api::PatchParams::apply("e2e").force(),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await
-        .expect("label the PVC");
+        // A plain merge patch, NOT `PatchParams::apply(..).force()`: kube
+        // rejects `force` on anything but `Patch::Apply`
+        // ("PatchParams::force only works with Patch::Apply"), and adding one
+        // label to an object this test already owns needs no field manager.
+        pvcs.patch(pvc, &Default::default(), &kube::api::Patch::Merge(&patch))
+            .await
+            .expect("label the PVC");
     }
 
     let repos: Api<kopiur_api::Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
@@ -179,42 +207,40 @@ async fn a_pvc_selector_fans_out_to_one_snapshot_per_matched_pvc() {
                 "Repository",
                 repo,
                 serde_json::json!({
-                    "spec": {
-                        // The shape from deploy/examples/04-multi-pvc-selector.yaml,
-                        // which is what the reporter had.
-                        "sources": [ {
-                            "pvcSelector": {
-                                "labelSelector": { "matchLabels": { BACKUP_LABEL.0: BACKUP_LABEL.1 } }
-                            },
-                            "sourcePathStrategy": "PvcName"
-                        } ],
-                        "groupBy": "None",
-                        "copyMethod": "Direct",
-                        "identity": { "username": "fanout", "hostname": "e2e" }
-                    }
+                    // The shape from deploy/examples/04-multi-pvc-selector.yaml,
+                    // which is what the reporter had.
+                    "sources": [ {
+                        "pvcSelector": {
+                            "labelSelector": { "matchLabels": { BACKUP_LABEL_KEY: FANOUT_LABEL_VALUE } }
+                        },
+                        "sourcePathStrategy": "PvcName"
+                    } ],
+                    "groupBy": "None",
+                    "copyMethod": "Direct",
+                    "identity": { "username": "fanout", "hostname": "e2e" }
                 }),
             )),
         )
         .await
         .expect("a pvcSelector policy must be ADMITTED — it is a documented feature");
+    assert_selector_landed(&policies, policy).await;
 
     // `runOnCreate` fires immediately, which is exactly how the reporter hit it.
     let schedule = "e2e-fanout-schedule";
-    schedules
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "kopiur.home-operations.com/v1alpha1",
-                "kind": "SnapshotSchedule",
-                "metadata": { "name": schedule, "namespace": E2E_NAMESPACE },
-                "spec": {
-                    "policyRef": { "name": policy },
-                    "schedule": { "cron": "0 3 * * *", "runOnCreate": true }
-                }
-            })),
-        )
-        .await
-        .expect("create SnapshotSchedule");
+    create_idempotent(
+        &schedules,
+        &cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotSchedule",
+            "metadata": { "name": schedule, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "policyRef": { "name": policy },
+                "schedule": { "cron": "0 3 * * *", "runOnCreate": true }
+            }
+        })),
+        "create SnapshotSchedule",
+    )
+    .await;
 
     // TWO children, not one, and not an invariant violation.
     wait_until(
@@ -333,39 +359,37 @@ async fn a_group_capture_is_shared_by_every_member_and_reaped_after() {
                 "Repository",
                 repo,
                 serde_json::json!({
-                    "spec": {
-                        "sources": [ {
-                            "pvcSelector": {
-                                "labelSelector": { "matchLabels": { BACKUP_LABEL.0: BACKUP_LABEL.1 } }
-                            }
-                        } ],
-                        // The DEFAULT. Example 04 does not set it either.
-                        "groupBy": "VolumeGroupSnapshot",
-                        "copyMethod": "Snapshot",
-                        "identity": { "username": "grouped", "hostname": "e2e" }
-                    }
+                    "sources": [ {
+                        "pvcSelector": {
+                            "labelSelector": { "matchLabels": { BACKUP_LABEL_KEY: GROUP_LABEL_VALUE } }
+                        }
+                    } ],
+                    // The DEFAULT. Example 04 does not set it either.
+                    "groupBy": "VolumeGroupSnapshot",
+                    "copyMethod": "Snapshot",
+                    "identity": { "username": "grouped", "hostname": "e2e" }
                 }),
             )),
         )
         .await
         .expect("create grouped SnapshotPolicy");
+    assert_selector_landed(&policies, policy).await;
 
     let schedule = "e2e-group-schedule";
-    schedules
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "kopiur.home-operations.com/v1alpha1",
-                "kind": "SnapshotSchedule",
-                "metadata": { "name": schedule, "namespace": E2E_NAMESPACE },
-                "spec": {
-                    "policyRef": { "name": policy },
-                    "schedule": { "cron": "0 3 * * *", "runOnCreate": true }
-                }
-            })),
-        )
-        .await
-        .expect("create SnapshotSchedule");
+    create_idempotent(
+        &schedules,
+        &cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotSchedule",
+            "metadata": { "name": schedule, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "policyRef": { "name": policy },
+                "schedule": { "cron": "0 3 * * *", "runOnCreate": true }
+            }
+        })),
+        "create SnapshotSchedule",
+    )
+    .await;
 
     let vgs = volume_group_snapshots(&client);
     // EXACTLY ONE group for the whole expansion — that is the entire point. N
