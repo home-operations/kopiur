@@ -5,6 +5,21 @@
 /// is a new variant, never a stringly-typed catch-all.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    /// A `pvcSelector` recipe matched no PersistentVolumeClaims, so there is
+    /// nothing to snapshot.
+    #[error(
+        "SnapshotPolicy {policy} uses a pvcSelector that currently matches no \
+         PersistentVolumeClaims in namespace {namespace}, so `snapshot now` has nothing to back \
+         up. Fix: check the selector's labels against `kubectl -n {namespace} get pvc \
+         --show-labels`"
+    )]
+    SelectorMatchedNothing {
+        /// The recipe whose selector matched nothing.
+        policy: String,
+        /// Namespace the selector was evaluated in.
+        namespace: String,
+    },
+
     /// The kubeconfig could not be loaded or the requested context resolved.
     #[error(
         "could not load a Kubernetes client configuration: {source}. \

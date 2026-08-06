@@ -819,9 +819,8 @@ fn build_backup_run_maps_snapshot_create_knobs_and_keeps_them_off_policy_args() 
 #[test]
 fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
     use kopiur_api::snapshot_policy::Source;
-    // pvcSelector-only / empty single source: the single-source mover path
-    // needs an explicit pvc or nfs (the webhook rejects this earlier; the
-    // controller defends against it rather than building a bogus Job).
+    // A genuinely empty source: admission rejects this, and the controller
+    // defends against it rather than building a bogus Job.
     let cfg = config_with_source(
         "x",
         Source {
@@ -835,6 +834,80 @@ fn build_backup_run_rejects_a_source_with_neither_pvc_nor_nfs() {
     );
     let repo = resolved_s3_repo();
     assert!(build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "x").is_err());
+}
+
+#[test]
+fn an_unpinned_snapshot_against_a_selector_policy_names_the_fix_not_a_bug_report() {
+    use kopiur_api::snapshot_policy::{PvcSelector, Source};
+    // #346 as users actually hit it. The old code matched `(&source.pvc,
+    // &source.nfs)`, so a pvcSelector fell into the `_` arm and produced
+    // "invariant violated ... This is likely a bug in kopiur — please report
+    // it". The previous version of THIS test asserted only `is_err()`, and its
+    // comment claimed the webhook rejected selectors earlier, which was false —
+    // `validate_source` accepted them. So the whole bug sat behind a green test.
+    let cfg = config_with_source(
+        "x",
+        Source {
+            pvc: None,
+            pvc_selector: Some(PvcSelector {
+                namespace_selector: None,
+                label_selector: None,
+            }),
+            nfs: None,
+            source_path_override: None,
+            source_path_strategy: None,
+            ..Default::default()
+        },
+    );
+    let repo = resolved_s3_repo();
+    let err = build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "x")
+        .expect_err("an unpinned Snapshot against a selector policy cannot run");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("invariant violated"),
+        "this is a user configuration problem, not a kopiur bug: {msg}"
+    );
+    assert!(msg.contains("pvcSelector"), "must name the cause: {msg}");
+    assert!(msg.contains("snapshot now"), "must name the fix: {msg}");
+}
+
+#[test]
+fn a_pinned_snapshot_against_a_selector_policy_builds_its_own_pvc_mount() {
+    use kopiur_api::snapshot_policy::{PvcSelector, Source, SourcePathStrategy};
+    // The other half: with `spec.source` naming the PVC, a selector policy
+    // builds an ordinary single-PVC run — which is the whole design.
+    let cfg = config_with_source(
+        "x",
+        Source {
+            pvc: None,
+            pvc_selector: Some(PvcSelector {
+                namespace_selector: None,
+                label_selector: None,
+            }),
+            nfs: None,
+            source_path_override: None,
+            source_path_strategy: Some(SourcePathStrategy::PvcNamespacedName),
+            ..Default::default()
+        },
+    );
+    let mut backup = dummy_backup();
+    backup.spec.source = Some(kopiur_api::SnapshotSourceRef {
+        source_index: 0,
+        target: kopiur_api::SnapshotSourceTarget::Pvc(kopiur_api::PvcTargetRef {
+            namespace: "web".into(),
+            name: "assets".into(),
+        }),
+        group: None,
+    });
+    let repo = resolved_s3_repo();
+    let (ws, mount, _repo_vol, _creds) =
+        build_backup_run(&backup, &cfg, &repo, "ns", "x").expect("builds");
+    let mount = mount.expect("a PVC source always mounts something");
+    assert_eq!(mount.mount_path, "/pvc/web/assets");
+    match &ws.operation {
+        Operation::Snapshot(op) => assert_eq!(op.source_path, "/pvc/web/assets"),
+        other => panic!("expected a Snapshot op, got {}", other.kind_str()),
+    }
 }
 
 // --- matches_snapshot_identity: the resolve_succeeded_snapshot predicate ---

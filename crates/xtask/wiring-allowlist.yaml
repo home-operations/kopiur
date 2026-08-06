@@ -180,14 +180,6 @@ allow:
   #     milestones that implement them; the entries fail the check the moment
   #     the field becomes wired, so they cannot outlive the work.
   # ==========================================================================
-  - path: SnapshotPolicy.spec.sources.pvcSelector
-    reason: >-
-      #346 — no expansion code exists; a policy using it hits
-      `Error::Invariant` in build_backup_run. Implemented in M4.
-  - path: SnapshotPolicy.spec.sources.pvcSelector.namespaceSelector
-    reason: "#346 — part of pvcSelector, likewise unimplemented. M4."
-  - path: SnapshotPolicy.spec.sources.pvcSelector.namespaceSelector.matchNames
-    reason: "#346 — part of pvcSelector, likewise unimplemented. M4."
   - path: SnapshotPolicy.spec.sources.sourcePathStrategy
     reason: >-
       #346 — only meaningful for pvcSelector expansion, so it is inert for the

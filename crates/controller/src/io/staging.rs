@@ -1062,19 +1062,26 @@ pub async fn resolve_staging(
     client: &kube::Client,
     scope: &crate::config::WatchScope,
     policy: &SnapshotPolicy,
+    pin: Option<&kopiur_api::SnapshotSourceRef>,
     ns: &str,
     snapshot_cr: &str,
     owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
-    let source = policy.spec.sources.first();
+    // The source THIS run covers. Without the pin a fanned-out child would
+    // stage `sources[0]`, which for a `pvcSelector` policy has no PVC at all —
+    // so every child would silently skip staging and read its live volume
+    // instead of a point-in-time copy (#346).
+    let eff = crate::expand::effective_source(policy, pin)
+        .map_err(|e| Error::Validation(e.to_string()))?;
+    let pinned_pvc = eff.pvc.as_ref().map(|p| p.name.clone());
     // Decide, before touching the cluster, whether staging applies at all and
     // whether this install can do it. Pure + unit-tested, because the ORDER is
     // the load-bearing part and `resolve_staging` itself is async and
     // Client-bound (so only the e2e tier reaches it).
     let source_name = match staging_applicability(
         copy_method,
-        source.and_then(|s| s.pvc.as_ref()).map(|p| p.name.as_str()),
+        pinned_pvc.as_deref(),
         matches!(scope, crate::config::WatchScope::Namespaced(_)),
     ) {
         StagingApplicability::NotApplicable => return Ok(StagingOutcome::NotApplicable),

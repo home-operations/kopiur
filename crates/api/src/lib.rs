@@ -20,6 +20,7 @@ pub mod snapshot_schedule;
 pub mod creds;
 pub mod duration;
 pub mod error;
+pub mod expand;
 pub mod identity;
 pub mod invariants;
 pub mod jitter;

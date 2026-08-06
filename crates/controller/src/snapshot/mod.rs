@@ -1347,6 +1347,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &ctx.client,
         &ctx.watch_scope,
         &config,
+        backup.spec.source.as_ref(),
         &namespace,
         &name,
         &owner,
@@ -3392,7 +3393,12 @@ async fn reconcile_pin(
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
-    let identity = resolve_identity_for(&config, namespace, repo.identity_defaults.as_ref())?;
+    let identity = resolve_identity_for(
+        &config,
+        namespace,
+        repo.identity_defaults.as_ref(),
+        backup.spec.source.as_ref(),
+    )?;
     let owner = io::owner_ref_for(backup, "Snapshot")?;
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
@@ -3757,7 +3763,12 @@ async fn resolve_succeeded_snapshot(
     namespace: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
-    let identity = resolve_identity_for(&config, namespace, repo.identity_defaults.as_ref())?;
+    let identity = resolve_identity_for(
+        &config,
+        namespace,
+        repo.identity_defaults.as_ref(),
+        backup.spec.source.as_ref(),
+    )?;
     match &repo.backend {
         Backend::Filesystem(fs) => {
             let creds = io::repo_credentials(&repo.encryption);

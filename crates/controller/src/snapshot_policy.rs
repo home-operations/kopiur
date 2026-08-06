@@ -11,6 +11,7 @@
 //! module only adapts `Snapshot` CRs to its `SnapshotLike` trait and decides which
 //! CRs to delete, both of which are pure and unit-tested here.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -98,8 +99,40 @@ pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
 /// `api::retention::select_kept`; returns the `delete` set. Snapshots that are not
 /// terminal-successful are ignored entirely (never selected for deletion here).
 pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String> {
-    let views: Vec<SnapshotRetentionView> = backups.iter().filter_map(retention_view).collect();
-    select_kept(&views, policy).delete
+    // GFS is applied PER SOURCE, not per policy. `select_kept` has no grouping
+    // key, so feeding one policy's whole child set through it once would make a
+    // 7-PVC `pvcSelector` fan-out under `keepDaily: 7` keep SEVEN SNAPSHOTS
+    // TOTAL — one day across all seven volumes — instead of seven days each.
+    // That is silent data loss introduced by the fan-out, so the grouping is
+    // not optional (#346).
+    //
+    // Un-fanned Snapshots all share the empty key, so a single-source policy is
+    // exactly one bucket and behaves byte-for-byte as before.
+    let mut buckets: BTreeMap<String, Vec<SnapshotRetentionView>> = BTreeMap::new();
+    for b in backups {
+        if let Some(v) = retention_view(b) {
+            buckets.entry(retention_group_key(b)).or_default().push(v);
+        }
+    }
+    buckets
+        .values()
+        .flat_map(|views| select_kept(views, policy).delete)
+        .collect()
+}
+
+/// **Pure.** The retention bucket a `Snapshot` belongs to.
+///
+/// One bucket per distinct backup source, so GFS keeps `keepDaily` days *of
+/// each PVC* rather than `keepDaily` snapshots across all of them. Empty for an
+/// un-fanned Snapshot, which is what makes a single-source policy one bucket
+/// and therefore unchanged.
+pub fn retention_group_key(b: &Snapshot) -> String {
+    match b.spec.source.as_ref().map(|s| &s.target) {
+        Some(kopiur_api::SnapshotSourceTarget::Pvc(t)) => {
+            format!("pvc/{}/{}", t.namespace, t.name)
+        }
+        None => String::new(),
+    }
 }
 
 /// **Pure.** The `Unchanged` Snapshots to prune: everything past the newest
@@ -1403,6 +1436,72 @@ mod tests {
             keep_daily: daily,
             ..Default::default()
         }
+    }
+
+    fn fanned_backup(name: &str, pvc: &str, end: DateTime<Utc>) -> Snapshot {
+        let mut b = succeeded_backup(name, end);
+        b.spec.source = Some(kopiur_api::SnapshotSourceRef {
+            source_index: 0,
+            target: kopiur_api::SnapshotSourceTarget::Pvc(kopiur_api::PvcTargetRef {
+                namespace: "ns".into(),
+                name: pvc.into(),
+            }),
+            group: None,
+        });
+        b
+    }
+
+    // --- #346: GFS is per SOURCE, not per policy ---------------------------
+
+    #[test]
+    fn retention_keeps_n_days_per_pvc_not_n_days_across_all_of_them() {
+        // The data-loss bug the fan-out would introduce. `select_kept` has no
+        // grouping key, so one flat pass over a 3-PVC × 3-day population under
+        // `keepDaily: 3` would keep 3 SNAPSHOTS TOTAL — one day — and delete the
+        // other 6, silently destroying two days of every volume.
+        let day = |d: u32| Utc.with_ymd_and_hms(2026, 8, d, 2, 0, 0).unwrap();
+        let mut backups = Vec::new();
+        for pvc in ["a", "b", "c"] {
+            for d in 3..=5 {
+                backups.push(fanned_backup(&format!("{pvc}-{d}"), pvc, day(d)));
+            }
+        }
+        let del = backups_to_delete(&backups, &policy(None, Some(3)));
+        assert!(
+            del.is_empty(),
+            "3 days × 3 PVCs under keepDaily=3 must keep everything, got deletes: {del:?}"
+        );
+
+        // And the bucketing really is per PVC: a 4th day evicts the oldest of
+        // EACH volume, not three days of one.
+        for pvc in ["a", "b", "c"] {
+            backups.push(fanned_backup(&format!("{pvc}-6"), pvc, day(6)));
+        }
+        let del: std::collections::BTreeSet<String> =
+            backups_to_delete(&backups, &policy(None, Some(3)))
+                .into_iter()
+                .collect();
+        assert_eq!(
+            del,
+            ["a-3".to_string(), "b-3".to_string(), "c-3".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn an_unfanned_policy_is_a_single_bucket_and_behaves_as_before() {
+        // The compatibility half: every existing single-source policy has no
+        // `spec.source`, shares the empty key, and must be untouched.
+        let day = |d: u32| Utc.with_ymd_and_hms(2026, 8, d, 2, 0, 0).unwrap();
+        let backups: Vec<Snapshot> = (1..=4)
+            .map(|d| succeeded_backup(&format!("d{d}"), day(d)))
+            .collect();
+        for b in &backups {
+            assert_eq!(retention_group_key(b), "");
+        }
+        let del = backups_to_delete(&backups, &policy(None, Some(2)));
+        assert_eq!(del.len(), 2, "keepDaily=2 over 4 days deletes the oldest 2");
     }
 
     // --- #351: Unchanged is a success that owns nothing --------------------

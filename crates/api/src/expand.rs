@@ -1,0 +1,377 @@
+//! Selector expansion: turning one `SnapshotPolicy` source into N concrete
+//! per-PVC backups (#346).
+//!
+//! # The model
+//!
+//! A `SnapshotPolicy` source is exactly one of `pvc`, `nfs`, or `pvcSelector`.
+//! The first two name a single thing; the third matches many. Kopiur's whole
+//! data model is built on **one `Snapshot` CR = one mover Job = one kopia
+//! source path = one kopia manifest**, owned via a finalizer — retention,
+//! restore, the catalog and the deletion policy all rest on that 1:1. So a
+//! selector is expanded into N *ordinary* `Snapshot` CRs, one per matched PVC,
+//! each of which is then indistinguishable from a hand-written single-PVC
+//! backup.
+//!
+//! Expansion happens **once, at mint time**, in whichever component creates the
+//! CR — a `SnapshotSchedule` fire or `kubectl kopiur snapshot now`. A `Snapshot`
+//! never expands itself: a CR minting sibling CRs would re-enter the same
+//! reconciler for each child and break the one-shot `run_decision` discipline,
+//! and a `SnapshotPolicy` that minted invocations would collapse the
+//! recipe/invocation/schedule split the project is built around.
+//!
+//! # What was here before
+//!
+//! Nothing. `pvcSelector` was schema-valid, admission-accepted, documented on
+//! six pages and shipped as `deploy/examples/04-multi-pvc-selector.yaml` — and
+//! no expansion code existed anywhere, so `build_backup_run` hit its
+//! `_ =>` arm and returned `invariant violated … This is likely a bug in
+//! kopiur`. That is #346.
+
+use std::collections::BTreeMap;
+
+use crate::error::ValidationError;
+use crate::snapshot::{PvcTargetRef, SnapshotSourceRef, SnapshotSourceTarget};
+use crate::snapshot_policy::SnapshotPolicy;
+use crate::snapshot_policy::{self, Source, SourcePathStrategy};
+use kube::ResourceExt;
+
+/// Max name length for a `Snapshot` CR produced by expansion.
+///
+/// **63, not 253.** The CR's name becomes the mover `Job`'s name, and
+/// `io::cleanup_staged_source` finds that Job's pods by the
+/// `batch.kubernetes.io/job-name` **label value**, which Kubernetes caps at 63
+/// bytes. A longer name silently breaks the pvc-protection release step and
+/// wedges staged-PVC teardown. Fan-out makes long names routine, so this is
+/// enforced here rather than discovered in production.
+const MAX_CHILD_NAME: usize = 63;
+
+/// The marker segment that makes a fanned-out name unambiguous.
+const FANOUT_MARKER: &str = "-pvc-";
+
+// --- the effective source for one run --------------------------------------
+
+/// The single source one `Snapshot` actually backs up, after resolving
+/// `spec.source` (a fanned-out child) against the policy's `sources[]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSource {
+    /// Index into `policy.spec.sources` these knobs came from.
+    pub index: usize,
+    /// The concrete PVC, when this is a PVC-shaped source.
+    pub pvc: Option<PvcTargetRef>,
+    /// The NFS export path, when this is an NFS source.
+    pub nfs_path: Option<String>,
+    /// `sourcePathOverride` from the governing source.
+    pub source_path_override: Option<String>,
+    /// Whether the mount is read-only.
+    pub read_only: bool,
+}
+
+impl EffectiveSource {
+    /// The kopia source path (and mount path) for this run.
+    ///
+    /// `sourcePathOverride` wins. Otherwise a PVC yields `/pvc/<name>` or
+    /// `/pvc/<namespace>/<name>` depending on the governing source's
+    /// [`SourcePathStrategy`], and an NFS source yields its export path.
+    pub fn kopia_source_path(&self, strategy: SourcePathStrategy) -> Option<String> {
+        if let Some(o) = &self.source_path_override {
+            return Some(o.clone());
+        }
+        if let Some(p) = &self.pvc {
+            return Some(match strategy {
+                SourcePathStrategy::PvcName => format!("/pvc/{}", p.name),
+                SourcePathStrategy::PvcNamespacedName => {
+                    format!("/pvc/{}/{}", p.namespace, p.name)
+                }
+            });
+        }
+        self.nfs_path.clone()
+    }
+}
+
+/// Resolve which source this `Snapshot` covers.
+///
+/// * `pin: None` — the ordinary single-source case: `sources[0]` governs, and
+///   its own `pvc`/`nfs` is the target. Byte-for-byte the old behavior.
+/// * `pin: Some(_)` — a fanned-out child: `sourceIndex` selects the governing
+///   source's knobs, and the pinned `target` is the concrete PVC.
+///
+/// An out-of-range `sourceIndex` (the policy shrank mid-run) is a named,
+/// terminal error. It is emphatically NOT a fallback to `sources[0]`: silently
+/// backing up a different volume than the one the CR names is the worst
+/// possible failure mode for a backup operator.
+pub fn effective_source(
+    policy: &SnapshotPolicy,
+    pin: Option<&SnapshotSourceRef>,
+) -> Result<EffectiveSource, ValidationError> {
+    let sources = &policy.spec.sources;
+    let index = pin.map(|p| p.source_index as usize).unwrap_or(0);
+    let Some(source) = sources.get(index) else {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "spec.source.sourceIndex".to_string(),
+            reason: format!(
+                "`spec.source.sourceIndex` is {index} but SnapshotPolicy `{}` now has {} source(s); \
+             the recipe was edited after this Snapshot was created. Delete this Snapshot and let \
+             the schedule re-fire, or recreate it against the current recipe.",
+                policy.name_any(),
+                sources.len()
+            ),
+        });
+    };
+    let read_only = snapshot_policy::source_read_only(source);
+    let common = |pvc: Option<PvcTargetRef>| EffectiveSource {
+        index,
+        pvc,
+        nfs_path: source.nfs.as_ref().map(|n| n.path.clone()),
+        source_path_override: source.source_path_override.clone(),
+        read_only,
+    };
+    match pin.map(|p| &p.target) {
+        // A fanned-out child names its own PVC; the policy source it came from
+        // is a selector and has no `pvc` of its own.
+        Some(SnapshotSourceTarget::Pvc(t)) => Ok(common(Some(t.clone()))),
+        None => Ok(common(source.pvc.as_ref().map(|p| PvcTargetRef {
+            // A non-selector `pvc:` source is always same-namespace.
+            namespace: policy.namespace().unwrap_or_default(),
+            name: p.name.clone(),
+        }))),
+    }
+}
+
+/// The `sourcePathStrategy` governing a source.
+///
+/// Deliberately only consulted for **selector-expanded** sources. A plain
+/// `pvc:` source keeps `/pvc/<name>` unconditionally: changing the path of an
+/// existing single-PVC policy would re-identify its kopia source and orphan
+/// every manifest it has ever taken.
+pub fn strategy_for(source: &Source) -> SourcePathStrategy {
+    if source.pvc_selector.is_some() {
+        source
+            .source_path_strategy
+            .unwrap_or(SourcePathStrategy::PvcName)
+    } else {
+        SourcePathStrategy::PvcName
+    }
+}
+
+/// Render a `LabelSelector` as the API server's selector string.
+///
+/// Lives here so the controller and the CLI build byte-identical queries: a
+/// divergence would make `kubectl kopiur snapshot now` and the schedule expand
+/// to DIFFERENT PVC sets for the same recipe, which is the kind of discrepancy
+/// nobody notices until a restore is missing a volume.
+pub fn label_selector_string(
+    sel: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
+) -> String {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
+    let mut terms: Vec<String> = Vec::new();
+    if let Some(labels) = &sel.match_labels {
+        for (k, v) in labels {
+            terms.push(format!("{k}={v}"));
+        }
+    }
+    if let Some(exprs) = &sel.match_expressions {
+        for LabelSelectorRequirement {
+            key,
+            operator,
+            values,
+        } in exprs
+        {
+            let vals = values.clone().unwrap_or_default().join(",");
+            match operator.as_str() {
+                "In" => terms.push(format!("{key} in ({vals})")),
+                "NotIn" => terms.push(format!("{key} notin ({vals})")),
+                "Exists" => terms.push(key.clone()),
+                "DoesNotExist" => terms.push(format!("!{key}")),
+                // Unknown operator: skip (the webhook/schema constrain the set).
+                _ => {}
+            }
+        }
+    }
+    terms.join(",")
+}
+
+// --- naming -----------------------------------------------------------------
+
+/// The deterministic name of the fanned-out `Snapshot` for one PVC.
+///
+/// `<base>-pvc-<slug>-<h8>`, capped at [`MAX_CHILD_NAME`].
+///
+/// * `<slug>` is human-legible (`<name>`, or `<namespace>-<name>` when the PVC
+///   is outside the policy's namespace) and may be clipped.
+/// * `<h8>` is 8 hex of FNV-1a over the exact string `"<namespace>/<name>"` and
+///   is **never** clipped — it is the injectivity guarantee.
+///
+/// Collision-free against the three existing schemes (`<schedule>-<slot>`,
+/// `<schedule>-<policy>-<slot>`, `<policy>-manual-<slot>`): each ends in a
+/// dash-free 14-digit slot stamp, while a fanned name's tail after `-pvc-`
+/// always contains a `-`.
+///
+/// This does NOT delegate to `io::staging::staged_child_name`, whose
+/// `MAX_NAME_LEN - tag.len() - suffix.len() - 2` is unchecked `usize`
+/// subtraction: its callers pass 4-char suffixes (`snap`, `src`), and a PVC
+/// name up to 253 chars would underflow it.
+///
+/// ```
+/// # use kopiur_api::expand::fanout_child_name;
+/// let n = fanout_child_name("nightly-20260805020000", "db", "db", "pgdata");
+/// assert!(n.starts_with("nightly-20260805020000-pvc-pgdata-"));
+/// assert!(n.len() <= 63);
+/// ```
+pub fn fanout_child_name(base: &str, policy_ns: &str, pvc_ns: &str, pvc_name: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{pvc_ns}/{pvc_name}").as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let tag = format!("{:08x}", (hash & 0xffff_ffff) as u32);
+
+    let slug_full = if pvc_ns == policy_ns {
+        pvc_name.to_string()
+    } else {
+        format!("{pvc_ns}-{pvc_name}")
+    };
+    let slug = sanitize_dns1123(&slug_full);
+
+    // Budget: base + "-pvc-" + slug + "-" + tag. Clip `base` first (it is the
+    // most redundant part — every sibling shares it), then the slug. Never the
+    // tag or the marker.
+    let fixed = FANOUT_MARKER.len() + 1 + tag.len();
+    let mut base_keep = base.len();
+    let mut slug_keep = slug.len();
+    if fixed + base_keep + slug_keep > MAX_CHILD_NAME {
+        let room = MAX_CHILD_NAME.saturating_sub(fixed);
+        // Give the slug up to a third of the room, the base the rest.
+        slug_keep = slug_keep.min(room / 3);
+        base_keep = base_keep.min(room.saturating_sub(slug_keep));
+    }
+    let name = format!(
+        "{}{FANOUT_MARKER}{}-{tag}",
+        clip(base, base_keep),
+        clip(&slug, slug_keep)
+    );
+    // A clip can leave a trailing '-', which is not a legal DNS-1123 name.
+    name.trim_matches('-').to_string()
+}
+
+/// Truncate on a char boundary.
+fn clip(s: &str, keep: usize) -> &str {
+    if keep >= s.len() {
+        return s;
+    }
+    let mut end = keep;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Lowercase, replacing anything outside `[a-z0-9-]` with `-`.
+fn sanitize_dns1123(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+// --- expansion ---------------------------------------------------------------
+
+/// One member of an expanded selector: the child's name and the `spec.source`
+/// to stamp on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedMember {
+    /// Deterministic child `Snapshot` name.
+    pub name: String,
+    /// The pin recording which PVC this child covers.
+    pub source: SnapshotSourceRef,
+}
+
+/// **Pure.** Expand one policy's sources against an already-matched PVC set.
+///
+/// `matched` is `(namespace, name)` per source index — the caller does the
+/// cluster IO ([`match_pvcs`]), this decides the names and pins.
+///
+/// Returns `Ok(None)` when the policy has no selector source at all, meaning
+/// "mint exactly one child with no `spec.source`", i.e. today's behavior. That
+/// distinction matters: an empty `Vec` would mean "a selector matched nothing",
+/// which is a different and much louder situation.
+///
+/// # The collision guard
+///
+/// `sourcePathStrategy` defaults to `PvcName` → `/pvc/<name>`. A selector with
+/// a cross-namespace `namespaceSelector` matching a PVC called `data` in two
+/// namespaces therefore yields **two kopia sources at the identical
+/// `user@host:/pvc/data`**, silently merging two volumes' histories into one
+/// stream — under a single `KOPIA_KEEP_MAX` retention pin, so they also prune
+/// each other. `detect_identity_collision` cannot catch this: it compares
+/// across policies and skips self. So it is caught here, before anything is
+/// created.
+pub fn expand_sources(
+    policy: &SnapshotPolicy,
+    base_name: &str,
+    matched: &BTreeMap<usize, Vec<PvcTargetRef>>,
+) -> Result<Option<Vec<ExpandedMember>>, ValidationError> {
+    let policy_ns = policy.namespace().unwrap_or_default();
+    if !policy.spec.sources.iter().any(|s| s.pvc_selector.is_some()) {
+        return Ok(None);
+    }
+    let mut members: Vec<ExpandedMember> = Vec::new();
+    let mut paths: BTreeMap<String, PvcTargetRef> = BTreeMap::new();
+
+    for (index, source) in policy.spec.sources.iter().enumerate() {
+        if source.pvc_selector.is_none() {
+            continue;
+        }
+        let strategy = strategy_for(source);
+        for target in matched.get(&index).into_iter().flatten() {
+            // Collision check against every path this expansion has produced.
+            let eff = EffectiveSource {
+                index,
+                pvc: Some(target.clone()),
+                nfs_path: None,
+                source_path_override: source.source_path_override.clone(),
+                read_only: snapshot_policy::source_read_only(source),
+            };
+            let path = eff
+                .kopia_source_path(strategy)
+                .unwrap_or_else(|| "/data".to_string());
+            if let Some(prev) = paths.insert(path.clone(), target.clone())
+                && (prev.namespace != target.namespace || prev.name != target.name)
+            {
+                return Err(ValidationError::InvalidFieldValue {
+                    field: "spec.source.sourceIndex".to_string(),
+                    reason: format!(
+                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, which \
+                     resolve to the SAME kopia source path `{path}` under `sourcePathStrategy: \
+                     PvcName`. Their backups would merge into one snapshot history and prune each \
+                     other. Set `sourcePathStrategy: PvcNamespacedName` on that source, or narrow \
+                     the selector to one namespace.",
+                        policy.name_any(),
+                        prev.namespace,
+                        prev.name,
+                        target.namespace,
+                        target.name,
+                    ),
+                });
+            }
+            members.push(ExpandedMember {
+                name: fanout_child_name(base_name, &policy_ns, &target.namespace, &target.name),
+                source: SnapshotSourceRef {
+                    source_index: index as u32,
+                    target: SnapshotSourceTarget::Pvc(target.clone()),
+                    // Group staging is wired in M5; `groupBy` is refused at
+                    // admission until then, so this is always None here.
+                    group: None,
+                },
+            });
+        }
+    }
+    Ok(Some(members))
+}
+
+#[cfg(test)]
+mod tests;

@@ -4424,7 +4424,7 @@ fn staging_overrides_rejected_for_direct_copy_method() {
 }
 
 #[test]
-fn staging_overrides_rejected_for_nfs_and_pvc_selector_sources() {
+fn staging_overrides_rejected_for_nfs_but_honored_for_pvc_selector_sources() {
     // NFS is read directly, never staged.
     let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
         "repository: { kind: Repository, name: r }\n\
@@ -4440,10 +4440,14 @@ fn staging_overrides_rejected_for_nfs_and_pvc_selector_sources() {
     assert!(msg.contains("spec.staging.accessModes"), "{msg}");
     assert!(msg.contains("NFS"), "{msg}");
 
-    // pvcSelector expansion skips staging, so an override would be silently inert.
+    // A pvcSelector source used to be rejected here for "not being CSI-staged".
+    // That was only true because the selector was never implemented (#346): each
+    // expanded member is now an ordinary single-PVC Snapshot and stages exactly
+    // like one, so the override applies to every member and must be ACCEPTED.
     let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
         "repository: { kind: Repository, name: r }\n\
          sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } } } ]\n\
+         groupBy: None\n\
          staging: { storageClassName: cephfs-shallow }\n",
     );
     let errs = validate_backup_config(&spec);
@@ -4452,7 +4456,41 @@ fn staging_overrides_rejected_for_nfs_and_pvc_selector_sources() {
         .map(|e| e.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(msg.contains("pvcSelector"), "{msg}");
+    assert!(
+        !msg.contains("staging"),
+        "a selector source now stages per member: {msg}"
+    );
+}
+
+#[test]
+fn flipping_source_path_strategy_forks_a_selector_source() {
+    // A `PvcName` -> `PvcNamespacedName` flip rewrites EVERY matched PVC's kopia
+    // path at once (`/pvc/x` -> `/pvc/ns/x`), re-identifying the source and
+    // orphaning every manifest it has taken. That is exactly what
+    // IdentityWouldFork exists to catch, and the guard did not cover it while
+    // the selector was unimplemented (#346).
+    let old: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         groupBy: None\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } } } ]\n",
+    );
+    let new: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         groupBy: None\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } }, \
+                      sourcePathStrategy: PvcNamespacedName } ]\n",
+    );
+    let err = crate::validate::identity::detect_source_path_fork(&old, &new, true, false)
+        .expect("a strategy flip must fork");
+    let msg = err.to_string();
+    assert!(msg.contains("/pvc/<name>"), "{msg}");
+    assert!(msg.contains("/pvc/<namespace>/<name>"), "{msg}");
+
+    // No history, or an explicit acknowledgement, still lets it through.
+    assert!(crate::validate::identity::detect_source_path_fork(&old, &new, false, false).is_none());
+    assert!(crate::validate::identity::detect_source_path_fork(&old, &new, true, true).is_none());
+    // And an unchanged strategy is not a fork.
+    assert!(crate::validate::identity::detect_source_path_fork(&old, &old, true, false).is_none());
 }
 
 #[test]
