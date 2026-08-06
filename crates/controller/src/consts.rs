@@ -300,6 +300,24 @@ pub const SOURCE_STAGED_REASON: &str = "SourceStaged";
 /// `reason` for [`SOURCE_STAGED_CONDITION`] = `False` while the VolumeSnapshot is
 /// still becoming `readyToUse` (a transient, requeued wait — not a failure).
 pub const STAGING_WAITING_REASON: &str = "WaitingForVolumeSnapshot";
+
+/// Condition reason: waiting for the shared `VolumeGroupSnapshot` to become
+/// `readyToUse` (`groupBy: VolumeGroupSnapshot`).
+pub const GROUP_STAGING_WAITING_REASON: &str = "WaitingForVolumeGroupSnapshot";
+/// Condition reason: the shared `VolumeGroupSnapshot` was still reporting an
+/// error when the staging deadline passed. Never produced on first sight of an
+/// error — snapshot-controller errors are transient until proven persistent.
+pub const REASON_VGS_FAILED: &str = "VolumeGroupSnapshotFailed";
+/// Condition reason: the shared `VolumeGroupSnapshot` did not become
+/// `readyToUse` within the staging deadline and reported no error.
+pub const REASON_GROUP_STAGING_TIMEOUT: &str = "GroupStagingTimedOut";
+/// Condition reason: the group became `readyToUse` but captured no member for
+/// THIS Snapshot's PVC — the PVC's labels most likely stopped matching the
+/// selector between expansion and capture (the snapshot-controller re-evaluates
+/// the selector at create time), or the driver excluded it from the group.
+pub const REASON_GROUP_MEMBER_MISSING: &str = "GroupMemberMissing";
+/// Condition reason: no usable `VolumeGroupSnapshotClass` for the source driver.
+pub const REASON_NO_GROUP_CLASS: &str = "NoVolumeGroupSnapshotClass";
 /// `reason` for [`SOURCE_STAGED_CONDITION`] = `False` while the staged PVC (on an
 /// `Immediate`-binding StorageClass) is still binding — the CSI restore/clone from
 /// the source is provisioning. A transient, requeued wait bounded by the staging

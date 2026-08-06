@@ -551,6 +551,18 @@ spec:
                       CephFS shallow-clone class actually took effect).
                     nullable: true
                     type: string
+                  volumeGroupSnapshotName:
+                    description: |-
+                      Name of the shared CSI `VolumeGroupSnapshot` this member staged from,
+                      when the recipe asked for a consistency group
+                      ([`groupBy: VolumeGroupSnapshot`](crate::snapshot_policy::GroupBy)).
+
+                      Recorded because the group is otherwise invisible: it deliberately
+                      carries no ownerReferences (see `io::group_staging`), so this is how an
+                      operator tells which capture a backup came from — and how `kubectl
+                      kopiur doctor` finds one that outlived its members.
+                    nullable: true
+                    type: string
                   volumeSnapshotName:
                     description: 'Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only).'
                     nullable: true

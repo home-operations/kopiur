@@ -21,25 +21,6 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(e);
         }
     }
-    // MILESTONE GATE (removed when group staging lands): a `pvcSelector`
-    // expands to one Snapshot per matched PVC, which are captured
-    // INDEPENDENTLY. `groupBy` defaults to `VolumeGroupSnapshot`, so an
-    // untouched selector policy is asking for a crash-consistent group across
-    // all of them — accepting it while only independent capture exists would
-    // silently give a weaker guarantee than the spec requested, which for a
-    // multi-volume application (a database and its WAL) is exactly the case
-    // where that matters.
-    if spec.sources.iter().any(|s| s.pvc_selector.is_some())
-        && spec.group_by != Some(crate::snapshot_policy::GroupBy::None)
-    {
-        errs.push(ValidationError::InvalidFieldValue {
-            field: "spec.groupBy".to_string(),
-            reason: "a pvcSelector currently captures each matched PVC independently, so it \
-                     cannot honor `groupBy: VolumeGroupSnapshot` (the default). Set `groupBy: \
-                     None` to accept independent per-PVC snapshots"
-                .to_string(),
-        });
-    }
     // Identity shape (kopia's username@hostname:path contract). The explicit
     // overrides are validated here — client-free, so this runs on every admission
     // even when the webhook has no kube client. CEL-resolved values and the

@@ -385,6 +385,16 @@ pub struct CleanupStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StagedSources {
+    /// Name of the shared CSI `VolumeGroupSnapshot` this member staged from,
+    /// when the recipe asked for a consistency group
+    /// ([`groupBy: VolumeGroupSnapshot`](crate::snapshot_policy::GroupBy)).
+    ///
+    /// Recorded because the group is otherwise invisible: it deliberately
+    /// carries no ownerReferences (see `io::group_staging`), so this is how an
+    /// operator tells which capture a backup came from — and how `kubectl
+    /// kopiur doctor` finds one that outlived its members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_group_snapshot_name: Option<String>,
     /// The resolved capture method (`Snapshot` or `Clone`) that produced this stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_method: Option<String>,

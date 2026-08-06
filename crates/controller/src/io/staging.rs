@@ -62,6 +62,30 @@ fn volume_snapshot_class_ar() -> ApiResource {
     )
 }
 
+/// `ApiResource` for `VolumeSnapshotContent` (cluster-scoped).
+fn volume_snapshot_content_ar() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(SNAPSHOT_GROUP, "v1", "VolumeSnapshotContent"),
+        "volumesnapshotcontents",
+    )
+}
+
+/// [`volume_snapshot_ar`] for the group-staging module.
+pub(crate) fn volume_snapshot_ar_pub() -> ApiResource {
+    volume_snapshot_ar()
+}
+
+/// [`volume_snapshot_content_ar`] for the group-staging module.
+pub(crate) fn volume_snapshot_content_ar_pub() -> ApiResource {
+    volume_snapshot_content_ar()
+}
+
+/// [`fmt_go_duration`] for the group-staging module, which renders the same
+/// deadline grammar.
+pub(crate) fn fmt_go_duration_pub(d: std::time::Duration) -> String {
+    fmt_go_duration(d)
+}
+
 fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), ns, &volume_snapshot_ar())
 }
@@ -76,7 +100,17 @@ pub struct StagedSource {
     /// Name of the staged PVC (mounted in place of the live source).
     pub pvc_name: String,
     /// Name of the `VolumeSnapshot` backing the stage (`Snapshot` mode; `None` for `Clone`).
+    ///
+    /// Under `groupBy: VolumeGroupSnapshot` this is the member snapshot the
+    /// shared group produced for THIS PVC — resolved by
+    /// `group_staging::map_group_members`, never guessed.
     pub volume_snapshot_name: Option<String>,
+    /// Name of the shared `VolumeGroupSnapshot` this member staged from, when
+    /// the policy asked for a consistency group. Recorded to status so the
+    /// group is observable — it has no ownerReferences, so this is how an
+    /// operator (and `kubectl kopiur doctor`) can tell which capture a backup
+    /// came from.
+    pub volume_group_snapshot_name: Option<String>,
     /// The resolved capture method (`Snapshot`/`Clone`) — recorded to status.
     pub copy_method: &'static str,
     /// StorageClass actually written to the staged PVC's spec — the
@@ -189,6 +223,16 @@ fn stack_missing_message(provisioner: &str) -> String {
 /// reads/deletes CSI staging needs (StorageClasses, VolumeSnapshotClasses,
 /// VolumeSnapshotContents) can never be granted — and `copyMethod` defaults to
 /// `Snapshot`, so an untouched policy lands here blindly.
+/// The namespaced-install refusal for a GROUP capture.
+fn namespaced_install_cannot_group_stage_message() -> String {
+    "this is a namespaced install (`installScope: namespaced`), whose Role RBAC cannot read the \
+     cluster-scoped VolumeGroupSnapshotClass, VolumeSnapshotContent and PersistentVolume objects \
+     a `VolumeGroupSnapshot` capture needs to map group members back to their PVCs. Fix: set \
+     `groupBy: None` with `copyMethod: Direct` (accepting independent reads of the live \
+     volumes), or reinstall with installScope=cluster."
+        .to_string()
+}
+
 fn namespaced_install_cannot_stage_message() -> String {
     format!(
         "this is a namespaced install (installScope: namespaced), whose Role RBAC cannot \
@@ -1086,9 +1130,20 @@ pub async fn resolve_staging(
     ) {
         StagingApplicability::NotApplicable => return Ok(StagingOutcome::NotApplicable),
         StagingApplicability::ClusterScopeRequired => {
+            // Group staging is STRICTLY more cluster-scoped than single-volume
+            // staging — on top of StorageClasses it needs cluster-scoped
+            // VolumeGroupSnapshotClasses, VolumeSnapshotContents and
+            // PersistentVolumes (the three-hop member→PVC reconstruction) — so
+            // it gets its own message rather than one that only mentions
+            // `copyMethod: Direct`.
+            let message = if pin.and_then(|p| p.group.as_ref()).is_some() {
+                namespaced_install_cannot_group_stage_message()
+            } else {
+                namespaced_install_cannot_stage_message()
+            };
             return Ok(StagingOutcome::Failed {
                 reason: REASON_SOURCE_NOT_CSI,
-                message: namespaced_install_cannot_stage_message(),
+                message,
             });
         }
         StagingApplicability::Proceed { source_name } => source_name.to_string(),
@@ -1136,6 +1191,66 @@ pub async fn resolve_staging(
             provisioner.as_deref(),
         ) {
             return Ok(StagingOutcome::Failed { reason, message });
+        }
+    }
+
+    // `groupBy: VolumeGroupSnapshot`: the capture is ONE shared object across
+    // every member of the expansion, so the create/wait/pick-my-member half is
+    // replaced — but the staged-PVC build and bind gate below are reused
+    // verbatim, because each member still restores into its own private
+    // `<cr>-src` PVC from its own private member snapshot.
+    if let Some(group) = pin.and_then(|p| p.group.as_ref())
+        && copy_method != CopyMethod::Clone
+    {
+        let Some(pvc) = eff.pvc.as_ref() else {
+            return Ok(StagingOutcome::NotApplicable);
+        };
+        match super::group_staging::resolve_group_stage(
+            client,
+            policy,
+            group,
+            eff.index,
+            &pvc.namespace,
+            &pvc.name,
+            provisioner.as_deref(),
+            timeout,
+        )
+        .await?
+        {
+            super::group_staging::GroupStage::Ready { member } => {
+                let data_source =
+                    data_source_for(copy_method, source_name, &member.volume_snapshot_name);
+                let staged = build_staged_pvc(
+                    &staged_pvc,
+                    ns,
+                    &source_pvc,
+                    data_source,
+                    member.restore_size.as_ref().map(|q| q.0.as_str()),
+                    staging,
+                    owner.clone(),
+                );
+                apply(&pvc_api, &staged_pvc, &staged).await?;
+                if let Some(outcome) =
+                    staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout)
+                        .await?
+                {
+                    return Ok(outcome);
+                }
+                return Ok(StagingOutcome::Ready(StagedSource {
+                    storage_class_name: staged_class_of(&staged),
+                    pvc_name: staged_pvc,
+                    volume_snapshot_name: Some(member.volume_snapshot_name),
+                    volume_group_snapshot_name: Some(group.volume_group_snapshot_name.clone()),
+                    copy_method: "Snapshot",
+                    staging_timeout_seconds,
+                }));
+            }
+            super::group_staging::GroupStage::Waiting { reason, message } => {
+                return Ok(StagingOutcome::Waiting { reason, message });
+            }
+            super::group_staging::GroupStage::Failed { reason, message } => {
+                return Ok(StagingOutcome::Failed { reason, message });
+            }
         }
     }
 
@@ -1241,6 +1356,7 @@ pub async fn resolve_staging(
             storage_class_name: staged_class_of(&staged),
             pvc_name: staged_pvc,
             volume_snapshot_name: Some(vs_name),
+            volume_group_snapshot_name: None,
             copy_method: "Snapshot",
             staging_timeout_seconds,
         }));
@@ -1270,6 +1386,7 @@ pub async fn resolve_staging(
         storage_class_name: staged_class_of(&staged),
         pvc_name: staged_pvc,
         volume_snapshot_name: None,
+        volume_group_snapshot_name: None,
         copy_method: "Clone",
         staging_timeout_seconds,
     }))
@@ -1296,6 +1413,7 @@ pub async fn cleanup_staged_source(
     client: &kube::Client,
     ns: &str,
     snapshot_cr: &str,
+    group: Option<&kopiur_api::SnapshotSourceGroup>,
 ) -> Result<()> {
     let staged_pvc = staged_pvc_name(snapshot_cr);
     let vs_name = volume_snapshot_name(snapshot_cr);
@@ -1340,6 +1458,22 @@ pub async fn cleanup_staged_source(
             }
         }
         delete_ignore_404(&pvc_api, &staged_pvc).await?;
+    }
+
+    // Under `groupBy: VolumeGroupSnapshot` the capture is SHARED, so this
+    // member owns no `<cr>-snap` of its own and must not delete the member
+    // snapshot directly — the group cascades onto it, and deleting it here
+    // would race the as-source-protection ordering the block above exists for.
+    // Instead try to reap the group itself; that is a no-op unless every
+    // sibling is done, and fails closed if the sibling list cannot be read.
+    if let Some(group) = group {
+        super::group_staging::cleanup_group_if_unused(
+            client,
+            &group.namespace,
+            &group.volume_group_snapshot_name,
+        )
+        .await?;
+        return Ok(());
     }
 
     let vs_api = volume_snapshot_api(client, ns);

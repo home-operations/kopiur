@@ -2051,6 +2051,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 | `ready` | boolean | — | `true` once the stage is ready for the mover. |
 | `stagingTimeoutSeconds` | integer | — | The resolved `spec.staging.timeout` (seconds) pinned when the stage was stamped, so the running-Job staged-PVC bind watchdog never re-resolves a policy that may have been edited or deleted mid-run. `0` = wait indefinitely. |
 | `storageClassName` | string | — | StorageClass of the staged PVC — `spec.staging.storageClassName` when set, else the source PVC's class. Pinned for observability (e.g. confirming a CephFS shallow-clone class actually took effect). |
+| `volumeGroupSnapshotName` | string | — | Name of the shared CSI `VolumeGroupSnapshot` this member staged from, when the recipe asked for a consistency group (`groupBy: VolumeGroupSnapshot`).<br>Recorded because the group is otherwise invisible: it deliberately carries no ownerReferences (see `io::group_staging`), so this is how an operator tells which capture a backup came from — and how `kubectl kopiur doctor` finds one that outlived its members. |
 | `volumeSnapshotName` | string | — | Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only). |
 
 #### `status.stats` { #snapshot-status-stats }

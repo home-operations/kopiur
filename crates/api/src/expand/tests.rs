@@ -298,3 +298,92 @@ fn the_same_pvc_matched_twice_is_not_a_collision() {
     )]);
     assert!(expand_sources(&p, "n", &matched).is_ok());
 }
+
+// --- groupBy: VolumeGroupSnapshot -------------------------------------------
+
+fn grouped_policy(sources: Vec<Source>) -> SnapshotPolicy {
+    let mut p = policy_with(sources);
+    p.spec.group_by = Some(crate::snapshot_policy::GroupBy::VolumeGroupSnapshot);
+    p
+}
+
+#[test]
+fn a_multi_member_group_pins_one_shared_volumegroupsnapshot_per_namespace() {
+    // A VolumeGroupSnapshot is namespaced and its source.selector is
+    // namespace-local, so a selector spanning namespaces yields ONE GROUP PER
+    // NAMESPACE — the consistency guarantee is per-namespace, and pretending
+    // otherwise would promise crash-consistency the CSI layer cannot give.
+    let p = grouped_policy(vec![selector_source(
+        Some(SourcePathStrategy::PvcNamespacedName),
+        vec!["billing", "web"],
+    )]);
+    let matched = BTreeMap::from([(
+        0,
+        vec![
+            target("billing", "a"),
+            target("billing", "b"),
+            target("web", "c"),
+            target("web", "d"),
+        ],
+    )]);
+    let members = expand_sources(&p, "nightly-1", &matched).unwrap().unwrap();
+    assert_eq!(members.len(), 4);
+
+    let group_of = |ns: &str| -> String {
+        members
+            .iter()
+            .find(|m| match &m.source.target {
+                SnapshotSourceTarget::Pvc(t) => t.namespace == ns,
+            })
+            .and_then(|m| m.source.group.as_ref())
+            .map(|g| g.volume_group_snapshot_name.clone())
+            .expect("group present")
+    };
+    let billing = group_of("billing");
+    let web = group_of("web");
+    assert_ne!(billing, web, "one group per namespace, not one overall");
+
+    // Every member of a namespace must pin the IDENTICAL name — that is what
+    // makes their racing server-side-applies converge on one object.
+    for m in &members {
+        let SnapshotSourceTarget::Pvc(t) = &m.source.target;
+        let g = m.source.group.as_ref().expect("group present");
+        assert_eq!(g.namespace, t.namespace);
+        let want = if t.namespace == "billing" {
+            &billing
+        } else {
+            &web
+        };
+        assert_eq!(&g.volume_group_snapshot_name, want);
+    }
+}
+
+#[test]
+fn a_single_member_group_degrades_to_the_plain_per_pvc_path() {
+    // A one-PVC "group" buys nothing and costs a VolumeGroupSnapshotClass — plus
+    // a Beta API group most clusters do not serve. Requiring it there would make
+    // `groupBy: VolumeGroupSnapshot` fail on setups where it is meaningless.
+    let p = grouped_policy(vec![selector_source(None, vec![])]);
+    let matched = BTreeMap::from([(0, vec![target("billing", "only")])]);
+    let members = expand_sources(&p, "nightly-1", &matched).unwrap().unwrap();
+    assert_eq!(members.len(), 1);
+    assert!(members[0].source.group.is_none());
+}
+
+#[test]
+fn group_by_none_never_pins_a_group() {
+    let mut p = policy_with(vec![selector_source(None, vec![])]);
+    p.spec.group_by = Some(crate::snapshot_policy::GroupBy::None);
+    let matched = BTreeMap::from([(0, vec![target("billing", "a"), target("billing", "b")])]);
+    let members = expand_sources(&p, "n", &matched).unwrap().unwrap();
+    assert!(members.iter().all(|m| m.source.group.is_none()));
+}
+
+#[test]
+fn group_names_are_deterministic_and_bounded() {
+    assert_eq!(group_name("base", "ns"), group_name("base", "ns"));
+    assert_ne!(group_name("base", "ns"), group_name("base", "other"));
+    let n = group_name(&"a".repeat(200), "ns");
+    assert!(n.len() <= 63, "len {} for {n}", n.len());
+    assert!(n.ends_with("-grp"), "{n}");
+}

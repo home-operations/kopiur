@@ -95,7 +95,7 @@ use std::collections::HashSet;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::api::{DeleteParams, ListParams, Preconditions};
-use kube::core::PartialObjectMeta;
+use kube::core::{DynamicObject, PartialObjectMeta};
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::snapshot::{Snapshot, SnapshotPhase};
@@ -130,6 +130,15 @@ type SecretMeta = PartialObjectMeta<Secret>;
 /// (creds resolve at the top of the Snapshot reconcile; hooks and CSI staging can
 /// sit between that and the Job).
 pub const CREDS_MIN_AGE_FLOOR_SECS: i64 = 15 * 60;
+
+/// Never sweep a shared `VolumeGroupSnapshot` younger than this, no matter how
+/// aggressive the configured sweep interval.
+///
+/// The group is applied by whichever member reaches staging first, and its
+/// siblings may not exist yet — so for a window there is a real group that no
+/// live `Snapshot` references. Without this floor a sweep landing in that
+/// window would delete a capture N backups are about to restore from.
+pub const GROUP_MIN_AGE_FLOOR_SECS: i64 = 15 * 60;
 
 /// Select the orphaned work-spec ConfigMaps out of `cms` (see the module doc
 /// for the guard set). `live_jobs` is the `(namespace, name)` set of every
@@ -562,6 +571,13 @@ pub struct SweepOutcome {
     /// Leaked TERMINAL batch delete Jobs whose members all drained (M5a). Logged,
     /// never metered — the dispatcher owns the batch-Job outcome counter.
     pub batch_jobs: usize,
+    /// Leaked shared `VolumeGroupSnapshot`s whose members are all gone (#346).
+    pub group_snapshots: usize,
+    /// Shared `VolumeGroupSnapshot`s alive at classification time, BEFORE this
+    /// pass's deletes. Backs the live gauge: a delete counter alone cannot tell
+    /// a healthy fleet from one quietly accumulating captures, which is exactly
+    /// how the projected-Secret leak ran unseen for weeks.
+    pub group_snapshots_live: usize,
     /// Projected credential Secrets alive at classification time, BEFORE this
     /// pass's deletes. Backs the `kopiur_projected_secrets` gauge — the population
     /// signal that was missing, and the reason this leak ran for weeks unseen: a
@@ -634,8 +650,47 @@ pub async fn run_sweep(
     let finalizer_holding = finalizer_holding_snapshot_uids(&snapshots);
     let now = chrono::Utc::now().timestamp();
 
+    // Shared VolumeGroupSnapshots. They deliberately carry NO ownerReferences
+    // (see `io::group_staging`), so ownerRef GC can never reclaim one — if the
+    // controller dies between the last member finishing and the reap, the
+    // capture is immortal. This is that backstop.
+    let group_api: Api<DynamicObject> = match scope {
+        config::WatchScope::Cluster => Api::all_with(
+            client.clone(),
+            &crate::io::group_staging::volume_group_snapshot_ar(),
+        ),
+        config::WatchScope::Namespaced(ns) => Api::namespaced_with(
+            client.clone(),
+            ns,
+            &crate::io::group_staging::volume_group_snapshot_ar(),
+        ),
+    };
+    // A cluster without the group-snapshot API group (404) is the common case,
+    // not an error: most clusters do not serve this Beta group.
+    let groups = match group_api
+        .list(&ListParams::default().labels(&managed))
+        .await
+    {
+        Ok(list) => list.items,
+        Err(kube::Error::Api(e)) if e.code == 404 => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let live_groups: HashSet<(String, String)> = snapshots
+        .iter()
+        .filter_map(|s| {
+            let g = s.spec.source.as_ref()?.group.as_ref()?;
+            Some((g.namespace.clone(), g.volume_group_snapshot_name.clone()))
+        })
+        .collect();
+
     Ok(SweepOutcome {
         projected_secrets_live: secrets.len(),
+        group_snapshots_live: groups.len(),
+        group_snapshots: delete_group_snapshot_victims(
+            client,
+            group_snapshot_candidates(&groups, &live_groups, min_age_secs, now),
+        )
+        .await,
         work_spec_cms: delete_cm_victims(
             client,
             sweep_candidates(&cms, &live_set, min_age_secs, now),
@@ -659,6 +714,68 @@ pub async fn run_sweep(
         )
         .await,
     })
+}
+
+/// **Pure.** The leaked shared `VolumeGroupSnapshot`s: kopiur-managed, older
+/// than the min-age floor, and named by NO live `Snapshot`'s
+/// `spec.source.group`.
+///
+/// The min-age floor is what makes this safe against the create race: a group
+/// is applied by whichever member reaches staging first, and its siblings may
+/// not have been created yet. Without the floor a sweep landing in that window
+/// would delete a capture that is about to be needed.
+pub fn group_snapshot_candidates<'a>(
+    groups: &'a [DynamicObject],
+    live_groups: &HashSet<(String, String)>,
+    min_age_secs: i64,
+    now_unix: i64,
+) -> Vec<&'a DynamicObject> {
+    let floor = min_age_secs.max(GROUP_MIN_AGE_FLOOR_SECS);
+    groups
+        .iter()
+        .filter(|g| {
+            let key = (g.namespace().unwrap_or_default(), g.name_any());
+            if live_groups.contains(&key) {
+                return false;
+            }
+            g.metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| now_unix - t.0.as_second() >= floor)
+                // No creationTimestamp: a partially-read object. Leave it —
+                // this backstop must never be the thing that loses a capture.
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Delete the leaked shared groups (background propagation, so their member
+/// VolumeSnapshots go too), tolerating a 404.
+async fn delete_group_snapshot_victims(
+    client: &kube::Client,
+    victims: Vec<&DynamicObject>,
+) -> usize {
+    let mut deleted = 0;
+    for g in victims {
+        let ns = g.namespace().unwrap_or_default();
+        let name = g.name_any();
+        let api: Api<DynamicObject> = Api::namespaced_with(
+            client.clone(),
+            &ns,
+            &crate::io::group_staging::volume_group_snapshot_ar(),
+        );
+        match api.delete(&name, &DeleteParams::background()).await {
+            Ok(_) => {
+                tracing::info!(namespace = %ns, name = %name, "swept leaked VolumeGroupSnapshot (no live Snapshot references it)");
+                deleted += 1;
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => {
+                tracing::warn!(namespace = %ns, name = %name, error = %e, "could not sweep leaked VolumeGroupSnapshot");
+            }
+        }
+    }
+    deleted
 }
 
 /// Delete the leaked terminal batch delete Jobs (background propagation, so their

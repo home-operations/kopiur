@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::ValidationError;
-use crate::snapshot::{PvcTargetRef, SnapshotSourceRef, SnapshotSourceTarget};
+use crate::snapshot::{PvcTargetRef, SnapshotSourceGroup, SnapshotSourceRef, SnapshotSourceTarget};
 use crate::snapshot_policy::SnapshotPolicy;
 use crate::snapshot_policy::{self, Source, SourcePathStrategy};
 use kube::ResourceExt;
@@ -290,6 +290,29 @@ pub struct ExpandedMember {
     pub source: SnapshotSourceRef,
 }
 
+/// The shared `VolumeGroupSnapshot` name for one expansion in one namespace.
+///
+/// Derived from the per-invocation base name, NOT from any one member: every
+/// member must compute the identical name without talking to its siblings,
+/// which is what makes their racing server-side-applies converge on one object
+/// instead of N.
+///
+/// Bounded to 63 chars for the same reason child names are — see
+/// [`fanout_child_name`].
+pub fn group_name(base: &str, namespace: &str) -> String {
+    let suffix = "-grp";
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in namespace.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let tag = format!("{:08x}", (hash & 0xffff_ffff) as u32);
+    let room = MAX_CHILD_NAME - suffix.len() - tag.len() - 1;
+    format!("{}-{tag}{suffix}", clip(base, room))
+        .trim_matches('-')
+        .to_string()
+}
+
 /// **Pure.** Expand one policy's sources against an already-matched PVC set.
 ///
 /// `matched` is `(namespace, name)` per source index — the caller does the
@@ -321,6 +344,23 @@ pub fn expand_sources(
     }
     let mut members: Vec<ExpandedMember> = Vec::new();
     let mut paths: BTreeMap<String, PvcTargetRef> = BTreeMap::new();
+    let grouped =
+        policy.spec.group_by == Some(crate::snapshot_policy::GroupBy::VolumeGroupSnapshot);
+    // How many members land in each namespace, computed up front: a
+    // VolumeGroupSnapshot is namespaced and its `source.selector` is
+    // namespace-local, so a selector spanning namespaces yields ONE GROUP PER
+    // NAMESPACE — the consistency guarantee is per-namespace, not global.
+    let mut per_namespace: BTreeMap<&str, usize> = BTreeMap::new();
+    if grouped {
+        for (index, source) in policy.spec.sources.iter().enumerate() {
+            if source.pvc_selector.is_none() {
+                continue;
+            }
+            for t in matched.get(&index).into_iter().flatten() {
+                *per_namespace.entry(t.namespace.as_str()).or_default() += 1;
+            }
+        }
+    }
 
     for (index, source) in policy.spec.sources.iter().enumerate() {
         if source.pvc_selector.is_none() {
@@ -363,9 +403,20 @@ pub fn expand_sources(
                 source: SnapshotSourceRef {
                     source_index: index as u32,
                     target: SnapshotSourceTarget::Pvc(target.clone()),
-                    // Group staging is wired in M5; `groupBy` is refused at
-                    // admission until then, so this is always None here.
-                    group: None,
+                    // A one-member "group" buys nothing and costs a
+                    // VolumeGroupSnapshotClass requirement (and a Beta API
+                    // group many clusters do not serve), so it degrades to the
+                    // ordinary per-PVC VolumeSnapshot path.
+                    group: (grouped
+                        && per_namespace
+                            .get(target.namespace.as_str())
+                            .copied()
+                            .unwrap_or(0)
+                            > 1)
+                    .then(|| SnapshotSourceGroup {
+                        namespace: target.namespace.clone(),
+                        volume_group_snapshot_name: group_name(base_name, &target.namespace),
+                    }),
                 },
             });
         }

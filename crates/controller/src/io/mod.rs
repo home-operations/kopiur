@@ -12,6 +12,7 @@ mod colocation;
 mod creds;
 mod events;
 mod finalizer;
+pub mod group_staging;
 mod maintenance;
 mod mover;
 mod prune;

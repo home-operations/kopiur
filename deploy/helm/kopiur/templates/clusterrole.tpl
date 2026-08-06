@@ -150,8 +150,17 @@ rules:
     verbs: [get, list, watch, delete]
   - apiGroups: [groupsnapshot.storage.k8s.io]
     resources:
+      # Cluster-scoped: resolving the class for a group capture is a
+      # cluster-wide read, which is why `groupBy: VolumeGroupSnapshot` cannot
+      # work on a namespaced install.
+      - volumegroupsnapshotclasses
+    verbs: [get, list, watch]
+  - apiGroups: [groupsnapshot.storage.k8s.io]
+    resources:
       - volumegroupsnapshots
-    verbs: [get, list, watch, create, delete]
+    # `patch` because N members race to server-side-apply the SAME shared group
+    # object; SSA over a deterministic name is what makes that convergent.
+    verbs: [get, list, watch, create, patch, delete]
   # Per-namespace mover RBAC minted by the controller (§4.12): a least-privilege
   # `kopiur-mover` ServiceAccount + a RoleBinding (to the mover ClusterRole) created
   # in each mover Job's namespace. Without these the mover Job's SA does not exist in
