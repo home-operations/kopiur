@@ -248,6 +248,10 @@ A [`pvcSelector`](backups.md#sources--what-to-back-up) source expands to **one `
 
     It also needs `installScope: cluster` — resolving a group class and mapping group members back to their PVCs are cluster-scoped reads a namespaced install's Role cannot make.
 
+    Beta here still means **off by default**: external-snapshotter ships `CSIVolumeGroupSnapshot` as `{Default: false, PreRelease: Beta}`, so both the `snapshot-controller` and the `csi-snapshotter` sidecar need `--feature-gates=CSIVolumeGroupSnapshot=true`. Without it the CRDs install and nothing ever reconciles them, so a `VolumeGroupSnapshot` sits at `readyToUse: false` forever and kopiur fails the members on the staging deadline.
+
+    Kopiur picks the class exactly as it does for per-volume snapshots — match the source PVC's CSI driver, else the unique class annotated `groupsnapshot.storage.kubernetes.io/is-default-class: "true"`. Note the annotation's domain is `kubernetes.io` while the API group is `k8s.io`; they differ for group classes where they match for per-volume ones.
+
 Consistency is **per namespace**: a `VolumeGroupSnapshot` is a namespaced object whose selector is namespace-local, so a selector spanning namespaces produces one group per namespace. A group with a single member degrades to the ordinary per-PVC path, since a one-volume "group" buys nothing.
 
 ### The flagship use: CephFS shallow snapshots

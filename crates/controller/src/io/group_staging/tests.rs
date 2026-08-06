@@ -271,3 +271,64 @@ fn an_empty_member_set_is_only_reapable_because_the_caller_proved_it() {
     // which is the same field that pins the group and therefore cannot drift.
     assert!(group_reapable(Some(&[])));
 }
+
+#[test]
+fn the_default_group_class_annotation_is_the_kubernetes_io_one() {
+    // A group class's default annotation is NOT the per-volume one, and is NOT
+    // the API group with `/is-default-class` glued on: external-snapshotter's
+    // `IsDefaultGroupSnapshotClassAnnotation` is under `kubernetes.io` while the
+    // API group is `k8s.io`. Both plausible-looking wrong answers make every
+    // group class read as non-default, so a cluster with two classes for one
+    // driver fails `AmbiguousClass` having annotated one exactly as documented.
+    assert_eq!(
+        DEFAULT_GROUP_CLASS_ANNOTATION,
+        "groupsnapshot.storage.kubernetes.io/is-default-class"
+    );
+    assert_ne!(
+        DEFAULT_GROUP_CLASS_ANNOTATION,
+        crate::io::staging::DEFAULT_CLASS_ANNOTATION
+    );
+    assert!(
+        !DEFAULT_GROUP_CLASS_ANNOTATION.starts_with(&format!("{GROUP_SNAPSHOT_GROUP}/")),
+        "the annotation domain deliberately differs from the API group"
+    );
+}
+
+#[test]
+fn the_built_group_carries_its_type_meta_and_group_label() {
+    // A `DynamicObject` is not self-describing: `types: None` serializes a body
+    // with no apiVersion/kind, and a server-side apply of that comes back
+    // `400 invalid object type: /, Kind=` — classified TRANSIENT, so every
+    // member requeues forever and the capture is never created. A typed object
+    // cannot reach this state, so only the dynamic path needs the guard.
+    let sel = k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
+        match_labels: Some([("backup".to_string(), "include".to_string())].into()),
+        ..Default::default()
+    };
+    let obj = build_volume_group_snapshot("grp-1", "billing", &sel, "hostpath-grpclass", "grp-1");
+
+    let types = obj.types.as_ref().expect("TypeMeta must be present");
+    assert_eq!(
+        types.api_version,
+        format!("{GROUP_SNAPSHOT_GROUP}/{GROUP_SNAPSHOT_VERSION}")
+    );
+    assert_eq!(types.kind, "VolumeGroupSnapshot");
+    assert_eq!(obj.metadata.namespace.as_deref(), Some("billing"));
+    assert_eq!(obj.metadata.name.as_deref(), Some("grp-1"));
+
+    // The join key the reaper and the sweep backstop select on. This object has
+    // no ownerReferences, so a missing label leaks the capture forever.
+    assert_eq!(
+        obj.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(GROUP_LABEL))
+            .map(String::as_str),
+        Some("grp-1")
+    );
+    assert_eq!(
+        obj.data["spec"]["volumeGroupSnapshotClassName"].as_str(),
+        Some("hostpath-grpclass")
+    );
+    assert!(obj.data["spec"]["source"]["selector"]["matchLabels"]["backup"].is_string());
+}

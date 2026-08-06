@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::PersistentVolume;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{DeleteParams, ListParams};
-use kube::core::{ApiResource, DynamicObject, GroupVersionKind, ObjectMeta};
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::{Api, ResourceExt};
 
 use kopiur_api::consts::GROUP_LABEL;
@@ -130,22 +130,24 @@ pub fn build_volume_group_snapshot(
         ("app.kubernetes.io/component", GROUP_COMPONENT),
         (GROUP_LABEL, group),
     ]);
-    DynamicObject {
-        types: None,
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(ns.to_string()),
-            labels: Some(labels),
-            // No ownerReferences — see the module docs.
-            ..Default::default()
-        },
-        data: serde_json::json!({
+    // `DynamicObject::new` (NOT a struct literal) so `types` carries the
+    // TypeMeta. A DynamicObject with `types: None` serializes a body with no
+    // apiVersion/kind, and a server-side apply of that is rejected with
+    // `400 invalid object type: /, Kind=` — a message that names neither the
+    // object nor the missing field, and which the reconciler classifies as
+    // TRANSIENT, so the member requeues forever instead of failing. Same
+    // construction as `staging::build_volume_snapshot`.
+    let mut obj = DynamicObject::new(name, &volume_group_snapshot_ar())
+        .within(ns)
+        .data(serde_json::json!({
             "spec": {
                 "volumeGroupSnapshotClassName": class,
                 "source": { "selector": selector },
             }
-        }),
-    }
+        }));
+    // No ownerReferences — see the module docs.
+    obj.metadata.labels = Some(labels);
+    obj
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +648,19 @@ pub enum GroupStage {
     },
 }
 
+/// The annotation marking the default `VolumeGroupSnapshotClass` for a driver.
+///
+/// **Not** [`super::staging::DEFAULT_CLASS_ANNOTATION`], and not derivable from
+/// the API group either: external-snapshotter uses `groupsnapshot.storage.`
+/// **`kubernetes`**`.io/is-default-class` (`pkg/utils/util.go`
+/// `IsDefaultGroupSnapshotClassAnnotation`), while the API group is
+/// `groupsnapshot.storage.`**`k8s`**`.io`. Reading the per-volume annotation
+/// here silently marks every group class non-default, so a cluster with two
+/// classes for one driver fails `AmbiguousClass` even though it annotated one
+/// exactly as the CSI docs say to.
+pub const DEFAULT_GROUP_CLASS_ANNOTATION: &str =
+    "groupsnapshot.storage.kubernetes.io/is-default-class";
+
 /// List `VolumeGroupSnapshotClass`es. `None` when the API group is not served
 /// (the group-snapshot stack is not installed), which is a distinct and much
 /// more actionable answer than "no class matched".
@@ -666,7 +681,7 @@ pub async fn list_group_classes(
                         .to_string(),
                     is_default: o
                         .annotations()
-                        .get(super::staging::DEFAULT_CLASS_ANNOTATION)
+                        .get(DEFAULT_GROUP_CLASS_ANNOTATION)
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     name: o.name_any(),
