@@ -354,10 +354,21 @@ spec:
               name: socket-dir
 
         - name: csi-snapshotter
-          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
           args:
             - -v=5
             - --csi-address=/csi/csi.sock
+            # Makes the sidecar watch VolumeGroupSnapshotContent and drive the
+            # driver's CreateVolumeGroupSnapshot / Delete / Get RPCs.
+            # hostpathplugin implements the GroupController service and
+            # advertises CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT, so this is
+            # all that is needed to exercise kopiur's group staging in kind.
+            #
+            # Same gate, same spelling, same reason as the snapshot-controller
+            # (see 05-setup-snapshot-controller.yaml): csi-snapshotter 8.2 has
+            # no `--enable-volume-group-snapshots` flag, only
+            # `--feature-gates`, and an unknown flag kills the container.
+            - --feature-gates=CSIVolumeGroupSnapshot=true
           securityContext:
             # This is necessary only for systems with SELinux, where
             # non-privileged sidecar containers cannot access unix domain socket

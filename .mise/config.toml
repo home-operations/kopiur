@@ -147,6 +147,22 @@ run = "cargo xtask gen-all"
 description = "Fail if checked-in CRDs/RBAC are stale (CI drift guard)"
 run = "cargo xtask gen-all --check"
 
+[tasks.wiring-check]
+description = "Fail if a CRD field is defined but read by no consumer crate (inert-field gate)"
+run = '''
+set -eu
+# `gen-check` proves the checked-in YAML matches the Rust types. It says nothing
+# about whether anything READS a field — and because every `crates/api` type is
+# `pub`, `dead_code` can never fire on one either. That gap shipped twice:
+# #346 (`pvcSelector` had no implementation at all) and #351
+# (`files.ignoreIdenticalSnapshots` was never mapped to a kopia flag).
+#
+# Exemptions live in crates/xtask/wiring-allowlist.yaml, each with a written
+# reason. The check fails in BOTH directions: a new inert field, and an
+# allowlisted field that has since been wired (delete the entry).
+cargo xtask check-wiring
+'''
+
 [tasks.cov]
 description = "Coverage over the hermetic suite -> lcov.info (report-only; no threshold)"
 run = "cargo llvm-cov --workspace --locked --lcov --output-path lcov.info"
@@ -254,7 +270,7 @@ run = "uv run mkdocs serve"
 
 [tasks.ci]
 description = "The full local hermetic gate: format, lint, build, test, and drift check"
-depends = ["fmt-check", "clippy", "build", "test", "gen-check"]
+depends = ["fmt-check", "clippy", "build", "test", "gen-check", "wiring-check"]
 
 [hooks]
 postinstall = "lefthook install"

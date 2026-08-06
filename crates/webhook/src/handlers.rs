@@ -30,6 +30,7 @@ use crate::error::{AdmissionError, AdmissionResult};
 use crate::tenancy::{self, TenancyDecision, TenancyDenial};
 use json_patch::{AddOperation, Patch, PatchOperation, jsonptr::PointerBuf};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Api;
 use kube::Client;
 use kube::core::DynamicObject;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
@@ -59,7 +60,7 @@ pub async fn dispatch(
     let base = AdmissionResponse::from(req);
     let result = match req.kind.kind.as_str() {
         "SnapshotPolicy" => handle_snapshot_policy(req, base, client).await,
-        "Snapshot" => handle_snapshot(req, base),
+        "Snapshot" => handle_snapshot(req, base, client).await,
         "SnapshotSchedule" => handle_snapshot_schedule(req, base),
         "Restore" => handle_restore(req, base, client).await,
         "Maintenance" => handle_maintenance(req, base, client).await,
@@ -293,9 +294,10 @@ async fn handle_snapshot_policy(
 
 // --- Snapshot -----------------------------------------------------------------
 
-fn handle_snapshot(
+async fn handle_snapshot(
     req: &AdmissionRequest<DynamicObject>,
     resp: AdmissionResponse,
+    client: Option<&Client>,
 ) -> AdmissionResult {
     let obj = raw_object(req)?;
     let spec: SnapshotSpec =
@@ -316,6 +318,48 @@ fn handle_snapshot(
     // there is no inline ClusterRepository ref to gate on a Snapshot. Tenancy for the
     // recipe is enforced on the SnapshotPolicy. We still default deletionPolicy and the
     // finalizer.
+
+    // A `pvcSelector` recipe expands to one Snapshot per matched PVC, so a
+    // Snapshot against one MUST say which PVC it covers. Refuse at apply time
+    // rather than letting it fail at reconcile: the operator will not pick a
+    // volume on the user's behalf, and silently backing up one of N looks
+    // exactly like success (#346).
+    //
+    // Referent read, so it is best-effort by design: no client (unit tests, a
+    // webhook running without one) or an unreadable/absent policy means the
+    // controller's own defensive check is the backstop. Failing admission on a
+    // transient GET would take out every Snapshot CREATE in the cluster, which
+    // is a far worse outcome than a late, actionable reconcile error.
+    if req.operation == Operation::Create
+        && spec.source.is_none()
+        && let Some(client) = client
+        && let Some(policy_ref) = spec.policy_ref.as_ref()
+    {
+        let ns = policy_ref
+            .namespace
+            .as_deref()
+            .or(obj.metadata.namespace.as_deref())
+            .or(req.namespace.as_deref())
+            .unwrap_or_default();
+        let api: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), ns);
+        if let Ok(Some(policy)) = api.get_opt(&policy_ref.name).await
+            && policy.spec.sources.iter().any(|s| s.pvc_selector.is_some())
+        {
+            return Err(AdmissionError::Invalid(vec![
+                ValidationError::InvalidFieldValue {
+                    field: "spec.source".to_string(),
+                    reason: format!(
+                        "SnapshotPolicy `{}` uses a pvcSelector, which expands to one Snapshot \
+                         per matched PersistentVolumeClaim — so a Snapshot against it must carry \
+                         `spec.source` naming the PVC it covers, and this one does not. Fix: run \
+                         `kubectl kopiur snapshot now --policy {}`, or let a SnapshotSchedule \
+                         fire it; both expand the selector for you.",
+                        policy_ref.name, policy_ref.name,
+                    ),
+                },
+            ]));
+        }
+    }
 
     let mut ops = Vec::new();
 

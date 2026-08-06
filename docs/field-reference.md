@@ -1863,7 +1863,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 
 ## Snapshot { #snapshot }
 
-**Scope:** Namespaced · **Short names:** `kopiasnap` · **Print columns:** `Phase`, `Origin`, `Snapshot`, `Age`
+**Scope:** Namespaced · **Short names:** `kopiasnap` · **Print columns:** `Phase`, `Origin`, `Snapshot`, `Source`, `Age`
 
 ### `spec` { #snapshot-spec }
 
@@ -1875,6 +1875,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
+| `source` | [object](#snapshot-spec-source) | — | The ONE concrete source this `Snapshot` covers, when `policyRef` names a recipe whose `sources[]` expands to many — i.e. a `pvcSelector`.<br>Stamped by whoever minted the CR: a `SnapshotSchedule` fire, or `kubectl kopiur snapshot now`. Absent for the ordinary single-source case, where the policy's own `sources0` is the target.<br>Absent against a *selector* policy is refused rather than guessed. The operator must never pick a PVC on the user's behalf: silently backing up one arbitrary volume out of N looks exactly like success. |
 | `tags` | map[string]string | — | Free-form tags attached to the kopia snapshot manifest itself (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the repository, independent of this CR. Keys must be non-empty, colon-free (kopia splits on the first colon), and must not start with the reserved `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes (webhook-enforced). |
 
 #### `spec.failurePolicy` { #snapshot-spec-failurepolicy }
@@ -1892,6 +1893,36 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `name` | string | **required** | Name of the referenced `SnapshotPolicy`. |
 | `namespace` | string | — | Namespace of the `SnapshotPolicy`; absent = same namespace as the referrer. |
 
+#### `spec.source` { #snapshot-spec-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `sourceIndex` | integer | **required**<br><sub>min 0</sub> | Zero-based index into `policyRef`'s `spec.sources` this child expanded from.<br>Pins WHICH source's knobs (`readOnly`, `sourcePathOverride`, `sourcePathStrategy`, `acknowledgeLiveMutation`) govern this run, so a policy carrying several sources stays unambiguous. An index that is out of range at reconcile time — the policy shrank mid-run — is a named terminal failure, never a silent fallback to `sources0`. |
+| `target` | [union](#snapshot-spec-source-target) | **required** | What the expansion resolved to. |
+| `group` | [object](#snapshot-spec-source-group) | — | The consistency group this child belongs to, present only when the policy asked for one (`groupBy: VolumeGroupSnapshot`) AND the expansion produced more than one member in this namespace. |
+
+##### `spec.source.target` { #snapshot-spec-source-target }
+
+Externally tagged — set **exactly one** of: `pvc`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pvc` | [object](#snapshot-spec-source-target-pvc) | — | One `PersistentVolumeClaim`, fully qualified. |
+
+###### `spec.source.target.pvc` { #snapshot-spec-source-target-pvc }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the matched `PersistentVolumeClaim`. |
+| `namespace` | string | **required** | Namespace of the matched `PersistentVolumeClaim`.<br>Explicit rather than inferred from the `Snapshot`'s own namespace: a `pvcSelector` under a `ClusterRepository` may match across namespaces. |
+
+##### `spec.source.group` { #snapshot-spec-source-group }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `namespace` | string | **required** | Namespace the `VolumeGroupSnapshot` lives in.<br>A `VolumeGroupSnapshot` is namespaced and its `source.selector` is namespace-local, so a selector spanning namespaces yields ONE GROUP PER NAMESPACE, not one group. The consistency guarantee is per-namespace and this field is where that shows. |
+| `volumeGroupSnapshotName` | string | **required** | Name of the shared `VolumeGroupSnapshot`. |
+
 ### `status` { #snapshot-status }
 
 | Field | Type | Default | Description |
@@ -1904,7 +1935,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
 | `origin` | enum: scheduled \| manual \| discovered \| adopted | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
-| `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered | — | Lifecycle phase of a `Snapshot`. |
+| `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered \| Unchanged | — | Lifecycle phase of a `Snapshot`. |
 | `pinned` | boolean | — | The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile. |
 | `preflightSince` | string | — | RFC 3339 timestamp of the first reconcile where the repository was `Ready` but a `spec.preflight` check was failing. The one-shot anchor for the preflight `timeout` deadline (so the budget covers preflight only, not the earlier repository-not-Ready wait). Cleared once every preflight check passes, so a later failing episode gets a fresh budget rather than a stale anchor. |
 | `recorded` | [object](#snapshot-status-recorded) | — | The mover identity recorded on the kopia snapshot itself (the `kopiur-meta` tag): the resolved effective uid/gid/fsGroup the backup ran as, plus its provenance. Produced runs stamp this at launch (from the same value written into the tag); discovered rows decode it from the tag during the catalog scan. Absent for pre-feature snapshots, foreign backups without the tag, or a tag this operator version cannot decode. |
@@ -2020,6 +2051,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `ready` | boolean | — | `true` once the stage is ready for the mover. |
 | `stagingTimeoutSeconds` | integer | — | The resolved `spec.staging.timeout` (seconds) pinned when the stage was stamped, so the running-Job staged-PVC bind watchdog never re-resolves a policy that may have been edited or deleted mid-run. `0` = wait indefinitely. |
 | `storageClassName` | string | — | StorageClass of the staged PVC — `spec.staging.storageClassName` when set, else the source PVC's class. Pinned for observability (e.g. confirming a CephFS shallow-clone class actually took effect). |
+| `volumeGroupSnapshotName` | string | — | Name of the shared CSI `VolumeGroupSnapshot` this member staged from, when the recipe asked for a consistency group (`groupBy: VolumeGroupSnapshot`).<br>Recorded because the group is otherwise invisible: it deliberately carries no ownerReferences (see `io::group_staging`), so this is how an operator tells which capture a backup came from — and how `kubectl kopiur doctor` finds one that outlived its members. |
 | `volumeSnapshotName` | string | — | Name of the `VolumeSnapshot` created from the source PVC (`copyMethod: Snapshot` only). |
 
 #### `status.stats` { #snapshot-status-stats }

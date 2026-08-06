@@ -1045,6 +1045,50 @@ fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
     }
 }
 
+/// #351: the field was declared, schema-generated, documented at
+/// `docs/reference/crds/snapshot-policy.md` — and `from_policy` never read it,
+/// so the knob did nothing at all.
+///
+/// Only `true` is emitted. `false`/unset must leave the PATH-scoped policy
+/// untouched, for two reasons: the mover pins `false` at the identity scope on
+/// every run (so the guarantee holds without this), and emitting anything here
+/// would make `is_empty()` permanently false and force a `kopia policy set` on
+/// every otherwise-unconfigured policy.
+#[test]
+fn from_policy_only_raises_ignore_identical_snapshots_on_opt_in() {
+    let mut spec = empty_policy_spec();
+
+    spec.files = Some(kopiur_api::snapshot_policy::Files {
+        ignore_rules: vec![],
+        ignore_cache_dirs: false,
+        ignore_identical_snapshots: true,
+    });
+    let p = PolicyArgsSpec::from_policy(&spec);
+    assert_eq!(p.ignore_identical_snapshots, Some(true));
+    assert!(!p.is_empty(), "an opt-in must reach kopia");
+    assert_eq!(p.to_kopia().ignore_identical_snapshots, Some(true));
+
+    // Opted out → absent, never `Some(false)`.
+    spec.files = Some(kopiur_api::snapshot_policy::Files {
+        ignore_rules: vec![],
+        ignore_cache_dirs: false,
+        ignore_identical_snapshots: false,
+    });
+    let p = PolicyArgsSpec::from_policy(&spec);
+    assert_eq!(p.ignore_identical_snapshots, None);
+    assert!(
+        p.is_empty(),
+        "an opted-out policy with nothing else set must still skip `policy set`"
+    );
+
+    // Absent `files:` block → likewise absent.
+    spec.files = None;
+    assert_eq!(
+        PolicyArgsSpec::from_policy(&spec).ignore_identical_snapshots,
+        None
+    );
+}
+
 /// The load-bearing glue test (task PR4): the apiserver only server-side-defaults
 /// NESTED fields when the parent object is present, so a `SnapshotPolicy` that
 /// omits `files:` entirely NEVER gets `Files.ignoreRules`'s schema default

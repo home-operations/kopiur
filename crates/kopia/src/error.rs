@@ -257,6 +257,41 @@ pub fn notfound_is_uninitialized(stderr: &str) -> bool {
     stderr.to_ascii_lowercase().contains("not initialized")
 }
 
+/// Whether a **successful** (exit 0) `snapshot create` that produced no JSON on
+/// stdout was kopia deliberately declining to write a manifest because the
+/// source is byte-identical to the previous snapshot.
+///
+/// kopia's message is:
+///
+/// ```text
+///  Not saving snapshot because no files have been changed since previous snapshot
+/// ```
+///
+/// This is gated by the **retention**-policy knob `ignoreIdenticalSnapshots`
+/// (`*OptionalBool`, kopia default `false`). With it on, `snapshot create
+/// --json` exits 0, writes **nothing** to stdout, and says why only on stderr —
+/// which read as a hard `EmptyOutput` failure and terminally failed the
+/// `Snapshot` CR (#351).
+///
+/// Matched on the stable middle of the sentence rather than the whole string:
+/// kopia prefixes it with a leading space and has reworded the surrounding
+/// phrasing across releases, but "no files have been changed" has been
+/// constant. Case-insensitive for the same reason.
+///
+/// ```
+/// use kopiur_kopia::snapshot_skipped_unchanged;
+/// assert!(snapshot_skipped_unchanged(
+///     " Not saving snapshot because no files have been changed since previous snapshot"
+/// ));
+/// assert!(!snapshot_skipped_unchanged("Snapshotting app@host:/pvc/data ..."));
+/// assert!(!snapshot_skipped_unchanged(""));
+/// ```
+pub fn snapshot_skipped_unchanged(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("no files have been changed")
+}
+
 impl fmt::Display for KopiaErrorClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -333,11 +368,19 @@ pub enum KopiaError {
     },
 
     /// We expected a JSON object/array on stdout but found none (kopia printed
-    /// only progress / nothing).
-    #[error("no JSON output found on stdout for `{context}`")]
+    /// only progress / nothing) even though it exited **0**.
+    ///
+    /// `stderr_tail` is what makes this diagnosable. Without it the variant
+    /// carried neither a reason nor an exit code, so a kopia that exited
+    /// cleanly and explained itself on stderr was indistinguishable from a
+    /// kopia that said nothing at all — the whole of #351.
+    #[error("no JSON output found on stdout for `{context}`: {stderr_tail}")]
     EmptyOutput {
         /// What we were trying to parse.
         context: String,
+        /// The trailing stderr lines, which is where kopia explains a silent
+        /// success. Empty when kopia really did say nothing.
+        stderr_tail: String,
     },
 
     /// The operation exceeded its configured timeout and was killed.
@@ -370,6 +413,11 @@ impl KopiaError {
     pub fn stderr_tail(&self) -> Option<&str> {
         match self {
             KopiaError::NonZeroExit { stderr_tail, .. } => Some(stderr_tail.as_str()),
+            // An exit-0-with-no-JSON keeps its stderr too, so `status.failure`
+            // shows kopia's own words instead of a bare "class Unknown".
+            KopiaError::EmptyOutput { stderr_tail, .. } if !stderr_tail.is_empty() => {
+                Some(stderr_tail.as_str())
+            }
             _ => None,
         }
     }

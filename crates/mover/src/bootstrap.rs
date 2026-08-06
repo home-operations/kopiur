@@ -505,6 +505,7 @@ mod tests {
     fn failed_result_roundtrips_with_failure_block() {
         let err = KopiaError::EmptyOutput {
             context: "repository status".into(),
+            stderr_tail: String::new(),
         };
         let f = BootstrapResult::failed(&err);
         let back: BootstrapResult =

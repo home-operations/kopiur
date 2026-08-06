@@ -536,7 +536,8 @@ fn snapshot_awaiting_launch(s: &Snapshot) -> bool {
             | SnapshotPhase::Succeeded
             | SnapshotPhase::Failed
             | SnapshotPhase::Deleting
-            | SnapshotPhase::Discovered,
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
         ) => false,
     }
 }
@@ -722,6 +723,7 @@ mod tests {
         let mut s = Snapshot::new(
             name,
             SnapshotSpec {
+                source: None,
                 policy_ref: None,
                 tags: None,
                 failure_policy: None,
@@ -787,6 +789,7 @@ mod tests {
         let mut s = Snapshot::new(
             name,
             SnapshotSpec {
+                source: None,
                 policy_ref: None,
                 tags: None,
                 failure_policy: None,

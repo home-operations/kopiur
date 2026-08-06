@@ -111,6 +111,41 @@ sources:
       sourcePathStrategy: PvcName # or PvcNamespacedName to disambiguate same-named PVCs
 ```
 
+A `pvcSelector` expands to **one `Snapshot` CR per matched PVC**. Each is an
+ordinary single-PVC backup from there on: its own mover Job, its own kopia
+snapshot, its own retention. That is deliberate — it keeps every other feature
+(restore, `deletionPolicy`, the catalog, GFS retention) working on a multi-PVC
+recipe without special cases.
+
+Consequences worth knowing:
+
+- **Retention is per PVC.** `keepDaily: 7` over a 5-PVC selector keeps seven
+  days *of each volume*, not seven snapshots in total.
+- **The expansion happens when a backup is invoked**, not when you write the
+  policy — a `SnapshotSchedule` fire, or `kubectl kopiur snapshot now`. A PVC
+  that gains the label is picked up at the next slot, and one that loses it
+  simply stops being backed up.
+- **A hand-written `Snapshot` with only a `policyRef` is rejected** against a
+  selector policy: it does not say which PVC it covers, and the operator will
+  not pick one of N on your behalf. Use `kubectl kopiur snapshot now` or a
+  schedule; both expand for you.
+- **The selector only matches PVCs in the policy's own namespace.**
+  `namespaceSelector` is refused, because a mover Pod can only mount
+  PersistentVolumeClaims in its own namespace and the mover Job runs in the
+  `Snapshot`'s — which is the policy's. Use one `SnapshotPolicy` per namespace;
+  they can share a repository.
+- **Two selector sources may not match the same PVC.** Both would resolve to one
+  kopia source path and one `Snapshot` name, so one of the two backups would
+  silently overwrite the other. Narrow the selectors instead.
+- **`sourcePathStrategy` is part of your data identity.** `PvcName` gives each
+  PVC the kopia path `/pvc/<name>`; `PvcNamespacedName` qualifies it with the
+  namespace. Changing the strategy later re-identifies every source, so it is
+  guarded like any other identity change
+  (see [Identity](#identity--what-kopia-records-usernamehostnamepath)).
+- **`groupBy`** decides whether the captures are crash-consistent with each
+  other; see [copy methods → multi-PVC and consistency
+  groups](copy-methods.md#multi-pvc-and-consistency-groups).
+
 Or back up an **NFS export directly** — no PVC (see [example 10](examples.md#example-10--nfs-source-no-pvc)):
 
 ```yaml
@@ -775,7 +810,7 @@ Failed `Snapshot` CRs from a schedule are bounded by `failedJobsHistoryLimit` (b
 
 ### A `Snapshot` runs exactly once
 
-A `Snapshot` is **one-shot**: once it reaches `Succeeded` or `Failed`, the operator never runs its mover again. The finished mover `Job` self-removes after `ttlSecondsAfterFinished` (default 1h, see [mover](#mover--resources-cache-security-context)) — that cleanup does **not** re-trigger the backup, and the recorded `status.snapshot.kopiaSnapshotID` / timing never change afterwards. The only things the operator still reconciles on a `Succeeded` snapshot are [`pin`](#pin--exempt-a-snapshot-from-retention) changes and deletion. A `Failed` snapshot stays failed until you create a new `Snapshot` (typically after fixing the recipe) — retries *within* a run are the `failurePolicy` above, never a silent re-run of a finished one.
+A `Snapshot` is **one-shot**: once it reaches `Succeeded`, `Failed`, or `Unchanged`, the operator never runs its mover again. The finished mover `Job` self-removes after `ttlSecondsAfterFinished` (default 1h, see [mover](#mover--resources-cache-security-context)) — that cleanup does **not** re-trigger the backup, and the recorded `status.snapshot.kopiaSnapshotID` / timing never change afterwards. The only things the operator still reconciles on a `Succeeded` snapshot are [`pin`](#pin--exempt-a-snapshot-from-retention) changes and deletion. A `Failed` snapshot stays failed until you create a new `Snapshot` (typically after fixing the recipe) — retries *within* a run are the `failurePolicy` above, never a silent re-run of a finished one.
 
 ## SnapshotSchedule — the cron
 

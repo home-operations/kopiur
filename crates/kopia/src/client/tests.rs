@@ -981,6 +981,48 @@ fn policy_set_args_builds_keep_flags() {
 }
 
 #[test]
+fn policy_set_args_emits_ignore_identical_snapshots_as_a_valued_tristate() {
+    // kopia's `--ignore-identical-snapshots` takes a VALUE (`true|false|inherit`),
+    // like the other policy tri-states and unlike the `--keep-*` pairs. A bare
+    // `--ignore-identical-snapshots` fails with "expected argument for flag".
+    //
+    // `false` must be emitted EXPLICITLY, not by omission: omitting it inherits,
+    // and inheriting a repository-global `true` is exactly how #351 was
+    // reachable without the CRD field ever being wired.
+    let off = PolicyArgs {
+        ignore_identical_snapshots: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        policy_set_args("user@host", &off),
+        vec![
+            "policy",
+            "set",
+            "user@host",
+            "--ignore-identical-snapshots=false",
+        ]
+    );
+    let on = PolicyArgs {
+        ignore_identical_snapshots: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        policy_set_args("user@host:/pvc/data", &on),
+        vec![
+            "policy",
+            "set",
+            "user@host:/pvc/data",
+            "--ignore-identical-snapshots=true",
+        ]
+    );
+    // Unset emits nothing at all (kopia inherits).
+    assert_eq!(
+        policy_set_args("--global", &PolicyArgs::default()),
+        vec!["policy", "set", "--global"]
+    );
+}
+
+#[test]
 fn policy_set_args_builds_flags() {
     let policy = PolicyArgs {
         compression: Some("zstd".into()),

@@ -237,6 +237,16 @@ pub enum MoverPhase {
     Succeeded,
     /// The operation failed terminally.
     Failed,
+    /// A backup ran to completion but kopia wrote no new manifest, because the
+    /// source is byte-identical to the previous snapshot
+    /// (`files.ignoreIdenticalSnapshots`).
+    ///
+    /// A success for every liveness purpose — the source was read and hashed,
+    /// and it is protected by the previous snapshot — but this run owns no
+    /// kopia manifest, so it must never be reported as `Succeeded`: the
+    /// controller would then resolve "its" snapshot and find its predecessor's
+    /// (#351).
+    Unchanged,
 }
 
 impl MoverPhase {
@@ -245,6 +255,7 @@ impl MoverPhase {
         match self {
             MoverPhase::Succeeded => "Succeeded",
             MoverPhase::Failed => "Failed",
+            MoverPhase::Unchanged => "Unchanged",
         }
     }
 }
@@ -346,6 +357,41 @@ impl StatusUpdate {
             stats: Some(stats_from_result(result)),
             failure: None,
             log_tail: Some(format!("Snapshot created: {}", result.id)),
+            resolved: None,
+        }
+    }
+
+    /// A completed backup that produced NO new kopia manifest: nothing changed
+    /// since the previous snapshot, so kopia deduped it away.
+    ///
+    /// Deliberately carries no `snapshot`, no `stats` and no `timing`. There is
+    /// no manifest to point at, and inventing one — say, by resolving the
+    /// newest snapshot for this identity — would hand this CR its
+    /// predecessor's manifest, which that CR owns via a finalizer and will
+    /// delete when retention prunes it (#351).
+    pub fn unchanged_backup(started_at: DateTime<Utc>, observed_at: DateTime<Utc>) -> Self {
+        StatusUpdate {
+            phase: Some(MoverPhase::Unchanged.as_str().to_string()),
+            observed_at,
+            snapshot: None,
+            // Timing IS recorded, from the mover's own clock rather than a
+            // manifest's. Without an `endTime` the policy's last-backup
+            // timestamp would never advance, and `KopiurBackupStale` would page
+            // for a source that is simply not changing — the healthy case this
+            // whole feature exists to support (#351).
+            timing: Some(SnapshotTiming {
+                start_time: Some(started_at.to_rfc3339()),
+                end_time: Some(observed_at.to_rfc3339()),
+                duration_seconds: Some((observed_at - started_at).num_seconds()),
+            }),
+            // No stats: there is no manifest to measure. The size/duration/file
+            // gauges keep describing the last snapshot that actually exists.
+            stats: None,
+            failure: None,
+            log_tail: Some(
+                "No files changed since the previous snapshot; no new snapshot was created"
+                    .to_string(),
+            ),
             resolved: None,
         }
     }
@@ -1029,6 +1075,36 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_backup_reports_success_with_no_manifest() {
+        // #351. Three things must all hold at once, and each is load-bearing:
+        let start = ts();
+        let end = start + chrono::Duration::seconds(9);
+        let u = StatusUpdate::unchanged_backup(start, end);
+
+        // 1. A distinct terminal phase, not `Succeeded`. Reporting Succeeded
+        //    would send the controller looking for "its" snapshot, and the
+        //    newest one matching this identity belongs to the PREVIOUS CR.
+        assert_eq!(u.phase.as_deref(), Some("Unchanged"));
+
+        // 2. NO snapshot block — this run owns no kopia manifest, so it must not
+        //    record an id it could later delete from under its owner.
+        assert!(
+            u.snapshot.is_none(),
+            "an Unchanged run must not claim a kopia snapshot id"
+        );
+        assert!(u.stats.is_none(), "no manifest means no stats to report");
+
+        // 3. Timing IS present. Without an endTime the policy's last-backup
+        //    timestamp never advances and KopiurBackupStale pages for a source
+        //    that is simply not changing.
+        let t = u.timing.as_ref().expect("timing present");
+        assert_eq!(t.end_time.as_deref(), Some(end.to_rfc3339()).as_deref());
+        assert_eq!(t.duration_seconds, Some(9));
+
+        assert!(u.failure.is_none(), "a dedupe is not a failure");
+    }
+
+    #[test]
     fn succeeded_backup_update() {
         let json = r#"{
             "id":"snap1","source":{"host":"h","userName":"u","path":"/p"},
@@ -1202,6 +1278,7 @@ mod tests {
     fn failed_update_carries_block() {
         let err = KopiaError::EmptyOutput {
             context: "snapshot create result".into(),
+            stderr_tail: String::new(),
         };
         let u = StatusUpdate::failed(&err, ts());
         assert_eq!(u.phase.as_deref(), Some("Failed"));

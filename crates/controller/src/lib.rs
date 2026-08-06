@@ -10,6 +10,7 @@ pub mod consts;
 pub mod context;
 mod controllers;
 pub mod error;
+pub mod expand;
 pub mod health;
 pub mod hooks;
 mod http;

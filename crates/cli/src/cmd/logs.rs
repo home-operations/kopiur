@@ -262,7 +262,8 @@ fn snapshot_terminal(snap: &Snapshot) -> bool {
             SnapshotPhase::Succeeded
             | SnapshotPhase::Failed
             | SnapshotPhase::Deleting
-            | SnapshotPhase::Discovered,
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
         ) => true,
     }
 }

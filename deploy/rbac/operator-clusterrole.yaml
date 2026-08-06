@@ -163,6 +163,7 @@ rules:
   - list
   - watch
   - create
+  - patch
   - delete
 - apiGroups:
   - ''
@@ -221,6 +222,14 @@ rules:
   - snapshot.storage.k8s.io
   resources:
   - volumesnapshotclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - groupsnapshot.storage.k8s.io
+  resources:
+  - volumegroupsnapshotclasses
   verbs:
   - get
   - list

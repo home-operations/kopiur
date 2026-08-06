@@ -533,11 +533,12 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             // Fire one Snapshot per resolved policy (single policyRef, or each
             // policySelector match — ADR-0005 §10). The single-ref form keeps the
             // slot-stamped name for lastSchedule.snapshotRef.
-            fire_for_targets(ctx, schedule, &namespace, slot).await?;
+            let fanned_out = fire_for_targets(ctx, schedule, &namespace, slot).await?;
             let snapshot_ref = schedule
                 .spec
                 .policy_ref
                 .as_ref()
+                .filter(|_| !fanned_out)
                 .map(|_| scheduled_backup_name(&sched_name, slot));
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
             let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
@@ -603,11 +604,12 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             .creation_timestamp()
             .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
             .unwrap_or(now);
-        fire_for_targets(ctx, schedule, &namespace, anchor).await?;
+        let fanned_out = fire_for_targets(ctx, schedule, &namespace, anchor).await?;
         let snapshot_ref = schedule
             .spec
             .policy_ref
             .as_ref()
+            .filter(|_| !fanned_out)
             .map(|_| scheduled_backup_name(&sched_name, anchor));
         let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
         io::patch_status(
@@ -916,8 +918,12 @@ fn scheduled_backup_spec(
     policy_ref: &PolicyRef,
     default_deletion_policy: Option<DeletionPolicy>,
     on_schedule_delete: ScheduleDeletePolicy,
+    source: Option<kopiur_api::SnapshotSourceRef>,
 ) -> SnapshotSpec {
     SnapshotSpec {
+        // Which PVC this child covers, for a `pvcSelector` expansion. `None`
+        // for the ordinary single-source policy (#346).
+        source,
         policy_ref: Some(policy_ref.clone()),
         tags: None,
         failure_policy: None,
@@ -1029,7 +1035,9 @@ async fn create_scheduled_backup(
     namespace: &str,
     backup_name: &str,
     policy_ref: &PolicyRef,
+    source: Option<&kopiur_api::SnapshotSourceRef>,
 ) -> Result<()> {
+    let source = source.cloned();
     let owner = io::owner_ref_for(schedule, "SnapshotSchedule")?;
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(
@@ -1066,7 +1074,12 @@ async fn create_scheduled_backup(
 
     let mut backup = Snapshot::new(
         backup_name,
-        scheduled_backup_spec(policy_ref, default_deletion_policy, on_schedule_delete),
+        scheduled_backup_spec(
+            policy_ref,
+            default_deletion_policy,
+            on_schedule_delete,
+            source.clone(),
+        ),
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
 
@@ -1087,19 +1100,62 @@ async fn fire_for_targets(
     schedule: &SnapshotSchedule,
     namespace: &str,
     slot: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<bool> {
+    // Whether ANY target policy expanded a `pvcSelector`. The caller needs this
+    // because `status.lastSchedule.snapshotRef` is reconstructed from the slot
+    // stamp alone — under fan-out the real children are named
+    // `<base>-pvc-<slug>-<h8>`, so that reconstruction would point at an object
+    // that does not exist. A dangling ref is worse than none.
+    let mut fanned_out = false;
     let targets = target_policy_refs(ctx, schedule, namespace).await?;
     let single = schedule.spec.policy_ref.is_some();
     let sched_name = schedule.name_any();
+    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(ctx.client.clone(), namespace);
     for pref in &targets {
-        let backup_name = if single {
+        let base_name = if single {
             scheduled_backup_name(&sched_name, slot)
         } else {
             format!("{sched_name}-{}-{}", pref.name, slot.format("%Y%m%d%H%M%S"))
         };
-        create_scheduled_backup(ctx, schedule, namespace, &backup_name, pref).await?;
+        // Expand `pvcSelector` sources into one child per matched PVC. A policy
+        // with no selector yields `None` — mint exactly one unpinned child,
+        // byte-for-byte the pre-#346 behavior.
+        let policy = policies.get(&pref.name).await?;
+        let matched = crate::expand::match_pvcs(&ctx.client, &policy).await?;
+        let members = crate::expand::expand_sources(&policy, &base_name, &matched)
+            .map_err(|e| Error::Validation(e.to_string()))?;
+        match members {
+            None => {
+                create_scheduled_backup(ctx, schedule, namespace, &base_name, pref, None).await?;
+            }
+            Some(members) if members.is_empty() => {
+                fanned_out = true;
+                // A selector that matched nothing is NOT an error — PVCs come
+                // and go — but it is silent data loss if nobody says so, since
+                // the schedule would look like it fired successfully.
+                tracing::warn!(
+                    schedule = %sched_name,
+                    policy = %pref.name,
+                    "pvcSelector matched no PersistentVolumeClaims; this slot backed up nothing"
+                );
+            }
+            Some(members) => {
+                fanned_out = true;
+                for m in &members {
+                    create_scheduled_backup(
+                        ctx,
+                        schedule,
+                        namespace,
+                        &m.name,
+                        pref,
+                        Some(&m.source),
+                    )
+                    .await?;
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(fanned_out)
 }
 
 /// `error_policy` for the `SnapshotSchedule` controller.
@@ -1210,6 +1266,7 @@ mod tests {
             &pref,
             Some(DeletionPolicy::Retain),
             ScheduleDeletePolicy::Retain,
+            None,
         );
         assert_eq!(retain.deletion_policy, Some(DeletionPolicy::Retain));
         assert_eq!(
@@ -1221,12 +1278,13 @@ mod tests {
             &pref,
             Some(DeletionPolicy::Orphan),
             ScheduleDeletePolicy::Retain,
+            None,
         );
         assert_eq!(orphan.deletion_policy, Some(DeletionPolicy::Orphan));
 
         // An unset recipe default leaves the field None, so the webhook's
         // safe origin-aware Delete default still applies (no behavior change).
-        let unset = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain);
+        let unset = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None);
         assert_eq!(unset.deletion_policy, None);
     }
 
@@ -1238,12 +1296,12 @@ mod tests {
         };
         // The cascade policy is stamped EXPLICITLY (never left None) so the
         // finalizer's cascade guard reads a concrete value — both defaults.
-        let retain = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain);
+        let retain = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None);
         assert_eq!(
             retain.on_schedule_delete,
             Some(ScheduleDeletePolicy::Retain)
         );
-        let delete = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Delete);
+        let delete = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Delete, None);
         assert_eq!(
             delete.on_schedule_delete,
             Some(ScheduleDeletePolicy::Delete)
@@ -1253,6 +1311,7 @@ mod tests {
             &pref,
             Some(DeletionPolicy::Orphan),
             ScheduleDeletePolicy::Delete,
+            None,
         );
         assert_eq!(threaded.deletion_policy, Some(DeletionPolicy::Orphan));
         assert_eq!(
@@ -1273,6 +1332,7 @@ mod tests {
                 },
                 None,
                 stamped.unwrap_or(ScheduleDeletePolicy::Retain),
+                None,
             ),
         );
         // scheduled_backup_spec always stamps Some(_); model an ABSENT stamp
@@ -1776,6 +1836,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 SnapshotSpec {
+                    source: None,
                     policy_ref: None,
                     tags: None,
                     failure_policy: None,

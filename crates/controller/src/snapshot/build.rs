@@ -35,30 +35,36 @@ pub(super) fn build_backup_run(
     namespace: &str,
     _name: &str,
 ) -> Result<SnapshotRun<'static>> {
-    let identity = resolve_identity_for(config, namespace, repo.identity_defaults.as_ref())?;
+    let pin = backup.spec.source.as_ref();
+    let identity = resolve_identity_for(config, namespace, repo.identity_defaults.as_ref(), pin)?;
 
-    // First source's volume + path drive the mount and the snapshot source path.
+    // Which source this run covers: the pinned one for a fanned-out child of a
+    // `pvcSelector` expansion, else `sources[0]` (byte-for-byte the old path).
+    let eff = crate::expand::effective_source(config, pin)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     let source = config
         .spec
         .sources
-        .first()
+        .get(eff.index)
         .ok_or_else(|| Error::Invariant("SnapshotPolicy has no sources".into()))?;
+    let strategy = crate::expand::strategy_for(source);
 
     // Read-only unless the recipe opts out. kopia only reads the source, so the mount
     // is read-only by default; `readOnly: false` exists solely so the kubelet will
     // apply `fsGroup` (it skips its recursive chgrp on a read-only mount). Admission
     // rejects the combinations where that cannot work or would rewrite live data
     // unacknowledged — see `validate_source`/`validate_backup_config`.
-    let read_only = kopiur_api::snapshot_policy::source_read_only(source);
+    let read_only = eff.read_only;
 
     // The mover snapshots whatever is mounted at `source_path`, so the mount path
-    // and the kopia source path are the same. PVC: `/pvc/<name>` by default; NFS:
-    // the export path by default; either overridable by `sourcePathOverride`.
-    let (source_path, source_volume) = match (&source.pvc, &source.nfs) {
+    // and the kopia source path are the same. PVC: `/pvc/<name>` by default (or
+    // `/pvc/<ns>/<name>` under `sourcePathStrategy: PvcNamespacedName` for a
+    // selector source); NFS: the export path by default; either overridable by
+    // `sourcePathOverride`.
+    let (source_path, source_volume) = match (&eff.pvc, &source.nfs) {
         (Some(pvc), None) => {
-            let path = source
-                .source_path_override
-                .clone()
+            let path = eff
+                .kopia_source_path(strategy)
                 .unwrap_or_else(|| format!("/pvc/{}", pvc.name));
             (
                 path.clone(),
@@ -85,9 +91,20 @@ pub(super) fn build_backup_run(
                 VolumeMountSpec::nfs(nfs.server.clone(), nfs.path.clone(), mount_path, read_only),
             )
         }
-        // `pvcSelector` (multi-PVC) and the mutually-exclusive cases are rejected
-        // at admission by `validate_source`; the single-source mover path requires
-        // an explicit `pvc` or `nfs`.
+        // A `pvcSelector` source reaches here ONLY when this Snapshot carries no
+        // `spec.source` pin — i.e. someone applied a bare `policyRef` Snapshot
+        // against a selector policy, or edited a `pvc:` policy into a selector
+        // after its Snapshots existed (which admission never sees). Refuse with
+        // the fix rather than the old `invariant violated … please report it`,
+        // which is what #346 actually looked like to users.
+        (None, None) if source.pvc_selector.is_some() => {
+            return Err(Error::Validation(format!(
+                "SnapshotPolicy `{}` source #{} is a `pvcSelector`, which expands to one Snapshot                  per matched PVC — but this Snapshot carries no `spec.source` saying which PVC it                  covers, so there is nothing unambiguous to back up. Create it with `kubectl                  kopiur snapshot now --policy {0}` or let a SnapshotSchedule fire it; both expand                  the selector for you.",
+                config.name_any(),
+                eff.index,
+            )));
+        }
+        // Genuinely mutually-exclusive/empty shapes, which admission does reject.
         _ => {
             return Err(Error::Invariant(
                 "backup mover path requires exactly one of source.pvc or source.nfs".into(),
@@ -227,12 +244,28 @@ pub(super) fn resolve_identity_for(
     config: &SnapshotPolicy,
     namespace: &str,
     defaults: Option<&kopiur_api::IdentityDefaults>,
+    pin: Option<&kopiur_api::SnapshotSourceRef>,
 ) -> Result<MoverIdentity> {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
+    // `pin` is the fanned-out child's `spec.source`. Without it this resolved
+    // `sources.first()`, which for a `pvcSelector` policy has no `pvc` at all —
+    // so every child of an expansion would have resolved the SAME path-less
+    // identity and written into one shared kopia source (#346).
+    let eff = crate::expand::effective_source(config, pin)
+        .map_err(|e| Error::Validation(e.to_string()))?;
+    let strategy = config
+        .spec
+        .sources
+        .get(eff.index)
+        .map(crate::expand::strategy_for)
+        .unwrap_or_default();
+    // The resolved kopia path, honoring `sourcePathStrategy` for selector
+    // sources. Passed as the override so the identity kernel uses it verbatim
+    // rather than re-deriving `/pvc/<name>` from the PVC name alone.
+    let resolved_path = eff.kopia_source_path(strategy);
+    let pvc_name = eff.pvc.as_ref().map(|p| p.name.clone());
     // A non-PVC NFS source supplies the sourcePath default (the export path).
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    let nfs_source_path = eff.nfs_path.clone();
+    let source_path_override = resolved_path;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,

@@ -95,6 +95,12 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "staging-recover",
     "staging-timeout",
     "staging-override",
+    // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
+    "multipvc-fanout",
+    "multipvc-group",
+    // #351 kopia-deduped (Unchanged) runs.
+    "unchanged-dedup",
+    "unchanged-default",
     "staging-mismatch",
     // Mass-deletion protection scenarios (crates/e2e/tests/mass_deletion.rs). Each
     // needs its OWN kopia repository so snapshot counts (schedule-cascade retain,

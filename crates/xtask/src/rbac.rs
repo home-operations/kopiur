@@ -223,10 +223,14 @@ fn workload_rules() -> Vec<PolicyRule> {
             &["volumesnapshots".into()],
             &["get", "list", "watch", "create", "patch", "delete"],
         ),
+        // `patch` is required because `io::apply` is a server-side apply (a
+        // PATCH): N members race to converge the SAME shared group object, and
+        // SSA over a deterministic name is what makes that safe. `create`
+        // alone would 403 every one of them.
         rule(
             &["groupsnapshot.storage.k8s.io"],
             &["volumegroupsnapshots".into()],
-            &["get", "list", "watch", "create", "delete"],
+            &["get", "list", "watch", "create", "patch", "delete"],
         ),
         // Per-namespace mover RBAC minted by the controller (§4.12): a
         // `kopiur-mover` ServiceAccount plus a RoleBinding to the `kopiur-mover`
@@ -417,6 +421,14 @@ fn cluster_artifact() -> Result<Artifact> {
     rules.push(rule(
         &["snapshot.storage.k8s.io"],
         &["volumesnapshotclasses".into()],
+        READ_VERBS,
+    ));
+    // Cluster-scoped, and the reason `groupBy: VolumeGroupSnapshot` cannot work
+    // on a namespaced install: resolving the class for a group capture is a
+    // cluster-wide read, exactly like its per-volume counterpart above.
+    rules.push(rule(
+        &["groupsnapshot.storage.k8s.io"],
+        &["volumegroupsnapshotclasses".into()],
         READ_VERBS,
     ));
     rules.push(rule(

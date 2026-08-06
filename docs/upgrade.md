@@ -6,6 +6,41 @@ the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which mo
 the CRDs between two Helm mechanisms and needs one deliberate step to avoid data
 loss. Read that section before you cross it.
 
+## 0.10.0: new RBAC and a new Snapshot phase
+
+Two things to know before you cross this release.
+
+### Apply the CRDs before rolling the operator
+
+`Snapshot.status.phase` gains a new value, `Unchanged` (see
+[#351](https://github.com/home-operations/kopiur/issues/351)). The mover writes
+the phase directly onto the status subresource, so a mover image that knows the
+new value talking to an apiserver whose CRD does not will have its status PATCH
+**rejected by schema validation**.
+
+Helm handles this for you — chart CRDs are applied before the Deployment rolls.
+If you manage CRDs yourself (`deploy/crds/`), apply them first:
+
+```bash
+kubectl apply -f deploy/crds/
+helm upgrade kopiur ...
+```
+
+### Non-Helm installs need the new RBAC
+
+`groupBy: VolumeGroupSnapshot` ([#346](https://github.com/home-operations/kopiur/issues/346))
+adds two grants:
+
+- `patch` on `groupsnapshot.storage.k8s.io/volumegroupsnapshots` — the members
+  of one expansion converge the shared capture by server-side apply, which is a
+  PATCH;
+- read on the cluster-scoped `volumegroupsnapshotclasses`.
+
+If you apply `deploy/rbac/*.yaml` directly rather than through the chart,
+re-apply them, or group staging fails with opaque 403s. Nothing else needs
+these: a policy without a `pvcSelector`, or with `groupBy: None`, never touches
+that API group.
+
 ## After 0.7.0: per-run work-spec ConfigMaps no longer exist (no action needed)
 
 Versions after 0.7.0 fix a resource leak: every mover run (backup, restore,

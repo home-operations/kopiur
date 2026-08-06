@@ -62,6 +62,30 @@ fn volume_snapshot_class_ar() -> ApiResource {
     )
 }
 
+/// `ApiResource` for `VolumeSnapshotContent` (cluster-scoped).
+fn volume_snapshot_content_ar() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(SNAPSHOT_GROUP, "v1", "VolumeSnapshotContent"),
+        "volumesnapshotcontents",
+    )
+}
+
+/// [`volume_snapshot_ar`] for the group-staging module.
+pub(crate) fn volume_snapshot_ar_pub() -> ApiResource {
+    volume_snapshot_ar()
+}
+
+/// [`volume_snapshot_content_ar`] for the group-staging module.
+pub(crate) fn volume_snapshot_content_ar_pub() -> ApiResource {
+    volume_snapshot_content_ar()
+}
+
+/// [`fmt_go_duration`] for the group-staging module, which renders the same
+/// deadline grammar.
+pub(crate) fn fmt_go_duration_pub(d: std::time::Duration) -> String {
+    fmt_go_duration(d)
+}
+
 fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), ns, &volume_snapshot_ar())
 }
@@ -76,7 +100,17 @@ pub struct StagedSource {
     /// Name of the staged PVC (mounted in place of the live source).
     pub pvc_name: String,
     /// Name of the `VolumeSnapshot` backing the stage (`Snapshot` mode; `None` for `Clone`).
+    ///
+    /// Under `groupBy: VolumeGroupSnapshot` this is the member snapshot the
+    /// shared group produced for THIS PVC — resolved by
+    /// `group_staging::map_group_members`, never guessed.
     pub volume_snapshot_name: Option<String>,
+    /// Name of the shared `VolumeGroupSnapshot` this member staged from, when
+    /// the policy asked for a consistency group. Recorded to status so the
+    /// group is observable — it has no ownerReferences, so this is how an
+    /// operator (and `kubectl kopiur doctor`) can tell which capture a backup
+    /// came from.
+    pub volume_group_snapshot_name: Option<String>,
     /// The resolved capture method (`Snapshot`/`Clone`) — recorded to status.
     pub copy_method: &'static str,
     /// StorageClass actually written to the staged PVC's spec — the
@@ -189,6 +223,16 @@ fn stack_missing_message(provisioner: &str) -> String {
 /// reads/deletes CSI staging needs (StorageClasses, VolumeSnapshotClasses,
 /// VolumeSnapshotContents) can never be granted — and `copyMethod` defaults to
 /// `Snapshot`, so an untouched policy lands here blindly.
+/// The namespaced-install refusal for a GROUP capture.
+fn namespaced_install_cannot_group_stage_message() -> String {
+    "this is a namespaced install (`installScope: namespaced`), whose Role RBAC cannot read the \
+     cluster-scoped VolumeGroupSnapshotClass, VolumeSnapshotContent and PersistentVolume objects \
+     a `VolumeGroupSnapshot` capture needs to map group members back to their PVCs. Fix: set \
+     `groupBy: None` with `copyMethod: Direct` (accepting independent reads of the live \
+     volumes), or reinstall with installScope=cluster."
+        .to_string()
+}
+
 fn namespaced_install_cannot_stage_message() -> String {
     format!(
         "this is a namespaced install (installScope: namespaced), whose Role RBAC cannot \
@@ -1007,6 +1051,53 @@ async fn staged_pvc_bind_gate(
     }
 }
 
+/// What a source's shape + `copyMethod` + install scope imply for staging,
+/// BEFORE any cluster read.
+///
+/// Pure so the ORDER is pinned by unit tests. The order was wrong: the
+/// namespaced-install refusal used to run *before* the source-shape checks, so
+/// an NFS-source policy under the defaulted `copyMethod: Snapshot` failed
+/// TERMINALLY on a namespaced install — when it should mount the live export
+/// and succeed. Nothing about an NFS source needs a cluster-scoped read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StagingApplicability<'a> {
+    /// `Direct`, or a non-PVC source (NFS, or a `pvcSelector` that produced no
+    /// concrete PVC): mount the live source, stage nothing.
+    NotApplicable,
+    /// A PVC source that wants staging, on an install whose Role RBAC cannot
+    /// read the cluster-scoped objects staging requires.
+    ClusterScopeRequired,
+    /// Stage this PVC.
+    Proceed {
+        /// The concrete source PVC name.
+        source_name: &'a str,
+    },
+}
+
+/// Decide [`StagingApplicability`]. See the enum for why the order matters.
+pub(crate) fn staging_applicability(
+    copy_method: CopyMethod,
+    source_pvc: Option<&str>,
+    namespaced_install: bool,
+) -> StagingApplicability<'_> {
+    // 1. Opted out entirely.
+    if copy_method == CopyMethod::Direct {
+        return StagingApplicability::NotApplicable;
+    }
+    // 2. Nothing to stage. Checked BEFORE the install-scope gate: every
+    //    cluster-scoped read staging performs (StorageClass, VolumeSnapshotClass,
+    //    the PersistentVolume reclaim patch) is on the PVC path only.
+    let Some(name) = source_pvc else {
+        return StagingApplicability::NotApplicable;
+    };
+    // 3. Now the gate is meaningful: this source really does need the
+    //    cluster-scoped reads a namespaced install's Role cannot make.
+    if namespaced_install {
+        return StagingApplicability::ClusterScopeRequired;
+    }
+    StagingApplicability::Proceed { source_name: name }
+}
+
 /// Resolve staging for a backup. Performs the cluster IO (preflight, create
 /// VolumeSnapshot, wait `readyToUse`, create staged PVC) and returns a [`StagingOutcome`]
 /// — **no** status side effects (the reconciler maps the outcome). Idempotent: every
@@ -1015,37 +1106,49 @@ pub async fn resolve_staging(
     client: &kube::Client,
     scope: &crate::config::WatchScope,
     policy: &SnapshotPolicy,
+    pin: Option<&kopiur_api::SnapshotSourceRef>,
     ns: &str,
     snapshot_cr: &str,
     owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
-    // Direct → never stage. Staging only applies to a single explicit `pvc` source; NFS
-    // and multi-PVC selectors mount the live source (the latter is already rejected
-    // downstream).
-    if copy_method == CopyMethod::Direct {
-        return Ok(StagingOutcome::NotApplicable);
-    }
-    // Staging reads StorageClasses/VolumeSnapshotClasses and deletes
-    // VolumeSnapshotContents — all cluster-scoped, all permanent 403s under a
-    // namespaced install's Role RBAC. Refuse up front with the fix instead of
-    // wedging the reconcile on retried 403s (and since copyMethod DEFAULTS to
-    // Snapshot, an untouched policy lands here — the message carries the
-    // default-changed note like every other staging refusal).
-    if matches!(scope, crate::config::WatchScope::Namespaced(_)) {
-        return Ok(StagingOutcome::Failed {
-            reason: REASON_SOURCE_NOT_CSI,
-            message: namespaced_install_cannot_stage_message(),
-        });
-    }
-    let Some(source) = policy.spec.sources.first() else {
-        return Ok(StagingOutcome::NotApplicable);
+    // The source THIS run covers. Without the pin a fanned-out child would
+    // stage `sources[0]`, which for a `pvcSelector` policy has no PVC at all —
+    // so every child would silently skip staging and read its live volume
+    // instead of a point-in-time copy (#346).
+    let eff = crate::expand::effective_source(policy, pin)
+        .map_err(|e| Error::Validation(e.to_string()))?;
+    let pinned_pvc = eff.pvc.as_ref().map(|p| p.name.clone());
+    // Decide, before touching the cluster, whether staging applies at all and
+    // whether this install can do it. Pure + unit-tested, because the ORDER is
+    // the load-bearing part and `resolve_staging` itself is async and
+    // Client-bound (so only the e2e tier reaches it).
+    let source_name = match staging_applicability(
+        copy_method,
+        pinned_pvc.as_deref(),
+        matches!(scope, crate::config::WatchScope::Namespaced(_)),
+    ) {
+        StagingApplicability::NotApplicable => return Ok(StagingOutcome::NotApplicable),
+        StagingApplicability::ClusterScopeRequired => {
+            // Group staging is STRICTLY more cluster-scoped than single-volume
+            // staging — on top of StorageClasses it needs cluster-scoped
+            // VolumeGroupSnapshotClasses, VolumeSnapshotContents and
+            // PersistentVolumes (the three-hop member→PVC reconstruction) — so
+            // it gets its own message rather than one that only mentions
+            // `copyMethod: Direct`.
+            let message = if pin.and_then(|p| p.group.as_ref()).is_some() {
+                namespaced_install_cannot_group_stage_message()
+            } else {
+                namespaced_install_cannot_stage_message()
+            };
+            return Ok(StagingOutcome::Failed {
+                reason: REASON_SOURCE_NOT_CSI,
+                message,
+            });
+        }
+        StagingApplicability::Proceed { source_name } => source_name.to_string(),
     };
-    let Some(pvc_ref) = source.pvc.as_ref() else {
-        // NFS / pvcSelector — nothing to snapshot.
-        return Ok(StagingOutcome::NotApplicable);
-    };
-    let source_name = &pvc_ref.name;
+    let source_name = &source_name;
 
     // Read the source PVC (needed for sizing + provisioner + shape).
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
@@ -1088,6 +1191,66 @@ pub async fn resolve_staging(
             provisioner.as_deref(),
         ) {
             return Ok(StagingOutcome::Failed { reason, message });
+        }
+    }
+
+    // `groupBy: VolumeGroupSnapshot`: the capture is ONE shared object across
+    // every member of the expansion, so the create/wait/pick-my-member half is
+    // replaced — but the staged-PVC build and bind gate below are reused
+    // verbatim, because each member still restores into its own private
+    // `<cr>-src` PVC from its own private member snapshot.
+    if let Some(group) = pin.and_then(|p| p.group.as_ref())
+        && copy_method != CopyMethod::Clone
+    {
+        let Some(pvc) = eff.pvc.as_ref() else {
+            return Ok(StagingOutcome::NotApplicable);
+        };
+        match super::group_staging::resolve_group_stage(
+            client,
+            policy,
+            group,
+            eff.index,
+            &pvc.namespace,
+            &pvc.name,
+            provisioner.as_deref(),
+            timeout,
+        )
+        .await?
+        {
+            super::group_staging::GroupStage::Ready { member } => {
+                let data_source =
+                    data_source_for(copy_method, source_name, &member.volume_snapshot_name);
+                let staged = build_staged_pvc(
+                    &staged_pvc,
+                    ns,
+                    &source_pvc,
+                    data_source,
+                    member.restore_size.as_ref().map(|q| q.0.as_str()),
+                    staging,
+                    owner.clone(),
+                );
+                apply(&pvc_api, &staged_pvc, &staged).await?;
+                if let Some(outcome) =
+                    staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout)
+                        .await?
+                {
+                    return Ok(outcome);
+                }
+                return Ok(StagingOutcome::Ready(StagedSource {
+                    storage_class_name: staged_class_of(&staged),
+                    pvc_name: staged_pvc,
+                    volume_snapshot_name: Some(member.volume_snapshot_name),
+                    volume_group_snapshot_name: Some(group.volume_group_snapshot_name.clone()),
+                    copy_method: "Snapshot",
+                    staging_timeout_seconds,
+                }));
+            }
+            super::group_staging::GroupStage::Waiting { reason, message } => {
+                return Ok(StagingOutcome::Waiting { reason, message });
+            }
+            super::group_staging::GroupStage::Failed { reason, message } => {
+                return Ok(StagingOutcome::Failed { reason, message });
+            }
         }
     }
 
@@ -1193,6 +1356,7 @@ pub async fn resolve_staging(
             storage_class_name: staged_class_of(&staged),
             pvc_name: staged_pvc,
             volume_snapshot_name: Some(vs_name),
+            volume_group_snapshot_name: None,
             copy_method: "Snapshot",
             staging_timeout_seconds,
         }));
@@ -1222,6 +1386,7 @@ pub async fn resolve_staging(
         storage_class_name: staged_class_of(&staged),
         pvc_name: staged_pvc,
         volume_snapshot_name: None,
+        volume_group_snapshot_name: None,
         copy_method: "Clone",
         staging_timeout_seconds,
     }))
@@ -1248,6 +1413,7 @@ pub async fn cleanup_staged_source(
     client: &kube::Client,
     ns: &str,
     snapshot_cr: &str,
+    group: Option<&kopiur_api::SnapshotSourceGroup>,
 ) -> Result<()> {
     let staged_pvc = staged_pvc_name(snapshot_cr);
     let vs_name = volume_snapshot_name(snapshot_cr);
@@ -1292,6 +1458,22 @@ pub async fn cleanup_staged_source(
             }
         }
         delete_ignore_404(&pvc_api, &staged_pvc).await?;
+    }
+
+    // Under `groupBy: VolumeGroupSnapshot` the capture is SHARED, so this
+    // member owns no `<cr>-snap` of its own and must not delete the member
+    // snapshot directly — the group cascades onto it, and deleting it here
+    // would race the as-source-protection ordering the block above exists for.
+    // Instead try to reap the group itself; that is a no-op unless every
+    // sibling is done, and fails closed if the sibling list cannot be read.
+    if let Some(group) = group {
+        super::group_staging::cleanup_group_if_unused(
+            client,
+            &group.namespace,
+            &group.volume_group_snapshot_name,
+        )
+        .await?;
+        return Ok(());
     }
 
     let vs_api = volume_snapshot_api(client, ns);
@@ -1541,6 +1723,60 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    // --- staging applicability ordering ------------------------------------
+
+    #[test]
+    fn nfs_source_is_not_applicable_even_on_a_namespaced_install() {
+        // The bug this reorder fixes. The namespaced-install refusal used to run
+        // BEFORE the source-shape checks, so an NFS-source policy under the
+        // DEFAULTED `copyMethod: Snapshot` failed terminally on a namespaced
+        // install — for a source that never needed a cluster-scoped read.
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, None, true),
+            StagingApplicability::NotApplicable
+        );
+        assert_eq!(
+            staging_applicability(CopyMethod::Clone, None, true),
+            StagingApplicability::NotApplicable
+        );
+    }
+
+    #[test]
+    fn direct_is_not_applicable_regardless_of_scope_or_source() {
+        for namespaced in [true, false] {
+            assert_eq!(
+                staging_applicability(CopyMethod::Direct, Some("data"), namespaced),
+                StagingApplicability::NotApplicable
+            );
+            assert_eq!(
+                staging_applicability(CopyMethod::Direct, None, namespaced),
+                StagingApplicability::NotApplicable
+            );
+        }
+    }
+
+    #[test]
+    fn a_pvc_source_on_a_namespaced_install_still_needs_cluster_scope() {
+        // The gate is not removed, only moved: a source that genuinely needs the
+        // cluster-scoped StorageClass / VolumeSnapshotClass / PersistentVolume
+        // reads must still be refused with the actionable message rather than
+        // wedging the reconcile on retried 403s.
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, Some("data"), true),
+            StagingApplicability::ClusterScopeRequired
+        );
+    }
+
+    #[test]
+    fn a_pvc_source_on_a_cluster_install_proceeds() {
+        assert_eq!(
+            staging_applicability(CopyMethod::Snapshot, Some("data"), false),
+            StagingApplicability::Proceed {
+                source_name: "data"
+            }
+        );
     }
 
     #[test]

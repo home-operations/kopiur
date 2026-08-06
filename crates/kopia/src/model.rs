@@ -207,6 +207,36 @@ pub struct SnapshotCreateResult {
     pub tags: BTreeMap<String, String>,
 }
 
+/// What a `kopia snapshot create` actually did.
+///
+/// Two outcomes, both successes, and they are NOT interchangeable:
+///
+/// * [`Created`](Self::Created) — a new manifest exists and this run owns it.
+/// * [`Unchanged`](Self::Unchanged) — kopia declined to write one because the
+///   source is byte-identical to the previous snapshot (its retention knob
+///   `ignoreIdenticalSnapshots`). There is **no new manifest**, and crucially
+///   nothing this run may claim: the newest manifest for this identity belongs
+///   to the *previous* `Snapshot` CR, which owns it via a finalizer and will
+///   delete it when retention prunes that CR.
+///
+/// Modelled as an enum rather than `Option<SnapshotCreateResult>` so the
+/// distinction cannot be `unwrap_or_default`-ed away. Collapsing it is exactly
+/// the bug: a deduped run recorded as an ordinary success goes looking for
+/// "its" snapshot, finds its predecessor's, and two CRs end up claiming one
+/// manifest (#351).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotCreateOutcome {
+    /// kopia wrote a new manifest; this run owns it.
+    ///
+    /// Boxed so the enum stays small: `SnapshotCreateResult` is ~320 bytes and
+    /// `Unchanged` is zero-sized, and every caller moves the result out
+    /// immediately.
+    Created(Box<SnapshotCreateResult>),
+    /// kopia deduped: nothing changed, so no manifest was written and this run
+    /// owns nothing. The previous snapshot remains the live restore point.
+    Unchanged,
+}
+
 impl SnapshotCreateResult {
     /// Total logical bytes in the snapshot, from the root summary (0 if absent).
     pub fn total_bytes(&self) -> u64 {

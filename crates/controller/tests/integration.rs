@@ -189,6 +189,7 @@ async fn backup_gets_finalizer_and_delete_path_removes_cr() {
     let mut b = Snapshot::new(
         "it-backup",
         SnapshotSpec {
+            source: None,
             policy_ref: None,
             tags: None,
             failure_policy: None,

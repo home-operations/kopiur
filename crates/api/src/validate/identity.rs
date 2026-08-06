@@ -251,6 +251,38 @@ fn pvc_source_effective_path(source: &Source) -> Option<(String, String)> {
     Some((name, path))
 }
 
+/// The `sourcePathStrategy` a **selector** source resolves to, keyed by a stable
+/// identifier for that source.
+///
+/// Selector sources have no PVC name to key on and their matched set changes
+/// over time, so they are keyed by position. That is exactly right for this
+/// guard: the question is "did source #N's path SHAPE change", not "which PVCs
+/// does it match today".
+///
+/// This exists because flipping `PvcName` → `PvcNamespacedName` rewrites every
+/// member's kopia path (`/pvc/x` → `/pvc/ns/x`), which re-identifies the source
+/// and orphans every manifest it has taken — precisely what this guard is for,
+/// and precisely what it did not cover while the selector was unimplemented.
+fn selector_source_strategies(spec: &SnapshotPolicySpec) -> BTreeMap<usize, &'static str> {
+    spec.sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.pvc_selector.is_some())
+        .map(|(i, s)| {
+            let label = match s
+                .source_path_strategy
+                .unwrap_or(crate::snapshot_policy::SourcePathStrategy::PvcName)
+            {
+                crate::snapshot_policy::SourcePathStrategy::PvcName => "/pvc/<name>",
+                crate::snapshot_policy::SourcePathStrategy::PvcNamespacedName => {
+                    "/pvc/<namespace>/<name>"
+                }
+            };
+            (i, label)
+        })
+        .collect()
+}
+
 /// Pure decision for the fork-on-edit guard on a per-source path change. A PVC's kopia
 /// source path is part of its identity, so changing `sourcePathOverride` on a PVC that
 /// already has history orphans that PVC's snapshots exactly as a username/hostname
@@ -279,6 +311,20 @@ pub fn detect_source_path_fork(
             return Some(ValidationError::IdentityWouldFork {
                 old: old_path.clone(),
                 new: new_path,
+            });
+        }
+    }
+    // Same guard for selector sources: a `sourcePathStrategy` flip rewrites
+    // every matched PVC's kopia path at once, so it forks harder than any
+    // single `sourcePathOverride` edit could.
+    let old_strategies = selector_source_strategies(old);
+    for (index, new_shape) in selector_source_strategies(new) {
+        if let Some(old_shape) = old_strategies.get(&index)
+            && *old_shape != new_shape
+        {
+            return Some(ValidationError::IdentityWouldFork {
+                old: (*old_shape).to_string(),
+                new: new_shape.to_string(),
             });
         }
     }

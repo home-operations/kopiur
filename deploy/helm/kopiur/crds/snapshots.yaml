@@ -25,6 +25,9 @@ spec:
     - jsonPath: .status.snapshot.kopiaSnapshotID
       name: Snapshot
       type: string
+    - jsonPath: .spec.source.target.pvc.name
+      name: Source
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -110,6 +113,85 @@ spec:
                     type: string
                 required:
                 - name
+                type: object
+              source:
+                description: |-
+                  The ONE concrete source this `Snapshot` covers, when `policyRef` names a
+                  recipe whose `sources[]` expands to many — i.e. a
+                  [`pvcSelector`](crate::snapshot_policy::PvcSelector).
+
+                  Stamped by whoever minted the CR: a `SnapshotSchedule` fire, or
+                  `kubectl kopiur snapshot now`. Absent for the ordinary single-source
+                  case, where the policy's own `sources[0]` is the target.
+
+                  Absent against a *selector* policy is refused rather than guessed. The
+                  operator must never pick a PVC on the user's behalf: silently backing up
+                  one arbitrary volume out of N looks exactly like success.
+                nullable: true
+                properties:
+                  group:
+                    description: |-
+                      The consistency group this child belongs to, present only when the
+                      policy asked for one (`groupBy: VolumeGroupSnapshot`) AND the expansion
+                      produced more than one member in this namespace.
+                    nullable: true
+                    properties:
+                      namespace:
+                        description: |-
+                          Namespace the `VolumeGroupSnapshot` lives in.
+
+                          A `VolumeGroupSnapshot` is namespaced and its `source.selector` is
+                          namespace-local, so a selector spanning namespaces yields ONE GROUP PER
+                          NAMESPACE, not one group. The consistency guarantee is per-namespace and
+                          this field is where that shows.
+                        type: string
+                      volumeGroupSnapshotName:
+                        description: Name of the shared `VolumeGroupSnapshot`.
+                        type: string
+                    required:
+                    - namespace
+                    - volumeGroupSnapshotName
+                    type: object
+                  sourceIndex:
+                    description: |-
+                      Zero-based index into `policyRef`'s `spec.sources` this child expanded
+                      from.
+
+                      Pins WHICH source's knobs (`readOnly`, `sourcePathOverride`,
+                      `sourcePathStrategy`, `acknowledgeLiveMutation`) govern this run, so a
+                      policy carrying several sources stays unambiguous. An index that is out
+                      of range at reconcile time — the policy shrank mid-run — is a named
+                      terminal failure, never a silent fallback to `sources[0]`.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  target:
+                    description: What the expansion resolved to.
+                    oneOf:
+                    - required:
+                      - pvc
+                    properties:
+                      pvc:
+                        description: One `PersistentVolumeClaim`, fully qualified.
+                        properties:
+                          name:
+                            description: Name of the matched `PersistentVolumeClaim`.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace of the matched `PersistentVolumeClaim`.
+
+                              Explicit rather than inferred from the `Snapshot`'s own namespace: a
+                              `pvcSelector` under a `ClusterRepository` may match across namespaces.
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    type: object
+                required:
+                - sourceIndex
+                - target
                 type: object
               tags:
                 additionalProperties:
@@ -273,6 +355,7 @@ spec:
                 - Failed
                 - Deleting
                 - Discovered
+                - Unchanged
                 nullable: true
                 type: string
               pinned:
@@ -466,6 +549,18 @@ spec:
                       StorageClass of the staged PVC — `spec.staging.storageClassName` when set,
                       else the source PVC's class. Pinned for observability (e.g. confirming a
                       CephFS shallow-clone class actually took effect).
+                    nullable: true
+                    type: string
+                  volumeGroupSnapshotName:
+                    description: |-
+                      Name of the shared CSI `VolumeGroupSnapshot` this member staged from,
+                      when the recipe asked for a consistency group
+                      ([`groupBy: VolumeGroupSnapshot`](crate::snapshot_policy::GroupBy)).
+
+                      Recorded because the group is otherwise invisible: it deliberately
+                      carries no ownerReferences (see `io::group_staging`), so this is how an
+                      operator tells which capture a backup came from — and how `kubectl
+                      kopiur doctor` finds one that outlived its members.
                     nullable: true
                     type: string
                   volumeSnapshotName:

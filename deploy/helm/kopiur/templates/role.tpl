@@ -116,7 +116,9 @@ rules:
   - apiGroups: [groupsnapshot.storage.k8s.io]
     resources:
       - volumegroupsnapshots
-    verbs: [get, list, watch, create, delete]
+    # `patch` because N members race to server-side-apply the SAME shared group
+    # object; SSA over a deterministic name is what makes that convergent.
+    verbs: [get, list, watch, create, patch, delete]
   # Per-namespace mover RBAC minted by the controller (§4.12). Minted via
   # server-side apply (PATCH), so `patch`/`update` are required, not just create/get.
   # `list`/`watch` for workload identity (SA watch — see clusterrole.yaml).

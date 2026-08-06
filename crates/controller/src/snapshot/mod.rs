@@ -274,6 +274,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     match run_decision(backup.status.as_ref().and_then(|s| s.phase)) {
         RunDecision::Run => {}
         RunDecision::SucceededSteadyState => {
+            // Two terminal successes share this arm: `Succeeded` (kopia wrote a
+            // manifest this CR owns) and `Unchanged` (kopia deduped, so this CR
+            // owns nothing — #351). Everything below is identical for both:
+            // afterSnapshot hooks, staged-source teardown, credential reap,
+            // projection-pin backfill. They diverge in exactly two places, both
+            // marked: the healed phase/reason/message, and pinning — which acts
+            // on a manifest an `Unchanged` run does not have.
+            let unchanged =
+                backup.status.as_ref().and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged);
             // The MOVER stamps `phase: Succeeded`, so the controller's first look
             // at a finished run can already be steady-state — the afterSnapshot
             // hooks (resume/notify) must still run, exactly once. Safe against
@@ -312,15 +321,28 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     .any(|c| c.type_ == crate::consts::READY_CONDITION && c.status == "True")
             });
             if !ready {
-                io::patch_status(
-                    &api,
-                    &name,
-                    snapshot_ready_status(
-                        backup,
+                let (phase, reason, message) = if unchanged {
+                    (
+                        SnapshotPhase::Unchanged,
+                        "NoChanges",
+                        "no files changed since the previous snapshot, so kopia created no new \
+                         snapshot; the previous one remains this source's restore point",
+                    )
+                } else {
+                    (
                         SnapshotPhase::Succeeded,
                         "SnapshotCreated",
                         "the kopia snapshot was created successfully",
-                    ),
+                    )
+                };
+                // Healing with a hard-coded `Succeeded` here would silently
+                // overwrite the mover's `Unchanged` on the very next reconcile
+                // — and then `finalize_succeeded`/`reconcile_pin` would go
+                // looking for a manifest this CR never created.
+                io::patch_status(
+                    &api,
+                    &name,
+                    snapshot_ready_status(backup, phase, reason, message),
                 )
                 .await?;
                 // The MOVER stamped `phase: Succeeded` (the common in-cluster path,
@@ -332,8 +354,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // concurrent reconcile can re-observe `!ready` before the healed
                 // status lands, adding a bounded duplicate count — never an
                 // under-count.
-                ctx.metrics
-                    .inc_snapshot_completed("succeeded", &namespace, backup_policy(backup));
+                ctx.metrics.inc_snapshot_completed(
+                    if unchanged { "unchanged" } else { "succeeded" },
+                    &namespace,
+                    backup_policy(backup),
+                );
             }
             // Certain incompleteness signal: the mover recorded source entries kopia
             // EXCLUDED (the ignore-file-errors path — an otherwise-silent partial backup).
@@ -360,7 +385,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // Complete; the requeue is a backstop for a missed event.
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                io::cleanup_staged_source(
+                    &ctx.client,
+                    &namespace,
+                    &name,
+                    backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                )
+                .await?;
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Self-gated by its stamp, so this costs nothing once it has run; if the
@@ -371,6 +402,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // pin, so its finalizer would strand once the recipe is deleted (#255).
             // This branch is the one every terminal Snapshot passes through on startup.
             backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
+            if unchanged {
+                // `spec.pin` acts on a kopia manifest and this run produced
+                // none. The only manifest that matches this identity belongs to
+                // the PREVIOUS Snapshot CR; pinning it here would both claim
+                // another CR's snapshot and — because kopia rewrites a
+                // manifest id on pin — invalidate the id that CR recorded.
+                return Ok(Action::await_change());
+            }
             // §13(c): spec.pin stays live after the mover Job is gone.
             return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
         }
@@ -465,7 +504,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 if !staged_teardown_ready(job.as_ref()) {
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                io::cleanup_staged_source(
+                    &ctx.client,
+                    &namespace,
+                    &name,
+                    backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                )
+                .await?;
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Unlike the Succeeded arm this one has no steady-state timer, so keep a
@@ -512,7 +557,26 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     )
                     .await;
                 }
-                if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Succeeded) {
+                // Which terminal phase the mover already wrote decides what is
+                // left to do. `Unchanged` is ALREADY final: kopia deliberately
+                // wrote no manifest, so there is nothing to finalize and — the
+                // load-bearing part — nothing to resolve. `finalize_succeeded`
+                // ends in `resolve_succeeded_snapshot`, which takes the newest
+                // manifest matching this identity; for a deduped run that is the
+                // PREVIOUS Snapshot CR's manifest. Letting it run here would
+                // stamp this CR with a kopia id it does not own, leaving two CRs
+                // claiming one manifest and the first prune deleting it out from
+                // under the second (#351).
+                //
+                // Note this was a bare `!= Some(Succeeded)`, which the compiler
+                // cannot check — the new phase would have been silently
+                // overwritten back to `Succeeded` on the very next reconcile.
+                let mover_phase = backup.status.as_ref().and_then(|s| s.phase);
+                let unchanged = mover_phase == Some(SnapshotPhase::Unchanged);
+                if !matches!(
+                    mover_phase,
+                    Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged)
+                ) {
                     finalize_succeeded(ctx, backup, &api, &name, &namespace).await?;
                 }
                 // Reap the CSI staging objects (VolumeSnapshot + staged PVC) now the
@@ -524,7 +588,22 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     .and_then(|s| s.staged.as_ref())
                     .is_some()
                 {
-                    io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                    io::cleanup_staged_source(
+                        &ctx.client,
+                        &namespace,
+                        &name,
+                        backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                    )
+                    .await?;
+                }
+                if unchanged {
+                    // Nothing to pin: `spec.pin` acts on a kopia manifest, and
+                    // this run produced none. Pinning would have to reach for
+                    // the previous CR's manifest — the same ownership confusion
+                    // as above, with the added twist that kopia REWRITES a
+                    // manifest id on pin, which would invalidate the owner's
+                    // recorded id.
+                    return Ok(Action::await_change());
                 }
                 // §13(c): reconcile kopia-side pin state with spec.pin once the
                 // snapshot exists. A no-op when already in the desired state.
@@ -588,7 +667,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     .and_then(|s| s.staged.as_ref())
                     .is_some()
                 {
-                    io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                    io::cleanup_staged_source(
+                        &ctx.client,
+                        &namespace,
+                        &name,
+                        backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                    )
+                    .await?;
                 }
                 return Ok(Action::requeue(Duration::from_secs(120)));
             }
@@ -620,7 +705,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         // Stop the kubelet's retry loop, then reap the staged objects
                         // (PVC before VS — the delete order that is safe mid-restore).
                         let _ = job_api.delete(&name, &DeleteParams::background()).await;
-                        io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                        io::cleanup_staged_source(
+                            &ctx.client,
+                            &namespace,
+                            &name,
+                            backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                        )
+                        .await?;
                         return Ok(Action::requeue(Duration::from_secs(120)));
                     }
                     StagedPvcWatch::Clear => {}
@@ -663,7 +754,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         .and_then(|s| s.staged.as_ref())
                         .is_some()
                     {
-                        io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+                        io::cleanup_staged_source(
+                            &ctx.client,
+                            &namespace,
+                            &name,
+                            backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                        )
+                        .await?;
                     }
                     return Ok(Action::requeue(Duration::from_secs(120)));
                 }
@@ -1286,6 +1383,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &ctx.client,
         &ctx.watch_scope,
         &config,
+        backup.spec.source.as_ref(),
         &namespace,
         &name,
         &owner,
@@ -1331,6 +1429,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     "staged": {
                         "copyMethod": staged.copy_method,
                         "volumeSnapshotName": staged.volume_snapshot_name,
+                        // Present only under `groupBy: VolumeGroupSnapshot`.
+                        // The group has no ownerReferences, so recording it here
+                        // is how it stays observable and reapable.
+                        "volumeGroupSnapshotName": staged.volume_group_snapshot_name,
                         "pvcName": staged.pvc_name,
                         "ready": true,
                         "storageClassName": staged.storage_class_name,
@@ -1449,7 +1551,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // finalizer drains an in-flight restore safely). The stamped `staged`
             // block also lets the terminal-path gates re-issue this on any later
             // reconcile, covering a crash between the patch above and this call.
-            io::cleanup_staged_source(&ctx.client, &namespace, &name).await?;
+            io::cleanup_staged_source(
+                &ctx.client,
+                &namespace,
+                &name,
+                backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+            )
+            .await?;
             return Ok(Action::await_change());
         }
     };
@@ -2119,7 +2227,13 @@ async fn handle_deletion(
         .and_then(|s| s.staged.as_ref())
         .is_some()
     {
-        io::cleanup_staged_source(&ctx.client, namespace, name).await?;
+        io::cleanup_staged_source(
+            &ctx.client,
+            namespace,
+            name,
+            backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+        )
+        .await?;
     }
 
     // Namespace-deletion cascade (ADR-0005 §5): if the owning namespace is being torn
@@ -3331,7 +3445,12 @@ async fn reconcile_pin(
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
-    let identity = resolve_identity_for(&config, namespace, repo.identity_defaults.as_ref())?;
+    let identity = resolve_identity_for(
+        &config,
+        namespace,
+        repo.identity_defaults.as_ref(),
+        backup.spec.source.as_ref(),
+    )?;
     let owner = io::owner_ref_for(backup, "Snapshot")?;
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
@@ -3696,7 +3815,12 @@ async fn resolve_succeeded_snapshot(
     namespace: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
-    let identity = resolve_identity_for(&config, namespace, repo.identity_defaults.as_ref())?;
+    let identity = resolve_identity_for(
+        &config,
+        namespace,
+        repo.identity_defaults.as_ref(),
+        backup.spec.source.as_ref(),
+    )?;
     match &repo.backend {
         Backend::Filesystem(fs) => {
             let creds = io::repo_credentials(&repo.encryption);

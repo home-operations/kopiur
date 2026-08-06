@@ -158,6 +158,15 @@ pub struct PolicyArgsSpec {
     /// `--[no-]ignore-cache-dirs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_cache_dirs: Option<bool>,
+    /// `--ignore-identical-snapshots` (`files.ignoreIdenticalSnapshots`).
+    ///
+    /// Only ever `Some(true)`: an opt-in raises the knob at the PATH scope,
+    /// which beats the `false` the mover pins at the identity scope on every
+    /// run. Leaving it `None` when the user did not opt in keeps
+    /// [`Self::is_empty`] meaningful, so an otherwise-unconfigured policy still
+    /// skips the path-scoped `policy set` entirely. See #351.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_identical_snapshots: Option<bool>,
     /// `--[no-]ignore-file-errors`. ADR-0005 §13(b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_file_errors: Option<bool>,
@@ -185,6 +194,7 @@ impl PolicyArgsSpec {
             && self.ignore.is_empty()
             && self.never_compress.is_empty()
             && self.ignore_cache_dirs.is_none()
+            && self.ignore_identical_snapshots.is_none()
             && self.ignore_file_errors.is_none()
             && self.ignore_dir_errors.is_none()
             && self.ignore_unknown_types.is_none()
@@ -207,6 +217,7 @@ impl PolicyArgsSpec {
             ignore: self.ignore.clone(),
             never_compress: self.never_compress.clone(),
             ignore_cache_dirs: self.ignore_cache_dirs,
+            ignore_identical_snapshots: self.ignore_identical_snapshots,
             ignore_file_errors: self.ignore_file_errors,
             ignore_dir_errors: self.ignore_dir_errors,
             ignore_unknown_types: self.ignore_unknown_types,
@@ -226,11 +237,20 @@ impl PolicyArgsSpec {
             Some(c) => (c.compressor.clone(), c.never_compress.clone()),
             None => (None, Vec::new()),
         };
-        let (ignore, ignore_cache_dirs) = match &spec.files {
+        let (ignore, ignore_cache_dirs, ignore_identical_snapshots) = match &spec.files {
             // `ignore_cache_dirs` is a bool on the CRD; only emit the flag when true
             // (Some(true)) — an unset/false leaves kopia's default rather than forcing
             // `--no-ignore-cache-dirs`, matching the "absent = kopia default" contract.
-            Some(f) => (f.ignore_rules.clone(), f.ignore_cache_dirs.then_some(true)),
+            //
+            // `ignore_identical_snapshots` follows the same only-when-true rule, but
+            // for a different reason: `false` is not "leave kopia's default", it is a
+            // guarantee Kopiur needs, so the mover pins it at the identity scope on
+            // EVERY run instead of relying on this path-scoped spec (#351).
+            Some(f) => (
+                f.ignore_rules.clone(),
+                f.ignore_cache_dirs.then_some(true),
+                f.ignore_identical_snapshots.then_some(true),
+            ),
             // The apiserver only server-side-defaults NESTED fields when the parent
             // object is present, so a `SnapshotPolicy` that omits `files:` entirely
             // (the common case) never gets `Files.ignore_rules`'s schema default
@@ -238,7 +258,11 @@ impl PolicyArgsSpec {
             // layer wires as the serde/schemars default, so there is one source of
             // truth for the OS-artifact exclude set regardless of which of the two
             // "absent" shapes (`files:` missing vs. `files: {}`) the spec took.
-            None => (kopiur_api::snapshot_policy::default_ignore_rules(), None),
+            None => (
+                kopiur_api::snapshot_policy::default_ignore_rules(),
+                None,
+                None,
+            ),
         };
         let eh = spec.error_handling.as_ref();
         let up = spec.upload.as_ref();
@@ -247,6 +271,7 @@ impl PolicyArgsSpec {
             ignore,
             never_compress,
             ignore_cache_dirs,
+            ignore_identical_snapshots,
             ignore_file_errors: eh.and_then(|e| e.ignore_file_errors.then_some(true)),
             ignore_dir_errors: eh.and_then(|e| e.ignore_dir_errors.then_some(true)),
             ignore_unknown_types: eh.and_then(|e| e.ignore_unknown_types.then_some(true)),

@@ -21,10 +21,27 @@ use crate::wait::{DEFAULT_WAIT_TIMEOUT, wait_for};
 /// rest of the tooling (`snapshots list --policy`, the controller's
 /// `resolve_origin`) treats it uniformly.
 pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc>) -> Snapshot {
-    let name = args
+    build_snapshot_for(args, namespace, now, None)
+}
+
+/// [`build_snapshot`] for one member of a `pvcSelector` expansion.
+///
+/// `member` carries the child's deterministic name and the `spec.source` pin
+/// saying which PVC it covers. `None` is the ordinary single-source case.
+pub fn build_snapshot_for(
+    args: &SnapshotNowArgs,
+    namespace: &str,
+    now: DateTime<Utc>,
+    member: Option<(&str, &kopiur_api::SnapshotSourceRef)>,
+) -> Snapshot {
+    let base = args
         .name
         .clone()
         .unwrap_or_else(|| format!("{}-manual-{}", args.policy, now.format("%Y%m%d%H%M%S")));
+    let (name, source) = match member {
+        Some((child, src)) => (child.to_string(), Some(src.clone())),
+        None => (base, None),
+    };
     let failure_policy = if args.backoff_limit.is_some()
         || args.active_deadline_seconds.is_some()
         || args.pod_startup_deadline_seconds.is_some()
@@ -40,6 +57,7 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
     let mut snapshot = Snapshot::new(
         &name,
         SnapshotSpec {
+            source,
             policy_ref: Some(PolicyRef {
                 name: args.policy.clone(),
                 namespace: None,
@@ -76,7 +94,11 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
 pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapshot>>> {
     match snapshot.status.as_ref().and_then(|s| s.phase)? {
         SnapshotPhase::Pending | SnapshotPhase::Running => None,
-        SnapshotPhase::Succeeded => Some(Ok(Box::new(snapshot.clone()))),
+        // `Unchanged` is a SUCCESS: the source was read and hashed, and kopia
+        // declined to write a second identical manifest. Exiting non-zero here
+        // would fail every `kubectl kopiur snapshot now --wait` in a CI/GitOps
+        // job the moment a source stopped changing — the healthy case.
+        SnapshotPhase::Succeeded | SnapshotPhase::Unchanged => Some(Ok(Box::new(snapshot.clone()))),
         SnapshotPhase::Failed => Some(Err(Box::new(snapshot.clone()))),
         // A manual Snapshot can only be Deleting if someone deleted it mid-run;
         // surface that as the failure path (the wait also catches the delete
@@ -89,8 +111,19 @@ pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapsho
 }
 
 /// One-line success summary from the terminal object's status.
+///
+/// An `Unchanged` run gets its own line rather than the usual one: it has no
+/// kopia id, no size and no duration to report, so the shared formatter would
+/// print `kopia id ?, ?, took ?` and read like something went wrong.
 pub fn success_summary(snapshot: &Snapshot) -> String {
     let status = snapshot.status.as_ref();
+    if status.and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged) {
+        let name = snapshot.metadata.name.as_deref().unwrap_or("?");
+        return format!(
+            "snapshot {name}: no files changed since the previous snapshot, so no new \
+             snapshot was created (the previous one is still the restore point)\n"
+        );
+    }
     let id = status
         .and_then(|s| s.snapshot.as_ref())
         .map(|i| i.kopia_snapshot_id.as_str())
@@ -125,6 +158,91 @@ pub fn failure_detail(snapshot: &Snapshot) -> String {
     }
     out.push('\n');
     out
+}
+
+/// The `Snapshot` CRs this invocation should create.
+///
+/// One, for an ordinary single-source recipe. N — one per matched PVC — when
+/// the recipe uses a `pvcSelector` (#346). The CLI expands rather than letting
+/// the operator guess, for the same reason a `SnapshotSchedule` does: a
+/// `Snapshot` must never pick one of N volumes on the user's behalf.
+///
+/// The decisions (names, pins, the same-path collision guard) come from
+/// `kopiur_api::expand`, shared verbatim with the controller. Only the PVC
+/// listing is here, because the CLI cannot depend on the controller crate.
+async fn plan_snapshots(
+    ctx: &KubeCtx,
+    args: &SnapshotNowArgs,
+    policy: &SnapshotPolicy,
+    ns: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<Snapshot>, CliError> {
+    use std::collections::BTreeMap;
+
+    let base = args
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{}-manual-{}", args.policy, now.format("%Y%m%d%H%M%S")));
+
+    let mut matched: BTreeMap<usize, Vec<kopiur_api::PvcTargetRef>> = BTreeMap::new();
+    for (index, source) in policy.spec.sources.iter().enumerate() {
+        let Some(selector) = source.pvc_selector.as_ref() else {
+            continue;
+        };
+        let namespaces: Vec<String> = match selector.namespace_selector.as_ref() {
+            Some(n) if !n.match_names.is_empty() => n.match_names.clone(),
+            _ => vec![ns.to_string()],
+        };
+        let label_selector = selector
+            .label_selector
+            .as_ref()
+            .map(kopiur_api::expand::label_selector_string)
+            .unwrap_or_default();
+        let mut found = Vec::new();
+        for namespace in &namespaces {
+            let api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+                Api::namespaced(ctx.client.clone(), namespace);
+            let mut lp = kube::api::ListParams::default();
+            if !label_selector.is_empty() {
+                lp = lp.labels(&label_selector);
+            }
+            let list = api.list(&lp).await.map_err(|e| {
+                classify_kube(
+                    "list",
+                    "PersistentVolumeClaim",
+                    "persistentvolumeclaims",
+                    Some(namespace),
+                    None,
+                    e,
+                )
+            })?;
+            for pvc in list.items {
+                if let Some(name) = pvc.metadata.name {
+                    found.push(kopiur_api::PvcTargetRef {
+                        namespace: namespace.clone(),
+                        name,
+                    });
+                }
+            }
+        }
+        // Deterministic: the child names derive from this order.
+        found.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        found.dedup();
+        matched.insert(index, found);
+    }
+
+    let members = kopiur_api::expand::expand_sources(policy, &base, &matched).map_err(|e| {
+        CliError::AdmissionDenied {
+            message: e.to_string(),
+        }
+    })?;
+    Ok(match members {
+        None => vec![build_snapshot(args, ns, now)],
+        Some(members) => members
+            .iter()
+            .map(|m| build_snapshot_for(args, ns, now, Some((&m.name, &m.source))))
+            .collect(),
+    })
 }
 
 /// Run `snapshot now`.
@@ -164,15 +282,50 @@ pub async fn run(
     }
 
     let snapshots: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
-    let snapshot = build_snapshot(args, ns, now);
-    let name = snapshot.metadata.name.clone().expect("name set by builder");
-    let created = snapshots
-        .create(&PostParams::default(), &snapshot)
-        .await
-        .map_err(|e| classify_kube("create", "Snapshot", "snapshots", Some(ns), Some(&name), e))?;
+    // A `pvcSelector` recipe expands to one Snapshot per matched PVC (#346).
+    // The CLI does the expansion itself for the same reason a SnapshotSchedule
+    // does: a Snapshot must never guess which of N volumes it covers.
+    let planned = plan_snapshots(ctx, args, &policy, ns, now).await?;
+    if planned.is_empty() {
+        return Err(CliError::SelectorMatchedNothing {
+            policy: args.policy.clone(),
+            namespace: ns.to_string(),
+        });
+    }
+    let mut created_all = Vec::new();
+    for snapshot in &planned {
+        let n = snapshot.metadata.name.clone().expect("name set by builder");
+        created_all.push(
+            snapshots
+                .create(&PostParams::default(), snapshot)
+                .await
+                .map_err(|e| {
+                    classify_kube("create", "Snapshot", "snapshots", Some(ns), Some(&n), e)
+                })?,
+        );
+    }
+    // The single-CR paths below (wait / --logs / the object echo) follow the
+    // FIRST child. With a fan-out there is no single object to echo, so the
+    // names are listed instead and the wait covers every child.
+    let created = created_all.first().cloned().expect("at least one");
+    let names: Vec<String> = created_all
+        .iter()
+        .filter_map(|s| s.metadata.name.clone())
+        .collect();
+    let name = names.first().cloned().expect("at least one");
+    let fanned = names.len() > 1;
 
     let wait = args.wait || args.logs;
-    let created_line = format!("snapshot.{}/{} created\n", kopiur_api::GROUP, name);
+    let created_line = if fanned {
+        format!(
+            "{} snapshots created ({}) — SnapshotPolicy {} expands a pvcSelector\n",
+            names.len(),
+            names.join(", "),
+            args.policy
+        )
+    } else {
+        format!("snapshot.{}/{} created\n", kopiur_api::GROUP, name)
+    };
     if !wait {
         let text = match output {
             OutputFormat::Table | OutputFormat::Wide => created_line,
