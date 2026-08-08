@@ -374,7 +374,7 @@ async fn list_repos(ctx: &KubeCtx) -> Result<Vec<RepoSummary>, Outcome> {
                     phase: r
                         .status
                         .as_ref()
-                        .and_then(|s| s.phase)
+                        .and_then(|s| s.phase.as_ref())
                         .map(|p| p.label().to_string()),
                     ready_message: r
                         .status
@@ -402,7 +402,7 @@ async fn list_repos(ctx: &KubeCtx) -> Result<Vec<RepoSummary>, Outcome> {
                     phase: r
                         .status
                         .as_ref()
-                        .and_then(|s| s.phase)
+                        .and_then(|s| s.phase.as_ref())
                         .map(|p| p.label().to_string()),
                     ready_message: r
                         .status
@@ -518,7 +518,7 @@ async fn check_stuck(ctx: &KubeCtx, threshold: std::time::Duration, now: DateTim
         Ok(listed) => {
             for s in listed.items {
                 let in_flight = matches!(
-                    s.status.as_ref().and_then(|st| st.phase),
+                    s.status.as_ref().and_then(|st| st.phase.as_ref()),
                     Some(SnapshotPhase::Pending | SnapshotPhase::Running) | None
                 );
                 if in_flight && age_of(&s.metadata, now).is_some_and(|a| a > threshold) {
@@ -540,7 +540,7 @@ async fn check_stuck(ctx: &KubeCtx, threshold: std::time::Duration, now: DateTim
         Ok(listed) => {
             for r in listed.items {
                 let in_flight = matches!(
-                    r.status.as_ref().and_then(|st| st.phase),
+                    r.status.as_ref().and_then(|st| st.phase.as_ref()),
                     Some(RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring)
                         | None
                 );

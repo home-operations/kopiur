@@ -357,7 +357,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // (generation) or a Secret content edit (resourceVersion; re-triggered by
             // the Secret watch in `lib.rs`).
             if io::terminal_gate_holds(
-                repo.status.as_ref().and_then(|s| s.phase),
+                repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 repo.metadata.generation,
                 repo.status
@@ -430,7 +430,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     let conditions = io::set_ready(
                         &conditions,
                         repo.metadata.generation,
-                        io::ready_outcome_for_phase(phase_enum),
+                        io::ready_outcome_for_phase(&phase_enum),
                         class.as_str(),
                         class.summary(),
                     );
@@ -483,7 +483,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             let conditions = io::set_ready(
                 &existing,
                 repo.metadata.generation,
-                io::ready_outcome_for_phase(RepositoryPhase::Ready),
+                io::ready_outcome_for_phase(&RepositoryPhase::Ready),
                 "Connected",
                 "connected to the existing repository",
             );
@@ -849,7 +849,7 @@ async fn bootstrap_cluster_via_mover(
         repo.status
             .as_ref()
             .and_then(|s| s.last_reverify_at.as_deref()),
-        repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
     );
 
     // Backend health probe (`spec.health.probe`, default-on) — mirrors the
@@ -866,8 +866,8 @@ async fn bootstrap_cluster_via_mover(
         .is_some();
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
-    let prior_phase = repo.status.as_ref().and_then(|s| s.phase);
-    let already_ready = prior_phase == Some(RepositoryPhase::Ready);
+    let prior_phase = repo.status.as_ref().and_then(|s| s.phase.as_ref());
+    let already_ready = prior_phase == Some(&RepositoryPhase::Ready);
     let probe_attempt_at = repo
         .status
         .as_ref()
@@ -983,7 +983,7 @@ async fn bootstrap_cluster_via_mover(
     if !(reverify
         || probe.launches()
         || catalog::bootstrap_create_due(
-            repo.status.as_ref().and_then(|s| s.phase) == Some(RepositoryPhase::Ready),
+            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
             repo.metadata.generation,
             repo.status.as_ref().and_then(|s| s.observed_generation),
             cluster_last_refresh_at(repo),
@@ -1043,7 +1043,7 @@ async fn bootstrap_cluster_via_mover(
     // twin). A spec change bypasses it (immediate retry on new config).
     if !spec_changed
         && let Some(remaining) = health::strict_retry_holdoff(
-            prior_phase == Some(RepositoryPhase::Degraded),
+            prior_phase == Some(&RepositoryPhase::Degraded),
             repo.status
                 .as_ref()
                 .and_then(|s| s.health.as_ref())
@@ -1506,7 +1506,7 @@ async fn finalize_cluster_bootstrap(
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(RepositoryPhase::Ready),
+        io::ready_outcome_for_phase(&RepositoryPhase::Ready),
         "Bootstrapped",
         if result.created {
             "created a new repository"
@@ -1669,7 +1669,7 @@ async fn finalize_cluster_bootstrap_failure(
         let conditions = io::set_ready(
             &conditions,
             repo.metadata.generation,
-            io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+            io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
             reason,
             &failure.condition_message(),
         );
@@ -1716,7 +1716,7 @@ async fn finalize_cluster_bootstrap_failure(
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(RepositoryPhase::Failed),
+        io::ready_outcome_for_phase(&RepositoryPhase::Failed),
         reason,
         &failure.condition_message(),
     );
@@ -1818,7 +1818,7 @@ async fn recycle_cluster_bootstrap_outage(
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(p.phase),
+        io::ready_outcome_for_phase(&p.phase),
         p.ready_reason,
         p.ready_message,
     );
@@ -1853,7 +1853,7 @@ async fn recycle_cluster_bootstrap_outage(
     // cycle for a multi-day outage.
     if p.opened
         && wrote
-        && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded)
+        && repo.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RepositoryPhase::Degraded)
     {
         failure.publish(ctx, &io::event_ref(repo), name).await;
         ctx.metrics
@@ -1946,7 +1946,7 @@ async fn finalize_cluster_probe_failure(
     let conditions = io::set_ready(
         &upd.conditions,
         repo.metadata.generation,
-        io::ready_outcome_for_phase(p.phase),
+        io::ready_outcome_for_phase(&p.phase),
         p.ready_reason,
         p.ready_message,
     );
@@ -1980,7 +1980,7 @@ async fn finalize_cluster_probe_failure(
     // byte-stable condition message deliberately omits.
     if p.opened
         && wrote
-        && repo.status.as_ref().and_then(|s| s.phase) != Some(RepositoryPhase::Degraded)
+        && repo.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RepositoryPhase::Degraded)
     {
         ctx.metrics
             .inc_breaker_trip("ClusterRepository", "", name, kind.label());

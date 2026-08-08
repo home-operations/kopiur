@@ -112,14 +112,19 @@ fn readiness_gate_holds_only_pre_launch_phases() {
     // Not yet launched (no status, Pending, or resolved-but-undispatched): the
     // repository-readiness gate may hold these.
     assert!(restore_awaiting_launch(None));
-    assert!(restore_awaiting_launch(Some(Pending)));
-    assert!(restore_awaiting_launch(Some(Resolving)));
+    assert!(restore_awaiting_launch(Some(&Pending)));
+    assert!(restore_awaiting_launch(Some(&Resolving)));
     // A live (or just-terminal) mover Job must be observed, never re-gated —
     // and a populator's non-terminal `Completed` heartbeat must not be flipped
     // back to `Pending`.
-    assert!(!restore_awaiting_launch(Some(Restoring)));
-    assert!(!restore_awaiting_launch(Some(Completed)));
-    assert!(!restore_awaiting_launch(Some(Failed)));
+    assert!(!restore_awaiting_launch(Some(&Restoring)));
+    assert!(!restore_awaiting_launch(Some(&Completed)));
+    assert!(!restore_awaiting_launch(Some(&Failed)));
+    // A phase written by a NEWER operator: never re-gate it back to `Pending`,
+    // which would fight a mover the newer operator may already have launched.
+    assert!(!restore_awaiting_launch(Some(&RestorePhase::Unknown(
+        "Staging".into()
+    ))));
 }
 
 #[test]
@@ -176,16 +181,23 @@ fn populator_completed_is_not_terminal_at_guard() {
     // `Completed` is also what makes a populator `Restore` REUSABLE: delete the claiming
     // PVC and apply a fresh one with the same `dataSourceRef` and reconcile falls through
     // here to populate the new (unbound) claim, rather than short-circuiting as "consumed".
-    assert!(!phase_is_terminal_at_guard(Completed, AwaitingClaim));
+    assert!(!phase_is_terminal_at_guard(&Completed, AwaitingClaim));
     // A direct restore writes the target itself, so `Completed` IS terminal.
-    assert!(phase_is_terminal_at_guard(Completed, DirectTarget));
+    assert!(phase_is_terminal_at_guard(&Completed, DirectTarget));
     // `Failed` is terminal regardless of dispatch model.
-    assert!(phase_is_terminal_at_guard(Failed, AwaitingClaim));
-    assert!(phase_is_terminal_at_guard(Failed, DirectTarget));
+    assert!(phase_is_terminal_at_guard(&Failed, AwaitingClaim));
+    assert!(phase_is_terminal_at_guard(&Failed, DirectTarget));
     // In-flight phases are never terminal.
-    for p in [Pending, Resolving, Restoring] {
-        assert!(!phase_is_terminal_at_guard(p, AwaitingClaim));
-        assert!(!phase_is_terminal_at_guard(p, DirectTarget));
+    for p in [
+        Pending,
+        Resolving,
+        Restoring,
+        // An uninterpretable phase must not short-circuit the reconcile into
+        // "nothing left to do".
+        RestorePhase::Unknown("Staging".into()),
+    ] {
+        assert!(!phase_is_terminal_at_guard(&p, AwaitingClaim));
+        assert!(!phase_is_terminal_at_guard(&p, DirectTarget));
     }
 }
 
@@ -211,7 +223,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
     assert_eq!(
         pinned_decision(
             Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-            Some(Completed),
+            Some(&Completed),
             AwaitingClaim,
             false,
         ),
@@ -225,7 +237,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
                 Some(ResolutionOutcome::Snapshot),
                 Some("k7")
             )),
-            Some(Pending),
+            Some(&Pending),
             DirectTarget,
             false,
         ),
@@ -236,7 +248,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
     assert_eq!(
         pinned_decision(
             Some(&resolved_with(None, Some("k7"))),
-            Some(Pending),
+            Some(&Pending),
             DirectTarget,
             false,
         ),
@@ -247,19 +259,19 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
     // resolved populator ALWAYS pins before Completed, so this unambiguously means
     // the decision was "empty" — back-fill Empty, do NOT re-resolve.
     assert_eq!(
-        pinned_decision(None, Some(Completed), AwaitingClaim, false),
+        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
         Some(Resolution::Empty)
     );
     // The same shape on a DIRECT target is not a stuck populator (its `Completed`
     // is terminal at the guard, so it never reaches here): require fresh resolution.
     assert_eq!(
-        pinned_decision(None, Some(Completed), DirectTarget, false),
+        pinned_decision(None, Some(&Completed), DirectTarget, false),
         None
     );
 
     // A fresh, un-pinned restore must resolve.
     assert_eq!(
-        pinned_decision(None, Some(Pending), AwaitingClaim, false),
+        pinned_decision(None, Some(&Pending), AwaitingClaim, false),
         None
     );
     assert_eq!(pinned_decision(None, None, DirectTarget, false), None);
@@ -279,13 +291,13 @@ fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
     // The no-op'd populator: do NOT infer "empty", leave it unresolved so a recreated
     // claim re-resolves and restores for real.
     assert_eq!(
-        pinned_decision(None, Some(Completed), AwaitingClaim, true),
+        pinned_decision(None, Some(&Completed), AwaitingClaim, true),
         None
     );
     // The legacy stuck populator (same shape, but NOT an already-bound no-op) still
     // back-fills — that heal must survive this fix.
     assert_eq!(
-        pinned_decision(None, Some(Completed), AwaitingClaim, false),
+        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
         Some(Resolution::Empty)
     );
     // A genuine deploy-or-restore PINNED `NoSnapshot`, so it reads its pin either way:
@@ -294,7 +306,7 @@ fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
         assert_eq!(
             pinned_decision(
                 Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-                Some(Completed),
+                Some(&Completed),
                 AwaitingClaim,
                 noop,
             ),
@@ -308,7 +320,7 @@ fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
                     Some(ResolutionOutcome::Snapshot),
                     Some("k9")
                 )),
-                Some(Completed),
+                Some(&Completed),
                 AwaitingClaim,
                 noop,
             ),
@@ -328,19 +340,25 @@ fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
 fn ready_outcome_maps_every_phase() {
     use crate::io::ReadyOutcome;
     assert_eq!(
-        restore_ready_outcome(RestorePhase::Completed),
+        restore_ready_outcome(&RestorePhase::Completed),
         ReadyOutcome::Ready
     );
     assert_eq!(
-        restore_ready_outcome(RestorePhase::Failed),
+        restore_ready_outcome(&RestorePhase::Failed),
         ReadyOutcome::Stalled
     );
     for p in [
         RestorePhase::Pending,
         RestorePhase::Resolving,
         RestorePhase::Restoring,
+        // Never Ready, never Stalled — `kubectl wait` keeps waiting.
+        RestorePhase::Unknown("Staging".into()),
     ] {
-        assert_eq!(restore_ready_outcome(p), ReadyOutcome::Reconciling, "{p:?}");
+        assert_eq!(
+            restore_ready_outcome(&p),
+            ReadyOutcome::Reconciling,
+            "{p:?}"
+        );
     }
 }
 
@@ -425,15 +443,15 @@ fn mover_stamped_terminal_phase_without_ready_is_not_settled() {
     status.phase = Some(RestorePhase::Completed); // mover stamp: phase only
     r.status = Some(status);
 
-    assert!(!kstatus_settled_for(&r, RestorePhase::Completed));
-    assert!(!kstatus_settled_for(&r, RestorePhase::Failed));
+    assert!(!kstatus_settled_for(&r, &RestorePhase::Completed));
+    assert!(!kstatus_settled_for(&r, &RestorePhase::Failed));
 
     // Heal (what the terminal gate patches), then it must be settled.
     let healed = restore_ready_status(&r, RestorePhase::Completed, "RestoreSucceeded", "done");
     let mut status = r.status.take().unwrap();
     status.conditions = serde_json::from_value(healed["conditions"].clone()).unwrap();
     r.status = Some(status);
-    assert!(kstatus_settled_for(&r, RestorePhase::Completed));
+    assert!(kstatus_settled_for(&r, &RestorePhase::Completed));
     // ...and the domain condition still survives the heal.
     let conds = &r.status.as_ref().unwrap().conditions;
     assert!(

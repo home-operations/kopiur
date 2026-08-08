@@ -64,7 +64,28 @@ impl SnapshotLike for SnapshotRetentionView {
 pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
     use kopiur_api::SnapshotPhase;
     let status = b.status.as_ref()?;
-    if status.phase != Some(SnapshotPhase::Succeeded) {
+    // Exhaustive, not `!= Succeeded`: GFS membership is a CLASSIFICATION whose
+    // "no" side spans four unrelated meanings (in-flight, failed, deduped,
+    // foreign). A new phase silently defaulting to "not retention-governed"
+    // would quietly stop protecting a real restore point, so the compiler asks
+    // here first. Deliberately NOT `is_terminal()`: `Discovered`/`Unchanged`
+    // are terminal but must not claim a GFS bucket.
+    let participates_in_gfs = status.phase.as_ref().is_some_and(|p| match p {
+        SnapshotPhase::Succeeded => true,
+        // `Unchanged` owns no manifest, so it must never displace one that
+        // exists; `Discovered` is bounded by the catalog, not by this policy's
+        // retention; the rest are not terminal successes at all.
+        SnapshotPhase::Unchanged
+        | SnapshotPhase::Discovered
+        | SnapshotPhase::Pending
+        | SnapshotPhase::Running
+        | SnapshotPhase::Failed
+        | SnapshotPhase::Deleting => false,
+        // Never let a phase this build cannot read enter a set whose losers get
+        // DELETED from the repository.
+        SnapshotPhase::Unknown(_) => false,
+    });
+    if !participates_in_gfs {
         return None;
     }
     // PROVENANCE (defense in depth): a `Succeeded` row only participates in GFS
@@ -159,7 +180,7 @@ pub fn unchanged_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<Str
     // every pass would churn ~10 finalizer-guarded deletes.
     let mut buckets: BTreeMap<String, Vec<&Snapshot>> = BTreeMap::new();
     for s in backups.iter().filter(|s| {
-        s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Unchanged)
+        s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)
             && s.metadata.deletion_timestamp.is_none()
     }) {
         buckets.entry(retention_group_key(s)).or_default().push(s);
@@ -493,11 +514,21 @@ pub fn consecutive_failures<'a>(backups: impl IntoIterator<Item = &'a Snapshot>)
     use kopiur_api::SnapshotPhase;
     let terminal_time = |b: &Snapshot| -> Option<(DateTime<Utc>, SnapshotPhase)> {
         let status = b.status.as_ref()?;
-        let phase = status.phase?;
-        if !matches!(
-            phase,
-            SnapshotPhase::Succeeded | SnapshotPhase::Failed | SnapshotPhase::Unchanged
-        ) {
+        let phase = status.phase.clone()?;
+        // Exhaustive, NOT `SnapshotPhase::is_terminal()`: a streak is about RUNS,
+        // so `Discovered` (terminal, but never a run of this policy) is
+        // deliberately excluded — the sets differ.
+        let counts_toward_streak = match phase {
+            SnapshotPhase::Succeeded | SnapshotPhase::Failed | SnapshotPhase::Unchanged => true,
+            SnapshotPhase::Pending
+            | SnapshotPhase::Running
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered => false,
+            // A phase this build cannot read is neither a success nor a
+            // failure; keeping it out leaves the streak on known evidence only.
+            SnapshotPhase::Unknown(_) => false,
+        };
+        if !counts_toward_streak {
             return None;
         }
         let t = status
@@ -522,12 +553,18 @@ pub fn consecutive_failures<'a>(backups: impl IntoIterator<Item = &'a Snapshot>)
             SnapshotPhase::Failed => n += 1,
             // `Unchanged` breaks the streak exactly like `Succeeded`: a run that
             // read the source and found it identical is proof the backup path
-            // works. Letting it fall through to `_ => {}` would leave the streak
-            // frozen at its last value, so `KopiurBackupFailing` could never
-            // clear for a policy that recovered and then went quiet.
+            // works. Letting it fall through to a `_ => {}` wildcard would leave
+            // the streak frozen at its last value, so `KopiurBackupFailing`
+            // could never clear for a policy that recovered and then went quiet.
             SnapshotPhase::Succeeded | SnapshotPhase::Unchanged => break,
-            // Non-terminal already filtered out.
-            _ => {}
+            // Unreachable: `terminal_time` already filtered these out. Named
+            // rather than `_ =>` so the filter and this match must be updated
+            // together when a phase is added.
+            SnapshotPhase::Pending
+            | SnapshotPhase::Running
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unknown(_) => {}
         }
     }
     n
@@ -1677,6 +1714,12 @@ mod tests {
         );
         // A genuine produced/adopted row (status.snapshot present) still enters GFS.
         assert!(retention_view(&succeeded_backup("real", at(2026, 5, 24))).is_some());
+        // A phase written by a NEWER operator never enters GFS either: the losers
+        // of a retention pass get DELETED from the repository, so a phase this
+        // build cannot read must not be able to claim (or lose) a bucket.
+        let mut future = succeeded_backup("future", at(2026, 5, 24));
+        future.status.as_mut().unwrap().phase = Some(SnapshotPhase::Unknown("Quiescing".into()));
+        assert!(retention_view(&future).is_none());
     }
 
     #[test]

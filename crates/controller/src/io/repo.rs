@@ -302,7 +302,7 @@ fn age_seconds(ts: Option<&str>, now: DateTime<Utc>) -> (bool, i64) {
 /// `ClusterRepository`) into [`PreflightInputs`]. The `maintenance.*` fields are left
 /// at their fail-closed defaults — the caller fills them via [`maintenance_recency`].
 pub fn repo_status_to_inputs(
-    phase: Option<RepositoryPhase>,
+    phase: Option<&RepositoryPhase>,
     conditions: &[Condition],
     storage: Option<&StorageStats>,
     health: Option<&RepositoryHealthStatus>,
@@ -328,7 +328,7 @@ pub fn repo_status_to_inputs(
     let (size_bytes_known, size_bytes) = split(storage.and_then(|s| s.total_size_bytes));
     PreflightInputs {
         repository_phase: phase.map(|p| p.label().to_string()).unwrap_or_default(),
-        repository_ready: phase == Some(RepositoryPhase::Ready),
+        repository_ready: phase == Some(&RepositoryPhase::Ready),
         backend_reachable,
         snapshot_count_known,
         snapshot_count,
@@ -410,7 +410,7 @@ pub async fn gather_preflight_inputs(
             })?;
             let st = repo.status.as_ref();
             let inputs = repo_status_to_inputs(
-                st.and_then(|s| s.phase),
+                st.and_then(|s| s.phase.as_ref()),
                 st.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
                 st.and_then(|s| s.storage_stats.as_ref()),
                 st.and_then(|s| s.health.as_ref()),
@@ -427,7 +427,7 @@ pub async fn gather_preflight_inputs(
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
             let st = repo.status.as_ref();
             let inputs = repo_status_to_inputs(
-                st.and_then(|s| s.phase),
+                st.and_then(|s| s.phase.as_ref()),
                 st.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
                 st.and_then(|s| s.storage_stats.as_ref()),
                 st.and_then(|s| s.health.as_ref()),
@@ -463,7 +463,7 @@ pub async fn request_repository_reverify(
 ) -> Result<()> {
     /// At most one forced re-probe per repository per this window.
     const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    let ready = Some(kopiur_api::RepositoryPhase::Ready);
+    let ready = Some(&kopiur_api::RepositoryPhase::Ready);
     let key = crate::consts::REVERIFY_REQUESTED_ANNOTATION;
     let body = |ts: &str| {
         Patch::Merge(serde_json::json!({
@@ -479,7 +479,7 @@ pub async fn request_repository_reverify(
             let Some(repo) = api.get_opt(&name).await? else {
                 return Ok(());
             };
-            if repo.status.as_ref().and_then(|s| s.phase) != ready {
+            if repo.status.as_ref().and_then(|s| s.phase.as_ref()) != ready {
                 return Ok(());
             }
             let existing = repo.metadata.annotations.as_ref().and_then(|a| a.get(key));
@@ -496,7 +496,7 @@ pub async fn request_repository_reverify(
             let Some(repo) = api.get_opt(&name).await? else {
                 return Ok(());
             };
-            if repo.status.as_ref().and_then(|s| s.phase) != ready {
+            if repo.status.as_ref().and_then(|s| s.phase.as_ref()) != ready {
                 return Ok(());
             }
             let existing = repo.metadata.annotations.as_ref().and_then(|a| a.get(key));

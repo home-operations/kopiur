@@ -143,7 +143,7 @@ fn condition<'a>(conditions: &'a [Condition], type_: &str) -> Option<&'a Conditi
 }
 
 /// Is a Snapshot non-terminal? Exhaustive.
-fn snapshot_in_flight(phase: Option<SnapshotPhase>) -> bool {
+fn snapshot_in_flight(phase: Option<&SnapshotPhase>) -> bool {
     match phase {
         Some(SnapshotPhase::Pending | SnapshotPhase::Running) | None => true,
         Some(
@@ -153,16 +153,22 @@ fn snapshot_in_flight(phase: Option<SnapshotPhase>) -> bool {
             | SnapshotPhase::Discovered
             | SnapshotPhase::Unchanged,
         ) => false,
+        // Counted as in-flight: an unrecognized phase is never reported as
+        // finished work, so `kubectl kopiur status` surfaces it instead of
+        // quietly dropping it from every total.
+        Some(SnapshotPhase::Unknown(_)) => true,
     }
 }
 
 /// Is a Restore non-terminal? Exhaustive.
-fn restore_in_flight(phase: Option<RestorePhase>) -> bool {
+fn restore_in_flight(phase: Option<&RestorePhase>) -> bool {
     match phase {
         Some(RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring) | None => {
             true
         }
         Some(RestorePhase::Completed | RestorePhase::Failed) => false,
+        // Counted as in-flight — see `snapshot_in_flight`.
+        Some(RestorePhase::Unknown(_)) => true,
     }
 }
 
@@ -353,7 +359,9 @@ async fn gather(
             "Repository",
             repo.name_any(),
             repo.metadata.namespace.clone(),
-            status.and_then(|s| s.phase).map(|p| p.label().to_string()),
+            status
+                .and_then(|s| s.phase.as_ref())
+                .map(|p| p.label().to_string()),
             status.and_then(|s| s.backend.clone()),
             format!("{:?}", repo.spec.mode),
             repo.spec.suspend,
@@ -397,7 +405,9 @@ async fn gather(
                 "ClusterRepository",
                 repo.name_any(),
                 None,
-                status.and_then(|s| s.phase).map(|p| p.label().to_string()),
+                status
+                    .and_then(|s| s.phase.as_ref())
+                    .map(|p| p.label().to_string()),
                 status.and_then(|s| s.backend.clone()),
                 format!("{:?}", repo.spec.mode),
                 repo.spec.suspend,
@@ -507,7 +517,7 @@ async fn gather(
         {
             continue;
         }
-        if snapshot_in_flight(status.and_then(|s| s.phase)) {
+        if snapshot_in_flight(status.and_then(|s| s.phase.as_ref())) {
             report.in_flight.snapshots += 1;
         }
         if let Some(c) = status
@@ -532,7 +542,7 @@ async fn gather(
             continue;
         }
         let status = restore.status.as_ref();
-        if restore_in_flight(status.and_then(|s| s.phase)) {
+        if restore_in_flight(status.and_then(|s| s.phase.as_ref())) {
             report.in_flight.restores += 1;
         }
         if let Some(c) = status
@@ -864,12 +874,20 @@ mod tests {
 
     #[test]
     fn in_flight_classification_is_exhaustive() {
-        assert!(snapshot_in_flight(Some(SnapshotPhase::Pending)));
-        assert!(snapshot_in_flight(Some(SnapshotPhase::Running)));
-        assert!(!snapshot_in_flight(Some(SnapshotPhase::Succeeded)));
-        assert!(!snapshot_in_flight(Some(SnapshotPhase::Discovered)));
-        assert!(restore_in_flight(Some(RestorePhase::Resolving)));
-        assert!(!restore_in_flight(Some(RestorePhase::Completed)));
+        assert!(snapshot_in_flight(Some(&SnapshotPhase::Pending)));
+        assert!(snapshot_in_flight(Some(&SnapshotPhase::Running)));
+        assert!(!snapshot_in_flight(Some(&SnapshotPhase::Succeeded)));
+        assert!(!snapshot_in_flight(Some(&SnapshotPhase::Discovered)));
+        assert!(restore_in_flight(Some(&RestorePhase::Resolving)));
+        assert!(!restore_in_flight(Some(&RestorePhase::Completed)));
+        // A phase from a NEWER operator is surfaced as in-flight, never
+        // silently dropped from the totals (#359 version-skew class).
+        assert!(snapshot_in_flight(Some(&SnapshotPhase::Unknown(
+            "Quiescing".into()
+        ))));
+        assert!(restore_in_flight(Some(&RestorePhase::Unknown(
+            "Staging".into()
+        ))));
     }
 
     #[test]

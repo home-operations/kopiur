@@ -82,6 +82,14 @@ mod tests;
 /// of times per hour. Active work (pin spawn, staging, Job polling) keeps its own
 /// short requeues — only the terminal steady state is slowed here.
 const TERMINAL_SNAPSHOT_STEADY_REQUEUE: Duration = Duration::from_secs(45 * 60);
+
+/// Requeue for a `Snapshot` held on a phase string this build cannot interpret
+/// (`SnapshotPhase::Unknown`, i.e. version skew). Deliberately a requeue rather
+/// than `await_change()`: nothing about the OBJECT has to change for this to
+/// resolve — finishing the operator rollout does — so the reconciler re-checks
+/// periodically and re-emits its warning instead of going quiet forever.
+const UNKNOWN_PHASE_HOLD_REQUEUE: Duration = Duration::from_secs(10 * 60);
+
 /// Reconcile a `Snapshot`.
 ///
 /// IO is intentionally thin here: the decision logic ([`plan_deletion`],
@@ -172,8 +180,8 @@ fn mover_failed_message(failure: Option<&FailureBlock>) -> String {
 /// keep the match legible under the complexity ratchet.
 async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
     if needs_terminal_pin(
-        backup.status.as_ref().and_then(|s| s.phase),
-        SnapshotPhase::Discovered,
+        backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+        &SnapshotPhase::Discovered,
     ) {
         let mut status = snapshot_ready_status(
             backup,
@@ -217,8 +225,8 @@ async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> 
     // to retention.
     if plan::adopted_row_has_provenance(backup)
         && needs_terminal_pin(
-            backup.status.as_ref().and_then(|s| s.phase),
-            SnapshotPhase::Succeeded,
+            backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+            &SnapshotPhase::Succeeded,
         )
     {
         let mut status = snapshot_ready_status(
@@ -271,7 +279,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the gate the next reconcile would re-run side-effecting hooks
     // (quiesce/exec) or resurrect the Failed phase to Succeeded — the fix lives
     // in the SnapshotPolicy, and a NEW Snapshot picks it up.
-    match run_decision(backup.status.as_ref().and_then(|s| s.phase)) {
+    match run_decision(backup.status.as_ref().and_then(|s| s.phase.as_ref())) {
         RunDecision::Run => {}
         RunDecision::SucceededSteadyState => {
             // Two terminal successes share this arm: `Succeeded` (kopia wrote a
@@ -281,8 +289,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // projection-pin backfill. They diverge in exactly two places, both
             // marked: the healed phase/reason/message, and pinning — which acts
             // on a manifest an `Unchanged` run does not have.
-            let unchanged =
-                backup.status.as_ref().and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged);
+            let unchanged = backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                == Some(&SnapshotPhase::Unchanged);
             // The MOVER stamps `phase: Succeeded`, so the controller's first look
             // at a finished run can already be steady-state — the afterSnapshot
             // hooks (resume/notify) must still run, exactly once. Safe against
@@ -529,7 +537,28 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
             return Ok(Action::await_change());
         }
-        RunDecision::Wait => return Ok(Action::await_change()),
+        RunDecision::Wait => {
+            // Surface loudly rather than parking in silence. `Deleting`/`Discovered`
+            // land here as a normal watch-desync wait, but an UNRECOGNIZED phase
+            // means version skew (a newer kopiur wrote this object), and a
+            // silently-held CR that no diagnostic mentions is exactly the
+            // all-green-while-stuck failure of #359. Requeue slowly so the warning
+            // repeats and the object self-heals after an operator upgrade.
+            if let Some(SnapshotPhase::Unknown(raw)) =
+                backup.status.as_ref().and_then(|s| s.phase.as_ref())
+            {
+                tracing::warn!(
+                    namespace = %namespace,
+                    snapshot = %name,
+                    phase = %raw,
+                    "Snapshot is parked on a phase this operator build does not recognize \
+                     (a newer kopiur most likely wrote it); holding without acting. Check \
+                     for a mixed-version rollout and finish upgrading the operator."
+                );
+                return Ok(Action::requeue(UNKNOWN_PHASE_HOLD_REQUEUE));
+            }
+            return Ok(Action::await_change());
+        }
     }
 
     // If the owned mover Job already reached a terminal state, copy phase/stats
@@ -571,12 +600,28 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // Note this was a bare `!= Some(Succeeded)`, which the compiler
                 // cannot check — the new phase would have been silently
                 // overwritten back to `Succeeded` on the very next reconcile.
-                let mover_phase = backup.status.as_ref().and_then(|s| s.phase);
-                let unchanged = mover_phase == Some(SnapshotPhase::Unchanged);
-                if !matches!(
-                    mover_phase,
-                    Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged)
-                ) {
+                let mover_phase = backup.status.as_ref().and_then(|s| s.phase.as_ref());
+                let unchanged = mover_phase == Some(&SnapshotPhase::Unchanged);
+                // Exhaustive, not `matches!`: this decides whether to OVERWRITE
+                // the phase the mover just wrote, so every phase must state
+                // whether it is already a recorded success.
+                let already_recorded = match mover_phase {
+                    Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged) => true,
+                    Some(
+                        SnapshotPhase::Pending
+                        | SnapshotPhase::Running
+                        | SnapshotPhase::Failed
+                        | SnapshotPhase::Deleting
+                        | SnapshotPhase::Discovered,
+                    )
+                    | None => false,
+                    // A phase from a newer operator is NOT a recorded success,
+                    // but overwriting it here would destroy information this
+                    // build cannot reconstruct. Treat it as already-recorded so
+                    // the controller leaves the newer writer's value alone.
+                    Some(SnapshotPhase::Unknown(_)) => true,
+                };
+                if !already_recorded {
                     finalize_succeeded(ctx, backup, &api, &name, &namespace).await?;
                 }
                 // Reap the CSI staging objects (VolumeSnapshot + staged PVC) now the
@@ -630,7 +675,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     )
                     .await?;
                 }
-                if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Failed) {
+                if backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                    != Some(&SnapshotPhase::Failed)
+                {
                     io::patch_status(
                         &api,
                         &name,
@@ -765,7 +812,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     return Ok(Action::requeue(Duration::from_secs(120)));
                 }
                 // Job exists but is still running/starting; mark Running and wait.
-                if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Running) {
+                if backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                    != Some(&SnapshotPhase::Running)
+                {
                     io::patch_status(
                         &api,
                         &name,
@@ -875,7 +924,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         .preflight
         .as_ref()
         .filter(|p| !p.checks.is_empty())
-        && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
+        && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase.as_ref()))
     {
         let now = chrono::Utc::now();
         // Maintenance recency is read from the shared informer; a not-yet-synced

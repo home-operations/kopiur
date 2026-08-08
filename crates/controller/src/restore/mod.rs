@@ -91,14 +91,14 @@ pub enum Resolution {
 /// - Otherwise → `None` (resolve now).
 fn pinned_decision(
     resolved: Option<&ResolvedRestore>,
-    phase: Option<RestorePhase>,
+    phase: Option<&RestorePhase>,
     state: PopulatorState,
     noop_already_bound: bool,
 ) -> Option<Resolution> {
     match resolved {
         Some(r) if r.resolution == Some(ResolutionOutcome::NoSnapshot) => Some(Resolution::Empty),
         Some(r) => r.kopia_snapshot_id.clone().map(Resolution::Snapshot),
-        None if phase == Some(RestorePhase::Completed)
+        None if phase == Some(&RestorePhase::Completed)
             && state == PopulatorState::AwaitingClaim
             && !noop_already_bound =>
         {
@@ -209,7 +209,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // self-trigger another reconcile (the same hot-loop class as the repo bug).
     // Mirrors the Snapshot reconciler's terminal discipline. (A `Completed` populator
     // is NOT terminal here — see `phase_is_terminal_at_guard`.)
-    match restore.status.as_ref().and_then(|s| s.phase) {
+    match restore.status.as_ref().and_then(|s| s.phase.as_ref()) {
         Some(phase) if phase_is_terminal_at_guard(phase, state) => {
             return steady_terminal_restore(restore, &api, &name, phase).await;
         }
@@ -267,7 +267,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // `pinned_decision` reads it (incl. legacy pins + the pre-fix stuck-populator
     // back-fill), returning `None` only when the source still has to be resolved.
     let resolved = restore.status.as_ref().and_then(|s| s.resolved.as_ref());
-    let phase = restore.status.as_ref().and_then(|s| s.phase);
+    let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 
     // A populator that completed as an already-bound NO-OP (#233) keeps reconciling
     // forever — its `Completed` is deliberately non-terminal precisely so a recreated
@@ -278,7 +278,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // status truthfully reads Completed/Ready. `drive_populator_restore` re-opens
     // resolution if the claim ever comes back unbound.
     let noop_already_bound = state == PopulatorState::AwaitingClaim
-        && phase == Some(RestorePhase::Completed)
+        && phase == Some(&RestorePhase::Completed)
         && completed_as_target_already_bound(restore);
 
     let decision = match pinned_decision(resolved, phase, state, noop_already_bound) {
@@ -849,9 +849,9 @@ async fn drive_populator_restore(
     // which, at the fleet scale this bug was reported from (one populator Restore per app),
     // is pure read amplification against a handshake that is over. Gated on the prime being
     // gone, so a reap whose best-effort delete did not land is still retried.
-    let settled_over_bound_claim = restore.status.as_ref().and_then(|s| s.phase)
-        == Some(RestorePhase::Completed)
-        && kstatus_settled_for(restore, RestorePhase::Completed)
+    let settled_over_bound_claim = restore.status.as_ref().and_then(|s| s.phase.as_ref())
+        == Some(&RestorePhase::Completed)
+        && kstatus_settled_for(restore, &RestorePhase::Completed)
         && pvc_is_bound(&consumer);
     if settled_over_bound_claim && pvc_api.get_opt(&prime_name).await?.is_none() {
         return Ok(Action::requeue(std::time::Duration::from_secs(600)));
@@ -985,8 +985,8 @@ async fn drive_populator_restore(
         .await?
         {
             MoverOutcome::Running { created } => {
-                let phase = restore.status.as_ref().and_then(|s| s.phase);
-                if created || phase != Some(RestorePhase::Restoring) {
+                let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+                if created || phase != Some(&RestorePhase::Restoring) {
                     io::patch_status(
                         api,
                         name,
@@ -1002,8 +1002,8 @@ async fn drive_populator_restore(
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
             MoverOutcome::Failed => {
-                let phase = restore.status.as_ref().and_then(|s| s.phase);
-                if phase != Some(RestorePhase::Failed) {
+                let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+                if phase != Some(&RestorePhase::Failed) {
                     io::patch_status(
                         api,
                         name,
@@ -1021,8 +1021,8 @@ async fn drive_populator_restore(
                 return Ok(Action::requeue(std::time::Duration::from_secs(120)));
             }
             MoverOutcome::Wedged { message } => {
-                let phase = restore.status.as_ref().and_then(|s| s.phase);
-                if phase != Some(RestorePhase::Failed) {
+                let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+                if phase != Some(&RestorePhase::Failed) {
                     io::patch_status(
                         api,
                         name,
@@ -1043,8 +1043,8 @@ async fn drive_populator_restore(
         // Deploy-or-restore: no mover. Pin an observable in-flight phase once (so
         // `kubectl get restore` shows progress, not a stale `Pending`, while the empty
         // prime is rebound), then fall through to the rebind.
-        let phase = restore.status.as_ref().and_then(|s| s.phase);
-        if phase != Some(RestorePhase::Restoring) {
+        let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+        if phase != Some(&RestorePhase::Restoring) {
             io::patch_status(
                 api,
                 name,
@@ -1248,8 +1248,9 @@ async fn complete_populator_already_bound(
         .await;
     }
 
-    let settled = restore.status.as_ref().and_then(|s| s.phase) == Some(RestorePhase::Completed)
-        && kstatus_settled_for(restore, RestorePhase::Completed);
+    let settled = restore.status.as_ref().and_then(|s| s.phase.as_ref())
+        == Some(&RestorePhase::Completed)
+        && kstatus_settled_for(restore, &RestorePhase::Completed);
     if !settled {
         // A lost rebind gets its OWN message: a prime was provisioned, a restore DID run,
         // and a full-size volume is now retained — saying "nothing was provisioned, no
@@ -1306,7 +1307,7 @@ async fn fail_populate_hijacked(
         &msg,
     )
     .await;
-    if restore.status.as_ref().and_then(|s| s.phase) != Some(RestorePhase::Failed) {
+    if restore.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RestorePhase::Failed) {
         io::patch_status(
             api,
             name,
@@ -1754,7 +1755,7 @@ async fn drive_direct_restore(
         }
     };
 
-    let phase = restore.status.as_ref().and_then(|s| s.phase);
+    let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 
     // Deploy-or-restore: no snapshot to write. The target PVC is ensured above (so a
     // `target.pvc` comes up empty rather than missing); a `pvcRef` already exists. Stamp
@@ -1762,7 +1763,7 @@ async fn drive_direct_restore(
     // heal does NOT clobber this message with "the snapshot data was written" — there is no
     // mover here, so the controller is the sole writer (no two-writer race).
     let Some(selection) = selection else {
-        if phase != Some(RestorePhase::Completed) {
+        if phase != Some(&RestorePhase::Completed) {
             let msg = "no snapshot found; provisioned an empty target volume (deploy-or-restore)";
             let conditions = io::upsert_condition(
                 &existing_conditions(restore),
@@ -1806,7 +1807,7 @@ async fn drive_direct_restore(
             if let Some(secs) = duration_secs {
                 ctx.metrics.set_restore_duration(namespace, name, secs);
             }
-            if phase != Some(RestorePhase::Completed) {
+            if phase != Some(&RestorePhase::Completed) {
                 // A fresh read serves two purposes. (1) A deferred
                 // (object-store/identity) resolution may have come up empty under
                 // `Continue`: the mover pins the outcome to status.resolved before
@@ -1830,7 +1831,7 @@ async fn drive_direct_restore(
             Ok(Action::requeue(std::time::Duration::from_secs(600)))
         }
         MoverOutcome::Failed => {
-            if phase != Some(RestorePhase::Failed) {
+            if phase != Some(&RestorePhase::Failed) {
                 // Live conditions base for the same reason as the Succeeded arm.
                 let Some(live) = io::live_conditions_source(api, name, restore).await else {
                     return Ok(Action::requeue(std::time::Duration::from_secs(120)));
@@ -1866,7 +1867,7 @@ async fn drive_direct_restore(
                 )
             };
             // A new Job always writes; a poll only on a phase flip.
-            if created || phase != Some(RestorePhase::Restoring) {
+            if created || phase != Some(&RestorePhase::Restoring) {
                 // Live conditions base: on `created` this write follows the SAME
                 // reconcile's inherit/compat condition patches (which re-read
                 // live), so building on the reconcile-start copy would erase them
@@ -1884,7 +1885,7 @@ async fn drive_direct_restore(
             Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
         MoverOutcome::Wedged { message } => {
-            if phase != Some(RestorePhase::Failed) {
+            if phase != Some(&RestorePhase::Failed) {
                 io::patch_status(
                     api,
                     name,
@@ -1934,7 +1935,7 @@ async fn steady_terminal_restore(
     restore: &Restore,
     api: &Api<Restore>,
     name: &str,
-    phase: RestorePhase,
+    phase: &RestorePhase,
 ) -> Result<Action> {
     if !kstatus_settled_for(restore, phase) {
         // Live conditions base: this reconcile is typically triggered by the
@@ -1948,7 +1949,7 @@ async fn steady_terminal_restore(
         let Some(live) = io::live_conditions_source(api, name, restore).await else {
             return Ok(Action::requeue(std::time::Duration::from_secs(600)));
         };
-        let status = if phase == RestorePhase::Completed {
+        let status = if phase == &RestorePhase::Completed {
             // The mover wrote `phase: Completed` + `status.resolved` in one
             // PATCH, so `resolved` is observed here — distinguish a real
             // restore from a deploy-or-restore that came up empty.
@@ -1957,7 +1958,7 @@ async fn steady_terminal_restore(
         } else {
             restore_ready_status(
                 &live,
-                phase,
+                phase.clone(),
                 "MoverJobFailed",
                 "the restore mover reported a terminal failure; see \
                  status.failure / status.logTail for the cause, fix it, and \
@@ -3363,7 +3364,7 @@ async fn gate_on_repository_readiness(
     namespace: &str,
     name: &str,
 ) -> Result<Option<Action>> {
-    if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase)) {
+    if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref())) {
         return Ok(None);
     }
     let Some((rref, base_ns)) = restore_repository_ref(ctx, restore, namespace).await? else {

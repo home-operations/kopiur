@@ -175,7 +175,7 @@ fn origin_cell(origin: Option<Origin>) -> String {
     }
 }
 
-fn phase_cell(phase: Option<SnapshotPhase>) -> String {
+fn phase_cell(phase: Option<&SnapshotPhase>) -> String {
     phase.map_or_else(|| EMPTY_CELL.into(), |p| p.label().to_string())
 }
 
@@ -226,7 +226,7 @@ pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool
     cells.extend([
         policy,
         origin_cell(status.and_then(|s| s.origin)),
-        phase_cell(status.and_then(|s| s.phase)),
+        phase_cell(status.and_then(|s| s.phase.as_ref())),
         status
             .and_then(|s| s.snapshot.as_ref())
             .map(|i| i.kopia_snapshot_id.clone())

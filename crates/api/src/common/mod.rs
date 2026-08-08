@@ -27,17 +27,116 @@ pub(crate) fn default_true() -> bool {
 /// A lifecycle-phase enum that can be rendered as a metric label.
 ///
 /// The single source of truth for a CRD's phase labels: [`PhaseLabel::ALL`]
-/// enumerates every variant and [`PhaseLabel::label`] is an exhaustive match.
-/// The controller's `kopiur_resource_phase` gauge uses these to set the active
-/// phase to 1 and the rest to 0 (and to clear all on deletion), so both the
-/// label string and the reset set come from the enum itself rather than a
-/// stringly-typed table that can silently drift (ADR §5.5 type-safety thesis).
-pub trait PhaseLabel: Copy + PartialEq + 'static {
-    /// Every variant, in declaration order.
+/// enumerates every **canonical** variant and [`PhaseLabel::label`] is an
+/// exhaustive match. The controller's `kopiur_resource_phase` gauge uses these
+/// to set the active phase to 1 and the rest to 0 (and to clear all on
+/// deletion), so both the label string and the reset set come from the enum
+/// itself rather than a stringly-typed table that can silently drift
+/// (ADR §5.5 type-safety thesis).
+///
+/// Every phase enum also carries an `Unknown(String)` decode-compat variant
+/// (see the crate-internal `phase_serde!` macro below). It is deliberately **absent**
+/// from [`PhaseLabel::ALL`]: `ALL` is the CRD schema's admissible set and the
+/// metric label domain, whereas `Unknown` only ever comes back off the wire
+/// from a newer operator's write. `label()` therefore returns `&str`, not
+/// `&'static str` — `Unknown` echoes the stored string verbatim.
+pub trait PhaseLabel: Clone + PartialEq + 'static {
+    /// Every canonical variant, in declaration order. Never contains `Unknown`.
     const ALL: &'static [Self];
-    /// The stable metric label string for this variant (exhaustive `match`).
-    fn label(&self) -> &'static str;
+
+    /// The stable metric/wire label string for this variant (exhaustive
+    /// `match`); the `Unknown` arm echoes the stored value verbatim so a
+    /// read-modify-write never mutates a phase this build does not understand.
+    fn label(&self) -> &str;
+
+    /// Build the decode-compat fallback for a non-canonical stored string.
+    /// Implemented by the `phase_serde!` macro's host enum.
+    fn unknown(raw: String) -> Self;
+
+    /// Parse a **canonical** label; `None` for anything else (including a value
+    /// that would decode to `Unknown`). Derived from `ALL` + `label()` so a new
+    /// variant is parseable the moment it is declared.
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|v| v.label() == s).cloned()
+    }
+
+    /// The canonical label set, for the CRD schema `enum` and "valid values"
+    /// messages. One definition, derived from `ALL`.
+    fn canonical() -> Vec<&'static str> {
+        Self::ALL.iter().map(PhaseLabel::label).collect()
+    }
 }
+
+/// Give a phase enum the `Unknown`-tolerant wire contract: `Serialize` echoes
+/// [`PhaseLabel::label`], `Deserialize` falls back to `Unknown(raw)` instead of
+/// erroring, and `JsonSchema` publishes **only** the canonical values.
+///
+/// Why the fallback exists (the graceful-decode convention, mirroring
+/// [`PvcAccessMode`]): a phase string this build does not know — written by a
+/// newer operator during a rolling upgrade, or by a future controller into a CR
+/// an older CLI then lists — must never fail the typed watch/list for the whole
+/// Kind. One un-decodable object would otherwise wedge every other object's
+/// reconciliation (and, for `kubectl kopiur doctor`, turn a real problem into a
+/// silent green). `Unknown` is never terminal, never schedulable, never
+/// reapable, and never a success: consumers hold and surface it loudly.
+///
+/// `$desc` is the CRD-schema `description`. It is spelled out here rather than
+/// taken from the doc comment because a manual `JsonSchema` impl cannot see doc
+/// comments; keep it byte-identical to the enum's summary line or
+/// `mise run gen-check` will (correctly) fail.
+///
+/// Crate-internal on purpose (`pub(crate) use` below, not `#[macro_export]`):
+/// it expands to impls of THIS crate's traits for THIS crate's enums and would
+/// commit `kopiur-api` to a public macro contract nothing outside needs.
+macro_rules! phase_serde {
+    ($ty:ty, $desc:literal) => {
+        impl ::serde::Serialize for $ty {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str($crate::common::PhaseLabel::label(self))
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for $ty {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                let s = String::deserialize(deserializer)?;
+                Ok(<Self as $crate::common::PhaseLabel>::parse(&s)
+                    .unwrap_or_else(|| <Self as $crate::common::PhaseLabel>::unknown(s)))
+            }
+        }
+
+        impl ::schemars::JsonSchema for $ty {
+            fn schema_name() -> ::std::borrow::Cow<'static, str> {
+                stringify!($ty).into()
+            }
+            fn json_schema(_: &mut ::schemars::SchemaGenerator) -> ::schemars::Schema {
+                // Canonical values only: `Unknown` is a decode-compat artifact,
+                // never an admissible write. The apiserver keeps rejecting
+                // anything outside this set.
+                //
+                // Shape matters: this is a `oneOf` of `const`s, NOT a flat
+                // `enum`, because that is exactly what `#[derive(JsonSchema)]`
+                // emits for a documented unit-only enum — and the two are not
+                // interchangeable downstream. `Option<Self>` runs schemars'
+                // `allow_null`, which appends a literal `null` to a flat `enum`
+                // but wraps a `oneOf` in `anyOf[.., null]`; kube's CRD rewriter
+                // then folds that back into `enum: [..] + nullable: true` with
+                // no bogus `null` member. Flattening this to `"enum"` silently
+                // changes every generated CRD (`mise run gen-check` catches it).
+                ::schemars::json_schema!({
+                    "description": $desc,
+                    "oneOf": <Self as $crate::common::PhaseLabel>::canonical()
+                        .into_iter()
+                        .map(|v| ::serde_json::json!({ "type": "string", "const": v }))
+                        .collect::<Vec<_>>(),
+                })
+            }
+        }
+    };
+}
+
+pub(crate) use phase_serde;
 
 /// Reference to a key within a `Secret`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

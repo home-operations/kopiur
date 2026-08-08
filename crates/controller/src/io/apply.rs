@@ -95,13 +95,26 @@ where
 /// `Failed` is treated as terminal — `Degraded` (a *retryable* failure) keeps
 /// retrying on the transient cadence.
 pub fn is_terminal_for_generation(
-    phase: Option<kopiur_api::RepositoryPhase>,
+    phase: Option<&kopiur_api::RepositoryPhase>,
     observed_generation: Option<i64>,
     generation: Option<i64>,
 ) -> bool {
-    generation.is_some()
-        && phase == Some(kopiur_api::RepositoryPhase::Failed)
-        && observed_generation == generation
+    use kopiur_api::RepositoryPhase as P;
+    // Exhaustive, not `== Failed`: this is a *classification* (is the reconciler
+    // hard-stopped?), so a new phase must not silently land on the "keep
+    // retrying" side by default — the compiler asks here first.
+    let hard_stopped = phase.is_some_and(|p| match p {
+        P::Failed => true,
+        // `Degraded` is a RETRYABLE failure (open circuit breaker / retryable
+        // bootstrap error) and keeps its transient cadence; the rest are
+        // in-flight or healthy.
+        P::Pending | P::Initializing | P::Ready | P::Degraded => false,
+        // A phase this build cannot interpret is never a hard stop: parking a
+        // newer operator's repository forever on an unreadable phase is strictly
+        // worse than one extra (cheap, idempotent) connect attempt.
+        P::Unknown(_) => false,
+    });
+    generation.is_some() && hard_stopped && observed_generation == generation
 }
 
 /// Whether the terminal-failure hard-stop still holds — i.e. we should return a
@@ -120,7 +133,7 @@ pub fn is_terminal_for_generation(
 /// generation AND the credential is byte-for-byte the same Secret revision. Any
 /// difference (including a first failure that recorded no version) reopens it.
 pub fn terminal_gate_holds(
-    phase: Option<kopiur_api::RepositoryPhase>,
+    phase: Option<&kopiur_api::RepositoryPhase>,
     observed_generation: Option<i64>,
     generation: Option<i64>,
     recorded_version: Option<&str>,

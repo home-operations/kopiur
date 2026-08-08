@@ -876,7 +876,7 @@ pub(super) fn backfill_patch_body(
 ///   Flux/Argo health check fail on a healthy dedupe.
 /// - `Failed` → `Stalled` (terminal: won't progress without a spec change/retry).
 /// - `Pending`/`Running`/`Deleting` → `Reconciling` (in flight).
-pub fn snapshot_ready_outcome(phase: SnapshotPhase) -> io::ReadyOutcome {
+pub fn snapshot_ready_outcome(phase: &SnapshotPhase) -> io::ReadyOutcome {
     match phase {
         SnapshotPhase::Succeeded | SnapshotPhase::Discovered | SnapshotPhase::Unchanged => {
             io::ReadyOutcome::Ready
@@ -885,6 +885,10 @@ pub fn snapshot_ready_outcome(phase: SnapshotPhase) -> io::ReadyOutcome {
         SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Deleting => {
             io::ReadyOutcome::Reconciling
         }
+        // Never `Ready` (a health check must not pass on a phase we cannot read)
+        // and never `Stalled` (it may well be progressing under a newer
+        // operator): `Reconciling` keeps `kubectl wait` honest.
+        SnapshotPhase::Unknown(_) => io::ReadyOutcome::Reconciling,
     }
 }
 
@@ -913,11 +917,14 @@ pub enum RunDecision {
     /// `Deleting`/`Discovered`: owned by earlier gates (the finalizer path and
     /// the Discovered pin). Reaching the run body in these phases is a watch
     /// desync — wait for a real change rather than acting on stale state.
+    ///
+    /// Also the landing place for a phase this build cannot interpret: never
+    /// launch a mover Job off a phase whose meaning is unknown.
     Wait,
 }
 
 /// Decide [`RunDecision`] from the observed phase (see the enum for semantics).
-pub fn run_decision(phase: Option<SnapshotPhase>) -> RunDecision {
+pub fn run_decision(phase: Option<&SnapshotPhase>) -> RunDecision {
     match phase {
         None | Some(SnapshotPhase::Pending) | Some(SnapshotPhase::Running) => RunDecision::Run,
         // `Unchanged` is terminal exactly like `Succeeded` — the mover ran, the
@@ -930,6 +937,10 @@ pub fn run_decision(phase: Option<SnapshotPhase>) -> RunDecision {
         }
         Some(SnapshotPhase::Failed) => RunDecision::TerminalFailed,
         Some(SnapshotPhase::Deleting) | Some(SnapshotPhase::Discovered) => RunDecision::Wait,
+        // A phase written by a newer operator: hold. Launching a Job would risk
+        // duplicating work that phase already represents, and calling it
+        // terminal would strand a run this build simply cannot read.
+        Some(SnapshotPhase::Unknown(_)) => RunDecision::Wait,
     }
 }
 
@@ -937,8 +948,21 @@ pub fn run_decision(phase: Option<SnapshotPhase>) -> RunDecision {
 /// launch (`None`/`Pending`). A `Running` snapshot whose mover Job vanished resumes
 /// via the `run_decision == Run` path; re-evaluating preflight there could demote or
 /// fail an in-flight backup on a since-flipped check, so it is excluded.
-pub(super) fn should_run_preflight(phase: Option<SnapshotPhase>) -> bool {
-    matches!(phase, None | Some(SnapshotPhase::Pending))
+pub(super) fn should_run_preflight(phase: Option<&SnapshotPhase>) -> bool {
+    match phase {
+        None | Some(SnapshotPhase::Pending) => true,
+        Some(
+            SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
+        ) => false,
+        // Not knowably "at first launch"; never re-open a preflight gate on a
+        // phase this build cannot place in the lifecycle.
+        Some(SnapshotPhase::Unknown(_)) => false,
+    }
 }
 
 /// Whether a terminal steady-state pin arm (`pin_discovered_row`/
@@ -948,7 +972,7 @@ pub(super) fn should_run_preflight(phase: Option<SnapshotPhase>) -> bool {
 /// "only pin when unset/divergent" idempotence both arms rely on — never
 /// re-patching (and so never re-generating kstatus conditions/timestamps) once
 /// pinned — is unit-tested without a cluster (M5).
-pub(super) fn needs_terminal_pin(observed: Option<SnapshotPhase>, target: SnapshotPhase) -> bool {
+pub(super) fn needs_terminal_pin(observed: Option<&SnapshotPhase>, target: &SnapshotPhase) -> bool {
     observed != Some(target)
 }
 
@@ -998,7 +1022,13 @@ pub(super) fn snapshot_ready_status(
     reason: &str,
     message: &str,
 ) -> serde_json::Value {
-    snapshot_ready_status_over(backup, phase, reason, message, &existing_conditions(backup))
+    snapshot_ready_status_over(
+        backup,
+        &phase,
+        reason,
+        message,
+        &existing_conditions(backup),
+    )
 }
 
 /// Like [`snapshot_ready_status`], but additionally upserts a domain condition
@@ -1020,7 +1050,7 @@ pub(super) fn snapshot_ready_status_with_condition(
         message,
         backup.meta().generation,
     );
-    snapshot_ready_status_over(backup, phase, reason, message, &seeded)
+    snapshot_ready_status_over(backup, &phase, reason, message, &seeded)
 }
 
 fn existing_conditions(
@@ -1035,7 +1065,7 @@ fn existing_conditions(
 
 fn snapshot_ready_status_over(
     backup: &Snapshot,
-    phase: SnapshotPhase,
+    phase: &SnapshotPhase,
     reason: &str,
     message: &str,
     existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],

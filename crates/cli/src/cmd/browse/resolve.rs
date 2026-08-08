@@ -55,7 +55,7 @@ pub fn kopia_id_of(snap: &Snapshot) -> Result<String, CliError> {
             let phase = snap
                 .status
                 .as_ref()
-                .and_then(|s| s.phase)
+                .and_then(|s| s.phase.as_ref())
                 .map(|p| format!("phase is {}", serde_json::json!(p).as_str().unwrap_or("?")))
                 .unwrap_or_else(|| "it has no status yet".to_string());
             Err(CliError::SnapshotNotBrowsable {

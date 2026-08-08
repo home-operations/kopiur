@@ -559,11 +559,11 @@ fn ready_outcome_for_phase_maps_every_phase() {
     // Issue #245: the phase→kstatus mapping used at every repository status write.
     use kopiur_api::RepositoryPhase;
     assert_eq!(
-        ready_outcome_for_phase(RepositoryPhase::Ready),
+        ready_outcome_for_phase(&RepositoryPhase::Ready),
         ReadyOutcome::Ready
     );
     assert_eq!(
-        ready_outcome_for_phase(RepositoryPhase::Failed),
+        ready_outcome_for_phase(&RepositoryPhase::Failed),
         ReadyOutcome::Stalled
     );
     // Reachable-but-unsettled and retryable-failure phases are Reconciling, never
@@ -572,8 +572,12 @@ fn ready_outcome_for_phase_maps_every_phase() {
         RepositoryPhase::Pending,
         RepositoryPhase::Initializing,
         RepositoryPhase::Degraded,
+        // Never Ready (a Flux `wait: true` check must not pass on a phase we
+        // cannot read) and never Stalled (it may be progressing under a newer
+        // operator) — Reconciling keeps the check waiting, the honest answer.
+        RepositoryPhase::Unknown("Upgrading".into()),
     ] {
-        assert_eq!(ready_outcome_for_phase(p), ReadyOutcome::Reconciling);
+        assert_eq!(ready_outcome_for_phase(&p), ReadyOutcome::Reconciling);
     }
 }
 
@@ -821,32 +825,40 @@ fn terminal_gate_only_on_failed_at_current_generation() {
     use kopiur_api::RepositoryPhase;
     // Failed at the current generation → terminal (hard-stop).
     assert!(is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(5)
     ));
     // Failed but the spec moved on (gen bumped) → gate reopens, re-attempt.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(6)
     ));
     // Degraded (a retryable failure) is never terminal — keep retrying.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Degraded),
+        Some(&RepositoryPhase::Degraded),
         Some(5),
         Some(5)
     ));
     // No generation yet / no observed generation → not terminal.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         None,
         Some(5)
     ));
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         None
+    ));
+    // A phase written by a NEWER operator is never a hard stop: parking someone
+    // else's repository forever on an unreadable phase is worse than one extra
+    // idempotent connect attempt.
+    assert!(!is_terminal_for_generation(
+        Some(&RepositoryPhase::Unknown("Upgrading".into())),
+        Some(5),
+        Some(5)
     ));
 }
 
@@ -856,7 +868,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     // Terminally Failed at gen 5; the password Secret recorded at failure was rv "100".
     let failed = |recorded: Option<&str>, current: &str| {
         terminal_gate_holds(
-            Some(RepositoryPhase::Failed),
+            Some(&RepositoryPhase::Failed),
             Some(5),
             Some(5),
             recorded,
@@ -873,7 +885,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     assert!(!failed(None, "100"));
     // A non-terminal phase never holds, regardless of the version match.
     assert!(!terminal_gate_holds(
-        Some(RepositoryPhase::Degraded),
+        Some(&RepositoryPhase::Degraded),
         Some(5),
         Some(5),
         Some("100"),
@@ -881,7 +893,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     ));
     // A spec change (gen bumped) reopens regardless of the version match.
     assert!(!terminal_gate_holds(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(6),
         Some("100"),
@@ -1267,7 +1279,7 @@ fn repo_status_to_inputs_maps_fields_and_sentinels() {
         observed_generation: None,
     }];
     let inputs = repo_status_to_inputs(
-        Some(RepositoryPhase::Ready),
+        Some(&RepositoryPhase::Ready),
         &conds,
         Some(&storage),
         Some(&health),

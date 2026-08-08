@@ -529,7 +529,7 @@ fn snapshot_awaiting_launch(s: &Snapshot) -> bool {
     if s.metadata.deletion_timestamp.is_some() {
         return false;
     }
-    match s.status.as_ref().and_then(|st| st.phase) {
+    match s.status.as_ref().and_then(|st| st.phase.as_ref()) {
         None | Some(SnapshotPhase::Pending) => true,
         Some(
             SnapshotPhase::Running
@@ -539,6 +539,10 @@ fn snapshot_awaiting_launch(s: &Snapshot) -> bool {
             | SnapshotPhase::Discovered
             | SnapshotPhase::Unchanged,
         ) => false,
+        // Not knowably pre-launch: this mapper only exists to speed up a resume,
+        // and a spurious enqueue on a phase we cannot read is churn with no
+        // corresponding gate to release.
+        Some(SnapshotPhase::Unknown(_)) => false,
     }
 }
 
@@ -833,7 +837,7 @@ mod tests {
             SnapshotPhase::Discovered,
         ] {
             assert!(
-                !snapshot_awaiting_launch(&snap_in_phase("c", Some(phase), false)),
+                !snapshot_awaiting_launch(&snap_in_phase("c", Some(phase.clone()), false)),
                 "{phase:?} must not map as pending"
             );
         }

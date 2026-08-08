@@ -256,7 +256,7 @@ async fn fetch_tail(
 /// Is the snapshot in a phase where no further mover pods can appear?
 fn snapshot_terminal(snap: &Snapshot) -> bool {
     use kopiur_api::SnapshotPhase;
-    match snap.status.as_ref().and_then(|s| s.phase) {
+    match snap.status.as_ref().and_then(|s| s.phase.as_ref()) {
         Some(SnapshotPhase::Pending | SnapshotPhase::Running) | None => false,
         Some(
             SnapshotPhase::Succeeded
@@ -265,17 +265,23 @@ fn snapshot_terminal(snap: &Snapshot) -> bool {
             | SnapshotPhase::Discovered
             | SnapshotPhase::Unchanged,
         ) => true,
+        // Never declare "no more pods can appear" on a phase this build cannot
+        // read: `kubectl kopiur logs -f` keeps following instead of exiting
+        // early on a run a newer operator is still driving.
+        Some(SnapshotPhase::Unknown(_)) => false,
     }
 }
 
 /// Is the restore in a phase where no further mover pods can appear?
 fn restore_terminal(restore: &Restore) -> bool {
     use kopiur_api::RestorePhase;
-    match restore.status.as_ref().and_then(|s| s.phase) {
+    match restore.status.as_ref().and_then(|s| s.phase.as_ref()) {
         Some(RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring) | None => {
             false
         }
         Some(RestorePhase::Completed | RestorePhase::Failed) => true,
+        // Keep following rather than exiting early — see `snapshot_terminal`.
+        Some(RestorePhase::Unknown(_)) => false,
     }
 }
 

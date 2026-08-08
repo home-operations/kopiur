@@ -47,7 +47,7 @@ fn not_ready_repository_holds_backup_pending() {
 
     // Pending is Reconciling (not Stalled), so the backup resumes on reconnect.
     assert_eq!(
-        snapshot_ready_outcome(SnapshotPhase::Pending),
+        snapshot_ready_outcome(&SnapshotPhase::Pending),
         io::ReadyOutcome::Reconciling
     );
     assert_eq!(SnapshotPhase::Pending.label(), "Pending");
@@ -86,25 +86,31 @@ fn run_decision_covers_every_phase() {
     use kopiur_api::snapshot::SnapshotPhase;
     // Not started / in flight → drive the Job.
     assert_eq!(run_decision(None), RunDecision::Run);
-    assert_eq!(run_decision(Some(SnapshotPhase::Pending)), RunDecision::Run);
-    assert_eq!(run_decision(Some(SnapshotPhase::Running)), RunDecision::Run);
+    assert_eq!(
+        run_decision(Some(&SnapshotPhase::Pending)),
+        RunDecision::Run
+    );
+    assert_eq!(
+        run_decision(Some(&SnapshotPhase::Running)),
+        RunDecision::Run
+    );
     // Succeeded → steady state (pin/staged only); NEVER a new mover Job.
     assert_eq!(
-        run_decision(Some(SnapshotPhase::Succeeded)),
+        run_decision(Some(&SnapshotPhase::Succeeded)),
         RunDecision::SucceededSteadyState
     );
     // Failed → terminal until the spec changes; no TTL-driven retry loop.
     assert_eq!(
-        run_decision(Some(SnapshotPhase::Failed)),
+        run_decision(Some(&SnapshotPhase::Failed)),
         RunDecision::TerminalFailed
     );
     // Phases owned by earlier gates → wait, don't act on a desynced view.
     assert_eq!(
-        run_decision(Some(SnapshotPhase::Deleting)),
+        run_decision(Some(&SnapshotPhase::Deleting)),
         RunDecision::Wait
     );
     assert_eq!(
-        run_decision(Some(SnapshotPhase::Discovered)),
+        run_decision(Some(&SnapshotPhase::Discovered)),
         RunDecision::Wait
     );
     // Unchanged → terminal steady state, same as Succeeded: the mover ran and
@@ -112,8 +118,15 @@ fn run_decision_covers_every_phase() {
     // steady-state arm decides — not here. Crucially it must NOT be `Run`, or a
     // deduped Snapshot would mint a fresh mover Job on every reconcile.
     assert_eq!(
-        run_decision(Some(SnapshotPhase::Unchanged)),
+        run_decision(Some(&SnapshotPhase::Unchanged)),
         RunDecision::SucceededSteadyState
+    );
+    // A phase written by a NEWER operator: hold. Launching a Job could duplicate
+    // work that phase already represents; calling it terminal would strand a run
+    // this build simply cannot read.
+    assert_eq!(
+        run_decision(Some(&SnapshotPhase::Unknown("Quiescing".into()))),
+        RunDecision::Wait
     );
 }
 
@@ -126,7 +139,7 @@ fn unchanged_is_ready_not_stalled() {
     // would fail `kubectl wait --for=condition=Ready` and every Flux/Argo health
     // check on a perfectly healthy dedupe (#351).
     assert_eq!(
-        snapshot_ready_outcome(SnapshotPhase::Unchanged),
+        snapshot_ready_outcome(&SnapshotPhase::Unchanged),
         ReadyOutcome::Ready
     );
 }
@@ -136,12 +149,17 @@ fn should_run_preflight_only_at_first_launch() {
     use kopiur_api::snapshot::SnapshotPhase;
     // First launch: gate runs.
     assert!(should_run_preflight(None));
-    assert!(should_run_preflight(Some(SnapshotPhase::Pending)));
+    assert!(should_run_preflight(Some(&SnapshotPhase::Pending)));
     // A Running snapshot whose Job vanished resumes — preflight must NOT re-gate it.
-    assert!(!should_run_preflight(Some(SnapshotPhase::Running)));
+    assert!(!should_run_preflight(Some(&SnapshotPhase::Running)));
     // Terminal/other phases never reach the gate, but be explicit.
-    assert!(!should_run_preflight(Some(SnapshotPhase::Succeeded)));
-    assert!(!should_run_preflight(Some(SnapshotPhase::Failed)));
+    assert!(!should_run_preflight(Some(&SnapshotPhase::Succeeded)));
+    assert!(!should_run_preflight(Some(&SnapshotPhase::Failed)));
+    // Not knowably "at first launch": never re-open the gate on a phase this
+    // build cannot place in the lifecycle.
+    assert!(!should_run_preflight(Some(&SnapshotPhase::Unknown(
+        "Quiescing".into()
+    ))));
 }
 
 #[test]
@@ -190,23 +208,25 @@ fn preflight_expired_anchors_on_since_and_honors_indefinite() {
 fn snapshot_ready_outcome_maps_every_phase() {
     use kopiur_api::snapshot::SnapshotPhase;
     assert_eq!(
-        snapshot_ready_outcome(SnapshotPhase::Succeeded),
+        snapshot_ready_outcome(&SnapshotPhase::Succeeded),
         io::ReadyOutcome::Ready
     );
     assert_eq!(
-        snapshot_ready_outcome(SnapshotPhase::Discovered),
+        snapshot_ready_outcome(&SnapshotPhase::Discovered),
         io::ReadyOutcome::Ready
     );
     assert_eq!(
-        snapshot_ready_outcome(SnapshotPhase::Failed),
+        snapshot_ready_outcome(&SnapshotPhase::Failed),
         io::ReadyOutcome::Stalled
     );
     for p in [
         SnapshotPhase::Pending,
         SnapshotPhase::Running,
         SnapshotPhase::Deleting,
+        // Never Ready, never Stalled — `kubectl wait` keeps waiting.
+        SnapshotPhase::Unknown("Quiescing".into()),
     ] {
-        assert_eq!(snapshot_ready_outcome(p), io::ReadyOutcome::Reconciling);
+        assert_eq!(snapshot_ready_outcome(&p), io::ReadyOutcome::Reconciling);
     }
 }
 
@@ -2850,23 +2870,23 @@ fn resolve_origin_reads_adopted_from_the_label_when_status_is_unset() {
 fn needs_terminal_pin_true_when_phase_unset() {
     assert!(super::plan::needs_terminal_pin(
         None,
-        SnapshotPhase::Discovered
+        &SnapshotPhase::Discovered
     ));
     assert!(super::plan::needs_terminal_pin(
         None,
-        SnapshotPhase::Succeeded
+        &SnapshotPhase::Succeeded
     ));
 }
 
 #[test]
 fn needs_terminal_pin_true_when_phase_diverges_from_target() {
     assert!(super::plan::needs_terminal_pin(
-        Some(SnapshotPhase::Pending),
-        SnapshotPhase::Succeeded
+        Some(&SnapshotPhase::Pending),
+        &SnapshotPhase::Succeeded
     ));
     assert!(super::plan::needs_terminal_pin(
-        Some(SnapshotPhase::Succeeded),
-        SnapshotPhase::Discovered
+        Some(&SnapshotPhase::Succeeded),
+        &SnapshotPhase::Discovered
     ));
 }
 
@@ -2875,12 +2895,12 @@ fn needs_terminal_pin_false_once_converged() {
     // The idempotence both `pin_discovered_row` and `pin_adopted_row` rely on:
     // once the observed phase matches the arm's own target, no further patch.
     assert!(!super::plan::needs_terminal_pin(
-        Some(SnapshotPhase::Discovered),
-        SnapshotPhase::Discovered
+        Some(&SnapshotPhase::Discovered),
+        &SnapshotPhase::Discovered
     ));
     assert!(!super::plan::needs_terminal_pin(
-        Some(SnapshotPhase::Succeeded),
-        SnapshotPhase::Succeeded
+        Some(&SnapshotPhase::Succeeded),
+        &SnapshotPhase::Succeeded
     ));
 }
 

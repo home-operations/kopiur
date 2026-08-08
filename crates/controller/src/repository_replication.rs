@@ -19,7 +19,7 @@ use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{RepositoryReplication, validate};
+use kopiur_api::{RepositoryReplication, RepositoryReplicationPhase, validate};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, ReplicateOp, ResolvedIdentity, TargetRef,
 };
@@ -82,7 +82,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             io::ReadyOutcome::Reconciling,
             "Suspended",
             "replication is suspended (spec.suspend)",
-            Some("Suspended"),
+            Some(RepositoryReplicationPhase::Suspended),
         )
         .await?;
         return Ok(Action::requeue(REQUEUE_CAP));
@@ -153,7 +153,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
                     io::ReadyOutcome::Stalled,
                     "ReplicationFailed",
                     "replication Job failed; see the Job/pod logs",
-                    Some("Failed"),
+                    Some(RepositoryReplicationPhase::Failed),
                 )
                 .await?;
                 nudge_repository_reverify(ctx, repl, &name, &namespace).await;
@@ -526,7 +526,12 @@ async fn has_active_replication_job(job_api: &Api<Job>, cr_name: &str) -> Result
 
 /// Patch the kstatus Ready conditions (+ optional phase + destinationBackend) only
 /// when the `Ready` condition changes, so the reconcile does not hot-loop on its own
-/// status writes (transition-guarded). `phase` is the optional phase string to set.
+/// status writes (transition-guarded).
+///
+/// `phase` is TYPED, not a `&str`: the wire value comes from
+/// [`PhaseLabel::label`], the same definition `RepositoryReplicationStatus`
+/// decodes with, so a renamed variant is a compile error here instead of a
+/// string that silently stops matching what anyone reads back.
 async fn patch_ready_if_changed(
     api: &Api<RepositoryReplication>,
     name: &str,
@@ -534,8 +539,9 @@ async fn patch_ready_if_changed(
     outcome: io::ReadyOutcome,
     reason: &str,
     message: &str,
-    phase: Option<&str>,
+    phase: Option<RepositoryReplicationPhase>,
 ) -> Result<()> {
+    use kopiur_api::common::PhaseLabel;
     let existing: Vec<_> = repl
         .status
         .as_ref()
@@ -561,7 +567,7 @@ async fn patch_ready_if_changed(
         "destinationBackend": repl.spec.destination.kind_str(),
     });
     if let Some(p) = phase {
-        status["phase"] = serde_json::json!(p);
+        status["phase"] = serde_json::json!(p.label());
     }
     io::patch_status(api, name, status).await?;
     Ok(())

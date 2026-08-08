@@ -182,7 +182,26 @@ pub enum Origin {
 }
 
 /// Lifecycle phase of a `Snapshot`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::SnapshotPhase;
+/// use kopiur_api::common::PhaseLabel;
+///
+/// // Canonical values round-trip as bare strings.
+/// assert_eq!(serde_json::to_value(SnapshotPhase::Succeeded).unwrap(), "Succeeded");
+/// let p: SnapshotPhase = serde_json::from_value(serde_json::json!("Running")).unwrap();
+/// assert_eq!(p, SnapshotPhase::Running);
+///
+/// // A phase written by a NEWER operator decodes into `Unknown` (never a
+/// // watcher-poisoning serde error) and re-serializes verbatim.
+/// let p: SnapshotPhase = serde_json::from_value(serde_json::json!("Quiescing")).unwrap();
+/// assert_eq!(p, SnapshotPhase::Unknown("Quiescing".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Quiescing");
+/// assert_eq!(p.label(), "Quiescing");
+/// // Never terminal: an unrecognized phase is held and surfaced, not finished.
+/// assert!(!p.is_terminal());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SnapshotPhase {
     /// Admitted, not yet started (also the default).
     #[default]
@@ -218,7 +237,18 @@ pub enum SnapshotPhase {
     /// `--ignore-identical-snapshots=false` at the identity scope on every run.
     /// See #351.
     Unchanged,
+    /// A phase string this build does not recognize — written by a newer
+    /// operator during a rolling upgrade, or persisted before this variant set
+    /// existed. Decode-compat only: hidden from the CRD schema (the apiserver
+    /// rejects it on every new write) and never produced by this build.
+    ///
+    /// Never terminal, never schedulable, never reapable, never a success —
+    /// every consumer holds and surfaces it rather than acting on a phase whose
+    /// meaning it does not know.
+    Unknown(String),
 }
+
+crate::common::phase_serde!(SnapshotPhase, "Lifecycle phase of a `Snapshot`.");
 
 impl Origin {
     /// The stable wire/label value (the serde camelCase encoding), for the
@@ -302,11 +332,19 @@ impl SnapshotPhase {
     /// assert!(!SnapshotPhase::Running.is_terminal());
     /// // A wedged finalizer is in-flight work, not a finished object.
     /// assert!(!SnapshotPhase::Deleting.is_terminal());
+    /// // An unrecognized phase is never terminal — hold and surface it.
+    /// assert!(!SnapshotPhase::Unknown("Quiescing".into()).is_terminal());
     /// ```
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Succeeded | Self::Failed | Self::Discovered | Self::Unchanged => true,
             Self::Pending | Self::Running | Self::Deleting => false,
+            // Conservative surface-it policy: a phase this build cannot
+            // interpret must never be reported as finished work, or a newer
+            // operator's in-flight (or wedged) object goes invisible to an
+            // older CLI/reconciler. Not-terminal keeps it in every "still
+            // working / worth looking at" set.
+            Self::Unknown(_) => false,
         }
     }
 }
@@ -321,7 +359,7 @@ impl crate::common::PhaseLabel for SnapshotPhase {
         Self::Discovered,
         Self::Unchanged,
     ];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
             Self::Running => "Running",
@@ -330,7 +368,11 @@ impl crate::common::PhaseLabel for SnapshotPhase {
             Self::Deleting => "Deleting",
             Self::Discovered => "Discovered",
             Self::Unchanged => "Unchanged",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 

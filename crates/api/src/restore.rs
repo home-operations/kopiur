@@ -288,7 +288,18 @@ pub enum OnMissingSnapshot {
 }
 
 /// Lifecycle phase of a restore.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::RestorePhase;
+///
+/// assert_eq!(serde_json::to_value(RestorePhase::Restoring).unwrap(), "Restoring");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: RestorePhase = serde_json::from_value(serde_json::json!("Staging")).unwrap();
+/// assert_eq!(p, RestorePhase::Unknown("Staging".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Staging");
+/// assert!(!p.is_terminal());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum RestorePhase {
     /// Admitted but not yet acted on; the default initial phase.
     #[default]
@@ -301,7 +312,13 @@ pub enum RestorePhase {
     Completed,
     /// The restore terminally failed; see `conditions` for the reason.
     Failed,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build, never terminal.
+    Unknown(String),
 }
+
+crate::common::phase_serde!(RestorePhase, "Lifecycle phase of a restore.");
 
 impl RestorePhase {
     /// Whether this phase is **terminal**: the restore reached an end state and
@@ -323,11 +340,16 @@ impl RestorePhase {
     /// assert!(!RestorePhase::Pending.is_terminal());
     /// assert!(!RestorePhase::Resolving.is_terminal());
     /// assert!(!RestorePhase::Restoring.is_terminal());
+    /// assert!(!RestorePhase::Unknown("Staging".into()).is_terminal());
     /// ```
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Completed | Self::Failed => true,
             Self::Pending | Self::Resolving | Self::Restoring => false,
+            // Conservative surface-it policy: a phase this build cannot
+            // interpret is never reported as finished, so a newer operator's
+            // in-flight restore stays visible to an older CLI/reconciler.
+            Self::Unknown(_) => false,
         }
     }
 }
@@ -340,14 +362,18 @@ impl crate::common::PhaseLabel for RestorePhase {
         Self::Completed,
         Self::Failed,
     ];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
             Self::Resolving => "Resolving",
             Self::Restoring => "Restoring",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 

@@ -657,10 +657,25 @@ async fn active_run_exists(ctx: &Context, namespace: &str, schedule: &str) -> Re
     let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
     let items = api.list(&lp).await?.items;
     Ok(items.iter().any(|b| {
-        matches!(
-            b.status.as_ref().and_then(|s| s.phase),
-            Some(SnapshotPhase::Pending) | Some(SnapshotPhase::Running) | None
-        ) && b.metadata.deletion_timestamp.is_none()
+        // Exhaustive: "unfinished" is the complement of the terminal set here,
+        // so a new phase must state which side of the schedule's concurrency
+        // gate it falls on before it compiles.
+        let unfinished = match b.status.as_ref().and_then(|s| s.phase.as_ref()) {
+            None | Some(SnapshotPhase::Pending | SnapshotPhase::Running) => true,
+            Some(
+                SnapshotPhase::Succeeded
+                | SnapshotPhase::Failed
+                | SnapshotPhase::Deleting
+                | SnapshotPhase::Discovered
+                | SnapshotPhase::Unchanged,
+            ) => false,
+            // Fail CLOSED: an unreadable phase may well be an in-flight run
+            // written by a newer operator, and starting a second run for the
+            // same schedule concurrently is the outcome this gate exists to
+            // prevent.
+            Some(SnapshotPhase::Unknown(_)) => true,
+        };
+        unfinished && b.metadata.deletion_timestamp.is_none()
     }))
 }
 
@@ -695,7 +710,21 @@ pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> V
         .iter()
         .filter(|s| {
             let st = s.status.as_ref();
-            st.and_then(|s| s.phase) == Some(SnapshotPhase::Failed)
+            // Exhaustive, not `== Failed`: this set's members get DELETED, so
+            // every phase must say out loud whether it belongs in the
+            // failure-history bound rather than inheriting an answer.
+            let is_failed_history = st.and_then(|s| s.phase.as_ref()).is_some_and(|p| match p {
+                SnapshotPhase::Failed => true,
+                SnapshotPhase::Pending
+                | SnapshotPhase::Running
+                | SnapshotPhase::Succeeded
+                | SnapshotPhase::Deleting
+                | SnapshotPhase::Discovered
+                | SnapshotPhase::Unchanged => false,
+                // Never delete a CR whose phase this build cannot read.
+                SnapshotPhase::Unknown(_) => false,
+            });
+            is_failed_history
                 && s.metadata.deletion_timestamp.is_none()
                 // Never auto-delete a Failed snapshot that produced a kopia snapshot.
                 && st.and_then(|s| s.snapshot.as_ref()).is_none()

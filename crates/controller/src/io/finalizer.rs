@@ -301,7 +301,7 @@ pub fn set_ready(
 ///   with `Reconciling=True`, so a health check waits rather than passing prematurely.
 /// - `Failed` → `Stalled` (a terminal connect/create failure): `Ready=False` with
 ///   `Stalled=True`, so a health check fails fast instead of hanging until timeout.
-pub fn ready_outcome_for_phase(phase: kopiur_api::RepositoryPhase) -> ReadyOutcome {
+pub fn ready_outcome_for_phase(phase: &kopiur_api::RepositoryPhase) -> ReadyOutcome {
     use kopiur_api::RepositoryPhase;
     match phase {
         RepositoryPhase::Ready => ReadyOutcome::Ready,
@@ -309,5 +309,10 @@ pub fn ready_outcome_for_phase(phase: kopiur_api::RepositoryPhase) -> ReadyOutco
             ReadyOutcome::Reconciling
         }
         RepositoryPhase::Failed => ReadyOutcome::Stalled,
+        // Never `Ready` and never `Stalled`: an uninterpretable phase must not
+        // let a Flux `wait: true` health check pass, nor fail it fast on a
+        // repository that may well be mid-bootstrap under a newer operator.
+        // `Reconciling` keeps the check waiting — the honest answer.
+        RepositoryPhase::Unknown(_) => ReadyOutcome::Reconciling,
     }
 }

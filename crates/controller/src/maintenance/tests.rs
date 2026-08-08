@@ -376,11 +376,25 @@ fn manual_run_request_dedupes_an_answered_timestamp_but_not_a_new_one() {
     let running = kopiur_api::ManualRunStatus {
         phase: Some(kopiur_api::ManualRunPhase::Running),
         completed_at: None,
-        ..answered
+        ..answered.clone()
     };
     let m = maint_with_annotations(
         &[(RUN_REQUESTED_ANNOTATION, "2026-06-11T12:00:00Z")],
         Some(running),
+    );
+    assert!(manual_run_request(&m).expect("ok").is_some());
+
+    // A phase written by a NEWER operator is NOT an answer this build can vouch
+    // for, so the request is re-driven (idempotent: the Job name is keyed on the
+    // request timestamp) rather than silently dropped.
+    let unknown = kopiur_api::ManualRunStatus {
+        phase: Some(kopiur_api::ManualRunPhase::Unknown("Queued".into())),
+        completed_at: None,
+        ..answered
+    };
+    let m = maint_with_annotations(
+        &[(RUN_REQUESTED_ANNOTATION, "2026-06-11T12:00:00Z")],
+        Some(unknown),
     );
     assert!(manual_run_request(&m).expect("ok").is_some());
 }

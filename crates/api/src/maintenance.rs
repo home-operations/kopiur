@@ -546,7 +546,17 @@ impl ManualRunMode {
 }
 
 /// Lifecycle of a manual run. Closed enum.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::maintenance::ManualRunPhase;
+///
+/// assert_eq!(serde_json::to_value(ManualRunPhase::Running).unwrap(), "Running");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: ManualRunPhase = serde_json::from_value(serde_json::json!("Queued")).unwrap();
+/// assert_eq!(p, ManualRunPhase::Unknown("Queued".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Queued");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualRunPhase {
     /// The mover Job for this request is in flight.
     Running,
@@ -554,16 +564,27 @@ pub enum ManualRunPhase {
     Succeeded,
     /// The run's Job failed; conditions carry the detail.
     Failed,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build. Never counted as a finished run, so a
+    /// re-run request is never deduped against it.
+    Unknown(String),
 }
+
+crate::common::phase_serde!(ManualRunPhase, "Lifecycle of a manual run. Closed enum.");
 
 impl crate::common::PhaseLabel for ManualRunPhase {
     const ALL: &'static [Self] = &[Self::Running, Self::Succeeded, Self::Failed];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Running => "Running",
             Self::Succeeded => "Succeeded",
             Self::Failed => "Failed",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 
