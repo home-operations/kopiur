@@ -352,6 +352,31 @@ impl RestorePhase {
             Self::Unknown(_) => false,
         }
     }
+
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch (#359, defect 3).
+    ///
+    /// Same narrow contract as [`SnapshotPhase::is_unknown`](crate::SnapshotPhase::is_unknown):
+    /// `true` means only "this string is not a phase this binary knows". A
+    /// canonical variant added later is not the sentinel, which is why the
+    /// `match` is written out exhaustively rather than left as a `matches!`.
+    ///
+    /// ```
+    /// use kopiur_api::RestorePhase;
+    ///
+    /// assert!(RestorePhase::Unknown("Staging".into()).is_unknown());
+    /// assert!(!RestorePhase::Completed.is_unknown());
+    /// assert!(!RestorePhase::Failed.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending | Self::Resolving | Self::Restoring | Self::Completed | Self::Failed => {
+                false
+            }
+        }
+    }
 }
 
 impl crate::common::PhaseLabel for RestorePhase {

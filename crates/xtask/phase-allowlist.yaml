@@ -19,6 +19,8 @@
 #   Rule D  `==` / `!=` against one phase variant. Adding a variant never breaks
 #           an equality, so this is the one class the `Unknown(String)` decode
 #           fallback cannot catch — the new variant silently takes the `else`.
+#   Rule E  a `let` pattern (`if let` / `while let` / `let … else`) naming one
+#           phase variant — Rule A's question in a spelling A, B and D all miss.
 #
 # An entry is `{file, snippet, reason}`:
 #
@@ -36,41 +38,19 @@
 #
 # The check fails in BOTH directions: an uncovered construct fails, and an entry
 # that matches nothing fails, so paying a site down forces its entry out instead
-# of letting the list rot.
+# of letting the list rot. A duplicated (file, snippet) fails too — only the
+# first of two identical keys is ever consulted, so the second is a reason nobody
+# reads.
 #
-# Seeded at introduction (#359): Rule B empty — every `_ =>` over a phase enum
-# was paid down in the same PR. Rule A holds only the two single-variant
-# `Unknown` probes below. Rule C holds the ten controller-internal condition
-# types. Rule D holds the per-site review of the surviving intentional
-# equalities.
+# Seeded at introduction (#359): Rules A and B EMPTY — every `matches!` and every
+# `_ =>` over a phase enum was paid down in the same PR, the last two becoming
+# `SnapshotPhase::is_unknown` / `RestorePhase::is_unknown` in `kopiur_api`, where
+# the exhaustive `match` is compiler-guarded. Rule C holds the ten
+# controller-internal condition types. Rule D holds the per-site review of the
+# surviving intentional equalities. Rule E holds the four version-skew probes
+# that must bind their payload to report it.
 
 allow:
-  # === Rule A — `matches!` over a phase enum =================================
-  #
-  # Both are the same shape and the only two left in the workspace: a
-  # SINGLE-VARIANT probe for the `Unknown(String)` sentinel, feeding the
-  # `PhaseView.unknown` bit that `classify_stuck` then consumes. The rule's
-  # premise — "a new variant silently classifies false" — is the correct answer
-  # here and only here: `Unknown` is the decode fallback itself, so a future
-  # canonical variant genuinely is NOT unknown. The set-shaped question next to
-  # it (`terminal`) is answered by the exhaustive `is_terminal()` in
-  # `kopiur_api`, not by these.
-  - file: crates/cli/src/cmd/doctor.rs
-    snippet: "matches!(phase, Some(SnapshotPhase::Unknown(_)))"
-    reason: >-
-      Single-variant probe for the `Unknown(String)` decode sentinel, not a
-      classification: it fills `PhaseView.unknown`, which `classify_stuck` uses
-      to report version skew. A phase variant added later is by definition NOT
-      the unknown-string fallback, so `false` is the right answer for it. The
-      set-shaped half of the same struct (`terminal`) goes through the
-      exhaustive `SnapshotPhase::is_terminal`.
-  - file: crates/cli/src/cmd/doctor.rs
-    snippet: "matches!(phase, Some(RestorePhase::Unknown(_)))"
-    reason: >-
-      The `Restore` mirror of the `SnapshotPhase::Unknown` probe above, same
-      `PhaseView.unknown` field, same reasoning — a new canonical variant is not
-      the unknown-string fallback.
-
   # === Rule C — condition types still defined controller-side ================
   #
   # Every row here says the same kind of thing in a checkable way: this
@@ -127,10 +107,13 @@ allow:
     snippet: HOOKS_SUCCEEDED_CONDITION
     reason: >-
       `patch_hook_failure` writes `HooksSucceeded=False` with `phase: Failed` in
-      the same patch when the hook aborts the run, and without a phase change
-      when `continueOnFailure` let the run proceed. Either way there is no
-      parked state: the CLI sees the terminal `Failed` phase, or there is
-      nothing to see.
+      the same patch on the pre-hook and post-hook-after-success paths
+      (`set_failed_phase: true`). The two `set_failed_phase: false` call sites
+      (`snapshot/mod.rs` `RunDecision::TerminalFailed` and the mover-failed arm)
+      are resume hooks running on a run that is ALREADY `Failed`; they omit the
+      phase write precisely so they cannot mask the primary mover failure. Every
+      path therefore ends on a terminal `Failed` phase the CLI already reads —
+      there is no parked state only this condition would reveal.
   - file: crates/controller/src/consts.rs
     snippet: SCRATCH_STORAGE_CLASS_IGNORED_CONDITION
     reason: >-
@@ -240,9 +223,10 @@ allow:
     reason: >-
       Write-dedupe before PATCHing `Restoring`: skip the write when `Restoring`
       is already recorded, so a poll of an in-flight mover does not hot-loop
-      status. Covers the populator `MoverOutcome::Running` arm, the populator
-      no-mover arm, and the direct-target running arm (each pairs it with
-      `created ||` so a NEW Job always writes).
+      status. Covers three sites — the populator `MoverOutcome::Running` arm and
+      the direct-target running arm, which pair it with `created ||` so a NEW Job
+      always writes, and the populator deploy-or-restore arm, which spawns no
+      mover and so needs no such pairing.
   - file: crates/controller/src/restore/mod.rs
     snippet: "phase != Some(&RestorePhase::Failed)"
     reason: >-
@@ -339,3 +323,49 @@ allow:
       `success_summary` wording pick, reached only after the exhaustive
       `terminal()` classification already said "this is a success". Chooses
       between the "backed up" and the "deduped, nothing new" sentence.
+
+  # === Rule E — `if let` single-variant probes ==============================
+  #
+  # All four are the same construct: the version-skew warning M2 added so an
+  # unreadable phase is NAMED before a driving reconciler overwrites it (see
+  # `io::warn_unreadable_phase`). Each is a probe for the `Unknown(String)`
+  # DECODE SENTINEL, which is the one variant where "a new variant takes the
+  # else" is the correct answer — a canonical phase added later is by definition
+  # not an unparseable string. That is the same contract
+  # `SnapshotPhase::is_unknown` states, and the two `matches!` probes in
+  # `doctor.rs` were converted to it in this PR.
+  #
+  # These four are NOT converted, because each binds the payload it exists to
+  # report — `p` for `PhaseLabel::label()`, `raw` for the log field — so a
+  # boolean predicate would only push the binding into a second statement
+  # without removing the pattern. If `ManualRunPhase` / `RepositoryPhase` ever
+  # grow an `is_unknown()` and a caller stops needing the payload, convert and
+  # delete the entry.
+  - file: crates/controller/src/repository.rs
+    snippet: "if let Some(p @ RepositoryPhase::Unknown(_)) ="
+    reason: >-
+      Version-skew warning at the top of `reconcile_inner`: this reconciler
+      DRIVES the object and every path below re-derives and overwrites the phase,
+      which is the right self-heal — but it must be named before it happens.
+      Binds `p` for `PhaseLabel::label()`. The read-only classifications that
+      consume this phase (`is_terminal_for_generation`, `breaker_open_since`)
+      hold exhaustively instead.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "if let Some(p @ RepositoryPhase::Unknown(_)) ="
+    reason: >-
+      `ClusterRepository` mirror of the `repository.rs` version-skew warning,
+      same binding and same reasoning.
+  - file: crates/controller/src/maintenance/mod.rs
+    snippet: "if let Some(p @ kopiur_api::ManualRunPhase::Unknown(_)) ="
+    reason: >-
+      The `Maintenance` manual-run mirror: a recorded `status.manualRun.phase`
+      this build cannot read will be re-driven and overwritten, so it is named
+      first. Binds `p` for `PhaseLabel::label()`.
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "if let Some(SnapshotPhase::Unknown(raw)) ="
+    reason: >-
+      The Snapshot HOLD path — unlike the drivers above this one does not
+      overwrite, it warns loudly and requeues (10m) so the object self-heals
+      after the operator upgrade, because a silently-held CR no diagnostic
+      mentions is exactly the all-green-while-stuck failure of #359. Binds `raw`
+      to put the unrecognized string in the log.

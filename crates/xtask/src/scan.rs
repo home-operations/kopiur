@@ -215,10 +215,10 @@ pub fn strip_cfg_test_lines(src: &str) -> String {
 /// The stripper both [`strip_cfg_test`] and [`strip_cfg_test_lines`] are named
 /// modes of.
 ///
-/// In [`Lines::Collapse`] mode an unbalanced or brace-less `#[cfg(test)]` drops
-/// the rest of the file, which is what the wiring ratchet has always done (it
-/// can only make the check more conservative). [`Lines::Preserve`] keeps that
-/// behavior and pads the dropped tail's newlines so the line count is stable.
+/// A `#[cfg(test)]` item ends at the close of its brace body **or** at the `;`
+/// that says it has no body — see [`cfg_test_item_end`]. Only a genuinely
+/// unterminated marker drops the rest of the file, which can never do more than
+/// make a caller more conservative.
 pub fn strip_cfg_test_mode(src: &str, lines: Lines) -> String {
     const MARK: &str = "#[cfg(test)]";
     let mut out = String::with_capacity(src.len());
@@ -227,33 +227,13 @@ pub fn strip_cfg_test_mode(src: &str, lines: Lines) -> String {
         out.push_str(&rest[..at]);
         let dropped_from = &rest[at..];
         let after = &rest[at + MARK.len()..];
-        // Skip to the item's opening brace, then match to its close.
-        let end = after.find('{').and_then(|open| {
-            let bytes = after.as_bytes();
-            let mut depth = 0usize;
-            let mut end = None;
-            for (k, ch) in bytes.iter().enumerate().skip(open) {
-                match ch {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(k + 1);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            end
-        });
-        match end {
+        match cfg_test_item_end(after) {
             Some(e) => {
                 out.push_str(&lines.newlines_only(&after[..e]));
                 rest = &after[e..];
             }
-            // Unbalanced, or `#[cfg(test)] use ...;` with no brace at all —
-            // drop the tail rather than risk a runaway.
+            // Neither a body nor a `;` — not valid Rust. Drop the tail rather
+            // than risk a runaway.
             None => {
                 out.push_str(&lines.newlines_only(dropped_from));
                 return out;
@@ -262,6 +242,59 @@ pub fn strip_cfg_test_mode(src: &str, lines: Lines) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Where the `#[cfg(test)]` item starting at `after` (the text just past the
+/// attribute) ends: one past its closing `}`, or one past the `;` of a
+/// **body-less** item.
+///
+/// The `;` case is the bug this function exists for. The repo's dominant
+/// convention is `#[cfg(test)]\nmod tests;` — a declaration with no body, whose
+/// contents live in a separate `tests.rs` the walker already skips. Scanning to
+/// "the next `{`" for one of those lands on *the next item's* body and deletes
+/// everything in between: measured on `crates/controller/src/snapshot/mod.rs`
+/// that silently removed lines 72–109, including all of `pub async fn reconcile`,
+/// from the scan corpus. So the first `;` and the first `{` race, and whichever
+/// comes first wins.
+///
+/// Depth-tracked over `(`/`[` so a `;` inside a type does not win the race:
+/// `#[cfg(test)] fn f() -> [u8; 4] { … }` still ends at its brace.
+///
+/// ```
+/// use xtask::scan::cfg_test_item_end;
+/// // Body-less declaration: ends at the `;`.
+/// assert_eq!(cfg_test_item_end("\nmod tests;\nfn real() {}").map(|e| e), Some(11));
+/// // With a body: ends at the matching close brace.
+/// assert_eq!(cfg_test_item_end(" mod t { fn f() {} }").map(|e| e), Some(20));
+/// ```
+pub fn cfg_test_item_end(after: &str) -> Option<usize> {
+    let b = after.as_bytes();
+    let mut depth = 0i32;
+    for (i, ch) in b.iter().enumerate() {
+        match ch {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => return Some(i + 1),
+            b'{' if depth == 0 => {
+                let mut d = 0usize;
+                for (k, c) in b.iter().enumerate().skip(i) {
+                    match c {
+                        b'{' => d += 1,
+                        b'}' => {
+                            d -= 1;
+                            if d == 0 {
+                                return Some(k + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Remove `use ...;` statements (including multi-line brace groups).

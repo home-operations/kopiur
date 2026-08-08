@@ -347,6 +347,41 @@ impl SnapshotPhase {
             Self::Unknown(_) => false,
         }
     }
+
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch (#359, defect 3).
+    ///
+    /// The contract is narrow on purpose, and it is the reason this is a method
+    /// rather than an inline `matches!` at each caller: `true` means *only*
+    /// "this string is not a phase this binary knows", never "unusual" or
+    /// "not one I handle". A canonical variant added to this enum later is by
+    /// definition **not** the sentinel, so `false` is the right answer for it —
+    /// which is exactly why the exhaustive `match` below is written out. Callers
+    /// asking a set-shaped question ("is this finished?", "is this a failure?")
+    /// want [`is_terminal`](Self::is_terminal) or their own exhaustive match,
+    /// not this.
+    ///
+    /// ```
+    /// use kopiur_api::SnapshotPhase;
+    ///
+    /// assert!(SnapshotPhase::Unknown("Quiescing".into()).is_unknown());
+    /// assert!(!SnapshotPhase::Succeeded.is_unknown());
+    /// assert!(!SnapshotPhase::Failed.is_unknown());
+    /// assert!(!SnapshotPhase::Deleting.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending
+            | Self::Running
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Deleting
+            | Self::Discovered
+            | Self::Unchanged => false,
+        }
+    }
 }
 
 impl crate::common::PhaseLabel for SnapshotPhase {

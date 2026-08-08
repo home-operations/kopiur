@@ -849,7 +849,7 @@ fn snapshot_stuck(
     let view = PhaseView {
         label: phase.map(PhaseLabel::label),
         terminal: phase.is_some_and(SnapshotPhase::is_terminal),
-        unknown: matches!(phase, Some(SnapshotPhase::Unknown(_))),
+        unknown: phase.is_some_and(SnapshotPhase::is_unknown),
     };
     classify_stuck(
         &view,
@@ -870,7 +870,7 @@ fn restore_stuck(
     let view = PhaseView {
         label: phase.map(PhaseLabel::label),
         terminal: phase.is_some_and(RestorePhase::is_terminal),
-        unknown: matches!(phase, Some(RestorePhase::Unknown(_))),
+        unknown: phase.is_some_and(RestorePhase::is_unknown),
     };
     classify_stuck(
         &view,

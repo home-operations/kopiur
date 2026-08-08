@@ -35,10 +35,11 @@ fn usage() {
          \n\
          check-phases\n\
          \x20          fail if a phase branch opts out of the exhaustive-match\n\
-         \x20          guarantee without the compiler saying so: a `matches!` or\n\
-         \x20          a `_ =>` arm over a phase enum, an `==`/`!=` against one\n\
-         \x20          variant, or a gate condition defined controller-side\n\
-         \x20          where the CLI cannot see it (#359). Exemptions live in\n\
+         \x20          guarantee without the compiler saying so: a `matches!`,\n\
+         \x20          a `_ =>` / `Some(_) =>` arm, an `==`/`!=` or an `if let`\n\
+         \x20          against one phase variant, or a gate condition defined\n\
+         \x20          controller-side where the CLI cannot see it (#359).\n\
+         \x20          Exemptions live in\n\
          \x20          crates/xtask/phase-allowlist.yaml, each with a reason.\n\
          \x20          Takes no --check: it never writes anything.\n\
          \n\

@@ -39,10 +39,64 @@ fn collapsing_strip_cfg_test_emits_no_filler_at_all() {
 }
 
 #[test]
-fn collapsing_strip_cfg_test_drops_the_tail_when_there_is_no_brace() {
-    // `#[cfg(test)] use ...;` — the documented conservative fallback.
+fn a_body_less_cfg_test_declaration_does_not_eat_the_next_item() {
+    // REGRESSION. The repo's dominant convention is `#[cfg(test)]\nmod tests;`
+    // — no body, contents in a separate `tests.rs` the walker already skips.
+    // Scanning to "the next `{`" lands on the FOLLOWING item's body and deletes
+    // everything in between. Measured on crates/controller/src/snapshot/mod.rs,
+    // that silently removed lines 72-109 from the scan corpus, including the
+    // const below's real counterpart and all of `pub async fn reconcile`.
+    let src = "#[cfg(test)]\n\
+               mod tests;\n\
+               const UNKNOWN_PHASE_HOLD_REQUEUE: u64 = 600;\n\
+               pub async fn reconcile(x: u8) -> u8 { x }\n";
+    for out in [strip_cfg_test(src), strip_cfg_test_lines(src)] {
+        assert!(!out.contains("mod tests"), "declaration survived: {out:?}");
+        assert!(
+            out.contains("UNKNOWN_PHASE_HOLD_REQUEUE"),
+            "production const was eaten: {out:?}"
+        );
+        assert!(
+            out.contains("pub async fn reconcile"),
+            "production fn was eaten: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn a_body_less_cfg_test_use_ends_at_its_semicolon_too() {
+    let src = "#[cfg(test)] use x::y;\nfn real() { keep(); }\n";
+    let out = strip_cfg_test(src);
+    assert!(!out.contains("x::y"), "got: {out:?}");
+    assert!(out.contains("keep()"), "got: {out:?}");
+}
+
+#[test]
+fn a_semicolon_inside_a_type_does_not_end_the_item_early() {
+    // `[u8; 4]` puts a `;` before the body's brace. Depth tracking is what keeps
+    // the `;`/`{` race honest.
+    let src = "#[cfg(test)]\nfn f() -> [u8; 4] { inert(); }\nfn real() { keep(); }\n";
+    let out = strip_cfg_test(src);
+    assert!(!out.contains("inert()"), "test body survived: {out:?}");
+    assert!(out.contains("keep()"), "got: {out:?}");
+}
+
+#[test]
+fn cfg_test_item_end_races_the_semicolon_against_the_brace() {
+    // The unit behind the three cases above.
+    assert_eq!(cfg_test_item_end("\nmod tests;\nfn real() {}"), Some(11));
+    assert_eq!(cfg_test_item_end(" mod t { fn f() {} }"), Some(20));
+    assert_eq!(cfg_test_item_end(" fn f() -> [u8; 4] { }"), Some(22));
+    // Neither a body nor a `;`: the conservative drop-the-tail fallback.
+    assert_eq!(cfg_test_item_end(" mod t { unbalanced"), None);
+    assert_eq!(cfg_test_item_end(" nothing at all"), None);
+}
+
+#[test]
+fn collapsing_strip_cfg_test_drops_the_tail_only_when_truly_unterminated() {
+    // The documented conservative fallback, now reached only by invalid source.
     assert_eq!(
-        strip_cfg_test("fn a() {}\n#[cfg(test)] use x;"),
+        strip_cfg_test("fn a() {}\n#[cfg(test)] mod t { unbalanced"),
         "fn a() {}\n"
     );
 }

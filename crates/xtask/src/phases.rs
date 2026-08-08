@@ -5,8 +5,8 @@
 //!
 //! The repo's load-bearing idea is that an invalid state is unrepresentable and
 //! reconcilers `match` exhaustively, so a new enum variant cannot compile until
-//! every handler accounts for it. Three constructs opt out of that guarantee
-//! *without the compiler ever saying so*, and all three have shipped bugs:
+//! every handler accounts for it. Four constructs opt out of that guarantee
+//! *without the compiler ever saying so*, and they have shipped bugs:
 //!
 //! * **`matches!`** is definitionally non-exhaustive — it carries an implicit
 //!   `_ => false`. `kubectl kopiur doctor`'s `check_stuck` classified stuck work
@@ -24,6 +24,9 @@
 //!   single-variant test. Adding a variant never breaks an equality, so this is
 //!   the one class the `Unknown(String)` decode fallback added in this same
 //!   change *cannot* catch: the new variant simply inherits the `else`.
+//! * **`if let <Enum>::X = …`** is the same single-variant probe again, spelled
+//!   so that none of the three scans above can see it — there is no `matches!`,
+//!   no `match` block and no `==` anywhere in it.
 //!
 //! And one drift class with no construct at all:
 //!
@@ -36,28 +39,38 @@
 //!
 //! # What it checks
 //!
-//! Four rules over the *scrubbed* source (see [`crate::scan`]) of
+//! Five rules over the *scrubbed* source (see [`crate::scan`]) of
 //! [`SCAN_CRATES`]. Every hit must be covered by an entry in
 //! `crates/xtask/phase-allowlist.yaml` carrying a written reason:
 //!
 //! * **Rule A** — a `matches!(…)` whose arguments name a [`phase_enums`] enum.
+//!   All three delimiters (`(`, `[`, `{`) count.
 //! * **Rule B** — a `match` block that names a phase enum *at its own level* and
-//!   has an arm-initial `_ =>` / `_ if … =>`.
+//!   has an arm-initial wildcard: `_ =>`, `_ if … =>`, or a `_` that is the sole
+//!   payload of a wrapper pattern (`Some(_) =>`, `Ok(_) =>`, `&_ =>`). The
+//!   wrapper case is not a nicety — every phase in this repo is read as
+//!   `Option<&Phase>`, so `Some(_)` is the most natural spelling of the next
+//!   #351. A named variant with a binding hole (`SnapshotPhase::Unknown(_)`) is
+//!   not a wildcard and is deliberately not charged.
 //! * **Rule C** — a `pub const …_CONDITION` still defined in
 //!   [`CONTROLLER_CONSTS_REL`], i.e. not hoisted into `kopiur_api` where both
 //!   the controller and the CLI can share it.
 //! * **Rule D** — an `==` / `!=` comparison against a phase-enum variant.
+//! * **Rule E** — a `let` pattern (`if let` / `while let` / `let … else`) naming
+//!   a phase-enum variant. Rule A's question in a spelling A, B and D all miss.
 //!
 //! Both directions fail, which is what makes it a ratchet rather than a
 //! snapshot: an **uncovered** hit fails (write the reason or rewrite the code),
 //! and a **stale** entry — one that matches no hit any more — fails too, so the
-//! list drains as the code is paid down instead of rotting.
+//! list drains as the code is paid down instead of rotting. A **duplicate**
+//! entry fails as well, because only the first of two identical keys is ever
+//! consulted and the second is a reason nobody reads.
 //!
 //! # Deliberate limits
 //!
 //! * **`crates/e2e` is not scanned.** The harness asserts on phases as *strings*
 //!   (`wait_phase("Succeeded")`), which carry no `Enum::` token for a text
-//!   scanner to see. Rules A/B/D are structurally blind there. That is
+//!   scanner to see. Rules A/B/D/E are structurally blind there. That is
 //!   acceptable — e2e is a test tier, and a test asserting a concrete expected
 //!   outcome is not a production classification.
 //! * **Test code is not scanned**, at the file level (`tests/`, `foo/tests.rs`)
@@ -71,7 +84,11 @@
 //!   `snapshot/plan.rs::needs_terminal_pin` is generic over its caller's target
 //!   (`observed != Some(target)`). A rewrite of one of those into the same defect
 //!   would not be caught here; the `Unknown`-variant fallback and the reviewed
-//!   inventory in the PR are what cover them.
+//!   inventory in the PR are what cover them. The same blindness applies to Rule
+//!   E: `if let Some(p) = phase.filter(|p| p.is_unknown())` names no variant path
+//!   and is invisible, which is a good reason to prefer a named predicate like
+//!   [`SnapshotPhase::is_unknown`](kopiur_api::SnapshotPhase::is_unknown) — it
+//!   moves the exhaustive `match` into `crates/api` where the compiler guards it.
 //! * **Enum discovery is `crates/api`-scoped**, plus [`MOVER_PHASE`] named
 //!   explicitly. It is not "every `*Phase` type in the workspace" because
 //!   `crates/controller/src/hooks.rs` defines an unrelated `HookPhase` (a
@@ -147,6 +164,9 @@ pub enum Rule {
     ControllerCondition,
     /// `==` / `!=` against a single phase variant.
     PhaseCompare,
+    /// `if let <Enum>::X = …` — Rule A's question, in a spelling no other rule
+    /// can see.
+    IfLetProbe,
 }
 
 impl Rule {
@@ -157,6 +177,7 @@ impl Rule {
             Rule::WildcardArm => "B",
             Rule::ControllerCondition => "C",
             Rule::PhaseCompare => "D",
+            Rule::IfLetProbe => "E",
         }
     }
 
@@ -181,6 +202,12 @@ impl Rule {
                  breaks an equality, so the new variant silently takes the \
                  `else`. Rewrite as an exhaustive classification, or record why \
                  the question really is one bit."
+            }
+            Rule::IfLetProbe => {
+                "`if let` naming one phase variant — the same non-exhaustive \
+                 single-variant probe Rule A flags, in a spelling `matches!`, \
+                 `match` and `==` scanning all miss. Rewrite as an exhaustive \
+                 `match`, or record why the question really is one bit."
             }
         }
     }
@@ -406,18 +433,24 @@ fn word_at(c: &[char], at: usize, word: &str) -> bool {
 
 // --- Rule A: `matches!` ----------------------------------------------------
 
-/// Every `matches!(…)` invocation in `text`, as `(char index, full text)`.
+/// Every `matches!` invocation in `text`, as `(char index, full text)`.
 ///
-/// The argument list is extracted by balanced parens rather than by scanning to
-/// the next `)`, which is what makes a nested call — or, before scrubbing, the
-/// `sweep.rs` case of a `// …)` comment sitting inside the arguments — parse the
-/// same as a flat one.
+/// The argument list is extracted by balanced delimiters rather than by scanning
+/// to the next closer, which is what makes a nested call — or, before scrubbing,
+/// the `sweep.rs` case of a `// …)` comment sitting inside the arguments — parse
+/// the same as a flat one.
+///
+/// All three macro-call delimiters are recognized. `matches![…]` and
+/// `matches!{…}` are rarer but identical to the compiler, so a rule that only
+/// knew `(` could be sidestepped by a formatting choice.
 ///
 /// ```
 /// use xtask::phases::matches_calls;
 /// let hits = matches_calls("if matches!(p, Some(A::B(_))) { }");
 /// assert_eq!(hits.len(), 1);
 /// assert_eq!(hits[0].1, "matches!(p, Some(A::B(_)))");
+/// assert_eq!(matches_calls("matches![p, A::B]")[0].1, "matches![p, A::B]");
+/// assert_eq!(matches_calls("matches!{p, A::B}")[0].1, "matches!{p, A::B}");
 /// ```
 pub fn matches_calls(text: &str) -> Vec<(usize, String)> {
     let c: Vec<char> = text.chars().collect();
@@ -431,7 +464,8 @@ pub fn matches_calls(text: &str) -> Vec<(usize, String)> {
             while c.get(j).is_some_and(|ch| ch.is_whitespace()) {
                 j += 1;
             }
-            if let Some(end) = balanced(&c, j, '(', ')') {
+            let delims = [('(', ')'), ('[', ']'), ('{', '}')];
+            if let Some(end) = delims.iter().find_map(|(o, cl)| balanced(&c, j, *o, *cl)) {
                 out.push((i, c[i..end].iter().collect::<String>()));
                 i = end;
                 continue;
@@ -560,21 +594,30 @@ pub fn mask_nested(body: &str) -> String {
     out
 }
 
-/// Every arm-initial `_ =>` / `_ if … =>` head in a masked block body, as
-/// `(char index within the masked body, head text)`.
+/// Every **wildcard arm head** in a masked block body, as `(char index within
+/// the masked body, head text)`.
 ///
-/// An arm begins at the start of the body, after a top-level `,`, after a
-/// masked brace-bodied arm ([`MASK`]), or after an or-pattern `|`. Requiring
-/// that position is what separates a wildcard *arm* from a `_` used as a
-/// binding, a tuple hole (`(a, _)`) or a numeric separator.
+/// An arm alternative begins at the start of the body, after a top-level `,`,
+/// after a masked brace-bodied arm ([`MASK`]), or after an or-pattern `|`.
+/// Requiring that position is what separates a wildcard *arm* from a `_` used as
+/// a binding, a tuple hole (`(a, _)`) or a numeric separator.
+///
+/// An alternative counts as a wildcard when
+/// [`pattern_is_wildcard_shape`] accepts it **and** it names no phase enum —
+/// see that function for why both halves are needed. The `enums` list is
+/// therefore load-bearing here, not just at the block level.
 ///
 /// ```
 /// use xtask::phases::wildcard_arm_heads;
-/// assert_eq!(wildcard_arm_heads("A::X => 1, _ => 2,").len(), 1);
-/// assert_eq!(wildcard_arm_heads("A::X(_) => 1, A::Y => 2,").len(), 0);
-/// assert_eq!(wildcard_arm_heads("_ if n > 3 => 1, A::Y => 2,").len(), 1);
+/// let e = ["SnapshotPhase"];
+/// assert_eq!(wildcard_arm_heads("A::X => 1, _ => 2,", &e).len(), 1);
+/// // The `Option<&Phase>` shape every phase in this repo is matched through.
+/// assert_eq!(wildcard_arm_heads("Some(SnapshotPhase::Failed) => 1, Some(_) => 2,", &e).len(), 1);
+/// // A binding hole inside a NAMED variant is not a wildcard.
+/// assert_eq!(wildcard_arm_heads("SnapshotPhase::Unknown(_) => 1, A::Y => 2,", &e).len(), 0);
+/// assert_eq!(wildcard_arm_heads("_ if n > 3 => 1, A::Y => 2,", &e).len(), 1);
 /// ```
-pub fn wildcard_arm_heads(masked_body: &str) -> Vec<(usize, String)> {
+pub fn wildcard_arm_heads(masked_body: &str, enums: &[&str]) -> Vec<(usize, String)> {
     let c: Vec<char> = masked_body.chars().collect();
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -591,6 +634,19 @@ pub fn wildcard_arm_heads(masked_body: &str) -> Vec<(usize, String)> {
             i += 1;
             continue;
         }
+        if arm_start
+            && depth == 0
+            && !word_before(&c, i)
+            && let Some((pat_end, arrow_end)) = alternative_span(&c, i)
+            && is_wildcard_alternative(&c[i..pat_end], enums)
+        {
+            out.push((i, normalize_ws(&c[i..arrow_end].iter().collect::<String>())));
+            // Skip past the arrow: nothing inside this head can start another
+            // alternative.
+            arm_start = false;
+            i = arrow_end;
+            continue;
+        }
         match ch {
             '(' | '[' => {
                 depth += 1;
@@ -603,12 +659,6 @@ pub fn wildcard_arm_heads(masked_body: &str) -> Vec<(usize, String)> {
             ',' if depth == 0 => arm_start = true,
             MASK => arm_start = true,
             '|' if depth == 0 => arm_start = true,
-            '_' if arm_start && depth == 0 && !word_before(&c, i) => {
-                if let Some(head) = wildcard_head_at(&c, i) {
-                    out.push((i, head));
-                }
-                arm_start = false;
-            }
             _ => arm_start = false,
         }
         i += 1;
@@ -616,39 +666,197 @@ pub fn wildcard_arm_heads(masked_body: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// If the `_` at `i` heads a wildcard arm, the head text through its `=>`.
-fn wildcard_head_at(c: &[char], i: usize) -> Option<String> {
-    // `_` must not be the start of an identifier like `_unused`.
-    if c.get(i + 1)
-        .is_some_and(|n| n.is_alphanumeric() || *n == '_')
-    {
-        return None;
-    }
-    let mut j = i + 1;
-    while c.get(j).is_some_and(|ch| ch.is_whitespace()) {
-        j += 1;
-    }
-    if c.get(j) == Some(&'=') && c.get(j + 1) == Some(&'>') {
-        return Some(normalize_ws(&c[i..j + 2].iter().collect::<String>()));
-    }
-    if !word_at(c, j, "if") {
-        return None;
-    }
-    // `_ if <guard> =>` — the guard runs to the arm's `=>` at depth 0.
+/// Whether one arm alternative is a catch-all: [`pattern_is_wildcard_shape`]
+/// accepts it AND it names no phase enum. Both halves are needed — see
+/// `pattern_is_wildcard_shape` for which direction each one guards.
+fn is_wildcard_alternative(pat: &[char], enums: &[&str]) -> bool {
+    let pat: String = pat.iter().collect();
+    pattern_is_wildcard_shape(&pat) && !mentions_enum(&pat, enums)
+}
+
+/// For an arm alternative starting at `i`, `(end of its pattern, end of the
+/// arm's `=>`)`.
+///
+/// The pattern ends at the alternative's own boundary — a depth-0 `|`, the start
+/// of an `if` guard, or the `=>` itself — while the arrow is the *arm's*, which
+/// may be several alternatives further on. Returns `None` if this is not an arm
+/// head at all (no `=>` before the next depth-0 `,`).
+fn alternative_span(c: &[char], i: usize) -> Option<(usize, usize)> {
     let mut depth = 0i32;
+    let mut j = i;
+    let mut pat_end = None;
     while j < c.len() {
+        if let Some(end) = char_lit_end(c, j) {
+            j = end + 1;
+            continue;
+        }
         match c[j] {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            MASK => return None,
             ',' if depth == 0 => return None,
+            '|' if depth == 0 => pat_end = pat_end.or(Some(j)),
             '=' if depth == 0 && c.get(j + 1) == Some(&'>') => {
-                return Some(normalize_ws(&c[i..j + 2].iter().collect::<String>()));
+                return Some((pat_end.unwrap_or(j), j + 2));
             }
+            _ if depth == 0 && word_at(c, j, "if") && pat_end.is_none() => pat_end = Some(j),
             _ => {}
         }
         j += 1;
     }
     None
+}
+
+/// Whether a match-arm pattern is *shaped* like a wildcard: a bare `_`, or a `_`
+/// that is the sole content of single-depth wrappers — `Some(_)`, `Ok(_)`,
+/// `&_`, `Some(&_)`, `ref _`.
+///
+/// Shape alone is not enough, and the caller must also check the pattern names
+/// no phase enum. Both halves are load-bearing in opposite directions:
+///
+/// * without the shape rule, `Some(_)` slips through — and since **every** phase
+///   in this repo is read as `Option<&Phase>`, `Some(_)` is the most natural way
+///   to write the next #351, not `_`;
+/// * without the enum check, `SnapshotPhase::Unknown(_)` would be charged, and
+///   that is a named variant with a binding hole, not a catch-all — flagging it
+///   would make the rule fire on correct exhaustive code.
+///
+/// ```
+/// use xtask::phases::pattern_is_wildcard_shape;
+/// assert!(pattern_is_wildcard_shape("_"));
+/// assert!(pattern_is_wildcard_shape("Some(_)"));
+/// assert!(pattern_is_wildcard_shape("Some( & _ )"));
+/// assert!(pattern_is_wildcard_shape("&_"));
+/// // A tuple has no single sole payload…
+/// assert!(!pattern_is_wildcard_shape("(_, _)"));
+/// // …and a named payload is not a hole.
+/// assert!(!pattern_is_wildcard_shape("Some(A::B)"));
+/// assert!(!pattern_is_wildcard_shape("None"));
+/// ```
+pub fn pattern_is_wildcard_shape(pat: &str) -> bool {
+    let p = pat.trim();
+    let p = p
+        .strip_prefix("ref ")
+        .or_else(|| p.strip_prefix("&mut "))
+        .or_else(|| p.strip_prefix('&'))
+        .unwrap_or(p)
+        .trim();
+    if p == "_" {
+        return true;
+    }
+    // `PATH ( INNER )`, where the parens span the whole remainder. A tuple
+    // pattern has an empty PATH and is rejected here, which is what keeps
+    // `(_, _)` and `(SnapshotPhase::Failed, _)` from being charged.
+    let Some(open) = p.find('(') else {
+        return false;
+    };
+    if !p.ends_with(')') || open == 0 {
+        return false;
+    }
+    let path = &p[..open];
+    if !path
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+    {
+        return false;
+    }
+    let inner = &p[open + 1..p.len() - 1];
+    // Exactly one payload: a comma at depth 0 means a tuple variant, whose holes
+    // are positional and not a catch-all.
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    pattern_is_wildcard_shape(inner)
+}
+
+// --- Rule E: `if let` / `while let` single-variant probes -------------------
+
+/// Every `let` binding whose **pattern** names something, as
+/// `(char index of the `let`, pattern text, full head text through the `=`)`.
+///
+/// This is the `if let` sibling of Rule A. `if let SnapshotPhase::Unknown(raw) =
+/// p` asks exactly the question `matches!` asks and is exactly as
+/// non-exhaustive, but it contains no `matches!`, no `match` block and no `==`,
+/// so Rules A/B/D are all blind to it.
+///
+/// Plain `let` bindings are scanned too rather than only `if let`/`while let`,
+/// because `let … else` is the third spelling of the same probe and an
+/// irrefutable `let` cannot name an enum variant in its pattern anyway — so the
+/// wider net costs nothing.
+///
+/// ```
+/// use xtask::phases::let_patterns;
+/// let hits = let_patterns("if let Some(P::Unknown(r)) = phase { }");
+/// assert_eq!(hits.len(), 1);
+/// assert_eq!(hits[0].1, "Some(P::Unknown(r))");
+/// assert_eq!(hits[0].2, "if let Some(P::Unknown(r)) =");
+/// // An ordinary binding names nothing in its pattern.
+/// assert_eq!(let_patterns("let x = P::Failed;")[0].1, "x");
+/// ```
+pub fn let_patterns(text: &str) -> Vec<(usize, String, String)> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        if !word_at(&c, i, "let") {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 3;
+        let mut depth = 0i32;
+        let mut eq = None;
+        while j < c.len() {
+            if let Some(end) = char_lit_end(&c, j) {
+                j = end + 1;
+                continue;
+            }
+            match c[j] {
+                // `{` is tracked because a struct pattern has one.
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ';' if depth == 0 => break,
+                '=' if depth == 0
+                    && c.get(j + 1) != Some(&'=')
+                    && c.get(j + 1) != Some(&'>')
+                    && !matches!(c.get(j.wrapping_sub(1)), Some('=' | '!' | '<' | '>')) =>
+                {
+                    eq = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(eq) = eq else {
+            i += 3;
+            continue;
+        };
+        // `if let` / `while let` prefix, so the head reads the way it was written.
+        let prefix = ["if", "while"]
+            .iter()
+            .find(|kw| {
+                let want = kw.len() + 1;
+                i >= want
+                    && c[i - want..i].iter().collect::<String>().trim() == **kw
+                    && !word_before(&c, i - want)
+            })
+            .map(|kw| format!("{kw} "))
+            .unwrap_or_default();
+        let pattern = normalize_ws(&c[i + 3..eq].iter().collect::<String>());
+        out.push((
+            i,
+            pattern.clone(),
+            normalize_ws(&format!("{prefix}let {pattern} =")),
+        ));
+        i = eq;
+    }
+    out
 }
 
 // --- Rule D: `==` / `!=` compares ------------------------------------------
@@ -832,7 +1040,7 @@ pub fn scan_source(file: &str, scrubbed: &str, enums: &[&str]) -> Vec<Finding> {
         if !mentions_enum(&masked, enums) {
             continue;
         }
-        for (rel, head) in wildcard_arm_heads(&masked) {
+        for (rel, head) in wildcard_arm_heads(&masked, enums) {
             // `rel` indexes the masked body, which is line-aligned with the
             // original because `mask_nested` keeps the newlines it removes.
             let line = line_of(&chars, block.body_at)
@@ -842,6 +1050,17 @@ pub fn scan_source(file: &str, scrubbed: &str, enums: &[&str]) -> Vec<Finding> {
                 file: file.to_string(),
                 line,
                 snippet: format!("match {} … {}", block.scrutinee, head),
+            });
+        }
+    }
+
+    for (at, pattern, head) in let_patterns(scrubbed) {
+        if mentions_enum(&pattern, enums) {
+            out.push(Finding {
+                rule: Rule::IfLetProbe,
+                file: file.to_string(),
+                line: line_of(&chars, at),
+                snippet: head,
             });
         }
     }
@@ -931,6 +1150,11 @@ pub struct Report {
     /// Allowlist entries that match no finding — the code was paid down (or the
     /// snippet was mistyped), so the exemption has to go.
     pub stale: Vec<Entry>,
+    /// Entries sharing a `(file, snippet)` key with an earlier one. Only the
+    /// first would ever be consulted, so the rest are invisible reasons: a
+    /// reviewer reads two justifications where the ratchet honors one, and
+    /// deleting the *live* one silently promotes a duplicate instead of failing.
+    pub duplicates: Vec<Entry>,
     /// How many constructs were flagged in total (covered or not).
     pub examined: usize,
 }
@@ -938,19 +1162,23 @@ pub struct Report {
 impl Report {
     /// Whether the ratchet passes.
     pub fn ok(&self) -> bool {
-        self.uncovered.is_empty() && self.stale.is_empty()
+        self.uncovered.is_empty() && self.stale.is_empty() && self.duplicates.is_empty()
     }
 }
 
 /// **Pure.** Decide the report from an already-collected finding set and
 /// allowlist, so the whole ratchet is unit-testable without touching disk.
 pub fn evaluate(findings: &[Finding], allow: &Allowlist) -> Report {
-    let mut covered: BTreeMap<(String, String), bool> =
-        allow.allow.iter().map(|e| (e.key(), false)).collect();
+    let mut covered: BTreeMap<(String, String), bool> = BTreeMap::new();
     let mut report = Report {
         examined: findings.len(),
         ..Default::default()
     };
+    for e in &allow.allow {
+        if covered.insert(e.key(), false).is_some() {
+            report.duplicates.push(e.clone());
+        }
+    }
     for f in findings {
         let key = f.key();
         match covered.get_mut(&key) {
@@ -973,20 +1201,23 @@ pub fn run() -> Result<i32> {
     let findings = collect()?;
     let report = evaluate(&findings, &allow);
 
-    // Self-ratchet: the hard-coded enum list must still be the real one.
+    // Self-ratchet: the hard-coded enum list must still be the real one. Reported
+    // alongside the rule findings rather than instead of them — short-circuiting
+    // here would hide every uncovered construct behind one unrelated failure, and
+    // the run that adds a phase enum is exactly the run with the most to say.
     let discovered = discover_api_phase_enums()?;
     let expected: BTreeSet<String> = API_PHASE_ENUMS.iter().map(|s| (*s).to_string()).collect();
-    if discovered != expected {
+    let enums_drifted = discovered != expected;
+    if enums_drifted {
         eprintln!(
             "check-phases: the `*Phase` enums declared in crates/api/src no longer match\n\
              `xtask::phases::API_PHASE_ENUMS`. A phase enum this list does not name is a\n\
-             phase enum none of the four rules cover.\n\
+             phase enum none of the rules cover.\n\
              \n  declared: {discovered:?}\n  expected: {expected:?}\n"
         );
-        return Ok(1);
     }
 
-    if report.ok() {
+    if report.ok() && !enums_drifted {
         println!(
             "check-phases: OK ({} construct(s) flagged, all {} allowlisted; \
              {} phase enums, {} crates scanned)",
@@ -1023,6 +1254,18 @@ pub fn run() -> Result<i32> {
             report.stale.len()
         );
         for e in &report.stale {
+            eprintln!("    {}  {}", e.file, normalize_ws(&e.snippet));
+        }
+        eprintln!();
+    }
+    if !report.duplicates.is_empty() {
+        eprintln!(
+            "check-phases: {} allowlist entr(ies) repeat a (file, snippet) already listed.\n\
+             Only the first is ever consulted, so the others are reasons nobody reads.\n\
+             Merge them into one entry in {ALLOWLIST_REL}:\n",
+            report.duplicates.len()
+        );
+        for e in &report.duplicates {
             eprintln!("    {}  {}", e.file, normalize_ws(&e.snippet));
         }
     }

@@ -36,15 +36,16 @@ silently did nothing). Exemptions live in `wiring-allowlist.yaml`, each with a
 written reason; see [`wiring`] for what counts as "read" and the deliberate
 limits of the search.
 
-The phase gate exists because the compiler cannot see the three constructs that
-opt out of exhaustiveness: `matches!` (an implicit `_ => false`), a `_ =>` arm,
-and `==`/`!=` against a single variant — plus one drift class with no construct
-at all, a gate condition the controller defines and the CLI never learns about.
-All four have shipped bugs: [#351]'s `SnapshotPhase::Unchanged` was swallowed by
-two `_ =>` arms, and [#359] was doctor reporting all-green over a `Snapshot`
-parked on a condition it had never heard of. Exemptions live in
-`phase-allowlist.yaml`, each with a written reason; see [`phases`] for the four
-rules and the deliberate limits of the scan.
+The phase gate exists because the compiler cannot see the four constructs that
+opt out of exhaustiveness: `matches!` (an implicit `_ => false`), a `_ =>` arm
+(including the wrapper form `Some(_) =>`, which is how every phase in this repo
+is actually read), `==`/`!=` against a single variant, and `if let` naming one
+variant — plus one drift class with no construct at all, a gate condition the
+controller defines and the CLI never learns about. They have shipped bugs:
+[#351]'s `SnapshotPhase::Unchanged` was swallowed by two `_ =>` arms, and [#359]
+was doctor reporting all-green over a `Snapshot` parked on a condition it had
+never heard of. Exemptions live in `phase-allowlist.yaml`, each with a written
+reason; see [`phases`] for the five rules and the deliberate limits of the scan.
 
 [#346]: https://github.com/home-operations/kopiur/issues/346
 [#351]: https://github.com/home-operations/kopiur/issues/351
@@ -68,7 +69,7 @@ lets the integration tests under `tests/` exercise it directly.
 | [`paths::workspace_root`] / [`paths::deploy_dir`] | Deterministic workspace-root resolution and the `deploy/` directory under it.                                               |
 | [`crds`] / [`rbac`] / [`dashboards`]              | The per-kind artifact generators.                                                                                           |
 | [`wiring`]                                        | The inert-field ratchet: walks the CRD schemas and asserts each field is read by a consumer crate or reviewed-and-allowlisted. |
-| [`phases`]                                        | The phase-exhaustiveness ratchet: flags `matches!` / `_ =>` / `==` over a phase enum, and condition types the CLI cannot see. |
+| [`phases`]                                        | The phase-exhaustiveness ratchet: flags `matches!` / `_ =>` / `==` / `if let` over a phase enum, and condition types the CLI cannot see. |
 | [`scan`]                                          | The source-scanning primitives both ratchets share: comment/string scrubbing, `#[cfg(test)]` stripping, and the `.rs` walker. |
 
 ## Example
