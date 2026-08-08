@@ -71,6 +71,16 @@ pub enum Operation {
     /// ([`kopiur_kopia::SessionCmd`]) via pod exec; the mover never PATCHes a
     /// status (`targetRef` names nothing the controller owns).
     BrowseSession(BrowseSessionOp),
+    /// Logical (snapshot-level) replication for a `SnapshotReplication` CR:
+    /// connect to the SOURCE repository (the work-spec `repository` field)
+    /// read-only with persisted credentials, connect to `destination`
+    /// read-write under a second kopia config, `kopia snapshot migrate
+    /// --source-config` the selected identities into the destination,
+    /// post-verify (kopia exits 0 on per-source failures), reconcile dest-side
+    /// `origin: replicated` Snapshot copy CRs, and prune per the carried
+    /// pruning mode. PATCHes the `SnapshotReplication` `.status`. Owns its own
+    /// (dual) connect lifecycle like [`Operation::Replicate`].
+    SnapshotReplicate(SnapshotReplicateOp),
 }
 
 impl Operation {
@@ -87,6 +97,7 @@ impl Operation {
             Operation::Verify(_) => "Verify",
             Operation::Replicate(_) => "Replicate",
             Operation::BrowseSession(_) => "BrowseSession",
+            Operation::SnapshotReplicate(_) => "SnapshotReplicate",
         }
     }
 }
@@ -1336,6 +1347,226 @@ impl ReplicateOp {
             update: self.update,
             max_download_speed_bytes_per_second: self.max_download_speed_bytes_per_second,
             max_upload_speed_bytes_per_second: self.max_upload_speed_bytes_per_second,
+        }
+    }
+}
+
+/// Payload for a logical (snapshot-level) replication run — the
+/// `SnapshotReplication` CRD's mover contract. Like every op payload this is a
+/// **wire mirror**: plain serde structs, never the CRD spec types themselves
+/// (the [`ReplicateOp`] precedent), so the controller↔mover JSON contract
+/// cannot drift with CRD refactors. Everything beyond the two repository
+/// blocks is serde-defaulted so a spec stamped by an older controller (or with
+/// selection/pruning omitted) still decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReplicateOp {
+    /// The DESTINATION backend to migrate snapshots into (the same
+    /// serializable wire type as the source `repository` field). The
+    /// destination's credentials arrive `KOPIUR_DEST_`-prefixed (issue #200);
+    /// its kopia password rides [`crate::env::DEST_KOPIA_PASSWORD`].
+    pub destination: RepositoryConnect,
+    /// The resolved destination repository CR — kind/name/namespace for the
+    /// `spec.repository` pin stamped on every copy CR, uid for the
+    /// `REPOSITORY_UID_LABEL` (and the three-label pruning candidate set).
+    pub destination_repository: ReplicationRepositoryRef,
+    /// The resolved SOURCE repository CR, carried for the copy CRs'
+    /// `status.copiedFrom.repository` lineage. No uid: nothing keys on it.
+    pub source_repository: ReplicationSourceRef,
+    /// Identity include matchers (`selection.identities.include`). Empty =
+    /// every identity in the source repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<IdentityMatcherSpec>,
+    /// Identity exclude matchers (`selection.identities.exclude`). An identity
+    /// matched by ANY exclude matcher is dropped even when included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<IdentityMatcherSpec>,
+    /// `--latest-only`: migrate only the newest snapshot per selected identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub latest_only: bool,
+    /// `--parallel <n>`: how many sources kopia migrates concurrently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// How kopia-side policies are treated on the destination. Defaults to
+    /// [`PolicyCopyModeSpec::None`] — the operator owns policy on both sides.
+    #[serde(default, skip_serializing_if = "PolicyCopyModeSpec::is_default")]
+    pub policies: PolicyCopyModeSpec,
+    /// Which dest-side copy CRs this run may prune. Defaults to
+    /// [`PruningSpec::None`] (never prune) — absent on the wire means none.
+    #[serde(default, skip_serializing_if = "PruningSpec::is_none")]
+    pub pruning: PruningSpec,
+}
+
+/// A fully-resolved repository CR reference on the wire (kind + name +
+/// namespace + uid). A plain-string mirror of the api crate's `RepositoryRef`
+/// plus the CR uid — never the CRD type itself (wire-mirror rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationRepositoryRef {
+    /// `"Repository"` or `"ClusterRepository"` (the CRD kind's serde value).
+    pub kind: String,
+    /// Name of the repository CR.
+    pub name: String,
+    /// Namespace of a namespaced `Repository`; `None` for `ClusterRepository`
+    /// (or a same-namespace reference).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The repository CR's `metadata.uid` — the value the copy CRs'
+    /// `REPOSITORY_UID_LABEL` carries (deletion batching / breaker keying).
+    pub uid: String,
+}
+
+/// The SOURCE repository CR reference on the wire — like
+/// [`ReplicationRepositoryRef`] but without a uid (nothing labels on it; it
+/// only feeds `status.copiedFrom.repository`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationSourceRef {
+    /// `"Repository"` or `"ClusterRepository"` (the CRD kind's serde value).
+    pub kind: String,
+    /// Name of the repository CR.
+    pub name: String,
+    /// Namespace of a namespaced `Repository`, when the reference crosses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// One identity matcher (`selection.identities.include`/`exclude` member).
+/// Each present field is a component glob (`*`/`?`, non-path-crossing) matched
+/// against the structured kopia triple; an absent field matches anything. An
+/// all-absent matcher is webhook-refused; the mover defensively treats one as
+/// matching NOTHING (an invalid matcher must never select — or exclude —
+/// everything).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityMatcherSpec {
+    /// Glob for the kopia `username` component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Glob for the kopia `hostname` component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Glob for the kopia source-path component (`*`/`?` never cross `/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+/// How `kopia snapshot migrate` treats kopia-side policies on the destination —
+/// the wire mirror of [`kopiur_kopia::MigratePolicies`]. Defaults to `None`:
+/// kopia's own `--policies` default is TRUE, so the mover must always render
+/// the mode explicitly (see [`Self::to_kopia`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PolicyCopyModeSpec {
+    /// `--no-policies`: copy no kopia policies (the default).
+    #[default]
+    None,
+    /// `--policies`: copy policies, keeping existing destination ones.
+    Copy,
+    /// `--policies --overwrite-policies`: copy, overwriting existing ones.
+    CopyOverwrite,
+}
+
+impl PolicyCopyModeSpec {
+    /// Whether this is the default mode (elided from the wire).
+    pub fn is_default(&self) -> bool {
+        *self == PolicyCopyModeSpec::None
+    }
+
+    /// Convert to the kopia client's [`MigratePolicies`](kopiur_kopia::MigratePolicies).
+    /// Exhaustive — a new mode cannot compile until mapped.
+    pub fn to_kopia(&self) -> kopiur_kopia::MigratePolicies {
+        match self {
+            PolicyCopyModeSpec::None => kopiur_kopia::MigratePolicies::None,
+            PolicyCopyModeSpec::Copy => kopiur_kopia::MigratePolicies::Copy,
+            PolicyCopyModeSpec::CopyOverwrite => kopiur_kopia::MigratePolicies::CopyOverwrite,
+        }
+    }
+}
+
+/// Which dest-side copy CRs a replication run prunes. Externally tagged
+/// (`{ "none": {} }` / `{ "mirrorSource": {} }` / `{ "retention": {...} }`)
+/// per the repo's discriminated-union rule, with empty marker sub-objects so
+/// future knobs slot in without wire breakage. Defaults to
+/// [`PruningSpec::None`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PruningSpec {
+    /// Never prune (the default): copies accumulate until pruned externally.
+    None(NoPruningSpec),
+    /// Delete copy CRs whose `(identity, startTime)` vanished from the source.
+    /// The mover deliberately stamps NO `pruned-by` annotation for these, so
+    /// the deletes classify EXTERNAL and the destination repository's
+    /// mass-deletion breaker holds a bulk source-vanish (ransomware at the
+    /// source cannot empty the offsite copy).
+    MirrorSource(MirrorSourcePruningSpec),
+    /// GFS retention over the copy CRs, bucketed per identity. An OPERATOR
+    /// prune: each delete is annotated `pruned-by: replication-retention`
+    /// BEFORE deletion, so it bypasses the breaker like any retention prune.
+    Retention(ReplicationRetentionSpec),
+}
+
+impl Default for PruningSpec {
+    fn default() -> Self {
+        PruningSpec::None(NoPruningSpec {})
+    }
+}
+
+impl PruningSpec {
+    /// Whether this is the no-pruning default (elided from the wire).
+    pub fn is_none(&self) -> bool {
+        matches!(self, PruningSpec::None(_))
+    }
+}
+
+/// Empty marker payload for [`PruningSpec::None`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoPruningSpec {}
+
+/// Empty marker payload for [`PruningSpec::MirrorSource`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorSourcePruningSpec {}
+
+/// GFS keep counts for [`PruningSpec::Retention`] — a wire mirror of the api
+/// crate's common `Retention` (same six fields, same semantics: union of
+/// buckets, all-`None` keeps nothing).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationRetentionSpec {
+    /// Keep the N most-recent copies regardless of age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_latest: Option<u32>,
+    /// Keep one copy per hour for the most-recent N hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_hourly: Option<u32>,
+    /// Keep one copy per day for the most-recent N days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_daily: Option<u32>,
+    /// Keep one copy per week for the most-recent N weeks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_weekly: Option<u32>,
+    /// Keep one copy per month for the most-recent N months.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_monthly: Option<u32>,
+    /// Keep one copy per year for the most-recent N years.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_annual: Option<u32>,
+}
+
+impl ReplicationRetentionSpec {
+    /// Convert to the api crate's GFS policy so the mover's prune selection
+    /// runs through the SAME kernel (`kopiur_api::select_kept`) as the
+    /// controller's `SnapshotPolicy` retention — no second GFS implementation.
+    pub fn to_retention(&self) -> kopiur_api::common::Retention {
+        kopiur_api::common::Retention {
+            keep_latest: self.keep_latest,
+            keep_hourly: self.keep_hourly,
+            keep_daily: self.keep_daily,
+            keep_weekly: self.keep_weekly,
+            keep_monthly: self.keep_monthly,
+            keep_annual: self.keep_annual,
         }
     }
 }

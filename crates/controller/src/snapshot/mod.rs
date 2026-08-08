@@ -1253,7 +1253,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         | Operation::SnapshotPin(_)
         | Operation::Verify(_)
         | Operation::Replicate(_)
-        | Operation::BrowseSession(_) => {
+        | Operation::BrowseSession(_)
+        | Operation::SnapshotReplicate(_) => {
             return Err(Error::Invariant(
                 "build_backup_run produced a non-Snapshot operation".into(),
             ));

@@ -171,7 +171,12 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
             | MoverError::Telemetry(_)
-            | MoverError::BatchDeleteIncomplete { .. } => (None, None, None),
+            | MoverError::BatchDeleteIncomplete { .. }
+            | MoverError::DestPasswordMissing { .. }
+            | MoverError::MigrateIncomplete { .. }
+            | MoverError::CopyCrSyncIncomplete { .. }
+            | MoverError::ReplicationCrList { .. }
+            | MoverError::PruneIncomplete { .. } => (None, None, None),
         };
         FailureBlock {
             kopia_error_class: err.kopia_class().as_str().to_string(),
@@ -620,6 +625,81 @@ pub fn replicate_failed_body(message: &str) -> serde_json::Value {
             }],
         }
     })
+}
+
+/// The per-run counters a snapshot-replication terminal PATCH reports
+/// (`SnapshotReplication.status.lastRun`). Field names are pinned by the
+/// serde attrs to the CRD's camelCase wire shape — a drifting name is
+/// silently pruned by the apiserver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReplicationRunStats {
+    /// How many distinct source identities the selection matched.
+    pub identities_selected: usize,
+    /// How many snapshots newly arrived on the destination this run.
+    pub snapshots_copied: usize,
+    /// How many expected snapshots were already on the destination.
+    pub already_present: usize,
+    /// How many expected snapshots did NOT arrive (post-verify misses).
+    pub failed: usize,
+    /// How many dest-side copy CRs this run's pruning deleted.
+    pub pruned: usize,
+}
+
+/// `{ "status": ... }` body for a successful snapshot replication: phase
+/// `Succeeded`, `lastReplicated`, the `lastRun` counters, and a `Ready=True`
+/// condition. `reason`/`message` are caller-supplied so the zero-match run
+/// (`NoIdentitiesMatched`) reads differently from a real copy wave.
+/// `observedGeneration` is 0 — the controller heals it (and Ready) on its next
+/// pass; the mover never knows the CR's generation (two-pass contract).
+pub fn snapshot_replicate_ok_body(
+    dest: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    stats: &SnapshotReplicationRunStats,
+    reason: &str,
+    message: &str,
+) -> serde_json::Value {
+    let ts = now.to_rfc3339();
+    serde_json::json!({
+        "status": {
+            "phase": "Succeeded",
+            "lastReplicated": ts,
+            "lastRun": stats,
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": reason,
+                "message": format!("{message} (destination: {dest})"),
+                "lastTransitionTime": ts,
+                "observedGeneration": 0,
+            }],
+        }
+    })
+}
+
+/// `{ "status": ... }` body for a failed snapshot replication: phase `Failed`
+/// and a `Ready=False`/`ReplicationFailed` condition carrying the actionable
+/// message. Carries `lastRun` counters when the run got far enough to have
+/// them (post-verify misses land here with `failed` set).
+pub fn snapshot_replicate_failed_body(
+    message: &str,
+    stats: Option<&SnapshotReplicationRunStats>,
+) -> serde_json::Value {
+    let mut status = serde_json::json!({
+        "phase": "Failed",
+        "conditions": [{
+            "type": "Ready",
+            "status": "False",
+            "reason": "ReplicationFailed",
+            "message": message,
+            "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+            "observedGeneration": 0,
+        }],
+    });
+    if let Some(s) = stats {
+        status["lastRun"] = serde_json::to_value(s).expect("stats serialize");
+    }
+    serde_json::json!({ "status": status })
 }
 
 /// `{ "status": ... }` body for a successful maintenance run. A full run also
@@ -1440,6 +1520,88 @@ mod tests {
             body["status"]["full"]["lastRunAt"],
             body["status"]["quick"]["lastRunAt"]
         );
+    }
+
+    #[test]
+    fn snapshot_replicate_ok_body_carries_last_run_and_ready_true() {
+        let stats = SnapshotReplicationRunStats {
+            identities_selected: 3,
+            snapshots_copied: 5,
+            already_present: 2,
+            failed: 0,
+            pruned: 1,
+        };
+        let body = snapshot_replicate_ok_body(
+            "S3",
+            &ts(),
+            &stats,
+            "ReplicationSucceeded",
+            "replicated 5 snapshot(s)",
+        );
+        assert_eq!(body["status"]["phase"], "Succeeded");
+        assert_eq!(body["status"]["lastReplicated"], ts().to_rfc3339());
+        // lastRun's exact camelCase field names — the apiserver prunes drift.
+        assert_eq!(body["status"]["lastRun"]["identitiesSelected"], 3);
+        assert_eq!(body["status"]["lastRun"]["snapshotsCopied"], 5);
+        assert_eq!(body["status"]["lastRun"]["alreadyPresent"], 2);
+        assert_eq!(body["status"]["lastRun"]["failed"], 0);
+        assert_eq!(body["status"]["lastRun"]["pruned"], 1);
+        let cond = &body["status"]["conditions"][0];
+        assert_eq!(cond["type"], "Ready");
+        assert_eq!(cond["status"], "True");
+        assert_eq!(cond["reason"], "ReplicationSucceeded");
+        assert!(
+            cond["message"]
+                .as_str()
+                .unwrap()
+                .contains("destination: S3"),
+            "{cond}"
+        );
+        // observedGeneration stays 0: the controller heals it next pass.
+        assert_eq!(cond["observedGeneration"], 0);
+    }
+
+    #[test]
+    fn snapshot_replicate_ok_body_supports_the_no_match_reason() {
+        let body = snapshot_replicate_ok_body(
+            "Filesystem",
+            &ts(),
+            &SnapshotReplicationRunStats::default(),
+            "NoIdentitiesMatched",
+            "no source identities matched the selection; nothing to replicate",
+        );
+        assert_eq!(body["status"]["phase"], "Succeeded");
+        assert_eq!(
+            body["status"]["conditions"][0]["reason"],
+            "NoIdentitiesMatched"
+        );
+        assert_eq!(body["status"]["lastRun"]["identitiesSelected"], 0);
+    }
+
+    #[test]
+    fn snapshot_replicate_failed_body_is_ready_false_with_optional_stats() {
+        // Without stats (a failure before any counters existed).
+        let body = snapshot_replicate_failed_body("source password probe failed", None);
+        assert_eq!(body["status"]["phase"], "Failed");
+        let cond = &body["status"]["conditions"][0];
+        assert_eq!(cond["type"], "Ready");
+        assert_eq!(cond["status"], "False");
+        assert_eq!(cond["reason"], "ReplicationFailed");
+        assert_eq!(cond["message"], "source password probe failed");
+        assert!(body["status"].get("lastRun").is_none());
+        assert!(body["status"].get("lastReplicated").is_none());
+
+        // With stats (post-verify misses carry the failed count).
+        let stats = SnapshotReplicationRunStats {
+            identities_selected: 2,
+            snapshots_copied: 1,
+            already_present: 0,
+            failed: 3,
+            pruned: 0,
+        };
+        let body = snapshot_replicate_failed_body("3 missing", Some(&stats));
+        assert_eq!(body["status"]["lastRun"]["failed"], 3);
+        assert_eq!(body["status"]["lastRun"]["snapshotsCopied"], 1);
     }
 
     #[test]
