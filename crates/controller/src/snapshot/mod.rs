@@ -48,14 +48,13 @@ use crate::consts::{
     HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
     INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON, INVALID_MASS_DELETION_ACK_REASON,
     MANAGED_BY_LABEL, MANAGED_BY_VALUE, MASS_DELETION_ACKNOWLEDGED_REASON,
-    MASS_DELETION_BREAKER_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH,
-    PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-    SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
-    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON, SNAPSHOT_INCOMPLETE_REASON,
-    SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
-    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
+    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MOVER_PERMITTED_CONDITION, OP_LABEL,
+    OP_SNAPSHOT_DELETE_BATCH, PIN_WORKLOAD_RUN_AS_USER_ACTION,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON,
+    SNAPSHOT_INCOMPLETE_REASON, SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON,
+    SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON, SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -851,11 +850,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .map(|s| s.conditions.clone())
             .unwrap_or_default();
-        let conditions = io::upsert_condition(
+        let conditions = io::upsert_gate(
             &conds,
-            crate::consts::REPOSITORY_WRITABLE_CONDITION,
-            false,
-            crate::consts::REPOSITORY_READ_ONLY_REASON,
+            &kopiur_api::gates::REPOSITORY_READ_ONLY_GATE,
             &readonly_backup_message(&config.spec.repository.name),
             backup.meta().generation,
         );
@@ -1072,11 +1069,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                crate::consts::MISSING_SERVICE_ACCOUNT_REASON,
+                &kopiur_api::gates::MISSING_SERVICE_ACCOUNT_GATE,
                 &msg,
                 backup.meta().generation,
             );
@@ -1197,11 +1192,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .map(|s| s.conditions.clone())
             .unwrap_or_default();
-        let conditions = io::upsert_condition(
+        let conditions = io::upsert_gate(
             &existing,
-            MOVER_PERMITTED_CONDITION,
-            false,
-            PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+            &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
             &msg,
             backup.meta().generation,
         );
@@ -1325,11 +1318,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                MISSING_CREDENTIALS_REASON,
+                &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
                 &msg,
                 backup.meta().generation,
             );
@@ -2513,11 +2504,9 @@ async fn hold_deletion(
     };
     // Transition-only event: fire only when the condition was not already True.
     let emit = should_emit_held_event(&existing);
-    let conditions = io::upsert_condition(
+    let conditions = io::upsert_gate(
         &existing,
-        DELETION_HELD_CONDITION,
-        true,
-        MASS_DELETION_BREAKER_REASON,
+        &kopiur_api::gates::DELETION_HELD_GATE,
         &message,
         backup.meta().generation,
     );

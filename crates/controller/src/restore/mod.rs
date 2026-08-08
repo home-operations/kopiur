@@ -32,9 +32,9 @@ use crate::config;
 use crate::consts::{
     ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_CREDENTIALS_REASON, MISSING_RECORDED_IDENTITY_REASON, MOVER_PERMITTED_CONDITION,
-    ORPHANED_PRIME_REAPED_REASON, POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-    RECORDED_APPLIED_REASON, RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
+    MISSING_RECORDED_IDENTITY_REASON, MOVER_PERMITTED_CONDITION, ORPHANED_PRIME_REAPED_REASON,
+    POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON, RECORDED_APPLIED_REASON,
+    RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
     RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION, RESTORE_TARGET_ALREADY_BOUND_REASON,
     SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
     SET_EXPLICIT_MOVER_CONTEXT_ACTION,
@@ -2095,11 +2095,9 @@ async fn run_restore_mover(
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                crate::consts::MISSING_SERVICE_ACCOUNT_REASON,
+                &kopiur_api::gates::MISSING_SERVICE_ACCOUNT_GATE,
                 &msg,
                 restore.metadata.generation,
             );
@@ -2214,11 +2212,9 @@ async fn run_restore_mover(
             .as_ref()
             .map(|s| s.conditions.clone())
             .unwrap_or_default();
-        let conditions = io::upsert_condition(
+        let conditions = io::upsert_gate(
             &existing,
-            MOVER_PERMITTED_CONDITION,
-            false,
-            PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+            &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
             &msg,
             restore.metadata.generation,
         );
@@ -2340,11 +2336,9 @@ async fn run_restore_mover(
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                MISSING_CREDENTIALS_REASON,
+                &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
                 &msg,
                 restore.metadata.generation,
             );

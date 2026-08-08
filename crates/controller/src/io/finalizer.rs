@@ -189,6 +189,34 @@ pub fn upsert_condition(
     )
 }
 
+/// Write a **structural gate** at its BLOCKED polarity, taking the condition
+/// `type`, `reason` and polarity from the registry row itself
+/// ([`kopiur_api::gates::STRUCTURAL_GATES`]) rather than restating them here.
+///
+/// The registry is the contract `kubectl kopiur doctor` reads (#359). A writer
+/// that spells its own triple can drift from the row that describes it — one
+/// renamed reason and the gate becomes invisible to the CLI while every test on
+/// this side still passes. Sourcing both sides from one `const` removes that
+/// class of drift for every gate whose write is unconditional and static; the
+/// two rows whose writers upsert BOTH polarities from computed state
+/// (`MassDeletionHeld`, `ScheduleRunnable`) keep their own `upsert_condition`
+/// call and are covered by the `every_registered_gate_has_a_writer` test.
+pub fn upsert_gate(
+    existing: &[Condition],
+    gate: &kopiur_api::gates::StructuralGate,
+    message: &str,
+    observed_generation: Option<i64>,
+) -> Vec<Condition> {
+    upsert_condition(
+        existing,
+        gate.condition,
+        gate.blocked_is_true(),
+        gate.reason,
+        message,
+        observed_generation,
+    )
+}
+
 /// Tri-state [`upsert_condition`]: takes the condition `status` string directly so a
 /// condition can be `"Unknown"` (the kstatus convention for "we can't tell yet"), not just
 /// `"True"`/`"False"`. Same order-stable, transition-time-preserving semantics.

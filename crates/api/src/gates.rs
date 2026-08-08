@@ -230,6 +230,91 @@ impl StructuralGate {
     }
 }
 
+/// An elevated mover in a namespace that has not opted in. The admin adds the
+/// `privileged-movers` annotation out-of-band; until then the object sits at
+/// `phase: Pending` — the exact shape of #359.
+pub const PRIVILEGED_MOVER_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::MOVER_PERMITTED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    severity: GateSeverity::Fail,
+};
+
+/// The mover's credential `Secret` is not in the workload namespace. Parks at
+/// `phase: Pending` until the user creates it (or enables projection).
+pub const MISSING_CREDENTIALS_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::CREDENTIALS_AVAILABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::MISSING_CREDENTIALS_REASON,
+    severity: GateSeverity::Fail,
+};
+
+/// Same condition as [`MISSING_CREDENTIALS_GATE`], different missing
+/// dependency: the workload-identity `ServiceAccount` the backend names.
+/// kopiur never creates it.
+pub const MISSING_SERVICE_ACCOUNT_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::CREDENTIALS_AVAILABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::MISSING_SERVICE_ACCOUNT_REASON,
+    severity: GateSeverity::Fail,
+};
+
+/// Inverted polarity: the per-`Snapshot` hold the mass-deletion breaker
+/// applies. Released only by the `allow-mass-deletion` acknowledgement on the
+/// repository, so it is squarely "needs a human".
+pub const DELETION_HELD_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Snapshot,
+    condition: consts::DELETION_HELD_CONDITION,
+    blocked_status: CONDITION_TRUE,
+    reason: consts::MASS_DELETION_BREAKER_REASON,
+    severity: GateSeverity::Fail,
+};
+
+/// The repository-level view of the same breaker: a whole wave is held.
+pub const MASS_DELETION_HELD_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::MASS_DELETION_HELD_CONDITION,
+    blocked_status: CONDITION_TRUE,
+    reason: consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
+    severity: GateSeverity::Fail,
+};
+
+/// A backup refused because its repository is `mode: ReadOnly`.
+///
+/// Unlike the other rows this is NOT an invisible park: the writer
+/// (`snapshot/mod.rs`) sets `phase: Failed` in the same status patch, so a
+/// phase-based check already sees the object. It is registered for EXPLANATORY
+/// value — it turns "this backup failed" into "this backup was refused because
+/// the repository is read-only" without a second lookup. Hence WARN, not Fail:
+/// a read-only repository is a legitimate, deliberate configuration (a
+/// replication target, an archived repo served for restores only), so a
+/// green/red verdict must not hinge on it.
+pub const REPOSITORY_READ_ONLY_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Snapshot,
+    condition: consts::REPOSITORY_WRITABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::REPOSITORY_READ_ONLY_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// Version skew, one kind removed: a previous run of this schedule sits at a
+/// phase string this build cannot interpret, so it can never be observed to
+/// finish. Under the default `concurrencyPolicy: Forbid` the schedule stops
+/// firing FOREVER while looking perfectly healthy — the concurrency gate is
+/// doing exactly what it was asked to. The out-of-band change that clears it is
+/// finishing the operator rollout (or deleting the wedged `Snapshot`), which is
+/// squarely "needs a human", so: Fail.
+pub const SCHEDULE_BLOCKED_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotSchedule,
+    condition: consts::SCHEDULE_RUNNABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -242,85 +327,21 @@ impl StructuralGate {
 ///
 /// Most rows are phase-INVISIBLE parks (the object sits at `phase: Pending`
 /// looking unremarkable), which is what makes the registry load-bearing. One
-/// row — `RepositoryWritable` — is phase-visible and registered anyway, for the
-/// explanation it adds to an already-visible failure; see its comment.
+/// row — [`REPOSITORY_READ_ONLY_GATE`] — is phase-visible and registered
+/// anyway, for the explanation it adds to an already-visible failure.
+///
+/// Each row is also a named `const` so a reconciler can write its condition
+/// FROM the row (`io::upsert_gate`) instead of restating the triple at the call
+/// site. A row nobody writes, or a writer nobody registered, is caught by the
+/// controller's `every_registered_gate_has_a_writer` drift test.
 pub const STRUCTURAL_GATES: &[StructuralGate] = &[
-    // An elevated mover in a namespace that has not opted in. The admin adds
-    // the `privileged-movers` annotation out-of-band; until then the object
-    // sits at `phase: Pending` — the exact shape of #359.
-    StructuralGate {
-        applies_to: GateScope::SnapshotOrRestore,
-        condition: consts::MOVER_PERMITTED_CONDITION,
-        blocked_status: CONDITION_FALSE,
-        reason: consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-        severity: GateSeverity::Fail,
-    },
-    // The mover's credential Secret is not in the workload namespace. Parks at
-    // `phase: Pending` until the user creates it (or enables projection).
-    StructuralGate {
-        applies_to: GateScope::SnapshotOrRestore,
-        condition: consts::CREDENTIALS_AVAILABLE_CONDITION,
-        blocked_status: CONDITION_FALSE,
-        reason: consts::MISSING_CREDENTIALS_REASON,
-        severity: GateSeverity::Fail,
-    },
-    // Same condition, different missing dependency: the workload-identity
-    // ServiceAccount the backend names. kopiur never creates it.
-    StructuralGate {
-        applies_to: GateScope::SnapshotOrRestore,
-        condition: consts::CREDENTIALS_AVAILABLE_CONDITION,
-        blocked_status: CONDITION_FALSE,
-        reason: consts::MISSING_SERVICE_ACCOUNT_REASON,
-        severity: GateSeverity::Fail,
-    },
-    // Inverted polarity: the per-Snapshot hold the mass-deletion breaker
-    // applies. Released only by the `allow-mass-deletion` acknowledgement on
-    // the repository, so it is squarely "needs a human".
-    StructuralGate {
-        applies_to: GateScope::Snapshot,
-        condition: consts::DELETION_HELD_CONDITION,
-        blocked_status: CONDITION_TRUE,
-        reason: consts::MASS_DELETION_BREAKER_REASON,
-        severity: GateSeverity::Fail,
-    },
-    // The repository-level view of the same breaker: a whole wave is held.
-    StructuralGate {
-        applies_to: GateScope::Repository,
-        condition: consts::MASS_DELETION_HELD_CONDITION,
-        blocked_status: CONDITION_TRUE,
-        reason: consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
-        severity: GateSeverity::Fail,
-    },
-    // A backup refused because its repository is `mode: ReadOnly`. Unlike the
-    // rows above this is NOT an invisible park: the writer
-    // (`snapshot/mod.rs`) sets `phase: Failed` in the same status patch, so a
-    // phase-based check already sees the object. It is registered for
-    // EXPLANATORY value — it turns "this backup failed" into "this backup was
-    // refused because the repository is read-only" without a second lookup.
-    // Hence WARN, not Fail: a read-only repository is a legitimate, deliberate
-    // configuration (a replication target, an archived repo served for restores
-    // only), so a green/red verdict must not hinge on it.
-    StructuralGate {
-        applies_to: GateScope::Snapshot,
-        condition: consts::REPOSITORY_WRITABLE_CONDITION,
-        blocked_status: CONDITION_FALSE,
-        reason: consts::REPOSITORY_READ_ONLY_REASON,
-        severity: GateSeverity::Warn,
-    },
-    // Version skew, one kind removed: a previous run of this schedule sits at a
-    // phase string this build cannot interpret, so it can never be observed to
-    // finish. Under the default `concurrencyPolicy: Forbid` the schedule stops
-    // firing FOREVER while looking perfectly healthy — the concurrency gate is
-    // doing exactly what it was asked to. The out-of-band change that clears it
-    // is finishing the operator rollout (or deleting the wedged Snapshot), which
-    // is squarely "needs a human", so: Fail.
-    StructuralGate {
-        applies_to: GateScope::SnapshotSchedule,
-        condition: consts::SCHEDULE_RUNNABLE_CONDITION,
-        blocked_status: CONDITION_FALSE,
-        reason: consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
-        severity: GateSeverity::Fail,
-    },
+    PRIVILEGED_MOVER_GATE,
+    MISSING_CREDENTIALS_GATE,
+    MISSING_SERVICE_ACCOUNT_GATE,
+    DELETION_HELD_GATE,
+    MASS_DELETION_HELD_GATE,
+    REPOSITORY_READ_ONLY_GATE,
+    SCHEDULE_BLOCKED_GATE,
 ];
 
 #[cfg(test)]
