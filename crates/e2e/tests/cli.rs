@@ -18,8 +18,10 @@
 //! - `restore`: snapshotRef×created-PVC byte round-trip (reader pod), fromPolicy
 //!   on a filesystem repo, and the missing-snapshot fail-closed path;
 //! - `status` aggregates real state; `doctor` passes per-check on a healthy
-//!   install (incl. the LIVE dry-run webhook probe) and fails actionably when
-//!   the credentials Secret is deleted;
+//!   install (incl. the LIVE dry-run webhook probe), fails actionably when the
+//!   credentials Secret is deleted, and (#359) reports a Snapshot parked on a
+//!   structural gate as FAIL immediately — however young — quoting the
+//!   operator's own fix command, then goes green once the gate clears;
 //! - `maintenance run` drives REAL quick/full runs (lastRunAt asserted — a
 //!   lease yield must not pass) by name and via --repository;
 //! - `migrate volsync` translates a real ReplicationSource (string `last`!),
@@ -136,6 +138,46 @@ where
     .await
 }
 
+/// Poll a CR until its status condition `type_` has status `want`, returning the
+/// condition as JSON so a caller can assert its `reason`/`message` too.
+///
+/// cli.rs keeps its own waiters (see [`wait_phase`]) rather than including
+/// `tests/common` — that module carries a large shared-fixture surface this
+/// binary has no other use for.
+async fn wait_condition<K>(
+    api: &Api<K>,
+    name: &str,
+    type_: &str,
+    want: &str,
+) -> anyhow::Result<serde_json::Value>
+where
+    K: kube::Resource + Clone + DeserializeOwned + serde::Serialize + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    wait_until(
+        &format!("{name} {type_}={want}"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let Some(obj) = api.get_opt(name).await? else {
+                return Ok(None);
+            };
+            let v = serde_json::to_value(&obj).unwrap_or_default();
+            let cond = v
+                .get("status")
+                .and_then(|s| s.get("conditions"))
+                .and_then(|c| c.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(type_))
+                })
+                .cloned();
+            Ok(cond.filter(|c| c.get("status").and_then(|s| s.as_str()) == Some(want)))
+        },
+    )
+    .await
+}
+
 /// SCHEDULED snapshots produced from our policy. Origin-filtered so the
 /// `snapshot now` test's manual snapshots (same config label) never leak into
 /// the schedule-firing assertions.
@@ -158,6 +200,36 @@ async fn schedule_suspended(api: &Api<SnapshotSchedule>) -> bool {
         .spec
         .schedule
         .suspend
+}
+
+/// `ensure_namespace`, hardened against a namespace still TERMINATING from an
+/// earlier run of the same scenario.
+///
+/// `ensure_namespace` treats `AlreadyExists` as success, but a namespace with a
+/// `deletionTimestamp` still "exists" — and every create inside it then 403s
+/// with `NamespaceTerminating`, failing the test for a reason that has nothing
+/// to do with what it asserts (observed against a reused cluster). Wait for the
+/// terminating namespace to actually go away first, then create.
+async fn ensure_namespace_settled(client: &kube::Client, ns: &str) {
+    use k8s_openapi::api::core::v1::Namespace;
+
+    let api: Api<Namespace> = Api::all(client.clone());
+    wait_until(
+        &format!("namespace {ns} absent or fully active"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(match api.get_opt(ns).await? {
+                Some(n) if n.metadata.deletion_timestamp.is_some() => None,
+                Some(_) | None => Some(()),
+            })
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("namespace {ns} should not be stuck Terminating: {e}"));
+    kopiur_e2e::ensure_namespace(client, ns)
+        .await
+        .unwrap_or_else(|e| panic!("create workload namespace {ns}: {e}"));
 }
 
 /// Delete an object if it exists and wait until it is fully gone (finalizers
@@ -971,6 +1043,219 @@ async fn cli_doctor_and_status() {
         "doctor must report the credentials present again: {}",
         out.stdout
     );
+}
+
+/// #359, live: `doctor` must report a Snapshot parked on a structural gate as
+/// **FAIL immediately** — however young the object is — and must quote the
+/// operator's own fix command.
+///
+/// The reported symptom was a backup wedged "BlockedOnGrant" (an elevated mover
+/// in a namespace that never opted in) while `doctor` printed all-green. That
+/// park is phase-INVISIBLE (`phase: Pending`, unremarkable) and never
+/// self-heals, so the old age-only check reported a healthy install for the
+/// first hour of a permanent outage. The unit tier covers the classifier
+/// exhaustively; THIS test is the end-to-end proof against a real operator:
+/// a real reconciler writes the real condition, and the real plugin binary
+/// reports it.
+///
+/// Age-independence is pinned by passing `--stuck-threshold 24h`: the Snapshot
+/// is seconds old, so an age-based verdict cannot produce this FAIL — only the
+/// shared gate registry can.
+///
+/// Fixture donor: `lifecycle.rs::privileged_mover_requires_namespace_optin` —
+/// own namespace, creds Secret in it (so the run reaches the privileged-mover
+/// gate rather than the credentials gate), a `ClusterRepository` over the
+/// SHARED `/repo` PVC (no new `REPO_SUBPATHS` entry: nothing here ever writes
+/// to the repo), and a root mover.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn cli_doctor_fails_on_blocked_on_grant() {
+    use kopiur_api::ClusterRepository;
+    use kopiur_e2e::{annotate_namespace, apply_secret};
+
+    /// Workload namespace that deliberately does NOT opt in to elevated movers.
+    const APP_NS: &str = "kopiur-e2e-cli-blocked";
+    const CREPO: &str = "e2e-cli-blocked-crepo";
+    const POLICY_BLOCKED: &str = "e2e-cli-blocked-pol";
+    const SNAP: &str = "e2e-cli-blocked-snap";
+    /// Filesystem-backend creds Secret (`Need::Filesystem` seeds it in the
+    /// operator namespace; the mover reads its copy in the workload namespace).
+    const FS_CREDS: &str = "kopia-creds";
+    const PRIV_ANNOTATION: &str = kopiur_api::consts::PRIVILEGED_MOVERS_ANNOTATION;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures (shared /repo PVC + creds Secret)");
+    let client = world.client().clone();
+
+    ensure_namespace_settled(&client, APP_NS).await;
+    // Retry-safety: the `e2e` nextest profile retries a failed test IN PLACE, and
+    // a previous attempt leaves the opt-in annotation and its Snapshot behind —
+    // which would make step 1 assert against an already-UNBLOCKED object and
+    // report a phantom regression. Reset both before building the fixture.
+    annotate_namespace(&client, APP_NS, PRIV_ANNOTATION, "false")
+        .await
+        .expect("reset the privileged-mover opt-in");
+    let snapshots: Api<Snapshot> = Api::namespaced(client.clone(), APP_NS);
+    delete_and_wait_gone(&snapshots, SNAP).await;
+    // Creds in the workload namespace so the run reaches the privileged-mover
+    // gate instead of parking on the credentials gate.
+    apply_secret(
+        &client,
+        APP_NS,
+        FS_CREDS,
+        &[("KOPIA_PASSWORD", "e2e-test-password-123")],
+    )
+    .await
+    .expect("apply creds Secret into the workload namespace");
+
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), APP_NS);
+
+    // A cluster-scoped repository over the SHARED hostPath repo PVC. Secret refs
+    // must carry an explicit namespace (cluster-scoped objects infer none).
+    let crepo = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "ClusterRepository",
+        "metadata": { "name": CREPO },
+        "spec": {
+            "backend": { "filesystem": { "path": "/repo", "volume": { "pvc": { "name": "kopiur-e2e-repo" } } } },
+            "encryption": {
+                "passwordSecretRef": {
+                    "name": FS_CREDS, "namespace": E2E_NAMESPACE, "key": "KOPIA_PASSWORD"
+                }
+            },
+            "create": { "enabled": true },
+            "allowedNamespaces": { "all": true }
+        }
+    });
+    // Tolerate one left by a previous attempt (see the retry note above).
+    let _ = crepos
+        .create(&PostParams::default(), &cr::<ClusterRepository>(crepo))
+        .await;
+    wait_phase(&crepos, CREPO, "Ready")
+        .await
+        .expect("ClusterRepository should reach Ready");
+
+    // A policy whose mover runs as root — the elevated shape the namespace has
+    // not opted in to.
+    let policy = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": POLICY_BLOCKED, "namespace": APP_NS },
+        "spec": {
+            "repository": { "kind": "ClusterRepository", "name": CREPO },
+            "sources": [ { "pvc": { "name": "e2e-src" } } ],
+            // e2e-src is a statically-provisioned (non-CSI) hostPath PVC; copyMethod
+            // defaults to Snapshot, which would fail preflight against it.
+            "copyMethod": "Direct",
+            "retention": { "keepLatest": 5 },
+            "mover": { "securityContext": { "runAsUser": 0, "runAsGroup": 0 } }
+        }
+    });
+    let _ = policies
+        .create(&PostParams::default(), &cr::<SnapshotPolicy>(policy))
+        .await;
+    let snap = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": { "name": SNAP, "namespace": APP_NS },
+        "spec": { "policyRef": { "name": POLICY_BLOCKED }, "deletionPolicy": "Retain" }
+    });
+    snapshots
+        .create(&PostParams::default(), &cr::<Snapshot>(snap))
+        .await
+        .expect("create Snapshot");
+
+    // --- 1. The operator parks it on the gate ...
+    let cond = wait_condition(&snapshots, SNAP, "MoverPermitted", "False")
+        .await
+        .expect("the privileged mover must be refused until the namespace opts in");
+    assert_eq!(
+        cond.get("reason").and_then(|r| r.as_str()),
+        Some("PrivilegedMoverNotPermitted"),
+        "the gate the CLI matches on is identified by its reason: {cond}"
+    );
+
+    // ... and doctor must say so, immediately. Before the fix this printed nine
+    // green checks and exited 0 — the exact #359 symptom.
+    let out = run_cli(&["-n", APP_NS, "doctor", "--stuck-threshold", "24h"]);
+    // The report is the artifact under test; print it so a run's log carries the
+    // real doctor output (and a future failure is diagnosable from it alone).
+    eprintln!(
+        "[#359] doctor while blocked (exit {:?}):\n{}",
+        out.code, out.stdout
+    );
+    assert!(
+        !out.success,
+        "doctor must not pass while a Snapshot is parked on a structural gate:\n{}",
+        out.stdout
+    );
+    assert_eq!(out.code, Some(1), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("FAIL  no blocked or stuck work"),
+        "the stuck check must FAIL (not warn, not pass):\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains(SNAP),
+        "the blocked Snapshot must be named:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("blocked on MoverPermitted=False (PrivilegedMoverNotPermitted)"),
+        "the verdict must name the registry row that produced it (not an age guess):\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains(PRIV_ANNOTATION),
+        "doctor must quote the operator's fix command (the annotation to set):\n{}",
+        out.stdout
+    );
+
+    // --- 2. Opt in → the gate clears → the same check goes green.
+    annotate_namespace(&client, APP_NS, PRIV_ANNOTATION, "true")
+        .await
+        .expect("annotate namespace for privileged movers");
+    wait_condition(&snapshots, SNAP, "MoverPermitted", "True")
+        .await
+        .expect("the namespace opt-in must un-stick the Snapshot (Namespace watch)");
+
+    // Only the per-check line is asserted, NOT the overall exit code: in a
+    // full-suite run other binaries deliberately leave Failed repositories and
+    // Failed Snapshots behind (see `cli_doctor_and_status`), and the freed
+    // Snapshot itself may fail here — the workload namespace has no source PVC
+    // and no repo PVC, which is deliberate: this scenario proves the GATE, not a
+    // backup. A failed backup is terminal, not blocked, so it cannot flip this
+    // check.
+    let out = run_cli(&["-n", APP_NS, "doctor", "--stuck-threshold", "24h"]);
+    eprintln!(
+        "[#359] doctor after the opt-in (exit {:?}):\n{}",
+        out.code, out.stdout
+    );
+    assert!(
+        out.stdout.contains("ok    no blocked or stuck work"),
+        "the gate cleared, so the stuck check must go green:\n{}",
+        out.stdout
+    );
+
+    // Cleanup. The ORDER is load-bearing: the mutating webhook resolves a
+    // policy's repositoryRef FAIL-CLOSED, so once the ClusterRepository is gone
+    // every write to the SnapshotPolicy is denied — including the controller's
+    // own patch removing the `policy-cleanup` finalizer. Deleting the repository
+    // first therefore wedges the policy, and its namespace sits in Terminating
+    // forever (observed: the namespace only finished terminating once the
+    // ClusterRepository was re-created). Namespaced CRs first, repository last.
+    delete_and_wait_gone(&snapshots, SNAP).await;
+    delete_and_wait_gone(&policies, POLICY_BLOCKED).await;
+    let _ = crepos.delete(CREPO, &DeleteParams::default()).await;
+    let nss: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client.clone());
+    let _ = nss.delete(APP_NS, &DeleteParams::default()).await;
 }
 
 /// M5: `maintenance run` — the annotation trigger drives a REAL out-of-band
