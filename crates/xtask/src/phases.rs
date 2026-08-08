@@ -96,6 +96,26 @@
 //!   every hook dispatch as a phase-handling defect. The api half is
 //!   self-ratcheting — see [`discover_api_phase_enums`] — so a *sixth* CR phase
 //!   enum cannot be added without this list being updated.
+//! * **Rule B's wrapper-wildcard charge can over-report.** It asks "does this
+//!   block mention a phase enum at its own level, and does it have a wildcard
+//!   alternative" — it does not know what the scrutinee's *type* is. So a match
+//!   whose wildcard is over something else entirely, but whose arm bodies
+//!   happen to name a phase, is charged:
+//!
+//!   ```text
+//!   match res {
+//!       Ok(_)  => SnapshotPhase::Succeeded,
+//!       Err(_) => SnapshotPhase::Failed,
+//!   }
+//!   ```
+//!
+//!   That is exhaustive and correct, and it yields two Rule B findings. Zero
+//!   occurrences today. The remedy is an allowlist entry with a reason, which is
+//!   the right cost for a shape this rare — the alternative is type inference,
+//!   and a scanner that guesses types would start *under*-reporting the case
+//!   Rule B exists for. Pinned by
+//!   `rule_b_over_reports_a_wildcard_over_a_non_phase_scrutinee` so the limit
+//!   stays visible rather than becoming folklore.
 //! * **It is a text scanner, not a parser.** It cannot see through a macro that
 //!   generates a `match`, and it reports the *file and line* of the construct,
 //!   not a call graph. Under-reporting is the intended direction: the check must
@@ -796,6 +816,8 @@ pub fn pattern_is_wildcard_shape(pat: &str) -> bool {
 /// assert_eq!(hits.len(), 1);
 /// assert_eq!(hits[0].1, "Some(P::Unknown(r))");
 /// assert_eq!(hits[0].2, "if let Some(P::Unknown(r)) =");
+/// // A line break between `if` and `let` must not lose the `if `.
+/// assert_eq!(let_patterns("if\n    let Some(P::X) = p {}")[0].2, "if let Some(P::X) =");
 /// // An ordinary binding names nothing in its pattern.
 /// assert_eq!(let_patterns("let x = P::Failed;")[0].1, "x");
 /// ```
@@ -837,15 +859,18 @@ pub fn let_patterns(text: &str) -> Vec<(usize, String, String)> {
             i += 3;
             continue;
         };
-        // `if let` / `while let` prefix, so the head reads the way it was written.
+        // `if let` / `while let` prefix, so the head reads the way it was
+        // written. The keyword is found by skipping back over whitespace rather
+        // than by a fixed offset, so a rustfmt line break between `if` and `let`
+        // does not silently drop the `if ` from the snippet — and with it the
+        // allowlist key.
+        let mut k = i;
+        while k > 0 && c[k - 1].is_whitespace() {
+            k -= 1;
+        }
         let prefix = ["if", "while"]
             .iter()
-            .find(|kw| {
-                let want = kw.len() + 1;
-                i >= want
-                    && c[i - want..i].iter().collect::<String>().trim() == **kw
-                    && !word_before(&c, i - want)
-            })
+            .find(|kw| k >= kw.len() && word_at(&c, k - kw.len(), kw))
             .map(|kw| format!("{kw} "))
             .unwrap_or_default();
         let pattern = normalize_ws(&c[i + 3..eq].iter().collect::<String>());

@@ -82,11 +82,68 @@ fn a_semicolon_inside_a_type_does_not_end_the_item_early() {
 }
 
 #[test]
+fn a_comment_semicolon_does_not_make_a_braced_module_look_body_less() {
+    // REGRESSION, and the dangerous direction: this one fails SILENTLY toward
+    // over-inclusion. Ending the "item" at a `;` inside a comment leaves the
+    // whole test module in the corpus, where its fixtures start counting as
+    // production code — a field "wired" only by a test, a phase construct
+    // charged to a file that does not contain it.
+    let src = "#[cfg(test)]\n\
+               // fixtures; see docs/dev/api-conventions.md\n\
+               mod tests {\n\
+               \x20   fn f() { inert_fixture(); }\n\
+               }\n\
+               fn real() { keep(); }\n";
+    for out in [strip_cfg_test(src), strip_cfg_test_lines(src)] {
+        assert!(
+            !out.contains("inert_fixture"),
+            "test module leaked in: {out:?}"
+        );
+        assert!(out.contains("keep()"), "production code was eaten: {out:?}");
+    }
+}
+
+#[test]
+fn a_block_comment_or_literal_cannot_decide_the_item_extent() {
+    // The same hole in its other three spellings: a `;` in a block comment, and
+    // a brace inside a string literal closing the body early.
+    let src =
+        "#[cfg(test)]\n/* one; two */\nmod t { fn f() { inert(); } }\nfn real() { keep(); }\n";
+    let out = strip_cfg_test(src);
+    assert!(!out.contains("inert()"), "got: {out:?}");
+    assert!(out.contains("keep()"), "got: {out:?}");
+
+    let src = "#[cfg(test)]\nmod t { fn f() { let s = \"}\"; inert(); } }\nfn real() { keep(); }\n";
+    let out = strip_cfg_test(src);
+    assert!(
+        !out.contains("inert()"),
+        "brace in a literal closed the body: {out:?}"
+    );
+    assert!(out.contains("keep()"), "got: {out:?}");
+}
+
+#[test]
+fn a_lifetime_is_not_an_unterminated_char_literal() {
+    // `'a` must not swallow the rest of the item.
+    let src = "#[cfg(test)]\nfn f<'a>(x: &'a str) { inert(); }\nfn real() { keep(); }\n";
+    let out = strip_cfg_test(src);
+    assert!(!out.contains("inert()"), "got: {out:?}");
+    assert!(out.contains("keep()"), "got: {out:?}");
+}
+
+#[test]
 fn cfg_test_item_end_races_the_semicolon_against_the_brace() {
     // The unit behind the three cases above.
     assert_eq!(cfg_test_item_end("\nmod tests;\nfn real() {}"), Some(11));
     assert_eq!(cfg_test_item_end(" mod t { fn f() {} }"), Some(20));
     assert_eq!(cfg_test_item_end(" fn f() -> [u8; 4] { }"), Some(22));
+    // Trivia never supplies the deciding `;`, `{` or `}`.
+    assert_eq!(
+        cfg_test_item_end(" // fixtures; see docs\nmod t { }"),
+        Some(32)
+    );
+    assert_eq!(cfg_test_item_end(" /* a; b */ mod t { }"), Some(21));
+    assert_eq!(cfg_test_item_end(" mod t { let s = \"}\"; }"), Some(23));
     // Neither a body nor a `;`: the conservative drop-the-tail fallback.
     assert_eq!(cfg_test_item_end(" mod t { unbalanced"), None);
     assert_eq!(cfg_test_item_end(" nothing at all"), None);

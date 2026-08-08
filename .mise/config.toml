@@ -168,13 +168,14 @@ description = "Fail if a phase branch is non-exhaustive or a gate condition is C
 run = '''
 set -eu
 # The compiler enforces exhaustiveness only where an exhaustive `match` was
-# written. Three constructs opt out of it silently — `matches!` (an implicit
-# `_ => false`), a `_ =>` arm, and `==`/`!=` against a single variant — and a
-# fourth drift class has no construct at all: a gate condition the controller
-# defines and the CLI never learns about. All four shipped: #351's
-# `SnapshotPhase::Unchanged` was swallowed by two `_ =>` arms, and #359 was
-# `kubectl kopiur doctor` reporting all-green over a Snapshot parked on
-# `MoverPermitted=False`.
+# written. Four constructs opt out of it silently — `matches!` (an implicit
+# `_ => false`), a `_ =>` arm (including the wrapper form `Some(_) =>`, which is
+# how every phase here is actually read), `==`/`!=` against a single variant, and
+# an `if let` naming one variant — and a fifth drift class has no construct at
+# all: a gate condition the controller defines and the CLI never learns about.
+# They shipped: #351's `SnapshotPhase::Unchanged` was swallowed by two `_ =>`
+# arms, and #359 was `kubectl kopiur doctor` reporting all-green over a Snapshot
+# parked on `MoverPermitted=False`.
 #
 # Exemptions live in crates/xtask/phase-allowlist.yaml, each with a written
 # reason. The check fails in BOTH directions: a new non-exhaustive construct,

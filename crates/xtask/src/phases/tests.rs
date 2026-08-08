@@ -230,6 +230,22 @@ fn rule_b_does_not_charge_a_named_variant_with_a_binding_hole() {
 }
 
 #[test]
+fn rule_b_over_reports_a_wildcard_over_a_non_phase_scrutinee() {
+    // DECLARED LIMIT, pinned so it stays visible instead of becoming folklore.
+    // Rule B has no type information: it asks whether the block names a phase at
+    // its own level and has a wildcard alternative. A `Result` match whose ARM
+    // BODIES produce phases satisfies both, so this exhaustive, correct code is
+    // charged twice. Zero occurrences in the tree today; the remedy is an
+    // allowlist entry with a reason, which is the right cost for a shape this
+    // rare — the alternative is type inference, and a scanner that guesses types
+    // would start UNDER-reporting the case Rule B exists for.
+    let f =
+        scan("match res { Ok(_) => SnapshotPhase::Succeeded, Err(_) => SnapshotPhase::Failed }");
+    assert_eq!(f.len(), 2, "the declared over-report changed shape: {f:?}");
+    assert!(f.iter().all(|x| x.rule == Rule::WildcardArm));
+}
+
+#[test]
 fn rule_b_does_not_charge_a_tuple_hole() {
     // A tuple's holes are positional, not a catch-all. Pinned because the
     // wrapper rule above is the obvious way to break this.
@@ -467,6 +483,19 @@ fn rule_e_ignores_a_let_whose_pattern_names_no_phase() {
 }
 
 #[test]
+fn rule_e_keeps_the_if_prefix_across_a_line_break() {
+    // rustfmt can put `if` and `let` on separate lines. Losing the `if ` would
+    // silently change the allowlist key, turning a reviewed exemption into a
+    // simultaneous stale + uncovered pair for no reason.
+    let one_line = scan("if let Some(SnapshotPhase::Failed) = p { }");
+    let reflowed = scan("if\n    let Some(SnapshotPhase::Failed) = p { }");
+    assert_eq!(one_line.len(), 1);
+    assert_eq!(reflowed.len(), 1);
+    assert_eq!(one_line[0].snippet, reflowed[0].snippet);
+    assert_eq!(one_line[0].snippet, "if let Some(SnapshotPhase::Failed) =");
+}
+
+#[test]
 fn rule_e_stops_the_pattern_at_the_binding_equals() {
     // Not at a comparison, and not at a struct pattern's braces.
     assert_eq!(let_patterns("if let Some(p) = a == b { }")[0].1, "Some(p)");
@@ -630,9 +659,11 @@ fn every_phase_construct_is_exhaustive_or_allowlisted() {
         "phase ratchet failed.\n\
          uncovered (flagged, no reviewed exemption): {:#?}\n\
          stale (exemption matches nothing — delete it): {:#?}\n\
+         duplicate (a (file, snippet) listed twice — merge them): {:#?}\n\
          Run `cargo xtask check-phases` for the full explanation.",
         report.uncovered,
-        report.stale
+        report.stale,
+        report.duplicates
     );
 }
 

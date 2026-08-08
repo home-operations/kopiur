@@ -257,44 +257,142 @@ pub fn strip_cfg_test_mode(src: &str, lines: Lines) -> String {
 /// from the scan corpus. So the first `;` and the first `{` race, and whichever
 /// comes first wins.
 ///
-/// Depth-tracked over `(`/`[` so a `;` inside a type does not win the race:
-/// `#[cfg(test)] fn f() -> [u8; 4] { … }` still ends at its brace.
+/// Depth-tracked over `(`/`[`, and blind to nothing: comments, string literals
+/// and char literals are stepped over, so none of them can supply a `;`, a `{`
+/// or a `}` that decides the item's extent. That matters in **both**
+/// directions and this function runs before [`scrub`], so it cannot lean on it:
+///
+/// * `#[cfg(test)] fn f() -> [u8; 4] { … }` — a `;` inside a type must not win
+///   the race, or the body leaks back into the corpus;
+/// * `#[cfg(test)]\n// fixtures; see docs\nmod tests { … }` — a `;` inside a
+///   *comment* must not win it either. That failure is silent
+///   **over-inclusion**: the whole test module stays in the corpus and starts
+///   counting as production code;
+/// * `mod tests { let s = "}"; }` — a brace inside a literal must not close the
+///   body early.
 ///
 /// ```
 /// use xtask::scan::cfg_test_item_end;
 /// // Body-less declaration: ends at the `;`.
-/// assert_eq!(cfg_test_item_end("\nmod tests;\nfn real() {}").map(|e| e), Some(11));
+/// assert_eq!(cfg_test_item_end("\nmod tests;\nfn real() {}"), Some(11));
 /// // With a body: ends at the matching close brace.
-/// assert_eq!(cfg_test_item_end(" mod t { fn f() {} }").map(|e| e), Some(20));
+/// assert_eq!(cfg_test_item_end(" mod t { fn f() {} }"), Some(20));
+/// // A `;` in a comment does not make a braced module look body-less.
+/// assert_eq!(cfg_test_item_end(" // fixtures; see docs\nmod t { }"), Some(32));
 /// ```
 pub fn cfg_test_item_end(after: &str) -> Option<usize> {
     let b = after.as_bytes();
     let mut depth = 0i32;
-    for (i, ch) in b.iter().enumerate() {
-        match ch {
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = trivia_end(b, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
             b'(' | b'[' => depth += 1,
             b')' | b']' => depth -= 1,
             b';' if depth == 0 => return Some(i + 1),
-            b'{' if depth == 0 => {
-                let mut d = 0usize;
-                for (k, c) in b.iter().enumerate().skip(i) {
-                    match c {
-                        b'{' => d += 1,
-                        b'}' => {
-                            d -= 1;
-                            if d == 0 {
-                                return Some(k + 1);
-                            }
-                        }
-                        _ => {}
-                    }
+            b'{' if depth == 0 => return brace_group_end(b, i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// One past the `}` matching the `{` at `open`, skipping trivia.
+fn brace_group_end(b: &[u8], open: usize) -> Option<usize> {
+    let mut d = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        if let Some(next) = trivia_end(b, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'{' => d += 1,
+            b'}' => {
+                d -= 1;
+                if d == 0 {
+                    return Some(i + 1);
                 }
-                return None;
             }
             _ => {}
         }
+        i += 1;
     }
     None
+}
+
+/// If `b[i]` opens a comment or a literal, the index just past it.
+///
+/// Returns `None` for ordinary code, including a lifetime (`'a`), which must not
+/// be mistaken for an unterminated char literal.
+fn trivia_end(b: &[u8], i: usize) -> Option<usize> {
+    match b[i] {
+        // Line comment, to the newline (which is left in place).
+        b'/' if b.get(i + 1) == Some(&b'/') => Some(
+            b[i..]
+                .iter()
+                .position(|c| *c == b'\n')
+                .map_or(b.len(), |n| i + n),
+        ),
+        // Block comment, nesting-aware like the language.
+        b'/' if b.get(i + 1) == Some(&b'*') => {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < b.len() && depth > 0 {
+                if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            Some(j)
+        }
+        // Raw string: r"…" / r#"…"# / r##"…"##
+        b'r' => {
+            let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+            if b.get(i + 1 + hashes) != Some(&b'"') {
+                return None;
+            }
+            let mut j = i + 2 + hashes;
+            while j < b.len() {
+                if b[j] == b'"' && b[j + 1..].iter().take(hashes).all(|h| *h == b'#') {
+                    return Some(j + 1 + hashes);
+                }
+                j += 1;
+            }
+            Some(b.len())
+        }
+        // Normal string, with escapes.
+        b'"' => {
+            let mut j = i + 1;
+            while j < b.len() {
+                match b[j] {
+                    b'\\' => j += 2,
+                    b'"' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            Some(b.len())
+        }
+        // Char literal — but `'a` is a lifetime, so require the closing quote.
+        b'\'' => {
+            if b.get(i + 1) == Some(&b'\\') {
+                return (i + 2..=(i + 12).min(b.len().saturating_sub(1)))
+                    .find(|&j| b.get(j) == Some(&b'\''))
+                    .map(|j| j + 1);
+            }
+            (b.get(i + 2) == Some(&b'\'')).then_some(i + 3)
+        }
+        _ => None,
+    }
 }
 
 /// Remove `use ...;` statements (including multi-line brace groups).
