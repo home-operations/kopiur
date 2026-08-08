@@ -13,7 +13,7 @@
 //! (`KOPIA_PASSWORD`), never on argv, so they never leak into process listings
 //! or error messages.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -474,6 +474,77 @@ impl ConnectSpec {
     }
 }
 
+/// Options for `kopia repository connect` beyond backend/cache selection.
+/// `Copy` + `Default` so the common read-write, non-persisted connect is
+/// `ConnectOptions::default()` — which produces byte-identical argv to a
+/// pre-`ConnectOptions` [`KopiaClient::repository_connect`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    /// `--readonly`: persist kopia's read-only bit into the client config, so
+    /// every subsequent invocation on this connection is structurally unable
+    /// to mutate the repository (browse sessions; replication source connects).
+    pub readonly: bool,
+    /// `--persist-credentials`: write the repository password beside the
+    /// config file (`<config>.kopia-password`) so later invocations reading
+    /// that config — including `kopia snapshot migrate --source-config` run
+    /// under a DIFFERENT `KOPIA_PASSWORD` — authenticate with the persisted
+    /// password. kopia's own default is already persist-on; passing it
+    /// explicitly pins the contract rather than relying on the default.
+    pub persist_credentials: bool,
+}
+
+/// Which source-repository snapshot sources `kopia snapshot migrate` copies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrateSources {
+    /// `--all`: migrate every source present in the source repository.
+    All,
+    /// One `--sources <spec>` per entry. Each spec is a kopia source triple
+    /// rendered as `username@hostname:/path` (see
+    /// [`crate::model::SnapshotSource::identity`]).
+    List(Vec<String>),
+}
+
+/// How `kopia snapshot migrate` treats kopia-side policies on the destination.
+///
+/// kopia's OWN default is `--policies` **true** (copy policies), so
+/// [`MigratePolicies::None`] must be rendered as an EXPLICIT `--no-policies` —
+/// omitting the flag would silently import the source repository's kopia
+/// policies (retention among them) into the destination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MigratePolicies {
+    /// `--no-policies`: copy no kopia policies (kopiur's default — the
+    /// operator owns policy on both sides).
+    #[default]
+    None,
+    /// `--policies`: copy policies for the migrated sources, keeping any that
+    /// already exist on the destination.
+    Copy,
+    /// `--policies --overwrite-policies`: copy policies, overwriting existing
+    /// destination policies for the migrated sources.
+    CopyOverwrite,
+}
+
+/// Options for `kopia snapshot migrate --source-config <path>` — logical
+/// (snapshot-level) replication from another repository into the CONNECTED
+/// one. See [`KopiaClient::snapshot_migrate`] for the execution contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMigrateOptions {
+    /// `--source-config`: path to the kopia config file of the SOURCE
+    /// repository. The source password is read from that config's persisted
+    /// credentials (`<config>.kopia-password` — see
+    /// [`ConnectOptions::persist_credentials`]), never from this client's
+    /// `KOPIA_PASSWORD` (which belongs to the connected destination).
+    pub source_config_path: String,
+    /// Which sources to migrate.
+    pub sources: MigrateSources,
+    /// `--latest-only`: migrate only the latest snapshot per source.
+    pub latest_only: bool,
+    /// `--parallel <n>`: how many sources to migrate concurrently.
+    pub parallel: Option<u32>,
+    /// Policy copy mode (kopiur defaults to [`MigratePolicies::None`]).
+    pub policies: MigratePolicies,
+}
+
 /// Options for `kopia snapshot verify`. All fields default to kopia's defaults
 /// when `None`/empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -896,6 +967,7 @@ impl Default for ServerStartSpec {
 pub struct KopiaClientBuilder {
     binary: Option<PathBuf>,
     common_env: BTreeMap<String, String>,
+    common_env_remove: BTreeSet<String>,
     common_args: Vec<String>,
     default_timeout: Option<Duration>,
 }
@@ -912,6 +984,19 @@ impl KopiaClientBuilder {
     /// `KOPIA_PASSWORD`, `KOPIA_CONFIG_PATH`, cache dirs, and S3 credentials.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.common_env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Record an environment variable to UNSET on every spawned command
+    /// (`Command::env_remove`), mirroring the `None` half of the
+    /// per-invocation overlay semantics (see `run_with_env`: `Some(v)` sets,
+    /// `None` unsets). Use this to keep an ambient/inherited credential from
+    /// leaking into a client that must not see it (e.g. the source
+    /// `KOPIA_PASSWORD` on a destination-configured replication client).
+    /// Applied AFTER [`Self::env`], so a key both set and removed ends up
+    /// unset; a later per-invocation overlay `Some(v)` still wins.
+    pub fn env_remove(mut self, key: impl Into<String>) -> Self {
+        self.common_env_remove.insert(key.into());
         self
     }
 
@@ -948,6 +1033,7 @@ impl KopiaClientBuilder {
         KopiaClient {
             binary: self.binary.unwrap_or_else(|| PathBuf::from("kopia")),
             common_env: self.common_env,
+            common_env_remove: self.common_env_remove,
             common_args,
             default_timeout: self.default_timeout,
         }
@@ -977,6 +1063,7 @@ impl KopiaClientBuilder {
 pub struct KopiaClient {
     binary: PathBuf,
     common_env: BTreeMap<String, String>,
+    common_env_remove: BTreeSet<String>,
     common_args: Vec<String>,
     default_timeout: Option<Duration>,
 }
@@ -1019,6 +1106,12 @@ impl KopiaClient {
         &self.common_env
     }
 
+    /// The environment-variable names UNSET on every invocation (useful for
+    /// tests asserting a credential is structurally kept away from a client).
+    pub fn common_env_remove(&self) -> &BTreeSet<String> {
+        &self.common_env_remove
+    }
+
     /// The global args appended after the subcommand on every invocation
     /// (useful for tests asserting e.g. `--no-auto-maintenance` is always
     /// present).
@@ -1054,6 +1147,11 @@ impl KopiaClient {
         // fine. We only override what common_env specifies.
         for (k, v) in &self.common_env {
             cmd.env(k, v);
+        }
+        // Builder-recorded unsets (env_remove) are applied after common_env,
+        // so a key both set and removed ends up unset.
+        for k in &self.common_env_remove {
+            cmd.env_remove(k);
         }
         // Per-invocation overlay wins over both the inherited env and common_env.
         for (k, v) in env_overlay {
@@ -1241,9 +1339,8 @@ impl KopiaClient {
         spec: &ConnectSpec,
         cache: CacheTuning,
     ) -> Result<(), KopiaError> {
-        self.run_ok(&connect_args(spec, cache, false))
+        self.repository_connect_with(spec, cache, ConnectOptions::default())
             .await
-            .map(|_| ())
     }
 
     /// Connect to an existing repository **read-only** (`kopia repository
@@ -1257,7 +1354,32 @@ impl KopiaClient {
         spec: &ConnectSpec,
         cache: CacheTuning,
     ) -> Result<(), KopiaError> {
-        self.run_ok(&connect_args(spec, cache, true))
+        self.repository_connect_with(
+            spec,
+            cache,
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: false,
+            },
+        )
+        .await
+    }
+
+    /// Connect to an existing repository with explicit [`ConnectOptions`]
+    /// (`kopia repository connect <backend> [--readonly]
+    /// [--persist-credentials]`). [`Self::repository_connect`] and
+    /// [`Self::repository_connect_readonly`] both delegate here with the
+    /// options that reproduce their historical argv byte-for-byte. The
+    /// replication mover's source connect uses `readonly` +
+    /// `persist_credentials` together so `snapshot migrate --source-config`
+    /// can later read the source password from the persisted credentials.
+    pub async fn repository_connect_with(
+        &self,
+        spec: &ConnectSpec,
+        cache: CacheTuning,
+        opts: ConnectOptions,
+    ) -> Result<(), KopiaError> {
+        self.run_ok(&connect_args(spec, cache, opts))
             .await
             .map(|_| ())
     }
@@ -1457,6 +1579,39 @@ impl KopiaClient {
             args.push(src.identity());
         }
         self.run_json(&args, "snapshot list").await
+    }
+
+    /// List EVERY snapshot in the repository regardless of owning identity
+    /// (`kopia snapshot list --json --all`). The unfiltered
+    /// [`Self::snapshot_list`] never passes `--all`, so kopia scopes it to the
+    /// CONNECTED identity's snapshots and foreign identities (e.g. rows
+    /// migrated from another repository under their original `user@host`) can
+    /// be missed entirely. Replication enumeration and post-migrate
+    /// verification must use this.
+    pub async fn snapshot_list_all(&self) -> Result<Vec<SnapshotListEntry>, KopiaError> {
+        self.run_json(&snapshot_list_all_args(), "snapshot list --all")
+            .await
+    }
+
+    /// Copy snapshot manifests (and their content) from ANOTHER repository
+    /// into the CONNECTED one (`kopia snapshot migrate --source-config
+    /// <path>`). The caller must already be connected to the **destination**;
+    /// the source repository is opened from the config file named in
+    /// [`SnapshotMigrateOptions::source_config_path`], authenticating with
+    /// that config's PERSISTED password (see
+    /// [`ConnectOptions::persist_credentials`]) — this client's
+    /// `KOPIA_PASSWORD` belongs to the destination. `snapshot migrate` has no
+    /// `--json`; success is exit code 0, like
+    /// [`Self::repository_sync_to`].
+    ///
+    /// **CAVEAT — kopia exits 0 even when a per-source migration failed**: the
+    /// per-source migration goroutines only LOG their errors (verified against
+    /// kopia 0.23.1's `cli/command_snapshot_migrate.go`), so a zero exit does
+    /// NOT mean every selected snapshot arrived. Callers MUST post-verify by
+    /// listing the destination ([`Self::snapshot_list_all`]) and checking that
+    /// every expected `(identity, startTime)` pair is present.
+    pub async fn snapshot_migrate(&self, opts: &SnapshotMigrateOptions) -> Result<(), KopiaError> {
+        self.run_ok(&snapshot_migrate_args(opts)).await.map(|_| ())
     }
 
     /// Delete a single snapshot by manifest id. kopia's `snapshot delete`
@@ -1726,6 +1881,9 @@ impl KopiaClient {
         for (k, v) in &self.common_env {
             cmd.env(k, v);
         }
+        for k in &self.common_env_remove {
+            cmd.env_remove(k);
+        }
         cmd.args(args);
         cmd.args(&self.common_args);
         cmd.stdin(Stdio::null());
@@ -1824,6 +1982,9 @@ impl KopiaClient {
         let mut cmd = std::process::Command::new(&self.binary);
         for (k, v) in &self.common_env {
             cmd.env(k, v);
+        }
+        for k in &self.common_env_remove {
+            cmd.env_remove(k);
         }
         cmd.args(&args);
         cmd.args(&self.common_args);
@@ -1991,15 +2152,73 @@ fn verify_args(opts: &VerifyOptions) -> Vec<String> {
 }
 
 /// Build the args for `kopia repository connect <backend> [flags]`. Pure so the
-/// read-only vs read-write argv split is unit-testable without spawning kopia.
+/// option → argv mapping is unit-testable without spawning kopia.
 /// `--readonly` (kopia's persistent read-only client-config bit) is appended
-/// only for read-only (browse) connects.
-fn connect_args(spec: &ConnectSpec, cache: CacheTuning, readonly: bool) -> Vec<String> {
+/// only for read-only connects (browse sessions; replication source connects),
+/// then `--persist-credentials` when the password must be written beside the
+/// config file. An all-default [`ConnectOptions`] appends nothing — byte-for-
+/// byte the pre-`ConnectOptions` read-write argv.
+fn connect_args(spec: &ConnectSpec, cache: CacheTuning, opts: ConnectOptions) -> Vec<String> {
     let mut args = vec!["repository".into(), "connect".into()];
     args.extend(spec.backend_args());
     args.extend(cache.args());
-    if readonly {
+    if opts.readonly {
         args.push("--readonly".into());
+    }
+    if opts.persist_credentials {
+        args.push("--persist-credentials".into());
+    }
+    args
+}
+
+/// Build the args for `kopia snapshot list --json --all`. Pure so the
+/// every-identity list argv is unit-testable without spawning kopia.
+fn snapshot_list_all_args() -> Vec<String> {
+    vec![
+        "snapshot".into(),
+        "list".into(),
+        "--json".into(),
+        "--all".into(),
+    ]
+}
+
+/// Build the args for `kopia snapshot migrate` plus options. Pure so it is
+/// unit-testable without spawning kopia. Exact shape: `["snapshot", "migrate",
+/// "--source-config", <path>]`, then `--all` OR one `--sources <spec>` per
+/// list entry, then `--latest-only` when set, `--parallel <n>` when set, then
+/// the policy mode. [`MigratePolicies::None`] MUST render an explicit
+/// `--no-policies` — kopia's own default for `--policies` is TRUE, so omission
+/// would silently import the source's kopia policies.
+fn snapshot_migrate_args(opts: &SnapshotMigrateOptions) -> Vec<String> {
+    let mut args = vec![
+        "snapshot".into(),
+        "migrate".into(),
+        "--source-config".into(),
+        opts.source_config_path.clone(),
+    ];
+    match &opts.sources {
+        MigrateSources::All => args.push("--all".into()),
+        MigrateSources::List(specs) => {
+            for spec in specs {
+                args.push("--sources".into());
+                args.push(spec.clone());
+            }
+        }
+    }
+    if opts.latest_only {
+        args.push("--latest-only".into());
+    }
+    if let Some(p) = opts.parallel {
+        args.push("--parallel".into());
+        args.push(p.to_string());
+    }
+    match opts.policies {
+        MigratePolicies::None => args.push("--no-policies".into()),
+        MigratePolicies::Copy => args.push("--policies".into()),
+        MigratePolicies::CopyOverwrite => {
+            args.push("--policies".into());
+            args.push("--overwrite-policies".into());
+        }
     }
     args
 }
