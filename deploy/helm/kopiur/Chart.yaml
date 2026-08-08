@@ -8,9 +8,9 @@ type: application
 # Chart + default image version, stamped by release-please on every release so
 # a git-sourced install deploys real image tags (the release workflow re-stamps
 # both at package time anyway; these keep the repo copy from going stale).
-version: 0.9.3 # x-release-please-version
+version: 0.9.4 # x-release-please-version
 # Operator/image version this chart deploys by default.
-appVersion: "0.9.3" # x-release-please-version
+appVersion: "0.9.4" # x-release-please-version
 # Floor matches the default `streamingLists: true` (WatchList: beta in 1.32/1.33,
 # GA in 1.34). The CSI volume-populator path (Restore + PVC.dataSourceRef) needs
 # the AnyVolumeDataSource feature, available well below this floor.
