@@ -93,7 +93,17 @@ failure is inside `--failure-lookback` (default `24h`) and only **warns** for
 older ones. `failedJobsHistoryLimit` keeps failed CRs around by design, so
 without that window one bad night last month would leave doctor permanently red.
 
+A failure a *deliberate configuration* explains is listed but never counted red,
+whatever its age — a repository you flipped to `mode: ReadOnly` refuses backups
+by design, so a schedule still firing against it warns rather than failing for
+the whole migration.
+
 ///
+
+Every check reports what it could actually see. If one kind cannot be listed
+(a kubeconfig without `list snapshotschedules`, say) only that kind degrades:
+the objects that did list are still examined, and the unreadable kind is named
+next to the verdict — never a green report standing in for an unread cluster.
 
 If the plugin is older than the operator it says so instead of reporting green:
 an unreadable phase, an unknown gate reason, or a response it cannot decode all

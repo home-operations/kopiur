@@ -522,6 +522,9 @@ fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
         }
     }
     if !fails.is_empty() {
+        // The warn-level findings are still listed — a Fail elsewhere must not
+        // swallow the ReadOnly/unknown-reason lines a reader needs to see.
+        fails.extend(warns);
         return Outcome::Fail {
             what: format!("repositories not Ready or blocked: {}", fails.join("; ")),
             why: "backups/restores against an unready repository cannot run, and a repository \
@@ -603,22 +606,32 @@ enum GateHit<'c> {
     Unregistered(&'c Condition),
 }
 
-/// The first structural gate among `conditions` that applies to a kind, per
-/// `covers` (one of the `GateScope::covers_*` classifiers). A registered row
-/// always wins over an unregistered trip, so a known gate is never masked by an
-/// unknown one listed earlier.
+/// The most severe structural gate among `conditions` that applies to a kind,
+/// per `covers` (one of the `GateScope::covers_*` classifiers).
+///
+/// Precedence, strictly: a registered `Fail` row, then a registered `Warn` row,
+/// then an unregistered trip. Severity outranks position because
+/// `status.conditions` is an arbitrarily-ordered array: without this, a
+/// `RepositoryWritable=False` (Warn) listed before a `MoverPermitted=False`
+/// (Fail) would silently downgrade the object's verdict — the same inversion
+/// the unregistered-last ordering already guards against.
 fn first_gate(conditions: &[Condition], covers: fn(GateScope) -> bool) -> Option<GateHit<'_>> {
+    let mut warned: Option<GateHit<'_>> = None;
     let mut unregistered: Option<&Condition> = None;
     for cond in conditions {
         let scoped = || STRUCTURAL_GATES.iter().filter(|g| covers(g.applies_to));
         if let Some(gate) = scoped().find(|g| g.matches(&cond.type_, &cond.status, &cond.reason)) {
-            return Some(GateHit::Known(gate, cond));
+            match gate.severity {
+                GateSeverity::Fail => return Some(GateHit::Known(gate, cond)),
+                GateSeverity::Warn => warned.get_or_insert(GateHit::Known(gate, cond)),
+            };
+            continue;
         }
         if unregistered.is_none() && scoped().any(|g| g.trips(&cond.type_, &cond.status)) {
             unregistered = Some(cond);
         }
     }
-    unregistered.map(GateHit::Unregistered)
+    warned.or_else(|| unregistered.map(GateHit::Unregistered))
 }
 
 /// One line about a registered gate. The operator's condition message already
@@ -676,8 +689,9 @@ enum StuckKind {
     Blocked {
         /// The registry row that identified it (its severity is the verdict).
         gate: &'static StructuralGate,
-        /// The operator's condition message, which carries the fix command.
-        message: String,
+        /// The rendered [`describe_gate`] line — one renderer, so the CLI
+        /// cannot describe the same gate two ways in two checks.
+        detail: String,
     },
     /// Non-terminal for longer than `--stuck-threshold`.
     Overdue,
@@ -718,10 +732,7 @@ impl StuckKind {
     /// The clause appended after the object's name.
     fn detail(&self, threshold_label: &str) -> String {
         match self {
-            Self::Blocked { gate, message } => format!(
-                "blocked on {}={} ({}): {message}",
-                gate.condition, gate.blocked_status, gate.reason
-            ),
+            Self::Blocked { detail, .. } => detail.clone(),
             Self::Overdue => format!("non-terminal for longer than {threshold_label}"),
             Self::UnknownPhase { phase } => {
                 format!("phase `{phase}` is not one this plugin understands")
@@ -793,7 +804,7 @@ fn classify_stuck(
     if let Some(GateHit::Known(gate, cond)) = gate {
         return Some(StuckKind::Blocked {
             gate,
-            message: cond.message.clone(),
+            detail: describe_gate(gate, cond),
         });
     }
     if age.is_some_and(|a| a > threshold) {
@@ -928,10 +939,19 @@ struct Work {
     snapshots: Vec<Snapshot>,
     restores: Vec<Restore>,
     schedules: Vec<SnapshotSchedule>,
+    /// Kinds that could not be listed, as the outcome their error mapped to.
+    ///
+    /// Degradation is **per kind**, never all-or-nothing. A kubeconfig scoped
+    /// to Snapshots and Restores but not SnapshotSchedules is ordinary, and
+    /// discarding two successful listings because a third 403'd would report
+    /// exit 0 with a blocked Snapshot sitting right there — the very failure
+    /// mode #359 is about. What listed is still examined; what did not is named
+    /// alongside the verdict.
+    degraded: Vec<Outcome>,
 }
 
-async fn list_work(ctx: &KubeCtx) -> Result<Work, Outcome> {
-    async fn listed<K>(ctx: &KubeCtx, resource: &str) -> Result<Vec<K>, Outcome>
+async fn list_work(ctx: &KubeCtx) -> Work {
+    async fn listed<K>(ctx: &KubeCtx, resource: &str, degraded: &mut Vec<Outcome>) -> Vec<K>
     where
         K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
             + Clone
@@ -943,16 +963,68 @@ async fn list_work(ctx: &KubeCtx) -> Result<Work, Outcome> {
             Scope::All => Api::all(ctx.client.clone()),
             Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
         };
-        api.list(&ListParams::default())
-            .await
-            .map(|l| l.items)
-            .map_err(|e| warn_for("list", resource, &e))
+        match api.list(&ListParams::default()).await {
+            Ok(l) => l.items,
+            Err(e) => {
+                degraded.push(warn_for("list", resource, &e));
+                Vec::new()
+            }
+        }
     }
-    Ok(Work {
-        snapshots: listed::<Snapshot>(ctx, "snapshots").await?,
-        restores: listed::<Restore>(ctx, "restores").await?,
-        schedules: listed::<SnapshotSchedule>(ctx, "snapshotschedules").await?,
-    })
+    let mut degraded = Vec::new();
+    Work {
+        snapshots: listed::<Snapshot>(ctx, "snapshots", &mut degraded).await,
+        restores: listed::<Restore>(ctx, "restores", &mut degraded).await,
+        schedules: listed::<SnapshotSchedule>(ctx, "snapshotschedules", &mut degraded).await,
+        degraded,
+    }
+}
+
+/// The one-line summary of a degradation, whatever severity it carried.
+fn degradation_note(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Warn(msg) => msg.clone(),
+        Outcome::Fail { what, .. } => what.clone(),
+        Outcome::Pass => String::new(),
+    }
+}
+
+fn with_notes(head: &str, notes: &[String]) -> String {
+    if head.is_empty() {
+        return notes.join("; ");
+    }
+    format!("{head}; {}", notes.join("; "))
+}
+
+/// Fold per-kind listing degradations into a check's verdict. Pure.
+///
+/// A finding always survives: degradation is appended to a `Fail`'s `what`
+/// rather than replacing it, so "a Snapshot is blocked AND schedules were
+/// unreadable" reports both. A degradation that is itself fatal (a decode/skew
+/// failure) escalates a Pass/Warn to `Fail`, because a kind nobody could read
+/// is not a kind anybody verified.
+fn merge_degradation(base: Outcome, degraded: &[Outcome]) -> Outcome {
+    if degraded.is_empty() {
+        return base;
+    }
+    let notes: Vec<String> = degraded.iter().map(degradation_note).collect();
+    let fatal = degraded.iter().find_map(|o| match o {
+        Outcome::Fail { why, fix, .. } => Some((why.clone(), fix.clone())),
+        Outcome::Pass | Outcome::Warn(_) => None,
+    });
+    match (base, fatal) {
+        (Outcome::Fail { what, why, fix }, _) => Outcome::Fail {
+            what: with_notes(&what, &notes),
+            why,
+            fix,
+        },
+        (other, Some((why, fix))) => Outcome::Fail {
+            what: with_notes(&degradation_note(&other), &notes),
+            why,
+            fix,
+        },
+        (other, None) => Outcome::Warn(with_notes(&degradation_note(&other), &notes)),
+    }
 }
 
 /// `ns/name`, with the namespace omitted for cluster-scoped objects.
@@ -1005,8 +1077,20 @@ struct FailureEntry {
     /// When the failure was recorded; `None` when nothing dates it (treated as
     /// old, so an undatable failure can never flip doctor red forever).
     at: Option<DateTime<Utc>>,
-    /// The operator's diagnosis, from the kstatus conditions.
+    /// The operator's diagnosis: the registered gate that explains the failure
+    /// when there is one, else the kstatus condition message.
     message: Option<String>,
+    /// Set when a `Warn`-severity registry row explains this failure.
+    ///
+    /// The registry's severity is authoritative on BOTH paths, not just the
+    /// in-flight one. `RepositoryWritable=False` is the case that matters: its
+    /// writer sets `phase: Failed` in the same status patch, so a repository
+    /// deliberately flipped to `mode: ReadOnly` for a migration produces one
+    /// fresh `Failed` Snapshot per schedule slot. Windowing those as current
+    /// problems would exit 1 for as long as the migration lasts — exactly the
+    /// "a green/red verdict must not hinge on it" the row's own comment
+    /// forbids. Explained failures are reported, never counted as red.
+    explained_by_warn_gate: bool,
 }
 
 /// When a terminal object recorded its failure: the newest transition time
@@ -1066,10 +1150,13 @@ fn failures_outcome(
     let window =
         chrono::Duration::from_std(lookback).unwrap_or_else(|_| chrono::Duration::hours(24));
     let cutoff = now - window;
-    let (recent, older): (Vec<&FailureEntry>, Vec<&FailureEntry>) = entries
+    // A failure a Warn-severity gate explains never enters the window at all.
+    let (explained, unexplained): (Vec<&FailureEntry>, Vec<&FailureEntry>) =
+        entries.iter().partition(|e| e.explained_by_warn_gate);
+    let (recent, older): (Vec<&&FailureEntry>, Vec<&&FailureEntry>) = unexplained
         .iter()
         .partition(|e| e.at.is_some_and(|t| t > cutoff));
-    let line = |e: &&FailureEntry| {
+    let line = |e: &FailureEntry| {
         format!(
             "{}{}{}",
             e.object,
@@ -1081,8 +1168,9 @@ fn failures_outcome(
                 .unwrap_or_default()
         )
     };
+    let explained_lines: Vec<String> = explained.iter().map(|e| line(e)).collect();
     if !recent.is_empty() {
-        let lines: Vec<String> = recent.iter().map(line).collect();
+        let mut lines: Vec<String> = recent.iter().map(|e| line(e)).collect();
         let older_note = if older.is_empty() {
             String::new()
         } else {
@@ -1091,10 +1179,12 @@ fn failures_outcome(
                 older.len()
             )
         };
+        let recent_count = recent.len();
+        // Explained failures are listed alongside, never counted as red.
+        lines.extend(explained_lines);
         return Outcome::Fail {
             what: format!(
-                "{} failed in the last {lookback_label}: {}{older_note}",
-                recent.len(),
+                "{recent_count} failed in the last {lookback_label}: {}{older_note}",
                 join_capped(&lines, 10)
             ),
             why: "a Failed Snapshot/Restore means a backup or restore did NOT happen; a failure \
@@ -1106,15 +1196,49 @@ fn failures_outcome(
                 .into(),
         };
     }
-    if older.is_empty() {
-        Outcome::Pass
-    } else {
-        let lines: Vec<String> = older.iter().map(line).collect();
-        Outcome::Warn(format!(
+    if older.is_empty() && explained_lines.is_empty() {
+        return Outcome::Pass;
+    }
+    let mut note = Vec::new();
+    if !explained_lines.is_empty() {
+        note.push(format!(
+            "{} failure(s) explained by a deliberate configuration: {}",
+            explained_lines.len(),
+            join_capped(&explained_lines, 5)
+        ));
+    }
+    if !older.is_empty() {
+        let lines: Vec<String> = older.iter().map(|e| line(e)).collect();
+        note.push(format!(
             "{} failed object(s) retained as history, none in the last {lookback_label}: {}",
             older.len(),
             join_capped(&lines, 5)
-        ))
+        ));
+    }
+    Outcome::Warn(note.join("; "))
+}
+
+/// Build one [`FailureEntry`], letting a `Warn`-severity registry row explain
+/// (and de-escalate) the failure. Pure.
+fn failure_entry(
+    object: String,
+    conditions: &[Condition],
+    meta: &kube::core::ObjectMeta,
+    covers: fn(GateScope) -> bool,
+) -> FailureEntry {
+    let warn_gate = match first_gate(conditions, covers) {
+        Some(GateHit::Known(gate, cond)) if gate.severity == GateSeverity::Warn => {
+            Some(describe_gate(gate, cond))
+        }
+        // A Fail-severity gate adds nothing here: the object is already red and
+        // the window is the right instrument for it.
+        Some(GateHit::Known(..) | GateHit::Unregistered(_)) | None => None,
+    };
+    FailureEntry {
+        object,
+        at: failed_at(conditions, meta),
+        explained_by_warn_gate: warn_gate.is_some(),
+        message: warn_gate.or_else(|| failure_message(conditions)),
     }
 }
 
@@ -1127,22 +1251,22 @@ fn check_recent_failures(
     let mut entries = Vec::new();
     for s in &work.snapshots {
         if s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Failed) {
-            let conds = conditions_of(s.status.as_ref().map(|st| &st.conditions));
-            entries.push(FailureEntry {
-                object: object_label("snapshot", &s.metadata),
-                at: failed_at(conds, &s.metadata),
-                message: failure_message(conds),
-            });
+            entries.push(failure_entry(
+                object_label("snapshot", &s.metadata),
+                conditions_of(s.status.as_ref().map(|st| &st.conditions)),
+                &s.metadata,
+                GateScope::covers_snapshot,
+            ));
         }
     }
     for r in &work.restores {
         if r.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&RestorePhase::Failed) {
-            let conds = conditions_of(r.status.as_ref().map(|st| &st.conditions));
-            entries.push(FailureEntry {
-                object: object_label("restore", &r.metadata),
-                at: failed_at(conds, &r.metadata),
-                message: failure_message(conds),
-            });
+            entries.push(failure_entry(
+                object_label("restore", &r.metadata),
+                conditions_of(r.status.as_ref().map(|st| &st.conditions)),
+                &r.metadata,
+                GateScope::covers_restore,
+            ));
         }
     }
     failures_outcome(&entries, now, lookback)
@@ -1263,30 +1387,24 @@ pub async fn run(
             });
         }
     }
-    // One listing pass feeds both work-scoped checks (and both report the same
-    // degradation when the list is unavailable).
-    match list_work(ctx).await {
-        Ok(work) => {
-            checks.push(CheckResult {
-                check: DoctorCheck::NoStuckWork,
-                outcome: check_stuck(&work, args.stuck_threshold, now),
-            });
-            checks.push(CheckResult {
-                check: DoctorCheck::RecentFailures,
-                outcome: check_recent_failures(&work, args.failure_lookback, now),
-            });
-        }
-        Err(outcome) => {
-            checks.push(CheckResult {
-                check: DoctorCheck::NoStuckWork,
-                outcome: outcome.clone(),
-            });
-            checks.push(CheckResult {
-                check: DoctorCheck::RecentFailures,
-                outcome,
-            });
-        }
-    }
+    // One listing pass feeds both work-scoped checks. A kind that could not be
+    // listed degrades ONLY itself: whatever listed is still examined, and the
+    // unreadable kind is named next to the verdict.
+    let work = list_work(ctx).await;
+    checks.push(CheckResult {
+        check: DoctorCheck::NoStuckWork,
+        outcome: merge_degradation(
+            check_stuck(&work, args.stuck_threshold, now),
+            &work.degraded,
+        ),
+    });
+    checks.push(CheckResult {
+        check: DoctorCheck::RecentFailures,
+        outcome: merge_degradation(
+            check_recent_failures(&work, args.failure_lookback, now),
+            &work.degraded,
+        ),
+    });
     checks.push(CheckResult {
         check: DoctorCheck::RecentWarnings,
         outcome: check_warnings(ctx, now).await,
@@ -1540,6 +1658,7 @@ mod tests {
             snapshots,
             restores,
             schedules: Vec::new(),
+            degraded: Vec::new(),
         }
     }
 
@@ -1848,6 +1967,7 @@ mod tests {
         let w = Work {
             snapshots: vec![],
             restores: vec![],
+            degraded: vec![],
             schedules: vec![schedule_with(vec![condition(
                 kopiur_api::consts::SCHEDULE_RUNNABLE_CONDITION,
                 "False",
@@ -2041,6 +2161,200 @@ mod tests {
             ),
             Outcome::Warn(_)
         ));
+    }
+
+    #[test]
+    fn a_readonly_repository_failure_warns_instead_of_failing_doctor() {
+        // The registry's severity is authoritative on the TERMINAL path too.
+        // The ReadOnly writer sets `phase: Failed` in the same status patch, so
+        // a repository flipped to `mode: ReadOnly` for a migration produces a
+        // fresh Failed Snapshot every schedule slot. Windowing those as current
+        // problems would exit 1 for the whole migration — which the row's own
+        // "a green/red verdict must not hinge on it" forbids.
+        let at = (now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let s = snapshot(
+            serde_json::json!({
+                "name": "nightly-1",
+                "namespace": "media",
+                "creationTimestamp": ago(10),
+            }),
+            serde_json::json!({
+                "phase": "Failed",
+                "conditions": [
+                    { "type": "Ready", "status": "False", "reason": "RepositoryReadOnly",
+                      "message": "refused", "lastTransitionTime": at },
+                    { "type": kopiur_api::consts::REPOSITORY_WRITABLE_CONDITION,
+                      "status": "False",
+                      "reason": kopiur_api::consts::REPOSITORY_READ_ONLY_REASON,
+                      "message": "repository nas is ReadOnly; backups are refused",
+                      "lastTransitionTime": at },
+                ],
+            }),
+        );
+        let outcome = check_recent_failures(
+            &work(vec![s], vec![]),
+            std::time::Duration::from_secs(24 * 3600),
+            now(),
+        );
+        let Outcome::Warn(msg) = &outcome else {
+            panic!("a Warn-severity gate must explain, not fail: {outcome:?}");
+        };
+        assert!(
+            msg.contains("explained by a deliberate configuration"),
+            "{msg}"
+        );
+        assert!(msg.contains("RepositoryWritable=False"), "{msg}");
+        assert!(msg.contains("repository nas is ReadOnly"), "{msg}");
+        assert_eq!(report(vec![outcome]).exit_code(), 0);
+    }
+
+    #[test]
+    fn a_gate_explained_failure_is_listed_but_never_counted_as_recent() {
+        // A genuine recent failure still fails — and the explained one is
+        // listed alongside it, not swallowed and not added to the count.
+        let at = (now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let readonly = snapshot(
+            serde_json::json!({ "name": "ro-1", "namespace": "media", "creationTimestamp": ago(10) }),
+            serde_json::json!({
+                "phase": "Failed",
+                "conditions": [
+                    { "type": kopiur_api::consts::REPOSITORY_WRITABLE_CONDITION,
+                      "status": "False",
+                      "reason": kopiur_api::consts::REPOSITORY_READ_ONLY_REASON,
+                      "message": "repository nas is ReadOnly", "lastTransitionTime": at },
+                ],
+            }),
+        );
+        let w = work(vec![readonly, failed_snapshot("nightly-1", 30)], vec![]);
+        let (what, ..) = fail_parts(&check_recent_failures(
+            &w,
+            std::time::Duration::from_secs(24 * 3600),
+            now(),
+        ));
+        assert!(what.starts_with("1 failed in the last"), "{what}");
+        assert!(what.contains("nightly-1"), "{what}");
+        assert!(what.contains("ro-1"), "{what}");
+    }
+
+    // --- per-kind list degradation ------------------------------------------
+
+    fn forbidden(resource: &str) -> Outcome {
+        warn_for(
+            "list",
+            resource,
+            &kube::Error::Api(
+                kube::core::Status::failure("forbidden", "Forbidden")
+                    .with_code(403)
+                    .boxed(),
+            ),
+        )
+    }
+
+    #[test]
+    fn one_unlistable_kind_does_not_hide_a_blocked_object_in_another() {
+        // A kubeconfig without `list snapshotschedules` is ordinary. Discarding
+        // the Snapshots that DID list would exit 0 with a wedged Snapshot right
+        // there — the failure mode under repair, one kind over.
+        let mut w = work(
+            vec![snap_at("Pending", 1, vec![mover_blocked_condition()])],
+            vec![],
+        );
+        w.degraded.push(forbidden("snapshotschedules"));
+        let (what, ..) = fail_parts(&merge_degradation(
+            check_stuck(&w, std::time::Duration::from_secs(3600), now()),
+            &w.degraded,
+        ));
+        assert!(what.contains("snapshot media/nightly-1"), "{what}");
+        assert!(what.contains("MoverPermitted=False"), "{what}");
+        assert!(
+            what.contains("grant `list` on `snapshotschedules`"),
+            "the degradation must be named alongside the finding: {what}"
+        );
+    }
+
+    #[test]
+    fn a_degraded_listing_with_no_findings_warns() {
+        let mut w = work(vec![snap_at("Pending", 1, vec![])], vec![]);
+        w.degraded.push(forbidden("snapshotschedules"));
+        let Outcome::Warn(msg) = merge_degradation(
+            check_stuck(&w, std::time::Duration::from_secs(3600), now()),
+            &w.degraded,
+        ) else {
+            panic!("an RBAC gap with nothing else found must warn");
+        };
+        assert!(msg.contains("snapshotschedules"), "{msg}");
+    }
+
+    #[test]
+    fn an_undecodable_kind_escalates_a_clean_check_to_fail() {
+        // A kind nobody could decode is not a kind anybody verified.
+        let mut w = work(vec![], vec![]);
+        w.degraded.push(warn_for(
+            "list",
+            "snapshots",
+            &kube::Error::SerdeError(
+                serde_json::from_str::<SnapshotPhase>("not-json").expect_err("decode error"),
+            ),
+        ));
+        let (what, _, fix) = fail_parts(&merge_degradation(
+            check_stuck(&w, std::time::Duration::from_secs(3600), now()),
+            &w.degraded,
+        ));
+        assert!(what.contains("cannot decode the snapshots"), "{what}");
+        assert!(fix.contains("upgrade the plugin"), "{fix}");
+    }
+
+    #[test]
+    fn a_fail_severity_gate_outranks_a_warn_one_whatever_the_condition_order() {
+        // `status.conditions` is an arbitrarily-ordered array: position must
+        // not decide the verdict.
+        let readonly = condition(
+            kopiur_api::consts::REPOSITORY_WRITABLE_CONDITION,
+            "False",
+            kopiur_api::consts::REPOSITORY_READ_ONLY_REASON,
+            "repository nas is ReadOnly",
+        );
+        for conditions in [
+            vec![readonly.clone(), mover_blocked_condition()],
+            vec![mover_blocked_condition(), readonly],
+        ] {
+            let s = snap_at("Pending", 1, conditions);
+            let kind = snapshot_stuck(&s, now(), hour()).expect("blocked");
+            assert_eq!(kind.severity(), GateSeverity::Fail, "{kind:?}");
+            assert!(
+                kind.detail("1h").contains("MoverPermitted=False"),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_repository_still_lists_its_warn_level_findings() {
+        let unready = repo_with(
+            "Degraded",
+            vec![condition(
+                "Ready",
+                "False",
+                "ConnectFailed",
+                "credentials rejected",
+            )],
+        );
+        let mut skewed = repo_with(
+            "Ready",
+            vec![condition(
+                kopiur_api::consts::MASS_DELETION_HELD_CONDITION,
+                "True",
+                "SomeFutureHold",
+                "held for a reason from the future",
+            )],
+        );
+        skewed.name = "archive".into();
+        let (what, ..) = fail_parts(&check_repos_ready(&[unready, skewed]));
+        assert!(what.contains("credentials rejected"), "{what}");
+        assert!(
+            what.contains("SomeFutureHold"),
+            "a Fail must not swallow the warn-level lines: {what}"
+        );
     }
 
     #[test]
