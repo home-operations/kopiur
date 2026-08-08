@@ -128,10 +128,44 @@ pub struct StructuralGate {
 }
 
 impl StructuralGate {
-    /// Whether a live condition's `type`/`status` pair trips this gate.
+    /// Whether a live condition **is** this gate: `type`, `status`, AND `reason`
+    /// all match.
+    ///
+    /// This is the matcher consumers should reach for. `condition` + `status`
+    /// alone do not identify a row — `CredentialsAvailable=False` is written
+    /// with two different reasons and therefore has two rows — so filtering the
+    /// registry on [`trips`](Self::trips) alone yields two hits for one live
+    /// condition and double-reports it. `matches` selects exactly one row per
+    /// live condition, which is the property
+    /// `gate_rows_are_unique_and_internally_consistent` pins.
+    ///
+    /// ```
+    /// use kopiur_api::gates::STRUCTURAL_GATES;
+    ///
+    /// // One live condition off a wedged Snapshot ⇒ exactly one registry row.
+    /// let hits: Vec<_> = STRUCTURAL_GATES
+    ///     .iter()
+    ///     .filter(|g| g.matches("CredentialsAvailable", "False", "MissingCredentialsSecret"))
+    ///     .collect();
+    /// assert_eq!(hits.len(), 1);
+    /// assert_eq!(hits[0].reason, "MissingCredentialsSecret");
+    /// // The other reason selects the other row, never both.
+    /// assert!(!hits[0].matches("CredentialsAvailable", "False", "MissingServiceAccount"));
+    /// ```
+    pub fn matches(&self, condition_type: &str, status: &str, reason: &str) -> bool {
+        self.trips(condition_type, status) && reason == self.reason
+    }
+
+    /// The **reason-agnostic** coarse filter: whether a live condition's
+    /// `type`/`status` pair is the blocked polarity of this gate's condition.
     ///
     /// The polarity comparison lives here so no consumer re-derives it (the
-    /// `!= "True"` / `== "True"` mix-ups this registry exists to prevent).
+    /// `!= "True"` / `== "True"` mix-ups this registry exists to prevent). Use
+    /// it to answer "is this condition one of the ones we gate on at all?" —
+    /// notably when a live condition carries a reason NO row covers (a newer
+    /// operator's reason string), where [`matches`](Self::matches) would
+    /// silently report nothing. To identify WHICH row a condition is, use
+    /// `matches`: `trips` can match several rows sharing a condition+polarity.
     ///
     /// ```
     /// use kopiur_api::gates::{STRUCTURAL_GATES, GateScope};
@@ -144,9 +178,41 @@ impl StructuralGate {
     /// assert!(!mover.trips("MoverPermitted", "True"));
     /// assert!(!mover.trips("Ready", "False"));
     /// assert_eq!(mover.applies_to, GateScope::SnapshotOrRestore);
+    ///
+    /// // Coarse by design: an unregistered reason still flags the condition.
+    /// assert!(mover.trips("MoverPermitted", "False"));
     /// ```
     pub fn trips(&self, condition_type: &str, status: &str) -> bool {
         condition_type == self.condition && status == self.blocked_status
+    }
+
+    /// [`blocked_status`](Self::blocked_status) as the `bool` a condition writer
+    /// passes when it writes this gate as BLOCKED — `true` for
+    /// [`CONDITION_TRUE`], `false` for [`CONDITION_FALSE`].
+    ///
+    /// The controller's `upsert_condition` takes a `bool`, so without this every
+    /// registry-driven writer would hand-translate the status string at its own
+    /// call site — exactly the per-site re-derivation this registry exists to
+    /// remove. Any other string reads as `false`; the
+    /// `every_gate_row_is_well_formed` tripwire makes that unreachable.
+    ///
+    /// ```
+    /// use kopiur_api::gates::STRUCTURAL_GATES;
+    ///
+    /// let mover = STRUCTURAL_GATES
+    ///     .iter()
+    ///     .find(|g| g.condition == "MoverPermitted")
+    ///     .expect("registered");
+    /// assert!(!mover.blocked_is_true()); // MoverPermitted=False blocks
+    ///
+    /// let held = STRUCTURAL_GATES
+    ///     .iter()
+    ///     .find(|g| g.condition == "DeletionHeld")
+    ///     .expect("registered");
+    /// assert!(held.blocked_is_true()); // DeletionHeld=True blocks
+    /// ```
+    pub fn blocked_is_true(&self) -> bool {
+        self.blocked_status == CONDITION_TRUE
     }
 }
 
@@ -158,8 +224,12 @@ impl StructuralGate {
 /// *reports* health (`IndexBlobHealth`, `BackendReachable`,
 /// `SecurityContextCompatible`) is NOT a gate — it blocks nothing — and a
 /// time-bounded wait (`SourceStaged`, `PreflightFailed`) is not one either,
-/// because it resolves itself into a terminal phase that phase-based checks
-/// already see.
+/// because it resolves itself into a terminal phase on its own.
+///
+/// Most rows are phase-INVISIBLE parks (the object sits at `phase: Pending`
+/// looking unremarkable), which is what makes the registry load-bearing. One
+/// row — `RepositoryWritable` — is phase-visible and registered anyway, for the
+/// explanation it adds to an already-visible failure; see its comment.
 pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     // An elevated mover in a namespace that has not opted in. The admin adds
     // the `privileged-movers` annotation out-of-band; until then the object
@@ -207,11 +277,15 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
         reason: consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
         severity: GateSeverity::Fail,
     },
-    // A backup refused because its repository is `mode: ReadOnly`. WARN, not
-    // Fail: a read-only repository is a legitimate, deliberate configuration
-    // (a replication target, an archived repo served for restores only), so a
-    // green/red verdict must not hinge on it — but it still explains why a
-    // backup will never run, which is worth saying out loud.
+    // A backup refused because its repository is `mode: ReadOnly`. Unlike the
+    // rows above this is NOT an invisible park: the writer
+    // (`snapshot/mod.rs`) sets `phase: Failed` in the same status patch, so a
+    // phase-based check already sees the object. It is registered for
+    // EXPLANATORY value — it turns "this backup failed" into "this backup was
+    // refused because the repository is read-only" without a second lookup.
+    // Hence WARN, not Fail: a read-only repository is a legitimate, deliberate
+    // configuration (a replication target, an archived repo served for restores
+    // only), so a green/red verdict must not hinge on it.
     StructuralGate {
         applies_to: GateScope::Snapshot,
         condition: consts::REPOSITORY_WRITABLE_CONDITION,
@@ -261,6 +335,76 @@ mod tests {
                 "{g:?}: must not trip on another condition type"
             );
         }
+    }
+
+    #[test]
+    fn a_live_condition_selects_exactly_one_row() {
+        // The whole registry must be a FUNCTION of a live condition: one
+        // (type, status, reason) triple in, at most one row out. Rows 2 and 3
+        // share condition+status+scope and differ only by reason, so a
+        // consumer filtering on `trips` alone would double-report a single
+        // wedged Snapshot. `matches` is the matcher that cannot.
+        for g in STRUCTURAL_GATES {
+            let hits: Vec<_> = STRUCTURAL_GATES
+                .iter()
+                .filter(|c| c.matches(g.condition, g.blocked_status, g.reason))
+                .collect();
+            assert_eq!(hits.len(), 1, "{g:?}: must select exactly one row");
+            assert_eq!(hits[0], g, "{g:?}: must select ITSELF");
+        }
+
+        // The concrete case the reviewer called out, spelled out end to end.
+        let creds_secret: Vec<_> = STRUCTURAL_GATES
+            .iter()
+            .filter(|g| {
+                g.matches(
+                    consts::CREDENTIALS_AVAILABLE_CONDITION,
+                    CONDITION_FALSE,
+                    consts::MISSING_CREDENTIALS_REASON,
+                )
+            })
+            .collect();
+        assert_eq!(creds_secret.len(), 1);
+        assert_eq!(creds_secret[0].reason, consts::MISSING_CREDENTIALS_REASON);
+
+        // ...and the coarse filter deliberately still matches BOTH rows, which
+        // is why it must never be used to identify a row.
+        let coarse = STRUCTURAL_GATES
+            .iter()
+            .filter(|g| g.trips(consts::CREDENTIALS_AVAILABLE_CONDITION, CONDITION_FALSE))
+            .count();
+        assert_eq!(coarse, 2, "`trips` is reason-agnostic by design");
+
+        // An unregistered reason for a gated condition: `matches` finds
+        // nothing, `trips` still flags it. That asymmetry is the reason
+        // `trips` is kept rather than removed.
+        assert!(!STRUCTURAL_GATES.iter().any(|g| g.matches(
+            consts::CREDENTIALS_AVAILABLE_CONDITION,
+            CONDITION_FALSE,
+            "SomeFutureReason"
+        )));
+        assert!(
+            STRUCTURAL_GATES
+                .iter()
+                .any(|g| g.trips(consts::CREDENTIALS_AVAILABLE_CONDITION, CONDITION_FALSE))
+        );
+    }
+
+    #[test]
+    fn blocked_is_true_mirrors_the_status_string() {
+        // The bool a registry-driven `upsert_condition` writer passes. Derived
+        // from the row, never hand-translated per call site.
+        for g in STRUCTURAL_GATES {
+            assert_eq!(
+                g.blocked_is_true(),
+                g.blocked_status == CONDITION_TRUE,
+                "{g:?}"
+            );
+        }
+        // Both polarities are actually exercised by the live registry, so this
+        // can never rot into a one-sided assertion.
+        assert!(STRUCTURAL_GATES.iter().any(|g| g.blocked_is_true()));
+        assert!(STRUCTURAL_GATES.iter().any(|g| !g.blocked_is_true()));
     }
 
     #[test]
