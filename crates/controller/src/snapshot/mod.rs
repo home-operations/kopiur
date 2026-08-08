@@ -240,6 +240,48 @@ async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> 
     Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
 }
 
+/// `Origin::Replicated` steady-state pin, modeled on [`pin_adopted_row`]: a
+/// dest-side copy CR a `SnapshotReplication` run minted for a kopia snapshot it
+/// `snapshot migrate`d — catalog history, NEVER a run, so like
+/// `Discovered`/`Adopted` it must never enter the backup-run machinery or mint
+/// a mover Job. It gets exactly what an adopted row gets: cleanup-finalizer
+/// upkeep (its CR deletion cascades to the dest manifest via the normal batched
+/// snapdel path) plus an idempotent, PROVENANCE-GATED terminal pin.
+///
+/// The provenance gate is the same one `pin_adopted_row` uses
+/// ([`plan::adopted_row_has_provenance`]: controller/mover-written
+/// `status.snapshot`): the replication mover stamps the copy's status (phase
+/// `Succeeded` + `snapshot` + `resolved.repository`) in ONE atomic body right
+/// after CREATE, so a genuine copy is only transiently phase-less and this pin
+/// is a heal for a mover that died between its status patch landing and the
+/// phase converging. A user-applied BARE `origin: replicated` label with no
+/// `status.snapshot` must stay phase-less — a phantom `Succeeded` row would
+/// otherwise claim history it does not have (the same forgery shape
+/// `pin_adopted_row` guards against).
+///
+/// Nothing produces `replicated` rows yet (#368 shared-foundations milestone);
+/// this arm exists so the reconciler is total over `Origin` the moment the
+/// first copy CR appears.
+async fn pin_replicated_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    io::ensure_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    if plan::adopted_row_has_provenance(backup)
+        && needs_terminal_pin(
+            backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+            &SnapshotPhase::Succeeded,
+        )
+    {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Succeeded,
+            "Replicated",
+            "replicated snapshot: a dest-side copy minted by a SnapshotReplication run",
+        );
+        status["origin"] = serde_json::json!("replicated");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
 async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let origin = resolve_origin(backup);
     let policy = effective_deletion_policy(backup.spec.deletion_policy, origin);
@@ -250,17 +292,38 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
 
     if backup.metadata.deletion_timestamp.is_some() {
+        // `policy` is already conservative for an unparseable origin
+        // (`effective_deletion_policy(_, None)` = forced Retain): the finalizer
+        // releases the CR without ever contacting the repository.
         return handle_deletion(backup, ctx, &api, &namespace, &name, policy).await;
     }
 
-    // Exhaustive over `Origin` (ADR §5.5): `Discovered` and `Adopted` rows are
-    // catalog history, not runs, and must return BEFORE any of the backup-run
-    // machinery below (`run_decision`, post-hooks, staged reap, pin jobs) —
-    // `Scheduled`/`Manual` are the only origins that ever mint a mover Job, so
-    // they fall through to it.
+    // An origin marker this build cannot parse (a typo, a forged label, or a
+    // row written by a NEWER operator during version skew): warn and HOLD —
+    // never fall through to the backup-run machinery (the old behavior folded
+    // unknown to Manual, which minted a mover Job for a foreign row). Inert on
+    // purpose: no finalizer, no phase pin, no Job — just surface it and keep
+    // re-checking at the steady cadence in case a newer writer completes it.
+    let Some(origin) = origin else {
+        tracing::warn!(
+            backup = %name, namespace = %namespace,
+            label = backup.labels().get(crate::consts::ORIGIN_LABEL).map(String::as_str).unwrap_or(""),
+            "unrecognized origin label on Snapshot: this build cannot classify the row, so it \
+             will not run, retain-count, or delete it; fix (or remove) the \
+             kopiur.home-operations.com/origin label, or upgrade the operator"
+        );
+        return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
+    };
+
+    // Exhaustive over `Origin` (ADR §5.5): `Discovered`, `Adopted`, and
+    // `Replicated` rows are catalog history, not runs, and must return BEFORE
+    // any of the backup-run machinery below (`run_decision`, post-hooks,
+    // staged reap, pin jobs) — `Scheduled`/`Manual` are the only origins that
+    // ever mint a mover Job, so they fall through to it.
     match origin {
         Origin::Discovered => return pin_discovered_row(backup, &api, &name).await,
         Origin::Adopted => return pin_adopted_row(backup, &api, &name).await,
+        Origin::Replicated => return pin_replicated_row(backup, &api, &name).await,
         Origin::Scheduled | Origin::Manual => {}
     }
 
@@ -418,7 +481,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Ok(Action::await_change());
             }
             // §13(c): spec.pin stays live after the mover Job is gone.
-            return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
+            return reconcile_pin(backup, ctx, &api, &namespace, &name, origin).await;
         }
         RunDecision::TerminalFailed => {
             // Resume hooks run even for a FAILED backup (quiesce/resume pairing —
@@ -656,7 +719,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 // §13(c): reconcile kopia-side pin state with spec.pin once the
                 // snapshot exists. A no-op when already in the desired state.
-                return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
+                return reconcile_pin(backup, ctx, &api, &namespace, &name, origin).await;
             }
             Some(false) => {
                 // Resume hooks run even when the backup FAILED — the canonical
@@ -3507,6 +3570,12 @@ async fn reconcile_pin(
     api: &Api<Snapshot>,
     namespace: &str,
     name: &str,
+    // The origin `reconcile_inner` already resolved (always `Scheduled` or
+    // `Manual` — the catalog origins return from their pin arms long before
+    // this). Threaded through rather than re-resolved so this Job-label stamp
+    // can never disagree with the dispatch decision (and never needs a default
+    // for an unparseable label, which cannot reach here).
+    origin: Origin,
 ) -> Result<Action> {
     let desired = backup.spec.pin;
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
@@ -3593,7 +3662,7 @@ async fn reconcile_pin(
         cache: Default::default(),
         throttle: Default::default(),
     };
-    let mut labels = run_labels(&config, resolve_origin(backup));
+    let mut labels = run_labels(&config, origin);
     labels.insert(
         "kopiur.home-operations.com/op".to_string(),
         "snapshot-pin".to_string(),

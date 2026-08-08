@@ -1131,6 +1131,10 @@ fn scheduled_backup_spec(
     source: Option<kopiur_api::SnapshotSourceRef>,
 ) -> SnapshotSpec {
     SnapshotSpec {
+        // The mint-time repository pin: stamped only by a MULTI-repository
+        // policy fan-out (#368, not built yet) — single-repo children stay
+        // unpinned so their wire shape is byte-identical to pre-feature CRs.
+        repository: None,
         // Which PVC this child covers, for a `pvcSelector` expansion. `None`
         // for the ordinary single-source policy (#346).
         source,
@@ -2047,6 +2051,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 SnapshotSpec {
+                    repository: None,
                     source: None,
                     policy_ref: None,
                     tags: None,
@@ -2118,6 +2123,7 @@ mod tests {
         let mut s = Snapshot::new(
             name,
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,

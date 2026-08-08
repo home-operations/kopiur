@@ -114,6 +114,35 @@ spec:
                 required:
                 - name
                 type: object
+              repository:
+                description: |-
+                  The ONE repository this `Snapshot` targets, pinned by value at mint
+                  time. Stamped by a multi-repository `SnapshotPolicy` fan-out (each child
+                  covers exactly one member of the policy's repository set) and by
+                  `SnapshotReplication` copy CRs (the destination repository). Absent for
+                  the legacy single-repository case, where the policy's own
+                  `spec.repository` (or, for catalog rows, the owning repository CR) is
+                  the answer — an absent pin resolves exactly as before this field
+                  existed, so pre-feature `Snapshot`s are untouched.
+                nullable: true
+                properties:
+                  kind:
+                    default: Repository
+                    description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                    enum:
+                    - Repository
+                    - ClusterRepository
+                    type: string
+                  name:
+                    description: Name of the referenced `Repository`/`ClusterRepository`.
+                    type: string
+                  namespace:
+                    description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
               source:
                 description: |-
                   The ONE concrete source this `Snapshot` covers, when `policyRef` names a
@@ -344,6 +373,7 @@ spec:
                 - manual
                 - discovered
                 - adopted
+                - replicated
                 nullable: true
                 type: string
               phase:

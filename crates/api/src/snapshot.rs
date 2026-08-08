@@ -1,10 +1,13 @@
 //! The `Snapshot` CRD — a single kopia snapshot as a Kubernetes object.
 //! ADR-0001 §3.4, ADR-0003 §4.5.
 //!
-//! Three origins (canonical value lives in `status.origin`):
+//! Origins (canonical value lives in `status.origin`):
 //! - `scheduled` — created by a `SnapshotSchedule`; spec carries `policyRef`.
 //! - `manual`    — created by `kubectl create` / external automation; spec carries `policyRef`.
 //! - `discovered`— materialized by the catalog scan; spec is empty/absent.
+//! - `adopted`   — a discovered row re-attached to a live `SnapshotPolicy`.
+//! - `replicated`— a dest-side copy CR minted by a `SnapshotReplication` run;
+//!   spec carries `repository` (the destination pin) and no `policyRef`.
 
 use crate::common::{
     CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef,
@@ -41,6 +44,16 @@ pub struct SnapshotSpec {
     /// The `SnapshotPolicy` recipe to run; absent for `discovered` backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<PolicyRef>,
+    /// The ONE repository this `Snapshot` targets, pinned by value at mint
+    /// time. Stamped by a multi-repository `SnapshotPolicy` fan-out (each child
+    /// covers exactly one member of the policy's repository set) and by
+    /// `SnapshotReplication` copy CRs (the destination repository). Absent for
+    /// the legacy single-repository case, where the policy's own
+    /// `spec.repository` (or, for catalog rows, the owning repository CR) is
+    /// the answer — an absent pin resolves exactly as before this field
+    /// existed, so pre-feature `Snapshot`s are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRef>,
     /// The ONE concrete source this `Snapshot` covers, when `policyRef` names a
     /// recipe whose `sources[]` expands to many — i.e. a
     /// [`pvcSelector`](crate::snapshot_policy::PvcSelector).
@@ -179,6 +192,28 @@ pub enum Origin {
     /// like any produced row, even though the operator did not create the
     /// underlying kopia snapshot.
     Adopted,
+    /// A destination-side copy CR minted by a `SnapshotReplication` run: the
+    /// kopia snapshot it represents was `snapshot migrate`d from another
+    /// repository, not produced by a backup run here. Like `discovered`/
+    /// `adopted` it is catalog history — it must never enter the backup-run
+    /// machinery — but it is pruned only by its `SnapshotReplication`'s own
+    /// pruning mode, never by any policy's GFS retention.
+    Replicated,
+}
+
+impl Origin {
+    /// Every variant, for the label-value ↔ [`parse`](Self::parse) round-trip
+    /// tests and consumer-side variant-count guards (e.g. the CLI's
+    /// `OriginFilter`). A new variant added without extending this array fails
+    /// the round-trip test (and `label_value`/`parse`'s exhaustive matches
+    /// won't compile until it is classified).
+    pub const ALL: &'static [Self] = &[
+        Self::Scheduled,
+        Self::Manual,
+        Self::Discovered,
+        Self::Adopted,
+        Self::Replicated,
+    ];
 }
 
 /// Lifecycle phase of a `Snapshot`.
@@ -260,6 +295,32 @@ impl Origin {
             Self::Manual => "manual",
             Self::Discovered => "discovered",
             Self::Adopted => "adopted",
+            Self::Replicated => "replicated",
+        }
+    }
+
+    /// Strict, TOTAL parse of an origin marker (the `origin` label /
+    /// `status.origin` wire value): `None` for anything unrecognized.
+    ///
+    /// The single inverse of [`label_value`](Self::label_value), so string
+    /// matchers (the controller's `resolve_origin`, the webhook's
+    /// `backup_origin`) can never silently classify an unknown origin as a
+    /// known one. The pre-parse versions of both defaulted unknown strings to
+    /// `Manual` — which would have routed a row written by a NEWER operator
+    /// (e.g. `replicated` before this variant existed) into the backup-run
+    /// machinery and minted a mover Job for a snapshot this build does not
+    /// understand. Callers must treat `None` conservatively: warn + inert
+    /// handling, never `Manual`.
+    pub fn parse(v: &str) -> Option<Self> {
+        // One arm per variant (each also pinned by the ALL round-trip test);
+        // the trailing arm is the UNKNOWN-string case, not a variant catch-all.
+        match v {
+            "scheduled" => Some(Self::Scheduled),
+            "manual" => Some(Self::Manual),
+            "discovered" => Some(Self::Discovered),
+            "adopted" => Some(Self::Adopted),
+            "replicated" => Some(Self::Replicated),
+            _ => None,
         }
     }
 }
@@ -274,9 +335,26 @@ pub enum PrunedBy {
     /// Policy-deletion cascade under `onPolicyDelete: Retain` — release the
     /// CR, never contact the repository.
     PolicyCascade,
+    /// A `SnapshotReplication`'s own retention prune of its dest-side copy CRs
+    /// (`pruning: retention`). An OPERATOR prune exactly like `Retention`:
+    /// bounded, deliberate, breaker-exempt. (`pruning: mirrorSource` deletes
+    /// deliberately carry NO stamp, so a mass source-vanish classifies EXTERNAL
+    /// and the dest repository's breaker holds it.)
+    ReplicationRetention,
 }
 
 impl PrunedBy {
+    /// Every variant, for the annotation-value ↔ [`parse`](Self::parse)
+    /// round-trip test. A new variant added without extending this array fails
+    /// that test (and the exhaustive matches here and in the controller's
+    /// deletion planner won't compile until it is classified).
+    pub const ALL: &'static [Self] = &[
+        Self::Retention,
+        Self::FailedHistory,
+        Self::PolicyCascade,
+        Self::ReplicationRetention,
+    ];
+
     /// The stable annotation value stamped by the operator before it deletes a
     /// `Snapshot` as part of its own lifecycle (see [`crate::consts::PRUNED_BY_ANNOTATION`]).
     pub fn annotation_value(self) -> &'static str {
@@ -284,6 +362,7 @@ impl PrunedBy {
             Self::Retention => "retention",
             Self::FailedHistory => "failed-history",
             Self::PolicyCascade => "policy-cascade",
+            Self::ReplicationRetention => "replication-retention",
         }
     }
 
@@ -294,6 +373,7 @@ impl PrunedBy {
             "retention" => Some(Self::Retention),
             "failed-history" => Some(Self::FailedHistory),
             "policy-cascade" => Some(Self::PolicyCascade),
+            "replication-retention" => Some(Self::ReplicationRetention),
             _ => None,
         }
     }
@@ -653,12 +733,19 @@ pub struct ResolvedSource {
     pub source_path: Option<String>,
 }
 
-/// Derive the repository a `Snapshot` belongs to: a *produced* snapshot pins it
-/// in `status.resolved.repository`; a *discovered* snapshot carries its
-/// `Repository`/`ClusterRepository` as the controller `ownerReference` (it has
-/// no `resolved` block). Pure. Shared by the `Restore` reconciler
-/// (`spec.repository` derivation for `snapshotRef`) and the `kubectl kopiur`
-/// browse data-plane, so the derivation rule cannot fork.
+/// Derive the repository a `Snapshot` belongs to, in fixed precedence order:
+///
+/// 1. `status.resolved.repository` — the run-time pin every *produced*
+///    snapshot records (controller-written, authoritative);
+/// 2. `spec.repository` — the mint-time pin a multi-repo policy fan-out child
+///    or a `SnapshotReplication` copy CR carries (present before any status
+///    has been written, and the only pin such a CR is guaranteed to have);
+/// 3. the `Repository`/`ClusterRepository` controller `ownerReference` a
+///    *discovered* snapshot carries (it has neither block).
+///
+/// Pure. Shared by the `Restore` reconciler (`spec.repository` derivation for
+/// `snapshotRef`) and the `kubectl kopiur` browse data-plane, so the
+/// derivation rule cannot fork.
 pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
     use crate::common::RepositoryKind;
     if let Some(rref) = snap
@@ -667,6 +754,9 @@ pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
         .and_then(|s| s.resolved.as_ref())
         .and_then(|r| r.repository.clone())
     {
+        return Some(rref);
+    }
+    if let Some(rref) = snap.spec.repository.clone() {
         return Some(rref);
     }
     let owners = snap
@@ -701,17 +791,45 @@ mod tests {
 
     #[test]
     fn origin_label_value_matches_the_serde_encoding() {
-        for origin in [
+        // Hard-coded ALL-variants array: adding a variant without classifying
+        // it here fails the length check, and the serde/label/parse trio must
+        // agree byte-for-byte for every variant.
+        let all = [
             Origin::Scheduled,
             Origin::Manual,
             Origin::Discovered,
             Origin::Adopted,
-        ] {
+            Origin::Replicated,
+        ];
+        assert_eq!(Origin::ALL, all, "Origin::ALL must list every variant");
+        for origin in all {
             assert_eq!(
                 serde_json::to_value(origin).unwrap(),
                 origin.label_value(),
                 "{origin:?}"
             );
+        }
+    }
+
+    #[test]
+    fn origin_parse_is_the_exact_inverse_of_label_value() {
+        for origin in [
+            Origin::Scheduled,
+            Origin::Manual,
+            Origin::Discovered,
+            Origin::Adopted,
+            Origin::Replicated,
+        ] {
+            assert_eq!(
+                Origin::parse(origin.label_value()),
+                Some(origin),
+                "{origin:?}"
+            );
+        }
+        // Unknown strings never resolve — in particular never to Manual, the
+        // pre-parse default that would mint a backup Job for a foreign row.
+        for garbage in ["", "Manual", "SCHEDULED", "replicated ", "garbage"] {
+            assert_eq!(Origin::parse(garbage), None, "{garbage:?}");
         }
     }
 
@@ -809,6 +927,41 @@ mod tests {
         }
 
         #[test]
+        fn spec_pin_wins_over_owner_ref_but_loses_to_status() {
+            // Precedence: status.resolved.repository → spec.repository → ownerRef.
+            // A replication copy CR (or multi-repo fan-out child) carries the
+            // spec pin from CREATE, before any status exists…
+            let spec_only = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": {
+                    "name": "s", "namespace": "media",
+                    // A repository ownerRef that must NOT win over the spec pin.
+                    "ownerReferences": [{
+                        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                        "kind": "Repository", "name": "owner-repo", "uid": "u1"
+                    }]
+                },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            }));
+            let rref = repository_ref_for(&spec_only).expect("derived from spec");
+            assert_eq!(rref.kind, RepositoryKind::ClusterRepository);
+            assert_eq!(rref.name, "offsite");
+
+            // …and once the run-time status pin lands, it stays authoritative.
+            let with_status = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } },
+                "status": { "resolved": { "repository": { "kind": "Repository", "name": "nas" } } }
+            }));
+            let rref = repository_ref_for(&with_status).expect("derived from status");
+            assert_eq!(rref.kind, RepositoryKind::Repository);
+            assert_eq!(rref.name, "nas");
+        }
+
+        #[test]
         fn foreign_owners_and_bare_snapshots_derive_nothing() {
             // A non-kopiur owner (e.g. a Job) must not be mistaken for a repository.
             let s = snap(serde_json::json!({
@@ -864,8 +1017,36 @@ deletionPolicy: Delete
         let spec: SnapshotSpec = from_yaml("{}\n");
         assert!(spec.policy_ref.is_none());
         assert!(spec.deletion_policy.is_none());
+        assert!(spec.repository.is_none());
         // Empty spec serializes to an empty object (all fields skip).
         assert_eq!(serde_json::to_value(&spec).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn backup_spec_repository_pin_round_trips_and_absent_stays_absent() {
+        use crate::common::RepositoryKind;
+        // The mint-time pin a multi-repo fan-out child / replication copy CR
+        // carries (nothing stamps it yet — the field is decode/encode-ready).
+        let spec: SnapshotSpec =
+            from_yaml("repository: { kind: ClusterRepository, name: offsite }\n");
+        let pin = spec.repository.as_ref().expect("pin decoded");
+        assert_eq!(pin.kind, RepositoryKind::ClusterRepository);
+        assert_eq!(pin.name, "offsite");
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["repository"]["name"], "offsite");
+        let reparsed: SnapshotSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Legacy single-repo children stay byte-identical: absent is elided.
+        let bare: SnapshotSpec = from_yaml("policyRef: { name: postgres-data }\n");
+        assert!(bare.repository.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("repository")
+                .is_none(),
+            "absent repository pin must be elided"
+        );
     }
 
     #[test]
@@ -917,18 +1098,25 @@ onScheduleDelete: Delete
 
     #[test]
     fn pruned_by_parse_is_the_exact_inverse_of_annotation_value() {
-        for variant in [
+        let all = [
             PrunedBy::Retention,
             PrunedBy::FailedHistory,
             PrunedBy::PolicyCascade,
-        ] {
+            PrunedBy::ReplicationRetention,
+        ];
+        assert_eq!(PrunedBy::ALL, all, "PrunedBy::ALL must list every variant");
+        for variant in all {
             assert_eq!(
                 PrunedBy::parse(variant.annotation_value()),
                 Some(variant),
                 "{variant:?}"
             );
         }
+        // Unrecognized ⇒ None ⇒ the finalizer classifies the deletion EXTERNAL
+        // (breaker-relevant) — a missed parse arm here would silently invert a
+        // new operator prune into a breaker-held external wave.
         assert_eq!(PrunedBy::parse("garbage"), None);
+        assert_eq!(PrunedBy::parse("replication_retention"), None);
     }
 
     #[test]
@@ -943,6 +1131,10 @@ onScheduleDelete: Delete
             "discovered"
         );
         assert_eq!(serde_json::to_value(Origin::Adopted).unwrap(), "adopted");
+        assert_eq!(
+            serde_json::to_value(Origin::Replicated).unwrap(),
+            "replicated"
+        );
         assert_eq!(
             serde_json::to_value(SnapshotPhase::Succeeded).unwrap(),
             "Succeeded"

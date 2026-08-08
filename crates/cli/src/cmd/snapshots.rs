@@ -171,6 +171,7 @@ fn origin_cell(origin: Option<Origin>) -> String {
         Some(Origin::Manual) => "manual".into(),
         Some(Origin::Discovered) => "discovered".into(),
         Some(Origin::Adopted) => "adopted".into(),
+        Some(Origin::Replicated) => "replicated".into(),
         None => EMPTY_CELL.into(),
     }
 }

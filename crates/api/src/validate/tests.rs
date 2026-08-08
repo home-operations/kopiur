@@ -168,17 +168,21 @@ fn produced_origins_accept_any_policy() {
 }
 
 #[test]
-fn adopted_accepts_any_policy() {
+fn adopted_and_replicated_accept_any_policy() {
     // Unlike `discovered`, an adopted row was deliberately re-attached to a
     // SnapshotPolicy so it is managed like a produced backup — any deletionPolicy
-    // (including None/Delete/Orphan) is legal.
-    for p in [
-        None,
-        Some(DeletionPolicy::Delete),
-        Some(DeletionPolicy::Retain),
-        Some(DeletionPolicy::Orphan),
-    ] {
-        assert!(validate_backup_deletion_policy(Origin::Adopted, p).is_ok());
+    // (including None/Delete/Orphan) is legal. A replicated copy CR is likewise
+    // operator-managed (its replication run minted BOTH the dest manifest and
+    // the CR), so any policy is legal there too.
+    for o in [Origin::Adopted, Origin::Replicated] {
+        for p in [
+            None,
+            Some(DeletionPolicy::Delete),
+            Some(DeletionPolicy::Retain),
+            Some(DeletionPolicy::Orphan),
+        ] {
+            assert!(validate_backup_deletion_policy(o, p).is_ok(), "{o:?}");
+        }
     }
 }
 
@@ -1704,6 +1708,7 @@ fn backup_config_valid_spec_has_no_errors() {
 fn backup_aggregate_rejects_discovered_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: None,
         failure_policy: None,
@@ -1712,7 +1717,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         on_schedule_delete: None,
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Discovered);
+    let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert_eq!(errs.len(), 1);
     assert!(matches!(
         errs[0],
@@ -1820,6 +1825,7 @@ fn snapshot_tags_accumulate_every_problem() {
 fn backup_aggregate_rejects_reserved_tags() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: Some(tags_of(&[("kopiur-meta", "{}")])),
         failure_policy: None,
@@ -1828,7 +1834,7 @@ fn backup_aggregate_rejects_reserved_tags() {
         on_schedule_delete: None,
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Manual);
+    let errs = validate_backup(&spec, Some(Origin::Manual));
     assert!(
         errs.iter().any(|e| e.to_string().contains("reserved")),
         "{errs:?}"
@@ -1839,7 +1845,7 @@ fn backup_aggregate_rejects_reserved_tags() {
 
 #[test]
 fn discovered_and_adopted_on_schedule_delete_is_rejected_for_either_variant() {
-    for origin in [Origin::Discovered, Origin::Adopted] {
+    for origin in [Origin::Discovered, Origin::Adopted, Origin::Replicated] {
         for v in [ScheduleDeletePolicy::Retain, ScheduleDeletePolicy::Delete] {
             let err = validate_backup_on_schedule_delete(origin, Some(v)).unwrap_err();
             match &err {
@@ -1880,6 +1886,7 @@ fn scheduled_and_manual_accept_on_schedule_delete() {
 fn backup_aggregate_rejects_discovered_on_schedule_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: None,
         failure_policy: None,
@@ -1888,11 +1895,42 @@ fn backup_aggregate_rejects_discovered_on_schedule_delete() {
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Discovered);
+    let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert!(errs.iter().any(|e| matches!(
         e,
         ValidationError::DiscoveredCannotSetOnScheduleDelete { .. }
     )));
+}
+
+#[test]
+fn backup_aggregate_with_unparseable_origin_skips_gated_rules_but_not_the_rest() {
+    // `None` = the caller could not parse the origin marker. The origin-GATED
+    // rules are skipped (the controller's conservative resolution makes the
+    // fields inert; refusing would wedge finalizer removal under version
+    // skew)…
+    let gated_only = SnapshotSpec {
+        policy_ref: None,
+        repository: None,
+        source: None,
+        tags: None,
+        failure_policy: None,
+        description: None,
+        deletion_policy: Some(DeletionPolicy::Delete),
+        on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
+        pin: false,
+    };
+    assert!(validate_backup(&gated_only, None).is_empty());
+
+    // …but the origin-INDEPENDENT rules still run (an empty tag key is
+    // invalid for every origin).
+    let bad_tags = SnapshotSpec {
+        tags: Some(std::collections::BTreeMap::from([(
+            String::new(),
+            "v".to_string(),
+        )])),
+        ..gated_only
+    };
+    assert!(!validate_backup(&bad_tags, None).is_empty());
 }
 
 #[test]

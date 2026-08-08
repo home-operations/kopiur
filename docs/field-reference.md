@@ -1875,6 +1875,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
+| `repository` | [object](#snapshot-spec-repository) | — | The ONE repository this `Snapshot` targets, pinned by value at mint time. Stamped by a multi-repository `SnapshotPolicy` fan-out (each child covers exactly one member of the policy's repository set) and by `SnapshotReplication` copy CRs (the destination repository). Absent for the legacy single-repository case, where the policy's own `spec.repository` (or, for catalog rows, the owning repository CR) is the answer — an absent pin resolves exactly as before this field existed, so pre-feature `Snapshot`s are untouched. |
 | `source` | [object](#snapshot-spec-source) | — | The ONE concrete source this `Snapshot` covers, when `policyRef` names a recipe whose `sources[]` expands to many — i.e. a `pvcSelector`.<br>Stamped by whoever minted the CR: a `SnapshotSchedule` fire, or `kubectl kopiur snapshot now`. Absent for the ordinary single-source case, where the policy's own `sources0` is the target.<br>Absent against a *selector* policy is refused rather than guessed. The operator must never pick a PVC on the user's behalf: silently backing up one arbitrary volume out of N looks exactly like success. |
 | `tags` | map[string]string | — | Free-form tags attached to the kopia snapshot manifest itself (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the repository, independent of this CR. Keys must be non-empty, colon-free (kopia splits on the first colon), and must not start with the reserved `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes (webhook-enforced). |
 
@@ -1892,6 +1893,14 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the referenced `SnapshotPolicy`. |
 | `namespace` | string | — | Namespace of the `SnapshotPolicy`; absent = same namespace as the referrer. |
+
+#### `spec.repository` { #snapshot-spec-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `spec.source` { #snapshot-spec-source }
 
@@ -1934,7 +1943,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 | `job` | [object](#snapshot-status-job) | — | The mover Job backing this run; absent for discovered. |
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
-| `origin` | enum: scheduled \| manual \| discovered \| adopted | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
+| `origin` | enum: scheduled \| manual \| discovered \| adopted \| replicated | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
 | `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered \| Unchanged | — | Lifecycle phase of a `Snapshot`. |
 | `pinned` | boolean | — | The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile. |
 | `preflightSince` | string | — | RFC 3339 timestamp of the first reconcile where the repository was `Ready` but a `spec.preflight` check was failing. The one-shot anchor for the preflight `timeout` deadline (so the budget covers preflight only, not the earlier repository-not-Ready wait). Cleared once every preflight check passes, so a later failing episode gets a fresh budget rather than a stale anchor. |

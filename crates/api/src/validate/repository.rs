@@ -112,7 +112,10 @@ pub fn validate_consumer_against_cluster_repo(
 /// never be the thing that deletes it. `adopted` is the one exception: an
 /// adopted row was deliberately re-attached to a `SnapshotPolicy` precisely so
 /// GFS retention (and any `deletionPolicy`) governs it like a produced backup —
-/// any policy is allowed. `scheduled`/`manual` are unchanged (any policy).
+/// any policy is allowed. `replicated` copies are likewise operator-managed
+/// (the replication run minted the dest-side manifest AND the CR, stamping
+/// `deletionPolicy: Delete` at create), so any policy is allowed there too.
+/// `scheduled`/`manual` are unchanged (any policy).
 pub fn validate_backup_deletion_policy(
     origin: crate::snapshot::Origin,
     policy: Option<crate::common::DeletionPolicy>,
@@ -126,7 +129,7 @@ pub fn validate_backup_deletion_policy(
                 got: format!("{other:?}"),
             }),
         },
-        Origin::Adopted | Origin::Scheduled | Origin::Manual => Ok(()),
+        Origin::Adopted | Origin::Scheduled | Origin::Manual | Origin::Replicated => Ok(()),
     }
 }
 

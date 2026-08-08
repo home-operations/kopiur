@@ -308,6 +308,27 @@ async fn handle_snapshot(
 
     let origin = backup_origin(&obj.metadata, &obj.data);
 
+    // Unrecognized origin marker (`None`): ADMIT with a loud warning, mutate
+    // nothing, and let the origin-gated validators skip (see `validate_backup`).
+    // Refusing would wedge metadata-only writes — finalizer removal above all —
+    // on rows carrying an origin a NEWER operator wrote during version skew,
+    // while admitting is safe because the controller's own conservative
+    // resolution makes such a row inert (forced Retain, never run, never
+    // retention-counted). What it must NOT get is the old `Manual` treatment:
+    // a `Delete` default and the policy config label.
+    let resp = match origin {
+        Some(_) => resp,
+        None => with_warnings(
+            resp,
+            vec![format!(
+                "unrecognized {} marker on this Snapshot: kopiur cannot classify its origin, \
+                 so it will be held inert (never run, never deleted by the operator); fix or \
+                 remove the label/status value, or upgrade the operator",
+                api::consts::ORIGIN_LABEL
+            )],
+        ),
+    };
+
     let errs = api::validate::validate_backup(&spec, origin);
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
@@ -367,10 +388,22 @@ async fn handle_snapshot(
     //   discovered → forced Retain; produced (scheduled/manual) → Delete.
     // (SnapshotPolicy.defaultDeletionPolicy inheritance is the controller's job once it
     // resolves the policyRef; the webhook only sets the safe origin-aware default.)
-    if spec.deletion_policy.is_none() {
+    // Unrecognized origin (`None`): stamp NOTHING — the controller's
+    // conservative resolution treats an absent deletionPolicy on such a row as
+    // forced Retain, and materializing any value here would claim a
+    // classification this build doesn't have.
+    if spec.deletion_policy.is_none()
+        && let Some(origin) = origin
+    {
         let default = match origin {
             Origin::Discovered => DeletionPolicy::Retain,
-            Origin::Scheduled | Origin::Manual | Origin::Adopted => DeletionPolicy::Delete,
+            // Replicated copy CRs are minted WITH `deletionPolicy: Delete`, so
+            // this default only fires for a hand-made replicated-labeled row —
+            // where the produced-row default is still the right answer (the
+            // controller manages the dest-side manifest lifecycle).
+            Origin::Scheduled | Origin::Manual | Origin::Adopted | Origin::Replicated => {
+                DeletionPolicy::Delete
+            }
         };
         ops.push(set_spec_field(
             &obj.data,
@@ -390,6 +423,7 @@ async fn handle_snapshot(
     // controller-side backfill of pre-existing CRs: retro-labeling would make a
     // previously-immortal raw-applied manual Snapshot GFS-prunable — silent data loss.
     if req.operation == Operation::Create
+        && let Some(origin) = origin
         && let Some(value) = config_label_stamp(
             origin,
             spec.policy_ref.as_ref(),
@@ -416,7 +450,10 @@ async fn handle_snapshot(
 ///   catalog-materialized Snapshot never ran through a policy, so a `policyRef`
 ///   on one (if any) doesn't earn the label. `Adopted` is the managed-row
 ///   exception: it was deliberately re-attached to a `SnapshotPolicy`, so it
-///   earns the label exactly like a produced Snapshot.
+///   earns the label exactly like a produced Snapshot. Never `Replicated`
+///   either: a copy CR carries no `policyRef` by contract, and the config
+///   label is what enrolls a row in a policy's GFS retention/cascade — a
+///   replication copy must never be selected by any policy.
 /// - `policy_ref` is present with a nonempty name.
 /// - The ref targets the Snapshot's OWN namespace (absent/empty `namespace`, or equal
 ///   to `cr_namespace`). The stamped label value is a bare policy name with no
@@ -431,7 +468,7 @@ fn config_label_stamp(
     existing_labels: Option<&BTreeMap<String, String>>,
 ) -> Option<String> {
     match origin {
-        Origin::Discovered => return None,
+        Origin::Discovered | Origin::Replicated => return None,
         Origin::Manual | Origin::Scheduled | Origin::Adopted => {}
     }
 
@@ -493,7 +530,13 @@ fn config_label_op(meta: &ObjectMeta, value: &str) -> PatchOperation {
 /// so they were never depending on the label winning. `produced` (scheduled/
 /// manual) rows get `status.origin` written shortly after creation and their
 /// admission-time defaulting never depended on which arm won either.
-fn backup_origin(meta: &ObjectMeta, data: &Value) -> Origin {
+///
+/// Parsing is the total `Origin::parse` — a marker that does not parse yields
+/// **`None`**, never `Manual` (the pre-parse default, which would have granted
+/// an unknown-origin row the full produced-row admission surface: a `Delete`
+/// deletionPolicy default and the policy config label). The caller treats
+/// `None` as warn-and-inert; only "no marker at all" is `Manual`.
+fn backup_origin(meta: &ObjectMeta, data: &Value) -> Option<Origin> {
     let from_label = meta
         .labels
         .as_ref()
@@ -504,11 +547,9 @@ fn backup_origin(meta: &ObjectMeta, data: &Value) -> Origin {
         .and_then(|s| s.get("origin"))
         .and_then(|v| v.as_str());
     match from_status.or(from_label) {
-        Some("discovered") => Origin::Discovered,
-        Some("scheduled") => Origin::Scheduled,
-        Some("adopted") => Origin::Adopted,
         // A user `kubectl create`-ing a Snapshot with no origin marker is manual.
-        _ => Origin::Manual,
+        None => Some(Origin::Manual),
+        Some(marker) => Origin::parse(marker),
     }
 }
 
@@ -1001,6 +1042,60 @@ mod tests {
         let r = policy_ref("nightly", None);
         assert_eq!(
             config_label_stamp(Origin::Discovered, Some(&r), "billing", None),
+            None
+        );
+    }
+
+    #[test]
+    fn replicated_origin_is_a_no_op_even_with_a_ref() {
+        // A replication copy CR carries no policyRef by contract; even a
+        // hand-made one must never earn the config label — that label is what
+        // enrolls a row in a policy's GFS retention/cascade, and GFS must
+        // never select replicated rows.
+        let r = policy_ref("nightly", None);
+        assert_eq!(
+            config_label_stamp(Origin::Replicated, Some(&r), "billing", None),
+            None
+        );
+    }
+
+    // --- backup_origin: total parse, None for unrecognized markers -------------
+
+    #[test]
+    fn backup_origin_no_marker_is_manual_and_known_markers_parse() {
+        let meta = ObjectMeta::default();
+        assert_eq!(backup_origin(&meta, &json!({})), Some(Origin::Manual));
+        for origin in Origin::ALL {
+            let meta = ObjectMeta {
+                labels: Some(labels(&[(api::consts::ORIGIN_LABEL, origin.label_value())])),
+                ..Default::default()
+            };
+            assert_eq!(
+                backup_origin(&meta, &json!({})),
+                Some(*origin),
+                "{origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_origin_unrecognized_marker_is_none_never_manual() {
+        // The webhook twin of the controller's resolve_origin fix: an unknown
+        // origin string must not be admitted with the Manual surface (Delete
+        // default + config label).
+        let meta = ObjectMeta {
+            labels: Some(labels(&[(api::consts::ORIGIN_LABEL, "frobnicated")])),
+            ..Default::default()
+        };
+        assert_eq!(backup_origin(&meta, &json!({})), None);
+        // status wins and parses totally too.
+        let meta = ObjectMeta::default();
+        assert_eq!(
+            backup_origin(&meta, &json!({ "status": { "origin": "replicated" } })),
+            Some(Origin::Replicated)
+        );
+        assert_eq!(
+            backup_origin(&meta, &json!({ "status": { "origin": "shinynew" } })),
             None
         );
     }

@@ -861,7 +861,9 @@ pub struct SnapshotsListArgs {
     pub repository_namespace: Option<String>,
 }
 
-/// `--origin` values; mirrors `kopiur_api::Origin`'s wire encoding.
+/// `--origin` values; mirrors `kopiur_api::Origin`'s wire encoding — ONE
+/// filter variant per `Origin` variant (pinned by the variant-count test
+/// against `Origin::ALL`, since nothing forces this enum at compile time).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OriginFilter {
     /// Created by a SnapshotSchedule.
@@ -870,6 +872,10 @@ pub enum OriginFilter {
     Manual,
     /// Materialized from a repository catalog scan.
     Discovered,
+    /// A discovered snapshot re-attached to a live SnapshotPolicy.
+    Adopted,
+    /// A dest-side copy minted by a SnapshotReplication run.
+    Replicated,
 }
 
 impl From<OriginFilter> for kopiur_api::Origin {
@@ -878,6 +884,8 @@ impl From<OriginFilter> for kopiur_api::Origin {
             OriginFilter::Scheduled => Self::Scheduled,
             OriginFilter::Manual => Self::Manual,
             OriginFilter::Discovered => Self::Discovered,
+            OriginFilter::Adopted => Self::Adopted,
+            OriginFilter::Replicated => Self::Replicated,
         }
     }
 }
@@ -1116,9 +1124,35 @@ mod tests {
             (OriginFilter::Scheduled, kopiur_api::Origin::Scheduled),
             (OriginFilter::Manual, kopiur_api::Origin::Manual),
             (OriginFilter::Discovered, kopiur_api::Origin::Discovered),
+            (OriginFilter::Adopted, kopiur_api::Origin::Adopted),
+            (OriginFilter::Replicated, kopiur_api::Origin::Replicated),
         ] {
             let wire = serde_json::to_value(origin).unwrap();
             assert_eq!(wire, filter.label_value());
+        }
+    }
+
+    #[test]
+    fn origin_filter_covers_every_origin_variant() {
+        // NOT compiler-forced: OriginFilter is a hand-mirrored clap enum, so a
+        // new `Origin` variant added without a filter variant would silently
+        // make `--origin` unable to select it (the pre-existing missing
+        // `Adopted` was exactly this failure). Pin the counts together, and
+        // require the mapping to reach every Origin variant.
+        use clap::ValueEnum;
+        let filters = OriginFilter::value_variants();
+        assert_eq!(
+            filters.len(),
+            kopiur_api::Origin::ALL.len(),
+            "OriginFilter must have one variant per kopiur_api::Origin variant"
+        );
+        for origin in kopiur_api::Origin::ALL {
+            assert!(
+                filters
+                    .iter()
+                    .any(|f| kopiur_api::Origin::from(*f) == *origin),
+                "no OriginFilter maps to {origin:?}"
+            );
         }
     }
 }

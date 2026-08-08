@@ -290,8 +290,10 @@ pub struct PolicyCascadePlan {
 /// 1. **Origin filter** (exhaustive over [`Origin`], status-first via
 ///    [`crate::snapshot::resolve_origin`]): `Discovered` is NEVER included in
 ///    any set — a hand-labeled discovered CR must not churn just because a
-///    policy it merely resembles was deleted. `Adopted | Scheduled | Manual`
-///    are cascaded — all three are operator-managed rows.
+///    policy it merely resembles was deleted. `Replicated` and
+///    unparseable-origin rows are excluded too (see [`cascade_eligible`]).
+///    `Adopted | Scheduled | Manual` are cascaded — all three are
+///    operator-managed rows.
 /// 2. **Terminating exclusion**: only a child with
 ///    `metadata.deletionTimestamp.is_none()` (live) may enter
 ///    `stamp_and_delete` or `delete_only`. A terminating child is handled by
@@ -315,13 +317,18 @@ pub fn plan_policy_cascade(children: &[Snapshot], mode: PolicyDeletePolicy) -> P
     plan
 }
 
-/// Step 1 of [`plan_policy_cascade`]: exhaustive over [`Origin`]. Only
-/// `Discovered` is excluded — the operator did not create that kopia
-/// snapshot and must never churn it on a policy's say-so.
+/// Step 1 of [`plan_policy_cascade`]: exhaustive over [`Origin`].
+/// `Discovered` is excluded — the operator did not create that kopia snapshot
+/// and must never churn it on a policy's say-so. `Replicated` is excluded for
+/// the sibling reason: a dest-side copy CR belongs to its
+/// `SnapshotReplication` (it carries no `policyRef` and never earns the config
+/// label), so no `SnapshotPolicy` deletion may cascade onto it. An
+/// unparseable origin marker (`None`) is excluded conservatively — never
+/// churn a row this build cannot classify.
 fn cascade_eligible(child: &Snapshot) -> bool {
     match crate::snapshot::resolve_origin(child) {
-        Origin::Discovered => false,
-        Origin::Adopted | Origin::Scheduled | Origin::Manual => true,
+        Some(Origin::Discovered | Origin::Replicated) | None => false,
+        Some(Origin::Adopted | Origin::Scheduled | Origin::Manual) => true,
     }
 }
 
@@ -1151,7 +1158,7 @@ fn own_snapshot_ids_and_history(
         // provenance, so a genuine adopted row that has converged to `Succeeded` is
         // caught by the first arm; this arm additionally counts an interim
         // controller-written adopted row before its phase pins.)
-        let adopted_with_provenance = crate::snapshot::resolve_origin(b) == Origin::Adopted
+        let adopted_with_provenance = crate::snapshot::resolve_origin(b) == Some(Origin::Adopted)
             && b.status
                 .as_ref()
                 .and_then(|s| s.snapshot.as_ref())
@@ -1431,6 +1438,7 @@ mod tests {
         let mut b = Snapshot::new(
             name,
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,
@@ -1742,7 +1750,10 @@ mod tests {
             Origin::Adopted.label_value().to_string(),
         );
         forged.metadata.labels = Some(labels);
-        assert_eq!(crate::snapshot::resolve_origin(&forged), Origin::Adopted);
+        assert_eq!(
+            crate::snapshot::resolve_origin(&forged),
+            Some(Origin::Adopted)
+        );
         let (_ids, has_history) = own_snapshot_ids_and_history(&[forged]);
         assert!(
             !has_history,
@@ -1761,6 +1772,7 @@ mod tests {
             let mut b = Snapshot::new(
                 "occupant",
                 SnapshotSpec {
+                    repository: None,
                     source: None,
                     policy_ref: None,
                     tags: None,
@@ -2040,6 +2052,7 @@ mod tests {
         let mut running = Snapshot::new(
             "running",
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,

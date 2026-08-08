@@ -57,6 +57,7 @@ pub fn build_snapshot_for(
     let mut snapshot = Snapshot::new(
         &name,
         SnapshotSpec {
+            repository: None,
             source,
             policy_ref: Some(PolicyRef {
                 name: args.policy.clone(),

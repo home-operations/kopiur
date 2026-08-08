@@ -306,7 +306,8 @@ pub async fn verify_step(
     // #168 gate: never schedule a verify before a verifiable snapshot exists — the
     // tier_after catch-up would otherwise fire a Job on the first reconcile, before
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
-    // snapshot OR its repo already carries discovered (adopted) snapshots. The
+    // snapshot OR its repo already carries discovered (adopted) or replicated
+    // snapshots (a replication DEST repo holding only copies is not empty). The
     // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
     // entirely once a successful backup already unlocks the gate. Probed in the
     // repository's OWN namespace (not the policy's — `RepositoryRef` allows a
@@ -689,13 +690,18 @@ fn verify_identity(
     }
 }
 
-/// Whether the policy's resolved repository already carries **discovered** (adopted)
-/// snapshots — the #168 verification escape hatch. A cheap labeled LIST scoped by the
-/// repo-uid + `origin=discovered` labels the catalog scanner stamps on every
-/// materialized foreign snapshot (`crate::catalog`); `true` as soon as one exists.
-/// The [`DiscoveredProbeScope`] (from [`discovered_probe_scope`]) selects namespaced
-/// vs cluster-wide so an adopted `ClusterRepository`'s scattered rows are seen. Thin
-/// IO over the pure [`verification_unlocked`] gate.
+/// Whether the policy's resolved repository already carries **discovered**
+/// (adopted) or **replicated** snapshots — the #168 verification escape hatch.
+/// A cheap labeled LIST scoped by the repo-uid label plus a SET-BASED origin
+/// selector (`origin in (discovered, replicated)`): discovered rows are what
+/// the catalog scanner stamps on every materialized foreign snapshot
+/// (`crate::catalog`), and replicated rows are the dest-side copy CRs a
+/// `SnapshotReplication` mints — a destination repository holding ONLY copies
+/// has verifiable content and must not look empty to this gate. `true` as soon
+/// as one of either exists. The [`DiscoveredProbeScope`] (from
+/// [`discovered_probe_scope`]) selects namespaced vs cluster-wide so an
+/// adopted `ClusterRepository`'s scattered rows are seen. Thin IO over the
+/// pure [`verification_unlocked`] gate.
 async fn repo_has_discovered_snapshots(
     client: &kube::Client,
     scope: &DiscoveredProbeScope,
@@ -706,8 +712,9 @@ async fn repo_has_discovered_snapshots(
         DiscoveredProbeScope::ClusterWide => Api::all(client.clone()),
     };
     let selector = format!(
-        "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL}={}",
-        Origin::Discovered.label_value()
+        "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL} in ({},{})",
+        Origin::Discovered.label_value(),
+        Origin::Replicated.label_value()
     );
     let lp = ListParams::default().labels(&selector).limit(1);
     Ok(!api.list(&lp).await?.items.is_empty())

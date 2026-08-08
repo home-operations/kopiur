@@ -119,19 +119,29 @@ fn anchor_for(backup: &Snapshot) -> SnapshotAnchor {
     }
 }
 
-/// REPO MATCH RULE: a CR whose `status.resolved.repository` pin matches `key`
-/// matches; a CR with NO pin (pre-#255) matches EVERY key. Conservative: an
-/// unpinned CR is over-counted into every repository's batch consideration
-/// rather than silently excluded from all of them — over-count is the
-/// fail-safe direction here (a missed member never gets deleted at all,
-/// while an extra candidate is still gated by the plan-would-delete check).
+/// REPO MATCH RULE, in fixed precedence order: a CR whose
+/// `status.resolved.repository` pin matches `key` matches; with no status pin,
+/// the mint-time `spec.repository` pin (a multi-repo fan-out child or a
+/// `SnapshotReplication` copy CR — stamped at CREATE, so present even before
+/// any status lands) decides; a CR with NEITHER pin (pre-#255 / legacy
+/// single-repo) matches EVERY key. Conservative: an unpinned CR is
+/// over-counted into every repository's batch consideration rather than
+/// silently excluded from all of them — over-count is the fail-safe direction
+/// here (a missed member never gets deleted at all, while an extra candidate
+/// is still gated by the plan-would-delete check). The spec-pin fallback
+/// closes the unpinned WINDOW a copy CR would otherwise have between CREATE
+/// and its status patch, during which it would match (and count toward) every
+/// repository's breaker.
 fn repo_matches(backup: &Snapshot, key: &str) -> bool {
-    match backup
+    if let Some(pinned) = backup
         .status
         .as_ref()
         .and_then(|s| s.resolved.as_ref())
         .and_then(|r| r.repository.as_ref())
     {
+        return repo_key(pinned) == key;
+    }
+    match backup.spec.repository.as_ref() {
         Some(pinned) => repo_key(pinned) == key,
         None => true,
     }
@@ -850,6 +860,69 @@ mod tests {
         assert_ne!(label, repo_label(&other_ns));
     }
 
+    // --- repo_matches: status pin → spec pin → match-all -----------------
+
+    #[test]
+    fn repo_matches_spec_pin_decides_when_status_pin_is_absent() {
+        // A replication copy CR / multi-repo fan-out child carries
+        // `spec.repository` from CREATE, before any status lands: it must
+        // match ONLY its pinned repository's key — never every key (the
+        // pre-spec-pin unpinned window would have counted it toward every
+        // repository's breaker).
+        let pinned = repo(RepositoryKind::Repository, Some("backups"), "nas");
+        let mut backup = Snapshot::new(
+            "copy",
+            SnapshotSpec {
+                repository: Some(pinned.clone()),
+                source: None,
+                policy_ref: None,
+                tags: None,
+                failure_policy: None,
+                deletion_policy: None,
+                on_schedule_delete: None,
+                pin: false,
+                description: None,
+            },
+        );
+        assert!(repo_matches(&backup, &repo_key(&pinned)));
+        let other = repo(RepositoryKind::ClusterRepository, None, "offsite");
+        assert!(!repo_matches(&backup, &repo_key(&other)));
+
+        // The run-time status pin stays authoritative once present: a stale or
+        // divergent spec pin must not override what the run actually targeted.
+        backup.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            resolved: Some(kopiur_api::snapshot::ResolvedSnapshot {
+                repository: Some(other.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(repo_matches(&backup, &repo_key(&other)));
+        assert!(!repo_matches(&backup, &repo_key(&pinned)));
+    }
+
+    #[test]
+    fn repo_matches_with_neither_pin_matches_every_key() {
+        // Legacy pre-#255 rows: conservative over-count into every batch.
+        let backup = Snapshot::new(
+            "legacy",
+            SnapshotSpec {
+                repository: None,
+                source: None,
+                policy_ref: None,
+                tags: None,
+                failure_policy: None,
+                deletion_policy: None,
+                on_schedule_delete: None,
+                pin: false,
+                description: None,
+            },
+        );
+        for key in ["repository:backups/nas", "clusterrepository:offsite"] {
+            assert!(repo_matches(&backup, key), "{key}");
+        }
+    }
+
     // --- pending_members -------------------------------------------------
 
     const KEY: &str = "repository:backups/nas";
@@ -877,6 +950,7 @@ mod tests {
         let mut backup = Snapshot::new(
             name,
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,

@@ -601,12 +601,14 @@ impl ScanOwner<'_> {
     }
 }
 
-/// The kopia snapshot ids of scheduled/manual/adopted `Snapshot` CRs that resolve
-/// to this repository CR. These are this cluster's *produced* (or
-/// adopted-into-managed) snapshots: a rescan must never duplicate them as
-/// discovered rows. Origin uses [`crate::snapshot::resolve_origin`]'s precedence
-/// (status, then label, default manual) — NOT the label alone, because a bare
-/// `kubectl create` manual Snapshot may never carry the origin label. Pure.
+/// The kopia snapshot ids of scheduled/manual/adopted/replicated `Snapshot`
+/// CRs that resolve to this repository CR. These are this cluster's *produced*
+/// (or adopted-into-managed, or replication-copied) snapshots: a rescan must
+/// never duplicate them as discovered rows. Origin uses
+/// [`crate::snapshot::resolve_origin`]'s precedence (status, then label,
+/// default manual; unparseable ⇒ conservative suppression) — NOT the label
+/// alone, because a bare `kubectl create` manual Snapshot may never carry the
+/// origin label. Pure.
 ///
 /// A row contributes its id through either of two arms:
 /// - **status arm**: `status.resolved.repository` (or the owner reference — the
@@ -633,9 +635,19 @@ pub fn produced_ids_for(
     snapshots
         .iter()
         .filter(|s| match crate::snapshot::resolve_origin(s) {
-            // Adopted ids must never re-materialize as discovered rows either.
-            Origin::Scheduled | Origin::Manual | Origin::Adopted => true,
-            Origin::Discovered => false,
+            // Adopted ids must never re-materialize as discovered rows either;
+            // nor replicated copies — the copy CR *is* the row for its
+            // dest-side manifest, so its id counting as "produced" is the
+            // suppression that stops a rescan minting a duplicate discovered
+            // twin for every copy.
+            Some(Origin::Scheduled | Origin::Manual | Origin::Adopted | Origin::Replicated) => true,
+            Some(Origin::Discovered) => false,
+            // Unparseable origin marker: conservative SUPPRESSION. Counting the
+            // id as produced can only prevent a duplicate discovered row from
+            // being minted — it never deletes anything and never grants GFS
+            // participation — while NOT counting it would re-materialize a row
+            // this build cannot classify as a second, competing CR.
+            None => true,
         })
         .filter_map(|s| {
             let status_arm = || {
@@ -1359,6 +1371,7 @@ async fn materialize_discovered(
     let mut backup = Snapshot::new(
         &cr_name,
         SnapshotSpec {
+            repository: None,
             source: None,
             policy_ref: None,
             tags: None,
@@ -2582,6 +2595,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 kopiur_api::snapshot::SnapshotSpec {
+                    repository: None,
                     source: None,
                     policy_ref: None,
                     tags: None,

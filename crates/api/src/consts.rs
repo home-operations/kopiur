@@ -33,6 +33,15 @@ pub const CONFIG_LABEL: &str = "kopiur.home-operations.com/config";
 /// under `policySelector` fan-out).
 pub const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
 
+/// Label naming the `SnapshotReplication` CR that minted an
+/// `origin: replicated` dest-side copy `Snapshot` — the selector a replication
+/// run (and its pruning pass) uses to find its own copies. Stamped at CREATE,
+/// alongside [`ORIGIN_LABEL`]/[`SNAPSHOT_ID_LABEL`]/[`REPOSITORY_UID_LABEL`].
+/// Lives in `kopiur-api` because the CLI and user automation must agree on it
+/// byte-for-byte. (Nothing stamps it yet — reserved by the shared-foundations
+/// milestone of #368.)
+pub const SNAPSHOT_REPLICATION_LABEL: &str = "kopiur.home-operations.com/snapshot-replication";
+
 /// Label naming the shared CSI `VolumeGroupSnapshot` a fanned-out `Snapshot`
 /// stages from — carried by BOTH the member `Snapshot` CRs and the
 /// `VolumeGroupSnapshot` object itself.
@@ -107,7 +116,8 @@ pub const ALLOW_IDENTITY_CHANGE_ANNOTATION: &str =
 
 /// Marks a `Snapshot` the OPERATOR is deleting as part of its own lifecycle,
 /// stamped immediately before the delete call. Values: `PrunedBy` annotation
-/// values (`retention`, `failed-history`). The Snapshot finalizer uses it to
+/// values (`retention`, `failed-history`, `policy-cascade`,
+/// `replication-retention`). The Snapshot finalizer uses it to
 /// distinguish Kopiur's own prunes from external deletions (GC cascades,
 /// kubectl, third-party controllers); external destructive deletions are
 /// subject to the schedule-cascade guard and the mass-deletion breaker,
@@ -359,6 +369,7 @@ mod tests {
             REPOSITORY_UID_LABEL,
             CONFIG_LABEL,
             SCHEDULE_LABEL,
+            SNAPSHOT_REPLICATION_LABEL,
             GROUP_LABEL,
             OP_LABEL,
             SESSION_LABEL,
