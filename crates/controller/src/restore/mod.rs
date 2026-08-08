@@ -2069,8 +2069,36 @@ async fn run_restore_mover(
     let restore_name = restore.name_any();
     let name = restore_name.as_str();
 
-    // Resolve the repository for the restore Job.
-    let repo = resolve_restore_repository(ctx, restore, namespace).await?;
+    // Resolve the repository for the restore Job. A missing `tls.caBundleRef`
+    // ConfigMap surfaces as the structural CredentialsAvailable gate
+    // (MISSING_CA_BUNDLE_GATE): the retry is transient, but a ConfigMap nobody
+    // creates never self-heals, and the park at `Pending` must be visible to
+    // doctor (#359).
+    let repo = match resolve_restore_repository(ctx, restore, namespace).await {
+        Ok(repo) => repo,
+        Err(Error::MissingCaBundle(msg)) => {
+            let existing = restore
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let conditions = io::upsert_gate(
+                &existing,
+                &kopiur_api::gates::MISSING_CA_BUNDLE_GATE,
+                &msg,
+                restore.metadata.generation,
+            );
+            io::patch_status(
+                api,
+                name,
+                serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+            )
+            .await?;
+            io::publish_missing_ca_bundle_event(ctx, restore, &msg).await;
+            return Err(Error::MissingCaBundle(msg));
+        }
+        Err(e) => return Err(e),
+    };
 
     // The restore mover Job runs in this (workload) namespace: resolve its run
     // identity here — the user's workload-identity SA (preflighted + bound to the
@@ -3251,7 +3279,13 @@ async fn resolve_restore_repository(
     // Explicit `spec.repository` wins. Honors `kind` (namespaced vs.
     // ClusterRepository) via the shared resolver (ADR §5.5).
     if let Some(rref) = &restore.spec.repository {
-        return io::resolve_repository_ref(&ctx.client, rref, namespace).await;
+        return io::resolve_repository_ref(
+            &ctx.client,
+            rref,
+            namespace,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await;
     }
     // SnapshotRef: derive from the referenced Snapshot (pinned resolved
     // repository for produced, owning repository for discovered).
@@ -3272,7 +3306,13 @@ async fn resolve_restore_repository(
         })?;
         // Resolved relative to the SNAPSHOT's namespace (an absent ref
         // namespace means "same as the snapshot", not "same as the restore").
-        return io::resolve_repository_ref(&ctx.client, &rref, snap_ns).await;
+        return io::resolve_repository_ref(
+            &ctx.client,
+            &rref,
+            snap_ns,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await;
     }
     // FromPolicy: resolve via the SnapshotPolicy's repository.
     if let RestoreSource::FromPolicy(c) = &restore.spec.source {
@@ -3282,7 +3322,13 @@ async fn resolve_restore_repository(
         let config = cfg_api.get_opt(&c.name).await?.ok_or_else(|| {
             Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", c.name))
         })?;
-        return io::resolve_repository_ref(&ctx.client, &config.spec.repository, cfg_ns).await;
+        return io::resolve_repository_ref(
+            &ctx.client,
+            &config.spec.repository,
+            cfg_ns,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await;
     }
     Err(Error::Validation(
         "restore with source.identity requires spec.repository (snapshotRef and fromPolicy \

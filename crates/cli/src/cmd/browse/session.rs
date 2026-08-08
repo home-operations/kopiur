@@ -43,6 +43,12 @@ const READY_WAIT: Duration = Duration::from_secs(300);
 /// The env var on the controller Deployment naming the mover image (mirrors
 /// `kopiur_controller::config::MOVER_IMAGE_ENV` without a controller dep).
 const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
+/// The chart labels identifying THE controller Deployment. Shared by the
+/// mover-image lookup ([`resolve_mover_image`]) and the operator-namespace
+/// discovery ([`super::resolve::resolve_ca_bundle`]); both demand exactly one
+/// match cluster-wide and fail closed otherwise.
+pub(crate) const CONTROLLER_DEPLOYMENT_SELECTOR: &str =
+    "app.kubernetes.io/name=kopiur,app.kubernetes.io/component=controller";
 
 /// FNV-1a 64-bit — a tiny, dependency-free stable hash for deterministic
 /// resource names. NOT a security boundary, just name disambiguation.
@@ -143,7 +149,10 @@ pub fn session_work_spec(target: &BrowseTarget, ttl: Duration) -> MoverWorkSpec 
             hostname: target.namespace.clone(),
             source_path: String::new(),
         },
-        repository: backend_to_repository_connect(&target.repo.backend),
+        repository: backend_to_repository_connect(
+            &target.repo.backend,
+            target.ca_bundle_pem.clone(),
+        ),
         target_ref: TargetRef {
             api_version: kopiur_api::consts::API_VERSION.into(),
             kind: match target.repo.kind {
@@ -464,7 +473,7 @@ fn owner_ref_for_repo(repo: &RepoHandle) -> OwnerReference {
 /// runs what the operator runs.
 async fn resolve_mover_image(ctx: &KubeCtx) -> Result<String, CliError> {
     let api: Api<Deployment> = Api::all(ctx.client.clone());
-    let selector = "app.kubernetes.io/name=kopiur,app.kubernetes.io/component=controller";
+    let selector = CONTROLLER_DEPLOYMENT_SELECTOR;
     let list = api
         .list(&ListParams::default().labels(selector))
         .await
@@ -769,6 +778,7 @@ mod tests {
                     },
                 },
             },
+            ca_bundle_pem: None,
         };
         let ws = session_work_spec(&target, Duration::from_secs(1800));
         match &ws.operation {

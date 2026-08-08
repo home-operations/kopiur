@@ -466,6 +466,7 @@ mod tests {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            root_ca_pem: None,
         };
         materialize(&mut spec, &dir).expect("materialize s3");
         // No staging dir created for an env-only backend.
@@ -495,6 +496,7 @@ mod tests {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: true,
+            root_ca_pem: None,
         };
         // Workload identity warns (no hints in this test env) but materializes
         // nothing — the credential is ambient, not a file.
@@ -511,6 +513,7 @@ mod tests {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            root_ca_pem: None,
         }
     }
 

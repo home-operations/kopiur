@@ -567,7 +567,7 @@ pub fn build_verify_work_spec(
             success_expr: verification.success_expr.clone(),
         }),
         identity,
-        repository: backend_to_repository_connect(&repo.backend),
+        repository: backend_to_repository_connect(&repo.backend, repo.ca_bundle_pem.clone()),
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
             kind: "SnapshotPolicy".to_string(),
@@ -1080,6 +1080,7 @@ mod tests {
             deletion_protection: None,
             mass_deletion_ack: None,
             catalog: None,
+            ca_bundle_pem: None,
         }
     }
 

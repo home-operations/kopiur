@@ -663,6 +663,22 @@ pub const NFS_FSGROUP_WARNING: &str = "NFS filesystem repo: fsGroup is ignored o
      grant the mover write access via moverDefaults.podSecurityContext.supplementalGroups \
      (with a group-writable export), securityContext.runAsUser, or NAS-side Mapall";
 
+/// The actionable admission warning for an S3 backend pairing `tls.caBundleRef`
+/// with `tls.insecureSkipVerify: true`: kopia's `--disable-tls-verification`
+/// wins, so the referenced CA bundle is ignored while insecureSkipVerify is set.
+/// Deliberately a WARNING, never a hard error — the `ClusterRepository` and
+/// `RepositoryReplication` reconcilers defensively re-validate the FULL spec on
+/// every reconcile and hard-error on failure, so promoting this combination to
+/// an error would brick every already-persisted CR carrying it on operator
+/// upgrade, with no admission request in flight for a user to react to. (The
+/// `caBundleRef` + `disableTls` contradiction IS a hard error, but only because
+/// `caBundleRef` never worked at all before this validation existed — no
+/// working CR can carry it.) Kept short for the admission response (kube
+/// truncates very long warnings).
+pub const S3_TLS_SKIP_VERIFY_WARNING: &str = "s3 tls: insecureSkipVerify wins at kopia — the \
+     referenced caBundleRef CA bundle is ignored while it is set; remove insecureSkipVerify \
+     once the CA bundle verifies the endpoint";
+
 /// Whether `moverDefaults` configures an NFS-effective write identity — i.e. a
 /// `runAsUser` (container or pod) that owns the export, or a `supplementalGroups`
 /// the export is group-writable by. `fsGroup` deliberately does **not** count: it
@@ -686,8 +702,10 @@ fn nfs_write_identity_configured(mover_defaults: Option<&MoverDefaults>) -> bool
 
 /// Non-blocking admission warnings for a `Repository`/`ClusterRepository`. Shared
 /// by both handlers (the rules can't fork). Today: the inline-NFS + `fsGroup`-only
-/// footgun (see [`NFS_FSGROUP_WARNING`]). Takes the resolved `backend` +
-/// `moverDefaults` so it serves both kinds without re-deriving them.
+/// footgun (see [`NFS_FSGROUP_WARNING`]) and the S3 `caBundleRef` +
+/// `insecureSkipVerify` shadowing (see [`S3_TLS_SKIP_VERIFY_WARNING`]). Takes the
+/// resolved `backend` + `moverDefaults` so it serves both kinds without
+/// re-deriving them.
 pub fn repository_warnings(
     backend: &Backend,
     mover_defaults: Option<&MoverDefaults>,
@@ -699,6 +717,13 @@ pub fn repository_warnings(
     );
     if inline_nfs && !nfs_write_identity_configured(mover_defaults) {
         warnings.push(NFS_FSGROUP_WARNING.to_string());
+    }
+    if let Backend::S3(s3) = backend
+        && let Some(tls) = &s3.tls
+        && tls.ca_bundle_ref.is_some()
+        && tls.insecure_skip_verify
+    {
+        warnings.push(S3_TLS_SKIP_VERIFY_WARNING.to_string());
     }
     warnings
 }

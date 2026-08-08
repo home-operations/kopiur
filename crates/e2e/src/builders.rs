@@ -10,7 +10,7 @@
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
-    Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, Service,
+    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, Service,
 };
 use serde_json::json;
 
@@ -75,6 +75,20 @@ pub fn dynamic_pvc(ns: &str, name: &str, size: &str) -> PersistentVolumeClaim {
     }))
 }
 
+/// A `ConfigMap` carrying plain string `data` (e.g. a CA bundle PEM).
+pub fn config_map(ns: &str, name: &str, data: &[(&str, &str)]) -> ConfigMap {
+    let data: serde_json::Map<String, serde_json::Value> = data
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), json!(v)))
+        .collect();
+    from_json(json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": { "name": name, "namespace": ns },
+        "data": data,
+    }))
+}
+
 /// An `Opaque` `Secret` carrying `stringData` (server applies it base64-encoded).
 pub fn opaque_secret(ns: &str, name: &str, string_data: &[(&str, &str)]) -> Secret {
     let data: serde_json::Map<String, serde_json::Value> = string_data
@@ -134,6 +148,185 @@ pub fn minio_service(ns: &str) -> Service {
         "spec": {
             "selector": { "app": "minio" },
             "ports": [{ "name": "s3", "port": 9000, "targetPort": 9000 }],
+        },
+    }))
+}
+
+/// The DNS SANs the TLS MinIO's leaf certificate must carry. kopia dials the
+/// endpoint host verbatim, so the FQDN form ([`consts::MINIO_TLS_ENDPOINT`]'s
+/// host) MUST be covered; the short Service forms ride along for any in-cluster
+/// client (the `mc` bucket pod) that prefers them.
+pub fn minio_tls_san_names() -> Vec<String> {
+    vec![
+        "minio-tls.kopiur-e2e.svc.cluster.local".to_string(),
+        "minio-tls.kopiur-e2e.svc".to_string(),
+        "minio-tls".to_string(),
+    ]
+}
+
+/// Throwaway TLS material for the TLS MinIO fixture: a private CA plus a leaf
+/// serving cert/key signed by it, all PEM. Minted fresh at test runtime.
+#[derive(Debug, Clone)]
+pub struct MinioTlsCerts {
+    /// CA certificate PEM — what lands in the `minio-ca` ConfigMap's `ca.crt`
+    /// key and must reach kopia as `--root-ca-pem-base64`.
+    pub ca_pem: String,
+    /// Leaf certificate PEM (MinIO's `public.crt`), SANs from
+    /// [`minio_tls_san_names`].
+    pub cert_pem: String,
+    /// Leaf private key PEM (MinIO's `private.key`).
+    pub key_pem: String,
+}
+
+/// Mint the [`MinioTlsCerts`] with `rcgen` (pure — no IO, no cluster). Mirrors
+/// `crates/controller/src/webhook_tls.rs`: a self-signed CA, then a ServerAuth
+/// leaf signed by an `Issuer` reloaded from the CA PEM. rcgen's default validity
+/// window (1975–4096) is fine for a throwaway e2e cert.
+pub fn mint_minio_tls_certs() -> Result<MinioTlsCerts, rcgen::Error> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::generate()?;
+    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "kopiur-e2e-minio-ca");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca_pem = ca_cert.pem();
+
+    let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
+    let leaf_key = KeyPair::generate()?;
+    // `new` populates `subject_alt_names` with a DnsName SAN per entry.
+    let mut leaf_params = CertificateParams::new(minio_tls_san_names())?;
+    leaf_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer)?;
+
+    Ok(MinioTlsCerts {
+        ca_pem,
+        cert_pem: leaf_cert.pem(),
+        key_pem: leaf_key.serialize_pem(),
+    })
+}
+
+/// A single-pod **HTTPS** MinIO `Deployment` (`minio-tls`) serving with the
+/// private-CA leaf from [`consts::SECRET_MINIO_TLS_CERTS`]. Same preloaded
+/// [`consts::MINIO_IMAGE`] as the plain instance.
+///
+/// MinIO tries to create a `CAs/` subdirectory under its `--certs-dir`, and a
+/// Secret projection is a read-only mount — so the Secret is mounted at a
+/// staging path and an initContainer (the MinIO image itself, which ships `sh`
+/// and `cp`) copies the two files into a writable emptyDir mounted at `/certs`.
+/// Readiness is an HTTPS `httpGet` (the kubelet probe skips cert verification).
+pub fn minio_tls_deployment(ns: &str) -> Deployment {
+    from_json(json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "minio-tls", "namespace": ns },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": "minio-tls" } },
+            "template": {
+                "metadata": { "labels": { "app": "minio-tls" } },
+                "spec": {
+                    "initContainers": [{
+                        "name": "copy-certs",
+                        "image": consts::MINIO_IMAGE,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["sh", "-c", format!(
+                            "cp /certs-src/{crt} /certs-src/{key} /certs/ && mkdir -p /certs/CAs",
+                            crt = consts::KEY_MINIO_TLS_PUBLIC,
+                            key = consts::KEY_MINIO_TLS_PRIVATE,
+                        )],
+                        "volumeMounts": [
+                            { "name": "certs-src", "mountPath": "/certs-src", "readOnly": true },
+                            { "name": "certs", "mountPath": "/certs" },
+                        ],
+                    }],
+                    "containers": [{
+                        "name": "minio",
+                        "image": consts::MINIO_IMAGE,
+                        "imagePullPolicy": "IfNotPresent",
+                        "args": ["server", "/data", "--certs-dir", "/certs", "--console-address", ":9001"],
+                        "env": [
+                            { "name": "MINIO_ROOT_USER", "value": consts::MINIO_USER },
+                            { "name": "MINIO_ROOT_PASSWORD", "value": consts::MINIO_PASS },
+                        ],
+                        "ports": [{ "containerPort": 9000 }],
+                        "volumeMounts": [{ "name": "certs", "mountPath": "/certs" }],
+                        "readinessProbe": {
+                            "httpGet": {
+                                "path": "/minio/health/ready",
+                                "port": 9000,
+                                "scheme": "HTTPS",
+                            },
+                            "periodSeconds": 3,
+                        },
+                    }],
+                    "volumes": [
+                        {
+                            "name": "certs-src",
+                            "secret": { "secretName": consts::SECRET_MINIO_TLS_CERTS },
+                        },
+                        { "name": "certs", "emptyDir": {} },
+                    ],
+                },
+            },
+        },
+    }))
+}
+
+/// The `Service` fronting the TLS MinIO on port 9000 (the HTTPS S3 endpoint).
+pub fn minio_tls_service(ns: &str) -> Service {
+    from_json(json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "minio-tls", "namespace": ns },
+        "spec": {
+            "selector": { "app": "minio-tls" },
+            "ports": [{ "name": "s3", "port": 9000, "targetPort": 9000 }],
+        },
+    }))
+}
+
+/// A one-shot `mc` Pod creating [`consts::MINIO_TLS_BUCKET`] on the **TLS**
+/// MinIO instance (mirrors [`mc_bucket_pod`], which only ever talks plain HTTP
+/// to the other instance's storage). `--insecure` because the throwaway CA is
+/// not in the mc image's trust store — the point of the fixture is that the
+/// *mover* must trust it via `caBundleRef`, not that `mc` does.
+pub fn mc_tls_bucket_pod(ns: &str, name: &str) -> Pod {
+    let script = format!(
+        "set -e\nuntil mc alias set localtls https://{endpoint} {user} {pass} --insecure >/dev/null 2>&1; \
+         do sleep 2; done\n\
+         mc mb --insecure --ignore-existing localtls/{bucket}\n",
+        endpoint = consts::MINIO_TLS_ENDPOINT,
+        user = consts::MINIO_USER,
+        pass = consts::MINIO_PASS,
+        bucket = consts::MINIO_TLS_BUCKET,
+    );
+    from_json(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "mc",
+                "image": consts::MC_IMAGE,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/bin/sh", "-c", script],
+            }],
         },
     }))
 }
@@ -905,6 +1098,145 @@ mod tests {
         let v = val(&s);
         assert_eq!(v.pointer("/spec/ports/0/port").unwrap(), 9000);
         assert_eq!(v.pointer("/spec/selector/app").unwrap(), "minio");
+    }
+
+    #[test]
+    fn config_map_carries_data() {
+        let cm = config_map(
+            consts::OPERATOR_NS,
+            consts::CM_MINIO_CA,
+            &[("ca.crt", "PEM")],
+        );
+        let v = val(&cm);
+        assert_eq!(v.pointer("/metadata/name").unwrap(), consts::CM_MINIO_CA);
+        assert_eq!(
+            v.pointer("/metadata/namespace").unwrap(),
+            consts::OPERATOR_NS
+        );
+        assert_eq!(v.pointer("/data/ca.crt").unwrap(), "PEM");
+    }
+
+    #[test]
+    fn minio_tls_san_names_cover_the_endpoint_host() {
+        let sans = minio_tls_san_names();
+        // kopia dials the endpoint host verbatim — the FQDN SAN is load-bearing.
+        let host = consts::MINIO_TLS_ENDPOINT
+            .split(':')
+            .next()
+            .expect("endpoint has a host");
+        assert!(
+            sans.iter().any(|s| s == host),
+            "leaf SANs {sans:?} must cover the dialed endpoint host {host}"
+        );
+        assert!(sans.iter().any(|s| s == "minio-tls.kopiur-e2e.svc"));
+        assert!(sans.iter().any(|s| s == "minio-tls"));
+    }
+
+    #[test]
+    fn mint_minio_tls_certs_yields_distinct_pem_material() {
+        let certs = mint_minio_tls_certs().expect("mint CA + leaf");
+        assert!(certs.ca_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(certs.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(certs.key_pem.contains("PRIVATE KEY"));
+        assert_ne!(certs.ca_pem, certs.cert_pem, "leaf must not BE the CA");
+    }
+
+    #[test]
+    fn minio_tls_deployment_serves_https_from_a_writable_certs_dir() {
+        let d = minio_tls_deployment(consts::OPERATOR_NS);
+        let v = val(&d);
+        let c = v
+            .pointer("/spec/template/spec/containers/0")
+            .expect("container");
+        assert_eq!(c.pointer("/image").unwrap(), consts::MINIO_IMAGE);
+        assert_eq!(c.pointer("/imagePullPolicy").unwrap(), "IfNotPresent");
+        // `--certs-dir /certs` points MinIO at the writable emptyDir copy.
+        let args: Vec<&str> = c
+            .pointer("/args")
+            .and_then(|a| a.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "server",
+                "/data",
+                "--certs-dir",
+                "/certs",
+                "--console-address",
+                ":9001"
+            ]
+        );
+        // The probe must be HTTPS — an HTTP GET against a TLS listener never readies.
+        assert_eq!(
+            c.pointer("/readinessProbe/httpGet/scheme").unwrap(),
+            "HTTPS"
+        );
+        assert_eq!(
+            c.pointer("/readinessProbe/httpGet/path").unwrap(),
+            "/minio/health/ready"
+        );
+        assert_eq!(c.pointer("/readinessProbe/httpGet/port").unwrap(), 9000);
+        // The Secret projection is read-only and MinIO creates `CAs/` under the
+        // certs dir, so the init container must copy BOTH fixed-name files into
+        // the emptyDir the server actually reads.
+        let init = v
+            .pointer("/spec/template/spec/initContainers/0")
+            .expect("copy-certs init container");
+        assert_eq!(init.pointer("/image").unwrap(), consts::MINIO_IMAGE);
+        let copy = init
+            .pointer("/command/2")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        assert!(
+            copy.contains(consts::KEY_MINIO_TLS_PUBLIC)
+                && copy.contains(consts::KEY_MINIO_TLS_PRIVATE)
+                && copy.contains("/certs/"),
+            "init container must copy public.crt + private.key into /certs, got: {copy}"
+        );
+        // MinIO's REQUIRED file names come from the Secret's key names verbatim.
+        assert_eq!(consts::KEY_MINIO_TLS_PUBLIC, "public.crt");
+        assert_eq!(consts::KEY_MINIO_TLS_PRIVATE, "private.key");
+        let secret_vol = v
+            .pointer("/spec/template/spec/volumes/0")
+            .expect("certs-src volume");
+        assert_eq!(
+            secret_vol.pointer("/secret/secretName").unwrap(),
+            consts::SECRET_MINIO_TLS_CERTS
+        );
+    }
+
+    #[test]
+    fn minio_tls_service_targets_9000() {
+        let s = minio_tls_service(consts::OPERATOR_NS);
+        let v = val(&s);
+        assert_eq!(v.pointer("/spec/ports/0/port").unwrap(), 9000);
+        assert_eq!(v.pointer("/spec/selector/app").unwrap(), "minio-tls");
+    }
+
+    #[test]
+    fn mc_tls_bucket_pod_dials_https_and_creates_the_tls_bucket() {
+        let p = mc_tls_bucket_pod(consts::OPERATOR_NS, "mc-mkbucket-tls");
+        let v = val(&p);
+        assert_eq!(v.pointer("/spec/restartPolicy").unwrap(), "Never");
+        let script = v
+            .pointer("/spec/containers/0/command/2")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        // HTTPS against the TLS instance, with --insecure (the throwaway CA is
+        // not in mc's trust store — trusting it is the MOVER's job in the test).
+        assert!(
+            script.contains(&format!("https://{}", consts::MINIO_TLS_ENDPOINT)),
+            "mc must dial the TLS endpoint over https, got: {script}"
+        );
+        assert!(script.contains("--insecure"));
+        assert!(script.contains(&format!(
+            "mc mb --insecure --ignore-existing localtls/{}",
+            consts::MINIO_TLS_BUCKET
+        )));
     }
 
     #[test]

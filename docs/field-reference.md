@@ -246,8 +246,8 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). |
-| `key` | string | — | Which key inside the `ConfigMap` to read. |
+| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the referrer's namespace for a namespaced `Repository`, and in the operator's namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no namespace of its own). |
+| `key` | string | — | Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset. |
 
 ##### `spec.backend.sftp` { #repository-spec-backend-sftp }
 
@@ -960,8 +960,8 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). |
-| `key` | string | — | Which key inside the `ConfigMap` to read. |
+| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the referrer's namespace for a namespaced `Repository`, and in the operator's namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no namespace of its own). |
+| `key` | string | — | Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset. |
 
 ##### `spec.backend.sftp` { #clusterrepository-spec-backend-sftp }
 
@@ -2845,8 +2845,8 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). |
-| `key` | string | — | Which key inside the `ConfigMap` to read. |
+| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the referrer's namespace for a namespaced `Repository`, and in the operator's namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no namespace of its own). |
+| `key` | string | — | Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset. |
 
 ##### `spec.destination.sftp` { #repositoryreplication-spec-destination-sftp }
 

@@ -41,12 +41,15 @@ rules:
     resources:
       - jobs
     verbs: [create, get, list, delete]
-  # `session end` best-effort-deletes a LEGACY session's work-spec ConfigMap
-  # (CLI versions that mounted the spec; today the spec rides the Job env).
+  # `get`: resolve a repository's `tls.caBundleRef` CA-bundle ConfigMap (the
+  # PEM is inlined into the session's work spec so the connect trusts a
+  # private-CA S3 endpoint). `delete`: `session end` best-effort-deletes a
+  # LEGACY session's work-spec ConfigMap (CLI versions that mounted the spec;
+  # today the spec rides the Job env).
   - apiGroups: [""]
     resources:
       - configmaps
-    verbs: [delete]
+    verbs: [get, delete]
   # Wait for the session pod to become Ready; surface its logs on failure.
   - apiGroups: [""]
     resources:

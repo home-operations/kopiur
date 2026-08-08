@@ -1429,6 +1429,16 @@ pub enum RepositoryConnect {
         /// Skip TLS certificate verification (`--disable-tls-verification`).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         disable_tls_verification: bool,
+        /// PEM CA bundle content (not a reference) used to verify the
+        /// endpoint's certificate. The controller resolves the CRD's
+        /// `tls.caBundleRef` ConfigMap at Job-build time and inlines the PEM
+        /// here, so the mover needs no ConfigMap access, no extra mounts, and
+        /// no per-namespace bundle copies — a CA certificate is public key
+        /// material, safe on the wire. Reaches kopia as
+        /// `--root-ca-pem-base64` (see `ConnectSpec::S3::root_ca_pem`).
+        /// Omitted when absent, so work specs written before this field parse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_bundle_pem: Option<String>,
         /// Authenticate via the ambient AWS credential chain (workload identity:
         /// IRSA / EKS Pod Identity) instead of static keys from the env. Defaults
         /// to `false` and is omitted from the wire when false, so work-spec
@@ -1542,6 +1552,7 @@ impl RepositoryConnect {
                 region,
                 disable_tls,
                 disable_tls_verification,
+                ca_bundle_pem,
                 ambient_credentials,
             } => ConnectSpec::S3 {
                 bucket: bucket.clone(),
@@ -1550,6 +1561,7 @@ impl RepositoryConnect {
                 region: region.clone(),
                 disable_tls: *disable_tls,
                 disable_tls_verification: *disable_tls_verification,
+                root_ca_pem: ca_bundle_pem.clone(),
                 ambient_credentials: *ambient_credentials,
             },
             RepositoryConnect::Azure {

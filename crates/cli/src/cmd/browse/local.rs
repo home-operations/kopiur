@@ -161,7 +161,12 @@ impl LocalSession {
 
         // SFTP/GCS/rclone file credentials: the exact mover materialization,
         // fed from the Secret map instead of the process env.
-        let mut connect = backend_to_repository_connect(&target.repo.backend).to_connect_spec();
+        // The resolved `tls.caBundleRef` PEM rides the connect spec as a kopia
+        // flag (`--root-ca-pem-base64`), so a private-CA S3 endpoint verifies
+        // on this machine too — no OS trust-store edits, any platform.
+        let mut connect =
+            backend_to_repository_connect(&target.repo.backend, target.ca_bundle_pem.clone())
+                .to_connect_spec();
         kopiur_mover::credentials::materialize_with(&mut connect, &workdir.join("creds"), &|key| {
             env.get(key).cloned()
         })

@@ -12,7 +12,7 @@
 //! install — is owned by the mise `e2e-*` tasks, NOT this module.
 
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use tokio::sync::OnceCell;
@@ -30,6 +30,14 @@ pub enum Need {
     /// A running MinIO (Deployment+Service) with the S3 buckets created and the
     /// good/bad S3 credential Secrets, in the operator namespace.
     Minio,
+    /// A SECOND MinIO (`minio-tls`) serving **HTTPS** with a leaf cert minted at
+    /// test runtime from a throwaway private CA (rcgen): the serving Secret
+    /// (`minio-tls-certs`), the CA ConfigMap (`minio-ca`, key `ca.crt`) in the
+    /// operator namespace (where the scenario's Repository CR lives — the
+    /// controller resolves `tls.caBundleRef` from the repository's namespace),
+    /// and its own bucket created over HTTPS. Implies [`Need::Minio`] for the
+    /// shared `kopia-s3-creds` Secret (root user/password are identical).
+    MinioTls,
     /// The workload namespace with its own source PV/PVC and S3 credentials
     /// (implies [`Need::Minio`], since those creds target MinIO).
     WorkloadNs,
@@ -68,6 +76,7 @@ pub struct World {
     client: Client,
     fs: OnceCell<()>,
     minio: OnceCell<()>,
+    minio_tls: OnceCell<()>,
     workload_ns: OnceCell<()>,
     projection_ns: OnceCell<()>,
     sftp: OnceCell<()>,
@@ -90,6 +99,7 @@ impl World {
             client,
             fs: OnceCell::new(),
             minio: OnceCell::new(),
+            minio_tls: OnceCell::new(),
             workload_ns: OnceCell::new(),
             projection_ns: OnceCell::new(),
             sftp: OnceCell::new(),
@@ -129,6 +139,11 @@ impl World {
                 }
                 Need::Minio => {
                     self.minio.get_or_try_init(|| self.ensure_minio()).await?;
+                }
+                Need::MinioTls => {
+                    self.minio_tls
+                        .get_or_try_init(|| self.ensure_minio_tls())
+                        .await?;
                 }
                 Need::WorkloadNs => {
                     self.workload_ns
@@ -264,6 +279,95 @@ impl World {
         wait::pod_succeeded(&self.client, consts::OPERATOR_NS, POD).await?;
         // Best-effort cleanup; the buckets persist on MinIO.
         let _ = api.delete(POD, &DeleteParams::default()).await;
+        Ok(())
+    }
+
+    /// Stand up the **TLS** MinIO (`minio-tls`) behind a runtime-minted private
+    /// CA, seed its serving Secret + the `minio-ca` ConfigMap, and create its
+    /// bucket over HTTPS. This is the fixture for the `tls.caBundleRef`
+    /// regression e2e (PR #364): a mover can only complete the bootstrap TLS
+    /// handshake if the controller inlines the ConfigMap's CA PEM into the work
+    /// spec (kopia `--root-ca-pem-base64`).
+    ///
+    /// Idempotency across test binaries: the running server reads its certs
+    /// once at pod start, so if BOTH the serving Secret and the CA ConfigMap
+    /// already exist (a reused cluster / an earlier binary), the existing
+    /// material is kept — re-minting would desync the published CA from the
+    /// cert the live server is presenting.
+    async fn ensure_minio_tls(&self) -> Result<()> {
+        // Implies Minio: the scenario's Repository reads the shared
+        // `kopia-s3-creds` Secret that `ensure_minio` seeds (the TLS instance
+        // runs the same root user/password).
+        self.minio.get_or_try_init(|| self.ensure_minio()).await?;
+
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), consts::OPERATOR_NS);
+        let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), consts::OPERATOR_NS);
+        let have_material = secrets
+            .get_opt(consts::SECRET_MINIO_TLS_CERTS)
+            .await
+            .context("query existing minio-tls serving Secret")?
+            .is_some()
+            && cms
+                .get_opt(consts::CM_MINIO_CA)
+                .await
+                .context("query existing minio-ca ConfigMap")?
+                .is_some();
+        if !have_material {
+            let certs =
+                builders::mint_minio_tls_certs().context("mint the MinIO private CA + leaf")?;
+            let fixtures: Vec<Fixture> = vec![
+                builders::opaque_secret(
+                    consts::OPERATOR_NS,
+                    consts::SECRET_MINIO_TLS_CERTS,
+                    &[
+                        (consts::KEY_MINIO_TLS_PUBLIC, &certs.cert_pem),
+                        (consts::KEY_MINIO_TLS_PRIVATE, &certs.key_pem),
+                    ],
+                )
+                .into(),
+                builders::config_map(
+                    consts::OPERATOR_NS,
+                    consts::CM_MINIO_CA,
+                    &[(consts::KEY_MINIO_CA, &certs.ca_pem)],
+                )
+                .into(),
+            ];
+            apply_all(&self.client, &fixtures).await?;
+        }
+
+        let fixtures: Vec<Fixture> = vec![
+            builders::minio_tls_deployment(consts::OPERATOR_NS).into(),
+            builders::minio_tls_service(consts::OPERATOR_NS).into(),
+        ];
+        apply_all(&self.client, &fixtures).await?;
+        wait::deployment_ready(&self.client, consts::OPERATOR_NS, "minio-tls").await?;
+
+        // Its bucket lives on THIS instance's storage, so the shared
+        // `ensure_buckets` pod (plain HTTP against `minio`) cannot create it.
+        const POD: &str = "mc-mkbucket-tls";
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), consts::OPERATOR_NS);
+        let _ = pods.delete(POD, &DeleteParams::default()).await;
+        crate::wait_until(
+            "leftover mc-mkbucket-tls cleared",
+            default_timeout(),
+            poll_interval(),
+            || async {
+                match pods.get_opt(POD).await? {
+                    Some(_) => Ok(None),
+                    None => Ok(Some(())),
+                }
+            },
+        )
+        .await?;
+        pods.create(
+            &PostParams::default(),
+            &builders::mc_tls_bucket_pod(consts::OPERATOR_NS, POD),
+        )
+        .await
+        .context("create mc-mkbucket-tls pod")?;
+        wait::pod_succeeded(&self.client, consts::OPERATOR_NS, POD).await?;
+        // Best-effort cleanup; the bucket persists on the TLS MinIO.
+        let _ = pods.delete(POD, &DeleteParams::default()).await;
         Ok(())
     }
 

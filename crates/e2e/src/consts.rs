@@ -346,6 +346,34 @@ pub const BUCKETS: &[&str] = &[
 /// [`BUCKETS`]); `mc anonymous set public` is applied to exactly this bucket.
 pub const WI_BUCKET: &str = "kopiur-wi";
 
+// --- TLS MinIO (private-CA `tls.caBundleRef` e2e, PR #364) ----------------------
+// A SECOND MinIO instance serving HTTPS with a leaf cert minted at test runtime
+// from a throwaway private CA (rcgen). A Repository pointing here can only
+// bootstrap if the controller resolves `backend.s3.tls.caBundleRef`, inlines the
+// CA PEM into the mover work spec, and kopia gets `--root-ca-pem-base64` — the
+// regression guard for the accepted-but-ignored field. Its bucket is created by
+// a dedicated `mc` pod ([`crate::builders::mc_tls_bucket_pod`]), NOT by
+// [`BUCKETS`]: that list targets the PLAIN `minio` instance's storage.
+/// In-cluster HTTPS S3 endpoint of the TLS MinIO (bare host:port — the S3
+/// `endpoint` field takes no scheme). Must match a DNS SAN of the leaf cert.
+pub const MINIO_TLS_ENDPOINT: &str = "minio-tls.kopiur-e2e.svc.cluster.local:9000";
+/// Secret holding the TLS MinIO's serving material. The key names are MinIO's
+/// REQUIRED `--certs-dir` file names, verbatim.
+pub const SECRET_MINIO_TLS_CERTS: &str = "minio-tls-certs";
+/// Leaf certificate key inside [`SECRET_MINIO_TLS_CERTS`] (MinIO's fixed name).
+pub const KEY_MINIO_TLS_PUBLIC: &str = "public.crt";
+/// Leaf private-key key inside [`SECRET_MINIO_TLS_CERTS`] (MinIO's fixed name).
+pub const KEY_MINIO_TLS_PRIVATE: &str = "private.key";
+/// ConfigMap carrying the private CA PEM. Lives in the namespace of the
+/// scenario's `Repository` CR ([`OPERATOR_NS`]) — the controller resolves a
+/// namespaced Repository's `caBundleRef` from the repository's OWN namespace.
+pub const CM_MINIO_CA: &str = "minio-ca";
+/// The CA-PEM key inside [`CM_MINIO_CA`]. Matches the controller's default for
+/// an omitted `caBundleRef.key` — the scenario omits `key` to exercise it.
+pub const KEY_MINIO_CA: &str = "ca.crt";
+/// Bucket on the TLS MinIO instance for the private-CA lifecycle scenario.
+pub const MINIO_TLS_BUCKET: &str = "kopiur-tls-ca";
+
 /// Bucket for the `Repository` arm of the #273 bootstrap-Job churn guard.
 pub const BUCKET_PROBE_CHURN_REPO: &str = "kopiur-probe-churn-repo";
 /// Bucket for the `ClusterRepository` arm of the #273 bootstrap-Job churn guard.

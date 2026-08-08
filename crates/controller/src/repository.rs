@@ -595,6 +595,8 @@ async fn reconcile_repository_server(
         owner,
         extra_labels: Default::default(),
         creds_src_namespace: namespace.to_string(),
+        repo_namespace: Some(namespace.to_string()),
+        operator_namespace: ctx.operator_namespace.clone(),
         is_cluster: false,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
@@ -1060,6 +1062,15 @@ async fn bootstrap_via_mover(
         name,
         Some(namespace),
     );
+    // A namespaced Repository's `tls.caBundleRef` ConfigMap lives in the
+    // repository's own namespace (see `io::resolve_backend_ca`).
+    let ca_bundle_pem = io::resolve_backend_ca(
+        &ctx.client,
+        backend,
+        Some(namespace),
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     let work_spec = bootstrap_work_spec(
         backend,
         name,
@@ -1074,6 +1085,7 @@ async fn bootstrap_via_mover(
         maintenance_enabled,
         foreign_maintenance,
         repo.spec.parameters.as_ref(),
+        ca_bundle_pem,
     );
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
@@ -1330,6 +1342,9 @@ fn bootstrap_work_spec(
     maintenance_enabled: bool,
     foreign_maintenance: bool,
     parameters: Option<&kopiur_api::repository::RepositoryParameters>,
+    // Resolved by the async caller (`io::resolve_backend_ca`) so this builder
+    // stays pure; the backend's `tls.caBundleRef` PEM content, if declared.
+    ca_bundle_pem: Option<String>,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
@@ -1373,7 +1388,7 @@ fn bootstrap_work_spec(
             hostname: namespace.to_string(),
             source_path: String::new(),
         },
-        repository: backend_to_repository_connect(backend),
+        repository: backend_to_repository_connect(backend, ca_bundle_pem),
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
             kind: "Repository".to_string(),
@@ -2258,7 +2273,7 @@ mod tests {
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
                 &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
-                false, None,
+                false, None, None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -2304,6 +2319,7 @@ mod tests {
                 read_only,
                 enabled,
                 foreign_m,
+                None,
                 None,
             );
             match spec.operation {

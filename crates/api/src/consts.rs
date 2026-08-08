@@ -316,6 +316,18 @@ pub const MISSING_CREDENTIALS_REASON: &str = "MissingCredentialsSecret";
 /// backend's `auth.workloadIdentity` names (the user creates it; kopiur never
 /// does — its cloud annotations are the user's federation contract).
 pub const MISSING_SERVICE_ACCOUNT_REASON: &str = "MissingServiceAccount";
+/// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False` when
+/// the missing dependency is the backend's `tls.caBundleRef` **ConfigMap** (or
+/// its key): the PEM CA bundle the mover needs to verify a private-CA S3
+/// endpoint. The user creates it; a ConfigMap that never appears never
+/// self-heals, so this is a structural gate
+/// ([`crate::gates::MISSING_CA_BUNDLE_GATE`]), not just a transient retry.
+pub const MISSING_CA_BUNDLE_REASON: &str = "MissingCaBundle";
+/// Default key within a `tls.caBundleRef` ConfigMap when `key` is unset — the
+/// conventional filename cert-manager and trust-manager emit CA bundles under.
+/// Lives here (not in the controller) because the kubectl-plugin resolves the
+/// same reference client-side and must agree on the default (centralize-config).
+pub const DEFAULT_CA_BUNDLE_KEY: &str = "ca.crt";
 
 /// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
 /// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)

@@ -317,6 +317,60 @@ fn stuck_finalizer_hint_names_the_escape_hatch_and_keeps_the_original_message() 
 }
 
 #[test]
+fn deletion_blockers_carry_the_stuck_finalizer_hint_including_a_missing_ca_bundle() {
+    use crate::error::Error;
+    // Regression: deleting the `tls.caBundleRef` ConfigMap during namespace
+    // teardown used to surface as a bare `missing CA bundle` error while the
+    // finalizer silently held the Snapshot terminating forever. The deletion
+    // path must enrich it with the escape hatch exactly like the deleted
+    // credential Secret (#255) — variant (and retry class) preserved.
+    let ca = super::hint_deletion_blocker(
+        Error::MissingCaBundle("tls.caBundleRef ConfigMap team-a/private-ca not found".into()),
+        "team-a",
+        "nightly-1",
+    );
+    match &ca {
+        Error::MissingCaBundle(msg) => {
+            assert!(
+                msg.starts_with("tls.caBundleRef ConfigMap team-a/private-ca"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
+                "{msg}"
+            );
+            assert!(msg.contains("team-a/nightly-1"), "{msg}");
+        }
+        other => panic!("variant must be preserved, got {other:?}"),
+    }
+    assert_eq!(ca.class(), crate::error::ErrorClass::Transient);
+
+    // The original #255 shape still maps.
+    let dep = super::hint_deletion_blocker(
+        Error::MissingDependency("credentials Secret `repo-pw` missing".into()),
+        "team-a",
+        "nightly-1",
+    );
+    match &dep {
+        Error::MissingDependency(msg) => {
+            assert!(
+                msg.contains(crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION),
+                "{msg}"
+            );
+        }
+        other => panic!("variant must be preserved, got {other:?}"),
+    }
+
+    // Anything else passes through untouched — the hint is only for the two
+    // deletable-dependency shapes.
+    let other = super::hint_deletion_blocker(Error::Validation("bad".into()), "team-a", "n");
+    match other {
+        Error::Validation(msg) => assert_eq!(msg, "bad"),
+        other => panic!("must pass through, got {other:?}"),
+    }
+}
+
+#[test]
 fn projection_to_pin_records_an_absent_opt_in_as_an_explicit_off() {
     // `None` on the pin means "this Snapshot predates the pin", which the delete path
     // resolves by falling back to the live recipe. A recipe that simply never opted in
@@ -458,6 +512,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         deletion_protection: None,
         mass_deletion_ack: None,
         catalog: None,
+        ca_bundle_pem: None,
     }
 }
 

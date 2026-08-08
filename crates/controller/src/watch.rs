@@ -214,6 +214,27 @@ pub fn configmap_to_repositories(
     })
 }
 
+/// RepositoryReplications whose *destination* backend references the changed
+/// TLS-CA `configmap`. The destination is an INLINE `Backend` on the namespaced
+/// CR (no Repository object behind it), so its `caBundleRef` resolves in the
+/// RepositoryReplication's OWN namespace — the ConfigMap must live there to
+/// match. A change to the *source* repository's CA instead re-reconciles the
+/// source `Repository`/`ClusterRepository`, which re-triggers this replication
+/// via the source-ref watch ([`repository_to_replications`]) — the same split
+/// as [`secret_to_replications`].
+pub fn configmap_to_replications(
+    store: &Store<RepositoryReplication>,
+    configmap: &PartialObjectMeta<ConfigMap>,
+) -> Vec<ObjectRef<RepositoryReplication>> {
+    let (Some(cm_ns), cm_name) = (configmap.namespace(), configmap.name_any()) else {
+        return Vec::new();
+    };
+    select(store, |repl: &RepositoryReplication| {
+        io::backend_tls_ca_configmap(&repl.spec.destination) == Some(cm_name.as_str())
+            && repl.namespace().as_deref() == Some(cm_ns.as_str())
+    })
+}
+
 /// ClusterRepositories that reference the changed TLS-CA `configmap`. A cluster
 /// repo's `caBundleRef` has no namespace, so this matches by ConfigMap *name* only
 /// (an over-trigger at worst re-runs an idempotent reconcile).
@@ -1001,5 +1022,90 @@ mod tests {
             "kopia-system",
             "kopia-creds"
         ));
+    }
+
+    // --- destination TLS-CA ConfigMap -> RepositoryReplication ---------------
+
+    fn repl_with_dest_ca(
+        name: &str,
+        ns: &str,
+        ca_configmap: Option<&str>,
+    ) -> RepositoryReplication {
+        use kopiur_api::common::{ConfigMapKeyRef, CronSpec, TlsConfig};
+        use kopiur_api::repository_replication::RepositoryReplicationSpec;
+        let mut r = RepositoryReplication::new(
+            name,
+            RepositoryReplicationSpec {
+                source_ref: rref(RepositoryKind::Repository, "nas", None),
+                destination: Backend::S3(S3Backend {
+                    bucket: "mirror".into(),
+                    prefix: None,
+                    endpoint: Some("https://minio.internal".into()),
+                    region: None,
+                    auth: None,
+                    tls: ca_configmap.map(|cm| TlsConfig {
+                        ca_bundle_ref: Some(ConfigMapKeyRef {
+                            config_map_name: Some(cm.into()),
+                            key: None,
+                        }),
+                        insecure_skip_verify: false,
+                        disable_tls: false,
+                    }),
+                }),
+                schedule: CronSpec {
+                    cron: "0 3 * * *".into(),
+                    jitter: None,
+                    timezone: None,
+                },
+                mover: None,
+                suspend: false,
+                sync: None,
+            },
+        );
+        r.metadata.namespace = Some(ns.into());
+        r
+    }
+
+    fn cm_meta(name: &str, ns: &str) -> PartialObjectMeta<ConfigMap> {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": name, "namespace": ns },
+        }))
+        .expect("configmap meta fixture")
+    }
+
+    #[test]
+    fn configmap_mapper_targets_replications_by_destination_name_and_own_namespace() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<RepositoryReplication>();
+        for repl in [
+            // Destination references `internal-ca` in its own namespace `backups`.
+            repl_with_dest_ca("offsite", "backups", Some("internal-ca")),
+            // Same ConfigMap name, DIFFERENT namespace — must not map: the
+            // destination bundle resolves in the CR's own namespace.
+            repl_with_dest_ca("other-ns", "media", Some("internal-ca")),
+            // No caBundleRef at all — never maps.
+            repl_with_dest_ca("plain", "backups", None),
+        ] {
+            writer.apply_watcher_event(&Event::Apply(repl));
+        }
+
+        // The changed ConfigMap in `backups` maps exactly the one replication
+        // whose destination names it from that namespace.
+        let hits = configmap_to_replications(&reader, &cm_meta("internal-ca", "backups"));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "offsite");
+        assert_eq!(hits[0].namespace.as_deref(), Some("backups"));
+
+        // The same name in an unreferenced namespace maps nothing.
+        assert!(
+            configmap_to_replications(&reader, &cm_meta("internal-ca", "elsewhere")).is_empty()
+        );
+        // An unrelated ConfigMap maps nothing.
+        assert!(
+            configmap_to_replications(&reader, &cm_meta("some-other-cm", "backups")).is_empty()
+        );
     }
 }

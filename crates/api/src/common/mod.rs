@@ -219,14 +219,21 @@ pub struct SecretRef {
     pub namespace: Option<String>,
 }
 
-/// Reference to a key within a `ConfigMap` (e.g. a CA bundle).
+/// Reference to a key within a `ConfigMap` (e.g. a CA bundle). The ref carries no
+/// `namespace` field: it always resolves in the referrer's namespace for a namespaced
+/// `Repository`. A `ClusterRepository` is cluster-scoped and has no namespace of its own,
+/// so for it the ref resolves in the operator's namespace (`KOPIUR_NAMESPACE`) — put the
+/// `ConfigMap` there.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapKeyRef {
-    /// Name of the `ConfigMap` holding the value (e.g. a CA bundle).
+    /// Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the
+    /// referrer's namespace for a namespaced `Repository`, and in the operator's
+    /// namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no
+    /// namespace of its own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_map_name: Option<String>,
-    /// Which key inside the `ConfigMap` to read.
+    /// Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }

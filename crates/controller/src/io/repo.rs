@@ -19,6 +19,17 @@ use crate::error::{Error, Result};
 /// Default key within the encryption password Secret when unset.
 pub const DEFAULT_PASSWORD_KEY: &str = "KOPIA_PASSWORD";
 
+/// Default key within a `tls.caBundleRef` ConfigMap when unset — re-exported
+/// from [`kopiur_api::consts`] (shared with the kubectl-plugin's client-side
+/// resolver, which must agree on the default).
+pub use kopiur_api::consts::DEFAULT_CA_BUNDLE_KEY;
+
+/// Upper bound on a resolved CA bundle. The whole work spec must fit in a Job
+/// env var ([`kopiur_mover::jobs`] caps it at 100 KiB against `MAX_ARG_STRLEN`),
+/// so an oversized bundle is rejected HERE with a message naming the ConfigMap,
+/// not later as an opaque work-spec-too-large build failure.
+pub const MAX_CA_BUNDLE_BYTES: usize = 64 * 1024;
+
 /// Resolve the mover work-spec throttle from a repository's `moverDefaults.throttle`
 /// (ADR-0005 §13(e)). Thin wrapper over the single tested mapping so the field is
 /// never inert; an absent throttle yields an empty spec (the mover skips the call).
@@ -112,6 +123,13 @@ pub struct ResolvedRepository {
     /// adoption falls through to the policy's own `spec.adoption` (else the
     /// default).
     pub catalog: Option<CatalogBounds>,
+    /// The RESOLVED content of the backend's `tls.caBundleRef` ConfigMap (a PEM
+    /// CA bundle), read live at resolution time by [`resolve_backend_ca`];
+    /// `None` when the backend declares none. Resolved HERE — not at each
+    /// work-spec build site — so no mover-spawning path can forget it: the
+    /// projection ([`kopiur_mover::repo_meta::backend_to_repository_connect`])
+    /// requires the value as a parameter, and this field is the single source.
+    pub ca_bundle_pem: Option<String>,
 }
 
 /// Which API a [`RepositoryRef`] resolves against, derived purely from `kind`.
@@ -185,10 +203,15 @@ pub fn repo_lookup(repo_ref: &RepositoryRef, default_ns: &str) -> RepoLookup {
 ///   via `ref.namespace` (defaulting to `default_ns`, usually the consumer's
 ///   namespace).
 /// - [`RepositoryKind::ClusterRepository`]: cluster-scoped lookup (`Api::all`).
+///
+/// `operator_ns` is the operator's own namespace (`ctx.operator_namespace`),
+/// used only to resolve a `ClusterRepository`'s `tls.caBundleRef` ConfigMap
+/// (see [`resolve_backend_ca`] for the namespace rule).
 pub async fn resolve_repository_ref(
     client: &kube::Client,
     repo_ref: &RepositoryRef,
     default_ns: &str,
+    operator_ns: Option<&str>,
 ) -> Result<ResolvedRepository> {
     match repo_lookup(repo_ref, default_ns) {
         RepoLookup::Namespaced { namespace, name } => {
@@ -198,6 +221,9 @@ pub async fn resolve_repository_ref(
             })?;
             let owner_ref = super::owner_ref_for(&repo, "Repository")?;
             let mass_deletion_ack = mass_deletion_ack(&repo);
+            let ca_bundle_pem =
+                resolve_backend_ca(client, &repo.spec.backend, Some(&namespace), operator_ns)
+                    .await?;
             Ok(ResolvedRepository {
                 repo_namespace: Some(namespace),
                 backend: repo.spec.backend,
@@ -215,6 +241,7 @@ pub async fn resolve_repository_ref(
                 deletion_protection: repo.spec.deletion_protection,
                 mass_deletion_ack,
                 catalog: repo.spec.catalog,
+                ca_bundle_pem,
             })
         }
         RepoLookup::Cluster { name } => {
@@ -225,6 +252,8 @@ pub async fn resolve_repository_ref(
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
             let owner_ref = super::owner_ref_for(&repo, "ClusterRepository")?;
             let mass_deletion_ack = mass_deletion_ack(&repo);
+            let ca_bundle_pem =
+                resolve_backend_ca(client, &repo.spec.backend, None, operator_ns).await?;
             Ok(ResolvedRepository {
                 repo_namespace: None,
                 backend: repo.spec.backend,
@@ -243,9 +272,113 @@ pub async fn resolve_repository_ref(
                 deletion_protection: repo.spec.deletion_protection,
                 mass_deletion_ack,
                 catalog: repo.spec.catalog,
+                ca_bundle_pem,
             })
         }
     }
+}
+
+/// Resolve the PEM content of a backend's `tls.caBundleRef` ConfigMap, or
+/// `Ok(None)` when the backend declares none.
+///
+/// **Namespace rule** (mirrors the `SecretKeyRef` convention documented on
+/// [`kopiur_api::common::SecretKeyRef`]): `ConfigMapKeyRef` carries no
+/// namespace, so a namespaced `Repository`'s bundle lives in the repository's
+/// own namespace (`referrer_ns`), and a `ClusterRepository`'s in the operator's
+/// namespace (`operator_ns`, from `KOPIUR_NAMESPACE`). The content — never a
+/// reference — is inlined into the mover work spec, so the bundle does NOT need
+/// to exist in every namespace movers run in.
+///
+/// Every failure is typed and actionable (what failed / why / how to fix), and
+/// fails the reconcile BEFORE a Job is stamped — the alternative (a ConfigMap
+/// volume with `optional: false`) leaves the pod wedged in
+/// `ContainerCreating` with no condition and no event.
+pub async fn resolve_backend_ca(
+    client: &kube::Client,
+    backend: &Backend,
+    referrer_ns: Option<&str>,
+    operator_ns: Option<&str>,
+) -> Result<Option<String>> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    let Some(key_ref) = kopiur_mover::repo_meta::backend_tls_ca_keyref(backend) else {
+        return Ok(None);
+    };
+    // An empty `caBundleRef: {}` is webhook-rejected (`validate_backend`), but
+    // this runs defensively on possibly-pre-webhook objects: surface it, don't
+    // silently skip TLS trust the user asked for.
+    let Some(cm_name) = key_ref.config_map_name.as_deref() else {
+        return Err(Error::Validation(
+            "tls.caBundleRef is set but names no ConfigMap: set \
+             tls.caBundleRef.configMapName to the ConfigMap holding the PEM CA \
+             bundle, or remove the caBundleRef block"
+                .to_string(),
+        ));
+    };
+    let ns = match referrer_ns.or(operator_ns) {
+        Some(ns) => ns.to_string(),
+        None => {
+            return Err(Error::Invariant(format!(
+                "cannot resolve tls.caBundleRef ConfigMap {cm_name:?}: a \
+                 ClusterRepository's CA bundle lives in the operator's namespace, \
+                 but KOPIUR_NAMESPACE is unset (running out-of-cluster?) — set \
+                 KOPIUR_NAMESPACE or move the repository to a namespaced Repository"
+            )));
+        }
+    };
+    let key = key_ref.key.as_deref().unwrap_or(DEFAULT_CA_BUNDLE_KEY);
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns);
+    let cm = api.get_opt(cm_name).await?.ok_or_else(|| {
+        Error::MissingCaBundle(format!(
+            "tls.caBundleRef ConfigMap {ns}/{cm_name} not found: create it with the \
+             PEM CA bundle under key {key:?} (for a ClusterRepository it must live \
+             in the operator's namespace; for a Repository, in the repository's)"
+        ))
+    })?;
+    // ConfigMaps carry text under `data` and bytes under `binaryData`; a PEM
+    // bundle is text, but accept both so `kubectl create configmap --from-file`
+    // works however the file was attached.
+    let content = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get(key))
+        .cloned()
+        .or_else(|| {
+            cm.binary_data
+                .as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(|b| String::from_utf8(b.0.clone()).ok())
+        });
+    let Some(pem) = content else {
+        let available: Vec<_> = cm
+            .data
+            .iter()
+            .flat_map(|d| d.keys())
+            .chain(cm.binary_data.iter().flat_map(|d| d.keys()))
+            .cloned()
+            .collect();
+        return Err(Error::MissingCaBundle(format!(
+            "tls.caBundleRef ConfigMap {ns}/{cm_name} has no key {key:?} (found: \
+             {available:?}): add the PEM CA bundle under that key, or set \
+             tls.caBundleRef.key to one of the existing keys"
+        )));
+    };
+    if !pem.contains("BEGIN CERTIFICATE") {
+        return Err(Error::Validation(format!(
+            "tls.caBundleRef ConfigMap {ns}/{cm_name} key {key:?} is not a PEM \
+             certificate bundle (no \"BEGIN CERTIFICATE\" block): store the CA \
+             chain PEM-encoded — kopia passes it to the S3 TLS verifier verbatim"
+        )));
+    }
+    if pem.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(Error::Validation(format!(
+            "tls.caBundleRef ConfigMap {ns}/{cm_name} key {key:?} is {} bytes, \
+             over the {MAX_CA_BUNDLE_BYTES}-byte limit: the bundle rides the mover \
+             work spec (a Job env var), so trim it to the CA chain this endpoint \
+             actually needs",
+            pem.len()
+        )));
+    }
+    Ok(Some(pem))
 }
 
 /// The RAW [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] value from a

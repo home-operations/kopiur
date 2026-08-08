@@ -297,7 +297,14 @@ pub(crate) fn repository_connect_pub(repo: &ResolvedRepository) -> Result<Reposi
 /// until it is wired through to the mover. Credentials never appear here; they
 /// flow to the mover Job as env vars from the referenced Secret (ADR §4.10).
 pub(super) fn repository_connect(repo: &ResolvedRepository) -> Result<RepositoryConnect> {
-    Ok(backend_to_repository_connect(&repo.backend))
+    // `ca_bundle_pem` was resolved once by `io::resolve_repository_ref` — the
+    // single source — so every Snapshot/Restore/pin/snapdel work spec built
+    // through here carries the private-CA trust bundle without a per-site
+    // ConfigMap read.
+    Ok(backend_to_repository_connect(
+        &repo.backend,
+        repo.ca_bundle_pem.clone(),
+    ))
 }
 
 // The pure `Backend -> RepositoryConnect` translation (and its exhaustive

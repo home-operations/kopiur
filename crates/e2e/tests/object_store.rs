@@ -26,7 +26,7 @@ use kube::api::{DeleteParams, ListParams, PostParams};
 use serde::de::DeserializeOwned;
 
 use kopiur_api::{ClusterRepository, Maintenance, Repository, Restore, Snapshot, SnapshotPolicy};
-use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
+use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait_until};
 
 /// Deserialize a CR from a JSON literal into its typed kube object.
 fn cr<T: DeserializeOwned>(v: serde_json::Value) -> T {
@@ -331,6 +331,118 @@ async fn s3_bootstrap_backup_restore_adopt_and_guard() {
         still.get("phase").and_then(|v| v.as_str()),
         Some("Ready"),
         "existing repository must remain Ready after the wrong-password attempt, got {still}"
+    );
+}
+
+/// Regression guard for the whole `tls.caBundleRef` feature (PR #364): the field
+/// was accepted by the CRD schema but silently IGNORED — the controller never
+/// resolved the ConfigMap, the mover never got the CA, and kopia never received
+/// `--root-ca-pem-base64`, so a Repository pointing at an S3 endpoint behind a
+/// private CA could never bootstrap (an unactionable TLS verification failure).
+///
+/// This drives the full pipeline against the TLS MinIO fixture, whose serving
+/// cert chains to a CA minted at test runtime — trusted by NOTHING except the
+/// `minio-ca` ConfigMap the `caBundleRef` names:
+/// 1. Repository over HTTPS (TLS is the default — no `disableTls`, no
+///    `insecureSkipVerify`) with `tls.caBundleRef: { configMapName: minio-ca }`,
+///    `key` omitted to exercise the `ca.crt` default → the bootstrap mover
+///    performs a REAL handshake against the private CA → `Ready`;
+/// 2. a SnapshotPolicy + Snapshot reach `Succeeded` with a real
+///    `kopiaSnapshotID` (the backup mover trusts the CA too).
+///
+/// Without the fix, step 1 times out at `wait_phase(... "Ready")` — kopia can't
+/// verify the endpoint's cert — which is exactly how this test fails on main.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + MinIO + built images + helm install"]
+async fn s3_private_ca_bundle_backup_lifecycle() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::MinioTls, Need::Filesystem])
+        .await
+        .expect("provision the TLS MinIO (CA + bucket) and the source PVC");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // 1. Bootstrap over HTTPS, trusting the private CA ONLY via caBundleRef.
+    //    Note what is NOT here: no `disableTls`, no `insecureSkipVerify`, and no
+    //    `key` on the caBundleRef (the controller must default it to `ca.crt`).
+    //    The endpoint is the bare host:port — schemes are not part of the field.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Repository",
+                "metadata": { "name": "e2e-s3-tlsca", "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "backend": { "s3": {
+                        "bucket": consts::MINIO_TLS_BUCKET,
+                        "endpoint": consts::MINIO_TLS_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "caBundleRef": { "configMapName": consts::CM_MINIO_CA } },
+                        "auth": { "secretRef": { "name": "kopia-s3-creds", "namespace": E2E_NAMESPACE } }
+                    }},
+                    "encryption": {
+                        "passwordSecretRef": { "name": "kopia-s3-creds", "key": "KOPIA_PASSWORD" }
+                    },
+                    "create": { "enabled": true }
+                }
+            })),
+        )
+        .await
+        .expect("create private-CA S3 Repository");
+    wait_phase(&repos, "e2e-s3-tlsca", "Ready").await.expect(
+        "Repository behind a private CA should reach Ready — the bootstrap mover must \
+             receive the caBundleRef CA (kopia --root-ca-pem-base64); a timeout here is the \
+             accepted-but-ignored caBundleRef bug",
+    );
+    let rstatus = status_json(&repos, "e2e-s3-tlsca").await;
+    assert!(
+        rstatus
+            .get("uniqueId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "private-CA Repository must carry a real kopia uniqueId, got {rstatus}"
+    );
+
+    // 2. A real backup rides the same trust path in the backup mover.
+    configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json(
+                "e2e-s3-tlsca-cfg",
+                "e2e-s3-tlsca",
+                "e2e-src",
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(backup_json(
+                "e2e-s3-tlsca-backup",
+                "e2e-s3-tlsca-cfg",
+                "Retain",
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+    wait_phase(&backups, "e2e-s3-tlsca-backup", "Succeeded")
+        .await
+        .expect("Snapshot against the private-CA repository should reach Succeeded");
+    let bstatus = status_json(&backups, "e2e-s3-tlsca-backup").await;
+    assert!(
+        bstatus
+            .get("snapshot")
+            .and_then(|s| s.get("kopiaSnapshotID"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !id.is_empty()),
+        "private-CA Snapshot must carry a real kopia snapshot id, got {bstatus}"
     );
 }
 

@@ -18,6 +18,7 @@ fn s3_backend_args_minimal() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        root_ca_pem: None,
     };
     assert_eq!(spec.backend_args(), vec!["s3", "--bucket", "b"]);
 }
@@ -36,6 +37,7 @@ fn s3_backend_args_ambient_credentials_pass_empty_key_flags() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: true,
+        root_ca_pem: None,
     };
     assert_eq!(
         spec.backend_args(),
@@ -61,6 +63,7 @@ fn s3_backend_args_full() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        root_ca_pem: None,
     };
     assert_eq!(
         spec.backend_args(),
@@ -79,6 +82,56 @@ fn s3_backend_args_full() {
 }
 
 #[test]
+fn s3_backend_args_root_ca_pem_emits_base64_flag_only_when_set() {
+    use base64::Engine as _;
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n";
+    // Set: the PEM rides argv base64-encoded (`--root-ca-pem-base64`) — a CA
+    // certificate is public key material, and kopia persists it into the
+    // connection config so every subsequent verb (including the exec'd
+    // server) inherits the trust without re-passing the flag.
+    let spec = ConnectSpec::S3 {
+        bucket: "b".into(),
+        endpoint: Some("https://minio.internal".into()),
+        prefix: None,
+        region: None,
+        disable_tls: false,
+        disable_tls_verification: false,
+        ambient_credentials: false,
+        root_ca_pem: Some(PEM.into()),
+    };
+    let args = spec.backend_args();
+    let flag_at = args
+        .iter()
+        .position(|a| a == "--root-ca-pem-base64")
+        .expect("--root-ca-pem-base64 must be emitted when the CA is set");
+    assert_eq!(
+        args[flag_at + 1],
+        base64::engine::general_purpose::STANDARD.encode(PEM),
+        "the flag value must be the standard-base64 of the exact PEM"
+    );
+
+    // None: no such flag — TLS verification stays on the system trust store.
+    let plain = ConnectSpec::S3 {
+        bucket: "b".into(),
+        endpoint: Some("https://minio.internal".into()),
+        prefix: None,
+        region: None,
+        disable_tls: false,
+        disable_tls_verification: false,
+        ambient_credentials: false,
+        root_ca_pem: None,
+    };
+    assert!(
+        !plain
+            .backend_args()
+            .iter()
+            .any(|a| a.contains("--root-ca-pem")),
+        "no CA flag may appear when root_ca_pem is None: {:?}",
+        plain.backend_args()
+    );
+}
+
+#[test]
 fn s3_backend_args_disable_tls_flags() {
     // Plain-HTTP endpoint (in-cluster MinIO/RustFS): emit --disable-tls.
     let spec = ConnectSpec::S3 {
@@ -89,6 +142,7 @@ fn s3_backend_args_disable_tls_flags() {
         disable_tls: true,
         disable_tls_verification: true,
         ambient_credentials: false,
+        root_ca_pem: None,
     };
     let args = spec.backend_args();
     assert!(args.contains(&"--disable-tls".to_string()));
@@ -384,6 +438,7 @@ fn kind_str_covers_every_variant() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            root_ca_pem: None,
         },
         ConnectSpec::Azure {
             container: "c".into(),
@@ -693,6 +748,7 @@ fn direct_credential_env_names_per_backend() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        root_ca_pem: None,
     };
     assert_eq!(
         s3.direct_credential_env_names(),
@@ -740,6 +796,7 @@ fn sync_to_args_builds_destination_and_flags() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        root_ca_pem: None,
     };
     assert_eq!(
         sync_to_args(&dest, &SyncToOptions::default()),

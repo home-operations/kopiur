@@ -189,6 +189,24 @@ where
     .await;
 }
 
+/// Emit a `Warning` Event for a missing `tls.caBundleRef` ConfigMap (see
+/// [`publish_warning_event`]). The reason matches
+/// [`kopiur_api::gates::MISSING_CA_BUNDLE_GATE`], the structural gate the
+/// Snapshot/Restore reconcilers write alongside this Event.
+pub async fn publish_missing_ca_bundle_event<K>(ctx: &Context, obj: &K, message: &str)
+where
+    K: Resource<DynamicType = ()>,
+{
+    publish_warning_event(
+        ctx,
+        obj,
+        crate::consts::MISSING_CA_BUNDLE_REASON,
+        CHECK_REFERENCES_ACTION,
+        message,
+    )
+    .await;
+}
+
 /// Kubernetes caps an Event's `note` at 1024 bytes (the apiserver validates with
 /// Go's `len`, i.e. bytes). A longer note is rejected with a 422, so the
 /// *actionable* warning never reaches `kubectl describe`. We clamp every
@@ -349,6 +367,18 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             format!(
                 "{err} — create it, or fix the reference in this object's spec; the reconcile \
                  retries automatically."
+            ),
+        ),
+        // The `tls.caBundleRef` ConfigMap (or its key) is absent. Same retry
+        // semantics as MissingDependency, but its own reason so the Event
+        // matches the structural gate (`MISSING_CA_BUNDLE_GATE`) the Snapshot/
+        // Restore reconcilers write for it.
+        Error::MissingCaBundle(_) => (
+            crate::consts::MISSING_CA_BUNDLE_REASON,
+            CHECK_REFERENCES_ACTION,
+            format!(
+                "{err} — create the ConfigMap (or fix tls.caBundleRef); the reconcile retries \
+                 automatically."
             ),
         ),
         Error::BlockedOnGrant(_) => (

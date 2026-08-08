@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
-    Namespace, PersistentVolume, PersistentVolumeClaim, Secret, Service,
+    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Secret, Service,
 };
 
 use crate::consts;
@@ -66,6 +66,8 @@ pub enum Fixture {
     /// Namespaced.
     Secret(Secret),
     /// Namespaced.
+    ConfigMap(ConfigMap),
+    /// Namespaced.
     Deployment(Deployment),
     /// Namespaced.
     Service(Service),
@@ -80,6 +82,7 @@ impl Fixture {
             Fixture::Pv(o) => apply(&Api::all(client.clone()), o).await,
             Fixture::Pvc(o) => apply(&namespaced(client, o)?, o).await,
             Fixture::Secret(o) => apply(&namespaced(client, o)?, o).await,
+            Fixture::ConfigMap(o) => apply(&namespaced(client, o)?, o).await,
             Fixture::Deployment(o) => apply(&namespaced(client, o)?, o).await,
             Fixture::Service(o) => apply(&namespaced(client, o)?, o).await,
         }
@@ -104,6 +107,11 @@ impl From<PersistentVolumeClaim> for Fixture {
 impl From<Secret> for Fixture {
     fn from(o: Secret) -> Self {
         Fixture::Secret(o)
+    }
+}
+impl From<ConfigMap> for Fixture {
+    fn from(o: ConfigMap) -> Self {
+        Fixture::ConfigMap(o)
     }
 }
 impl From<Deployment> for Fixture {

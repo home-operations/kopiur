@@ -43,6 +43,11 @@ pub struct BrowseTarget {
     pub kopia_snapshot_id: String,
     /// The repository holding the snapshot.
     pub repo: RepoHandle,
+    /// The RESOLVED PEM content of the backend's `tls.caBundleRef` ConfigMap
+    /// (`None` when the backend declares none). Resolved once at target
+    /// resolution ([`resolve_ca_bundle`]) and carried here so both transports'
+    /// work-spec builders stay pure.
+    pub ca_bundle_pem: Option<String>,
 }
 
 /// Extract the kopia snapshot id a Snapshot pins in status, or say exactly why
@@ -182,12 +187,174 @@ pub async fn resolve(ctx: &KubeCtx, snapshot_name: &str) -> Result<BrowseTarget,
         }
     };
 
+    let ca_bundle_pem = resolve_ca_bundle(ctx, &repo).await?;
     Ok(BrowseTarget {
         snapshot: snapshot_name.to_string(),
         namespace: ns,
         kopia_snapshot_id,
         repo,
+        ca_bundle_pem,
     })
+}
+
+use kopiur_api::consts::DEFAULT_CA_BUNDLE_KEY;
+
+/// Resolve the PEM content of the repository backend's `tls.caBundleRef`
+/// ConfigMap, or `Ok(None)` when the backend declares none — the CLI-side twin
+/// of the controller's `resolve_backend_ca`, with the same namespace rule: a
+/// namespaced `Repository`'s bundle lives in the repository's own namespace, a
+/// `ClusterRepository`'s in the operator's. The CLI does not know the
+/// operator's namespace, so it discovers it the same way the mover-image
+/// lookup finds the operator: exactly one controller Deployment cluster-wide
+/// (fail closed on zero or several — see
+/// [`super::session::CONTROLLER_DEPLOYMENT_SELECTOR`]).
+pub async fn resolve_ca_bundle(
+    ctx: &KubeCtx,
+    repo: &RepoHandle,
+) -> Result<Option<String>, CliError> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    let Some(key_ref) = kopiur_mover::repo_meta::backend_tls_ca_keyref(&repo.backend) else {
+        return Ok(None);
+    };
+    let Some(cm_name) = key_ref.config_map_name.as_deref() else {
+        // Webhook-rejected normally; surface it rather than silently skipping
+        // TLS trust the repository asked for.
+        return Err(CliError::CaBundleUnresolvable {
+            repository: repo.name.clone(),
+            detail: "tls.caBundleRef is set but names no ConfigMap".to_string(),
+            fix: "set tls.caBundleRef.configMapName on the repository, or remove the \
+                  caBundleRef block"
+                .to_string(),
+        });
+    };
+    let ns = match &repo.namespace {
+        Some(ns) => ns.clone(),
+        None => operator_namespace_for_ca(ctx, &repo.name, cm_name).await?,
+    };
+    let key = key_ref.key.as_deref().unwrap_or(DEFAULT_CA_BUNDLE_KEY);
+    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
+    let cm = api
+        .get_opt(cm_name)
+        .await
+        .map_err(|e| {
+            classify_kube(
+                "get",
+                "ConfigMap",
+                "configmaps",
+                Some(&ns),
+                Some(cm_name),
+                e,
+            )
+        })?
+        .ok_or_else(|| CliError::CaBundleUnresolvable {
+            repository: repo.name.clone(),
+            detail: format!("ConfigMap {ns}/{cm_name} not found"),
+            fix: format!(
+                "create it with the PEM CA bundle under key {key:?} (a ClusterRepository's \
+                 bundle lives in the operator's namespace; a Repository's in its own)"
+            ),
+        })?;
+    // Text under `data`, bytes under `binaryData` — accept both, like the
+    // controller, so `kubectl create configmap --from-file` works either way.
+    let content = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get(key))
+        .cloned()
+        .or_else(|| {
+            cm.binary_data
+                .as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(|b| String::from_utf8(b.0.clone()).ok())
+        });
+    let Some(pem) = content else {
+        let available: Vec<_> = cm
+            .data
+            .iter()
+            .flat_map(|d| d.keys())
+            .chain(cm.binary_data.iter().flat_map(|d| d.keys()))
+            .cloned()
+            .collect();
+        return Err(CliError::CaBundleUnresolvable {
+            repository: repo.name.clone(),
+            detail: format!("ConfigMap {ns}/{cm_name} has no key {key:?} (found: {available:?})"),
+            fix: "add the PEM CA bundle under that key, or set tls.caBundleRef.key to one \
+                  of the existing keys"
+                .to_string(),
+        });
+    };
+    if !pem.contains("BEGIN CERTIFICATE") {
+        return Err(CliError::CaBundleUnresolvable {
+            repository: repo.name.clone(),
+            detail: format!(
+                "ConfigMap {ns}/{cm_name} key {key:?} is not a PEM certificate bundle \
+                 (no \"BEGIN CERTIFICATE\" block)"
+            ),
+            fix: "store the CA chain PEM-encoded — kopia passes it to the TLS verifier \
+                  verbatim"
+                .to_string(),
+        });
+    }
+    Ok(Some(pem))
+}
+
+/// Discover the operator's namespace (where a `ClusterRepository`'s
+/// `tls.caBundleRef` ConfigMap lives) from the single controller Deployment —
+/// the same exactly-one-cluster-wide convention `resolve_mover_image` uses, so
+/// a spoofed kopiur-labeled Deployment cannot silently redirect the lookup.
+async fn operator_namespace_for_ca(
+    ctx: &KubeCtx,
+    repository: &str,
+    configmap: &str,
+) -> Result<String, CliError> {
+    use k8s_openapi::api::apps::v1::Deployment;
+    let selector = super::session::CONTROLLER_DEPLOYMENT_SELECTOR;
+    let api: Api<Deployment> = Api::all(ctx.client.clone());
+    let list = api
+        .list(&kube::api::ListParams::default().labels(selector))
+        .await
+        .map_err(|e| classify_kube("list", "Deployment", "deployments", None, None, e))?;
+    match list.items.as_slice() {
+        [] => Err(CliError::OperatorNamespaceUnresolvable {
+            repository: repository.to_string(),
+            configmap: configmap.to_string(),
+            why: format!("no Deployment matches {selector} in any namespace"),
+            fix: "is the kopiur operator installed? The CA bundle is read from the \
+                  namespace the controller Deployment runs in"
+                .to_string(),
+        }),
+        [only] => {
+            only.metadata
+                .namespace
+                .clone()
+                .ok_or_else(|| CliError::OperatorNamespaceUnresolvable {
+                    repository: repository.to_string(),
+                    configmap: configmap.to_string(),
+                    why: "the controller Deployment carries no namespace".to_string(),
+                    fix: "check the install; a namespaced Deployment always has one".to_string(),
+                })
+        }
+        many => Err(CliError::OperatorNamespaceUnresolvable {
+            repository: repository.to_string(),
+            configmap: configmap.to_string(),
+            why: format!(
+                "{} Deployments match {selector}: {} — refusing to guess which install's \
+                 namespace to trust",
+                many.len(),
+                many.iter()
+                    .map(|d| format!(
+                        "{}/{}",
+                        d.metadata.namespace.clone().unwrap_or_default(),
+                        d.metadata.name.clone().unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            fix: "remove the impostor/stale Deployment (only one kopiur controller should \
+                  exist), or scope your kubeconfig to the real one"
+                .to_string(),
+        }),
+    }
 }
 
 /// Fetch just the [`RepoHandle`] for an explicitly-named repository (the

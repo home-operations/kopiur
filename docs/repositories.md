@@ -612,6 +612,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `encryption.passwordSecretRef.{name,key}`              | Where the kopia password lives.                   |
 | `create.enabled`                                       | Whether to initialize a new repository.           |
 | `backend.s3.tls.disableTls`                            | Plain-HTTP endpoints (in-cluster MinIO/RustFS).   |
+| `backend.s3.tls.caBundleRef`                           | Trust a private-CA HTTPS endpoint: a ConfigMap key with the CA PEM (`key` defaults to `ca.crt`), resolved in the `Repository`'s namespace — operator's namespace for a `ClusterRepository` — and inlined into every mover. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
 | `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`) and, for a repository shared across clusters, `cluster`. |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |

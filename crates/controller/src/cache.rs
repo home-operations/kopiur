@@ -164,6 +164,7 @@ mod tests {
             deletion_protection: None,
             mass_deletion_ack: None,
             catalog: None,
+            ca_bundle_pem: None,
         }
     }
 

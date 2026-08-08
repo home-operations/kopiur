@@ -94,6 +94,17 @@ pub enum ConnectSpec {
         disable_tls: bool,
         /// Skip TLS certificate verification (`--disable-tls-verification`).
         disable_tls_verification: bool,
+        /// PEM CA bundle used to verify the endpoint's certificate
+        /// (`--root-ca-pem-base64`, base64-encoded on argv — a CA cert is
+        /// public, and the base64 form needs no file the way
+        /// `--root-ca-pem-path` would). kopia persists it into the connection
+        /// config (`s3.Options.RootCA`, `json:"rootCA"`), so one connect covers
+        /// every later verb reading that config — including an exec'd
+        /// `kopia server start`. NOTE: kopia builds a FRESH cert pool from this
+        /// bundle for the S3 connection (it does not extend the system roots),
+        /// so a chain that also needs public roots must include them in the
+        /// bundle.
+        root_ca_pem: Option<String>,
         /// Authenticate via the ambient AWS credential chain (IRSA web-identity,
         /// EKS Pod Identity, IMDS) instead of static keys — the workload-identity
         /// path. kopia 0.23 marks `--access-key`/`--secret-access-key` as
@@ -248,6 +259,7 @@ impl ConnectSpec {
     ///     disable_tls: false,
     ///     disable_tls_verification: false,
     ///     ambient_credentials: false,
+    ///     root_ca_pem: None,
     /// };
     /// assert_eq!(s3.kind_str(), "s3");
     /// ```
@@ -337,6 +349,7 @@ impl ConnectSpec {
                 region,
                 disable_tls,
                 disable_tls_verification,
+                root_ca_pem,
                 ambient_credentials,
             } => {
                 let mut a = vec!["s3".into(), "--bucket".into(), bucket.clone()];
@@ -348,6 +361,11 @@ impl ConnectSpec {
                 }
                 if *disable_tls_verification {
                     a.push("--disable-tls-verification".into());
+                }
+                if let Some(pem) = root_ca_pem {
+                    use base64::Engine as _;
+                    a.push("--root-ca-pem-base64".into());
+                    a.push(base64::engine::general_purpose::STANDARD.encode(pem));
                 }
                 if *ambient_credentials {
                     // Single `=`-joined tokens: an empty value as a separate argv

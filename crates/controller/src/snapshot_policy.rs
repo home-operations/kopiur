@@ -678,7 +678,13 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     //    What keeps an already-snapshotted policy from silently re-identifying is
     //    the fork guard at admission (`IdentityWouldFork`/
     //    `RepositoryIdentityWouldFork`), not this pin.
-    let repo = io::resolve_repository_ref(&ctx.client, &config.spec.repository, &namespace).await?;
+    let repo = io::resolve_repository_ref(
+        &ctx.client,
+        &config.spec.repository,
+        &namespace,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     let resolved = resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
     io::patch_status_if_changed(
         &api,

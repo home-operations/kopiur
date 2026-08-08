@@ -43,17 +43,15 @@ pub fn filesystem_repo_mount_source(backend: &Backend) -> Option<MountSource> {
     }
 }
 
-/// The TLS CA-bundle `ConfigMap` name an object-store backend references, if any
-/// (currently only S3 exposes `tls.caBundleRef`). Exhaustive over [`Backend`]
-/// (ADR §5.5): a new backend that adds TLS must decide its CA source here. Used by
-/// the ConfigMap→repo watch so editing a CA bundle re-triggers a connect.
-pub fn backend_tls_ca_configmap(backend: &Backend) -> Option<&str> {
+/// The TLS CA-bundle `ConfigMap` key reference an object-store backend declares,
+/// if any (currently only S3 exposes `tls.caBundleRef`). Exhaustive over
+/// [`Backend`] (ADR §5.5): a new backend that adds TLS must decide its CA source
+/// here. The controller's `resolve_backend_ca` reads the referenced content at
+/// Job-build time; [`backend_tls_ca_configmap`] projects just the name for the
+/// ConfigMap→repo watch.
+pub fn backend_tls_ca_keyref(backend: &Backend) -> Option<&kopiur_api::common::ConfigMapKeyRef> {
     match backend {
-        Backend::S3(b) => b
-            .tls
-            .as_ref()
-            .and_then(|t| t.ca_bundle_ref.as_ref())
-            .and_then(|c| c.config_map_name.as_deref()),
+        Backend::S3(b) => b.tls.as_ref().and_then(|t| t.ca_bundle_ref.as_ref()),
         Backend::Azure(_)
         | Backend::Gcs(_)
         | Backend::B2(_)
@@ -65,13 +63,31 @@ pub fn backend_tls_ca_configmap(backend: &Backend) -> Option<&str> {
     }
 }
 
+/// The TLS CA-bundle `ConfigMap` name an object-store backend references, if
+/// any. Used by the ConfigMap→repo watch so editing a CA bundle re-triggers a
+/// connect. Name-only projection of [`backend_tls_ca_keyref`].
+pub fn backend_tls_ca_configmap(backend: &Backend) -> Option<&str> {
+    backend_tls_ca_keyref(backend).and_then(|c| c.config_map_name.as_deref())
+}
+
 /// Pure `Backend -> RepositoryConnect` translation (no kube types), so it is
 /// unit-testable and shared by every reconciler plus the browse-session spawner.
 ///
 /// Exhaustive over every CRD `Backend` variant — a new backend cannot compile
 /// until it is wired through to the mover. Credentials never appear here; they
 /// flow to the mover Job as env vars from the referenced Secret (ADR §4.10).
-pub fn backend_to_repository_connect(backend: &Backend) -> RepositoryConnect {
+///
+/// `ca_bundle_pem` is the RESOLVED content of the backend's `tls.caBundleRef`
+/// ConfigMap (a PEM CA bundle), or `None` when the backend declares none. The
+/// parameter exists so that no caller can compile without deciding where the
+/// CA comes from — the field was silently dropped for every mover before it
+/// was added (issue behind PR #364). Only S3 exposes `tls` today (see
+/// [`backend_tls_ca_configmap`], exhaustive); the value is ignored for every
+/// other backend.
+pub fn backend_to_repository_connect(
+    backend: &Backend,
+    ca_bundle_pem: Option<String>,
+) -> RepositoryConnect {
     match backend {
         Backend::Filesystem(f) => RepositoryConnect::Filesystem {
             path: f.path.clone(),
@@ -87,6 +103,7 @@ pub fn backend_to_repository_connect(backend: &Backend) -> RepositoryConnect {
                 .as_ref()
                 .map(|t| t.insecure_skip_verify)
                 .unwrap_or(false),
+            ca_bundle_pem,
             // Workload identity: no static keys in the env — kopia is invoked
             // with explicitly-empty key flags so its credential chain resolves
             // ambiently (IRSA / EKS Pod Identity / IMDS).
@@ -203,7 +220,7 @@ mod tests {
                 service_account_name: "backup-mover".into(),
             }),
         }));
-        match backend_to_repository_connect(&wi) {
+        match backend_to_repository_connect(&wi, None) {
             RepositoryConnect::S3 {
                 ambient_credentials,
                 ..
@@ -221,7 +238,7 @@ mod tests {
                 workload_identity: None,
             })),
         ] {
-            match backend_to_repository_connect(&backend) {
+            match backend_to_repository_connect(&backend, None) {
                 RepositoryConnect::S3 {
                     ambient_credentials,
                     ..
@@ -294,7 +311,7 @@ mod tests {
         // Each maps without panicking and converts cleanly to a kopia ConnectSpec
         // whose discriminant matches the backend kind.
         for backend in cases {
-            let rc = backend_to_repository_connect(&backend);
+            let rc = backend_to_repository_connect(&backend, None);
             let spec = rc.to_connect_spec();
             let want = match backend.kind_str() {
                 "WebDav" => "webdav",
