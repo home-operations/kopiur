@@ -27,6 +27,7 @@ rules:
       - maintenances/status
       - snapshotpolicies/status
       - repositoryreplications/status
+      - snapshotreplications/status
     verbs: [get, patch]
   - apiGroups: [""]
     resources:

@@ -61,6 +61,9 @@ const MOVER_STATUS_CRDS: &[&str] = &[
     // covered here.
     "snapshotpolicies",
     "repositoryreplications",
+    // The snapshot-replication mover PATCHes SnapshotReplication/status at the
+    // end of a run (issue #368).
+    "snapshotreplications",
 ];
 
 const KOPIA_GROUP: &str = "kopiur.home-operations.com";
@@ -74,7 +77,7 @@ const WEBHOOK_VALIDATING_CONFIG: &str = "kopiur-validating";
 const WEBHOOK_MUTATING_CONFIG: &str = "kopiur-mutating";
 const WEBHOOK_TLS_SECRET: &str = "kopiur-webhook-tls";
 
-/// All 8 CRD plurals in `kopiur.home-operations.com`. `clusterrepositories` is cluster-scoped.
+/// All 9 CRD plurals in `kopiur.home-operations.com`. `clusterrepositories` is cluster-scoped.
 const NAMESPACED_CRDS: &[&str] = &[
     "repositories",
     "snapshotpolicies",
@@ -83,6 +86,7 @@ const NAMESPACED_CRDS: &[&str] = &[
     "restores",
     "maintenances",
     "repositoryreplications",
+    "snapshotreplications",
 ];
 const CLUSTER_CRDS: &[&str] = &["clusterrepositories"];
 

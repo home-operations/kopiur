@@ -19,8 +19,8 @@ Webhook: {{ if .Values.webhook.enabled }}enabled (failurePolicy={{ .Values.webho
 
    kubectl get crd -l app.kubernetes.io/part-of=kopiur
    # repositories, clusterrepositories, snapshotpolicies, snapshots,
-   # snapshotschedules, restores, maintenances, repositoryreplications
-   # (all in group kopiur.home-operations.com)
+   # snapshotschedules, restores, maintenances, repositoryreplications,
+   # snapshotreplications (all in group kopiur.home-operations.com)
 
 {{- if .Values.webhook.enabled }}
 {{- if eq .Values.webhook.tls.mode "self" }}
@@ -74,6 +74,6 @@ Webhook: {{ if .Values.webhook.enabled }}enabled (failurePolicy={{ .Values.webho
 4. Watch your resources:
 
    kubectl get repositories,snapshotpolicies,snapshotschedules,snapshots,restores -A
-   kubectl get maintenances,repositoryreplications -A
+   kubectl get maintenances,repositoryreplications,snapshotreplications -A
 
 Docs: docs/install.md

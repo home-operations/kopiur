@@ -60,7 +60,7 @@ $ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
     --namespace kopiur-system --create-namespace
 ```
 
-**Verify** the operator is up and the 8 CRDs are registered:
+**Verify** the operator is up and the 9 CRDs are registered:
 
 ```console
 $ kubectl -n kopiur-system rollout status deploy/kopiur-controller
@@ -73,10 +73,11 @@ clusterrepositories.kopiur.home-operations.com        ...
 maintenances.kopiur.home-operations.com               ...
 repositories.kopiur.home-operations.com               ...
 repositoryreplications.kopiur.home-operations.com     ...
+snapshotreplications.kopiur.home-operations.com       ...
 restores.kopiur.home-operations.com                   ...
 ```
 
-Eight CRDs and two ready Deployments means the operator is live.
+Nine CRDs and two ready Deployments means the operator is live.
 
 ## Step 2 — Give it credentials
 

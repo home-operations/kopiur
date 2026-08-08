@@ -196,3 +196,19 @@ allow:
     reason: >-
       #346 — only meaningful for pvcSelector expansion, so it is inert for the
       same reason. Wired in M4.
+
+  # ==========================================================================
+  # (e) TEMPORARY — feat/snapshot-replication (#368) lands in milestones this
+  #     branch: the SnapshotReplication CRD (M3, this entry set) precedes its
+  #     mover (M4) and controller (M5) consumers. Each entry fails the check
+  #     the moment its consumer lands, which is what forces drainage at the
+  #     wave gates.
+  # ==========================================================================
+  - path: SnapshotReplication.spec.destinationRef
+    reason: >-
+      Consumed by mover/controller landing later in feat/snapshot-replication
+      (M5 resolves both refs; M4 rides the work spec).
+  - path: SnapshotReplication.status.lastRun
+    reason: >-
+      Consumed by mover/controller landing later in feat/snapshot-replication
+      (M4 mover terminal status body; CLI status/doctor render it in M6).

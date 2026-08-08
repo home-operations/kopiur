@@ -6,6 +6,7 @@ use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
 use crate::repository::{RepositoryHealthSpec, RepositorySpec};
 use crate::repository_replication::RepositoryReplicationSpec;
+use crate::snapshot_replication::{Pruning, SnapshotReplicationSpec, validate_component_glob};
 use std::collections::BTreeMap;
 
 /// A `RepositoryRef` is well-formed: a `ClusterRepository` reference is by name
@@ -915,6 +916,128 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
             )
         {
             errs.push(e);
+        }
+    }
+    errs
+}
+
+/// Validate a `SnapshotReplication` spec, accumulating all problems (issue
+/// #368): both repository refs are well-formed and not literally the same
+/// reference, the schedule cron/timezone/jitter parse, every identity matcher
+/// sets at least one component and every set component is a compilable glob,
+/// `migrate.parallel` is >= 1, a `retention` pruning keeps at least something,
+/// and (when a mover is set) it's well-formed and does not claim
+/// `inheritSecurityContextFrom`. The "two different refs resolving to the same
+/// storage" rule needs both resolved backends, which this pure validator cannot
+/// fetch — the webhook resolves them and compares [`backend_target_key`]s.
+pub fn validate_snapshot_replication(spec: &SnapshotReplicationSpec) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    for r in [&spec.source_ref, &spec.destination_ref] {
+        if let Err(e) = validate_repository_ref(r) {
+            errs.push(e);
+        }
+    }
+    // Literal self-target: same kind + name + namespace *field*. Two None
+    // namespaces both resolve to this CR's own namespace, so they are equal too;
+    // a None-vs-Some pair MAY still collide (Some(ns) == the CR's namespace) but
+    // deciding that needs the CR's metadata, which a spec-only validator does
+    // not have — the webhook's backend_target_key comparison backstops it.
+    if spec.source_ref.kind == spec.destination_ref.kind
+        && spec.source_ref.name == spec.destination_ref.name
+        && spec.source_ref.namespace == spec.destination_ref.namespace
+    {
+        errs.push(ValidationError::SnapshotReplicationSelfTarget {
+            kind: match spec.source_ref.kind {
+                RepositoryKind::Repository => "Repository".to_string(),
+                RepositoryKind::ClusterRepository => "ClusterRepository".to_string(),
+            },
+            name: spec.source_ref.name.clone(),
+        });
+    }
+    if let Err(e) = validate_cron(&spec.schedule.cron) {
+        errs.push(e);
+    }
+    if let Err(e) = validate_timezone(spec.schedule.timezone.as_deref()) {
+        errs.push(e);
+    }
+    if let Err(e) = validate_jitter(
+        "SnapshotReplication spec.schedule.jitter",
+        spec.schedule.jitter.as_deref(),
+    ) {
+        errs.push(e);
+    }
+    if let Some(m) = &spec.mover {
+        if let Err(e) = validate_mover(m, "SnapshotReplication mover") {
+            errs.push(e);
+        }
+        // Same accepted-then-ignored hazard as the RepositoryReplication arm
+        // above: a snapshot-replication mover copies snapshot manifests
+        // repo-to-repo and never reads a workload's files, so there is no
+        // workload identity to inherit and the reconciler never resolves the
+        // field. Reject it instead of ignoring it.
+        if let Err(e) = super::forbid_inherit(
+            m,
+            "SnapshotReplication spec",
+            "is not honored by a snapshot-replication mover, which copies snapshot manifests \
+             repository-to-repository and never reads a workload's files — there is no \
+             workload whose identity it could take. Remove it; set mover.securityContext \
+             explicitly if a filesystem-backed repository needs a particular UID/GID (e.g. \
+             an NFS export)",
+        ) {
+            errs.push(e);
+        }
+    }
+    if let Some(ids) = spec.selection.as_ref().and_then(|s| s.identities.as_ref()) {
+        for (list_name, list) in [("include", &ids.include), ("exclude", &ids.exclude)] {
+            for (i, m) in list.iter().enumerate() {
+                let field =
+                    format!("SnapshotReplication spec.selection.identities.{list_name}[{i}]");
+                if m.username.is_none() && m.hostname.is_none() && m.source_path.is_none() {
+                    errs.push(ValidationError::EmptyIdentityMatcher { field });
+                    continue;
+                }
+                for (comp, val) in [
+                    ("username", &m.username),
+                    ("hostname", &m.hostname),
+                    ("sourcePath", &m.source_path),
+                ] {
+                    if let Some(pattern) = val
+                        && let Err(reason) = validate_component_glob(pattern)
+                    {
+                        errs.push(ValidationError::InvalidFieldValue {
+                            field: format!("{field}.{comp}"),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if let Some(p) = spec.migrate.as_ref().and_then(|m| m.parallel)
+        && let Some(e) = require_min("SnapshotReplication spec.migrate.parallel", p.into(), 1)
+    {
+        errs.push(e);
+    }
+    if let Some(pruning) = &spec.pruning {
+        // Exhaustive: a new pruning mode cannot compile without deciding its
+        // admission rule here.
+        match pruning {
+            Pruning::None(_) | Pruning::MirrorSource(_) => {}
+            Pruning::Retention(r) => {
+                let keeps_any = [
+                    r.keep_latest,
+                    r.keep_hourly,
+                    r.keep_daily,
+                    r.keep_weekly,
+                    r.keep_monthly,
+                    r.keep_annual,
+                ]
+                .iter()
+                .any(Option::is_some);
+                if !keeps_any {
+                    errs.push(ValidationError::RetentionKeepsNothing);
+                }
+            }
         }
     }
     errs

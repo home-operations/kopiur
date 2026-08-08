@@ -10,6 +10,7 @@ use crate::repository_replication::RepositoryReplicationSpec;
 use crate::restore::{RestoreSource, RestoreSpec, RestoreTarget};
 use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{Hook, HttpHeader, SnapshotPolicySpec, Source};
+use crate::snapshot_replication::SnapshotReplicationSpec;
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -5645,4 +5646,416 @@ fn cluster_repository_gets_the_identical_blob_retention_rules() {
         "{base}parameters:\n  blobRetention:\n    governance:\n      period: 720h\n"
     ));
     assert!(validate_cluster_repository(&spec).is_empty());
+}
+
+// --- validate_snapshot_replication (issue #368) ---
+
+/// Helper: a named `RepositoryRef` (the shared `repo_ref` pins the name to "r",
+/// which the self-target tests need to vary).
+fn srepl_ref(kind: RepositoryKind, name: &str, ns: Option<&str>) -> RepositoryRef {
+    RepositoryRef {
+        kind,
+        name: name.to_string(),
+        namespace: ns.map(String::from),
+    }
+}
+
+/// Helper: a minimal valid `SnapshotReplicationSpec` the matrix mutates.
+fn srepl_spec(source: RepositoryRef, dest: RepositoryRef, cron: &str) -> SnapshotReplicationSpec {
+    SnapshotReplicationSpec {
+        source_ref: source,
+        destination_ref: dest,
+        schedule: crate::common::CronSpec {
+            cron: cron.into(),
+            jitter: None,
+            timezone: None,
+        },
+        selection: None,
+        migrate: None,
+        pruning: None,
+        mover: None,
+        credential_projection: None,
+        suspend: false,
+    }
+}
+
+#[test]
+fn srepl_valid_full_spec_has_no_errors() {
+    use crate::snapshot_replication::{
+        IdentityMatcher, IdentitySelection, MigrateOptions, PolicyCopyMode, Pruning, SelectionSpec,
+    };
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "offsite", None),
+        "0 6 * * *",
+    );
+    spec.schedule.jitter = Some("30m".into());
+    spec.schedule.timezone = Some("America/Chicago".into());
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![IdentityMatcher {
+                username: Some("pg-*".into()),
+                hostname: None,
+                source_path: None,
+            }],
+            exclude: vec![IdentityMatcher {
+                username: None,
+                hostname: None,
+                source_path: Some("/scratch/*".into()),
+            }],
+        }),
+        latest_only: true,
+    });
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(4),
+        policies: PolicyCopyMode::Copy,
+    });
+    spec.pruning = Some(Pruning::Retention(Retention {
+        keep_daily: Some(7),
+        ..Default::default()
+    }));
+    assert_eq!(validate_snapshot_replication(&spec), vec![]);
+}
+
+#[test]
+fn srepl_rejects_bad_refs_on_both_sides() {
+    // A namespace on a ClusterRepository ref is rejected for EACH offending ref
+    // independently — the aggregate accumulates rather than stopping at the first.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::ClusterRepository, "a", Some("oops-src")),
+        srepl_ref(RepositoryKind::ClusterRepository, "b", Some("oops-dst")),
+        "0 6 * * *",
+    );
+    let errs = validate_snapshot_replication(&spec);
+    let forbidden: Vec<_> = errs
+        .iter()
+        .filter(|e| matches!(e, ValidationError::ClusterRepoNamespaceForbidden { .. }))
+        .collect();
+    assert_eq!(
+        forbidden.len(),
+        2,
+        "both refs must be flagged, got {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_rejects_literal_self_target() {
+    // Same kind + name, both namespaces absent → both resolve to this CR's own
+    // namespace → self-target.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        "0 6 * * *",
+    );
+    let errs = validate_snapshot_replication(&spec);
+    match errs.as_slice() {
+        [ValidationError::SnapshotReplicationSelfTarget { kind, name }] => {
+            assert_eq!(kind, "Repository");
+            assert_eq!(name, "nas-primary");
+        }
+        other => panic!("expected exactly the self-target error, got {other:?}"),
+    }
+    // The message is what/why/fix for a rejected kubectl apply.
+    let msg = errs[0].to_string();
+    assert!(msg.contains("nas-primary"), "{msg}");
+    assert!(msg.contains("different repository"), "{msg}");
+
+    // Same for a shared ClusterRepository (namespace is structurally absent).
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        "0 6 * * *",
+    );
+    assert!(
+        validate_snapshot_replication(&spec)
+            .iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. }))
+    );
+    // Same kind+name with an explicit equal namespace on both sides.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", Some("backups")),
+        srepl_ref(RepositoryKind::Repository, "nas-primary", Some("backups")),
+        "0 6 * * *",
+    );
+    assert!(
+        validate_snapshot_replication(&spec)
+            .iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. }))
+    );
+}
+
+#[test]
+fn srepl_self_target_needs_kind_name_and_namespace_to_all_match() {
+    // Different kind: a Repository and a ClusterRepository sharing a name are
+    // different objects.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "shared", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    // Different explicit namespaces.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "repo", Some("a")),
+        srepl_ref(RepositoryKind::Repository, "repo", Some("b")),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    // None vs Some is undecidable spec-only (Some(ns) may or may not be this
+    // CR's namespace) — the pure validator must NOT guess; the webhook's
+    // resolved-backend comparison is the backstop.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "repo", None),
+        srepl_ref(RepositoryKind::Repository, "repo", Some("elsewhere")),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_rejects_bad_cron_timezone_and_jitter_together() {
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "not a cron",
+    );
+    spec.schedule.timezone = Some("America/Chicgo".into());
+    spec.schedule.jitter = Some("30 parsecs".into());
+    let errs = validate_snapshot_replication(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidCron { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotReplication spec.schedule.jitter"
+        )),
+        "{errs:?}"
+    );
+    assert_eq!(errs.len(), 3, "all three problems in one apply: {errs:?}");
+}
+
+#[test]
+fn srepl_mover_inherit_is_rejected_with_the_adapted_message() {
+    use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.mover = Some(mover_with_inherit(InheritSecurityContextFrom::Snapshot(
+        SnapshotInherit {},
+    )));
+    let errs = validate_snapshot_replication(&spec);
+    match errs.as_slice() {
+        [ValidationError::InvalidFieldValue { field, reason }] => {
+            assert_eq!(
+                field,
+                "SnapshotReplication spec.mover.inheritSecurityContextFrom"
+            );
+            assert!(reason.contains("snapshot manifests"), "{reason}");
+            assert!(
+                reason.contains("never reads a workload's files"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected the inherit rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn srepl_plain_mover_is_accepted() {
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.mover = Some(crate::common::MoverSpec::default());
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_empty_matcher_is_rejected_in_both_lists_with_indexed_paths() {
+    use crate::snapshot_replication::{IdentityMatcher, IdentitySelection, SelectionSpec};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![
+                IdentityMatcher {
+                    username: Some("pg-*".into()),
+                    hostname: None,
+                    source_path: None,
+                },
+                IdentityMatcher::default(), // empty → rejected, include[1]
+            ],
+            exclude: vec![IdentityMatcher::default()], // empty → rejected, exclude[0]
+        }),
+        latest_only: false,
+    });
+    let errs = validate_snapshot_replication(&spec);
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::EmptyIdentityMatcher { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.selection.identities.include[1]",
+            "SnapshotReplication spec.selection.identities.exclude[0]",
+        ],
+        "got {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_bad_glob_component_is_rejected_per_component() {
+    use crate::snapshot_replication::{IdentityMatcher, IdentitySelection, SelectionSpec};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![IdentityMatcher {
+                username: Some("data[0-9]".into()), // unsupported character class
+                hostname: Some("ok-*".into()),
+                source_path: Some("".into()), // empty pattern
+            }],
+            exclude: vec![],
+        }),
+        latest_only: false,
+    });
+    let errs = validate_snapshot_replication(&spec);
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.selection.identities.include[0].username",
+            "SnapshotReplication spec.selection.identities.include[0].sourcePath",
+        ],
+        "each bad component flagged, the good one not: {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_migrate_parallel_zero_is_rejected() {
+    use crate::snapshot_replication::MigrateOptions;
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_snapshot_replication(&spec);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotReplication spec.migrate.parallel"
+        )),
+        "{errs:?}"
+    );
+    // >= 1 passes.
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(1),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_retention_that_keeps_nothing_is_rejected() {
+    use crate::snapshot_replication::{MirrorSourcePruning, NoPruning, Pruning};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.pruning = Some(Pruning::Retention(Retention::default()));
+    let errs = validate_snapshot_replication(&spec);
+    assert_eq!(
+        errs,
+        vec![ValidationError::RetentionKeepsNothing],
+        "an all-absent retention keeps nothing"
+    );
+
+    // Any keep* bucket satisfies it.
+    spec.pruning = Some(Pruning::Retention(Retention {
+        keep_annual: Some(1),
+        ..Default::default()
+    }));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+
+    // The marker modes carry no retention and are always fine.
+    spec.pruning = Some(Pruning::None(NoPruning {}));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    spec.pruning = Some(Pruning::MirrorSource(MirrorSourcePruning {}));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+/// The same rejections, through the REAL wire shape users apply: YAML → JSON →
+/// typed, then the aggregate validator (mirrors the RepositoryReplication
+/// entry-point test above).
+#[test]
+fn srepl_yaml_entry_point_rejects_and_accepts() {
+    let bad: SnapshotReplicationSpec = crate::testutil::from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { name: nas-primary }
+schedule: { cron: "0 6 * * *" }
+pruning: { retention: {} }
+"#,
+    );
+    let errs = validate_snapshot_replication(&bad);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::RetentionKeepsNothing)),
+        "{errs:?}"
+    );
+
+    let ok: SnapshotReplicationSpec = crate::testutil::from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { kind: ClusterRepository, name: offsite }
+schedule: { cron: "0 6 * * *", jitter: 30m }
+selection:
+  identities:
+    include:
+      - username: pg-*
+  latestOnly: true
+migrate: { parallel: 2, policies: none }
+pruning: { mirrorSource: {} }
+"#,
+    );
+    assert!(validate_snapshot_replication(&ok).is_empty());
 }

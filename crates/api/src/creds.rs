@@ -146,6 +146,17 @@ pub fn mover_creds_secrets(backend: &Backend, enc: &Encryption) -> Vec<String> {
 /// replication mover builds its remap from the `ConnectSpec` it hands to `sync-to`.
 pub const DEST_ENV_PREFIX: &str = "KOPIUR_DEST_";
 
+/// Env var carrying the **destination** repository's encryption password
+/// (`KOPIA_PASSWORD`) into a snapshot-replication mover. The source password
+/// rides the plain `KOPIA_PASSWORD` (persisted into the source kopia config at
+/// connect), so the destination's must arrive under a distinct name — the mover
+/// reads this and re-exports it as `KOPIA_PASSWORD` for the destination client
+/// only. Deliberately NOT `{DEST_ENV_PREFIX}KOPIA_PASSWORD` mechanical prefixing:
+/// the controller delivers it as a single `valueFrom.secretKeyRef` env var built
+/// from the RESOLVED destination credentials (which may be a projected copy with
+/// a different Secret name), not via an `envFrom` prefix remap.
+pub const DEST_KOPIA_PASSWORD_ENV: &str = "KOPIUR_DEST_KOPIA_PASSWORD";
+
 #[cfg(test)]
 mod dest_env_tests {
     use super::*;
@@ -153,5 +164,14 @@ mod dest_env_tests {
     #[test]
     fn dest_env_prefix_is_stable() {
         assert_eq!(DEST_ENV_PREFIX, "KOPIUR_DEST_");
+    }
+
+    /// The controller writes this env var into replication mover Jobs and the
+    /// mover reads it back by name — a rename would silently break every
+    /// in-flight Job across a skewed upgrade, so the literal is pinned exactly
+    /// like [`DEST_ENV_PREFIX`]'s.
+    #[test]
+    fn dest_kopia_password_env_is_stable() {
+        assert_eq!(DEST_KOPIA_PASSWORD_ENV, "KOPIUR_DEST_KOPIA_PASSWORD");
     }
 }

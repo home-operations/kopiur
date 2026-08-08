@@ -290,6 +290,55 @@ spec:
                   - type
                   type: object
                 type: array
+              copiedFrom:
+                description: |-
+                  Lineage for `origin: replicated` rows: the source repository, source
+                  manifest id, and `startTime` the copy was migrated from. Written by the
+                  `SnapshotReplication` mover in the same atomic PATCH as
+                  `status.snapshot`; absent on every other origin. See [`CopiedFrom`] for
+                  why this lives on the CR rather than as kopia tags.
+                nullable: true
+                properties:
+                  repository:
+                    description: |-
+                      The SOURCE repository the snapshot was migrated from (the
+                      `SnapshotReplication`'s `sourceRef`, resolved at run time).
+                    properties:
+                      kind:
+                        default: Repository
+                        description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                        enum:
+                        - Repository
+                        - ClusterRepository
+                        type: string
+                      name:
+                        description: Name of the referenced `Repository`/`ClusterRepository`.
+                        type: string
+                      namespace:
+                        description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  sourceManifestId:
+                    description: |-
+                      The kopia manifest id the snapshot had in the SOURCE repository.
+                      Migrate assigns a NEW manifest id on the destination
+                      (`status.snapshot.kopiaSnapshotID`); this is the old one, kept for
+                      cross-repository correlation.
+                    type: string
+                  startTime:
+                    description: |-
+                      The snapshot's RFC3339 `startTime` — preserved verbatim by migrate and
+                      the key (together with the identity triple) both idempotent re-migration
+                      and `pruning: mirrorSource` correlate source and destination rows on.
+                    type: string
+                required:
+                - repository
+                - sourceManifestId
+                - startTime
+                type: object
               failure:
                 description: Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
                 nullable: true

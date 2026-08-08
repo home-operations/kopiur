@@ -474,6 +474,52 @@ pub enum ValidationError {
         backend: String,
     },
 
+    /// A `SnapshotReplication`'s `sourceRef` and `destinationRef` are the same
+    /// reference (same kind, name, and effective namespace) — copying a
+    /// repository's snapshots into itself is a no-op at best and duplicates
+    /// every manifest at worst. The pure validator catches the literal same-ref
+    /// case; the webhook additionally rejects two *different* refs that resolve
+    /// to the same storage target (`backend_target_key`).
+    #[error(
+        "SnapshotReplication sourceRef and destinationRef point at the same {kind} {name:?} — \
+         a replication cannot copy a repository's snapshots into itself. Point destinationRef \
+         at a different repository (typically the off-site one)"
+    )]
+    SnapshotReplicationSelfTarget {
+        /// The shared repository kind (`Repository` or `ClusterRepository`).
+        kind: String,
+        /// The shared repository name both refs point at.
+        name: String,
+    },
+
+    /// A `SnapshotReplication` identity matcher set none of
+    /// `username`/`hostname`/`sourcePath`. An empty matcher constrains nothing —
+    /// in an `include` list it would silently select EVERY identity, and in an
+    /// `exclude` list it would silently exclude everything — so the intent must
+    /// be spelled out instead.
+    #[error(
+        "identity matcher {field} sets none of username/hostname/sourcePath — an empty matcher \
+         constrains nothing (it would match every identity). Set at least one component \
+         (globs allowed, e.g. username: \"pg-*\"), or remove the matcher"
+    )]
+    EmptyIdentityMatcher {
+        /// The offending matcher's field path (e.g.
+        /// `"SnapshotReplication spec.selection.identities.include[0]"`).
+        field: String,
+    },
+
+    /// A `SnapshotReplication` `pruning.retention` block set no `keep*` bucket.
+    /// A retention that keeps nothing would prune every replicated copy on the
+    /// next run — almost certainly a typo'd field name, so it is rejected
+    /// rather than honored.
+    #[error(
+        "spec.pruning.retention sets no keep* bucket (keepLatest/keepHourly/keepDaily/\
+         keepWeekly/keepMonthly/keepAnnual) — a retention that keeps nothing would prune \
+         every replicated snapshot on the next run. Set at least one keep* count, or use \
+         `pruning: {{ none: {{}} }}` (or omit pruning) to keep copies forever"
+    )]
+    RetentionKeepsNothing,
+
     /// A namespaced `Repository` set `spec.maintenance.namespace`, which only
     /// applies to a cluster-scoped `ClusterRepository` (a namespaced
     /// `Repository`'s managed `Maintenance` always lives in the repository's own

@@ -24,6 +24,7 @@ rules:
   - restores
   - maintenances
   - repositoryreplications
+  - snapshotreplications
   - clusterrepositories
   verbs:
   - get
@@ -50,6 +51,8 @@ rules:
   - maintenances/finalizers
   - repositoryreplications/status
   - repositoryreplications/finalizers
+  - snapshotreplications/status
+  - snapshotreplications/finalizers
   - clusterrepositories/status
   - clusterrepositories/finalizers
   verbs:

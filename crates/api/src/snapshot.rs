@@ -555,6 +555,13 @@ pub struct SnapshotStatus {
     /// backups without the tag, or a tag this operator version cannot decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<crate::recorded::RecordedSnapshotMeta>,
+    /// Lineage for `origin: replicated` rows: the source repository, source
+    /// manifest id, and `startTime` the copy was migrated from. Written by the
+    /// `SnapshotReplication` mover in the same atomic PATCH as
+    /// `status.snapshot`; absent on every other origin. See [`CopiedFrom`] for
+    /// why this lives on the CR rather than as kopia tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<CopiedFrom>,
 }
 
 /// One-shot markers for the cleanups a terminal `Snapshot` performs, mirroring
@@ -719,6 +726,32 @@ pub struct ResolvedSnapshot {
     /// writes it, including `enabled: false`, so absent stays distinguishable from off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<CredentialProjection>,
+}
+
+/// Lineage of an `origin: replicated` row: where the copy came from.
+///
+/// `kopia snapshot migrate` cannot stamp tags onto the migrated manifest (it
+/// preserves the source manifest verbatim apart from assigning a new manifest
+/// id), so the provenance a dest-side copy CR needs — which repository it was
+/// copied FROM, which source manifest it corresponds to, and the `startTime`
+/// migrate keys idempotency on — cannot live in the kopia repository. It lives
+/// here, written by the replication mover in the same atomic status PATCH that
+/// records the destination manifest (`status.snapshot.kopiaSnapshotID`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CopiedFrom {
+    /// The SOURCE repository the snapshot was migrated from (the
+    /// `SnapshotReplication`'s `sourceRef`, resolved at run time).
+    pub repository: RepositoryRef,
+    /// The kopia manifest id the snapshot had in the SOURCE repository.
+    /// Migrate assigns a NEW manifest id on the destination
+    /// (`status.snapshot.kopiaSnapshotID`); this is the old one, kept for
+    /// cross-repository correlation.
+    pub source_manifest_id: String,
+    /// The snapshot's RFC3339 `startTime` — preserved verbatim by migrate and
+    /// the key (together with the identity triple) both idempotent re-migration
+    /// and `pruning: mirrorSource` correlate source and destination rows on.
+    pub start_time: String,
 }
 
 /// One resolved source backed up by a run — a concrete PVC and its kopia path.
@@ -1230,6 +1263,48 @@ recorded:
         assert!(bare.recorded.is_none());
         let wire = serde_json::to_value(&bare).unwrap();
         assert!(wire.get("recorded").is_none());
+    }
+
+    #[test]
+    fn replicated_status_copied_from_roundtrips_and_absent_stays_absent() {
+        use crate::common::RepositoryKind;
+        // The lineage block a SnapshotReplication copy CR carries (migrate
+        // cannot stamp kopia tags, so provenance lives on the CR status).
+        let yaml = r#"
+phase: Succeeded
+origin: replicated
+snapshot:
+  kopiaSnapshotID: destid123
+  identity:
+    username: mydb
+    hostname: prod
+    sourcePath: /pvc/mydb
+copiedFrom:
+  repository: { kind: Repository, name: nas-primary, namespace: backups }
+  sourceManifestId: srcid456
+  startTime: 2026-08-01T02:00:00Z
+"#;
+        let status: SnapshotStatus = from_yaml(yaml);
+        let cf = status.copied_from.as_ref().expect("copiedFrom decoded");
+        assert_eq!(cf.repository.kind, RepositoryKind::Repository);
+        assert_eq!(cf.repository.name, "nas-primary");
+        assert_eq!(cf.source_manifest_id, "srcid456");
+        assert_eq!(cf.start_time, "2026-08-01T02:00:00Z");
+
+        // The exact camelCase wire keys — a drifting name is silently pruned
+        // by the apiserver's structural schema.
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["copiedFrom"]["sourceManifestId"], "srcid456");
+        assert_eq!(json["copiedFrom"]["startTime"], "2026-08-01T02:00:00Z");
+        assert_eq!(json["copiedFrom"]["repository"]["name"], "nas-primary");
+        let reparsed: SnapshotStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Every other origin: absent stays absent (no null/{} noise).
+        let bare: SnapshotStatus = from_yaml("phase: Succeeded\n");
+        assert!(bare.copied_from.is_none());
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(wire.get("copiedFrom").is_none());
     }
 
     #[test]

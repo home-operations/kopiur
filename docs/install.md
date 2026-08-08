@@ -37,7 +37,7 @@ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
 kubectl -n kopiur-system rollout status deploy/kopiur-controller
 kubectl -n kopiur-system rollout status deploy/kopiur-webhook
 
-# 3. Confirm the 8 CRDs are registered.
+# 3. Confirm the 9 CRDs are registered.
 kubectl get crd | grep kopiur.home-operations.com
 ```
 
@@ -118,7 +118,7 @@ spec:
 
 /// warning | `helm upgrade` and GitOps reconciles never update the CRDs
 
-The 8 CRDs ship in the chart's special `crds/` directory, which Helm installs
+The 9 CRDs ship in the chart's special `crds/` directory, which Helm installs
 once and never touches on upgrade (see [CRD lifecycle](#crd-lifecycle) below).
 A GitOps tool with a `CreateReplace` / server-side-apply CRD policy handles
 schema changes automatically; otherwise apply `deploy/crds/` yourself.
@@ -251,7 +251,7 @@ citizen toward a struggling control plane.
 
 ## CRD lifecycle
 
-The 8 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
+The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
 
 > Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it** — you must apply the new CRDs yourself:
 >

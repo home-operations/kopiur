@@ -10,7 +10,7 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 
 ///
 
-## The 8 CRDs (`kopiur.home-operations.com/v1alpha1`)
+## The 9 CRDs (`kopiur.home-operations.com/v1alpha1`)
 
 | CRD                 | Scope      | Layer                | Purpose                                                                         |
 | ------------------- | ---------- | -------------------- | ------------------------------------------------------------------------------- |
@@ -22,6 +22,7 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 | `Restore`           | Namespaced | Operation            | Restore a snapshot to a PVC, or act as a passive volume-populator source.       |
 | `Maintenance`       | Namespaced | Lifecycle            | Schedules `kopia maintenance` quick + full with an ownership lease.             |
 | `RepositoryReplication` | Namespaced | Durability        | Mirror a repository's blobs to a second backend on a schedule (the "2" in 3-2-1). |
+| `SnapshotReplication` | Namespaced | Durability        | Copy selected snapshots from one repository into another on a schedule (kopia `snapshot migrate`). |
 
 ## Where to next
 
@@ -34,6 +35,6 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 - **[Backups & schedules](backups.md)** and **[Restores](restores.md)** — the recipe/invocation/schedule model and reading data back.
 - **[Troubleshooting](troubleshooting.md)** — when something doesn't go green.
 - **[GitOps (Flux / Argo)](gitops.md)** — kstatus health, `kubectl wait`, managed-by/ownerRefs, drift-free applies.
-- **[Field reference](field-reference.md)** — every field of all 8 CRDs: type, default, immutability.
+- **[Field reference](field-reference.md)** — every field of all 9 CRDs: type, default, immutability.
 - **[API reference (rustdoc)](api-reference.md)** — the generated Rust API docs for every crate in the workspace.
 - **[API conventions](dev/api-conventions.md)** and **[Observability](dev/observability.md)** — developer notes.

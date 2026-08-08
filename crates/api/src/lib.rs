@@ -12,6 +12,7 @@ pub mod restore;
 pub mod server;
 pub mod snapshot;
 pub mod snapshot_policy;
+pub mod snapshot_replication;
 pub mod snapshot_schedule;
 
 // Shared pure-logic modules (no controller-runtime deps). The webhook and the
@@ -74,6 +75,12 @@ pub use snapshot::{
 pub use snapshot_policy::{
     CopyMethod, DeepVerification, GroupBy, Hook, SnapshotPolicy, SnapshotPolicySpec,
     SnapshotPolicyStatus, SourcePathStrategy, StagingSpec, Verification,
+};
+pub use snapshot_replication::{
+    IdentityMatcher, IdentitySelection, MigrateOptions, MirrorSourcePruning, NoPruning,
+    PolicyCopyMode, Pruning, SelectionSpec, SnapshotReplication, SnapshotReplicationPhase,
+    SnapshotReplicationRunStats, SnapshotReplicationSpec, SnapshotReplicationStatus,
+    component_glob_matches, validate_component_glob,
 };
 pub use snapshot_schedule::{
     ConcurrencyPolicy, ScheduleSpec, SnapshotSchedule, SnapshotScheduleSpec, SnapshotScheduleStatus,
