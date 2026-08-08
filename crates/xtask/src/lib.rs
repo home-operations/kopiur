@@ -7,6 +7,7 @@ pub mod dashboards;
 pub mod docs;
 pub mod paths;
 pub mod rbac;
+pub mod scan;
 pub mod wiring;
 
 use anyhow::Result;
