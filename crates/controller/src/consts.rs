@@ -5,23 +5,29 @@
 //! `managed-by`, kstatus condition types, API version) live in
 //! [`kopiur_api::consts`] so external tooling shares one definition; they are
 //! re-exported here so controller call sites keep their existing import paths.
+//!
+//! The **structural gates** — the condition/reason pairs a reconciler stamps
+//! when work is blocked on something only a human can change — are likewise
+//! `kopiur_api::consts` strings, enumerated as typed rows in
+//! [`kopiur_api::gates::STRUCTURAL_GATES`] so the `kubectl kopiur doctor` side
+//! of the contract can never fall behind the controller side (#359). Their
+//! Event `action` hints ([`ALLOW_PRIVILEGED_MOVER_ACTION`],
+//! [`APPLY_GRANT_ACTION`], [`ACKNOWLEDGE_MASS_DELETION_ACTION`]) stay
+//! controller-side: they are remediation copy, not wire contract.
 
 pub use kopiur_api::consts::{
-    ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, CONFIG_LABEL, INDEX_BLOB_HEALTH_CONDITION,
-    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    MASS_DELETION_HELD_CONDITION, OP_LABEL, OP_RESTORE, OP_RESTORE_TARGET, ORIGIN_LABEL,
-    READY_CONDITION, RECONCILING_CONDITION, REPOSITORY_UID_LABEL, RUN_MODE_ANNOTATION,
-    RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL, STALLED_CONDITION,
+    ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
+    DELETION_HELD_CONDITION, INDEX_BLOB_HEALTH_CONDITION, MAINTENANCE_CONFIGURED_CONDITION,
+    MANAGED_BY_LABEL, MANAGED_BY_VALUE, MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
+    MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CREDENTIALS_REASON,
+    MISSING_SERVICE_ACCOUNT_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_RESTORE,
+    OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    PRIVILEGED_MOVERS_ANNOTATION, READY_CONDITION, RECONCILING_CONDITION,
+    REPOSITORY_READ_ONLY_REASON, REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION,
+    RUN_MODE_ANNOTATION, RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL,
+    STALLED_CONDITION,
 };
-
-/// `Snapshot` condition recording whether its repository accepts writes (§11). Set
-/// `False` (with [`REPOSITORY_READ_ONLY_REASON`]) when a backup is refused because
-/// the repository is `mode: ReadOnly`.
-pub const REPOSITORY_WRITABLE_CONDITION: &str = "RepositoryWritable";
-/// `reason`/Event reason when a backup or maintenance is refused on a `ReadOnly`
-/// repository (ADR-0005 §11).
-pub const REPOSITORY_READ_ONLY_REASON: &str = "RepositoryReadOnly";
 
 /// `reason` when a backup is held in `Pending` because its referenced repository
 /// is not `Ready` (backend unreachable). Mirrors the readiness gate Maintenance,
@@ -202,10 +208,6 @@ pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
 /// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
 pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
 
-/// `Snapshot`/`Restore` condition surfaced when the mover Job's credential Secret is
-/// absent from the workload namespace — `False` carries the actionable message
-/// (which Secret, which namespace, why, and how to fix). ADR §4.12.
-pub const CREDENTIALS_AVAILABLE_CONDITION: &str = "CredentialsAvailable";
 /// `Snapshot` condition tracking kopia-side pin reconciliation (ADR-0005 §13(c)).
 /// `True`/`False` mirrors `status.pinned` once a SnapshotPin mover Job ran;
 /// `Unknown` with reason `PinJobRunning` while one is in flight. Named for the
@@ -221,13 +223,6 @@ pub const PIN_JOB_FAILED_REASON: &str = "PinJobFailed";
 /// desired `spec.pin` — so a stale Job can't satisfy the opposite toggle and a
 /// pin that completed after a mid-flight spec flip is still recorded.
 pub const PIN_TARGET_ANNOTATION: &str = "kopiur.home-operations.com/pin-target";
-/// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False`.
-pub const MISSING_CREDENTIALS_REASON: &str = "MissingCredentialsSecret";
-/// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False` when
-/// the missing dependency is the **workload-identity ServiceAccount** the
-/// backend's `auth.workloadIdentity` names (the user creates it; kopiur never
-/// does — its cloud annotations are the user's federation contract).
-pub const MISSING_SERVICE_ACCOUNT_REASON: &str = "MissingServiceAccount";
 /// `reason` for [`CREDENTIALS_AVAILABLE_CONDITION`] = `True` when the operator
 /// supplied the credential Secret(s) itself via projection (opt-in
 /// `spec.credentialProjection`), rather than the user pre-creating them.
@@ -277,17 +272,6 @@ pub const CREDENTIAL_PROJECTION_FLAG: &str = "features.credentialProjection.enab
 /// error when a server Secret write is forbidden.
 pub const KOPIA_UI_FLAG: &str = "features.kopiaUi.enabled";
 
-/// Namespace annotation a cluster admin sets to allow elevated (root/privileged)
-/// movers in that namespace (ADR §4.11/§G16). Without it, a `SnapshotPolicy` whose
-/// `spec.mover` requests privilege is refused — a tenant could otherwise reuse the
-/// minted mover ServiceAccount at that privilege. Mirrors VolSync's
-/// `volsync.backube/privileged-movers`.
-pub const PRIVILEGED_MOVERS_ANNOTATION: &str = "kopiur.home-operations.com/privileged-movers";
-/// `Snapshot` condition surfaced when a privileged mover is requested in a namespace
-/// that has not opted in — `False` carries the actionable message.
-pub const MOVER_PERMITTED_CONDITION: &str = "MoverPermitted";
-/// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False`.
-pub const PRIVILEGED_MOVER_NOT_PERMITTED_REASON: &str = "PrivilegedMoverNotPermitted";
 /// Event `action` (remediation hint) for a refused privileged mover.
 pub const ALLOW_PRIVILEGED_MOVER_ACTION: &str = "AnnotateNamespaceForPrivilegedMovers";
 /// `Snapshot` condition for CSI source staging (`copyMethod: Snapshot`/`Clone`,
@@ -592,14 +576,6 @@ pub const DELETE_MEMBERS_ANNOTATION: &str = "kopiur.home-operations.com/delete-m
 /// listing every batch Job in the install scope.
 pub const DELETE_REPO_LABEL: &str = "kopiur.home-operations.com/delete-repo";
 
-/// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
-/// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
-/// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the
-/// repository.
-pub const DELETION_HELD_CONDITION: &str = "DeletionHeld";
-/// `reason` for [`DELETION_HELD_CONDITION`] = `True`.
-pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
-
 /// Event reason on a `Snapshot` whose own deletion is held by the
 /// mass-deletion breaker.
 pub const SNAPSHOT_DELETION_HELD_REASON: &str = "SnapshotDeletionHeld";
@@ -616,10 +592,6 @@ pub const SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON: &str = "SnapshotRetainedOnP
 /// silently disarming the breaker.
 pub const INVALID_MASS_DELETION_ACK_REASON: &str = "InvalidMassDeletionAck";
 
-/// `reason` for [`MASS_DELETION_HELD_CONDITION`] = `True` on a
-/// `Repository`/`ClusterRepository`: pending external destructive deletions for
-/// this repository are at/above its breaker threshold.
-pub const MASS_DELETION_THRESHOLD_EXCEEDED_REASON: &str = "ThresholdExceeded";
 /// `reason` for [`MASS_DELETION_HELD_CONDITION`] = `False`: pending external
 /// destructive deletions are below the breaker threshold (or the breaker is off).
 pub const MASS_DELETION_BELOW_THRESHOLD_REASON: &str = "BelowThreshold";

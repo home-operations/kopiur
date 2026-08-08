@@ -303,6 +303,35 @@ pub enum RestorePhase {
     Failed,
 }
 
+impl RestorePhase {
+    /// Whether this phase is **terminal**: the restore reached an end state and
+    /// the operator will do no further work on it of its own accord.
+    ///
+    /// `Pending`, `Resolving`, and `Restoring` are all in-flight — including a
+    /// `Pending` restore parked on a structural gate (see
+    /// [`crate::gates::STRUCTURAL_GATES`]), which never progresses but is
+    /// emphatically not finished. A `Restore` has no deletion phase of its own,
+    /// so unlike `SnapshotPhase` there is no wedged-finalizer case to exclude.
+    ///
+    /// Pure + exhaustive so the single definition lives in one tested place.
+    ///
+    /// ```
+    /// use kopiur_api::RestorePhase;
+    ///
+    /// assert!(RestorePhase::Completed.is_terminal());
+    /// assert!(RestorePhase::Failed.is_terminal());
+    /// assert!(!RestorePhase::Pending.is_terminal());
+    /// assert!(!RestorePhase::Resolving.is_terminal());
+    /// assert!(!RestorePhase::Restoring.is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Completed | Self::Failed => true,
+            Self::Pending | Self::Resolving | Self::Restoring => false,
+        }
+    }
+}
+
 impl crate::common::PhaseLabel for RestorePhase {
     const ALL: &'static [Self] = &[
         Self::Pending,
@@ -434,8 +463,41 @@ pub struct RestoreProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::PhaseLabel;
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn restore_phase_all_covers_every_variant_uniquely() {
+        // Mirrors the `SnapshotPhase` tripwire: every variant is in ALL with a
+        // unique, non-empty label. A variant added without updating ALL fails
+        // here (and `label`'s exhaustive match won't compile at all).
+        let labels: Vec<&str> = RestorePhase::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(RestorePhase::ALL.len(), 5);
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
+        assert!(RestorePhase::ALL.contains(&RestorePhase::default()));
+    }
+
+    #[test]
+    fn restore_terminal_set_is_pinned() {
+        // Driven off ALL so a new variant must be classified deliberately.
+        let terminal: Vec<&str> = RestorePhase::ALL
+            .iter()
+            .filter(|p| p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(terminal, ["Completed", "Failed"]);
+        let in_flight: Vec<&str> = RestorePhase::ALL
+            .iter()
+            .filter(|p| !p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(in_flight, ["Pending", "Resolving", "Restoring"]);
+    }
 
     #[test]
     fn restore_crd_metadata_is_correct() {

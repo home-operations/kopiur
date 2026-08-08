@@ -21,6 +21,7 @@ pub mod creds;
 pub mod duration;
 pub mod error;
 pub mod expand;
+pub mod gates;
 pub mod identity;
 pub mod invariants;
 pub mod jitter;
@@ -81,6 +82,7 @@ pub use snapshot_schedule::{
 // Shared logic re-exports.
 pub use duration::{parse_go_duration, render_go_duration, resolve_timeout};
 pub use error::{ValidationError, ValidationResult};
+pub use gates::{GateScope, GateSeverity, STRUCTURAL_GATES, StructuralGate};
 pub use identity::{
     HostClass, IdentityInputs, classify_hostname, identity_string, resolve_identity,
     validate_identity_expr,

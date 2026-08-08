@@ -269,6 +269,48 @@ impl PrunedBy {
     }
 }
 
+impl SnapshotPhase {
+    /// Whether this phase is **terminal**: the operator will do no further work
+    /// on the object of its own accord, so a diagnostic must not report it as
+    /// in-flight (nor as stuck).
+    ///
+    /// `Deleting` is deliberately **not** terminal. A CR sitting in `Deleting`
+    /// has a finalizer that is still trying to reclaim its kopia snapshot — a
+    /// wedged finalizer (an unreachable backend, a held mass-deletion breaker)
+    /// is in-flight work that never completes, which is exactly the state worth
+    /// surfacing. Classifying it terminal is how a stuck deletion becomes
+    /// invisible.
+    ///
+    /// `Discovered` and `Unchanged` ARE terminal: a discovered CR mirrors a
+    /// kopia snapshot the operator did not produce and never advances on its
+    /// own, and an `Unchanged` run already finished (successfully, owning no
+    /// manifest). A `Discovered` CR that is later deleted moves to `Deleting`
+    /// like any other, so nothing is lost by treating the phase itself as done.
+    ///
+    /// Pure + exhaustive so the single definition lives in one tested place —
+    /// the CLI and the controller must never disagree about what "still
+    /// working" means.
+    ///
+    /// ```
+    /// use kopiur_api::SnapshotPhase;
+    ///
+    /// assert!(SnapshotPhase::Succeeded.is_terminal());
+    /// assert!(SnapshotPhase::Failed.is_terminal());
+    /// assert!(SnapshotPhase::Discovered.is_terminal());
+    /// assert!(SnapshotPhase::Unchanged.is_terminal());
+    /// assert!(!SnapshotPhase::Pending.is_terminal());
+    /// assert!(!SnapshotPhase::Running.is_terminal());
+    /// // A wedged finalizer is in-flight work, not a finished object.
+    /// assert!(!SnapshotPhase::Deleting.is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed | Self::Discovered | Self::Unchanged => true,
+            Self::Pending | Self::Running | Self::Deleting => false,
+        }
+    }
+}
+
 impl crate::common::PhaseLabel for SnapshotPhase {
     const ALL: &'static [Self] = &[
         Self::Pending,
@@ -610,6 +652,28 @@ mod tests {
         assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
         // Default is reachable through ALL.
         assert!(SnapshotPhase::ALL.contains(&SnapshotPhase::default()));
+    }
+
+    #[test]
+    fn snapshot_terminal_set_is_pinned() {
+        // Tripwire for the classifier every consumer (doctor, metrics, the
+        // schedule's concurrency accounting) must agree on. Driven off ALL so a
+        // NEW variant cannot join without a deliberate decision here — the
+        // `is_terminal` match won't compile until it is classified, and this
+        // assertion won't pass until the expected set is updated.
+        let terminal: Vec<&str> = SnapshotPhase::ALL
+            .iter()
+            .filter(|p| p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(terminal, ["Succeeded", "Failed", "Discovered", "Unchanged"]);
+        let in_flight: Vec<&str> = SnapshotPhase::ALL
+            .iter()
+            .filter(|p| !p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        // `Deleting` stays here on purpose: a wedged finalizer is in-flight work.
+        assert_eq!(in_flight, ["Pending", "Running", "Deleting"]);
     }
 
     /// Regression for the inert "derived from source" contract (found by the

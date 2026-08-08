@@ -556,6 +556,17 @@ pub enum ManualRunPhase {
     Failed,
 }
 
+impl crate::common::PhaseLabel for ManualRunPhase {
+    const ALL: &'static [Self] = &[Self::Running, Self::Succeeded, Self::Failed];
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
 /// Bookkeeping for the most recent annotation-requested run.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -610,9 +621,33 @@ pub struct RunStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::RepositoryKind;
+    use crate::common::{PhaseLabel, RepositoryKind};
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn manual_run_phase_all_covers_every_variant_uniquely() {
+        // `ManualRunPhase` was the one phase enum with no `PhaseLabel` impl, so
+        // nothing could enumerate it. Same tripwire as the other phases: every
+        // variant in ALL, unique non-empty labels, and the label string equal to
+        // the serde encoding (this phase is written to `status.manualRun.phase`,
+        // so a label that drifts from the wire value would mislabel metrics and
+        // any CLI rendering).
+        let labels: Vec<&str> = ManualRunPhase::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(ManualRunPhase::ALL.len(), 3);
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
+        for p in ManualRunPhase::ALL {
+            assert_eq!(
+                serde_json::to_value(p).expect("serialize"),
+                p.label(),
+                "{p:?}"
+            );
+        }
+    }
 
     #[test]
     fn lease_identity_is_hostname_safe_and_stable() {
