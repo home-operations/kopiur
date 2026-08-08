@@ -18,10 +18,12 @@ Each subcommand also takes a `--check` mode (`mise run gen-check`) that re-rende
 everything in memory and compares it against the checked-in files **without
 writing**, so CI fails on drift instead of silently shipping stale YAML.
 
-It also hosts one non-generating gate:
+It also hosts two non-generating gates:
 
 - `check-wiring` (`mise run wiring-check`) → fail if a CRD field is defined and
   schema-generated but read by **no** consumer crate.
+- `check-phases` (`mise run phase-check`) → fail if a phase branch opts out of
+  the exhaustive-match guarantee without the compiler saying so.
 
 That gate exists because `gen-check` answers the wrong question. It proves the
 checked-in YAML matches the Rust types; it says nothing about whether anything
@@ -34,8 +36,19 @@ silently did nothing). Exemptions live in `wiring-allowlist.yaml`, each with a
 written reason; see [`wiring`] for what counts as "read" and the deliberate
 limits of the search.
 
+The phase gate exists because the compiler cannot see the three constructs that
+opt out of exhaustiveness: `matches!` (an implicit `_ => false`), a `_ =>` arm,
+and `==`/`!=` against a single variant — plus one drift class with no construct
+at all, a gate condition the controller defines and the CLI never learns about.
+All four have shipped bugs: [#351]'s `SnapshotPhase::Unchanged` was swallowed by
+two `_ =>` arms, and [#359] was doctor reporting all-green over a `Snapshot`
+parked on a condition it had never heard of. Exemptions live in
+`phase-allowlist.yaml`, each with a written reason; see [`phases`] for the four
+rules and the deliberate limits of the scan.
+
 [#346]: https://github.com/home-operations/kopiur/issues/346
 [#351]: https://github.com/home-operations/kopiur/issues/351
+[#359]: https://github.com/home-operations/kopiur/issues/359
 
 The generation logic deliberately lives in the **library** (`xtask::`), not in
 `main.rs`: a binary crate's modules aren't importable, so keeping it in the lib
@@ -55,6 +68,8 @@ lets the integration tests under `tests/` exercise it directly.
 | [`paths::workspace_root`] / [`paths::deploy_dir`] | Deterministic workspace-root resolution and the `deploy/` directory under it.                                               |
 | [`crds`] / [`rbac`] / [`dashboards`]              | The per-kind artifact generators.                                                                                           |
 | [`wiring`]                                        | The inert-field ratchet: walks the CRD schemas and asserts each field is read by a consumer crate or reviewed-and-allowlisted. |
+| [`phases`]                                        | The phase-exhaustiveness ratchet: flags `matches!` / `_ =>` / `==` over a phase enum, and condition types the CLI cannot see. |
+| [`scan`]                                          | The source-scanning primitives both ratchets share: comment/string scrubbing, `#[cfg(test)]` stripping, and the `.rs` walker. |
 
 ## Example
 
@@ -85,9 +100,11 @@ From the command line:
 cargo xtask gen-all           # regenerate deploy/crds + RBAC + dashboard
 cargo xtask gen-all --check   # CI drift guard: nonzero exit if artifacts are stale
 cargo xtask check-wiring      # inert-field gate (no --check; it never writes)
+cargo xtask check-phases      # phase-exhaustiveness gate (likewise)
 mise run gen                  # the same, via the pinned task runner
 mise run gen-check
 mise run wiring-check
+mise run phase-check
 ```
 
 ## See also

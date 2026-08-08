@@ -590,6 +590,14 @@ jobs:
       - name: Check CRD field wiring
         run: mise run wiring-check
 
+      # The compiler enforces exhaustiveness only where an exhaustive `match`
+      # was written. `matches!`, a `_ =>` arm and `==` against one variant all
+      # opt out of it silently — see #351 (`Unchanged` swallowed by `_ =>`) and
+      # #359 (doctor all-green over a Snapshot parked on a condition the CLI
+      # had never heard of).
+      - name: Check phase-handling exhaustiveness
+        run: mise run phase-check
+
   workflow-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')

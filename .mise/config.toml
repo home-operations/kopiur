@@ -163,6 +163,25 @@ set -eu
 cargo xtask check-wiring
 '''
 
+[tasks.phase-check]
+description = "Fail if a phase branch is non-exhaustive or a gate condition is CLI-invisible"
+run = '''
+set -eu
+# The compiler enforces exhaustiveness only where an exhaustive `match` was
+# written. Three constructs opt out of it silently — `matches!` (an implicit
+# `_ => false`), a `_ =>` arm, and `==`/`!=` against a single variant — and a
+# fourth drift class has no construct at all: a gate condition the controller
+# defines and the CLI never learns about. All four shipped: #351's
+# `SnapshotPhase::Unchanged` was swallowed by two `_ =>` arms, and #359 was
+# `kubectl kopiur doctor` reporting all-green over a Snapshot parked on
+# `MoverPermitted=False`.
+#
+# Exemptions live in crates/xtask/phase-allowlist.yaml, each with a written
+# reason. The check fails in BOTH directions: a new non-exhaustive construct,
+# and an exemption that matches nothing any more (delete the entry).
+cargo xtask check-phases
+'''
+
 [tasks.cov]
 description = "Coverage over the hermetic suite -> lcov.info (report-only; no threshold)"
 run = "cargo llvm-cov --workspace --locked --lcov --output-path lcov.info"
@@ -270,7 +289,7 @@ run = "uv run mkdocs serve"
 
 [tasks.ci]
 description = "The full local hermetic gate: format, lint, build, test, and drift check"
-depends = ["fmt-check", "clippy", "build", "test", "gen-check", "wiring-check"]
+depends = ["fmt-check", "clippy", "build", "test", "gen-check", "wiring-check", "phase-check"]
 
 [hooks]
 postinstall = "lefthook install"
