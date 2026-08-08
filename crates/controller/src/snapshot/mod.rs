@@ -615,10 +615,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         | SnapshotPhase::Discovered,
                     )
                     | None => false,
-                    // A phase from a newer operator is NOT a recorded success,
-                    // but overwriting it here would destroy information this
-                    // build cannot reconstruct. Treat it as already-recorded so
-                    // the controller leaves the newer writer's value alone.
+                    // UNREACHABLE in practice, and deliberately so: `run_decision`
+                    // at the top of this reconcile already answered `Wait` for an
+                    // unreadable phase and returned (with the warning + hold
+                    // requeue), so an `Unknown` Snapshot never gets this far.
+                    // `run_decision` is the real guard; this arm exists because
+                    // the match is exhaustive and must still state an answer.
+                    // `true` (= "leave it alone") is the answer consistent with
+                    // that guard — if the early return is ever removed, this
+                    // still refuses to overwrite a value the build cannot read.
                     Some(SnapshotPhase::Unknown(_)) => true,
                 };
                 if !already_recorded {

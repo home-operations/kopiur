@@ -68,6 +68,43 @@ pub async fn publish_warning_event<K>(
     }
 }
 
+/// Name an unreadable `status.phase` in the log before this build acts on the
+/// object anyway.
+///
+/// Every phase enum decodes an unrecognized string into an `Unknown` variant
+/// rather than failing the typed watch (see `kopiur_api::common`'s
+/// `phase_serde!`, which documents the full policy). A reconciler that then
+/// re-derives and OVERWRITES that phase is doing the right thing — parking
+/// forever would strand the object, including for a legacy value no upgrade
+/// will ever explain — but only where re-driving is idempotent:
+///
+/// - `Restore` — the source is pinned in `status.resolved` and never
+///   re-resolved, so a re-drive restores the same snapshot to the same target.
+/// - `Repository` / `ClusterRepository` — connect is idempotent.
+/// - `Maintenance` manual run — the Job name is keyed on the request timestamp.
+///
+/// `Snapshot` is deliberately NOT in that list: a `Snapshot` is its own run, so
+/// re-driving one would mint a second mover Job and a second kopia snapshot.
+/// That reconciler holds instead (`run_decision` ⇒ `Wait`, log + slow requeue).
+///
+/// The overwrite is only defensible if it is never silent, which is what this
+/// is for. Call it at the reconciler's entry, before the first status write.
+/// (Log, not Event: this fires per reconcile pass and has no transition to
+/// dedupe against; the holds that WEDGE get conditions + Events instead —
+/// `ScheduleRunnable` is the one such gate today.)
+pub fn warn_unreadable_phase(kind: &str, namespace: &str, name: &str, phase: &str) {
+    tracing::warn!(
+        kind,
+        namespace,
+        name,
+        phase,
+        "status.phase is a value this kopiur build does not recognize (a newer operator most \
+         likely wrote it); reconciling anyway and re-deriving the phase from observed state, \
+         which OVERWRITES that value. Finish the operator upgrade so two builds are not \
+         driving this object."
+    );
+}
+
 /// Emit a `Normal` Event on `obj` so an informational message is visible via
 /// `kubectl describe`/`get events`, not only in the controller log. The `Normal`
 /// counterpart to [`publish_warning_event`]: used for expected, non-error

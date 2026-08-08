@@ -24,7 +24,9 @@ use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind, RepositoryRef};
+use kopiur_api::common::{
+    CatalogBounds, ForeignSnapshots, PhaseLabel, RepositoryKind, RepositoryRef,
+};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{ClusterRepository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -246,6 +248,14 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
 
     let name = repo.name_any();
     let api: Api<ClusterRepository> = Api::all(ctx.client.clone());
+
+    // Version skew — see the `Repository` mirror of this block: the reconciler
+    // drives the object and will overwrite a phase it cannot read, so name it first.
+    if let Some(p @ RepositoryPhase::Unknown(_)) =
+        repo.status.as_ref().and_then(|s| s.phase.as_ref())
+    {
+        io::warn_unreadable_phase("ClusterRepository", "", &name, p.label());
+    }
 
     // Deletion: a cluster-scoped owner cannot own its namespaced server children,
     // so owner-ref GC can't reap them — clean up explicitly via the finalizer.

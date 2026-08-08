@@ -315,6 +315,22 @@ pub fn manual_run_request(
     {
         return Ok(None);
     }
+    // Not deduped, and the recorded phase is one this build cannot read: the
+    // request will be re-driven and `status.manualRun.phase` overwritten. Name
+    // it first — the overwrite is the deliberate self-heal for a driving
+    // reconciler (see `io::warn_unreadable_phase`), never a silent one.
+    if let Some(p @ kopiur_api::ManualRunPhase::Unknown(_)) = answered
+        .filter(|m| m.requested_at.as_deref() == Some(raw))
+        .and_then(|m| m.phase.as_ref())
+    {
+        use kopiur_api::common::PhaseLabel;
+        crate::io::warn_unreadable_phase(
+            "Maintenance (manualRun)",
+            maint.namespace().unwrap_or_default().as_str(),
+            &maint.name_any(),
+            p.label(),
+        );
+    }
     // Shared parse (also enforced at admission by the webhook) — one
     // validator, two callers.
     match kopiur_api::maintenance::parse_run_annotations(annotations) {

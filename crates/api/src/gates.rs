@@ -38,6 +38,9 @@ use crate::consts;
 /// // Repository gates live on Repository/ClusterRepository.
 /// assert!(GateScope::Repository.covers_repository());
 /// assert!(!GateScope::Repository.covers_snapshot());
+/// // A schedule-level block lives on the SnapshotSchedule itself.
+/// assert!(GateScope::SnapshotSchedule.covers_snapshot_schedule());
+/// assert!(!GateScope::Snapshot.covers_snapshot_schedule());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GateScope {
@@ -48,6 +51,9 @@ pub enum GateScope {
     Snapshot,
     /// Written on `Repository` and `ClusterRepository` CRs.
     Repository,
+    /// Written on `SnapshotSchedule` CRs only — the schedule itself is blocked,
+    /// as opposed to any individual run being blocked.
+    SnapshotSchedule,
 }
 
 impl GateScope {
@@ -55,7 +61,7 @@ impl GateScope {
     pub fn covers_snapshot(self) -> bool {
         match self {
             Self::SnapshotOrRestore | Self::Snapshot => true,
-            Self::Repository => false,
+            Self::Repository | Self::SnapshotSchedule => false,
         }
     }
 
@@ -63,7 +69,7 @@ impl GateScope {
     pub fn covers_restore(self) -> bool {
         match self {
             Self::SnapshotOrRestore => true,
-            Self::Snapshot | Self::Repository => false,
+            Self::Snapshot | Self::Repository | Self::SnapshotSchedule => false,
         }
     }
 
@@ -72,7 +78,15 @@ impl GateScope {
     pub fn covers_repository(self) -> bool {
         match self {
             Self::Repository => true,
-            Self::SnapshotOrRestore | Self::Snapshot => false,
+            Self::SnapshotOrRestore | Self::Snapshot | Self::SnapshotSchedule => false,
+        }
+    }
+
+    /// Whether a `SnapshotSchedule` can carry a gate of this scope. Exhaustive.
+    pub fn covers_snapshot_schedule(self) -> bool {
+        match self {
+            Self::SnapshotSchedule => true,
+            Self::SnapshotOrRestore | Self::Snapshot | Self::Repository => false,
         }
     }
 }
@@ -293,6 +307,20 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
         reason: consts::REPOSITORY_READ_ONLY_REASON,
         severity: GateSeverity::Warn,
     },
+    // Version skew, one kind removed: a previous run of this schedule sits at a
+    // phase string this build cannot interpret, so it can never be observed to
+    // finish. Under the default `concurrencyPolicy: Forbid` the schedule stops
+    // firing FOREVER while looking perfectly healthy — the concurrency gate is
+    // doing exactly what it was asked to. The out-of-band change that clears it
+    // is finishing the operator rollout (or deleting the wedged Snapshot), which
+    // is squarely "needs a human", so: Fail.
+    StructuralGate {
+        applies_to: GateScope::SnapshotSchedule,
+        condition: consts::SCHEDULE_RUNNABLE_CONDITION,
+        blocked_status: CONDITION_FALSE,
+        reason: consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
+        severity: GateSeverity::Fail,
+    },
 ];
 
 #[cfg(test)]
@@ -485,6 +513,13 @@ mod tests {
                 GateScope::Snapshot,
                 GateSeverity::Warn,
             ),
+            (
+                consts::SCHEDULE_RUNNABLE_CONDITION,
+                CONDITION_FALSE,
+                consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
+                GateScope::SnapshotSchedule,
+                GateSeverity::Fail,
+            ),
         ];
         assert_eq!(
             STRUCTURAL_GATES.len(),
@@ -505,21 +540,25 @@ mod tests {
 
     #[test]
     fn every_scope_classifier_is_consistent() {
-        // Each scope covers at least one kind, and no scope claims both a work
-        // kind and the repository kind (they are read from different lists).
+        // Each scope covers exactly one of the three kind families a consumer
+        // reads from separate lists (work CRs, repositories, schedules), so a
+        // diagnostic can dispatch on scope without double-listing a gate.
         for scope in [
             GateScope::SnapshotOrRestore,
             GateScope::Snapshot,
             GateScope::Repository,
+            GateScope::SnapshotSchedule,
         ] {
             let work = scope.covers_snapshot() || scope.covers_restore();
-            assert!(
-                work || scope.covers_repository(),
-                "{scope:?} covers no kind at all"
-            );
-            assert!(
-                !(work && scope.covers_repository()),
-                "{scope:?} straddles work and repository kinds"
+            let families = [
+                work,
+                scope.covers_repository(),
+                scope.covers_snapshot_schedule(),
+            ];
+            assert_eq!(
+                families.iter().filter(|f| **f).count(),
+                1,
+                "{scope:?} must cover exactly one kind family, got {families:?}"
             );
         }
     }

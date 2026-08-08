@@ -284,6 +284,19 @@ pub const MOVER_PERMITTED_CONDITION: &str = "MoverPermitted";
 /// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False`.
 pub const PRIVILEGED_MOVER_NOT_PERMITTED_REASON: &str = "PrivilegedMoverNotPermitted";
 
+/// `SnapshotSchedule` condition recording whether the schedule is able to fire
+/// its next slot. Set `False` (with [`BLOCKED_ON_UNREADABLE_RUN_REASON`]) when
+/// the concurrency gate is held by a `Snapshot` whose `status.phase` this build
+/// cannot interpret.
+pub const SCHEDULE_RUNNABLE_CONDITION: &str = "ScheduleRunnable";
+/// `reason`/Event reason for [`SCHEDULE_RUNNABLE_CONDITION`] = `False`: a
+/// previous run of this schedule sits at a phase string written by a NEWER
+/// kopiur, so this build can never observe it reach a terminal phase. Under the
+/// default `concurrencyPolicy: Forbid` that stops the schedule permanently, and
+/// nothing about the `SnapshotSchedule` itself would otherwise say so — the
+/// silent-wedge shape of #359, one kind removed.
+pub const BLOCKED_ON_UNREADABLE_RUN_REASON: &str = "BlockedOnUnreadableRun";
+
 /// `Snapshot` condition recording whether its repository accepts writes (§11). Set
 /// `False` (with [`REPOSITORY_READ_ONLY_REASON`]) when a backup is refused because
 /// the repository is `mode: ReadOnly`.

@@ -545,7 +545,15 @@ impl ManualRunMode {
     }
 }
 
-/// Lifecycle of a manual run. Closed enum.
+/// Lifecycle of a manual run.
+///
+/// **Closed on the wire, open on decode.** The CRD schema still admits exactly
+/// `Running`/`Succeeded`/`Failed` — the apiserver rejects anything else on
+/// every write — but [`Self::Unknown`] exists so a value written by a NEWER
+/// kopiur decodes instead of failing the typed watch for the whole Kind. The
+/// schema `description` this type publishes deliberately still reads "Closed
+/// enum." and is frozen there; see `phase_serde!` on why the rustdoc and the
+/// schema text diverge.
 ///
 /// ```
 /// use kopiur_api::maintenance::ManualRunPhase;

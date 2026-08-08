@@ -77,13 +77,55 @@ pub trait PhaseLabel: Clone + PartialEq + 'static {
 /// an older CLI then lists — must never fail the typed watch/list for the whole
 /// Kind. One un-decodable object would otherwise wedge every other object's
 /// reconciliation (and, for `kubectl kopiur doctor`, turn a real problem into a
-/// silent green). `Unknown` is never terminal, never schedulable, never
-/// reapable, and never a success: consumers hold and surface it loudly.
+/// silent green).
 ///
-/// `$desc` is the CRD-schema `description`. It is spelled out here rather than
-/// taken from the doc comment because a manual `JsonSchema` impl cannot see doc
-/// comments; keep it byte-identical to the enum's summary line or
-/// `mise run gen-check` will (correctly) fail.
+/// # What consumers do with `Unknown` — a deliberate three-way split
+///
+/// `Unknown` is never terminal, never schedulable, never reapable, and never a
+/// success. What follows from that is NOT uniform, and the differences are the
+/// point rather than an oversight:
+///
+/// 1. **Read-only classifications HOLD.** Anything deciding "is this finished /
+///    reapable / retention-eligible / a success" answers *no*, and stays out of
+///    every set whose members get deleted or whose absence silences an alert.
+///    The CLI's `--wait` paths keep waiting rather than exiting 0 or 1 on an
+///    outcome they cannot substantiate.
+/// 2. **Reconcilers whose re-drive is IDEMPOTENT self-heal by overwriting.**
+///    `Restore` (its source is pinned in `status.resolved` and never
+///    re-resolved, so re-driving restores the same snapshot to the same
+///    target), `Repository`/`ClusterRepository` (connect is idempotent), and a
+///    `Maintenance` manual run (its Job name is keyed on the request timestamp)
+///    all re-derive the phase from observed state and write it, replacing the
+///    value they could not read. Parking instead would strand the object with
+///    no way out — remember the fallback also catches legacy stored values that
+///    no future upgrade will ever explain. Each names the phase first via the
+///    controller's `io::warn_unreadable_phase`: deliberate, never silent.
+/// 3. **Reconcilers whose re-drive would DUPLICATE irreversible work hold.**
+///    `Snapshot` is the one: a `Snapshot` IS its run, and re-driving one mints a
+///    second mover Job and a second kopia snapshot. That is the exact hazard the
+///    one-shot discipline exists for, so the reconciler holds (log + slow
+///    requeue) instead. Idempotence, not read-vs-write, is what separates (2)
+///    from (3).
+///
+/// A fourth case is created by (3) composing with a fail-closed gate: a
+/// `SnapshotSchedule` whose concurrency gate is held by an `Unknown`-phase run
+/// stops firing permanently under `concurrencyPolicy: Forbid`, and neither the
+/// schedule nor the run looks unhealthy. That one is not resolved by weakening
+/// the hold (the hold is right) but by SURFACING it: a registered structural
+/// gate ([`crate::gates::STRUCTURAL_GATES`], `ScheduleRunnable=False`) plus a
+/// Warning Event — a condition rather than a log, because unlike a per-pass
+/// warning it has a real transition to record and a diagnostic to feed.
+///
+/// # `$desc`
+///
+/// The CRD-schema `description`. It is spelled out here rather than taken from
+/// the doc comment because a manual `JsonSchema` impl cannot see doc comments;
+/// keep it byte-identical to what the derive used to emit or `mise run
+/// gen-check` will (correctly) fail. It therefore deliberately DIVERGES from
+/// the enum's rustdoc: the rustdoc is free to explain `Unknown` to Rust
+/// readers, while `$desc` must stay frozen at the pre-`Unknown` wording,
+/// because changing it would rewrite the published CRD for no behavioral
+/// reason. Treat `$desc` as a schema artifact, not documentation.
 ///
 /// Crate-internal on purpose (`pub(crate) use` below, not `#[macro_export]`):
 /// it expands to impls of THIS crate's traits for THIS crate's enums and would

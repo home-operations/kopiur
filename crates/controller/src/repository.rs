@@ -22,7 +22,9 @@ use kube::runtime::controller::Action;
 use kube::{Api, Resource, ResourceExt};
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{CatalogBounds, ForeignSnapshots, RepositoryKind, RepositoryRef};
+use kopiur_api::common::{
+    CatalogBounds, ForeignSnapshots, PhaseLabel, RepositoryKind, RepositoryRef,
+};
 use kopiur_api::repository::resolve_index_blob_warn_threshold;
 use kopiur_api::{Repository, RepositoryPhase, validate};
 use kopiur_kopia::{ConnectSpec, SnapshotListEntry};
@@ -117,6 +119,18 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
         .uid()
         .ok_or_else(|| Error::Invariant("Repository has no uid".into()))?;
     let api: Api<Repository> = Api::namespaced(ctx.client.clone(), &namespace);
+
+    // Version skew: a phase written by a NEWER kopiur. This reconciler DRIVES the
+    // object — every path below re-derives the phase from the observed connect and
+    // overwrites it — which is the right self-heal (a value we cannot read must not
+    // park a repository forever), but it must be named before it happens. The
+    // read-only classifications that consume this phase (`is_terminal_for_generation`,
+    // `breaker_open_since`) all hold instead; see `io::warn_unreadable_phase`.
+    if let Some(p @ RepositoryPhase::Unknown(_)) =
+        repo.status.as_ref().and_then(|s| s.phase.as_ref())
+    {
+        io::warn_unreadable_phase("Repository", &namespace, &name, p.label());
+    }
 
     // §14(e): a suspended Repository skips connect/bootstrap AND maintenance
     // projection entirely — a declarative pause. Surface it via a condition and back

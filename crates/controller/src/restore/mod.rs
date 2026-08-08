@@ -16,7 +16,7 @@ use std::sync::Arc;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::RepositoryRef;
+use kopiur_api::common::{PhaseLabel, RepositoryRef};
 use kopiur_api::restore::ResolvedRestore;
 use kopiur_api::snapshot::Snapshot;
 use kopiur_api::{
@@ -213,7 +213,23 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         Some(phase) if phase_is_terminal_at_guard(phase, state) => {
             return steady_terminal_restore(restore, &api, &name, phase).await;
         }
-        _ => {}
+        // A phase this build cannot read is NOT terminal, so the reconcile
+        // proceeds and will re-derive (and overwrite) the phase from the mover
+        // Job below. That self-heal is the right default — the resolution is
+        // PINNED in `status.resolved` and never re-resolved, so re-driving
+        // restores the same snapshot into the same target rather than
+        // retargeting — but it must never be silent.
+        Some(phase @ RestorePhase::Unknown(_)) => {
+            io::warn_unreadable_phase("Restore", &namespace, &name, phase.label());
+        }
+        Some(
+            RestorePhase::Pending
+            | RestorePhase::Resolving
+            | RestorePhase::Restoring
+            | RestorePhase::Completed
+            | RestorePhase::Failed,
+        )
+        | None => {}
     }
 
     // §3: pin the resolved source kind to status so the SOURCE printer column shows

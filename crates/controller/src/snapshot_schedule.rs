@@ -42,6 +42,14 @@ use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io;
 
+/// Requeue while a `SnapshotSchedule` is held by a run whose phase this build
+/// cannot read (`ScheduleRunnable=False`). The ordinary concurrency wait
+/// requeues at the 1s floor because it expects the run to finish in seconds;
+/// this hold cannot clear until an operator acts, so a 1s cadence would spin the
+/// reconciler (and re-log) forever. 10 min keeps the warning recurring often
+/// enough to be noticed without becoming the noise.
+const UNREADABLE_RUN_HOLD_REQUEUE: StdDuration = StdDuration::from_secs(10 * 60);
+
 /// Parse Go-style duration strings used in the CRD (`30m`, `1h`, `90s`).
 /// Re-exported from `kopiur-api` so the admission validator and every
 /// reconciler (schedules, maintenance, replication, restore `waitTimeout`)
@@ -320,8 +328,10 @@ pub fn should_run_on_create(schedule: &ScheduleSpec, already_ran: bool) -> bool 
 fn schedule_ready_status(
     schedule: &SnapshotSchedule,
     ambiguity: Option<&TimezoneAmbiguity>,
+    blocked: Option<&UnreadableRun>,
 ) -> (serde_json::Value, i64) {
     use crate::consts::{
+        BLOCKED_ON_UNREADABLE_RUN_REASON, SCHEDULE_RUNNABLE_CONDITION,
         SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION, SCHEDULE_TIMEZONE_AMBIGUOUS_REASON,
         SCHEDULE_TIMEZONE_RESOLVED_REASON,
     };
@@ -365,7 +375,53 @@ fn schedule_ready_status(
         &tz_message,
         Some(generation),
     );
+    // Upsert the runnable gate either way, so it CLEARS the moment the schedule
+    // can fire again (the blocking Snapshot was deleted, or this build learned
+    // the phase). A registered structural gate that could only ever be set would
+    // be worse than none — doctor would report a resolved outage forever.
+    let (runnable_reason, runnable_message) = match blocked {
+        Some(b) => (
+            BLOCKED_ON_UNREADABLE_RUN_REASON,
+            format!(
+                "Snapshot `{}` holds this schedule's concurrency gate at phase `{}`, which this \
+                 kopiur build does not recognize — most likely a newer operator wrote it. This \
+                 build can never observe that run finish, so under \
+                 `concurrencyPolicy: Forbid` NO FURTHER BACKUPS WILL RUN for this schedule. \
+                 Finish the operator upgrade (or delete Snapshot `{}` if the run is genuinely \
+                 over) to release the gate.",
+                b.snapshot, b.phase, b.snapshot
+            ),
+        ),
+        None => (
+            "Runnable",
+            "the schedule's concurrency gate is clear".to_string(),
+        ),
+    };
+    let conditions = io::upsert_condition(
+        &conditions,
+        SCHEDULE_RUNNABLE_CONDITION,
+        blocked.is_none(),
+        runnable_reason,
+        &runnable_message,
+        Some(generation),
+    );
     (serde_json::json!(conditions), generation)
+}
+
+/// Whether `status.conditions` already records the blocked-on-unreadable-run
+/// gate. The transition guard for its Warning Event: this branch re-runs on
+/// every hold requeue, and an Event per pass would bury the cluster's event log.
+fn recorded_blocked_on_unreadable(schedule: &SnapshotSchedule) -> bool {
+    schedule
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == crate::consts::SCHEDULE_RUNNABLE_CONDITION)
+        .is_some_and(|c| {
+            c.status == "False" && c.reason == crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON
+        })
 }
 
 /// Reconcile a `SnapshotSchedule`.
@@ -470,7 +526,14 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // freshly-pinned slot fires when due. The equal case falls through untouched.
         if needs_recompute {
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
-            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            // Re-pinning for a timezone change CLEARS the runnable gate, and that
+            // is correct rather than merely convenient: this path abandons the
+            // stale slot and pins a fresh one in the future, so at this instant
+            // there is no due slot for anything to hold shut. If the blocker is
+            // still there when the new slot comes due, the concurrency path below
+            // re-sets the gate (and re-Events) then.
+            let (conditions, generation) =
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -489,8 +552,18 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
         // Is a run currently active (an unfinished Snapshot owned by this schedule)?
-        let run_active = active_run_exists(ctx, &namespace, &sched_name).await?;
-        let disposition = slot_disposition(&schedule.spec.schedule, slot, now, run_active);
+        let runs = active_runs(ctx, &namespace, &sched_name).await?;
+        let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
+        // The blocker only MATTERS when it is actually holding a due slot shut:
+        // under `concurrencyPolicy: Allow` an unreadable run does not block, and
+        // a suspended or not-yet-due schedule is not being held by anything.
+        // Computed once here so every status write below either sets or CLEARS
+        // the `ScheduleRunnable` gate from the same fact.
+        let blocker = runs.unreadable.as_ref().filter(|_| {
+            disposition == SlotDisposition::Wait
+                && !schedule.spec.schedule.suspend
+                && should_fire_now(slot, now)
+        });
         // A slot expired past `startingDeadlineSeconds` must re-pin forward, or the
         // wait branch below computes `(slot - now)` for a past instant and requeues
         // at the 1s floor forever with the pin stuck on the expired slot. Skip it
@@ -498,7 +571,8 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // pin the next upcoming slot.
         if disposition == SlotDisposition::SkipExpired {
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
-            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            let (conditions, generation) =
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -541,7 +615,8 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 .filter(|_| !fanned_out)
                 .map(|_| scheduled_backup_name(&sched_name, slot));
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
-            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            let (conditions, generation) =
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -557,16 +632,70 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
+        // A DUE slot held shut by a run this build cannot read. Unlike every other
+        // `Wait`, this one never resolves on its own: `classify_active_runs` fails
+        // closed on an unreadable phase (correctly — it may be a live run), but this
+        // build can never see that phase become terminal, so under the default
+        // `concurrencyPolicy: Forbid` the schedule stops firing PERMANENTLY while
+        // every object involved still looks healthy. That is #359's shape one kind
+        // removed, so it is surfaced on the SnapshotSchedule itself: a registered
+        // structural gate (`ScheduleRunnable=False`) plus a one-shot Warning Event.
+        if let Some(blocked) = blocker {
+            let (conditions, generation) =
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), Some(blocked));
+            io::patch_status(
+                &api,
+                &sched_name,
+                serde_json::json!({
+                    "observedGeneration": generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+            // Transition-guarded: this branch re-runs on every hold requeue, and
+            // one Event per pass would bury the namespace's event log.
+            if !recorded_blocked_on_unreadable(schedule) {
+                io::publish_warning_event(
+                    ctx,
+                    schedule,
+                    crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
+                    "FinishOperatorUpgrade",
+                    &format!(
+                        "no further backups will run: Snapshot `{}` holds the concurrency gate \
+                         at phase `{}`, which this kopiur build does not recognize (a newer \
+                         operator most likely wrote it). Finish the operator upgrade, or delete \
+                         that Snapshot if its run is genuinely over.",
+                        blocked.snapshot, blocked.phase
+                    ),
+                )
+                .await;
+            }
+            tracing::warn!(
+                namespace = %namespace,
+                schedule = %sched_name,
+                blocking_snapshot = %blocked.snapshot,
+                phase = %blocked.phase,
+                "SnapshotSchedule is blocked: a previous run sits at a phase this operator \
+                 build does not recognize, so the concurrency gate can never clear here"
+            );
+            return Ok(Action::requeue(UNREADABLE_RUN_HOLD_REQUEUE));
+        }
+
         // Slot not yet due: wait until it is. The ambiguity condition is otherwise
         // only rewritten on a status-patching path, so a resolved (or newly-arisen)
         // ambiguity could linger until the next fire. When resolution succeeded and
         // the freshly-computed state differs from what's recorded, patch just the
         // conditions; the equality guard keeps steady state patch-free, and a Degraded
         // pass is skipped entirely (it asserts nothing about ambiguity).
+        // The runnable gate rides along for the same reason: `blocker` is `None`
+        // here, so a schedule that was blocked and is now free clears the gate on
+        // the first pass after the blocking Snapshot goes away.
         if matches!(resolution, TimezoneResolution::Resolved { .. })
-            && tz_ambiguity.is_some() != recorded_tz_ambiguous(schedule)
+            && (tz_ambiguity.is_some() != recorded_tz_ambiguous(schedule)
+                || recorded_blocked_on_unreadable(schedule))
         {
-            let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+            let (conditions, generation) =
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -611,7 +740,8 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             .as_ref()
             .filter(|_| !fanned_out)
             .map(|_| scheduled_backup_name(&sched_name, anchor));
-        let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+        // First reconcile: no prior run of this schedule exists, so no blocker.
+        let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
         io::patch_status(
             &api,
             &sched_name,
@@ -629,7 +759,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     }
 
     // No runOnCreate: pin the next slot without firing (GitOps-friendly default).
-    let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref());
+    let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
     io::patch_status(
         &api,
         &sched_name,
@@ -650,13 +780,40 @@ fn scheduled_backup_name(schedule: &str, slot: DateTime<Utc>) -> String {
     format!("{schedule}-{}", slot.format("%Y%m%d%H%M%S"))
 }
 
-/// Whether an unfinished Snapshot created by this schedule still exists.
-async fn active_run_exists(ctx: &Context, namespace: &str, schedule: &str) -> Result<bool> {
+/// A run of this schedule that holds the concurrency gate open on a phase string
+/// THIS build cannot interpret — i.e. version skew, written by a newer kopiur.
+///
+/// Named separately from the plain "a run is active" bool because the two have
+/// opposite futures: an ordinary active run reaches a terminal phase and
+/// releases the gate, whereas this one never can under this build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableRun {
+    /// `metadata.name` of the blocking `Snapshot`.
+    pub snapshot: String,
+    /// Its `status.phase` verbatim, so the operator sees the actual string.
+    pub phase: String,
+}
+
+/// The concurrency gate's answer: whether any unfinished run of this schedule
+/// exists, plus — when the blocker is a phase this build cannot read — which one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActiveRuns {
+    /// An unfinished `Snapshot` owned by this schedule exists.
+    pub active: bool,
+    /// The first blocker whose phase is `SnapshotPhase::Unknown`, if any.
+    pub unreadable: Option<UnreadableRun>,
+}
+
+/// **Pure.** Classify this schedule's `Snapshot` children into [`ActiveRuns`].
+/// Split from the `Api::list` so the concurrency gate — including the
+/// version-skew blocker it must surface — is unit-tested without a cluster.
+pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
     use kopiur_api::SnapshotPhase;
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    let items = api.list(&lp).await?.items;
-    Ok(items.iter().any(|b| {
+    let mut out = ActiveRuns::default();
+    for b in items {
+        if b.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
         // Exhaustive: "unfinished" is the complement of the terminal set here,
         // so a new phase must state which side of the schedule's concurrency
         // gate it falls on before it compiles.
@@ -672,11 +829,29 @@ async fn active_run_exists(ctx: &Context, namespace: &str, schedule: &str) -> Re
             // Fail CLOSED: an unreadable phase may well be an in-flight run
             // written by a newer operator, and starting a second run for the
             // same schedule concurrently is the outcome this gate exists to
-            // prevent.
-            Some(SnapshotPhase::Unknown(_)) => true,
+            // prevent. But failing closed here can never clear on its own — see
+            // `unreadable` and the `ScheduleRunnable` gate that surfaces it.
+            Some(SnapshotPhase::Unknown(raw)) => {
+                if out.unreadable.is_none() {
+                    out.unreadable = Some(UnreadableRun {
+                        snapshot: b.name_any(),
+                        phase: raw.clone(),
+                    });
+                }
+                true
+            }
         };
-        unfinished && b.metadata.deletion_timestamp.is_none()
-    }))
+        out.active |= unfinished;
+    }
+    out
+}
+
+/// Whether an unfinished Snapshot created by this schedule still exists, and
+/// whether the blocker is one this build cannot interpret.
+async fn active_runs(ctx: &Context, namespace: &str, schedule: &str) -> Result<ActiveRuns> {
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
+    Ok(classify_active_runs(&api.list(&lp).await?.items))
 }
 
 /// The terminal time used to order Failed snapshots for pruning: `status.timing.endTime`
@@ -1196,6 +1371,7 @@ pub fn error_policy(obj: Arc<SnapshotSchedule>, err: &Error, ctx: Arc<Context>) 
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use kopiur_api::SnapshotPhase;
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap()
@@ -1928,5 +2104,191 @@ mod tests {
         );
         // Limit ≥ count → no-op.
         assert!(failed_snapshots_to_prune(&all, 10).is_empty());
+    }
+
+    // --- concurrency gate: the version-skew livelock (#359 class) ------------
+
+    fn run_in_phase(name: &str, phase: Option<SnapshotPhase>, deleting: bool) -> Snapshot {
+        let mut s = Snapshot::new(
+            name,
+            SnapshotSpec {
+                source: None,
+                policy_ref: None,
+                tags: None,
+                failure_policy: None,
+                deletion_policy: None,
+                on_schedule_delete: None,
+                pin: false,
+                description: None,
+            },
+        );
+        s.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            phase,
+            ..Default::default()
+        });
+        if deleting {
+            s.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ));
+        }
+        s
+    }
+
+    #[test]
+    fn classify_active_runs_matches_the_old_unfinished_set() {
+        // Terminal children never hold the gate.
+        for terminal in [
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+            SnapshotPhase::Unchanged,
+        ] {
+            let runs = classify_active_runs(&[run_in_phase("a", Some(terminal.clone()), false)]);
+            assert_eq!(runs, ActiveRuns::default(), "{terminal:?}");
+        }
+        // In-flight (and status-less) children do.
+        for unfinished in [
+            None,
+            Some(SnapshotPhase::Pending),
+            Some(SnapshotPhase::Running),
+        ] {
+            let runs = classify_active_runs(&[run_in_phase("a", unfinished.clone(), false)]);
+            assert!(runs.active, "{unfinished:?}");
+            assert_eq!(runs.unreadable, None, "only an Unknown phase is unreadable");
+        }
+        // A terminating child is excluded outright, whatever its phase.
+        assert_eq!(
+            classify_active_runs(&[run_in_phase("a", Some(SnapshotPhase::Running), true)]),
+            ActiveRuns::default()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_phase_holds_the_gate_and_is_named() {
+        // Fails CLOSED (it may be a live run under a newer operator) — but this
+        // build can never see it finish, so the blocker must be NAMED, not just
+        // counted, or the schedule stops firing with nothing saying why (#359).
+        let runs = classify_active_runs(&[run_in_phase(
+            "nightly-20260807",
+            Some(SnapshotPhase::Unknown("Quiescing".into())),
+            true, // terminating: excluded, so this one must NOT register
+        )]);
+        assert_eq!(
+            runs,
+            ActiveRuns::default(),
+            "a terminating child is skipped"
+        );
+
+        let runs = classify_active_runs(&[
+            run_in_phase("finished", Some(SnapshotPhase::Succeeded), false),
+            run_in_phase(
+                "nightly-20260807",
+                Some(SnapshotPhase::Unknown("Quiescing".into())),
+                false,
+            ),
+        ]);
+        assert!(runs.active);
+        assert_eq!(
+            runs.unreadable,
+            Some(UnreadableRun {
+                snapshot: "nightly-20260807".into(),
+                phase: "Quiescing".into(),
+            })
+        );
+
+        // Under the default `Forbid` this is what stops the schedule dead: the
+        // gate says Wait, and no future reconcile of THIS build can change that.
+        let spec = schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Forbid, None);
+        assert_eq!(
+            slot_disposition(
+                &spec,
+                at(2026, 8, 4, 3, 0),
+                at(2026, 8, 4, 3, 5),
+                runs.active
+            ),
+            SlotDisposition::Wait
+        );
+        // `Allow` declares overlap, so an unreadable run does not block it — the
+        // reconciler's `blocker` filter keys on the disposition for exactly this.
+        let allow = schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Allow, None);
+        assert_eq!(
+            slot_disposition(
+                &allow,
+                at(2026, 8, 4, 3, 0),
+                at(2026, 8, 4, 3, 5),
+                runs.active
+            ),
+            SlotDisposition::Fire
+        );
+    }
+
+    #[test]
+    fn the_runnable_gate_is_set_and_cleared_from_the_same_fact() {
+        use crate::consts::{BLOCKED_ON_UNREADABLE_RUN_REASON, SCHEDULE_RUNNABLE_CONDITION};
+        let mut sched = SnapshotSchedule::new(
+            "nightly",
+            kopiur_api::SnapshotScheduleSpec {
+                policy_ref: None,
+                policy_selector: None,
+                schedule: schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Forbid, None),
+                failed_jobs_history_limit: None,
+                deletion: None,
+            },
+        );
+        sched.metadata.namespace = Some("apps".into());
+        sched.metadata.generation = Some(2);
+
+        let blocked = UnreadableRun {
+            snapshot: "nightly-20260807".into(),
+            phase: "Quiescing".into(),
+        };
+        let (conditions, _) = schedule_ready_status(&sched, None, Some(&blocked));
+        let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(conditions).unwrap();
+        let gate = conds
+            .iter()
+            .find(|c| c.type_ == SCHEDULE_RUNNABLE_CONDITION)
+            .expect("the runnable gate is written");
+        assert_eq!(gate.status, "False");
+        assert_eq!(gate.reason, BLOCKED_ON_UNREADABLE_RUN_REASON);
+        // The message must name BOTH the blocking Snapshot and the raw phase —
+        // without them the operator cannot act on it.
+        assert!(
+            gate.message.contains("nightly-20260807"),
+            "{}",
+            gate.message
+        );
+        assert!(gate.message.contains("Quiescing"), "{}", gate.message);
+
+        // The registry row and the writer agree — the whole point of #359's
+        // shared-by-construction fix. (M3's doctor reads the same row.)
+        let row = kopiur_api::gates::STRUCTURAL_GATES
+            .iter()
+            .find(|g| g.matches(&gate.type_, &gate.status, &gate.reason))
+            .expect("the gate this reconciler writes must be registered");
+        assert!(row.applies_to.covers_snapshot_schedule());
+
+        // Clearing: the SAME function with no blocker flips it back, so a
+        // resolved outage does not read as permanent.
+        sched.status = Some(kopiur_api::SnapshotScheduleStatus {
+            conditions: conds,
+            ..Default::default()
+        });
+        assert!(recorded_blocked_on_unreadable(&sched));
+        let (cleared, _) = schedule_ready_status(&sched, None, None);
+        let cleared: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(cleared).unwrap();
+        let gate = cleared
+            .iter()
+            .find(|c| c.type_ == SCHEDULE_RUNNABLE_CONDITION)
+            .expect("still present, just True");
+        assert_eq!(gate.status, "True");
+        sched.status = Some(kopiur_api::SnapshotScheduleStatus {
+            conditions: cleared,
+            ..Default::default()
+        });
+        assert!(!recorded_blocked_on_unreadable(&sched));
     }
 }
