@@ -1,7 +1,9 @@
 # Reviewed exemptions for `cargo xtask check-phases` (crates/xtask/src/phases.rs).
 #
-# The ratchet flags four constructs that opt out of kopiur's exhaustive-match
-# guarantee WITHOUT the compiler ever saying so:
+# The ratchet has five rules: four constructs that opt out of kopiur's
+# exhaustive-match guarantee WITHOUT the compiler ever saying so (A, B, D, E),
+# plus one drift class with no construct at all (C) — the same taxonomy the
+# module doc in crates/xtask/src/phases.rs spells out:
 #
 #   Rule A  `matches!(…)` over a phase enum — an implicit `_ => false`.
 #           `kubectl kopiur doctor` classified stuck work this way, so a wedged

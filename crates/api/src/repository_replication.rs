@@ -136,6 +136,43 @@ pub enum RepositoryReplicationPhase {
     Unknown(String),
 }
 
+impl RepositoryReplicationPhase {
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch (#359, defect 3).
+    ///
+    /// Same narrow contract as [`SnapshotPhase::is_unknown`](crate::SnapshotPhase::is_unknown):
+    /// `true` means only "this string is not a phase this binary knows", never
+    /// "unusual" or "not one I handle". A canonical variant added to this enum
+    /// later is by definition **not** the sentinel, which is why the `match` is
+    /// written out exhaustively rather than left as a `matches!` — the compiler,
+    /// not a reviewer, is what forces the new variant to answer.
+    ///
+    /// The reconciler uses it for its entry-time version-skew warning
+    /// (`io::warn_unreadable_phase`): this reconciler DRIVES the object and
+    /// re-derives the phase every pass, so an unreadable value is overwritten —
+    /// correct self-heal, but never silent.
+    ///
+    /// ```
+    /// use kopiur_api::RepositoryReplicationPhase;
+    ///
+    /// assert!(RepositoryReplicationPhase::Unknown("Verifying".into()).is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Pending.is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Replicating.is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Suspended.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending
+            | Self::Replicating
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Suspended => false,
+        }
+    }
+}
+
 crate::common::phase_serde!(
     RepositoryReplicationPhase,
     "Lifecycle phase of a replication."

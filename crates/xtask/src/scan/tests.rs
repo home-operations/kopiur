@@ -150,6 +150,24 @@ fn cfg_test_item_end_races_the_semicolon_against_the_brace() {
 }
 
 #[test]
+fn an_escaped_quote_char_literal_ends_where_it_really_ends() {
+    // `'\''` is the one char literal whose BODY is a quote. Ending it at that
+    // body leaves its real terminator to be re-read as the opening of a fresh
+    // literal, which then swallows the byte after it — here the `}` that closes
+    // the module, so the item's extent came up short and the tail of a test
+    // module leaked back into the production corpus.
+    assert_eq!(
+        cfg_test_item_end(" mod t { let c = ('\\'','}'); }"),
+        Some(30)
+    );
+    // The neighbouring escape forms must keep working: a one-char escape, a
+    // unicode escape whose own braces must not count, and the byte spelling.
+    assert_eq!(cfg_test_item_end(" mod t { let c = '\\n'; }"), Some(24));
+    assert_eq!(cfg_test_item_end(" mod t { let c = '\\u{7d}'; }"), Some(28));
+    assert_eq!(cfg_test_item_end(" mod t { let c = b'\\''; }"), Some(25));
+}
+
+#[test]
 fn collapsing_strip_cfg_test_drops_the_tail_only_when_truly_unterminated() {
     // The documented conservative fallback, now reached only by invalid source.
     assert_eq!(

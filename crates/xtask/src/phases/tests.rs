@@ -140,6 +140,28 @@ fn rule_a_ignores_a_char_literal_paren_in_the_arguments() {
 }
 
 #[test]
+fn an_escaped_quote_char_literal_does_not_end_one_char_early() {
+    fn cs(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+    // `'\''` is the one char literal whose BODY is a quote. Ending it there
+    // hands its real terminator back to the scanner as the opening of a new
+    // literal, which then eats the char after it — below, the `)` that closes
+    // the argument group, so Rule A's extraction stops mid-`matches!`.
+    assert_eq!(char_lit_end(&cs("'\\''"), 0), Some(3));
+    assert_eq!(char_lit_end(&cs("'\\n'"), 0), Some(3));
+    assert_eq!(char_lit_end(&cs("'\\u{7d}'"), 0), Some(7));
+    assert_eq!(char_lit_end(&cs("'a'"), 0), Some(2));
+    assert_eq!(
+        char_lit_end(&cs("'a"), 0),
+        None,
+        "a lifetime, not a literal"
+    );
+    // The consequence, in the balanced scan every rule leans on.
+    assert_eq!(balanced(&cs("('\\'',')')"), 0, '(', ')'), Some(10));
+}
+
+#[test]
 fn rule_a_recognizes_all_three_macro_delimiters() {
     // `matches![…]` / `matches!{…}` are identical to the compiler, so a rule
     // that only knew `(` could be sidestepped by a formatting choice.
@@ -607,7 +629,7 @@ fn an_entry_written_with_different_whitespace_still_covers() {
 fn the_api_phase_enum_list_matches_the_real_source() {
     // The self-ratchet: a SIXTH CR phase enum cannot be added without this
     // failing, because a phase enum the list does not name is a phase enum none
-    // of the four rules cover.
+    // of the five rules cover.
     let discovered = discover_api_phase_enums().expect("api sources");
     let expected: BTreeSet<String> = API_PHASE_ENUMS.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(discovered, expected);

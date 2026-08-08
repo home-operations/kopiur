@@ -383,9 +383,16 @@ fn trivia_end(b: &[u8], i: usize) -> Option<usize> {
             Some(b.len())
         }
         // Char literal — but `'a` is a lifetime, so require the closing quote.
+        // (A byte literal `b'…'` arrives here too: the `b` is ordinary code and
+        // the next byte is this quote.)
         b'\'' => {
             if b.get(i + 1) == Some(&b'\\') {
-                return (i + 2..=(i + 12).min(b.len().saturating_sub(1)))
+                // From `i + 3`, not `i + 2`: an escape body is at least one byte
+                // and starts at `i + 2`, so the terminator is never there — and
+                // for `'\''` / `b'\''` the body IS a quote, which a scan from
+                // `i + 2` would mistake for the close, ending the literal one
+                // byte early and re-reading its real terminator as a new one.
+                return (i + 3..=(i + 12).min(b.len().saturating_sub(1)))
                     .find(|&j| b.get(j) == Some(&b'\''))
                     .map(|j| j + 1);
             }

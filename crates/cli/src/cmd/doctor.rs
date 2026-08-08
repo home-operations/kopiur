@@ -513,8 +513,15 @@ fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
                     GateSeverity::Warn => warns.push(line),
                 }
             }
+            // The hint is inlined rather than left to a `fix:` line: this is the
+            // only unregistered-gate report whose finding carries no per-class
+            // fix (the Warn outcome is just these lines, and when a Fail is also
+            // present they are folded into ITS fix, which is about condition
+            // messages). Without it the reader is told about the skew and not
+            // what to do about it. The stuck-work path says the same thing in
+            // `StuckKind::fix`, so it is not repeated in the shared describer.
             Some(GateHit::Unregistered(cond)) => warns.push(format!(
-                "{}: {}",
+                "{}: {} — {UPGRADE_PLUGIN_FIX}",
                 r.label(),
                 describe_unregistered_gate(cond)
             )),
@@ -2045,6 +2052,9 @@ mod tests {
             panic!("an unregistered repository gate must warn");
         };
         assert!(msg.contains("SomeFutureHold"), "{msg}");
+        // Naming the skew without naming the remedy is half a report: this Warn
+        // carries no `fix:` line of its own, so the upgrade hint has to be in it.
+        assert!(msg.contains(UPGRADE_PLUGIN_FIX), "{msg}");
     }
 
     #[test]

@@ -394,7 +394,14 @@ fn char_lit_end(c: &[char], i: usize) -> Option<usize> {
     }
     if c.get(i + 1) == Some(&'\\') {
         // `'\n'`, `'\''`, `'\u{1F600}'` — bounded scan for the close.
-        return (i + 2..=(i + 12).min(c.len().saturating_sub(1)))
+        //
+        // The scan starts at `i + 3`, not `i + 2`, and that is what makes the
+        // escaped quote `'\''` work: an escape body is at least one char and
+        // begins at `i + 2`, so the terminator can never be there — but for
+        // `'\''` the body IS a quote, and a scan from `i + 2` would stop on it
+        // and report the literal one char short, leaving the real terminator to
+        // be re-read as the start of a fresh literal.
+        return (i + 3..=(i + 12).min(c.len().saturating_sub(1)))
             .find(|&j| c.get(j) == Some(&'\''));
     }
     (c.get(i + 2) == Some(&'\'')).then_some(i + 2)

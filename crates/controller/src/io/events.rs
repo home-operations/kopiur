@@ -82,6 +82,8 @@ pub async fn publish_warning_event<K>(
 ///   re-resolved, so a re-drive restores the same snapshot to the same target.
 /// - `Repository` / `ClusterRepository` — connect is idempotent.
 /// - `Maintenance` manual run — the Job name is keyed on the request timestamp.
+/// - `RepositoryReplication` — the Job name is keyed on the due slot, so a
+///   re-drive adopts the in-flight run instead of minting a second one.
 ///
 /// `Snapshot` is deliberately NOT in that list: a `Snapshot` is its own run, so
 /// re-driving one would mint a second mover Job and a second kopia snapshot.

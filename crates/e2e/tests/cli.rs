@@ -1181,8 +1181,9 @@ async fn cli_doctor_fails_on_blocked_on_grant() {
         "the gate the CLI matches on is identified by its reason: {cond}"
     );
 
-    // ... and doctor must say so, immediately. Before the fix this printed nine
-    // green checks and exited 0 — the exact #359 symptom.
+    // ... and doctor must say so, immediately. Before the fix this printed eight
+    // green checks and exited 0 — the exact #359 symptom. (Eight, not nine: the
+    // `no recent failed snapshots/restores` check is added by this same change.)
     let out = run_cli(&["-n", APP_NS, "doctor", "--stuck-threshold", "24h"]);
     // The report is the artifact under test; print it so a run's log carries the
     // real doctor output (and a future failure is diagnosable from it alone).

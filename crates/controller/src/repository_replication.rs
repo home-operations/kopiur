@@ -73,6 +73,17 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     let name = repl.name_any();
     let api: Api<RepositoryReplication> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    // Version skew: a phase written by a NEWER kopiur. This reconciler DRIVES the
+    // object — every path below re-derives the phase from the observed schedule
+    // and Job state and OVERWRITES it — which is the right self-heal (a value we
+    // cannot read must not park a replication forever) and is idempotent here:
+    // the Job name is keyed on the due slot, so a re-drive adopts the in-flight
+    // Job rather than minting a second run. But the overwrite must never be
+    // silent — see `io::warn_unreadable_phase`.
+    if let Some(label) = unreadable_phase(repl) {
+        io::warn_unreadable_phase("RepositoryReplication", &namespace, &name, label);
+    }
+
     // §14(e): a suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
         patch_ready_if_changed(
@@ -170,6 +181,25 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
     }
+}
+
+/// The stored `status.phase` label when it is one this build cannot read.
+///
+/// The pure seam behind the entry-time version-skew warning: `Some(label)`
+/// exactly when a phase is recorded AND it decoded to
+/// [`RepositoryReplicationPhase::Unknown`] (a newer operator's value, or legacy
+/// stored data), `None` otherwise — including the no-status-yet case, which is
+/// ordinary first-reconcile state and not skew.
+///
+/// The decision is delegated to
+/// [`RepositoryReplicationPhase::is_unknown`], whose exhaustive `match` lives in
+/// `kopiur_api`, so a phase variant added later cannot silently be treated as
+/// unreadable here (and so this reads as a named predicate rather than an
+/// `if let … Unknown(_)` probe the phase ratchet is blind to).
+fn unreadable_phase(repl: &RepositoryReplication) -> Option<&str> {
+    use kopiur_api::common::PhaseLabel;
+    let phase = repl.status.as_ref()?.phase.as_ref()?;
+    phase.is_unknown().then(|| phase.label())
 }
 
 /// Best-effort nudge asking this replication's SOURCE repository to re-verify
@@ -648,6 +678,47 @@ mod tests {
             mass_deletion_ack: None,
             catalog: None,
         }
+    }
+
+    /// The skew seam: only a phase this build cannot decode is named, and the
+    /// ordinary states (no status, no phase, a known phase) stay quiet — a
+    /// warning on every pass of a healthy replication would be noise nobody
+    /// reads, which is how a real skew gets missed.
+    #[test]
+    fn only_an_undecodable_phase_is_named_as_skew() {
+        let none_at_all = repl_with("0 5 * * *", None);
+        assert_eq!(unreadable_phase(&none_at_all), None, "no status yet");
+
+        let no_phase = repl_with("0 5 * * *", Some(RepositoryReplicationStatus::default()));
+        assert_eq!(unreadable_phase(&no_phase), None, "status without a phase");
+
+        for known in [
+            RepositoryReplicationPhase::Pending,
+            RepositoryReplicationPhase::Replicating,
+            RepositoryReplicationPhase::Succeeded,
+            RepositoryReplicationPhase::Failed,
+            RepositoryReplicationPhase::Suspended,
+        ] {
+            let r = repl_with(
+                "0 5 * * *",
+                Some(RepositoryReplicationStatus {
+                    phase: Some(known.clone()),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!(unreadable_phase(&r), None, "{known:?} is readable");
+        }
+
+        // What a NEWER operator wrote: decoded verbatim into `Unknown`, and
+        // reported with the raw string so the log names the actual value.
+        let skewed = repl_with(
+            "0 5 * * *",
+            Some(RepositoryReplicationStatus {
+                phase: Some(RepositoryReplicationPhase::Unknown("Verifying".into())),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(unreadable_phase(&skewed), Some("Verifying"));
     }
 
     #[test]
