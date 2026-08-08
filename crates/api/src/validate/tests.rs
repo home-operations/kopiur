@@ -362,6 +362,131 @@ fn rclone_startup_timeout_must_be_a_go_duration() {
     assert!(validate_backend(&mk(Some("soon"))).is_err());
 }
 
+// --- validate_backend_tls (s3 tls.caBundleRef consistency) ---
+
+fn s3_with_tls(tls: crate::common::TlsConfig) -> crate::backend::Backend {
+    use crate::backend::{Backend, S3Backend};
+    Backend::S3(S3Backend {
+        bucket: "b".into(),
+        prefix: None,
+        endpoint: Some("https://minio.internal".into()),
+        region: None,
+        auth: None,
+        tls: Some(tls),
+    })
+}
+
+fn ca_ref(name: Option<&str>, key: Option<&str>) -> crate::common::ConfigMapKeyRef {
+    crate::common::ConfigMapKeyRef {
+        config_map_name: name.map(str::to_string),
+        key: key.map(str::to_string),
+    }
+}
+
+#[test]
+fn s3_tls_ca_bundle_with_configmap_name_passes() {
+    use crate::common::TlsConfig;
+    // With and without an explicit key (absent key = the `ca.crt` default).
+    for key in [None, Some("bundle.pem")] {
+        let b = s3_with_tls(TlsConfig {
+            ca_bundle_ref: Some(ca_ref(Some("internal-ca"), key)),
+            ..Default::default()
+        });
+        assert!(validate_backend(&b).is_ok(), "key {key:?} must pass");
+    }
+    // A bare tls block (no caBundleRef) stays valid too.
+    assert!(validate_backend(&s3_with_tls(TlsConfig::default())).is_ok());
+}
+
+#[test]
+fn s3_tls_ca_bundle_without_configmap_name_is_rejected() {
+    use crate::common::TlsConfig;
+    // `configMapName` is Option for API growth, so `caBundleRef: {}` (or an empty
+    // name) parses — but it is a dead reference that could never resolve. Reject
+    // it at admission instead of silently dropping it (same posture as the
+    // replication `inherit` rejection in validate_repository_replication).
+    for name in [None, Some("")] {
+        let b = s3_with_tls(TlsConfig {
+            ca_bundle_ref: Some(ca_ref(name, None)),
+            ..Default::default()
+        });
+        match validate_backend(&b) {
+            Err(ValidationError::InvalidFieldValue { field, reason }) => {
+                assert!(field.contains("tls.caBundleRef.configMapName"), "{field}");
+                assert!(reason.contains("set configMapName"), "{reason}");
+            }
+            other => panic!("configMapName {name:?} must be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn s3_tls_ca_bundle_configmap_name_must_be_dns1123() {
+    use crate::common::TlsConfig;
+    let b = s3_with_tls(TlsConfig {
+        ca_bundle_ref: Some(ca_ref(Some("Not_A_Valid_Name!"), None)),
+        ..Default::default()
+    });
+    assert!(matches!(
+        validate_backend(&b),
+        Err(ValidationError::InvalidFieldValue { .. })
+    ));
+}
+
+#[test]
+fn s3_tls_ca_bundle_plus_disable_tls_is_rejected() {
+    use crate::common::TlsConfig;
+    // Contradiction: --disable-tls means no TLS handshake at all, so the CA
+    // bundle can never be consulted.
+    let b = s3_with_tls(TlsConfig {
+        ca_bundle_ref: Some(ca_ref(Some("internal-ca"), None)),
+        disable_tls: true,
+        ..Default::default()
+    });
+    match validate_backend(&b) {
+        Err(ValidationError::MutuallyExclusive { a, b, context }) => {
+            assert_eq!(a, "tls.caBundleRef");
+            assert_eq!(b, "tls.disableTls");
+            assert!(context.contains("no TLS handshake"), "{context}");
+        }
+        other => panic!("caBundleRef + disableTls must be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn s3_tls_ca_bundle_blank_key_is_rejected() {
+    use crate::common::TlsConfig;
+    // An explicitly blank key would shadow the `ca.crt` default and never match
+    // a real ConfigMap key.
+    for key in ["", "   "] {
+        let b = s3_with_tls(TlsConfig {
+            ca_bundle_ref: Some(ca_ref(Some("internal-ca"), Some(key))),
+            ..Default::default()
+        });
+        match validate_backend(&b) {
+            Err(ValidationError::InvalidFieldValue { field, reason }) => {
+                assert!(field.contains("tls.caBundleRef.key"), "{field}");
+                assert!(reason.contains("ca.crt"), "{reason}");
+            }
+            other => panic!("blank key {key:?} must be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn s3_tls_ca_bundle_plus_insecure_skip_verify_passes_validation() {
+    use crate::common::TlsConfig;
+    // Shadowed-but-working: kopia's --disable-tls-verification wins and ignores
+    // the bundle. This is an admission WARNING (see the repository_warnings
+    // tests), deliberately not an error.
+    let b = s3_with_tls(TlsConfig {
+        ca_bundle_ref: Some(ca_ref(Some("internal-ca"), None)),
+        insecure_skip_verify: true,
+        ..Default::default()
+    });
+    assert!(validate_backend(&b).is_ok());
+}
+
 // --- validate_backend_auth / workload identity ---
 
 fn s3_with_auth(auth: Option<crate::backend::BackendAuth>) -> crate::backend::Backend {
@@ -2506,6 +2631,32 @@ fn replication_rejects_invalid_destination_backend_content() {
 }
 
 #[test]
+fn replication_destination_inherits_s3_tls_rules() {
+    use crate::common::TlsConfig;
+    // The destination backend routes through the same validate_backend as
+    // Repository/ClusterRepository, so the caBundleRef + disableTls
+    // contradiction is rejected here too — the rules cannot fork per kind.
+    let spec = replication_spec(
+        repo_ref(RepositoryKind::Repository, None),
+        s3_with_tls(TlsConfig {
+            ca_bundle_ref: Some(ca_ref(Some("internal-ca"), None)),
+            disable_tls: true,
+            ..Default::default()
+        }),
+        "0 5 * * *",
+    );
+    let errs = validate_repository_replication(&spec);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::MutuallyExclusive { a, b, .. }
+                if a == "tls.caBundleRef" && b == "tls.disableTls"
+        )),
+        "destination must inherit the S3 tls rules, got {errs:?}"
+    );
+}
+
+#[test]
 fn replication_sync_all_zero_is_valid() {
     // #216: a `sync` block is optional and every field individually optional;
     // a fully-populated but in-range block must not error.
@@ -3358,6 +3509,104 @@ allowedNamespaces:
     );
     let warns = repository_warnings(&crepo.backend, crepo.mover_defaults.as_ref());
     assert_eq!(warns, vec![NFS_FSGROUP_WARNING.to_string()]);
+}
+
+// --- repository_warnings (s3 caBundleRef + insecureSkipVerify shadowing) ---
+
+#[test]
+fn s3_ca_bundle_with_insecure_skip_verify_warns() {
+    // insecureSkipVerify maps to kopia's --disable-tls-verification, which wins:
+    // the referenced CA bundle is ignored while it is set. Admissible, but the
+    // user gets told (through the YAML→JSON path the apiserver uses).
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  s3:
+    bucket: b
+    endpoint: https://minio.internal
+    tls:
+      caBundleRef:
+        configMapName: internal-ca
+      insecureSkipVerify: true
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+    );
+    let warns = repository_warnings(&repo.backend, repo.mover_defaults.as_ref());
+    assert_eq!(warns, vec![S3_TLS_SKIP_VERIFY_WARNING.to_string()]);
+}
+
+#[test]
+fn s3_ca_bundle_alone_or_skip_verify_alone_does_not_warn() {
+    let bundle_only: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  s3:
+    bucket: b
+    endpoint: https://minio.internal
+    tls:
+      caBundleRef:
+        configMapName: internal-ca
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+    );
+    assert!(
+        repository_warnings(&bundle_only.backend, bundle_only.mover_defaults.as_ref()).is_empty()
+    );
+
+    let skip_only: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  s3:
+    bucket: b
+    endpoint: https://minio.internal
+    tls:
+      insecureSkipVerify: true
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+    );
+    assert!(repository_warnings(&skip_only.backend, skip_only.mover_defaults.as_ref()).is_empty());
+}
+
+#[test]
+fn s3_skip_verify_plus_ca_bundle_stays_admissible_so_persisted_crs_survive_upgrade() {
+    // REGRESSION GUARD — severity is deliberate, do not "harden" this to an error.
+    // The ClusterRepository (cluster_repository.rs) and RepositoryReplication
+    // (repository_replication.rs) reconcilers defensively re-validate the FULL
+    // spec on every reconcile and hard-error on failure. caBundleRef +
+    // insecureSkipVerify is a combination an existing, working, persisted CR may
+    // already carry (skip-verify simply wins at kopia), so promoting it to a hard
+    // validation error would brick those CRs on operator upgrade with no
+    // admission request in flight for the user to react to. It must stay a
+    // warning: full validation passes, the warning surfaces at admission.
+    let repo: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend:
+  s3:
+    bucket: b
+    endpoint: https://minio.internal
+    tls:
+      caBundleRef:
+        configMapName: internal-ca
+      insecureSkipVerify: true
+encryption:
+  passwordSecretRef:
+    name: creds
+"#,
+    );
+    let errs = validate_repository(&repo);
+    assert!(
+        errs.is_empty(),
+        "skip-verify + caBundleRef must keep passing full validation (existing \
+         CRs keep reconciling on upgrade), got {errs:?}"
+    );
+    let warns = repository_warnings(&repo.backend, repo.mover_defaults.as_ref());
+    assert_eq!(warns, vec![S3_TLS_SKIP_VERIFY_WARNING.to_string()]);
 }
 
 // --- validate_server (spec.server) ---

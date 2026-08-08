@@ -1,0 +1,75 @@
+# Backend: S3 — private-CA HTTPS (internal CA / self-signed endpoint)
+#
+# A variant of the S3 backend for an S3-compatible store served over HTTPS with
+# a certificate your cluster does not already trust — an internal PKI, or a
+# self-signed MinIO / Ceph RGW cert. `tls.caBundleRef` names a ConfigMap key
+# holding the CA bundle (PEM). The operator resolves the CONTENT at reconcile
+# time and inlines it into every mover work spec, so backup, restore,
+# maintenance, verification, replication, and the repository server all verify
+# the endpoint against your CA.
+#
+# Namespace rule: the ConfigMap is read from the Repository's OWN namespace
+# (for a ClusterRepository: the operator's namespace, KOPIUR_NAMESPACE). It
+# does NOT need to exist in workload namespaces — the content travels in the
+# work spec, never as a volume reference.
+#
+# Field shapes verified against crates/api: externally-tagged backend
+# (`backend.s3`); `tls.caBundleRef: { configMapName, key }` with `key`
+# defaulting to `ca.crt`. kopia builds a FRESH certificate pool from this
+# bundle (it does not extend the system roots): if the endpoint's chain also
+# needs a public root, concatenate both PEMs into the same key.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-private-ca
+  namespace: backups # a namespaced Repository resolves the ConfigMap HERE
+data:
+  # `key` defaults to ca.crt, so this name needs no `key:` in the Repository.
+  # Paste your CA (or the whole chain, certificates concatenated) PEM-encoded.
+  # The block below is a TRUNCATED placeholder, not a real certificate.
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    REPLACE_ME...TRUNCATED-PLACEHOLDER...paste-your-CA-chain-here
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-private-ca-creds
+  namespace: backups
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: s3-private-ca
+  namespace: backups
+spec:
+  backend:
+    s3:
+      bucket: kopia # the bucket holding the repository (create it first)
+      prefix: clusters/prod/ # optional; lets several repos share one bucket
+      # Bare host[:port] of the HTTPS endpoint — no https:// scheme.
+      endpoint: s3.internal.example.com
+      region: us-east-1 # any string for MinIO/RGW; must be real for AWS-style stores
+      tls:
+        caBundleRef:
+          configMapName: s3-private-ca # the ConfigMap above
+          # key: ca.crt               # the default — set it only for another key
+        # Do NOT combine caBundleRef with disableTls (rejected at admission:
+        # a CA bundle is meaningless over plain HTTP) or insecureSkipVerify
+        # (admission warns: skip-verify wins and the bundle is ignored).
+      auth:
+        secretRef:
+          name: s3-private-ca-creds
+  encryption:
+    passwordSecretRef:
+      name: s3-private-ca-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true # initialize the repo if it does not exist yet

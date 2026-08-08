@@ -48,6 +48,15 @@ pub enum Error {
     #[error("missing dependency: {0}")]
     MissingDependency(String),
 
+    /// A backend's `tls.caBundleRef` ConfigMap (or its key) was not found at
+    /// resolution time ([`crate::io::resolve_backend_ca`]). Transient like
+    /// [`Error::MissingDependency`] — GitOps apply ordering means the ConfigMap
+    /// may appear shortly — but typed separately so reconcilers can surface the
+    /// dedicated structural gate ([`kopiur_api::gates::MISSING_CA_BUNDLE_GATE`]):
+    /// a bundle that never appears never self-heals, and doctor must see it.
+    #[error("missing CA bundle: {0}")]
+    MissingCaBundle(String),
+
     /// Blocked on a grant an admin applies out-of-band on ANOTHER object (e.g.
     /// the namespace `privileged-movers` opt-in annotation). The granting object
     /// is watched, so the grant re-enqueues the blocked CR the moment it lands —
@@ -160,6 +169,7 @@ impl Error {
         match self {
             Error::Kube(_)
             | Error::MissingDependency(_)
+            | Error::MissingCaBundle(_)
             | Error::WebhookSetup(_)
             | Error::WebhookCert(_) => ErrorClass::Transient,
             Error::Kopia(e) => {
@@ -195,6 +205,7 @@ impl Error {
             Error::Kopia(_)
             | Error::Validation(_)
             | Error::MissingDependency(_)
+            | Error::MissingCaBundle(_)
             | Error::BlockedOnGrant(_)
             | Error::MissingRecordedIdentity(_)
             | Error::Serialization(_)
@@ -348,6 +359,20 @@ mod tests {
             Error::MissingDependency("repo".into()).class(),
             ErrorClass::Transient
         );
+    }
+
+    #[test]
+    fn missing_ca_bundle_is_transient_and_publishes() {
+        // A `tls.caBundleRef` ConfigMap absent at resolution time is GitOps
+        // apply ordering, exactly like MissingDependency: retry on the fast
+        // transient cadence (the CM may land any moment), and keep the Warning
+        // Event flowing — the client is healthy, only the ConfigMap is missing.
+        let err =
+            Error::MissingCaBundle("tls.caBundleRef ConfigMap team-a/private-ca not found".into());
+        assert_eq!(err.class(), ErrorClass::Transient);
+        assert!(!err.event_publish_futile());
+        assert!(err.to_string().contains("missing CA bundle"));
+        assert!(err.to_string().contains("team-a/private-ca"));
     }
 
     #[test]

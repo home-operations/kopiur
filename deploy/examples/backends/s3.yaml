@@ -45,9 +45,11 @@ spec:
       #   endpoint: minio.storage.svc.cluster.local:9000
       #   tls:
       #     disableTls: true        # in-cluster plain HTTP (kopia assumes HTTPS otherwise)
-      #     # or, for self-signed HTTPS, prefer a CA bundle over skipping verify:
-      #     # caBundleRef: { configMapName: minio-ca, key: ca.crt }
-      #     # insecureSkipVerify: true   # last resort
+      #     # For HTTPS signed by your own CA, point caBundleRef at a ConfigMap
+      #     # in THIS Repository's namespace (key defaults to ca.crt) — the
+      #     # complete example is backends/s3-private-ca.yaml:
+      #     # caBundleRef: { configMapName: s3-private-ca }
+      #     # insecureSkipVerify: true   # last resort; ignores caBundleRef if both are set
       auth:
         secretRef:
           name: s3-repo-creds

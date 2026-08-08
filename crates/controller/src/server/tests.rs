@@ -49,6 +49,7 @@ fn inputs<'a>(ns: &'a str, auth: ResolvedAuth) -> ServerBuildInputs<'a> {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         read_only: false,
         port: 51515,
@@ -89,6 +90,65 @@ fn gen_auth() -> ResolvedAuth {
 fn object_names_are_derived_from_instance() {
     assert_eq!(server_object_name("nas"), "nas-kopia-ui");
     assert_eq!(generated_secret_name("nas"), "nas-kopia-ui-auth");
+}
+
+/// The pod-template spec-hash annotation, for assertions.
+fn spec_hash_annotation(dep: &Deployment) -> String {
+    dep.spec
+        .as_ref()
+        .unwrap()
+        .template
+        .metadata
+        .as_ref()
+        .expect("pod template carries metadata")
+        .annotations
+        .as_ref()
+        .expect("pod template carries annotations")
+        .get(crate::consts::SERVER_SPEC_HASH_ANNOTATION)
+        .expect("pod template carries the server-spec hash")
+        .clone()
+}
+
+#[test]
+fn deployment_pod_template_hash_rolls_on_spec_change_and_is_stable_otherwise() {
+    // Regression: the server reads its work spec from a mounted ConfigMap, and
+    // a ConfigMap content change alone never restarts a running pod — so a CA
+    // rotation (or any server-spec change) used to leave a stale server running
+    // until something else touched the pod template. The template must pin a
+    // hash of the spec.
+    let base = inputs("ns", gen_auth());
+    let dep_a = build_server_deployment(&base);
+    let dep_b = build_server_deployment(&inputs("ns", gen_auth()));
+    // Same spec ⇒ same annotation (the SSA apply stays a no-op — no restart churn).
+    assert_eq!(spec_hash_annotation(&dep_a), spec_hash_annotation(&dep_b));
+
+    // A changed CA bundle is a server-spec change ⇒ different annotation ⇒ the
+    // pod template differs ⇒ the Deployment rolls.
+    let mut with_ca = inputs("ns", gen_auth());
+    with_ca.repository = RepositoryConnect::S3 {
+        bucket: "b".into(),
+        endpoint: Some("https://minio".into()),
+        prefix: None,
+        region: None,
+        disable_tls: false,
+        disable_tls_verification: false,
+        ambient_credentials: false,
+        ca_bundle_pem: Some(
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+        ),
+    };
+    assert_ne!(
+        spec_hash_annotation(&dep_a),
+        spec_hash_annotation(&build_server_deployment(&with_ca))
+    );
+
+    // Any other spec knob rolls too (port change as a representative).
+    let mut with_port = inputs("ns", gen_auth());
+    with_port.port = 51516;
+    assert_ne!(
+        spec_hash_annotation(&dep_a),
+        spec_hash_annotation(&build_server_deployment(&with_port))
+    );
 }
 
 #[test]

@@ -205,6 +205,43 @@ pub enum CliError {
         fix: String,
     },
 
+    /// A ClusterRepository's `tls.caBundleRef` ConfigMap lives in the
+    /// operator's namespace, which could not be discovered (zero or several
+    /// controller Deployments matched the chart labels).
+    #[error(
+        "cannot locate the operator namespace holding ClusterRepository {repository:?}'s \
+         tls.caBundleRef ConfigMap {configmap:?}: {why}. \
+         A ClusterRepository's CA bundle lives in the namespace the kopiur controller \
+         runs in (KOPIUR_NAMESPACE), which the CLI discovers from the controller \
+         Deployment. Fix: {fix}"
+    )]
+    OperatorNamespaceUnresolvable {
+        /// The ClusterRepository whose CA bundle needs the namespace.
+        repository: String,
+        /// The `tls.caBundleRef` ConfigMap name.
+        configmap: String,
+        /// What went wrong with the discovery.
+        why: String,
+        /// What to do about it.
+        fix: String,
+    },
+
+    /// A backend's `tls.caBundleRef` could not be resolved to PEM content
+    /// (missing ConfigMap, missing key, or non-PEM data).
+    #[error(
+        "cannot resolve tls.caBundleRef for repository {repository:?}: {detail}. \
+         The CA bundle is inlined into the kopia connect so the backend's \
+         private-CA TLS endpoint is trusted. Fix: {fix}"
+    )]
+    CaBundleUnresolvable {
+        /// The repository whose backend declares the caBundleRef.
+        repository: String,
+        /// What exactly failed (names the ConfigMap/namespace/key).
+        detail: String,
+        /// What to do about it.
+        fix: String,
+    },
+
     /// A path component that must be a directory is something else.
     #[error(
         "{path:?} is not a directory (kopia entry type {entry_type:?}); \

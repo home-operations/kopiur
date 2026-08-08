@@ -960,6 +960,89 @@ mod tests {
     }
 
     #[test]
+    fn ca_bundle_rides_the_work_spec_and_grows_no_volume_or_env() {
+        // Regression against the rejected mount approach (PR #364): the
+        // resolved `tls.caBundleRef` PEM is INLINED in the work spec (a Job
+        // env var the mover already carries), never a ConfigMap volume/mount
+        // or an extra env var — a mount with `optional: false` wedges the pod
+        // in ContainerCreating with no condition when the ConfigMap vanishes.
+        let mut with_ca = sample_work_spec();
+        with_ca.repository = RepositoryConnect::S3 {
+            bucket: "b".into(),
+            endpoint: Some("https://minio.internal".into()),
+            prefix: None,
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+            ca_bundle_pem: Some(
+                "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n".into(),
+            ),
+        };
+        // Compare against the SAME S3 backend without a CA so the only delta
+        // is the bundle (the fixture's filesystem repo would differ in volumes).
+        let mut without_ca = sample_work_spec();
+        without_ca.repository = RepositoryConnect::S3 {
+            bucket: "b".into(),
+            endpoint: Some("https://minio.internal".into()),
+            prefix: None,
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+            ca_bundle_pem: None,
+        };
+        let job_with = build_job(&inputs(&with_ca, JobLimits::default())).unwrap();
+        let job_without = build_job(&inputs(&without_ca, JobLimits::default())).unwrap();
+        let pod_with = job_with.spec.unwrap().template.spec.unwrap();
+        let pod_without = job_without.spec.unwrap().template.spec.unwrap();
+
+        // Identical volume/mount/env SHAPE — the CA adds nothing pod-side.
+        assert_eq!(
+            pod_with.volumes.as_ref().map(Vec::len),
+            pod_without.volumes.as_ref().map(Vec::len),
+            "a CA bundle must not add a volume"
+        );
+        assert_eq!(
+            pod_with.containers[0].volume_mounts.as_ref().map(Vec::len),
+            pod_without.containers[0]
+                .volume_mounts
+                .as_ref()
+                .map(Vec::len),
+            "a CA bundle must not add a volume mount"
+        );
+        let env_names = |pod: &k8s_openapi::api::core::v1::PodSpec| -> Vec<String> {
+            pod.containers[0]
+                .env
+                .as_ref()
+                .map(|e| e.iter().map(|v| v.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            env_names(&pod_with),
+            env_names(&pod_without),
+            "a CA bundle must not add an env var — it rides INSIDE the work-spec env"
+        );
+
+        // The PEM is present exactly once: inside the serialized work spec.
+        let spec_env = pod_with.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == WORK_SPEC_ENV)
+            .expect("work-spec env present");
+        assert!(
+            spec_env
+                .value
+                .as_deref()
+                .unwrap()
+                .contains("BEGIN CERTIFICATE"),
+            "the PEM must ride the work-spec env"
+        );
+    }
+
+    #[test]
     fn result_config_map_is_result_only_and_cr_owned() {
         let ws = sample_work_spec();
         let cm = build_result_config_map(&inputs(&ws, JobLimits::default()));

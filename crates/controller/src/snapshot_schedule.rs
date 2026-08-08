@@ -1097,7 +1097,13 @@ async fn policy_repo_timezone_default(
     let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
         Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
     })?;
-    let repo = io::resolve_repository_ref(&ctx.client, &policy.spec.repository, policy_ns).await?;
+    let repo = io::resolve_repository_ref(
+        &ctx.client,
+        &policy.spec.repository,
+        policy_ns,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     Ok(repo.schedule_defaults.and_then(|d| d.timezone))
 }
 

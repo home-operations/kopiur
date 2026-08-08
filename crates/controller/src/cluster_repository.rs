@@ -765,6 +765,8 @@ async fn reconcile_cluster_server(
         owner: None,
         extra_labels,
         creds_src_namespace,
+        repo_namespace: None,
+        operator_namespace: ctx.operator_namespace.clone(),
         is_cluster: true,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
@@ -1130,6 +1132,16 @@ async fn bootstrap_cluster_via_mover(
         name,
         None,
     );
+    // A ClusterRepository's `tls.caBundleRef` ConfigMap lives in the OPERATOR's
+    // namespace (`KOPIUR_NAMESPACE`) — see `io::resolve_backend_ca`'s namespace
+    // rule; `referrer_ns: None` selects that arm.
+    let ca_bundle_pem = io::resolve_backend_ca(
+        &ctx.client,
+        backend,
+        None,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -1143,6 +1155,7 @@ async fn bootstrap_cluster_via_mover(
         maintenance_enabled,
         foreign_maintenance,
         repo.spec.parameters.as_ref(),
+        ca_bundle_pem,
     );
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
@@ -1335,6 +1348,9 @@ fn cluster_bootstrap_work_spec(
     maintenance_enabled: bool,
     foreign_maintenance: bool,
     parameters: Option<&kopiur_api::repository::RepositoryParameters>,
+    // Resolved by the async caller (`io::resolve_backend_ca`, operator-namespace
+    // arm) so this builder stays pure; the backend's `tls.caBundleRef` PEM.
+    ca_bundle_pem: Option<String>,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
@@ -1378,7 +1394,7 @@ fn cluster_bootstrap_work_spec(
             hostname: name.to_string(),
             source_path: String::new(),
         },
-        repository: backend_to_repository_connect(backend),
+        repository: backend_to_repository_connect(backend, ca_bundle_pem),
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
             kind: "ClusterRepository".to_string(),
@@ -2174,6 +2190,7 @@ mod tests {
                 read_only,
                 enabled,
                 foreign_m,
+                None,
                 None,
             );
             match spec.operation {

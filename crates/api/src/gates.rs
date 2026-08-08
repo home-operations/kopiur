@@ -147,9 +147,9 @@ impl StructuralGate {
     ///
     /// This is the matcher consumers should reach for. `condition` + `status`
     /// alone do not identify a row — `CredentialsAvailable=False` is written
-    /// with two different reasons and therefore has two rows — so filtering the
-    /// registry on [`trips`](Self::trips) alone yields two hits for one live
-    /// condition and double-reports it. `matches` selects exactly one row per
+    /// with several different reasons and therefore has several rows — so
+    /// filtering the registry on [`trips`](Self::trips) alone yields multiple
+    /// hits for one live condition and double-reports it. `matches` selects exactly one row per
     /// live condition, which is the property
     /// `gate_rows_are_unique_and_internally_consistent` pins.
     ///
@@ -262,6 +262,19 @@ pub const MISSING_SERVICE_ACCOUNT_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// Same condition as [`MISSING_CREDENTIALS_GATE`], a third missing
+/// dependency: the backend's `tls.caBundleRef` ConfigMap (the PEM CA bundle
+/// for a private-CA S3 endpoint). kopiur never creates it, and a ConfigMap
+/// that never appears never self-heals — the exact phase-invisible park shape
+/// of #359.
+pub const MISSING_CA_BUNDLE_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::CREDENTIALS_AVAILABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::MISSING_CA_BUNDLE_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// Inverted polarity: the per-`Snapshot` hold the mass-deletion breaker
 /// applies. Released only by the `allow-mass-deletion` acknowledgement on the
 /// repository, so it is squarely "needs a human".
@@ -338,6 +351,7 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     PRIVILEGED_MOVER_GATE,
     MISSING_CREDENTIALS_GATE,
     MISSING_SERVICE_ACCOUNT_GATE,
+    MISSING_CA_BUNDLE_GATE,
     DELETION_HELD_GATE,
     MASS_DELETION_HELD_GATE,
     REPOSITORY_READ_ONLY_GATE,
@@ -422,7 +436,7 @@ mod tests {
             .iter()
             .filter(|g| g.trips(consts::CREDENTIALS_AVAILABLE_CONDITION, CONDITION_FALSE))
             .count();
-        assert_eq!(coarse, 2, "`trips` is reason-agnostic by design");
+        assert_eq!(coarse, 3, "`trips` is reason-agnostic by design");
 
         // An unregistered reason for a gated condition: `matches` finds
         // nothing, `trips` still flags it. That asymmetry is the reason
@@ -510,6 +524,13 @@ mod tests {
                 consts::CREDENTIALS_AVAILABLE_CONDITION,
                 CONDITION_FALSE,
                 consts::MISSING_SERVICE_ACCOUNT_REASON,
+                GateScope::SnapshotOrRestore,
+                GateSeverity::Fail,
+            ),
+            (
+                consts::CREDENTIALS_AVAILABLE_CONDITION,
+                CONDITION_FALSE,
+                consts::MISSING_CA_BUNDLE_REASON,
                 GateScope::SnapshotOrRestore,
                 GateSeverity::Fail,
             ),

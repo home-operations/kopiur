@@ -35,7 +35,7 @@ answers "which referrers care about this referent event?". Two rules:
 | When this changes… | …these re-reconcile (mapper) |
 | --- | --- |
 | `Secret` | `Repository` (`secret_to_repositories`), `ClusterRepository` (`secret_to_cluster_repositories`), `RepositoryReplication` destination creds (`secret_to_replications`) |
-| `ConfigMap` (TLS CA bundle) | `Repository` (`configmap_to_repositories`), `ClusterRepository` (`configmap_to_cluster_repositories`) |
+| `ConfigMap` (TLS CA bundle) | `Repository` (`configmap_to_repositories`), `ClusterRepository` (`configmap_to_cluster_repositories`), `RepositoryReplication` destination CA (`configmap_to_replications`) |
 | `Repository` / `ClusterRepository` | `SnapshotPolicy` (`*_to_policies`), `Restore` (`*_to_restores`), `Maintenance` (`*_to_maintenances`), `RepositoryReplication` source (`*_to_replications`) |
 | `SnapshotPolicy` | `Snapshot` (`policy_to_snapshots`), `SnapshotSchedule` (`policy_to_schedules`) |
 

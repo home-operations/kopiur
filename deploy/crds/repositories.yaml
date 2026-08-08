@@ -398,11 +398,15 @@ spec:
                             nullable: true
                             properties:
                               configMapName:
-                                description: Name of the `ConfigMap` holding the value (e.g. a CA bundle).
+                                description: |-
+                                  Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the
+                                  referrer's namespace for a namespaced `Repository`, and in the operator's
+                                  namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no
+                                  namespace of its own).
                                 nullable: true
                                 type: string
                               key:
-                                description: Which key inside the `ConfigMap` to read.
+                                description: Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset.
                                 nullable: true
                                 type: string
                             type: object

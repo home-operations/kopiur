@@ -263,6 +263,41 @@ fn cluster_repo_secret_without_namespace_names_the_field() {
 }
 
 #[test]
+fn operator_namespace_unresolvable_names_the_configmap_and_the_discovery_rule() {
+    let msg = CliError::OperatorNamespaceUnresolvable {
+        repository: "nas".into(),
+        configmap: "internal-ca".into(),
+        why: "no Deployment matches the controller labels".into(),
+        fix: "is the kopiur operator installed?".into(),
+    }
+    .to_string();
+    assert!(msg.contains("\"nas\""), "{msg}");
+    assert!(msg.contains("\"internal-ca\""), "{msg}");
+    // The user must learn WHERE a ClusterRepository's bundle lives and HOW the
+    // CLI finds that namespace.
+    assert!(msg.contains("KOPIUR_NAMESPACE"), "{msg}");
+    assert!(msg.contains("controller"), "{msg}");
+    assert!(
+        msg.contains("Fix: is the kopiur operator installed?"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn ca_bundle_unresolvable_names_the_cause_and_the_fix() {
+    let msg = CliError::CaBundleUnresolvable {
+        repository: "nas".into(),
+        detail: "ConfigMap team-a/internal-ca has no key \"ca.crt\"".into(),
+        fix: "add the PEM CA bundle under that key".into(),
+    }
+    .to_string();
+    assert!(msg.contains("\"nas\""), "{msg}");
+    assert!(msg.contains("team-a/internal-ca"), "{msg}");
+    assert!(msg.contains("tls.caBundleRef"), "{msg}");
+    assert!(msg.contains("Fix: add the PEM CA bundle"), "{msg}");
+}
+
+#[test]
 fn session_pod_failure_and_timeout_point_at_pods_and_doctor() {
     let failed = CliError::SessionPodFailed {
         job: "kopiur-browse-nas-abc123".into(),

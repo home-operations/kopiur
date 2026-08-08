@@ -20,7 +20,7 @@ pub use kopiur_api::consts::{
     CREDENTIALS_AVAILABLE_CONDITION, DELETION_HELD_CONDITION, INDEX_BLOB_HEALTH_CONDITION,
     MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
     MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
-    MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CREDENTIALS_REASON,
+    MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CA_BUNDLE_REASON, MISSING_CREDENTIALS_REASON,
     MISSING_SERVICE_ACCOUNT_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_RESTORE,
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     PRIVILEGED_MOVERS_ANNOTATION, READY_CONDITION, RECONCILING_CONDITION,
@@ -91,6 +91,13 @@ pub const REPLICATION_COMPONENT: &str = "replication";
 pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replication";
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
+
+/// Annotation on the kopia-server Deployment's POD TEMPLATE carrying a short
+/// hash of the serialized `ServerWorkSpec`. The server reads its spec from a
+/// mounted ConfigMap, and a ConfigMap content change alone never restarts a
+/// running pod — so any server-spec change (a rotated `tls.caBundleRef` CA, a
+/// new port/auth mode) must move this annotation to roll the Deployment.
+pub const SERVER_SPEC_HASH_ANNOTATION: &str = "kopiur.home-operations.com/server-spec-hash";
 
 /// Annotation a `Snapshot` stamps (RFC3339) on its repository when a backup fails,
 /// requesting an immediate connectivity re-probe. Honored once via

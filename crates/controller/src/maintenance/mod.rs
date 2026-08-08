@@ -110,7 +110,13 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let api: Api<Maintenance> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let repo_ref = &maint.spec.repository;
-    let repo = io::resolve_repository_ref(&ctx.client, repo_ref, &namespace).await?;
+    let repo = io::resolve_repository_ref(
+        &ctx.client,
+        repo_ref,
+        &namespace,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     // GitHub #174 item 3: the last of the three cascade levels (per-cron →
     // schedule-level → repo scheduleDefaults.timezone → UTC), resolved in
     // `slot_for`.
@@ -562,7 +568,7 @@ async fn spawn_maintenance_job(
             hostname: namespace.to_string(),
             source_path: String::new(),
         },
-        repository: backend_to_repository_connect(&repo.backend),
+        repository: backend_to_repository_connect(&repo.backend, repo.ca_bundle_pem.clone()),
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
             kind: "Maintenance".to_string(),

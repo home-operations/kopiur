@@ -115,6 +115,7 @@ mod tests {
                 disable_tls: false,
                 disable_tls_verification: false,
                 ambient_credentials: false,
+                ca_bundle_pem: None,
             },
             listen_port: 51515,
             auth: ServerAuthSpec::Password {

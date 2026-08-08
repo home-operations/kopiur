@@ -1110,6 +1110,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn s3_ca_bundle_with_skip_verify_repository_admission_warns() {
+        // caBundleRef + insecureSkipVerify is admissible (a hard error would
+        // brick already-persisted CRs on upgrade — the ClusterRepository and
+        // RepositoryReplication reconcilers re-validate the full spec every
+        // reconcile) but the shadowing is surfaced as an admission warning.
+        let spec = json!({
+            "backend": { "s3": {
+                "bucket": "b",
+                "endpoint": "https://minio.internal",
+                "tls": {
+                    "caBundleRef": { "configMapName": "internal-ca" },
+                    "insecureSkipVerify": true,
+                },
+            } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let req = admission_request("Repository", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(resp.allowed, "must still be admitted: {:?}", resp.result);
+        assert_eq!(
+            resp.warnings.as_deref(),
+            Some(&[api::validate::S3_TLS_SKIP_VERIFY_WARNING.to_string()][..]),
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_ca_bundle_with_skip_verify_cluster_repository_admission_warns() {
+        // Same warning through the ClusterRepository handler — both route
+        // through api::validate::repository_warnings, the rules cannot fork.
+        let spec = json!({
+            "backend": { "s3": {
+                "bucket": "b",
+                "endpoint": "https://minio.internal",
+                "tls": {
+                    "caBundleRef": { "configMapName": "internal-ca" },
+                    "insecureSkipVerify": true,
+                },
+            } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+        });
+        let req = admission_request("ClusterRepository", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(resp.allowed, "must still be admitted: {:?}", resp.result);
+        assert_eq!(
+            resp.warnings.as_deref(),
+            Some(&[api::validate::S3_TLS_SKIP_VERIFY_WARNING.to_string()][..]),
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_ca_bundle_with_disable_tls_repository_admission_is_rejected() {
+        // The contradictory pair IS a hard error: with --disable-tls there is no
+        // TLS handshake, so the CA bundle could never be consulted (and no
+        // working persisted CR can carry the pair — caBundleRef never worked
+        // before this validation existed).
+        let spec = json!({
+            "backend": { "s3": {
+                "bucket": "b",
+                "endpoint": "http://minio.internal",
+                "tls": {
+                    "caBundleRef": { "configMapName": "internal-ca" },
+                    "disableTls": true,
+                },
+            } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let req = admission_request("Repository", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(!resp.allowed, "caBundleRef + disableTls must be rejected");
+        assert!(
+            resp.result.message.contains("mutually exclusive"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
     // --- identity hardening ----------------------------------------------------
 
     #[tokio::test]

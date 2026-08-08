@@ -3209,6 +3209,16 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::MISSING_SERVICE_ACCOUNT_REASON,
         "snapshot::reconcile_inner + restore::run_restore_mover SA arm (upsert_gate)",
     ),
+    // The `Error::MissingCaBundle` arm around repo resolution in both
+    // reconcilers (snapshot::reconcile_inner's resolve_recipe +
+    // restore::run_restore_mover's resolve_restore_repository), via
+    // io::upsert_gate(&MISSING_CA_BUNDLE_GATE, …).
+    (
+        crate::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        false,
+        crate::consts::MISSING_CA_BUNDLE_REASON,
+        "snapshot::reconcile_inner + restore::run_restore_mover CA-bundle arm (upsert_gate)",
+    ),
     // `snapshot::hold_deletion`, via io::upsert_gate(&DELETION_HELD_GATE, …).
     (
         crate::consts::DELETION_HELD_CONDITION,

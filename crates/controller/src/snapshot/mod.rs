@@ -837,7 +837,35 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
 
     // No Job yet: resolve the recipe and create the mover Job + ConfigMap.
-    let (config, repo) = resolve_recipe(ctx, backup, &namespace).await?;
+    // A missing `tls.caBundleRef` ConfigMap surfaces as the structural
+    // CredentialsAvailable gate (MISSING_CA_BUNDLE_GATE): the retry is
+    // transient, but a ConfigMap nobody creates never self-heals, and the park
+    // at `Pending` must be visible to doctor (#359).
+    let (config, repo) = match resolve_recipe(ctx, backup, &namespace).await {
+        Ok(resolved) => resolved,
+        Err(Error::MissingCaBundle(msg)) => {
+            let existing = backup
+                .status
+                .as_ref()
+                .map(|s| s.conditions.clone())
+                .unwrap_or_default();
+            let conditions = io::upsert_gate(
+                &existing,
+                &kopiur_api::gates::MISSING_CA_BUNDLE_GATE,
+                &msg,
+                backup.meta().generation,
+            );
+            io::patch_status(
+                &api,
+                &name,
+                serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+            )
+            .await?;
+            io::publish_missing_ca_bundle_event(ctx, backup, &msg).await;
+            return Err(Error::MissingCaBundle(msg));
+        }
+        Err(e) => return Err(e),
+    };
 
     // §11: a ReadOnly repository serves restores only — refuse to create a backup
     // Job. Surface a clear condition + Event and stop (not an error: it's a
@@ -2388,11 +2416,16 @@ async fn execute_delete_snapshot(
         io::remove_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
         return Ok(Action::await_change());
     };
+    // A repo-resolution blocker on the DELETION path (the CA ConfigMap reaped
+    // by namespace teardown, a vanished credential dependency) wedges the
+    // finalizer, so it must carry the stuck-finalizer escape hatch (#255).
     let (repo_ref, repo) = match resolved {
-        Some(r) => r?,
+        Some(r) => r.map_err(|e| hint_deletion_blocker(e, namespace, name))?,
         // Unreachable by construction (plan=Delete implies the resolution ran);
         // resolve again rather than panic.
-        None => resolve_repo_for_deletion(ctx, backup, namespace).await?,
+        None => resolve_repo_for_deletion(ctx, backup, namespace)
+            .await
+            .map_err(|e| hint_deletion_blocker(e, namespace, name))?,
     };
     drive_batch_deletion(
         backup,
@@ -2607,7 +2640,13 @@ async fn resolve_repo_for_deletion(
         .and_then(|s| s.resolved.as_ref())
         .and_then(|r| r.repository.as_ref())
     {
-        let repo = io::resolve_repository_ref(&ctx.client, pinned, namespace).await?;
+        let repo = io::resolve_repository_ref(
+            &ctx.client,
+            pinned,
+            namespace,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await?;
         return Ok((pinned.clone(), repo));
     }
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
@@ -2638,6 +2677,28 @@ fn stuck_finalizer_hint(msg: &str, namespace: &str, name: &str) -> String {
          stays in the repository and the catalog can rediscover it — annotate the Snapshot \
          `{SKIP_SNAPSHOT_CLEANUP_ANNOTATION}: \"true\"`."
     )
+}
+
+/// Enrich a deletion-path blocker with the stuck-finalizer escape hatch
+/// ([`stuck_finalizer_hint`]), preserving the error's variant (and therefore
+/// its retry class).
+///
+/// Two dependency shapes can be deleted out from under a terminating
+/// `Snapshot` and silently wedge its finalizer: the credential Secret
+/// ([`Error::MissingDependency`], #255) and — since `tls.caBundleRef` — the CA
+/// ConfigMap ([`Error::MissingCaBundle`]), which namespace teardown reaps just
+/// like the Secret. Both must carry the way out; anything else passes through
+/// untouched.
+pub(super) fn hint_deletion_blocker(e: Error, namespace: &str, name: &str) -> Error {
+    match e {
+        Error::MissingDependency(m) => {
+            Error::MissingDependency(stuck_finalizer_hint(&m, namespace, name))
+        }
+        Error::MissingCaBundle(m) => {
+            Error::MissingCaBundle(stuck_finalizer_hint(&m, namespace, name))
+        }
+        other => other,
+    }
 }
 
 /// The per-repository BATCH delete dispatcher (mass-deletion protection), run by
@@ -3319,12 +3380,7 @@ async fn build_batch_job(
         &repo_ref.name,
     )
     .await
-    .map_err(|e| match e {
-        Error::MissingDependency(m) => {
-            Error::MissingDependency(stuck_finalizer_hint(&m, src_namespace, src_name))
-        }
-        other => other,
-    })?;
+    .map_err(|e| hint_deletion_blocker(e, src_namespace, src_name))?;
     if creds.projected > 0 {
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
@@ -3925,7 +3981,13 @@ async fn resolve_recipe(
     // `ref.namespace`, defaulting to the config's namespace) vs. cluster-scoped
     // `ClusterRepository` (`Api::all`). The discriminated kind is matched
     // exhaustively in the resolver (ADR §5.5).
-    let repo = io::resolve_repository_ref(&ctx.client, &config.spec.repository, cfg_ns).await?;
+    let repo = io::resolve_repository_ref(
+        &ctx.client,
+        &config.spec.repository,
+        cfg_ns,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
     Ok((config, repo))
 }
 

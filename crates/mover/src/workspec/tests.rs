@@ -147,6 +147,7 @@ fn restore_roundtrip() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         target_ref: TargetRef {
             kind: "Restore".into(),
@@ -244,6 +245,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         target_ref: TargetRef {
             kind: "Restore".into(),
@@ -431,6 +433,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             disable_tls: true,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         target_ref: TargetRef {
             kind: "Repository".into(),
@@ -544,6 +547,7 @@ fn maintenance_roundtrip_and_wire_shape() {
             disable_tls: true,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         target_ref: TargetRef {
             kind: "Maintenance".into(),
@@ -676,6 +680,7 @@ fn connect_spec_conversion() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        ca_bundle_pem: None,
     };
     assert_eq!(
         s3.to_connect_spec(),
@@ -687,6 +692,7 @@ fn connect_spec_conversion() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            root_ca_pem: None,
         }
     );
 }
@@ -889,6 +895,7 @@ fn s3_ambient_credentials_roundtrips_and_defaults_false() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: true,
+        ca_bundle_pem: None,
     };
     let v: serde_json::Value = serde_json::to_value(&wire).unwrap();
     assert_eq!(v["s3"]["ambientCredentials"], true);
@@ -916,6 +923,48 @@ fn s3_ambient_credentials_roundtrips_and_defaults_false() {
     // And `false` stays off the wire, so legacy movers can read new specs too.
     let v = serde_json::to_value(&parsed).unwrap();
     assert!(v["s3"].get("ambientCredentials").is_none());
+}
+
+#[test]
+fn s3_ca_bundle_pem_roundtrips_and_reaches_the_kopia_connect_spec() {
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n";
+    // The resolved PEM travels the wire as `caBundlePem` (content, never a
+    // ConfigMap reference — the mover has no ConfigMap access).
+    let wire = RepositoryConnect::S3 {
+        bucket: "b".into(),
+        endpoint: Some("https://minio.internal".into()),
+        prefix: None,
+        region: None,
+        disable_tls: false,
+        disable_tls_verification: false,
+        ambient_credentials: false,
+        ca_bundle_pem: Some(PEM.into()),
+    };
+    let v: serde_json::Value = serde_json::to_value(&wire).unwrap();
+    assert_eq!(v["s3"]["caBundlePem"], PEM);
+    let back: RepositoryConnect = serde_json::from_value(v).unwrap();
+    assert_eq!(back, wire);
+    // …and it reaches the kopia connect spec's `root_ca_pem`, the single
+    // path to `--root-ca-pem-base64` for EVERY verb (kopia persists it in the
+    // connection config at connect time).
+    match back.to_connect_spec() {
+        kopiur_kopia::ConnectSpec::S3 { root_ca_pem, .. } => {
+            assert_eq!(root_ca_pem.as_deref(), Some(PEM));
+        }
+        other => panic!("expected S3, got {other:?}"),
+    }
+
+    // Back-compat: a work spec written before the field existed still parses
+    // (defaults to None — no CA, exactly the old behavior)…
+    let legacy = serde_json::json!({ "s3": { "bucket": "b" } });
+    let parsed: RepositoryConnect = serde_json::from_value(legacy).unwrap();
+    match &parsed {
+        RepositoryConnect::S3 { ca_bundle_pem, .. } => assert_eq!(*ca_bundle_pem, None),
+        other => panic!("expected S3, got {other:?}"),
+    }
+    // …and `None` stays OFF the wire, so legacy movers can read new specs too.
+    let v = serde_json::to_value(&parsed).unwrap();
+    assert!(v["s3"].get("caBundlePem").is_none());
 }
 
 // --- §13(b)/§13(f) policy-args mapping (api spec → work-spec → kopia args) ---
@@ -1317,6 +1366,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle_pem: None,
         },
         target_ref: TargetRef {
             kind: "SnapshotPolicy".into(),
@@ -1467,6 +1517,7 @@ fn replicate_roundtrip_and_wire_shape() {
                 disable_tls: false,
                 disable_tls_verification: false,
                 ambient_credentials: false,
+                ca_bundle_pem: None,
             },
             delete_extra: true,
             parallel: Some(8),
@@ -1527,6 +1578,7 @@ fn replicate_roundtrip_and_wire_shape() {
                 disable_tls: false,
                 disable_tls_verification: false,
                 ambient_credentials: false,
+                root_ca_pem: None,
             }
         );
         // #216 controller-glue guard: every new op field reaches the kopia

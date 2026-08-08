@@ -200,6 +200,19 @@ impl ServerBuildInputs<'_> {
     }
 }
 
+/// Short, deterministic hash of the serialized [`ServerWorkSpec`] these inputs
+/// produce — the value of [`crate::consts::SERVER_SPEC_HASH_ANNOTATION`] on the
+/// Deployment's pod template. Same spec ⇒ same hash (the SSA apply stays a
+/// no-op); any spec change ⇒ a new hash ⇒ the pod template differs ⇒ the
+/// Deployment rolls and the server re-reads its ConfigMap.
+pub fn server_spec_hash(inputs: &ServerBuildInputs<'_>) -> String {
+    // `ServerWorkSpec` is a plain data struct (string-keyed, no non-string map
+    // keys), so serialization cannot fail in practice; the fallback hashes a
+    // stable sentinel rather than panicking inside a pure builder.
+    let json = serde_json::to_string(&build_server_work_spec(inputs)).unwrap_or_default();
+    crate::naming::short_hash(&json)
+}
+
 /// Build the server work spec the mover `serve` entrypoint consumes.
 pub fn build_server_work_spec(inputs: &ServerBuildInputs<'_>) -> ServerWorkSpec {
     ServerWorkSpec {
@@ -461,6 +474,15 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(object_labels(inputs.instance, &inputs.extra_labels)),
+                    // The server reads its work spec from the mounted ConfigMap,
+                    // and a ConfigMap content change never restarts a running
+                    // pod — so the template pins a hash of the spec: any change
+                    // (a rotated CA bundle, port, auth mode) moves the
+                    // annotation and rolls the Deployment (Recreate strategy).
+                    annotations: Some(BTreeMap::from([(
+                        crate::consts::SERVER_SPEC_HASH_ANNOTATION.to_string(),
+                        server_spec_hash(inputs),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(pod_spec),
@@ -602,6 +624,14 @@ pub struct ServerReconcileCtx<'a> {
     pub extra_labels: BTreeMap<String, String>,
     /// Namespace the repository credentials Secret lives in.
     pub creds_src_namespace: String,
+    /// The repository's OWN namespace (`Some` for a namespaced `Repository`,
+    /// `None` for a `ClusterRepository`) — the referrer namespace for resolving
+    /// the backend's `tls.caBundleRef` ConfigMap (see
+    /// [`crate::io::resolve_backend_ca`]'s namespace rule).
+    pub repo_namespace: Option<String>,
+    /// The operator's own namespace (`KOPIUR_NAMESPACE`), where a
+    /// `ClusterRepository`'s `tls.caBundleRef` ConfigMap lives.
+    pub operator_namespace: Option<String>,
     /// Whether the owner is cluster-scoped (drives creds mirroring + no owner refs).
     pub is_cluster: bool,
     /// Mover image (carries the kopia binary + embedded UI) for the server pod.
@@ -810,7 +840,20 @@ async fn ensure_in(
     // cannot mutate the repository. Pinned to status below.
     let read_only = rc.read_only_mode || server.read_only.unwrap_or(false);
 
-    let repository = crate::snapshot::backend_to_repository_connect(rc.backend);
+    // The served kopia connection needs the same private-CA trust a mover gets:
+    // resolve the backend's `tls.caBundleRef` with the served repo kind's
+    // namespace semantics (Repository → its own namespace, ClusterRepository →
+    // the operator's). kopia persists the CA in the connection config at
+    // connect time, so inlining it into the server work spec covers the exec'd
+    // `kopia server` too.
+    let ca_bundle_pem = crate::io::resolve_backend_ca(
+        rc.client,
+        rc.backend,
+        rc.repo_namespace.as_deref(),
+        rc.operator_namespace.as_deref(),
+    )
+    .await?;
+    let repository = crate::snapshot::backend_to_repository_connect(rc.backend, ca_bundle_pem);
     let inputs = ServerBuildInputs {
         instance: rc.instance,
         namespace,

@@ -723,6 +723,18 @@ pub(crate) async fn spawn_all(
                 move |s: PartialObjectMeta<Secret>| watch::secret_to_replications(&store, &s)
             },
         )
+        // The destination backend's `tls.caBundleRef` ConfigMap: creating (or
+        // fixing) the CA bundle re-triggers a replication blocked on it, the
+        // same shape as the destination credential Secret watch above.
+        .watches_stream(
+            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg),
+            {
+                let store = repl_store.clone();
+                move |cm: PartialObjectMeta<ConfigMap>| {
+                    watch::configmap_to_replications(&store, &cm)
+                }
+            },
+        )
         .watches(scoped_api::<Repository>(&client, &scope), cfg.clone(), {
             let store = repl_store.clone();
             move |r: Repository| watch::repository_to_replications(&store, &r)

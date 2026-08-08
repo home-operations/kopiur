@@ -1791,6 +1791,7 @@ dependencies = [
  "k8s-openapi",
  "kopiur-api",
  "kube",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
@@ -1801,6 +1802,7 @@ dependencies = [
 name = "kopiur-kopia"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",

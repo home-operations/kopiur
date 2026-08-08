@@ -112,7 +112,13 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     }
 
     let source_ref = &repl.spec.source_ref;
-    let repo = io::resolve_repository_ref(&ctx.client, source_ref, &namespace).await?;
+    let repo = io::resolve_repository_ref(
+        &ctx.client,
+        source_ref,
+        &namespace,
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
 
     // Gate on the source repository being Ready (an object-store repo must be
     // bootstrapped before `sync-to` can reach it) — mirrors maintenance's G7.
@@ -251,7 +257,18 @@ async fn spawn_replication_job(
     repo: &ResolvedRepository,
     slot: DateTime<Utc>,
 ) -> Result<()> {
-    let work_spec = build_replication_work_spec(repl, repo, namespace, cr_name);
+    // The DESTINATION is an inline `Backend` on this CR (no Repository object
+    // behind it), so its `tls.caBundleRef` resolves relative to the
+    // RepositoryReplication's own namespace — the source's bundle was already
+    // resolved by `resolve_repository_ref` and rides `repo.ca_bundle_pem`.
+    let dest_ca_bundle_pem = io::resolve_backend_ca(
+        &ctx.client,
+        &repl.spec.destination,
+        Some(namespace),
+        ctx.operator_namespace.as_deref(),
+    )
+    .await?;
+    let work_spec = build_replication_work_spec(repl, repo, namespace, cr_name, dest_ca_bundle_pem);
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -412,12 +429,13 @@ pub fn build_replication_work_spec(
     repo: &ResolvedRepository,
     namespace: &str,
     cr_name: &str,
+    dest_ca_bundle_pem: Option<String>,
 ) -> MoverWorkSpec {
     let sync = repl.spec.sync.unwrap_or_default();
     MoverWorkSpec {
         version: 1,
         operation: Operation::Replicate(ReplicateOp {
-            destination: backend_to_repository_connect(&repl.spec.destination),
+            destination: backend_to_repository_connect(&repl.spec.destination, dest_ca_bundle_pem),
             // Additive sync by default (never prune the destination automatically).
             delete_extra: sync.delete_extra,
             parallel: sync.parallel,
@@ -433,7 +451,7 @@ pub fn build_replication_work_spec(
             hostname: namespace.to_string(),
             source_path: String::new(),
         },
-        repository: backend_to_repository_connect(&repo.backend),
+        repository: backend_to_repository_connect(&repo.backend, repo.ca_bundle_pem.clone()),
         target_ref: TargetRef {
             api_version: API_VERSION.to_string(),
             kind: "RepositoryReplication".to_string(),
@@ -689,6 +707,7 @@ mod tests {
             deletion_protection: None,
             mass_deletion_ack: None,
             catalog: None,
+            ca_bundle_pem: None,
         }
     }
 
@@ -806,7 +825,7 @@ mod tests {
     fn work_spec_maps_source_and_destination() {
         let r = repl_with("0 5 * * *", None);
         let repo = sample_repo();
-        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite");
+        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None);
         // Operation is Replicate with the S3 destination; source is the filesystem repo.
         match &ws.operation {
             Operation::Replicate(op) => {
@@ -844,7 +863,7 @@ mod tests {
             max_upload_speed_bytes_per_second: Some(3_000_000),
         });
         let repo = sample_repo();
-        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite");
+        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None);
         match &ws.operation {
             Operation::Replicate(op) => {
                 assert_eq!(op.parallel, Some(6));

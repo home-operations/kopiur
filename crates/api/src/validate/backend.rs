@@ -60,11 +60,73 @@ pub fn validate_backend_auth(
     Ok(())
 }
 
+/// A backend's `tls` block is internally consistent — every rule the structural
+/// schema can't express. A `caBundleRef` must actually name a ConfigMap
+/// (`configMapName` was `Option` for API growth, so an empty `caBundleRef: {}`
+/// parses fine but would be a silently dead reference), the name must be a
+/// valid object name (or every mover run fails at ConfigMap resolution with a
+/// far less actionable message), an explicitly-set `key` must not be blank
+/// (blank would shadow the `ca.crt` default and never match a real key), and
+/// pairing `caBundleRef` with `disableTls: true` is a contradiction: with
+/// kopia's `--disable-tls` there is no TLS handshake at all, so the CA could
+/// never be consulted. `context` names the backend (e.g. `"s3 backend"`) for
+/// the message.
+///
+/// Deliberately NOT here: `caBundleRef` + `insecureSkipVerify: true` is an
+/// admission *warning* ([`super::S3_TLS_SKIP_VERIFY_WARNING`]), never an error
+/// — see that constant's doc for why upgrades forbid hardening it.
+pub fn validate_backend_tls(tls: &crate::common::TlsConfig, context: &str) -> ValidationResult {
+    let Some(ca) = &tls.ca_bundle_ref else {
+        return Ok(());
+    };
+    if tls.disable_tls {
+        return Err(ValidationError::MutuallyExclusive {
+            a: "tls.caBundleRef".to_string(),
+            b: "tls.disableTls".to_string(),
+            context: format!(
+                "{context}: with disableTls (kopia --disable-tls) there is no TLS \
+                 handshake at all, so the referenced CA bundle can never be \
+                 consulted — remove disableTls to verify with the CA bundle, or \
+                 remove caBundleRef for plain HTTP"
+            ),
+        });
+    }
+    match ca.config_map_name.as_deref() {
+        None | Some("") => {
+            return Err(ValidationError::InvalidFieldValue {
+                field: format!("{context} tls.caBundleRef.configMapName"),
+                reason: "the caBundleRef names no ConfigMap, so there is nothing to \
+                         resolve the CA bundle from — set configMapName to the \
+                         ConfigMap holding the PEM CA bundle, or remove the \
+                         caBundleRef block"
+                    .to_string(),
+            });
+        }
+        Some(name) => {
+            validate_dns1123_name(name, &format!("{context} tls.caBundleRef.configMapName"))?;
+        }
+    }
+    if let Some(key) = &ca.key
+        && key.trim().is_empty()
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{context} tls.caBundleRef.key"),
+            reason: format!(
+                "is blank ({key:?}) and can never match a ConfigMap key — set it to \
+                 the key holding the PEM CA bundle, or omit it to use the default \
+                 \"ca.crt\""
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Validate backend *content* the structural schema can't express: the
 /// inline-NFS volume on a `Filesystem` backend, the `secretRef` XOR
-/// `workloadIdentity` rule on the cloud-IAM backends, and Azure's
-/// workload-identity prerequisites. Exhaustive `match` so a new `Backend`
-/// variant must be considered here before it compiles.
+/// `workloadIdentity` rule on the cloud-IAM backends, Azure's
+/// workload-identity prerequisites, and the S3 `tls` block's consistency.
+/// Exhaustive `match` so a new `Backend` variant must be considered here
+/// before it compiles.
 pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
     use crate::backend::{Backend, RepoVolume};
     match backend {
@@ -72,10 +134,15 @@ pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
             Some(RepoVolume::Nfs(nfs)) => validate_nfs_volume(nfs, "filesystem repo"),
             Some(RepoVolume::Pvc(_)) | None => Ok(()),
         },
-        Backend::S3(s) => match &s.auth {
-            Some(auth) => validate_backend_auth(auth, "s3 backend"),
-            None => Ok(()),
-        },
+        Backend::S3(s) => {
+            if let Some(auth) = &s.auth {
+                validate_backend_auth(auth, "s3 backend")?;
+            }
+            if let Some(tls) = &s.tls {
+                validate_backend_tls(tls, "s3 backend")?;
+            }
+            Ok(())
+        }
         Backend::Azure(a) => match &a.auth {
             Some(auth) => {
                 validate_backend_auth(auth, "azure backend")?;
