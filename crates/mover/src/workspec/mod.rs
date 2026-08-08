@@ -1391,6 +1391,19 @@ impl ResolvedIdentity {
         format!("{}@{}:{}", self.username, self.hostname, self.source_path)
     }
 }
+/// A PEM CA bundle in a `ConfigMap`, mounted into the mover so it can verify a
+/// self-signed object-store endpoint.
+///
+/// Resolved in the mover's OWN namespace: `ConfigMap` volumes are namespace-local,
+/// so the bundle must exist wherever movers run, not only beside the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaBundle {
+    /// Name of the `ConfigMap`.
+    pub config_map_name: String,
+    /// Key inside the `ConfigMap` holding the PEM bundle.
+    pub key: String,
+}
 
 /// How to reach the repository. Externally tagged: exactly one backend.
 ///
@@ -1429,6 +1442,12 @@ pub enum RepositoryConnect {
         /// Skip TLS certificate verification (`--disable-tls-verification`).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         disable_tls_verification: bool,
+        /// `ConfigMap` holding a PEM CA bundle the mover must trust to verify this
+        /// endpoint. kopia exposes no CA flag, so the bundle is mounted into the
+        /// pod and Go's verifier is pointed at it; see `build_job`. Omitted from
+        /// the wire when absent, so work specs written before this field parse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_bundle: Option<CaBundle>,
         /// Authenticate via the ambient AWS credential chain (workload identity:
         /// IRSA / EKS Pod Identity) instead of static keys from the env. Defaults
         /// to `false` and is omitted from the wire when false, so work-spec
@@ -1543,6 +1562,9 @@ impl RepositoryConnect {
                 disable_tls,
                 disable_tls_verification,
                 ambient_credentials,
+                // Not a kopia flag: the bundle reaches kopia as a mounted file
+                // plus SSL_CERT_FILE on the mover pod (see jobs::build_job).
+                ca_bundle: _,
             } => ConnectSpec::S3 {
                 bucket: bucket.clone(),
                 endpoint: endpoint.clone(),

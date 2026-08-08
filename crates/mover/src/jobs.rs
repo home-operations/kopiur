@@ -39,6 +39,15 @@ pub const DEFAULT_MOVER_IMAGE: &str = "ghcr.io/home-operations/kopiur-mover:v0.1
 /// `VolumeMount`, and the mover's writability preflight + restore target all
 /// reference this single constant so they can never drift (centralize-config).
 pub const DEEP_SCRATCH_PATH: &str = "/scratch";
+
+/// Volume name for the mounted CA bundle.
+pub const CA_BUNDLE_VOLUME: &str = "ca-bundle";
+/// Directory the CA bundle is mounted at.
+pub const CA_BUNDLE_DIR: &str = "/etc/kopia/ca";
+/// Filename the bundle is projected to, regardless of the ConfigMap key.
+pub const CA_BUNDLE_FILE: &str = "ca.crt";
+/// The image's public root set, kept alongside the custom bundle via SSL_CERT_DIR.
+pub const SYSTEM_CERT_DIR: &str = "/etc/ssl/certs";
 /// Data key the LEGACY per-run work-spec ConfigMaps carried (operator versions
 /// that mounted the spec instead of embedding it in the Job env). Still
 /// referenced by the controller's orphan sweep, which reaps those leftovers.
@@ -514,6 +523,38 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
         volume_mounts.push(repo.to_volume_mount("repo"));
     }
 
+    // A self-signed object-store endpoint needs its CA *inside* the mover pod:
+    // kopia exposes no CA flag, so the bundle is mounted and Go's verifier is
+    // pointed at it via SSL_CERT_FILE below. Without this the repository can
+    // connect (the controller resolves the ConfigMap itself) while every mover
+    // fails `x509: certificate signed by unknown authority`.
+    let ca_bundle = match &inputs.work_spec.repository {
+        crate::workspec::RepositoryConnect::S3 { ca_bundle, .. } => ca_bundle.as_ref(),
+        _ => None,
+    };
+    if let Some(ca) = ca_bundle {
+        volumes.push(Volume {
+            name: CA_BUNDLE_VOLUME.to_string(),
+            config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                name: ca.config_map_name.clone(),
+                items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
+                    key: ca.key.clone(),
+                    path: CA_BUNDLE_FILE.to_string(),
+                    ..Default::default()
+                }]),
+                optional: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: CA_BUNDLE_VOLUME.to_string(),
+            mount_path: CA_BUNDLE_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
     // Credentials (KOPIA_PASSWORD + backend creds) come from Secret(s) as env,
     // never from the ConfigMap. One `envFrom` per distinct secret so an
     // object-store repo whose password and backend keys live in separate Secrets
@@ -565,6 +606,21 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
             value_from: None,
         },
     ];
+    if ca_bundle.is_some() {
+        // SSL_CERT_FILE alone would REPLACE the image's root set; pairing it with
+        // SSL_CERT_DIR keeps the public roots so a mover can still reach an
+        // OTLP collector or a publicly-signed endpoint.
+        env.push(k8s_openapi::api::core::v1::EnvVar {
+            name: "SSL_CERT_FILE".to_string(),
+            value: Some(format!("{CA_BUNDLE_DIR}/{CA_BUNDLE_FILE}")),
+            value_from: None,
+        });
+        env.push(k8s_openapi::api::core::v1::EnvVar {
+            name: "SSL_CERT_DIR".to_string(),
+            value: Some(SYSTEM_CERT_DIR.to_string()),
+            value_from: None,
+        });
+    }
     if let Some(cm) = inputs.result_configmap {
         env.push(k8s_openapi::api::core::v1::EnvVar {
             name: RESULT_CONFIGMAP_ENV.to_string(),
@@ -1329,6 +1385,96 @@ mod tests {
             .find(|e| e.secret_ref.as_ref().map(|s| s.name.as_str()) == Some("dest-creds"))
             .expect("dest envFrom");
         assert_eq!(dest.prefix.as_deref(), Some("KOPIUR_DEST_"));
+    }
+
+    #[test]
+    fn s3_ca_bundle_is_mounted_and_trusted_by_the_mover() {
+        use crate::workspec::{CaBundle, RepositoryConnect};
+        // The repository connects via the controller, which resolves the CA itself;
+        // the mover only ever sees what build_job mounts. Without this the mover
+        // fails `x509: certificate signed by unknown authority` while the
+        // repository reports Ready.
+        let mut ws = sample_work_spec();
+        ws.repository = RepositoryConnect::S3 {
+            bucket: "kopiur".into(),
+            endpoint: Some("minio.storage.svc:9001".into()),
+            prefix: None,
+            region: Some("us-east-1".into()),
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+            ca_bundle: Some(CaBundle {
+                config_map_name: "minio-ca".into(),
+                key: "ca.crt".into(),
+            }),
+        };
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == CA_BUNDLE_VOLUME)
+            .expect("ca-bundle volume missing");
+        let cm = vol.config_map.as_ref().expect("configMap source");
+        assert_eq!(cm.name, "minio-ca");
+        // The key is projected to a fixed filename so the env below is constant.
+        let item = &cm.items.as_ref().unwrap()[0];
+        assert_eq!(item.key, "ca.crt");
+        assert_eq!(item.path, CA_BUNDLE_FILE);
+
+        let container = &pod.containers[0];
+        let mount = container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == CA_BUNDLE_VOLUME)
+            .expect("ca-bundle mount missing");
+        assert_eq!(mount.mount_path, CA_BUNDLE_DIR);
+        assert_eq!(mount.read_only, Some(true));
+
+        let env = container.env.as_ref().unwrap();
+        let file = env
+            .iter()
+            .find(|e| e.name == "SSL_CERT_FILE")
+            .expect("SSL_CERT_FILE set");
+        assert_eq!(
+            file.value.as_deref(),
+            Some(format!("{CA_BUNDLE_DIR}/{CA_BUNDLE_FILE}").as_str())
+        );
+        // Paired with SSL_CERT_DIR so the image's public roots survive.
+        let dir = env
+            .iter()
+            .find(|e| e.name == "SSL_CERT_DIR")
+            .expect("SSL_CERT_DIR set");
+        assert_eq!(dir.value.as_deref(), Some(SYSTEM_CERT_DIR));
+    }
+
+    #[test]
+    fn s3_without_a_ca_bundle_mounts_nothing_extra() {
+        let ws = sample_work_spec();
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert!(
+            !pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == CA_BUNDLE_VOLUME),
+            "no CA volume without caBundleRef"
+        );
+        assert!(
+            !pod.containers[0]
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "SSL_CERT_FILE"),
+            "SSL_CERT_FILE must not be set without a bundle"
+        );
     }
 
     #[test]

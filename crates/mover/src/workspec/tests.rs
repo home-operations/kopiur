@@ -147,6 +147,7 @@ fn restore_roundtrip() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         target_ref: TargetRef {
             kind: "Restore".into(),
@@ -244,6 +245,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         target_ref: TargetRef {
             kind: "Restore".into(),
@@ -431,6 +433,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             disable_tls: true,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         target_ref: TargetRef {
             kind: "Repository".into(),
@@ -544,6 +547,7 @@ fn maintenance_roundtrip_and_wire_shape() {
             disable_tls: true,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         target_ref: TargetRef {
             kind: "Maintenance".into(),
@@ -676,6 +680,7 @@ fn connect_spec_conversion() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: false,
+        ca_bundle: None,
     };
     assert_eq!(
         s3.to_connect_spec(),
@@ -889,6 +894,7 @@ fn s3_ambient_credentials_roundtrips_and_defaults_false() {
         disable_tls: false,
         disable_tls_verification: false,
         ambient_credentials: true,
+        ca_bundle: None,
     };
     let v: serde_json::Value = serde_json::to_value(&wire).unwrap();
     assert_eq!(v["s3"]["ambientCredentials"], true);
@@ -1317,6 +1323,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         target_ref: TargetRef {
             kind: "SnapshotPolicy".into(),
@@ -1467,6 +1474,7 @@ fn replicate_roundtrip_and_wire_shape() {
                 disable_tls: false,
                 disable_tls_verification: false,
                 ambient_credentials: false,
+                ca_bundle: None,
             },
             delete_extra: true,
             parallel: Some(8),

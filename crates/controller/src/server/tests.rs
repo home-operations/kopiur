@@ -49,6 +49,7 @@ fn inputs<'a>(ns: &'a str, auth: ResolvedAuth) -> ServerBuildInputs<'a> {
             disable_tls: false,
             disable_tls_verification: false,
             ambient_credentials: false,
+            ca_bundle: None,
         },
         read_only: false,
         port: 51515,

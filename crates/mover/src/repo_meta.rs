@@ -11,6 +11,7 @@
 //! Every mapping is exhaustive over [`Backend`] (ADR §5.5): a new backend
 //! variant cannot compile until each projection decides what it yields.
 
+use crate::workspec::CaBundle;
 use kopiur_api::backend::{Backend, RepoVolume};
 
 use crate::jobs::MountSource;
@@ -87,6 +88,19 @@ pub fn backend_to_repository_connect(backend: &Backend) -> RepositoryConnect {
                 .as_ref()
                 .map(|t| t.insecure_skip_verify)
                 .unwrap_or(false),
+            // A CA bundle only reaches kopia as a mounted file, so carry the
+            // ConfigMap reference through to `build_job`. `key` defaults to the
+            // conventional `ca.crt` when the CRD leaves it unset.
+            ca_bundle: s
+                .tls
+                .as_ref()
+                .and_then(|t| t.ca_bundle_ref.as_ref())
+                .and_then(|r| {
+                    r.config_map_name.as_ref().map(|name| CaBundle {
+                        config_map_name: name.clone(),
+                        key: r.key.clone().unwrap_or_else(|| "ca.crt".to_string()),
+                    })
+                }),
             // Workload identity: no static keys in the env — kopia is invoked
             // with explicitly-empty key flags so its credential chain resolves
             // ambiently (IRSA / EKS Pod Identity / IMDS).
