@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.4](https://github.com/home-operations/kopiur/compare/0.9.3...0.9.4) (2026-08-08)
+
+
+### Features
+
+* **docs:** Update README.md ([#358](https://github.com/home-operations/kopiur/issues/358)) ([05d2506](https://github.com/home-operations/kopiur/commit/05d2506fb7e5a81d4db22abdb68cf78037150e70))
+
+
+### Bug Fixes
+
+* implement pvcSelector/groupBy ([#346](https://github.com/home-operations/kopiur/issues/346)) and model deduped backups as Unchanged ([#351](https://github.com/home-operations/kopiur/issues/351)) ([#354](https://github.com/home-operations/kopiur/issues/354)) ([a2b9ae6](https://github.com/home-operations/kopiur/commit/a2b9ae6ee5e6de729108a2f7b88894a027b61d95))
+* **rust:** update crate clap (4.6.5 → 4.6.6) ([#357](https://github.com/home-operations/kopiur/issues/357)) ([e9ca396](https://github.com/home-operations/kopiur/commit/e9ca3969fdc746b6b1f96f72e7668fab2c2117be))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update tool node (24.18.1 → v24.19.0) ([#353](https://github.com/home-operations/kopiur/issues/353)) ([2f28c6d](https://github.com/home-operations/kopiur/commit/2f28c6d8daa4f90eb4fc213c0ababdf3b65730ce))
+* **mise:** Update tool oxfmt (0.61.0 → 0.62.0) ([#356](https://github.com/home-operations/kopiur/issues/356)) ([e95df6b](https://github.com/home-operations/kopiur/commit/e95df6bade7327bc8ad238e3466e030a08de8082))
+
 ## [0.9.3](https://github.com/home-operations/kopiur/compare/0.9.2...0.9.3) (2026-08-05)
 
 
