@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.5](https://github.com/home-operations/kopiur/compare/0.9.4...0.9.5) (2026-08-08)
+
+
+### Bug Fixes
+
+* deliver s3 tls.caBundleRef to every kopia invocation ([#365](https://github.com/home-operations/kopiur/issues/365)) ([cda0237](https://github.com/home-operations/kopiur/commit/cda0237d3ed9d6b980c79125c521ece5a618b79f))
+* doctor misses structurally-blocked work ([#359](https://github.com/home-operations/kopiur/issues/359)) + phase/gate exhaustiveness ratchet ([#363](https://github.com/home-operations/kopiur/issues/363)) ([b844974](https://github.com/home-operations/kopiur/commit/b844974fd2f4d899a54315bef990d96146607d91))
+* **rust:** update crate thiserror (2.0.19 → 2.0.20) ([#360](https://github.com/home-operations/kopiur/issues/360)) ([4aa646d](https://github.com/home-operations/kopiur/commit/4aa646d9578c1406593769a6ae2db33894e15a22))
+
+
+### Continuous Integration
+
+* **github-action:** Update action docker/github-builder (v1.15.0 → v1.16.0) ([#362](https://github.com/home-operations/kopiur/issues/362)) ([db32818](https://github.com/home-operations/kopiur/commit/db32818586c75de393c7285fd0204be5ddfa8c5e))
+
 ## [0.9.4](https://github.com/home-operations/kopiur/compare/0.9.3...0.9.4) (2026-08-08)
 
 
