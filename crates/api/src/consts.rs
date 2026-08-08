@@ -258,6 +258,73 @@ pub fn effective_mass_deletion_threshold(p: Option<&crate::common::DeletionProte
 /// deletions for this repository are at/above the breaker threshold and held.
 pub const MASS_DELETION_HELD_CONDITION: &str = "MassDeletionHeld";
 
+/// `reason` for [`MASS_DELETION_HELD_CONDITION`] = `True` on a
+/// `Repository`/`ClusterRepository`: pending external destructive deletions for
+/// this repository are at/above its breaker threshold.
+pub const MASS_DELETION_THRESHOLD_EXCEEDED_REASON: &str = "ThresholdExceeded";
+
+// --- Structural-gate conditions/reasons (shared with `kubectl kopiur doctor`) -
+//
+// These are the condition `type`/`reason` pairs the reconcilers stamp when work
+// is BLOCKED on something only a human can change (a namespace opt-in, a Secret,
+// an acknowledgement annotation). They live here — not in `kopiur-controller` —
+// because the CLI's `doctor` must recognize them byte-for-byte; the typed
+// registry in [`crate::gates`] is the shared enumeration built from them, and
+// the controller re-exports each name so its call sites are unchanged.
+
+/// Namespace annotation a cluster admin sets to allow elevated (root/privileged)
+/// movers in that namespace (ADR §4.11/§G16). Without it, a `SnapshotPolicy` whose
+/// `spec.mover` requests privilege is refused — a tenant could otherwise reuse the
+/// minted mover ServiceAccount at that privilege. Mirrors VolSync's
+/// `volsync.backube/privileged-movers`.
+pub const PRIVILEGED_MOVERS_ANNOTATION: &str = "kopiur.home-operations.com/privileged-movers";
+/// `Snapshot`/`Restore` condition surfaced when a privileged mover is requested in a
+/// namespace that has not opted in — `False` carries the actionable message.
+pub const MOVER_PERMITTED_CONDITION: &str = "MoverPermitted";
+/// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False`.
+pub const PRIVILEGED_MOVER_NOT_PERMITTED_REASON: &str = "PrivilegedMoverNotPermitted";
+
+/// `SnapshotSchedule` condition recording whether the schedule is able to fire
+/// its next slot. Set `False` (with [`BLOCKED_ON_UNREADABLE_RUN_REASON`]) when
+/// the concurrency gate is held by a `Snapshot` whose `status.phase` this build
+/// cannot interpret.
+pub const SCHEDULE_RUNNABLE_CONDITION: &str = "ScheduleRunnable";
+/// `reason`/Event reason for [`SCHEDULE_RUNNABLE_CONDITION`] = `False`: a
+/// previous run of this schedule sits at a phase string written by a NEWER
+/// kopiur, so this build can never observe it reach a terminal phase. Under the
+/// default `concurrencyPolicy: Forbid` that stops the schedule permanently, and
+/// nothing about the `SnapshotSchedule` itself would otherwise say so — the
+/// silent-wedge shape of #359, one kind removed.
+pub const BLOCKED_ON_UNREADABLE_RUN_REASON: &str = "BlockedOnUnreadableRun";
+
+/// `Snapshot` condition recording whether its repository accepts writes (§11). Set
+/// `False` (with [`REPOSITORY_READ_ONLY_REASON`]) when a backup is refused because
+/// the repository is `mode: ReadOnly`.
+pub const REPOSITORY_WRITABLE_CONDITION: &str = "RepositoryWritable";
+/// `reason`/Event reason when a backup or maintenance is refused on a `ReadOnly`
+/// repository (ADR-0005 §11).
+pub const REPOSITORY_READ_ONLY_REASON: &str = "RepositoryReadOnly";
+
+/// `Snapshot`/`Restore` condition surfaced when the mover Job's credential Secret is
+/// absent from the workload namespace — `False` carries the actionable message
+/// (which Secret, which namespace, why, and how to fix). ADR §4.12.
+pub const CREDENTIALS_AVAILABLE_CONDITION: &str = "CredentialsAvailable";
+/// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False`.
+pub const MISSING_CREDENTIALS_REASON: &str = "MissingCredentialsSecret";
+/// `reason`/Event reason for [`CREDENTIALS_AVAILABLE_CONDITION`] = `False` when
+/// the missing dependency is the **workload-identity ServiceAccount** the
+/// backend's `auth.workloadIdentity` names (the user creates it; kopiur never
+/// does — its cloud annotations are the user's federation contract).
+pub const MISSING_SERVICE_ACCOUNT_REASON: &str = "MissingServiceAccount";
+
+/// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
+/// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
+/// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the
+/// repository.
+pub const DELETION_HELD_CONDITION: &str = "DeletionHeld";
+/// `reason` for [`DELETION_HELD_CONDITION`] = `True`.
+pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +356,7 @@ mod tests {
             ALLOW_IDENTITY_CHANGE_ANNOTATION,
             PRUNED_BY_ANNOTATION,
             ALLOW_MASS_DELETION_ANNOTATION,
+            PRIVILEGED_MOVERS_ANNOTATION,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");
         }

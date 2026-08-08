@@ -30,13 +30,14 @@ emits the full typed report for dashboards/scripts.
 
 ## `doctor`
 
-Diagnoses an installation and exits 1 if anything failed: the 8 CRDs are
-installed and serve `v1alpha1`, the controller (and webhook, when installed)
-Deployments are ready, a **live dry-run admission probe** (an intentionally
-invalid SnapshotPolicy that must be denied — zero cluster mutation), every
-repository is `Ready`, every repository's credential Secrets resolve, nothing
-has been Pending/Running longer than `--stuck-threshold` (default `1h`), and
-recent Warning events are summarized.
+Diagnoses an installation and exits 1 if anything failed. Nine checks: the 8
+CRDs are installed and serve `v1alpha1`, the controller (and webhook, when
+installed) Deployments are ready, a **live dry-run admission probe** (an
+intentionally invalid SnapshotPolicy that must be denied — zero cluster
+mutation), every repository is `Ready` and unblocked, every repository's
+credential Secrets resolve, no work is **blocked or stuck**, no Snapshot/Restore
+failed within `--failure-lookback` (default `24h`), and recent Warning events
+are summarized.
 
 ```console
 $ kubectl kopiur doctor -n media
@@ -48,14 +49,65 @@ $ kubectl kopiur doctor -n media
   FAIL  credential secrets present: Repository/nas: secret media/kopia-creds not found
         why: movers load credentials via namespace-local envFrom; a missing Secret fails every run against that repository
         fix: create the Secret in the named namespace (or enable credentialProjection where supported)
-  ok    no stuck snapshots/restores
+  ok    no blocked or stuck work
+  ok    no recent failed snapshots/restores
   ok    recent warning events
 
-8 check(s): 1 failed, 0 warning(s)
+9 check(s): 1 failed, 0 warning(s)
 ```
 
 Checks the user lacks RBAC for degrade to warnings naming the missing grant —
 doctor never crashes on a restricted kubeconfig.
+
+### Blocked is not the same as old
+
+`no blocked or stuck work` reads **conditions**, not just phases. Some states
+never self-heal: the operator parks the object and waits for a change only you
+can make — a namespace opt-in annotation for a privileged mover, a missing
+credential `Secret` or `ServiceAccount`, an acknowledgement for the
+[mass-deletion breaker](../repositories.md#deletionprotection--the-mass-deletion-circuit-breaker), or a `SnapshotSchedule` whose previous
+run sits at a phase this plugin cannot read. The object's phase stays an
+unremarkable `Pending`, so an age threshold would hide it.
+
+Those are reported **immediately, whatever the object's age**, and the FAIL line
+quotes the operator's own condition message — which already contains the exact
+command to run:
+
+```console
+$ kubectl kopiur doctor -n media
+  FAIL  no blocked or stuck work: snapshot media/nightly-1759: blocked on MoverPermitted=False (PrivilegedMoverNotPermitted): the mover for SnapshotPolicy media/nightly needs elevated privileges; run: kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=allow
+        why: a structural gate never self-heals — the operator has parked the object until a human makes an out-of-band change, so it will wait forever however new it is
+        fix: the condition message above is the operator's own diagnosis and carries the exact command to run; apply it and the object proceeds on its own
+```
+
+`--stuck-threshold` (default `1h`) governs only the **age**-based verdict: an
+in-flight Snapshot/Restore that is not blocked, just slow. A Snapshot being
+deleted is measured from its `deletionTimestamp`, not its creation, so a routine
+retention prune of month-old snapshots is never reported as stuck — only a
+finalizer that is genuinely wedged.
+
+/// tip | Failed work is a separate check
+
+`no recent failed snapshots/restores` fails on a `Failed` Snapshot/Restore whose
+failure is inside `--failure-lookback` (default `24h`) and only **warns** for
+older ones. `failedJobsHistoryLimit` keeps failed CRs around by design, so
+without that window one bad night last month would leave doctor permanently red.
+
+A failure a *deliberate configuration* explains is listed but never counted red,
+whatever its age — a repository you flipped to `mode: ReadOnly` refuses backups
+by design, so a schedule still firing against it warns rather than failing for
+the whole migration.
+
+///
+
+Every check reports what it could actually see. If one kind cannot be listed
+(a kubeconfig without `list snapshotschedules`, say) only that kind degrades:
+the objects that did list are still examined, and the unreadable kind is named
+next to the verdict — never a green report standing in for an unread cluster.
+
+If the plugin is older than the operator it says so instead of reporting green:
+an unreadable phase, an unknown gate reason, or a response it cannot decode all
+render as a check telling you to upgrade `kubectl-kopiur`.
 
 ## `maintenance run`
 
@@ -143,10 +195,11 @@ $ kubectl kopiur doctor -n media
   ok    webhook admission (live dry-run probe)
   ok    repositories ready
   ok    credential secrets present
-  ok    no stuck snapshots/restores
+  ok    no blocked or stuck work
+  ok    no recent failed snapshots/restores
   ok    recent warning events
 
-8 check(s): 0 failed, 0 warning(s)
+9 check(s): 0 failed, 0 warning(s)
 ```
 
 **3. Pause and unpause** the schedule declaratively (idempotent — re-running prints `unchanged`):

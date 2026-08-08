@@ -333,18 +333,31 @@ fn terminal_snapshot_uids(snapshots: &[Snapshot]) -> HashSet<String> {
     snapshots
         .iter()
         .filter(|s| {
-            matches!(
-                s.status.as_ref().and_then(|st| st.phase),
+            // Exhaustive, NOT `SnapshotPhase::is_terminal()`: this set
+            // deliberately EXCLUDES `Discovered`, which is terminal but never
+            // had a mover run and so never had a projected credential copy to
+            // reap. Collapsing the two would silently widen a reap set.
+            match s.status.as_ref().and_then(|st| st.phase.as_ref()) {
                 // `Unchanged` is terminal too — no further mover Job will ever
                 // launch for it — so its projected credential copy is dead
                 // weight the moment it lands. Omitting it leaks one Secret per
                 // deduped run, forever, on exactly the workload this phase
                 // exists for (a frequent schedule over static data): #240 all
                 // over again.
-                Some(SnapshotPhase::Succeeded)
-                    | Some(SnapshotPhase::Failed)
-                    | Some(SnapshotPhase::Unchanged)
-            )
+                Some(
+                    SnapshotPhase::Succeeded | SnapshotPhase::Failed | SnapshotPhase::Unchanged,
+                ) => true,
+                Some(
+                    SnapshotPhase::Pending
+                    | SnapshotPhase::Running
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered,
+                )
+                | None => false,
+                // Never reap a live credential off a phase this build cannot
+                // read: a newer operator's run may still need it.
+                Some(SnapshotPhase::Unknown(_)) => false,
+            }
         })
         .filter_map(|s| s.uid())
         .collect()
@@ -1598,5 +1611,61 @@ mod tests {
         let snaps = vec![mk("a", "uid-a", true), mk("b", "uid-b", false)];
         let holding = finalizer_holding_snapshot_uids(&snaps);
         assert_eq!(holding, HashSet::from(["uid-a".to_string()]));
+    }
+
+    #[test]
+    fn terminal_snapshot_uids_is_the_finished_run_set_not_the_terminal_phase_set() {
+        use kopiur_api::snapshot::{SnapshotSpec, SnapshotStatus};
+        let mk = |uid: &str, phase: Option<SnapshotPhase>| {
+            let mut s = Snapshot::new(
+                uid,
+                SnapshotSpec {
+                    source: None,
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            s.metadata.uid = Some(uid.to_string());
+            s.status = Some(SnapshotStatus {
+                phase,
+                ..Default::default()
+            });
+            s
+        };
+        let snaps = vec![
+            mk("uid-succeeded", Some(SnapshotPhase::Succeeded)),
+            mk("uid-failed", Some(SnapshotPhase::Failed)),
+            // `Unchanged` MUST be in the set, or a frequent schedule over static
+            // data leaks one projected Secret per deduped run, forever (#240).
+            mk("uid-unchanged", Some(SnapshotPhase::Unchanged)),
+            mk("uid-pending", Some(SnapshotPhase::Pending)),
+            mk("uid-running", Some(SnapshotPhase::Running)),
+            mk("uid-deleting", Some(SnapshotPhase::Deleting)),
+            // Deliberately EXCLUDED even though `SnapshotPhase::is_terminal()`
+            // says `Discovered` is terminal: a catalog row never had a mover run
+            // and so never had a credential copy to reap. This assertion is the
+            // guard against "simplifying" the match into `is_terminal()`.
+            mk("uid-discovered", Some(SnapshotPhase::Discovered)),
+            // A phase written by a NEWER operator: never reap a credential a
+            // still-live run might need.
+            mk(
+                "uid-future",
+                Some(SnapshotPhase::Unknown("Quiescing".into())),
+            ),
+            mk("uid-nostatus", None),
+        ];
+        assert_eq!(
+            terminal_snapshot_uids(&snaps),
+            HashSet::from([
+                "uid-succeeded".to_string(),
+                "uid-failed".to_string(),
+                "uid-unchanged".to_string(),
+            ])
+        );
     }
 }

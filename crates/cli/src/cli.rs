@@ -374,8 +374,22 @@ pub struct StatusArgs {
 #[derive(clap::Args, Debug)]
 pub struct DoctorArgs {
     /// Treat a Snapshot/Restore Pending/Running longer than this as stuck.
+    ///
+    /// Only the AGE-based verdict uses this: an object parked on a structural
+    /// gate (a missing namespace opt-in, a missing credential Secret, a held
+    /// mass-deletion breaker) never self-heals and is reported immediately,
+    /// however young it is.
     #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration)]
     pub stuck_threshold: std::time::Duration,
+
+    /// How far back a terminal `Failed` Snapshot/Restore counts as a CURRENT
+    /// problem (doctor fails) rather than retained history (doctor warns).
+    ///
+    /// `failedJobsHistoryLimit` keeps Failed CRs around by design, so an
+    /// unbounded window would leave doctor permanently red on a healthy
+    /// install that failed once last month.
+    #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = parse_duration)]
+    pub failure_lookback: std::time::Duration,
 }
 
 /// Flags for `restore`: exactly one source, exactly one target (both enforced

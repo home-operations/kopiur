@@ -644,13 +644,13 @@ impl Metrics {
                         let phase = s
                             .status
                             .as_ref()
-                            .and_then(|st| st.phase)
+                            .and_then(|st| st.phase.clone())
                             .unwrap_or_default();
                         let mut attrs = vec![
                             KeyValue::new("kind", "Snapshot"),
                             KeyValue::new("namespace", s.namespace().unwrap_or_default()),
                             KeyValue::new("name", s.name_any()),
-                            KeyValue::new("phase", phase.label()),
+                            KeyValue::new("phase", phase.label().to_string()),
                         ];
                         if let Some(pr) = s.spec.policy_ref.as_ref() {
                             attrs.push(KeyValue::new("policy", pr.name.clone()));
@@ -661,7 +661,7 @@ impl Metrics {
                         let phase = r
                             .status
                             .as_ref()
-                            .and_then(|st| st.phase)
+                            .and_then(|st| st.phase.clone())
                             .unwrap_or_default();
                         o.observe(
                             1,
@@ -677,7 +677,7 @@ impl Metrics {
                         let phase = r
                             .status
                             .as_ref()
-                            .and_then(|st| st.phase)
+                            .and_then(|st| st.phase.clone())
                             .unwrap_or_default();
                         // Cluster-scoped: empty namespace, matching the sync convention.
                         o.observe(
@@ -689,7 +689,7 @@ impl Metrics {
                         let phase = r
                             .status
                             .as_ref()
-                            .and_then(|st| st.phase)
+                            .and_then(|st| st.phase.clone())
                             .unwrap_or_default();
                         o.observe(
                             1,
@@ -1088,9 +1088,11 @@ impl Metrics {
                         let Some(st) = r.status.as_ref() else {
                             continue;
                         };
-                        if let Some(ts) =
-                            breaker_open_since(st.phase, st.health.as_ref(), &st.conditions)
-                        {
+                        if let Some(ts) = breaker_open_since(
+                            st.phase.as_ref(),
+                            st.health.as_ref(),
+                            &st.conditions,
+                        ) {
                             o.observe(
                                 ts,
                                 &repo_health_attrs(
@@ -1105,9 +1107,11 @@ impl Metrics {
                         let Some(st) = r.status.as_ref() else {
                             continue;
                         };
-                        if let Some(ts) =
-                            breaker_open_since(st.phase, st.health.as_ref(), &st.conditions)
-                        {
+                        if let Some(ts) = breaker_open_since(
+                            st.phase.as_ref(),
+                            st.health.as_ref(),
+                            &st.conditions,
+                        ) {
                             o.observe(
                                 ts,
                                 &repo_health_attrs("ClusterRepository", "", &r.name_any()),
@@ -1440,12 +1444,14 @@ pub struct ResourceStores {
 /// Attributes for a `kopiur_resource_phase` series without a `policy` label
 /// (Repository/ClusterRepository/Restore, and discovered Snapshots go through the
 /// Snapshot-specific path).
-fn phase_attrs(kind: &'static str, ns: &str, name: &str, phase: &'static str) -> [KeyValue; 4] {
+fn phase_attrs(kind: &'static str, ns: &str, name: &str, phase: &str) -> [KeyValue; 4] {
     [
         KeyValue::new("kind", kind),
         KeyValue::new("namespace", ns.to_string()),
         KeyValue::new("name", name.to_string()),
-        KeyValue::new("phase", phase),
+        // Owned: a phase label is `&'static str` for every canonical variant but
+        // borrows the CR's own string for `Unknown`, so it cannot be a `&'static`.
+        KeyValue::new("phase", phase.to_string()),
     ]
 }
 
@@ -1544,10 +1550,20 @@ fn snapshot_success_unix(s: &Snapshot) -> Option<i64> {
     // `Succeeded` alone freezes this timestamp for any policy with
     // `ignoreIdenticalSnapshots` over static data, and `KopiurBackupStale`
     // then pages for the healthy case (#351).
-    if !matches!(
-        status.phase,
-        Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged)
-    ) {
+    let counts_as_backup = status.phase.as_ref().is_some_and(|p| match p {
+        SnapshotPhase::Succeeded | SnapshotPhase::Unchanged => true,
+        SnapshotPhase::Pending
+        | SnapshotPhase::Running
+        | SnapshotPhase::Failed
+        | SnapshotPhase::Deleting
+        // A discovered row mirrors a snapshot the operator did not produce and
+        // carries no run timing of its own.
+        | SnapshotPhase::Discovered => false,
+        // Never claim a fresh backup from a phase this build cannot interpret:
+        // a wrongly-advanced liveness timestamp silences `KopiurBackupStale`.
+        SnapshotPhase::Unknown(_) => false,
+    });
+    if !counts_as_backup {
         return None;
     }
     status
@@ -1592,7 +1608,19 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
         // out the size/duration/file series for a policy whose data simply
         // stopped changing. The last snapshot that actually exists stays the
         // one described here; liveness is the other function's job.
-        if status.phase != Some(SnapshotPhase::Succeeded) {
+        let describes_a_manifest = status.phase.as_ref().is_some_and(|p| match p {
+            SnapshotPhase::Succeeded => true,
+            SnapshotPhase::Unchanged
+            | SnapshotPhase::Pending
+            | SnapshotPhase::Running
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered => false,
+            // An uninterpretable phase describes nothing; leave the last real
+            // snapshot as the one these size/duration/file series report.
+            SnapshotPhase::Unknown(_) => false,
+        });
+        if !describes_a_manifest {
             continue;
         }
         let Some(end_unix) = status
@@ -1659,15 +1687,27 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
         let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
             continue;
         };
-        let healthy = match s.status.as_ref().and_then(|st| st.phase) {
+        let healthy = match s.status.as_ref().and_then(|st| st.phase.as_ref()) {
             // `Unchanged` is a healthy terminal outcome. Skipping it (the old
             // `_ => continue`) would leave the LAST FAILED run as the winning
             // observation forever, pinning the policy unhealthy and making
             // `KopiurSnapshotFailed`'s recovery gate unable to ever clear.
             Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged) => true,
             Some(SnapshotPhase::Failed) => false,
-            // Non-terminal / Discovered / Deleting never define "last backup".
-            _ => continue,
+            // Non-terminal / Discovered / Deleting never define "last backup"
+            // (spelled out rather than `_ =>` so a new phase must be classified
+            // here before it can compile).
+            Some(
+                SnapshotPhase::Pending
+                | SnapshotPhase::Running
+                | SnapshotPhase::Deleting
+                | SnapshotPhase::Discovered,
+            )
+            | None => continue,
+            // An uninterpretable phase is neither healthy nor failed — leave the
+            // policy's last *known* terminal observation standing rather than
+            // guessing, in either direction.
+            Some(SnapshotPhase::Unknown(_)) => continue,
         };
         let created = s
             .metadata
@@ -1759,8 +1799,22 @@ struct GatedSnapshots {
 /// `Ready` condition carries reason `RepositoryNotReady`. Pure so the gating
 /// predicate is unit-tested off-OTel.
 fn snapshot_gated(s: &Snapshot) -> bool {
-    let phase = s.status.as_ref().and_then(|st| st.phase);
-    if !matches!(phase, None | Some(SnapshotPhase::Pending)) {
+    let parked = match s.status.as_ref().and_then(|st| st.phase.as_ref()) {
+        // Unset defaults to `Pending` for a just-created CR.
+        None | Some(SnapshotPhase::Pending) => true,
+        Some(
+            SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
+        ) => false,
+        // A phase this build cannot interpret is not knowably "parked at
+        // Pending"; do not inflate the gated gauge with it.
+        Some(SnapshotPhase::Unknown(_)) => false,
+    };
+    if !parked {
         return false;
     }
     s.status.as_ref().is_some_and(|st| {
@@ -1824,11 +1878,11 @@ fn repo_consecutive_backend_failures(
 /// the open window and disappears on recovery. Pure so the open-window rule is
 /// unit-tested off-OTel.
 fn breaker_open_since(
-    phase: Option<kopiur_api::RepositoryPhase>,
+    phase: Option<&kopiur_api::RepositoryPhase>,
     health: Option<&kopiur_api::repository::RepositoryHealthStatus>,
     conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
 ) -> Option<i64> {
-    if phase != Some(kopiur_api::RepositoryPhase::Degraded) {
+    if phase != Some(&kopiur_api::RepositoryPhase::Degraded) {
         return None;
     }
     let backend_unreachable = conditions
@@ -3165,18 +3219,22 @@ mod tests {
 
         // Open: Degraded + BackendReachable=False → firstFailureAt.
         assert_eq!(
-            breaker_open_since(Some(RepositoryPhase::Degraded), Some(&health), &unreachable),
+            breaker_open_since(
+                Some(&RepositoryPhase::Degraded),
+                Some(&health),
+                &unreachable
+            ),
             Some(END_UNIX)
         );
         // Degraded for a NON-breaker reason (condition not False) → absent: a
         // retryable bootstrap failure is Degraded too, but it is not an open breaker.
         assert_eq!(
-            breaker_open_since(Some(RepositoryPhase::Degraded), Some(&health), &[]),
+            breaker_open_since(Some(&RepositoryPhase::Degraded), Some(&health), &[]),
             None
         );
         // Not Degraded → absent even with a stale False condition.
         assert_eq!(
-            breaker_open_since(Some(RepositoryPhase::Ready), Some(&health), &unreachable),
+            breaker_open_since(Some(&RepositoryPhase::Ready), Some(&health), &unreachable),
             None
         );
         // Open but no firstFailureAt recorded → no fabricated timestamp.
@@ -3184,7 +3242,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "consecutiveProbeFailures": 3 })).unwrap();
         assert_eq!(
             breaker_open_since(
-                Some(RepositoryPhase::Degraded),
+                Some(&RepositoryPhase::Degraded),
                 Some(&no_first),
                 &unreachable
             ),

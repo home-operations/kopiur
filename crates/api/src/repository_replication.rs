@@ -107,7 +107,17 @@ pub struct SyncOptions {
 }
 
 /// Lifecycle phase of a replication.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::repository_replication::RepositoryReplicationPhase as P;
+///
+/// assert_eq!(serde_json::to_value(P::Suspended).unwrap(), "Suspended");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: P = serde_json::from_value(serde_json::json!("Verifying")).unwrap();
+/// assert_eq!(p, P::Unknown("Verifying".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Verifying");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum RepositoryReplicationPhase {
     /// Admitted, not yet run (also the default).
     #[default]
@@ -120,7 +130,56 @@ pub enum RepositoryReplicationPhase {
     Failed,
     /// Suspended via `spec.suspend`.
     Suspended,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build, never a success.
+    Unknown(String),
 }
+
+impl RepositoryReplicationPhase {
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch (#359, defect 3).
+    ///
+    /// Same narrow contract as [`SnapshotPhase::is_unknown`](crate::SnapshotPhase::is_unknown):
+    /// `true` means only "this string is not a phase this binary knows", never
+    /// "unusual" or "not one I handle". A canonical variant added to this enum
+    /// later is by definition **not** the sentinel, which is why the `match` is
+    /// written out exhaustively rather than left as a `matches!` — the compiler,
+    /// not a reviewer, is what forces the new variant to answer.
+    ///
+    /// The reconciler uses it for its entry-time version-skew warning
+    /// (`io::warn_unreadable_phase`). Unlike the other drivers, it does not
+    /// promptly overwrite what it cannot read: no branch reads this phase, and
+    /// the terminal stamp comes from the mover at the end of a run, so an
+    /// unreadable value simply persists — up to a whole schedule interval. The
+    /// warning is therefore repeated every pass rather than emitted once: the
+    /// log is where the skew is visible.
+    ///
+    /// ```
+    /// use kopiur_api::RepositoryReplicationPhase;
+    ///
+    /// assert!(RepositoryReplicationPhase::Unknown("Verifying".into()).is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Pending.is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Replicating.is_unknown());
+    /// assert!(!RepositoryReplicationPhase::Suspended.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending
+            | Self::Replicating
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Suspended => false,
+        }
+    }
+}
+
+crate::common::phase_serde!(
+    RepositoryReplicationPhase,
+    "Lifecycle phase of a replication."
+);
 
 impl crate::common::PhaseLabel for RepositoryReplicationPhase {
     const ALL: &'static [Self] = &[
@@ -130,14 +189,18 @@ impl crate::common::PhaseLabel for RepositoryReplicationPhase {
         Self::Failed,
         Self::Suspended,
     ];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
             Self::Replicating => "Replicating",
             Self::Succeeded => "Succeeded",
             Self::Failed => "Failed",
             Self::Suspended => "Suspended",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 

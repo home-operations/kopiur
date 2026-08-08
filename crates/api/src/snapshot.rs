@@ -182,7 +182,26 @@ pub enum Origin {
 }
 
 /// Lifecycle phase of a `Snapshot`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::SnapshotPhase;
+/// use kopiur_api::common::PhaseLabel;
+///
+/// // Canonical values round-trip as bare strings.
+/// assert_eq!(serde_json::to_value(SnapshotPhase::Succeeded).unwrap(), "Succeeded");
+/// let p: SnapshotPhase = serde_json::from_value(serde_json::json!("Running")).unwrap();
+/// assert_eq!(p, SnapshotPhase::Running);
+///
+/// // A phase written by a NEWER operator decodes into `Unknown` (never a
+/// // watcher-poisoning serde error) and re-serializes verbatim.
+/// let p: SnapshotPhase = serde_json::from_value(serde_json::json!("Quiescing")).unwrap();
+/// assert_eq!(p, SnapshotPhase::Unknown("Quiescing".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Quiescing");
+/// assert_eq!(p.label(), "Quiescing");
+/// // Never terminal: an unrecognized phase is held and surfaced, not finished.
+/// assert!(!p.is_terminal());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SnapshotPhase {
     /// Admitted, not yet started (also the default).
     #[default]
@@ -218,7 +237,18 @@ pub enum SnapshotPhase {
     /// `--ignore-identical-snapshots=false` at the identity scope on every run.
     /// See #351.
     Unchanged,
+    /// A phase string this build does not recognize — written by a newer
+    /// operator during a rolling upgrade, or persisted before this variant set
+    /// existed. Decode-compat only: hidden from the CRD schema (the apiserver
+    /// rejects it on every new write) and never produced by this build.
+    ///
+    /// Never terminal, never schedulable, never reapable, never a success —
+    /// every consumer holds and surfaces it rather than acting on a phase whose
+    /// meaning it does not know.
+    Unknown(String),
 }
+
+crate::common::phase_serde!(SnapshotPhase, "Lifecycle phase of a `Snapshot`.");
 
 impl Origin {
     /// The stable wire/label value (the serde camelCase encoding), for the
@@ -269,6 +299,91 @@ impl PrunedBy {
     }
 }
 
+impl SnapshotPhase {
+    /// Whether this phase is **terminal**: the operator will do no further work
+    /// on the object of its own accord, so a diagnostic must not report it as
+    /// in-flight (nor as stuck).
+    ///
+    /// `Deleting` is deliberately **not** terminal. A CR sitting in `Deleting`
+    /// has a finalizer that is still trying to reclaim its kopia snapshot — a
+    /// wedged finalizer (an unreachable backend, a held mass-deletion breaker)
+    /// is in-flight work that never completes, which is exactly the state worth
+    /// surfacing. Classifying it terminal is how a stuck deletion becomes
+    /// invisible.
+    ///
+    /// `Discovered` and `Unchanged` ARE terminal: a discovered CR mirrors a
+    /// kopia snapshot the operator did not produce and never advances on its
+    /// own, and an `Unchanged` run already finished (successfully, owning no
+    /// manifest). A `Discovered` CR that is later deleted moves to `Deleting`
+    /// like any other, so nothing is lost by treating the phase itself as done.
+    ///
+    /// Pure + exhaustive so the single definition lives in one tested place —
+    /// the CLI and the controller must never disagree about what "still
+    /// working" means.
+    ///
+    /// ```
+    /// use kopiur_api::SnapshotPhase;
+    ///
+    /// assert!(SnapshotPhase::Succeeded.is_terminal());
+    /// assert!(SnapshotPhase::Failed.is_terminal());
+    /// assert!(SnapshotPhase::Discovered.is_terminal());
+    /// assert!(SnapshotPhase::Unchanged.is_terminal());
+    /// assert!(!SnapshotPhase::Pending.is_terminal());
+    /// assert!(!SnapshotPhase::Running.is_terminal());
+    /// // A wedged finalizer is in-flight work, not a finished object.
+    /// assert!(!SnapshotPhase::Deleting.is_terminal());
+    /// // An unrecognized phase is never terminal — hold and surface it.
+    /// assert!(!SnapshotPhase::Unknown("Quiescing".into()).is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed | Self::Discovered | Self::Unchanged => true,
+            Self::Pending | Self::Running | Self::Deleting => false,
+            // Conservative surface-it policy: a phase this build cannot
+            // interpret must never be reported as finished work, or a newer
+            // operator's in-flight (or wedged) object goes invisible to an
+            // older CLI/reconciler. Not-terminal keeps it in every "still
+            // working / worth looking at" set.
+            Self::Unknown(_) => false,
+        }
+    }
+
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch (#359, defect 3).
+    ///
+    /// The contract is narrow on purpose, and it is the reason this is a method
+    /// rather than an inline `matches!` at each caller: `true` means *only*
+    /// "this string is not a phase this binary knows", never "unusual" or
+    /// "not one I handle". A canonical variant added to this enum later is by
+    /// definition **not** the sentinel, so `false` is the right answer for it —
+    /// which is exactly why the exhaustive `match` below is written out. Callers
+    /// asking a set-shaped question ("is this finished?", "is this a failure?")
+    /// want [`is_terminal`](Self::is_terminal) or their own exhaustive match,
+    /// not this.
+    ///
+    /// ```
+    /// use kopiur_api::SnapshotPhase;
+    ///
+    /// assert!(SnapshotPhase::Unknown("Quiescing".into()).is_unknown());
+    /// assert!(!SnapshotPhase::Succeeded.is_unknown());
+    /// assert!(!SnapshotPhase::Failed.is_unknown());
+    /// assert!(!SnapshotPhase::Deleting.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending
+            | Self::Running
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Deleting
+            | Self::Discovered
+            | Self::Unchanged => false,
+        }
+    }
+}
+
 impl crate::common::PhaseLabel for SnapshotPhase {
     const ALL: &'static [Self] = &[
         Self::Pending,
@@ -279,7 +394,7 @@ impl crate::common::PhaseLabel for SnapshotPhase {
         Self::Discovered,
         Self::Unchanged,
     ];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
             Self::Running => "Running",
@@ -288,7 +403,11 @@ impl crate::common::PhaseLabel for SnapshotPhase {
             Self::Deleting => "Deleting",
             Self::Discovered => "Discovered",
             Self::Unchanged => "Unchanged",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 
@@ -610,6 +729,28 @@ mod tests {
         assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
         // Default is reachable through ALL.
         assert!(SnapshotPhase::ALL.contains(&SnapshotPhase::default()));
+    }
+
+    #[test]
+    fn snapshot_terminal_set_is_pinned() {
+        // Tripwire for the classifier every consumer (doctor, metrics, the
+        // schedule's concurrency accounting) must agree on. Driven off ALL so a
+        // NEW variant cannot join without a deliberate decision here — the
+        // `is_terminal` match won't compile until it is classified, and this
+        // assertion won't pass until the expected set is updated.
+        let terminal: Vec<&str> = SnapshotPhase::ALL
+            .iter()
+            .filter(|p| p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(terminal, ["Succeeded", "Failed", "Discovered", "Unchanged"]);
+        let in_flight: Vec<&str> = SnapshotPhase::ALL
+            .iter()
+            .filter(|p| !p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        // `Deleting` stays here on purpose: a wedged finalizer is in-flight work.
+        assert_eq!(in_flight, ["Pending", "Running", "Deleting"]);
     }
 
     /// Regression for the inert "derived from source" contract (found by the

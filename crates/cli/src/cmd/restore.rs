@@ -166,10 +166,13 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
 
 /// Terminal-phase classification. Exhaustive over [`RestorePhase`].
 pub fn terminal(restore: &Restore) -> Option<Result<Box<Restore>, Box<Restore>>> {
-    match restore.status.as_ref().and_then(|s| s.phase)? {
+    match restore.status.as_ref().and_then(|s| s.phase.as_ref())? {
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => None,
         RestorePhase::Completed => Some(Ok(Box::new(restore.clone()))),
         RestorePhase::Failed => Some(Err(Box::new(restore.clone()))),
+        // Never a terminal answer: `--wait` keeps waiting (bounded by its own
+        // timeout) rather than exiting 0 or 1 on a phase it cannot interpret.
+        RestorePhase::Unknown(_) => None,
     }
 }
 

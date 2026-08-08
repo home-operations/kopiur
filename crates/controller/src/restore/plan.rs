@@ -97,10 +97,14 @@ pub fn populator_needs_cluster_scope_message() -> String {
 /// non-terminal `Completed` heartbeat must not be flipped back to `Pending` by the
 /// gate). Pure + exhaustive over [`RestorePhase`], so a new phase must decide its
 /// gate membership before it compiles.
-pub(super) fn restore_awaiting_launch(phase: Option<RestorePhase>) -> bool {
+pub(super) fn restore_awaiting_launch(phase: Option<&RestorePhase>) -> bool {
     match phase {
         None | Some(RestorePhase::Pending | RestorePhase::Resolving) => true,
         Some(RestorePhase::Restoring | RestorePhase::Completed | RestorePhase::Failed) => false,
+        // Never re-gate a phase this build cannot place in the lifecycle: a
+        // newer operator may already have a Job in flight, and flipping the
+        // object back to `Pending` would fight it.
+        Some(RestorePhase::Unknown(_)) => false,
     }
 }
 
@@ -121,11 +125,14 @@ pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
 /// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
 /// while the prime→consumer rebind is still pending, so it must fall through to
 /// [`drive_populator_restore`]. Pure.
-pub(super) fn phase_is_terminal_at_guard(phase: RestorePhase, state: PopulatorState) -> bool {
+pub(super) fn phase_is_terminal_at_guard(phase: &RestorePhase, state: PopulatorState) -> bool {
     match phase {
         RestorePhase::Failed => true,
         RestorePhase::Completed => state == PopulatorState::DirectTarget,
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => false,
+        // Not terminal: an uninterpretable phase must not short-circuit the
+        // reconcile into "nothing left to do".
+        RestorePhase::Unknown(_) => false,
     }
 }
 
@@ -311,13 +318,16 @@ pub(super) fn reaped_populate_artifacts_note(
 /// - `Failed` → `Stalled` (terminal: a Restore is one-shot; a NEW Restore is how
 ///   a retry happens).
 /// - `Pending`/`Resolving`/`Restoring` → `Reconciling` (in flight).
-pub fn restore_ready_outcome(phase: RestorePhase) -> io::ReadyOutcome {
+pub fn restore_ready_outcome(phase: &RestorePhase) -> io::ReadyOutcome {
     match phase {
         RestorePhase::Completed => io::ReadyOutcome::Ready,
         RestorePhase::Failed => io::ReadyOutcome::Stalled,
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => {
             io::ReadyOutcome::Reconciling
         }
+        // Never `Ready` and never `Stalled` — `kubectl wait` keeps waiting
+        // rather than passing or failing on a phase we cannot read.
+        RestorePhase::Unknown(_) => io::ReadyOutcome::Reconciling,
     }
 }
 
@@ -343,7 +353,7 @@ pub(super) fn restore_ready_status_on(
     let conditions = io::set_ready(
         base,
         generation,
-        restore_ready_outcome(phase),
+        restore_ready_outcome(&phase),
         reason,
         message,
     );
@@ -379,7 +389,7 @@ pub(super) fn restore_ready_status(
 /// PHASE alone is not enough, because the mover stamps the terminal phase
 /// without conditions (so the conditions can still say `Reconciling` — or be
 /// absent entirely — while the phase is already `Completed`).
-pub(super) fn kstatus_settled_for(restore: &Restore, phase: RestorePhase) -> bool {
+pub(super) fn kstatus_settled_for(restore: &Restore, phase: &RestorePhase) -> bool {
     use crate::consts::{READY_CONDITION, RECONCILING_CONDITION, STALLED_CONDITION};
     let distinctive = match restore_ready_outcome(phase) {
         io::ReadyOutcome::Ready => READY_CONDITION,

@@ -6,6 +6,7 @@
 //!   * `gen-docs [--check]`  — write `docs/field-reference.md` from the schemas
 //!   * `gen-all  [--check]`  — all of the above (+ dashboards)
 //!   * `check-wiring`        — fail if a CRD field is read by no consumer crate
+//!   * `check-phases`        — fail if a phase branch is non-exhaustive (#359)
 //!
 //! `--check` generates everything in memory and compares it against the
 //! checked-in files, writing nothing and exiting non-zero on any drift. This is
@@ -18,6 +19,7 @@ fn usage() {
     eprintln!(
         "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-all> [--check]\n\
                 cargo xtask check-wiring\n\
+                cargo xtask check-phases\n\
          \n\
          gen-crds   generate deploy/crds/*.yaml from the kopiur-api CRD types\n\
          gen-rbac   generate deploy/rbac/*.yaml (ClusterRole + Role install modes)\n\
@@ -29,6 +31,16 @@ fn usage() {
          \x20          by no consumer crate (an INERT field: users can set it and\n\
          \x20          nothing happens). Exemptions live in\n\
          \x20          crates/xtask/wiring-allowlist.yaml, each with a reason.\n\
+         \x20          Takes no --check: it never writes anything.\n\
+         \n\
+         check-phases\n\
+         \x20          fail if a phase branch opts out of the exhaustive-match\n\
+         \x20          guarantee without the compiler saying so: a `matches!`,\n\
+         \x20          a `_ =>` / `Some(_) =>` arm, an `==`/`!=` or an `if let`\n\
+         \x20          against one phase variant, or a gate condition defined\n\
+         \x20          controller-side where the CLI cannot see it (#359).\n\
+         \x20          Exemptions live in\n\
+         \x20          crates/xtask/phase-allowlist.yaml, each with a reason.\n\
          \x20          Takes no --check: it never writes anything.\n\
          \n\
          --check    compare generated output against checked-in files; write\n\
@@ -55,8 +67,15 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        // Not an artifact subcommand: no output files, so no --check mode.
+        // Not artifact subcommands: no output files, so no --check mode.
         "check-wiring" => match xtask::wiring::run() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        },
+        "check-phases" => match xtask::phases::run() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("error: {e:#}");

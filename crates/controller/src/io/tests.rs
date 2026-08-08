@@ -559,11 +559,11 @@ fn ready_outcome_for_phase_maps_every_phase() {
     // Issue #245: the phase→kstatus mapping used at every repository status write.
     use kopiur_api::RepositoryPhase;
     assert_eq!(
-        ready_outcome_for_phase(RepositoryPhase::Ready),
+        ready_outcome_for_phase(&RepositoryPhase::Ready),
         ReadyOutcome::Ready
     );
     assert_eq!(
-        ready_outcome_for_phase(RepositoryPhase::Failed),
+        ready_outcome_for_phase(&RepositoryPhase::Failed),
         ReadyOutcome::Stalled
     );
     // Reachable-but-unsettled and retryable-failure phases are Reconciling, never
@@ -572,8 +572,12 @@ fn ready_outcome_for_phase_maps_every_phase() {
         RepositoryPhase::Pending,
         RepositoryPhase::Initializing,
         RepositoryPhase::Degraded,
+        // Never Ready (a Flux `wait: true` check must not pass on a phase we
+        // cannot read) and never Stalled (it may be progressing under a newer
+        // operator) — Reconciling keeps the check waiting, the honest answer.
+        RepositoryPhase::Unknown("Upgrading".into()),
     ] {
-        assert_eq!(ready_outcome_for_phase(p), ReadyOutcome::Reconciling);
+        assert_eq!(ready_outcome_for_phase(&p), ReadyOutcome::Reconciling);
     }
 }
 
@@ -821,32 +825,40 @@ fn terminal_gate_only_on_failed_at_current_generation() {
     use kopiur_api::RepositoryPhase;
     // Failed at the current generation → terminal (hard-stop).
     assert!(is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(5)
     ));
     // Failed but the spec moved on (gen bumped) → gate reopens, re-attempt.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(6)
     ));
     // Degraded (a retryable failure) is never terminal — keep retrying.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Degraded),
+        Some(&RepositoryPhase::Degraded),
         Some(5),
         Some(5)
     ));
     // No generation yet / no observed generation → not terminal.
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         None,
         Some(5)
     ));
     assert!(!is_terminal_for_generation(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         None
+    ));
+    // A phase written by a NEWER operator is never a hard stop: parking someone
+    // else's repository forever on an unreadable phase is worse than one extra
+    // idempotent connect attempt.
+    assert!(!is_terminal_for_generation(
+        Some(&RepositoryPhase::Unknown("Upgrading".into())),
+        Some(5),
+        Some(5)
     ));
 }
 
@@ -856,7 +868,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     // Terminally Failed at gen 5; the password Secret recorded at failure was rv "100".
     let failed = |recorded: Option<&str>, current: &str| {
         terminal_gate_holds(
-            Some(RepositoryPhase::Failed),
+            Some(&RepositoryPhase::Failed),
             Some(5),
             Some(5),
             recorded,
@@ -873,7 +885,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     assert!(!failed(None, "100"));
     // A non-terminal phase never holds, regardless of the version match.
     assert!(!terminal_gate_holds(
-        Some(RepositoryPhase::Degraded),
+        Some(&RepositoryPhase::Degraded),
         Some(5),
         Some(5),
         Some("100"),
@@ -881,7 +893,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
     ));
     // A spec change (gen bumped) reopens regardless of the version match.
     assert!(!terminal_gate_holds(
-        Some(RepositoryPhase::Failed),
+        Some(&RepositoryPhase::Failed),
         Some(5),
         Some(6),
         Some("100"),
@@ -1267,7 +1279,7 @@ fn repo_status_to_inputs_maps_fields_and_sentinels() {
         observed_generation: None,
     }];
     let inputs = repo_status_to_inputs(
-        Some(RepositoryPhase::Ready),
+        Some(&RepositoryPhase::Ready),
         &conds,
         Some(&storage),
         Some(&health),
@@ -3153,4 +3165,137 @@ mod resolved_from_recorded_meta {
         );
         assert_eq!(r.contexts, expected);
     }
+}
+
+// --- gate ↔ writer drift guard ----------------------------------------------
+
+/// Every row of the shared structural-gate registry, paired with the reconciler
+/// site that actually stamps it.
+///
+/// The registry is the contract `kubectl kopiur doctor` reads (#359). It is
+/// data, so nothing stops the two halves drifting apart in either direction: a
+/// row nobody writes (doctor watches for a condition that can never appear), or
+/// a writer nobody registered (the CLI is blind to a real gate — the original
+/// bug). This table is the pinned second opinion. Adding a gate means touching
+/// the registry, the writer, AND this table.
+///
+/// Tuple: (condition `type`, blocked status as the `bool` `upsert_condition`
+/// takes, `reason`, the writer). Rows marked `upsert_gate` are written FROM the
+/// registry const and are re-derived below; the two dynamic writers upsert both
+/// polarities from computed state, so they name the test that pins them.
+const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
+    // `snapshot::reconcile_inner` + `restore::run_restore_mover`, both via
+    // io::upsert_gate(&PRIVILEGED_MOVER_GATE, …).
+    (
+        crate::consts::MOVER_PERMITTED_CONDITION,
+        false,
+        crate::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+        "snapshot::reconcile_inner + restore::run_restore_mover (upsert_gate)",
+    ),
+    // The `Error::MissingDependency` credential arm in `snapshot::reconcile_inner`
+    // and `restore::run_restore_mover`, via
+    // io::upsert_gate(&MISSING_CREDENTIALS_GATE, …).
+    (
+        crate::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        false,
+        crate::consts::MISSING_CREDENTIALS_REASON,
+        "snapshot::reconcile_inner + restore::run_restore_mover creds arm (upsert_gate)",
+    ),
+    // The `Error::MissingDependency` arm around `io::ensure_mover_identity` in
+    // both reconcilers, via io::upsert_gate(&MISSING_SERVICE_ACCOUNT_GATE, …).
+    (
+        crate::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        false,
+        crate::consts::MISSING_SERVICE_ACCOUNT_REASON,
+        "snapshot::reconcile_inner + restore::run_restore_mover SA arm (upsert_gate)",
+    ),
+    // `snapshot::hold_deletion`, via io::upsert_gate(&DELETION_HELD_GATE, …).
+    (
+        crate::consts::DELETION_HELD_CONDITION,
+        true,
+        crate::consts::MASS_DELETION_BREAKER_REASON,
+        "snapshot::hold_deletion (upsert_gate)",
+    ),
+    // `snapshot::plan::repo_mass_deletion_condition` (held arm) folded into the
+    // repository status write. Both polarities are computed, so it keeps its own
+    // `upsert_condition`; its reason is pinned by
+    // `snapshot::tests::repo_mass_deletion_condition_held_at_or_above_threshold`.
+    (
+        crate::consts::MASS_DELETION_HELD_CONDITION,
+        true,
+        crate::consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
+        "snapshot::plan::repo_mass_deletion_condition (computed polarity)",
+    ),
+    // `snapshot::reconcile_inner`'s ReadOnly refusal, via
+    // io::upsert_gate(&REPOSITORY_READ_ONLY_GATE, …).
+    (
+        crate::consts::REPOSITORY_WRITABLE_CONDITION,
+        false,
+        crate::consts::REPOSITORY_READ_ONLY_REASON,
+        "snapshot::reconcile_inner ReadOnly refusal (upsert_gate)",
+    ),
+    // `snapshot_schedule::schedule_ready_status`, which upserts the runnable
+    // gate either way so it CLEARS; pinned by
+    // `snapshot_schedule::tests::the_runnable_gate_is_set_and_cleared_from_the_same_fact`.
+    (
+        crate::consts::SCHEDULE_RUNNABLE_CONDITION,
+        false,
+        crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
+        "snapshot_schedule::schedule_ready_status (computed polarity)",
+    ),
+];
+
+#[test]
+fn every_registered_gate_has_a_writer() {
+    use kopiur_api::gates::STRUCTURAL_GATES;
+    // Registry → writer: a row doctor watches for that nothing ever stamps.
+    for gate in STRUCTURAL_GATES {
+        assert!(
+            GATE_WRITERS.iter().any(|(condition, blocked, reason, _)| {
+                *condition == gate.condition
+                    && *blocked == gate.blocked_is_true()
+                    && *reason == gate.reason
+            }),
+            "{gate:?} is registered but no writer is pinned for it — either a reconciler \
+             stamps it (add it to GATE_WRITERS) or nothing does (drop the row)"
+        );
+    }
+    // Writer → registry: a gate a reconciler stamps that doctor cannot see.
+    for (condition, blocked, reason, writer) in GATE_WRITERS {
+        assert!(
+            STRUCTURAL_GATES.iter().any(|g| {
+                g.condition == *condition && g.blocked_is_true() == *blocked && g.reason == *reason
+            }),
+            "{writer} writes {condition}={blocked} ({reason}), which is NOT in \
+             STRUCTURAL_GATES — kubectl kopiur doctor is blind to it (#359)"
+        );
+    }
+    assert_eq!(
+        GATE_WRITERS.len(),
+        STRUCTURAL_GATES.len(),
+        "one writer entry per registry row"
+    );
+}
+
+#[test]
+fn upsert_gate_writes_exactly_what_the_row_declares() {
+    use kopiur_api::gates::STRUCTURAL_GATES;
+    // The registry-driven writer path: the emitted Condition must be the row,
+    // including the inverted polarity of `DeletionHeld=True`.
+    for gate in STRUCTURAL_GATES {
+        let conds = upsert_gate(&[], gate, "why this is blocked", Some(7));
+        let [written] = conds.as_slice() else {
+            panic!("{gate:?}: exactly one condition");
+        };
+        assert_eq!(written.type_, gate.condition, "{gate:?}");
+        assert_eq!(written.status, gate.blocked_status, "{gate:?}");
+        assert_eq!(written.reason, gate.reason, "{gate:?}");
+        assert_eq!(written.message, "why this is blocked", "{gate:?}");
+        assert_eq!(written.observed_generation, Some(7), "{gate:?}");
+    }
+    // …and it upserts in place rather than appending a duplicate.
+    let first = upsert_gate(&[], &kopiur_api::gates::PRIVILEGED_MOVER_GATE, "a", None);
+    let again = upsert_gate(&first, &kopiur_api::gates::PRIVILEGED_MOVER_GATE, "b", None);
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].message, "b");
 }

@@ -584,7 +584,17 @@ pub fn resolve_index_blob_warn_threshold(health: Option<&RepositoryHealthSpec>) 
 }
 
 /// Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// ```
+/// use kopiur_api::repository::RepositoryPhase;
+///
+/// assert_eq!(serde_json::to_value(RepositoryPhase::Ready).unwrap(), "Ready");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: RepositoryPhase = serde_json::from_value(serde_json::json!("Upgrading")).unwrap();
+/// assert_eq!(p, RepositoryPhase::Unknown("Upgrading".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Upgrading");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum RepositoryPhase {
     /// Accepted by the API server but not yet reconciled.
     #[default]
@@ -601,7 +611,17 @@ pub enum RepositoryPhase {
     Degraded,
     /// Connect/create failed; see conditions for the actionable reason.
     Failed,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build. Never treated as `Ready`: consumers that gate on
+    /// "is the repository usable" must hold, not proceed.
+    Unknown(String),
 }
+
+crate::common::phase_serde!(
+    RepositoryPhase,
+    "Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`."
+);
 
 impl crate::common::PhaseLabel for RepositoryPhase {
     const ALL: &'static [Self] = &[
@@ -611,14 +631,18 @@ impl crate::common::PhaseLabel for RepositoryPhase {
         Self::Degraded,
         Self::Failed,
     ];
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
             Self::Initializing => "Initializing",
             Self::Ready => "Ready",
             Self::Degraded => "Degraded",
             Self::Failed => "Failed",
+            Self::Unknown(s) => s,
         }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
     }
 }
 
@@ -762,9 +786,24 @@ pub struct CatalogStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::RepositoryMode;
+    use crate::common::{PhaseLabel, RepositoryMode};
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn repository_phase_all_covers_every_variant_uniquely() {
+        // Mirrors the `SnapshotPhase` tripwire: every variant is in ALL with a
+        // unique, non-empty label, so the metrics reset set and any consumer
+        // iterating phases can never silently miss one.
+        let labels: Vec<&str> = RepositoryPhase::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(RepositoryPhase::ALL.len(), 5);
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
+        assert!(RepositoryPhase::ALL.contains(&RepositoryPhase::default()));
+    }
 
     #[test]
     fn repository_schema_emits_context_free_defaults() {

@@ -422,8 +422,8 @@ async fn a_group_capture_is_shared_by_every_member_and_reaped_after() {
         || async {
             let kids = children_of(&client, policy).await;
             let done = kids.iter().filter(|k| {
-                k.status.as_ref().and_then(|s| s.phase)
-                    == Some(kopiur_api::SnapshotPhase::Succeeded)
+                k.status.as_ref().and_then(|s| s.phase.as_ref())
+                    == Some(&kopiur_api::SnapshotPhase::Succeeded)
             });
             Ok((kids.len() == 2 && done.count() == 2).then_some(()))
         },

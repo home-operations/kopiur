@@ -1240,3 +1240,134 @@ retryRecommended: false
     let v = serde_json::to_value(&fb).unwrap();
     assert!(v.get("op").is_none(), "op: None must be omitted, got {v}");
 }
+
+// --- phase-enum `Unknown` decode fallback (M2, #359 version-skew class) ------
+
+/// Assert the full `phase_serde!` contract for one phase enum:
+/// every canonical variant round-trips as a bare string via `label()`, an
+/// unrecognized string decodes to `Unknown` (never a serde error that would
+/// poison the typed watch/list for the whole Kind) and re-serializes verbatim,
+/// and `ALL`/`canonical()` never leak `Unknown` into the CRD schema's value set.
+fn assert_phase_contract<P>(unknown_wire: &str)
+where
+    P: PhaseLabel + serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    for variant in P::ALL {
+        let wire = serde_json::to_value(variant).unwrap();
+        assert_eq!(
+            wire,
+            variant.label(),
+            "{variant:?} must serialize to label()"
+        );
+        let back: P = serde_json::from_value(wire).unwrap();
+        assert_eq!(&back, variant, "{variant:?} must round-trip");
+        assert_eq!(P::parse(variant.label()).as_ref(), Some(variant));
+    }
+    // The schema's value set is exactly ALL's labels — `Unknown` is never in it.
+    let canonical = P::canonical();
+    assert_eq!(canonical.len(), P::ALL.len());
+    assert!(!canonical.contains(&unknown_wire));
+
+    // A phase written by a NEWER operator decodes instead of erroring…
+    let decoded: P = serde_json::from_value(serde_json::json!(unknown_wire)).unwrap();
+    assert_eq!(decoded, P::unknown(unknown_wire.to_string()));
+    // …echoes the stored value verbatim (so a read-modify-write never mutates
+    // a phase this build does not understand)…
+    assert_eq!(decoded.label(), unknown_wire);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), unknown_wire);
+    // …and is NOT parseable as a canonical value.
+    assert!(P::parse(unknown_wire).is_none());
+    // Not in ALL: the metric label domain and the schema enum stay canonical.
+    assert!(!P::ALL.contains(&decoded));
+}
+
+#[test]
+fn every_phase_enum_decodes_an_unknown_string_instead_of_erroring() {
+    use crate::maintenance::ManualRunPhase;
+    use crate::repository::RepositoryPhase;
+    use crate::repository_replication::RepositoryReplicationPhase;
+    use crate::{RestorePhase, SnapshotPhase};
+
+    assert_phase_contract::<SnapshotPhase>("Quiescing");
+    assert_phase_contract::<RestorePhase>("Staging");
+    assert_phase_contract::<RepositoryPhase>("Upgrading");
+    assert_phase_contract::<RepositoryReplicationPhase>("Verifying");
+    assert_phase_contract::<ManualRunPhase>("Queued");
+}
+
+#[test]
+fn unknown_phase_is_never_terminal() {
+    use crate::{RestorePhase, SnapshotPhase};
+    // The conservative surface-it policy: a phase this build cannot interpret
+    // must never be reported as finished work, or a newer operator's in-flight
+    // (or wedged) object goes invisible to an older CLI — exactly the silent
+    // green #359 is about.
+    assert!(!SnapshotPhase::Unknown("Quiescing".into()).is_terminal());
+    assert!(!RestorePhase::Unknown("Staging".into()).is_terminal());
+    // Canonical terminals are unaffected.
+    assert!(SnapshotPhase::Succeeded.is_terminal());
+    assert!(RestorePhase::Completed.is_terminal());
+}
+
+#[test]
+fn a_snapshot_cr_with_a_future_phase_still_decodes_whole() {
+    use crate::testutil::from_yaml;
+    use crate::{Snapshot, SnapshotPhase};
+    // The regression this exists for: ONE object written by a newer operator
+    // must not fail the typed `list()`/watch for every other Snapshot. Parsed
+    // the cluster's way (YAML -> serde_json::Value -> typed).
+    let s: Snapshot = from_yaml(
+        r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: nightly-1
+  namespace: apps
+spec:
+  policyRef:
+    name: nightly
+status:
+  phase: Quiescing
+  observedGeneration: 4
+"#,
+    );
+    let phase = s.status.as_ref().unwrap().phase.clone().unwrap();
+    assert_eq!(phase, SnapshotPhase::Unknown("Quiescing".into()));
+    // The rest of the status survived — the fallback is a decode nicety, not a
+    // whole-object bail-out.
+    assert_eq!(s.status.as_ref().unwrap().observed_generation, Some(4));
+    // Re-serializing the status writes the phase back BYTE-IDENTICAL, so an
+    // older operator's read-modify-write cannot downgrade the newer value.
+    let round = serde_json::to_value(&s.status).unwrap();
+    assert_eq!(round["phase"], "Quiescing");
+}
+
+#[test]
+fn a_restore_cr_with_a_future_phase_still_decodes_whole() {
+    use crate::testutil::from_yaml;
+    use crate::{Restore, RestorePhase};
+    let r: Restore = from_yaml(
+        r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: r1
+  namespace: apps
+spec:
+  repository:
+    name: nas
+  source:
+    snapshotRef:
+      name: nightly-1
+  target:
+    pvcRef:
+      name: data
+status:
+  phase: Staging
+"#,
+    );
+    assert_eq!(
+        r.status.as_ref().unwrap().phase,
+        Some(RestorePhase::Unknown("Staging".into()))
+    );
+}

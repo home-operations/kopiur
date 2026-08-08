@@ -48,14 +48,13 @@ use crate::consts::{
     HOOKS_SUCCEEDED_CONDITION, INHERIT_APPLIED_REASON, INHERIT_FALLBACK_REASON,
     INHERIT_OVERRIDDEN_REASON, INHERIT_PINNED_NO_UID_REASON, INVALID_MASS_DELETION_ACK_REASON,
     MANAGED_BY_LABEL, MANAGED_BY_VALUE, MASS_DELETION_ACKNOWLEDGED_REASON,
-    MASS_DELETION_BREAKER_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_CREDENTIALS_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_SNAPSHOT_DELETE_BATCH,
-    PIN_WORKLOAD_RUN_AS_USER_ACTION, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
-    SECURITY_CONTEXT_COMPATIBLE_CONDITION, SECURITY_CONTEXT_COMPATIBLE_REASON,
-    SECURITY_CONTEXT_INHERITED_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
-    SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON, SNAPSHOT_INCOMPLETE_REASON,
-    SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON, SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON,
-    SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
+    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MOVER_PERMITTED_CONDITION, OP_LABEL,
+    OP_SNAPSHOT_DELETE_BATCH, PIN_WORKLOAD_RUN_AS_USER_ACTION,
+    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, SECURITY_CONTEXT_COMPATIBLE_CONDITION,
+    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
+    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_DELETION_HELD_REASON,
+    SNAPSHOT_INCOMPLETE_REASON, SNAPSHOT_RETAINED_ON_POLICY_DELETE_REASON,
+    SNAPSHOT_RETAINED_ON_SCHEDULE_DELETE_REASON, SOURCE_STAGED_CONDITION, SOURCE_STAGED_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -82,6 +81,14 @@ mod tests;
 /// of times per hour. Active work (pin spawn, staging, Job polling) keeps its own
 /// short requeues — only the terminal steady state is slowed here.
 const TERMINAL_SNAPSHOT_STEADY_REQUEUE: Duration = Duration::from_secs(45 * 60);
+
+/// Requeue for a `Snapshot` held on a phase string this build cannot interpret
+/// (`SnapshotPhase::Unknown`, i.e. version skew). Deliberately a requeue rather
+/// than `await_change()`: nothing about the OBJECT has to change for this to
+/// resolve — finishing the operator rollout does — so the reconciler re-checks
+/// periodically and re-emits its warning instead of going quiet forever.
+const UNKNOWN_PHASE_HOLD_REQUEUE: Duration = Duration::from_secs(10 * 60);
+
 /// Reconcile a `Snapshot`.
 ///
 /// IO is intentionally thin here: the decision logic ([`plan_deletion`],
@@ -172,8 +179,8 @@ fn mover_failed_message(failure: Option<&FailureBlock>) -> String {
 /// keep the match legible under the complexity ratchet.
 async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
     if needs_terminal_pin(
-        backup.status.as_ref().and_then(|s| s.phase),
-        SnapshotPhase::Discovered,
+        backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+        &SnapshotPhase::Discovered,
     ) {
         let mut status = snapshot_ready_status(
             backup,
@@ -217,8 +224,8 @@ async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> 
     // to retention.
     if plan::adopted_row_has_provenance(backup)
         && needs_terminal_pin(
-            backup.status.as_ref().and_then(|s| s.phase),
-            SnapshotPhase::Succeeded,
+            backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+            &SnapshotPhase::Succeeded,
         )
     {
         let mut status = snapshot_ready_status(
@@ -271,7 +278,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the gate the next reconcile would re-run side-effecting hooks
     // (quiesce/exec) or resurrect the Failed phase to Succeeded — the fix lives
     // in the SnapshotPolicy, and a NEW Snapshot picks it up.
-    match run_decision(backup.status.as_ref().and_then(|s| s.phase)) {
+    match run_decision(backup.status.as_ref().and_then(|s| s.phase.as_ref())) {
         RunDecision::Run => {}
         RunDecision::SucceededSteadyState => {
             // Two terminal successes share this arm: `Succeeded` (kopia wrote a
@@ -281,8 +288,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // projection-pin backfill. They diverge in exactly two places, both
             // marked: the healed phase/reason/message, and pinning — which acts
             // on a manifest an `Unchanged` run does not have.
-            let unchanged =
-                backup.status.as_ref().and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged);
+            let unchanged = backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                == Some(&SnapshotPhase::Unchanged);
             // The MOVER stamps `phase: Succeeded`, so the controller's first look
             // at a finished run can already be steady-state — the afterSnapshot
             // hooks (resume/notify) must still run, exactly once. Safe against
@@ -529,7 +536,28 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             backfill_projection_pin(backup, ctx, &api, &namespace, &name).await?;
             return Ok(Action::await_change());
         }
-        RunDecision::Wait => return Ok(Action::await_change()),
+        RunDecision::Wait => {
+            // Surface loudly rather than parking in silence. `Deleting`/`Discovered`
+            // land here as a normal watch-desync wait, but an UNRECOGNIZED phase
+            // means version skew (a newer kopiur wrote this object), and a
+            // silently-held CR that no diagnostic mentions is exactly the
+            // all-green-while-stuck failure of #359. Requeue slowly so the warning
+            // repeats and the object self-heals after an operator upgrade.
+            if let Some(SnapshotPhase::Unknown(raw)) =
+                backup.status.as_ref().and_then(|s| s.phase.as_ref())
+            {
+                tracing::warn!(
+                    namespace = %namespace,
+                    snapshot = %name,
+                    phase = %raw,
+                    "Snapshot is parked on a phase this operator build does not recognize \
+                     (a newer kopiur most likely wrote it); holding without acting. Check \
+                     for a mixed-version rollout and finish upgrading the operator."
+                );
+                return Ok(Action::requeue(UNKNOWN_PHASE_HOLD_REQUEUE));
+            }
+            return Ok(Action::await_change());
+        }
     }
 
     // If the owned mover Job already reached a terminal state, copy phase/stats
@@ -571,12 +599,33 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // Note this was a bare `!= Some(Succeeded)`, which the compiler
                 // cannot check — the new phase would have been silently
                 // overwritten back to `Succeeded` on the very next reconcile.
-                let mover_phase = backup.status.as_ref().and_then(|s| s.phase);
-                let unchanged = mover_phase == Some(SnapshotPhase::Unchanged);
-                if !matches!(
-                    mover_phase,
-                    Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged)
-                ) {
+                let mover_phase = backup.status.as_ref().and_then(|s| s.phase.as_ref());
+                let unchanged = mover_phase == Some(&SnapshotPhase::Unchanged);
+                // Exhaustive, not `matches!`: this decides whether to OVERWRITE
+                // the phase the mover just wrote, so every phase must state
+                // whether it is already a recorded success.
+                let already_recorded = match mover_phase {
+                    Some(SnapshotPhase::Succeeded | SnapshotPhase::Unchanged) => true,
+                    Some(
+                        SnapshotPhase::Pending
+                        | SnapshotPhase::Running
+                        | SnapshotPhase::Failed
+                        | SnapshotPhase::Deleting
+                        | SnapshotPhase::Discovered,
+                    )
+                    | None => false,
+                    // UNREACHABLE in practice, and deliberately so: `run_decision`
+                    // at the top of this reconcile already answered `Wait` for an
+                    // unreadable phase and returned (with the warning + hold
+                    // requeue), so an `Unknown` Snapshot never gets this far.
+                    // `run_decision` is the real guard; this arm exists because
+                    // the match is exhaustive and must still state an answer.
+                    // `true` (= "leave it alone") is the answer consistent with
+                    // that guard — if the early return is ever removed, this
+                    // still refuses to overwrite a value the build cannot read.
+                    Some(SnapshotPhase::Unknown(_)) => true,
+                };
+                if !already_recorded {
                     finalize_succeeded(ctx, backup, &api, &name, &namespace).await?;
                 }
                 // Reap the CSI staging objects (VolumeSnapshot + staged PVC) now the
@@ -630,7 +679,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     )
                     .await?;
                 }
-                if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Failed) {
+                if backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                    != Some(&SnapshotPhase::Failed)
+                {
                     io::patch_status(
                         &api,
                         &name,
@@ -765,7 +816,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     return Ok(Action::requeue(Duration::from_secs(120)));
                 }
                 // Job exists but is still running/starting; mark Running and wait.
-                if backup.status.as_ref().and_then(|s| s.phase) != Some(SnapshotPhase::Running) {
+                if backup.status.as_ref().and_then(|s| s.phase.as_ref())
+                    != Some(&SnapshotPhase::Running)
+                {
                     io::patch_status(
                         &api,
                         &name,
@@ -797,11 +850,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .map(|s| s.conditions.clone())
             .unwrap_or_default();
-        let conditions = io::upsert_condition(
+        let conditions = io::upsert_gate(
             &conds,
-            crate::consts::REPOSITORY_WRITABLE_CONDITION,
-            false,
-            crate::consts::REPOSITORY_READ_ONLY_REASON,
+            &kopiur_api::gates::REPOSITORY_READ_ONLY_GATE,
             &readonly_backup_message(&config.spec.repository.name),
             backup.meta().generation,
         );
@@ -875,7 +926,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         .preflight
         .as_ref()
         .filter(|p| !p.checks.is_empty())
-        && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase))
+        && should_run_preflight(backup.status.as_ref().and_then(|s| s.phase.as_ref()))
     {
         let now = chrono::Utc::now();
         // Maintenance recency is read from the shared informer; a not-yet-synced
@@ -1018,11 +1069,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                crate::consts::MISSING_SERVICE_ACCOUNT_REASON,
+                &kopiur_api::gates::MISSING_SERVICE_ACCOUNT_GATE,
                 &msg,
                 backup.meta().generation,
             );
@@ -1143,11 +1192,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .map(|s| s.conditions.clone())
             .unwrap_or_default();
-        let conditions = io::upsert_condition(
+        let conditions = io::upsert_gate(
             &existing,
-            MOVER_PERMITTED_CONDITION,
-            false,
-            PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+            &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
             &msg,
             backup.meta().generation,
         );
@@ -1271,11 +1318,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .as_ref()
                 .map(|s| s.conditions.clone())
                 .unwrap_or_default();
-            let conditions = io::upsert_condition(
+            let conditions = io::upsert_gate(
                 &existing,
-                CREDENTIALS_AVAILABLE_CONDITION,
-                false,
-                MISSING_CREDENTIALS_REASON,
+                &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
                 &msg,
                 backup.meta().generation,
             );
@@ -2459,11 +2504,9 @@ async fn hold_deletion(
     };
     // Transition-only event: fire only when the condition was not already True.
     let emit = should_emit_held_event(&existing);
-    let conditions = io::upsert_condition(
+    let conditions = io::upsert_gate(
         &existing,
-        DELETION_HELD_CONDITION,
-        true,
-        MASS_DELETION_BREAKER_REASON,
+        &kopiur_api::gates::DELETION_HELD_GATE,
         &message,
         backup.meta().generation,
     );

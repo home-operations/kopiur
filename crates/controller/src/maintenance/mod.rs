@@ -296,14 +296,40 @@ pub fn manual_run_request(
     // Dedupe BEFORE parsing: a terminally-answered request stays answered even
     // if someone later scribbles garbage into the mode annotation.
     let answered = maint.status.as_ref().and_then(|st| st.manual_run.as_ref());
+    let terminally_answered = |m: &kopiur_api::ManualRunStatus| {
+        use kopiur_api::ManualRunPhase as P;
+        // Exhaustive: this dedupe decides whether a user's run request is
+        // DROPPED, so a new phase must state whether it counts as an answer.
+        m.phase.as_ref().is_some_and(|p| match p {
+            P::Succeeded | P::Failed => true,
+            P::Running => false,
+            // A phase this build cannot read is not an answer we can vouch for;
+            // re-driving the request is idempotent (the Job name is keyed on
+            // the request timestamp), whereas dropping it loses the run.
+            P::Unknown(_) => false,
+        })
+    };
     if let Some(m) = answered
         && m.requested_at.as_deref() == Some(raw)
-        && matches!(
-            m.phase,
-            Some(kopiur_api::ManualRunPhase::Succeeded | kopiur_api::ManualRunPhase::Failed)
-        )
+        && terminally_answered(m)
     {
         return Ok(None);
+    }
+    // Not deduped, and the recorded phase is one this build cannot read: the
+    // request will be re-driven and `status.manualRun.phase` overwritten. Name
+    // it first — the overwrite is the deliberate self-heal for a driving
+    // reconciler (see `io::warn_unreadable_phase`), never a silent one.
+    if let Some(p @ kopiur_api::ManualRunPhase::Unknown(_)) = answered
+        .filter(|m| m.requested_at.as_deref() == Some(raw))
+        .and_then(|m| m.phase.as_ref())
+    {
+        use kopiur_api::common::PhaseLabel;
+        crate::io::warn_unreadable_phase(
+            "Maintenance (manualRun)",
+            maint.namespace().unwrap_or_default().as_str(),
+            &maint.name_any(),
+            p.label(),
+        );
     }
     // Shared parse (also enforced at admission by the webhook) — one
     // validator, two callers.
@@ -368,7 +394,7 @@ async fn handle_manual_run(
         .is_some_and(|m| {
             m.requested_at.as_deref() == Some(annotation_value.as_str())
                 && m.mode == Some(mode)
-                && m.phase == Some(kopiur_api::ManualRunPhase::Running)
+                && m.phase.as_ref() == Some(&kopiur_api::ManualRunPhase::Running)
         });
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {

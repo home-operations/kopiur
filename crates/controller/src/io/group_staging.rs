@@ -538,12 +538,26 @@ async fn sibling_states(
             }
         };
         states.push(SiblingState {
-            terminal: matches!(
-                m.status.as_ref().and_then(|st| st.phase),
-                Some(SnapshotPhase::Succeeded)
-                    | Some(SnapshotPhase::Failed)
-                    | Some(SnapshotPhase::Unchanged)
-            ),
+            // Exhaustive, NOT `SnapshotPhase::is_terminal()`: this set
+            // deliberately EXCLUDES `Discovered` (a catalog row is never a
+            // group member with a stage to release) — the two sets differ, so
+            // they must not be collapsed.
+            terminal: match m.status.as_ref().and_then(|st| st.phase.as_ref()) {
+                Some(
+                    SnapshotPhase::Succeeded | SnapshotPhase::Failed | SnapshotPhase::Unchanged,
+                ) => true,
+                Some(
+                    SnapshotPhase::Pending
+                    | SnapshotPhase::Running
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered,
+                )
+                | None => false,
+                // A sibling in an unreadable phase is NOT done: keeping the
+                // shared VolumeGroupSnapshot alive is the fail-closed answer
+                // (deleting it under a live member loses the stage).
+                Some(SnapshotPhase::Unknown(_)) => false,
+            },
             staged_pvc_present,
         });
     }

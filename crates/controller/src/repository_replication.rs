@@ -19,7 +19,7 @@ use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{RepositoryReplication, validate};
+use kopiur_api::{RepositoryReplication, RepositoryReplicationPhase, validate};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, ReplicateOp, ResolvedIdentity, TargetRef,
 };
@@ -73,6 +73,29 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     let name = repl.name_any();
     let api: Api<RepositoryReplication> = Api::namespaced(ctx.client.clone(), &namespace);
 
+    // Version skew: a phase written by a NEWER kopiur. Two facts shape what this
+    // warning is for, and neither is the prompt-overwrite story the other
+    // drivers have (see `io::warn_unreadable_phase`):
+    //
+    // - Nothing below READS `status.phase` — no branch, no gate, no dedupe — so
+    //   an unreadable value changes no behavior: the replication keeps running
+    //   its schedule normally.
+    // - Nothing below promptly rewrites it either. Only the suspended and
+    //   Job-failed paths pass a phase at all (and both go through
+    //   `patch_ready_if_changed`, which short-circuits when the `Ready`
+    //   condition is unchanged); the waiting/idle/in-flight paths pass
+    //   `phase: None` or do not patch, and the terminal `Succeeded`/`Failed`
+    //   stamp comes from the mover at the END of a run. So the value PERSISTS —
+    //   potentially a whole schedule interval, until the next run stamps over it.
+    //
+    // Which is exactly why the warn is unconditional and repeats on every pass
+    // (every 30s while a Job is in flight, otherwise up to the requeue cap): the
+    // log is the only place this skew surfaces, so it has to keep surfacing
+    // until the operator upgrade finishes.
+    if let Some(label) = unreadable_phase(repl) {
+        io::warn_unreadable_phase("RepositoryReplication", &namespace, &name, label);
+    }
+
     // §14(e): a suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
         patch_ready_if_changed(
@@ -82,7 +105,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             io::ReadyOutcome::Reconciling,
             "Suspended",
             "replication is suspended (spec.suspend)",
-            Some("Suspended"),
+            Some(RepositoryReplicationPhase::Suspended),
         )
         .await?;
         return Ok(Action::requeue(REQUEUE_CAP));
@@ -153,7 +176,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
                     io::ReadyOutcome::Stalled,
                     "ReplicationFailed",
                     "replication Job failed; see the Job/pod logs",
-                    Some("Failed"),
+                    Some(RepositoryReplicationPhase::Failed),
                 )
                 .await?;
                 nudge_repository_reverify(ctx, repl, &name, &namespace).await;
@@ -170,6 +193,25 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
     }
+}
+
+/// The stored `status.phase` label when it is one this build cannot read.
+///
+/// The pure seam behind the entry-time version-skew warning: `Some(label)`
+/// exactly when a phase is recorded AND it decoded to
+/// [`RepositoryReplicationPhase::Unknown`] (a newer operator's value, or legacy
+/// stored data), `None` otherwise — including the no-status-yet case, which is
+/// ordinary first-reconcile state and not skew.
+///
+/// The decision is delegated to
+/// [`RepositoryReplicationPhase::is_unknown`], whose exhaustive `match` lives in
+/// `kopiur_api`, so a phase variant added later cannot silently be treated as
+/// unreadable here (and so this reads as a named predicate rather than an
+/// `if let … Unknown(_)` probe the phase ratchet is blind to).
+fn unreadable_phase(repl: &RepositoryReplication) -> Option<&str> {
+    use kopiur_api::common::PhaseLabel;
+    let phase = repl.status.as_ref()?.phase.as_ref()?;
+    phase.is_unknown().then(|| phase.label())
 }
 
 /// Best-effort nudge asking this replication's SOURCE repository to re-verify
@@ -526,7 +568,12 @@ async fn has_active_replication_job(job_api: &Api<Job>, cr_name: &str) -> Result
 
 /// Patch the kstatus Ready conditions (+ optional phase + destinationBackend) only
 /// when the `Ready` condition changes, so the reconcile does not hot-loop on its own
-/// status writes (transition-guarded). `phase` is the optional phase string to set.
+/// status writes (transition-guarded).
+///
+/// `phase` is TYPED, not a `&str`: the wire value comes from
+/// [`PhaseLabel::label`], the same definition `RepositoryReplicationStatus`
+/// decodes with, so a renamed variant is a compile error here instead of a
+/// string that silently stops matching what anyone reads back.
 async fn patch_ready_if_changed(
     api: &Api<RepositoryReplication>,
     name: &str,
@@ -534,8 +581,9 @@ async fn patch_ready_if_changed(
     outcome: io::ReadyOutcome,
     reason: &str,
     message: &str,
-    phase: Option<&str>,
+    phase: Option<RepositoryReplicationPhase>,
 ) -> Result<()> {
+    use kopiur_api::common::PhaseLabel;
     let existing: Vec<_> = repl
         .status
         .as_ref()
@@ -561,7 +609,7 @@ async fn patch_ready_if_changed(
         "destinationBackend": repl.spec.destination.kind_str(),
     });
     if let Some(p) = phase {
-        status["phase"] = serde_json::json!(p);
+        status["phase"] = serde_json::json!(p.label());
     }
     io::patch_status(api, name, status).await?;
     Ok(())
@@ -642,6 +690,47 @@ mod tests {
             mass_deletion_ack: None,
             catalog: None,
         }
+    }
+
+    /// The skew seam: only a phase this build cannot decode is named, and the
+    /// ordinary states (no status, no phase, a known phase) stay quiet — a
+    /// warning on every pass of a healthy replication would be noise nobody
+    /// reads, which is how a real skew gets missed.
+    #[test]
+    fn only_an_undecodable_phase_is_named_as_skew() {
+        let none_at_all = repl_with("0 5 * * *", None);
+        assert_eq!(unreadable_phase(&none_at_all), None, "no status yet");
+
+        let no_phase = repl_with("0 5 * * *", Some(RepositoryReplicationStatus::default()));
+        assert_eq!(unreadable_phase(&no_phase), None, "status without a phase");
+
+        for known in [
+            RepositoryReplicationPhase::Pending,
+            RepositoryReplicationPhase::Replicating,
+            RepositoryReplicationPhase::Succeeded,
+            RepositoryReplicationPhase::Failed,
+            RepositoryReplicationPhase::Suspended,
+        ] {
+            let r = repl_with(
+                "0 5 * * *",
+                Some(RepositoryReplicationStatus {
+                    phase: Some(known.clone()),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!(unreadable_phase(&r), None, "{known:?} is readable");
+        }
+
+        // What a NEWER operator wrote: decoded verbatim into `Unknown`, and
+        // reported with the raw string so the log names the actual value.
+        let skewed = repl_with(
+            "0 5 * * *",
+            Some(RepositoryReplicationStatus {
+                phase: Some(RepositoryReplicationPhase::Unknown("Verifying".into())),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(unreadable_phase(&skewed), Some("Verifying"));
     }
 
     #[test]

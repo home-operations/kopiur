@@ -92,7 +92,7 @@ pub fn build_snapshot_for(
 /// What a terminal phase means for this command. Exhaustive over
 /// [`SnapshotPhase`]: a new phase cannot compile until classified.
 pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapshot>>> {
-    match snapshot.status.as_ref().and_then(|s| s.phase)? {
+    match snapshot.status.as_ref().and_then(|s| s.phase.as_ref())? {
         SnapshotPhase::Pending | SnapshotPhase::Running => None,
         // `Unchanged` is a SUCCESS: the source was read and hashed, and kopia
         // declined to write a second identical manifest. Exiting non-zero here
@@ -107,6 +107,10 @@ pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapsho
         SnapshotPhase::Deleting | SnapshotPhase::Discovered => {
             Some(Err(Box::new(snapshot.clone())))
         }
+        // Never a terminal answer: `--wait` keeps waiting (bounded by its own
+        // timeout) rather than exiting 0 (a success we cannot substantiate) or
+        // 1 (a failure that may not have happened).
+        SnapshotPhase::Unknown(_) => None,
     }
 }
 
@@ -117,7 +121,7 @@ pub fn terminal(snapshot: &Snapshot) -> Option<Result<Box<Snapshot>, Box<Snapsho
 /// print `kopia id ?, ?, took ?` and read like something went wrong.
 pub fn success_summary(snapshot: &Snapshot) -> String {
     let status = snapshot.status.as_ref();
-    if status.and_then(|s| s.phase) == Some(SnapshotPhase::Unchanged) {
+    if status.and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged) {
         let name = snapshot.metadata.name.as_deref().unwrap_or("?");
         return format!(
             "snapshot {name}: no files changed since the previous snapshot, so no new \

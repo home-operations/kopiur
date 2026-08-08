@@ -1,0 +1,373 @@
+# Reviewed exemptions for `cargo xtask check-phases` (crates/xtask/src/phases.rs).
+#
+# The ratchet has five rules: four constructs that opt out of kopiur's
+# exhaustive-match guarantee WITHOUT the compiler ever saying so (A, B, D, E),
+# plus one drift class with no construct at all (C) — the same taxonomy the
+# module doc in crates/xtask/src/phases.rs spells out:
+#
+#   Rule A  `matches!(…)` over a phase enum — an implicit `_ => false`.
+#           `kubectl kopiur doctor` classified stuck work this way, so a wedged
+#           `Deleting` Snapshot read as terminal (#359, defect 2).
+#   Rule B  a `match` over a phase enum with an arm-initial `_ =>` / `_ if … =>`.
+#           When #351 added `SnapshotPhase::Unchanged`, two wildcard arms
+#           swallowed it — `metrics.rs::policy_backup_health` pinned the policy
+#           unhealthy forever, `snapshot_policy.rs::consecutive_failures` dropped
+#           the run out of the streak. Neither was a compile error.
+#   Rule C  a `pub const …_CONDITION` still defined in
+#           crates/controller/src/consts.rs. #359's real defect was a gate the
+#           server grew and the CLI never learned about; a condition that gates
+#           work belongs in `kopiur_api::consts` + `kopiur_api::gates`, where
+#           both sides read the same row.
+#   Rule D  `==` / `!=` against one phase variant. Adding a variant never breaks
+#           an equality, so this is the one class the `Unknown(String)` decode
+#           fallback cannot catch — the new variant silently takes the `else`.
+#   Rule E  a `let` pattern (`if let` / `while let` / `let … else`) naming one
+#           phase variant — Rule A's question in a spelling A, B and D all miss.
+#
+# An entry is `{file, snippet, reason}`:
+#
+#   file     workspace-relative, `/`-separated, exactly as the check prints it.
+#            No globs: an exemption names the file it was reviewed in.
+#   snippet  the construct. Matched WHITESPACE-NORMALIZED (and with the spaces
+#            that carry no meaning in Rust dropped), so a rustfmt reflow cannot
+#            invalidate a reviewed exemption — copy it verbatim from the check's
+#            output. One entry covers every identical construct in that file;
+#            where that collapses several call sites the reason says so and
+#            covers all of them.
+#   reason   why this is right. Required, and it must be checkable against the
+#            code — a reason that stops being true means the site must be
+#            converted, not re-allowlisted.
+#
+# The check fails in BOTH directions: an uncovered construct fails, and an entry
+# that matches nothing fails, so paying a site down forces its entry out instead
+# of letting the list rot. A duplicated (file, snippet) fails too — only the
+# first of two identical keys is ever consulted, so the second is a reason nobody
+# reads.
+#
+# Seeded at introduction (#359): Rules A and B EMPTY — every `matches!` and every
+# `_ =>` over a phase enum was paid down in the same PR, the last two becoming
+# `SnapshotPhase::is_unknown` / `RestorePhase::is_unknown` in `kopiur_api`, where
+# the exhaustive `match` is compiler-guarded. Rule C holds the ten
+# controller-internal condition types. Rule D holds the per-site review of the
+# surviving intentional equalities. Rule E holds the four version-skew probes
+# that must bind their payload to report it.
+
+allow:
+  # === Rule C — condition types still defined controller-side ================
+  #
+  # Every row here says the same kind of thing in a checkable way: this
+  # condition never leaves work PARKED in a state a phase check cannot see.
+  # Either it resolves into a terminal `Failed` phase (which doctor's
+  # `check_recent_failures` reads), or it moves a Repository off `Ready` (which
+  # `check_repos_ready` reads), or it is advisory and never blocks at all. A
+  # condition that does park work belongs in `kopiur_api::gates` instead — that
+  # is the whole point of the registry, and of this rule.
+  - file: crates/controller/src/consts.rs
+    snippet: REPOSITORY_BOOTSTRAPPED_CONDITION
+    reason: >-
+      `Bootstrapped=False` is only ever written together with the repository
+      leaving `Ready` (repository.rs/cluster_repository.rs `finalize_*` write it
+      under the `p.opened` recycle verdict, alongside the phase). Repository
+      usability is already a phase, and doctor's `check_repos_ready` reads it;
+      the condition adds the kopia error class, not a separate blocked state.
+  - file: crates/controller/src/consts.rs
+    snippet: PINNED_CONDITION
+    reason: >-
+      A post-terminal side effect on a Snapshot that is already `Succeeded`:
+      `Unknown`/`PinJobRunning` while a SnapshotPin mover runs, `False` when it
+      failed (requeued with a 120s backoff, so it self-retries). It never holds
+      a backup back, so a CLI that cannot see it still reports the backup's real
+      state.
+  - file: crates/controller/src/consts.rs
+    snippet: SOURCE_STAGED_CONDITION
+    reason: >-
+      Bounded, not structural. `StagingOutcome::Waiting` parks at `Pending` for
+      a DEADLINED wait on the CSI stack (`snapshot/mod.rs`); when the deadline
+      passes, `StagingOutcome::Failed` writes `phase: Failed` + `Stalled=True`
+      and the run is terminal. So the state doctor would need this condition for
+      is either a legitimate short wait (covered by the stuck-age threshold) or
+      already a `Failed` phase (covered by `check_recent_failures`).
+  - file: crates/controller/src/consts.rs
+    snippet: SECURITY_CONTEXT_COMPATIBLE_CONDITION
+    reason: >-
+      Warn-only heuristic, documented as such at the const: `True` on a provable
+      match, `Unknown` in the common undecidable case, `False` only after a run
+      COMPLETED with unreadable entries. It never blocks a mover and never
+      changes a phase.
+  - file: crates/controller/src/consts.rs
+    snippet: SECURITY_CONTEXT_INHERITED_CONDITION
+    reason: >-
+      Reports whether securityContext inheritance did what was asked; every
+      `False` reason is a fallback that still produced a usable mover spec, so
+      the run proceeds. Advisory, never a hold.
+  - file: crates/controller/src/consts.rs
+    snippet: RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION
+    reason: >-
+      The `Restore` mirror of `SecurityContextCompatible`, same tri-state
+      warn-only semantics and the same never-blocks guarantee.
+  - file: crates/controller/src/consts.rs
+    snippet: HOOKS_SUCCEEDED_CONDITION
+    reason: >-
+      `patch_hook_failure` writes `HooksSucceeded=False` with `phase: Failed` in
+      the same patch on the pre-hook and post-hook-after-success paths
+      (`set_failed_phase: true`). The two `set_failed_phase: false` call sites
+      (`snapshot/mod.rs` `RunDecision::TerminalFailed` and the mover-failed arm)
+      are resume hooks running on a run that is ALREADY `Failed`; they omit the
+      phase write precisely so they cannot mask the primary mover failure. Every
+      path therefore ends on a terminal `Failed` phase the CLI already reads —
+      there is no parked state only this condition would reveal.
+  - file: crates/controller/src/consts.rs
+    snippet: SCRATCH_STORAGE_CLASS_IGNORED_CONDITION
+    reason: >-
+      `SnapshotPolicy` warn-only no-op notice — a scratch `storageClassName`
+      with no capacity behind it. Deep verify still runs on an `emptyDir`, so
+      nothing is ever held; documented "never blocks" at the const.
+  - file: crates/controller/src/consts.rs
+    snippet: SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION
+    reason: >-
+      `SnapshotSchedule` warn-only notice that the inherited cron timezone was
+      ambiguous and UTC was used. Scheduling continues either way. The schedule
+      condition that DOES park runs — `ScheduleRunnable` — was hoisted to
+      `kopiur_api::consts` and registered in `kopiur_api::gates` in this same
+      change, which is the distinction this rule is drawing.
+  - file: crates/controller/src/consts.rs
+    snippet: BACKEND_REACHABLE_CONDITION
+    reason: >-
+      Documented NON-BLOCKING sensor: the repository stays `Ready` and backups
+      and replication keep running while it is `False`. It is an alert, never an
+      outage gate. When the debounced probe does open the breaker, that shows up
+      as `RepositoryPhase::Degraded`, which doctor reads.
+
+  # === Rule D — surviving intentional single-variant equalities ==============
+  #
+  # Reviewed per site during the M2 sweep. Everything whose negation spanned
+  # several unrelated meanings — a CLASSIFICATION wearing an equality's clothes —
+  # was converted to an exhaustive `match` and is gone from this list
+  # (`is_terminal_for_generation`, `retention_view`, `failed_snapshots_to_prune`,
+  # `latest_per_policy`, `snapshot_success_unix`, `snapshot_gated`,
+  # `manual_run_request`, …). What is left is two honest shapes:
+  #
+  #   * idempotent write-dedupe — "is the phase already the one I am about to
+  #     PATCH", which exists only to stop a status hot-loop; and
+  #   * genuine one-bit questions and wording picks downstream of a
+  #     classification that an exhaustive `match` already made.
+  #
+  # NOT VISIBLE to this rule, and deliberately not faked into it: the compares
+  # that name no variant path. `io/repo.rs::repository_ready` and
+  # `request_repository_reverify` compare against a `ready` binding, and
+  # `snapshot/plan.rs::needs_terminal_pin` is generic over its caller's target
+  # (`observed != Some(target)`). See the "Deliberate limits" section of
+  # crates/xtask/src/phases.rs.
+
+  # --- Repository readiness: "is the backend usable right now" ---------------
+  - file: crates/controller/src/repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready)"
+    reason: >-
+      The `bootstrap_create_due` gate, at both call sites in
+      `bootstrap_via_mover`. `Ready` is the only phase in which the backend is
+      known-connected; every other phase, `Unknown` included, correctly means
+      "not yet", so the compare fails CLOSED uniformly. One bit, not a
+      multi-category classification.
+  - file: crates/controller/src/repository.rs
+    snippet: "prior_phase == Some(&RepositoryPhase::Ready)"
+    reason: >-
+      `already_ready` health-probe gate: only a repository that WAS `Ready` may
+      flip to `Degraded`. The negation is uniformly "not yet connected".
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready)"
+    reason: >-
+      `ClusterRepository` mirror of the `bootstrap_create_due` gate in
+      `repository.rs`, at both call sites in `bootstrap_cluster_via_mover`.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "prior_phase == Some(&RepositoryPhase::Ready)"
+    reason: >-
+      `ClusterRepository` mirror of the `already_ready` health-probe gate.
+  - file: crates/controller/src/io/repo.rs
+    snippet: "phase == Some(&RepositoryPhase::Ready)"
+    reason: >-
+      `repo_status_to_inputs` projects the same one-bit "usable now" answer into
+      `PreflightInputs` for CEL. The raw phase string is exported alongside it,
+      so a user expression can still test any other phase by name — this field
+      is not the only way to ask.
+
+  # --- Breaker state: "did we already record the open breaker" ---------------
+  - file: crates/controller/src/repository.rs
+    snippet: "prior_phase == Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      `strict_retry_holdoff`: the exponential bootstrap hold-off applies only
+      while the breaker is open. Any other phase means there is no backoff
+      window to honor.
+  - file: crates/controller/src/repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      Transition-only guard in `recycle_bootstrap_outage` and
+      `finalize_probe_failure`: fire the breaker-trip Event and metric on the
+      TRANSITION into `Degraded`, not on every reconcile that re-confirms it.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "prior_phase == Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      `ClusterRepository` mirror of the `strict_retry_holdoff` gate.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      `ClusterRepository` mirror of the transition-only breaker-trip guard, in
+      `recycle_cluster_bootstrap_outage` and `finalize_cluster_probe_failure`.
+  - file: crates/controller/src/metrics.rs
+    snippet: "phase != Some(&kopiur_api::RepositoryPhase::Degraded)"
+    reason: >-
+      `breaker_open_since`. The gauge's own description names the exact state it
+      reports (`Degraded` + `BackendReachable=False`), so any other phase
+      correctly yields no series rather than a wrong one.
+
+  # --- Restore write-dedupe and branch picks ---------------------------------
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "phase != Some(&RestorePhase::Restoring)"
+    reason: >-
+      Write-dedupe before PATCHing `Restoring`: skip the write when `Restoring`
+      is already recorded, so a poll of an in-flight mover does not hot-loop
+      status. Covers three sites — the populator `MoverOutcome::Running` arm and
+      the direct-target running arm, which pair it with `created ||` so a NEW Job
+      always writes, and the populator deploy-or-restore arm, which spawns no
+      mover and so needs no such pairing.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "phase != Some(&RestorePhase::Failed)"
+    reason: >-
+      Write-dedupe before PATCHing `Failed`, on the `MoverOutcome::Failed` and
+      `MoverOutcome::Wedged` arms of both `drive_populator_restore` and
+      `drive_direct_restore`.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "phase != Some(&RestorePhase::Completed)"
+    reason: >-
+      Write-dedupe before PATCHing `Completed` in `drive_direct_restore` — the
+      no-selection deploy-or-restore arm and the `MoverOutcome::Succeeded` arm.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "restore.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RestorePhase::Failed)"
+    reason: >-
+      The same write-dedupe on `fail_populate_hijacked`, where the phase is read
+      inline rather than from a local binding.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "phase == Some(&RestorePhase::Completed)"
+    reason: >-
+      Two deliberately NARROW definitions. `pinned_decision`'s legacy
+      stuck-populator back-fill is keyed to the ONE historical shape — a
+      `Completed` populator with no `status.resolved`; widening it would infer
+      "empty volume" for states that never had that bug, a data-loss direction
+      (#233). `reconcile_inner`'s `noop_already_bound` is defined as exactly
+      `Completed` plus a bound target.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "restore.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Completed)"
+    reason: >-
+      The `settled` steady-state exit in `drive_populator_restore`
+      (`settled_over_bound_claim`) and `complete_populator_already_bound`. Both
+      are paired with `kstatus_settled_for(&Completed)`, which is where the
+      classification actually lives.
+  - file: crates/controller/src/restore/mod.rs
+    snippet: "phase == &RestorePhase::Completed"
+    reason: >-
+      `steady_terminal_restore` wording pick. The caller already classified this
+      phase as terminal via the exhaustive `phase_is_terminal_at_guard`; this
+      only chooses between the success and the failure message.
+
+  # --- Snapshot write-dedupe and `Unchanged` branch picks --------------------
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "backup.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)"
+    reason: >-
+      Inside the `RunDecision::SucceededSteadyState` arm, which `run_decision`
+      reached by an exhaustive classification. Picks which of the two success
+      variants this is, to decide whether there is a kopia manifest to pin — an
+      `Unchanged` run owns none (#351).
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "mover_phase == Some(&SnapshotPhase::Unchanged)"
+    reason: >-
+      The same two-way success pick, immediately beside the exhaustive
+      `already_recorded` match that decides whether the phase the mover wrote is
+      already a recorded success.
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "backup.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&SnapshotPhase::Failed)"
+    reason: >-
+      Write-dedupe before PATCHing `Failed` after an observed mover-Job failure.
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "backup.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&SnapshotPhase::Running)"
+    reason: >-
+      Write-dedupe before PATCHing `Running` while the mover Job is in flight.
+  - file: crates/controller/src/snapshot_policy.rs
+    snippet: "s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)"
+    reason: >-
+      `unchanged_snapshots_to_prune` bounds exactly the `Unchanged` population.
+      A new phase must NOT join a DELETE set by default, and `==` is precisely
+      what keeps it out — an exhaustive match here would be the more dangerous
+      shape, because it would force someone to name the new variant in a
+      deletion path.
+
+  # --- Maintenance -----------------------------------------------------------
+  - file: crates/controller/src/maintenance/mod.rs
+    snippet: "m.phase.as_ref() == Some(&kopiur_api::ManualRunPhase::Running)"
+    reason: >-
+      `handle_manual_run`'s `already_running` write-dedupe: skip re-PATCHing the
+      manual-run block when it already reads `Running` for this exact request.
+
+  # --- CLI ------------------------------------------------------------------
+  - file: crates/cli/src/cmd/doctor.rs
+    snippet: "s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Failed)"
+    reason: >-
+      `check_recent_failures` is DEFINED as the terminally-`Failed` window.
+      `is_terminal()` is the wrong set here — `Succeeded`, `Unchanged` and
+      `Discovered` are terminal too — and a phase added later must not join a
+      "recent failures" report by inheriting an `else`.
+  - file: crates/cli/src/cmd/doctor.rs
+    snippet: "r.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&RestorePhase::Failed)"
+    reason: >-
+      The `Restore` half of the same `check_recent_failures` window, same
+      reasoning.
+  - file: crates/cli/src/cmd/snapshot.rs
+    snippet: "status.and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)"
+    reason: >-
+      `success_summary` wording pick, reached only after the exhaustive
+      `terminal()` classification already said "this is a success". Chooses
+      between the "backed up" and the "deduped, nothing new" sentence.
+
+  # === Rule E — `if let` single-variant probes ==============================
+  #
+  # All four are the same construct: the version-skew warning M2 added so an
+  # unreadable phase is NAMED before a driving reconciler overwrites it (see
+  # `io::warn_unreadable_phase`). Each is a probe for the `Unknown(String)`
+  # DECODE SENTINEL, which is the one variant where "a new variant takes the
+  # else" is the correct answer — a canonical phase added later is by definition
+  # not an unparseable string. That is the same contract
+  # `SnapshotPhase::is_unknown` states, and the two `matches!` probes in
+  # `doctor.rs` were converted to it in this PR.
+  #
+  # These four are NOT converted, because each binds the payload it exists to
+  # report — `p` for `PhaseLabel::label()`, `raw` for the log field — so a
+  # boolean predicate would only push the binding into a second statement
+  # without removing the pattern. If `ManualRunPhase` / `RepositoryPhase` ever
+  # grow an `is_unknown()` and a caller stops needing the payload, convert and
+  # delete the entry.
+  - file: crates/controller/src/repository.rs
+    snippet: "if let Some(p @ RepositoryPhase::Unknown(_)) ="
+    reason: >-
+      Version-skew warning at the top of `reconcile_inner`: this reconciler
+      DRIVES the object and every path below re-derives and overwrites the phase,
+      which is the right self-heal — but it must be named before it happens.
+      Binds `p` for `PhaseLabel::label()`. The read-only classifications that
+      consume this phase (`is_terminal_for_generation`, `breaker_open_since`)
+      hold exhaustively instead.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "if let Some(p @ RepositoryPhase::Unknown(_)) ="
+    reason: >-
+      `ClusterRepository` mirror of the `repository.rs` version-skew warning,
+      same binding and same reasoning.
+  - file: crates/controller/src/maintenance/mod.rs
+    snippet: "if let Some(p @ kopiur_api::ManualRunPhase::Unknown(_)) ="
+    reason: >-
+      The `Maintenance` manual-run mirror: a recorded `status.manualRun.phase`
+      this build cannot read will be re-driven and overwritten, so it is named
+      first. Binds `p` for `PhaseLabel::label()`.
+  - file: crates/controller/src/snapshot/mod.rs
+    snippet: "if let Some(SnapshotPhase::Unknown(raw)) ="
+    reason: >-
+      The Snapshot HOLD path — unlike the drivers above this one does not
+      overwrite, it warns loudly and requeues (10m) so the object self-heals
+      after the operator upgrade, because a silently-held CR no diagnostic
+      mentions is exactly the all-green-while-stuck failure of #359. Binds `raw`
+      to put the unrecognized string in the log.

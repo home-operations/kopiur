@@ -36,10 +36,10 @@
 //! # Deliberate limits
 //!
 //! Reachability is a whole-word identifier search over *scrubbed* source (see
-//! [`scrub`]): comments and string literals are removed, so a field named only
-//! in a doc comment or an error message does not count as wired. `#[cfg(test)]`
-//! modules and test files are excluded, so a field used only by fixtures does
-//! not count either.
+//! [`scan::scrub`]): comments and string literals are removed, so a field named
+//! only in a doc comment or an error message does not count as wired.
+//! `#[cfg(test)]` modules and test files are excluded, so a field used only by
+//! fixtures does not count either.
 //!
 //! It is still a name search, not a call graph, so it **under-reports**: a
 //! generic name (`name`, `path`, `enabled`) matches something somewhere and is
@@ -53,7 +53,6 @@
 //! is still inert at runtime.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps;
@@ -61,6 +60,12 @@ use kube::core::CustomResourceExt;
 use serde::Deserialize;
 
 use crate::paths::workspace_root;
+use crate::scan;
+// The text-scanning primitives moved to [`crate::scan`] when the phase ratchet
+// grew a second consumer of them. Re-exported so `xtask::wiring::scrub` and
+// friends keep resolving — this module is where they were first documented, and
+// the wiring tests still reach for them by that path.
+pub use crate::scan::{scrub, strip_cfg_test, strip_use_stmts};
 
 /// Crates whose source counts as "something consumes this field".
 ///
@@ -333,146 +338,6 @@ pub fn mentions_variant(haystack: &str, variant: &str) -> bool {
 
 // --- source scanning -------------------------------------------------------
 
-/// Remove comments and string/char literals from Rust source, so a field named
-/// only in a doc comment or an error message is not mistaken for a consumer.
-///
-/// This is deliberately a character scanner rather than a parser: it must never
-/// fail on valid source, and over-removal only makes the check more
-/// conservative.
-///
-/// ```
-/// use xtask::wiring::scrub;
-/// assert_eq!(scrub("let a = 1; // pvc_selector"), "let a = 1; ");
-/// assert!(!scrub(r#"err("pvc_selector missing")"#).contains("pvc_selector"));
-/// ```
-pub fn scrub(src: &str) -> String {
-    let b: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        // Line comment (covers `//`, `///` and `//!`).
-        if c == '/' && b.get(i + 1) == Some(&'/') {
-            while i < b.len() && b[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment, nesting-aware (Rust allows nesting).
-        if c == '/' && b.get(i + 1) == Some(&'*') {
-            let mut depth = 1;
-            i += 2;
-            while i < b.len() && depth > 0 {
-                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            out.push(' ');
-            continue;
-        }
-        // Raw string: r"..." / r#"..."# / r##"..."##
-        if c == 'r' {
-            let mut hashes = 0;
-            let mut j = i + 1;
-            while b.get(j) == Some(&'#') {
-                hashes += 1;
-                j += 1;
-            }
-            if b.get(j) == Some(&'"') {
-                j += 1;
-                loop {
-                    if j >= b.len() {
-                        break;
-                    }
-                    if b[j] == '"' && b[j + 1..].iter().take(hashes).all(|h| *h == '#') {
-                        j += 1 + hashes;
-                        break;
-                    }
-                    j += 1;
-                }
-                out.push(' ');
-                i = j;
-                continue;
-            }
-        }
-        // Normal string literal.
-        if c == '"' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == '\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push(' ');
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// Remove `#[cfg(test)]`-annotated items by brace matching, so fixtures do not
-/// count as consumers.
-///
-/// ```
-/// use xtask::wiring::strip_cfg_test;
-/// let s = "fn real() { a(); }\n#[cfg(test)]\nmod tests { fn f() { pvc_selector(); } }\n";
-/// assert!(!strip_cfg_test(s).contains("pvc_selector"));
-/// assert!(strip_cfg_test(s).contains("real"));
-/// ```
-pub fn strip_cfg_test(src: &str) -> String {
-    const MARK: &str = "#[cfg(test)]";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    while let Some(at) = rest.find(MARK) {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + MARK.len()..];
-        // Skip to the item's opening brace, then match to its close.
-        match after.find('{') {
-            Some(open) => {
-                let bytes = after.as_bytes();
-                let mut depth = 0usize;
-                let mut end = None;
-                for (k, ch) in bytes.iter().enumerate().skip(open) {
-                    match ch {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = Some(k + 1);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                match end {
-                    Some(e) => rest = &after[e..],
-                    // Unbalanced (shouldn't happen in valid source) — drop the tail.
-                    None => return out,
-                }
-            }
-            // e.g. `#[cfg(test)] use ...;` — drop to end of statement.
-            None => return out,
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Whether `ident` occurs in `haystack` as a whole word.
 ///
 /// ```
@@ -500,85 +365,15 @@ pub fn mentions(haystack: &str, ident: &str) -> bool {
     false
 }
 
-/// Remove `use ...;` statements (including multi-line brace groups).
-///
-/// An import is not a use: `use kopiur_api::GroupBy;` contains `::GroupBy` and
-/// would otherwise satisfy [`mentions_variant`] without anyone ever dispatching
-/// on the type. Stripping them keeps "wired" meaning "something acts on it".
-///
-/// ```
-/// use xtask::wiring::strip_use_stmts;
-/// assert!(!strip_use_stmts("use kopiur_api::GroupBy;\nlet a = 1;").contains("GroupBy"));
-/// assert!(strip_use_stmts("use a::B;\nmatch x { GroupBy::None => () }").contains("GroupBy::None"));
-/// ```
-pub fn strip_use_stmts(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    // Walk line by line; a `use` statement always starts one (after indentation
-    // and an optional `pub `), and runs to the next `;` — which may be several
-    // lines later for a brace group.
-    let mut rest = src;
-    while !rest.is_empty() {
-        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
-        let line = &rest[..line_end];
-        let head = line.trim_start();
-        let head = head.strip_prefix("pub ").unwrap_or(head);
-        if head.starts_with("use ") {
-            match rest.find(';') {
-                Some(semi) => {
-                    out.push('\n');
-                    rest = &rest[semi + 1..];
-                }
-                // Unterminated (not valid Rust) — drop the tail rather than loop.
-                None => break,
-            }
-        } else {
-            out.push_str(line);
-            rest = &rest[line_end..];
-        }
-    }
-    out
-}
-
-/// Every `.rs` file whose text counts as a consumer, excluding test files.
-fn consumer_sources() -> Result<Vec<PathBuf>> {
-    let root = workspace_root().join("crates");
-    let mut out = Vec::new();
-    for c in CONSUMER_CRATES {
-        let dir = root.join(c).join("src");
-        if dir.is_dir() {
-            collect_rs(&dir, &mut out)?;
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let p = e?.path();
-        if p.is_dir() {
-            // `src/**/tests/` holds fixtures only.
-            if p.file_name().is_some_and(|n| n == "tests") {
-                continue;
-            }
-            collect_rs(&p, out)?;
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            // `foo/tests.rs` is the repo's `#[cfg(test)] mod tests;` file.
-            if p.file_stem().is_some_and(|n| n == "tests") {
-                continue;
-            }
-            out.push(p);
-        }
-    }
-    Ok(())
-}
-
 /// The scrubbed, test-stripped text of every consumer source, concatenated.
+///
+/// Per-file scanning lives in [`crate::scan`]; the wiring check only asks
+/// "does this identifier appear *anywhere*", so it folds the files back into one
+/// corpus. The pipeline — `strip_cfg_test` → `scrub` → `strip_use_stmts`, each
+/// in its collapsing form — is unchanged from before that extraction.
 pub fn consumer_corpus() -> Result<String> {
     let mut corpus = String::new();
-    for p in consumer_sources()? {
-        let raw =
-            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    for (_, raw) in scan::sources(CONSUMER_CRATES)? {
         corpus.push_str(&strip_use_stmts(&scrub(&strip_cfg_test(&raw))));
         corpus.push('\n');
     }

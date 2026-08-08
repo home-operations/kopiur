@@ -862,7 +862,7 @@ pub fn probe_failure_phase(
 /// `Ready`/`Failed` repo, a never-reconciled `Pending`) shows `Initializing` as
 /// before. Exhaustive over [`RepositoryPhase`] — no `_ =>` — so a new phase
 /// must choose.
-pub fn launch_phase(prior: Option<RepositoryPhase>) -> &'static str {
+pub fn launch_phase(prior: Option<&RepositoryPhase>) -> &'static str {
     match prior {
         Some(RepositoryPhase::Degraded) => "Degraded",
         Some(
@@ -872,6 +872,10 @@ pub fn launch_phase(prior: Option<RepositoryPhase>) -> &'static str {
             | RepositoryPhase::Failed,
         )
         | None => "Initializing",
+        // A phase this build cannot interpret is not a known-paused `Degraded`
+        // repository, so the launch reports plain first-bootstrap progress
+        // rather than inventing a breaker state it cannot verify.
+        Some(RepositoryPhase::Unknown(_)) => "Initializing",
     }
 }
 
@@ -1812,16 +1816,25 @@ mod tests {
     fn launch_phase_keeps_degraded_and_initializes_everything_else() {
         // Audit 3d: a Degraded repo's strict retry must not flap the phase to
         // Initializing every cycle (phase-keyed alerts/gauges would break).
-        assert_eq!(launch_phase(Some(RepositoryPhase::Degraded)), "Degraded");
+        assert_eq!(launch_phase(Some(&RepositoryPhase::Degraded)), "Degraded");
         // Every other pre-Ready state keeps the pre-M4 Initializing.
         assert_eq!(launch_phase(None), "Initializing");
-        assert_eq!(launch_phase(Some(RepositoryPhase::Pending)), "Initializing");
         assert_eq!(
-            launch_phase(Some(RepositoryPhase::Initializing)),
+            launch_phase(Some(&RepositoryPhase::Pending)),
             "Initializing"
         );
-        assert_eq!(launch_phase(Some(RepositoryPhase::Ready)), "Initializing");
-        assert_eq!(launch_phase(Some(RepositoryPhase::Failed)), "Initializing");
+        assert_eq!(
+            launch_phase(Some(&RepositoryPhase::Initializing)),
+            "Initializing"
+        );
+        assert_eq!(launch_phase(Some(&RepositoryPhase::Ready)), "Initializing");
+        assert_eq!(launch_phase(Some(&RepositoryPhase::Failed)), "Initializing");
+        // Not a known-paused `Degraded` repository, so the launch reports plain
+        // first-bootstrap progress rather than inventing a breaker state.
+        assert_eq!(
+            launch_phase(Some(&RepositoryPhase::Unknown("Upgrading".into()))),
+            "Initializing"
+        );
     }
 
     #[test]
@@ -1917,7 +1930,7 @@ mod tests {
         let open_conditions = crate::io::set_ready(
             &u3.conditions,
             Some(1),
-            crate::io::ready_outcome_for_phase(RepositoryPhase::Degraded),
+            crate::io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
             breaker_reason(ProbeFailureKind::Unreachable),
             breaker_open_message(ProbeFailureKind::Unreachable),
         );
@@ -1943,7 +1956,7 @@ mod tests {
 
         // While open: the strict retry launch keeps the phase Degraded (no
         // Initializing flap) and is rate-limited by the holdoff...
-        assert_eq!(launch_phase(Some(RepositoryPhase::Degraded)), "Degraded");
+        assert_eq!(launch_phase(Some(&RepositoryPhase::Degraded)), "Degraded");
         let last_failure = u3.health.last_probe_at.clone().unwrap();
         assert!(
             strict_retry_holdoff(true, 3, Some(&last_failure), t(110)).is_some(),

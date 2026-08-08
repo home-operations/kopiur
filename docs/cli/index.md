@@ -107,7 +107,7 @@ $ kubectl krew install kopiur/kopiur
 $ kubectl kopiur --version
 ```
 
-**3. Prove the install with `doctor` (deep).** It exits **0** when all eight checks pass:
+**3. Prove the install with `doctor` (deep).** It exits **0** when all nine checks pass:
 
 ```console
 $ kubectl kopiur doctor -n media
@@ -117,10 +117,11 @@ $ kubectl kopiur doctor -n media
   ok    webhook admission (live dry-run probe)
   ok    repositories ready
   ok    credential secrets present
-  ok    no stuck snapshots/restores
+  ok    no blocked or stuck work
+  ok    no recent failed snapshots/restores
   ok    recent warning events
 
-8 check(s): 0 failed, 0 warning(s)
+9 check(s): 0 failed, 0 warning(s)
 
 $ echo $?
 0

@@ -61,10 +61,14 @@ pub fn answered(
     if manual.requested_at.as_deref() != Some(requested_at) {
         return None;
     }
-    match manual.phase? {
+    match manual.phase.as_ref()? {
         ManualRunPhase::Running => None,
         ManualRunPhase::Succeeded => Some(Ok(Box::new(maint.clone()))),
         ManualRunPhase::Failed => Some(Err(Box::new(maint.clone()))),
+        // Not an answer this build can read: keep waiting (the caller's own
+        // timeout bounds it) rather than reporting a success or a failure we
+        // cannot substantiate.
+        ManualRunPhase::Unknown(_) => None,
     }
 }
 
