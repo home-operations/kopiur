@@ -73,13 +73,25 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     let name = repl.name_any();
     let api: Api<RepositoryReplication> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    // Version skew: a phase written by a NEWER kopiur. This reconciler DRIVES the
-    // object — every path below re-derives the phase from the observed schedule
-    // and Job state and OVERWRITES it — which is the right self-heal (a value we
-    // cannot read must not park a replication forever) and is idempotent here:
-    // the Job name is keyed on the due slot, so a re-drive adopts the in-flight
-    // Job rather than minting a second run. But the overwrite must never be
-    // silent — see `io::warn_unreadable_phase`.
+    // Version skew: a phase written by a NEWER kopiur. Two facts shape what this
+    // warning is for, and neither is the prompt-overwrite story the other
+    // drivers have (see `io::warn_unreadable_phase`):
+    //
+    // - Nothing below READS `status.phase` — no branch, no gate, no dedupe — so
+    //   an unreadable value changes no behavior: the replication keeps running
+    //   its schedule normally.
+    // - Nothing below promptly rewrites it either. Only the suspended and
+    //   Job-failed paths pass a phase at all (and both go through
+    //   `patch_ready_if_changed`, which short-circuits when the `Ready`
+    //   condition is unchanged); the waiting/idle/in-flight paths pass
+    //   `phase: None` or do not patch, and the terminal `Succeeded`/`Failed`
+    //   stamp comes from the mover at the END of a run. So the value PERSISTS —
+    //   potentially a whole schedule interval, until the next run stamps over it.
+    //
+    // Which is exactly why the warn is unconditional and repeats on every pass
+    // (every 30s while a Job is in flight, otherwise up to the requeue cap): the
+    // log is the only place this skew surfaces, so it has to keep surfacing
+    // until the operator upgrade finishes.
     if let Some(label) = unreadable_phase(repl) {
         io::warn_unreadable_phase("RepositoryReplication", &namespace, &name, label);
     }

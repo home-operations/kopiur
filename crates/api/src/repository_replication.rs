@@ -149,9 +149,12 @@ impl RepositoryReplicationPhase {
     /// not a reviewer, is what forces the new variant to answer.
     ///
     /// The reconciler uses it for its entry-time version-skew warning
-    /// (`io::warn_unreadable_phase`): this reconciler DRIVES the object and
-    /// re-derives the phase every pass, so an unreadable value is overwritten —
-    /// correct self-heal, but never silent.
+    /// (`io::warn_unreadable_phase`). Unlike the other drivers, it does not
+    /// promptly overwrite what it cannot read: no branch reads this phase, and
+    /// the terminal stamp comes from the mover at the end of a run, so an
+    /// unreadable value simply persists — up to a whole schedule interval. The
+    /// warning is therefore repeated every pass rather than emitted once: the
+    /// log is where the skew is visible.
     ///
     /// ```
     /// use kopiur_api::RepositoryReplicationPhase;
