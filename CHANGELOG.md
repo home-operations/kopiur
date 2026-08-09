@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.0](https://github.com/home-operations/kopiur/compare/0.9.5...0.10.0) (2026-08-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rust:** Update crate base64 (0.22.1 → 0.23.1) ([#366](https://github.com/home-operations/kopiur/issues/366))
+
+### Features
+
+* **rust:** Update crate base64 (0.22.1 → 0.23.1) ([#366](https://github.com/home-operations/kopiur/issues/366)) ([2c6e3e7](https://github.com/home-operations/kopiur/commit/2c6e3e7cb53706fd20d1096342292f583930e671))
+* SnapshotReplication (logical snapshot-level replication) + SnapshotPolicy multi-repository fan-out ([#370](https://github.com/home-operations/kopiur/issues/370)) ([4e06e42](https://github.com/home-operations/kopiur/commit/4e06e42f2f9eb8711c17c443d0e51deead45c55d))
+
+
+### Continuous Integration
+
+* **github-action:** Update action Swatinem/rust-cache (v2.9.1 → v2.9.2) ([#372](https://github.com/home-operations/kopiur/issues/372)) ([e4ce173](https://github.com/home-operations/kopiur/commit/e4ce173b44b37fd0f5bfb5fbc98892d67ccff63f))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update mise tools ([#367](https://github.com/home-operations/kopiur/issues/367)) ([d6f82f4](https://github.com/home-operations/kopiur/commit/d6f82f488883a0fecb7b41888d216ae8cfe4b3a4))
+* **mise:** Update tool cosign (3.1.2 → 3.1.3) ([#371](https://github.com/home-operations/kopiur/issues/371)) ([558b9f4](https://github.com/home-operations/kopiur/commit/558b9f4d487e93e75d7d42ffa59d3e68eea8ed48))
+
 ## [0.9.5](https://github.com/home-operations/kopiur/compare/0.9.4...0.9.5) (2026-08-08)
 
 
