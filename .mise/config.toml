@@ -6,7 +6,7 @@
 # (or any sub-task, e.g. `//crates/e2e:cluster-create`). `settings.experimental`
 # enables this persistently — no MISE_EXPERIMENTAL env var needed in CI or dev
 # shells. Existing root tasks below stay invokable unprefixed (`mise run test`).
-experimental_monorepo_root = true
+monorepo_root = true
 
 [settings]
 experimental = true
@@ -16,7 +16,7 @@ config_roots = ["crates/e2e"]
 
 [tools]
 actionlint = "1.7.12"
-rust = { version = "1.97.1", components = "rustfmt,clippy,llvm-tools-preview" }
+rust = { version = "1.97.1", components = "rustfmt,clippy,llvm-tools" }
 lefthook = "2.1.10"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
@@ -71,7 +71,7 @@ run = "cargo build --release --locked -p kopiur-controller -p kopiur-webhook -p 
 
 [tasks.rust-components]
 description = "Install Rust components required by project tasks"
-run = "rustup component add rustfmt clippy llvm-tools-preview"
+run = "rustup component add rustfmt clippy llvm-tools"
 
 [tasks.test]
 # The second command compile-checks ALL feature-gated targets (integration/e2e)
@@ -290,7 +290,15 @@ run = "uv run mkdocs serve"
 
 [tasks.ci]
 description = "The full local hermetic gate: format, lint, build, test, and drift check"
-depends = ["fmt-check", "clippy", "build", "test", "gen-check", "wiring-check", "phase-check"]
+depends = [
+  "fmt-check",
+  "clippy",
+  "build",
+  "test",
+  "gen-check",
+  "wiring-check",
+  "phase-check",
+]
 
 [hooks]
 postinstall = "lefthook install"
