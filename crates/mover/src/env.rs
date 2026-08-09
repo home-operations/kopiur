@@ -49,6 +49,16 @@ pub const SERVER_PASSWORD: &str = "KOPIA_SERVER_PASSWORD";
 /// reads the result back to drive the `Repository` status + catalog.
 pub const RESULT_CONFIGMAP: &str = "KOPIUR_RESULT_CONFIGMAP";
 
+/// The snapshot-replication DESTINATION repository's kopia password. Injected
+/// by the controller via a `secretKeyRef` under this dedicated name so it can
+/// never collide with the SOURCE's `KOPIA_PASSWORD` (issue #200's prefix rule;
+/// the destination's other creds ride `KOPIUR_DEST_`-prefixed env). The
+/// replication mover sets it as `KOPIA_PASSWORD` on the destination client
+/// only. Re-exported from the api crate so the controller (which stamps it
+/// onto the Job) and the mover (which reads it back) share one definition;
+/// value pinned by `dest_kopia_password_env_is_stable`.
+pub const DEST_KOPIA_PASSWORD: &str = kopiur_api::creds::DEST_KOPIA_PASSWORD_ENV;
+
 /// Marker file a `BrowseSession` mover writes once its read-only repository
 /// connect succeeded. The session pod's readinessProbe execs `kopiur-mover
 /// ready`, which exits 0 iff this file exists — the distroless image has no
@@ -57,3 +67,20 @@ pub const RESULT_CONFIGMAP: &str = "KOPIUR_RESULT_CONFIGMAP";
 /// ([`kopiur_kopia::env::DEFAULT_CACHE_DIR`], `/var/cache/kopia`) because that
 /// emptyDir is the only writable mount on a read-only-root mover pod.
 pub const READY_MARKER: &str = "/var/cache/kopia/.kopiur-session-ready";
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dest_kopia_password_env_is_stable() {
+        // The controller stamps this exact name onto the mover Job's env
+        // (via secretKeyRef) and the replication mover reads it back — a
+        // silent rename would strand the destination password. Must also stay
+        // under the KOPIUR_DEST_ prefix so the projected-Secret reap and the
+        // env-collision rule (issue #200) both cover it.
+        assert_eq!(super::DEST_KOPIA_PASSWORD, "KOPIUR_DEST_KOPIA_PASSWORD");
+        assert!(
+            super::DEST_KOPIA_PASSWORD.starts_with(kopiur_api::creds::DEST_ENV_PREFIX),
+            "the destination password must ride the KOPIUR_DEST_ prefix"
+        );
+    }
+}

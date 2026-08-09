@@ -289,6 +289,64 @@ pub struct RepositoryRef {
     pub namespace: Option<String>,
 }
 
+/// A normalized, comparable repository key for a consumer's [`RepositoryRef`]
+/// resolved from `owner_namespace` (the consuming CR's namespace). Two
+/// references are "the same repository" only when their keys match. Pure +
+/// exhaustive over [`RepositoryKind`]. Hoisted from the webhook's
+/// identity-collision module so the validator, the webhook, and child-naming
+/// all normalize identically (the webhook re-exports this).
+///
+/// - `Repository` → `"Repository/<effective-ns>/<name>"` (effective-ns is
+///   `ref.namespace` or the owner's namespace).
+/// - `ClusterRepository` → `"ClusterRepository/<name>"` (namespace-free).
+///
+/// ```
+/// use kopiur_api::common::{RepositoryKind, RepositoryRef, repo_key};
+///
+/// let r = RepositoryRef { kind: RepositoryKind::Repository, name: "nas".into(), namespace: None };
+/// assert_eq!(repo_key(&r, "backups"), "Repository/backups/nas");
+/// let c = RepositoryRef { kind: RepositoryKind::ClusterRepository, name: "shared".into(), namespace: None };
+/// assert_eq!(repo_key(&c, "backups"), "ClusterRepository/shared");
+/// ```
+pub fn repo_key(repo: &RepositoryRef, owner_namespace: &str) -> String {
+    match repo.kind {
+        RepositoryKind::Repository => {
+            let ns = repo.namespace.as_deref().unwrap_or(owner_namespace);
+            format!("Repository/{ns}/{}", repo.name)
+        }
+        RepositoryKind::ClusterRepository => format!("ClusterRepository/{}", repo.name),
+    }
+}
+
+/// Normalize a [`RepositoryRef`] against the namespace it resolves relative to
+/// (`owner_namespace`, the consuming CR's namespace): a namespaced `Repository`
+/// ref carries its EFFECTIVE namespace explicitly (so a later reader can
+/// re-resolve it from anywhere — e.g. after the owning recipe is gone); a
+/// cluster-scoped `ClusterRepository` ref carries none (the webhook forbids
+/// one). This is the one normal form every pin uses — `status.resolved.repository`
+/// (the controller's run-time pin) and `Snapshot.spec.repository` (the
+/// mint-time pin a multi-repo fan-out child or replication copy CR carries) —
+/// so [`repo_key`] over a normalized ref is namespace-independent. Exhaustive
+/// over [`RepositoryKind`].
+pub fn normalized_repository_ref(r: &RepositoryRef, owner_namespace: &str) -> RepositoryRef {
+    match r.kind {
+        RepositoryKind::Repository => RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: r.name.clone(),
+            namespace: Some(
+                r.namespace
+                    .clone()
+                    .unwrap_or_else(|| owner_namespace.to_string()),
+            ),
+        },
+        RepositoryKind::ClusterRepository => RepositoryRef {
+            kind: RepositoryKind::ClusterRepository,
+            name: r.name.clone(),
+            namespace: None,
+        },
+    }
+}
+
 /// Repository encryption settings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]

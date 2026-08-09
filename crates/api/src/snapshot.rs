@@ -1,10 +1,13 @@
 //! The `Snapshot` CRD — a single kopia snapshot as a Kubernetes object.
 //! ADR-0001 §3.4, ADR-0003 §4.5.
 //!
-//! Three origins (canonical value lives in `status.origin`):
+//! Origins (canonical value lives in `status.origin`):
 //! - `scheduled` — created by a `SnapshotSchedule`; spec carries `policyRef`.
 //! - `manual`    — created by `kubectl create` / external automation; spec carries `policyRef`.
 //! - `discovered`— materialized by the catalog scan; spec is empty/absent.
+//! - `adopted`   — a discovered row re-attached to a live `SnapshotPolicy`.
+//! - `replicated`— a dest-side copy CR minted by a `SnapshotReplication` run;
+//!   spec carries `repository` (the destination pin) and no `policyRef`.
 
 use crate::common::{
     CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef,
@@ -41,6 +44,16 @@ pub struct SnapshotSpec {
     /// The `SnapshotPolicy` recipe to run; absent for `discovered` backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<PolicyRef>,
+    /// The ONE repository this `Snapshot` targets, pinned by value at mint
+    /// time. Stamped by a multi-repository `SnapshotPolicy` fan-out (each child
+    /// covers exactly one member of the policy's repository set) and by
+    /// `SnapshotReplication` copy CRs (the destination repository). Absent for
+    /// the legacy single-repository case, where the policy's own
+    /// `spec.repository` (or, for catalog rows, the owning repository CR) is
+    /// the answer — an absent pin resolves exactly as before this field
+    /// existed, so pre-feature `Snapshot`s are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRef>,
     /// The ONE concrete source this `Snapshot` covers, when `policyRef` names a
     /// recipe whose `sources[]` expands to many — i.e. a
     /// [`pvcSelector`](crate::snapshot_policy::PvcSelector).
@@ -179,6 +192,28 @@ pub enum Origin {
     /// like any produced row, even though the operator did not create the
     /// underlying kopia snapshot.
     Adopted,
+    /// A destination-side copy CR minted by a `SnapshotReplication` run: the
+    /// kopia snapshot it represents was `snapshot migrate`d from another
+    /// repository, not produced by a backup run here. Like `discovered`/
+    /// `adopted` it is catalog history — it must never enter the backup-run
+    /// machinery — but it is pruned only by its `SnapshotReplication`'s own
+    /// pruning mode, never by any policy's GFS retention.
+    Replicated,
+}
+
+impl Origin {
+    /// Every variant, for the label-value ↔ [`parse`](Self::parse) round-trip
+    /// tests and consumer-side variant-count guards (e.g. the CLI's
+    /// `OriginFilter`). A new variant added without extending this array fails
+    /// the round-trip test (and `label_value`/`parse`'s exhaustive matches
+    /// won't compile until it is classified).
+    pub const ALL: &'static [Self] = &[
+        Self::Scheduled,
+        Self::Manual,
+        Self::Discovered,
+        Self::Adopted,
+        Self::Replicated,
+    ];
 }
 
 /// Lifecycle phase of a `Snapshot`.
@@ -260,6 +295,32 @@ impl Origin {
             Self::Manual => "manual",
             Self::Discovered => "discovered",
             Self::Adopted => "adopted",
+            Self::Replicated => "replicated",
+        }
+    }
+
+    /// Strict, TOTAL parse of an origin marker (the `origin` label /
+    /// `status.origin` wire value): `None` for anything unrecognized.
+    ///
+    /// The single inverse of [`label_value`](Self::label_value), so string
+    /// matchers (the controller's `resolve_origin`, the webhook's
+    /// `backup_origin`) can never silently classify an unknown origin as a
+    /// known one. The pre-parse versions of both defaulted unknown strings to
+    /// `Manual` — which would have routed a row written by a NEWER operator
+    /// (e.g. `replicated` before this variant existed) into the backup-run
+    /// machinery and minted a mover Job for a snapshot this build does not
+    /// understand. Callers must treat `None` conservatively: warn + inert
+    /// handling, never `Manual`.
+    pub fn parse(v: &str) -> Option<Self> {
+        // One arm per variant (each also pinned by the ALL round-trip test);
+        // the trailing arm is the UNKNOWN-string case, not a variant catch-all.
+        match v {
+            "scheduled" => Some(Self::Scheduled),
+            "manual" => Some(Self::Manual),
+            "discovered" => Some(Self::Discovered),
+            "adopted" => Some(Self::Adopted),
+            "replicated" => Some(Self::Replicated),
+            _ => None,
         }
     }
 }
@@ -274,9 +335,26 @@ pub enum PrunedBy {
     /// Policy-deletion cascade under `onPolicyDelete: Retain` — release the
     /// CR, never contact the repository.
     PolicyCascade,
+    /// A `SnapshotReplication`'s own retention prune of its dest-side copy CRs
+    /// (`pruning: retention`). An OPERATOR prune exactly like `Retention`:
+    /// bounded, deliberate, breaker-exempt. (`pruning: mirrorSource` deletes
+    /// deliberately carry NO stamp, so a mass source-vanish classifies EXTERNAL
+    /// and the dest repository's breaker holds it.)
+    ReplicationRetention,
 }
 
 impl PrunedBy {
+    /// Every variant, for the annotation-value ↔ [`parse`](Self::parse)
+    /// round-trip test. A new variant added without extending this array fails
+    /// that test (and the exhaustive matches here and in the controller's
+    /// deletion planner won't compile until it is classified).
+    pub const ALL: &'static [Self] = &[
+        Self::Retention,
+        Self::FailedHistory,
+        Self::PolicyCascade,
+        Self::ReplicationRetention,
+    ];
+
     /// The stable annotation value stamped by the operator before it deletes a
     /// `Snapshot` as part of its own lifecycle (see [`crate::consts::PRUNED_BY_ANNOTATION`]).
     pub fn annotation_value(self) -> &'static str {
@@ -284,6 +362,7 @@ impl PrunedBy {
             Self::Retention => "retention",
             Self::FailedHistory => "failed-history",
             Self::PolicyCascade => "policy-cascade",
+            Self::ReplicationRetention => "replication-retention",
         }
     }
 
@@ -294,6 +373,7 @@ impl PrunedBy {
             "retention" => Some(Self::Retention),
             "failed-history" => Some(Self::FailedHistory),
             "policy-cascade" => Some(Self::PolicyCascade),
+            "replication-retention" => Some(Self::ReplicationRetention),
             _ => None,
         }
     }
@@ -475,6 +555,13 @@ pub struct SnapshotStatus {
     /// backups without the tag, or a tag this operator version cannot decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<crate::recorded::RecordedSnapshotMeta>,
+    /// Lineage for `origin: replicated` rows: the source repository, source
+    /// manifest id, and `startTime` the copy was migrated from. Written by the
+    /// `SnapshotReplication` mover in the same atomic PATCH as
+    /// `status.snapshot`; absent on every other origin. See [`CopiedFrom`] for
+    /// why this lives on the CR rather than as kopia tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<CopiedFrom>,
 }
 
 /// One-shot markers for the cleanups a terminal `Snapshot` performs, mirroring
@@ -641,6 +728,32 @@ pub struct ResolvedSnapshot {
     pub credential_projection: Option<CredentialProjection>,
 }
 
+/// Lineage of an `origin: replicated` row: where the copy came from.
+///
+/// `kopia snapshot migrate` cannot stamp tags onto the migrated manifest (it
+/// preserves the source manifest verbatim apart from assigning a new manifest
+/// id), so the provenance a dest-side copy CR needs — which repository it was
+/// copied FROM, which source manifest it corresponds to, and the `startTime`
+/// migrate keys idempotency on — cannot live in the kopia repository. It lives
+/// here, written by the replication mover in the same atomic status PATCH that
+/// records the destination manifest (`status.snapshot.kopiaSnapshotID`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CopiedFrom {
+    /// The SOURCE repository the snapshot was migrated from (the
+    /// `SnapshotReplication`'s `sourceRef`, resolved at run time).
+    pub repository: RepositoryRef,
+    /// The kopia manifest id the snapshot had in the SOURCE repository.
+    /// Migrate assigns a NEW manifest id on the destination
+    /// (`status.snapshot.kopiaSnapshotID`); this is the old one, kept for
+    /// cross-repository correlation.
+    pub source_manifest_id: String,
+    /// The snapshot's RFC3339 `startTime` — preserved verbatim by migrate and
+    /// the key (together with the identity triple) both idempotent re-migration
+    /// and `pruning: mirrorSource` correlate source and destination rows on.
+    pub start_time: String,
+}
+
 /// One resolved source backed up by a run — a concrete PVC and its kopia path.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -653,12 +766,19 @@ pub struct ResolvedSource {
     pub source_path: Option<String>,
 }
 
-/// Derive the repository a `Snapshot` belongs to: a *produced* snapshot pins it
-/// in `status.resolved.repository`; a *discovered* snapshot carries its
-/// `Repository`/`ClusterRepository` as the controller `ownerReference` (it has
-/// no `resolved` block). Pure. Shared by the `Restore` reconciler
-/// (`spec.repository` derivation for `snapshotRef`) and the `kubectl kopiur`
-/// browse data-plane, so the derivation rule cannot fork.
+/// Derive the repository a `Snapshot` belongs to, in fixed precedence order:
+///
+/// 1. `status.resolved.repository` — the run-time pin every *produced*
+///    snapshot records (controller-written, authoritative);
+/// 2. `spec.repository` — the mint-time pin a multi-repo policy fan-out child
+///    or a `SnapshotReplication` copy CR carries (present before any status
+///    has been written, and the only pin such a CR is guaranteed to have);
+/// 3. the `Repository`/`ClusterRepository` controller `ownerReference` a
+///    *discovered* snapshot carries (it has neither block).
+///
+/// Pure. Shared by the `Restore` reconciler (`spec.repository` derivation for
+/// `snapshotRef`) and the `kubectl kopiur` browse data-plane, so the
+/// derivation rule cannot fork.
 pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
     use crate::common::RepositoryKind;
     if let Some(rref) = snap
@@ -667,6 +787,9 @@ pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
         .and_then(|s| s.resolved.as_ref())
         .and_then(|r| r.repository.clone())
     {
+        return Some(rref);
+    }
+    if let Some(rref) = snap.spec.repository.clone() {
         return Some(rref);
     }
     let owners = snap
@@ -692,6 +815,91 @@ pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
     })
 }
 
+/// THE repository a policy-child `Snapshot` runs against, resolved from the
+/// mint-time pin + the referenced policy's repository set. **Pure.** This is
+/// the single decision every launch/deletion/pin/preflight path shares, so
+/// multi-repo pin semantics cannot fork between consumers.
+///
+/// The rule, in order:
+///
+/// 1. **No `policyRef`** — this is NOT a policy child (a `SnapshotReplication`
+///    copy CR, or a discovered row): the `policy` argument is not this row's
+///    recipe and is ignored; the row's own derivation
+///    ([`repository_ref_for`]: status pin → spec pin → owner ref) answers, or
+///    [`ValidationError::SnapshotRepositoryUnresolvable`] when it has none.
+/// 2. **Pin present** (`spec.repository`) — the pin wins, but it must still be
+///    a member of the policy's CURRENT repository set (compared by normalized
+///    [`repo_key`](crate::common::repo_key) against `policy_ns`); a pin the
+///    recipe no longer lists is the terminal
+///    [`ValidationError::SnapshotPinNotInPolicy`] ("the recipe was edited out
+///    from under this Snapshot's pin"), never a silent re-target.
+/// 3. **No pin, single-repo policy** — the policy's one `spec.repository`,
+///    verbatim (byte-identical to the pre-multi-repo behavior).
+/// 4. **No pin, multi-repo policy** —
+///    [`ValidationError::MultiRepoSnapshotUnpinned`]: the controller-side
+///    backstop of the admission rule; repository #1 is never guessed.
+///
+/// A malformed policy (neither/both repository shapes) surfaces as its
+/// [`ValidationError::PolicyRepositoryExactlyOne`].
+pub fn effective_repository_ref(
+    snap: &Snapshot,
+    policy: &crate::snapshot_policy::SnapshotPolicySpec,
+    policy_ns: &str,
+) -> Result<RepositoryRef, crate::error::ValidationError> {
+    use crate::common::repo_key;
+    use crate::snapshot_policy::{PolicyRepositories, policy_repositories};
+    use kube::ResourceExt;
+
+    if snap.spec.policy_ref.is_none() {
+        return repository_ref_for(snap).ok_or_else(|| {
+            crate::error::ValidationError::SnapshotRepositoryUnresolvable {
+                snapshot: snap.name_any(),
+            }
+        });
+    }
+    let repos = policy_repositories(policy)?;
+    if let Some(pin) = snap.spec.repository.as_ref() {
+        // The pin was stamped NORMALIZED at mint, so keying it against the
+        // policy's namespace is stable; the members normalize against the same
+        // namespace the policy resolves them in.
+        let pin_key = repo_key(pin, policy_ns);
+        let members: Vec<&RepositoryRef> = match repos {
+            PolicyRepositories::Single(r) => vec![r],
+            PolicyRepositories::Multi(rs) => rs.iter().collect(),
+        };
+        return match members.iter().find(|m| repo_key(m, policy_ns) == pin_key) {
+            Some(_) => Ok(pin.clone()),
+            None => Err(crate::error::ValidationError::SnapshotPinNotInPolicy {
+                pin: pin_key,
+                policy: snap
+                    .spec
+                    .policy_ref
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+                valid: members
+                    .iter()
+                    .map(|m| repo_key(m, policy_ns))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        };
+    }
+    match repos {
+        PolicyRepositories::Single(r) => Ok(r.clone()),
+        PolicyRepositories::Multi(_) => {
+            Err(crate::error::ValidationError::MultiRepoSnapshotUnpinned {
+                policy: snap
+                    .spec
+                    .policy_ref
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,17 +909,45 @@ mod tests {
 
     #[test]
     fn origin_label_value_matches_the_serde_encoding() {
-        for origin in [
+        // Hard-coded ALL-variants array: adding a variant without classifying
+        // it here fails the length check, and the serde/label/parse trio must
+        // agree byte-for-byte for every variant.
+        let all = [
             Origin::Scheduled,
             Origin::Manual,
             Origin::Discovered,
             Origin::Adopted,
-        ] {
+            Origin::Replicated,
+        ];
+        assert_eq!(Origin::ALL, all, "Origin::ALL must list every variant");
+        for origin in all {
             assert_eq!(
                 serde_json::to_value(origin).unwrap(),
                 origin.label_value(),
                 "{origin:?}"
             );
+        }
+    }
+
+    #[test]
+    fn origin_parse_is_the_exact_inverse_of_label_value() {
+        for origin in [
+            Origin::Scheduled,
+            Origin::Manual,
+            Origin::Discovered,
+            Origin::Adopted,
+            Origin::Replicated,
+        ] {
+            assert_eq!(
+                Origin::parse(origin.label_value()),
+                Some(origin),
+                "{origin:?}"
+            );
+        }
+        // Unknown strings never resolve — in particular never to Manual, the
+        // pre-parse default that would mint a backup Job for a foreign row.
+        for garbage in ["", "Manual", "SCHEDULED", "replicated ", "garbage"] {
+            assert_eq!(Origin::parse(garbage), None, "{garbage:?}");
         }
     }
 
@@ -751,6 +987,175 @@ mod tests {
             .collect();
         // `Deleting` stays here on purpose: a wedged finalizer is in-flight work.
         assert_eq!(in_flight, ["Pending", "Running", "Deleting"]);
+    }
+
+    /// The 5-way contract of [`effective_repository_ref`] — the single
+    /// launch/deletion/pin/preflight repository decision (multi-repo fan-out,
+    /// #368). Specs are constructed directly, the same shapes admission
+    /// accepts now that the M7 feature gate is lifted.
+    mod effective_repository {
+        use super::super::effective_repository_ref;
+        use crate::error::ValidationError;
+        use crate::{Snapshot, SnapshotPolicySpec};
+
+        fn snap(v: serde_json::Value) -> Snapshot {
+            serde_json::from_value(v).expect("snapshot fixture")
+        }
+
+        fn policy(v: serde_json::Value) -> SnapshotPolicySpec {
+            serde_json::from_value(v).expect("policy fixture")
+        }
+
+        fn multi_policy() -> SnapshotPolicySpec {
+            policy(serde_json::json!({
+                "repositories": [
+                    { "kind": "Repository", "name": "a" },
+                    { "kind": "ClusterRepository", "name": "b" },
+                ],
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }))
+        }
+
+        #[test]
+        fn no_policy_ref_short_circuits_to_the_rows_own_derivation() {
+            // A replication copy CR: no policyRef, spec pin present. The policy
+            // argument (a multi-repo recipe that does NOT list the pin) is
+            // ignored — it is not this row's recipe.
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "copy", "namespace": "media" },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            }));
+            let r = effective_repository_ref(&s, &multi_policy(), "media").unwrap();
+            assert_eq!(r.name, "offsite");
+
+            // …and a bare row with nothing to derive from is a NAMED error,
+            // never a guess.
+            let bare = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "bare", "namespace": "media" },
+                "spec": {}
+            }));
+            assert!(matches!(
+                effective_repository_ref(&bare, &multi_policy(), "media").unwrap_err(),
+                ValidationError::SnapshotRepositoryUnresolvable { snapshot } if snapshot == "bare"
+            ));
+        }
+
+        #[test]
+        fn pin_that_is_a_member_wins() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    // Normalized pin: the Repository member resolves to
+                    // media/a, and so does this explicit-namespace pin.
+                    "repository": { "kind": "Repository", "name": "a", "namespace": "media" }
+                }
+            }));
+            let r = effective_repository_ref(&s, &multi_policy(), "media").unwrap();
+            assert_eq!(r.name, "a");
+            assert_eq!(r.namespace.as_deref(), Some("media"));
+        }
+
+        #[test]
+        fn pin_edited_out_of_the_policy_is_terminal() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "gone", "namespace": "media" }
+                }
+            }));
+            let err = effective_repository_ref(&s, &multi_policy(), "media").unwrap_err();
+            match err {
+                ValidationError::SnapshotPinNotInPolicy { pin, policy, valid } => {
+                    assert_eq!(pin, "Repository/media/gone");
+                    assert_eq!(policy, "pol");
+                    assert_eq!(valid, "Repository/media/a, ClusterRepository/b");
+                }
+                other => panic!("expected SnapshotPinNotInPolicy, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn unpinned_single_repo_child_uses_the_single_ref() {
+            let single = policy(serde_json::json!({
+                "repository": { "kind": "Repository", "name": "r" },
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }));
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "policyRef": { "name": "pol" } }
+            }));
+            // Verbatim — byte-identical to the pre-multi-repo behavior (no
+            // namespace materialized that the spec didn't carry).
+            let r = effective_repository_ref(&s, &single, "media").unwrap();
+            assert_eq!(r.name, "r");
+            assert_eq!(r.namespace, None);
+        }
+
+        #[test]
+        fn unpinned_multi_repo_child_is_refused_never_guessed() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "policyRef": { "name": "pol" } }
+            }));
+            assert!(matches!(
+                effective_repository_ref(&s, &multi_policy(), "media").unwrap_err(),
+                ValidationError::MultiRepoSnapshotUnpinned { policy } if policy == "pol"
+            ));
+        }
+
+        #[test]
+        fn pin_against_a_single_repo_policy_still_checks_membership() {
+            // A multi→single edit that removed the pinned repo is the same
+            // "edited out from under the pin" terminal error, not a silent
+            // re-target onto the surviving repository.
+            let single = policy(serde_json::json!({
+                "repository": { "kind": "Repository", "name": "kept" },
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }));
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "removed", "namespace": "media" }
+                }
+            }));
+            assert!(matches!(
+                effective_repository_ref(&s, &single, "media").unwrap_err(),
+                ValidationError::SnapshotPinNotInPolicy { .. }
+            ));
+            // …while a pin that matches the single ref proceeds.
+            let matching = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "kept", "namespace": "media" }
+                }
+            }));
+            assert_eq!(
+                effective_repository_ref(&matching, &single, "media")
+                    .unwrap()
+                    .name,
+                "kept"
+            );
+        }
     }
 
     /// Regression for the inert "derived from source" contract (found by the
@@ -809,6 +1214,41 @@ mod tests {
         }
 
         #[test]
+        fn spec_pin_wins_over_owner_ref_but_loses_to_status() {
+            // Precedence: status.resolved.repository → spec.repository → ownerRef.
+            // A replication copy CR (or multi-repo fan-out child) carries the
+            // spec pin from CREATE, before any status exists…
+            let spec_only = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": {
+                    "name": "s", "namespace": "media",
+                    // A repository ownerRef that must NOT win over the spec pin.
+                    "ownerReferences": [{
+                        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                        "kind": "Repository", "name": "owner-repo", "uid": "u1"
+                    }]
+                },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            }));
+            let rref = repository_ref_for(&spec_only).expect("derived from spec");
+            assert_eq!(rref.kind, RepositoryKind::ClusterRepository);
+            assert_eq!(rref.name, "offsite");
+
+            // …and once the run-time status pin lands, it stays authoritative.
+            let with_status = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } },
+                "status": { "resolved": { "repository": { "kind": "Repository", "name": "nas" } } }
+            }));
+            let rref = repository_ref_for(&with_status).expect("derived from status");
+            assert_eq!(rref.kind, RepositoryKind::Repository);
+            assert_eq!(rref.name, "nas");
+        }
+
+        #[test]
         fn foreign_owners_and_bare_snapshots_derive_nothing() {
             // A non-kopiur owner (e.g. a Job) must not be mistaken for a repository.
             let s = snap(serde_json::json!({
@@ -864,8 +1304,36 @@ deletionPolicy: Delete
         let spec: SnapshotSpec = from_yaml("{}\n");
         assert!(spec.policy_ref.is_none());
         assert!(spec.deletion_policy.is_none());
+        assert!(spec.repository.is_none());
         // Empty spec serializes to an empty object (all fields skip).
         assert_eq!(serde_json::to_value(&spec).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn backup_spec_repository_pin_round_trips_and_absent_stays_absent() {
+        use crate::common::RepositoryKind;
+        // The mint-time pin a multi-repo fan-out child / replication copy CR
+        // carries (nothing stamps it yet — the field is decode/encode-ready).
+        let spec: SnapshotSpec =
+            from_yaml("repository: { kind: ClusterRepository, name: offsite }\n");
+        let pin = spec.repository.as_ref().expect("pin decoded");
+        assert_eq!(pin.kind, RepositoryKind::ClusterRepository);
+        assert_eq!(pin.name, "offsite");
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["repository"]["name"], "offsite");
+        let reparsed: SnapshotSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Legacy single-repo children stay byte-identical: absent is elided.
+        let bare: SnapshotSpec = from_yaml("policyRef: { name: postgres-data }\n");
+        assert!(bare.repository.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("repository")
+                .is_none(),
+            "absent repository pin must be elided"
+        );
     }
 
     #[test]
@@ -917,18 +1385,25 @@ onScheduleDelete: Delete
 
     #[test]
     fn pruned_by_parse_is_the_exact_inverse_of_annotation_value() {
-        for variant in [
+        let all = [
             PrunedBy::Retention,
             PrunedBy::FailedHistory,
             PrunedBy::PolicyCascade,
-        ] {
+            PrunedBy::ReplicationRetention,
+        ];
+        assert_eq!(PrunedBy::ALL, all, "PrunedBy::ALL must list every variant");
+        for variant in all {
             assert_eq!(
                 PrunedBy::parse(variant.annotation_value()),
                 Some(variant),
                 "{variant:?}"
             );
         }
+        // Unrecognized ⇒ None ⇒ the finalizer classifies the deletion EXTERNAL
+        // (breaker-relevant) — a missed parse arm here would silently invert a
+        // new operator prune into a breaker-held external wave.
         assert_eq!(PrunedBy::parse("garbage"), None);
+        assert_eq!(PrunedBy::parse("replication_retention"), None);
     }
 
     #[test]
@@ -943,6 +1418,10 @@ onScheduleDelete: Delete
             "discovered"
         );
         assert_eq!(serde_json::to_value(Origin::Adopted).unwrap(), "adopted");
+        assert_eq!(
+            serde_json::to_value(Origin::Replicated).unwrap(),
+            "replicated"
+        );
         assert_eq!(
             serde_json::to_value(SnapshotPhase::Succeeded).unwrap(),
             "Succeeded"
@@ -1038,6 +1517,48 @@ recorded:
         assert!(bare.recorded.is_none());
         let wire = serde_json::to_value(&bare).unwrap();
         assert!(wire.get("recorded").is_none());
+    }
+
+    #[test]
+    fn replicated_status_copied_from_roundtrips_and_absent_stays_absent() {
+        use crate::common::RepositoryKind;
+        // The lineage block a SnapshotReplication copy CR carries (migrate
+        // cannot stamp kopia tags, so provenance lives on the CR status).
+        let yaml = r#"
+phase: Succeeded
+origin: replicated
+snapshot:
+  kopiaSnapshotID: destid123
+  identity:
+    username: mydb
+    hostname: prod
+    sourcePath: /pvc/mydb
+copiedFrom:
+  repository: { kind: Repository, name: nas-primary, namespace: backups }
+  sourceManifestId: srcid456
+  startTime: 2026-08-01T02:00:00Z
+"#;
+        let status: SnapshotStatus = from_yaml(yaml);
+        let cf = status.copied_from.as_ref().expect("copiedFrom decoded");
+        assert_eq!(cf.repository.kind, RepositoryKind::Repository);
+        assert_eq!(cf.repository.name, "nas-primary");
+        assert_eq!(cf.source_manifest_id, "srcid456");
+        assert_eq!(cf.start_time, "2026-08-01T02:00:00Z");
+
+        // The exact camelCase wire keys — a drifting name is silently pruned
+        // by the apiserver's structural schema.
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["copiedFrom"]["sourceManifestId"], "srcid456");
+        assert_eq!(json["copiedFrom"]["startTime"], "2026-08-01T02:00:00Z");
+        assert_eq!(json["copiedFrom"]["repository"]["name"], "nas-primary");
+        let reparsed: SnapshotStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Every other origin: absent stays absent (no null/{} noise).
+        let bare: SnapshotStatus = from_yaml("phase: Succeeded\n");
+        assert!(bare.copied_from.is_none());
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(wire.get("copiedFrom").is_none());
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use kopiur_api::{
     ClusterRepositorySpec, MaintenanceSpec, RepositoryReplicationSpec, RepositorySpec, RestoreSpec,
-    SnapshotPolicySpec, SnapshotScheduleSpec, SnapshotSpec,
+    SnapshotPolicySpec, SnapshotReplicationSpec, SnapshotScheduleSpec, SnapshotSpec,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -101,6 +101,7 @@ fn all_examples_match_crd_field_shapes() {
                 "RepositoryReplication" => {
                     check_spec::<RepositoryReplicationSpec>(kind, &json, &file)
                 }
+                "SnapshotReplication" => check_spec::<SnapshotReplicationSpec>(kind, &json, &file),
                 other => panic!("{file}: unexpected kopiur.home-operations.com kind {other}"),
             }
         }

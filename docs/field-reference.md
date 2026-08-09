@@ -3,7 +3,7 @@
      Drift-gated by `mise run gen-check`. -->
 # Field reference
 
-Every spec and status field of all eight CRDs in `kopiur.home-operations.com/v1alpha1`, with its type, schema default, and a one-line meaning taken straight from the Rust doc comments.
+Every spec and status field of all nine CRDs in `kopiur.home-operations.com/v1alpha1`, with its type, schema default, and a one-line meaning taken straight from the Rust doc comments.
 
 This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen-docs` (run `mise run gen`); it is drift-checked in CI, so it can never go stale against the shipped CRDs. To change an entry, edit the doc comment on the field in `crates/api` — not this file. For the task-oriented explanations (mental model, which knobs you actually change), see the per-CRD pages under [CRD reference](reference/crds/index.md).
 
@@ -1445,13 +1445,14 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 ## SnapshotPolicy { #snapshotpolicy }
 
-**Scope:** Namespaced · **Short names:** `kopiasp` · **Print columns:** `Repository`, `Last-Snapshot`, `Last-Verified`, `Suspended`, `Age`
+**Scope:** Namespaced · **Short names:** `kopiasp` · **Print columns:** `Repository`, `Repositories`, `Last-Snapshot`, `Last-Verified`, `Suspended`, `Age`
 
 ### `spec` { #snapshotpolicy-spec }
 
+Externally tagged — set **exactly one** of: `repositories` · `repository`.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `repository` | [object](#snapshotpolicy-spec-repository) | **required** | Discriminated reference to a `Repository` or `ClusterRepository`. |
 | `adoption` | enum: Adopt \| Ignore | — | Whether a discovered snapshot whose resolved identity matches a live `SnapshotPolicy` is automatically adopted — re-attached (stamped with that policy's config label, `status.origin` flipped to `Adopted`) so GFS retention governs it and eventually prunes it, instead of it sitting in the catalog forever as an immortal `discovered` row. |
 | `compression` | [object](#snapshotpolicy-spec-compression) | — | Compression algorithm + per-extension opt-outs. |
 | `copyMethod` | enum: Snapshot \| Clone \| Direct | `Snapshot` | How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`. |
@@ -1466,6 +1467,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `identity` | [object](#snapshotpolicy-spec-identity) | — | Identity overrides — what kopia records as `username@hostname:path`. |
 | `mover` | [object](#snapshotpolicy-spec-mover) | — | Per-recipe mover overrides (resources, cache, security context). |
 | `preflight` | [object](#snapshotpolicy-spec-preflight) | — | Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒ no preflight). A failing check holds the `Snapshot` in `Pending` (`PreflightFailed`) and, after `timeout`, fails it. |
+| `repositories` | [][object](#snapshotpolicy-spec-repositories) | —<br><sub>minItems 1; maxItems 8</sub> | Multi-repository fan-out: every listed `Repository`/`ClusterRepository` receives its own independent backup of each source — one `Snapshot` CR + one mover Job per (source, repository) pair, so the captures are separate kopia snapshots, not copies of one another. Identity resolves per-repo under that repository's `identityDefaults`. Mutually exclusive with `repository` (exactly one of the two is set) AND with `hooks`: with N concurrent children the first finisher would run the thaw hook while the other N-1 movers still read — use a single-repo policy plus a `SnapshotReplication` when hooks are needed for a second target. |
+| `repository` | [object](#snapshotpolicy-spec-repository) | — | Discriminated reference to a `Repository` or `ClusterRepository`. Mutually exclusive with `repositories` (exactly one of the two is set). |
 | `retention` | [object](#snapshotpolicy-spec-retention) | — | GFS retention, enforced by the operator pruning `Snapshot` CRs. |
 | `sources` | [][object](#snapshotpolicy-spec-sources) | —<br><sub>maxItems 100</sub> | What to back up (at least one source; webhook-enforced). |
 | `staging` | [object](#snapshotpolicy-spec-staging) | — | Staging knobs for `copyMethod: Snapshot`/`Clone` (e.g. how long to wait for the CSI capture to become ready before failing the backup). |
@@ -1473,14 +1476,6 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `upload` | [object](#snapshotpolicy-spec-upload) | — | Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`). |
 | `verification` | [object](#snapshotpolicy-spec-verification) | — | First-class backup verification; opt-in (absent ⇒ no verification runs). |
 | `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. Absent or empty both mean auto-select the default class for the source PVC's CSI driver, so a GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset. |
-
-#### `spec.repository` { #snapshotpolicy-spec-repository }
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
-| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
-| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `spec.compression` { #snapshotpolicy-spec-compression }
 
@@ -1684,6 +1679,22 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `name` | string | **required**<br><sub>minLength 1; maxLength 63</sub> | Stable identifier surfaced in the `Snapshot`'s status when this check blocks (e.g. `maintenance-fresh`). Unique within the policy. |
 | `message` | string | — | Optional human message surfaced alongside the check name when it blocks. |
 
+#### `spec.repositories[]` { #snapshotpolicy-spec-repositories }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+#### `spec.repository` { #snapshotpolicy-spec-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
 #### `spec.retention` { #snapshotpolicy-spec-retention }
 
 | Field | Type | Default | Description |
@@ -1802,10 +1813,13 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `adoption` | [object](#snapshotpolicy-status-adoption) | — | Summary of automatic adoption of discovered snapshots into this recipe. |
 | `conditions` | [][object](#snapshotpolicy-status-conditions) | — | Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`). |
 | `lastSuccessfulSnapshot` | string | — | RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe. |
-| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). Single-repo: stamped directly by the verify mover. Multi-repo: computed by the controller as the MINIMUM `lastVerified` across the CURRENT repositories ("everything is verified as of T"), absent until every current repository has verified at least once. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
+| `repositorySummary` | string | — | Human-readable summary of the policy's repository target(s) for the `Repositories` print column: the comma-joined repository names (the one name for the single-repo shape), capped near a kubectl column width with a `+N` overflow marker. Written by the controller. |
 | `resolved` | [object](#snapshotpolicy-status-resolved) | — | What would be passed to kopia — pinned at admission. |
 | `retention` | [object](#snapshotpolicy-status-retention) | — | Summary of GFS retention pruning against this config's `Snapshot` CRs. |
+| `verification` | [][object](#snapshotpolicy-status-verification) | — | Per-repository verification records for a multi-repository policy (#368): one entry per CURRENT `spec.repositories` member, maintained by the controller (single writer — entries for repositories no longer in the spec are pruned). Empty (elided) for the single-repo shape, whose wire stays byte-identical. |
+| `verificationStamps` | map[string]string | — | Internal write channel for per-repository verification (#368): RFC3339 markers keyed by the normalized repository key (`repo_key`). Each verify mover merge-patches ONLY its own key — a JSON merge patch merges map keys, so two concurrent per-repo verifies can never clobber one another (a Vec would be replaced wholesale). The controller folds these into `verification` on its next pass and prunes keys for repositories no longer in the spec. Never written for the single-repo shape. |
 
 #### `status.adoption` { #snapshotpolicy-status-adoption }
 
@@ -1834,9 +1848,33 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `identity` | [object](#snapshotpolicy-status-resolved-identity) | — | The resolved `username@hostname` identity. |
+| `repositories` | [][object](#snapshotpolicy-status-resolved-repositories) | — | Per-repository resolution for a MULTI-repository policy (`spec.repositories`): one entry per member, each carrying the identity resolved under THAT repository's `identityDefaults` (the unit of identity is the `(repository, identity)` pair — N members means N independent kopia lineages). Empty — and elided from the wire — for the classic single-repo shape, whose resolution stays in the top-level `identity`/`sources` fields exactly as before this field existed. |
 | `sources` | [][object](#snapshotpolicy-status-resolved-sources) | — | The concrete PVCs + source paths after selector expansion. |
 
 ##### `status.resolved.identity` { #snapshotpolicy-status-resolved-identity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `hostname` | string | **required** | The final `hostname` kopia records, fixed at admission. |
+| `username` | string | **required** | The final `username` kopia records, fixed at admission. |
+| `sourcePath` | string | — | The resolved snapshot source path, when applicable (`username@hostname:path`). |
+
+##### `status.resolved.repositories[]` { #snapshotpolicy-status-resolved-repositories }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `repository` | [object](#snapshotpolicy-status-resolved-repositories-repository) | **required** | The member repository this entry resolves for (by value, as listed in `spec.repositories`). |
+| `identity` | [object](#snapshotpolicy-status-resolved-repositories-identity) | — | The `username@hostname` identity resolved under this repository's `identityDefaults`; absent when it could not be resolved (the guard treats an absent baseline as "no baseline" and degrades to allow for that member only). |
+
+###### `status.resolved.repositories[].repository` { #snapshotpolicy-status-resolved-repositories-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+###### `status.resolved.repositories[].identity` { #snapshotpolicy-status-resolved-repositories-identity }
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -1859,6 +1897,21 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `lastPruneAt` | string | — | RFC3339 timestamp of the last prune pass. |
 | `lastPruneDeleted` | integer | — | Number of `Snapshot` CRs deleted by the last prune pass. |
 
+#### `status.verification[]` { #snapshotpolicy-status-verification }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `repository` | [object](#snapshotpolicy-status-verification-repository) | **required** | The repository this record covers, normalized (`normalized_repository_ref`) so it re-resolves from anywhere. |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier) against THIS repository; absent until its first successful verify. |
+
+##### `status.verification[].repository` { #snapshotpolicy-status-verification-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
 ---
 
 ## Snapshot { #snapshot }
@@ -1875,6 +1928,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
+| `repository` | [object](#snapshot-spec-repository) | — | The ONE repository this `Snapshot` targets, pinned by value at mint time. Stamped by a multi-repository `SnapshotPolicy` fan-out (each child covers exactly one member of the policy's repository set) and by `SnapshotReplication` copy CRs (the destination repository). Absent for the legacy single-repository case, where the policy's own `spec.repository` (or, for catalog rows, the owning repository CR) is the answer — an absent pin resolves exactly as before this field existed, so pre-feature `Snapshot`s are untouched. |
 | `source` | [object](#snapshot-spec-source) | — | The ONE concrete source this `Snapshot` covers, when `policyRef` names a recipe whose `sources[]` expands to many — i.e. a `pvcSelector`.<br>Stamped by whoever minted the CR: a `SnapshotSchedule` fire, or `kubectl kopiur snapshot now`. Absent for the ordinary single-source case, where the policy's own `sources0` is the target.<br>Absent against a *selector* policy is refused rather than guessed. The operator must never pick a PVC on the user's behalf: silently backing up one arbitrary volume out of N looks exactly like success. |
 | `tags` | map[string]string | — | Free-form tags attached to the kopia snapshot manifest itself (`snapshot create --tags`), e.g. `reason: pre-upgrade` — durable in the repository, independent of this CR. Keys must be non-empty, colon-free (kopia splits on the first colon), and must not start with the reserved `kopiur` prefix; at most 10 tags, keys ≤ 63 bytes, values ≤ 256 bytes (webhook-enforced). |
 
@@ -1892,6 +1946,14 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the referenced `SnapshotPolicy`. |
 | `namespace` | string | — | Namespace of the `SnapshotPolicy`; absent = same namespace as the referrer. |
+
+#### `spec.repository` { #snapshot-spec-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `spec.source` { #snapshot-spec-source }
 
@@ -1929,12 +1991,13 @@ Externally tagged — set **exactly one** of: `pvc`.
 | --- | --- | --- | --- |
 | `cleanup` | [object](#snapshot-status-cleanup) | — | Post-run cleanup bookkeeping, so each cleanup runs at most once per Snapshot. |
 | `conditions` | [][object](#snapshot-status-conditions) | — | Standard Kubernetes conditions (e.g. `SourcesQuiesced`, `SnapshotCreated`). |
+| `copiedFrom` | [object](#snapshot-status-copiedfrom) | — | Lineage for `origin: replicated` rows: the source repository, source manifest id, and `startTime` the copy was migrated from. Written by the `SnapshotReplication` mover in the same atomic PATCH as `status.snapshot`; absent on every other origin. See `CopiedFrom` for why this lives on the CR rather than as kopia tags. |
 | `failure` | [object](#snapshot-status-failure) | — | Structured terminal-failure detail (kopia error class, stderr tail, retry hint). |
 | `hooks` | [object](#snapshot-status-hooks) | — | Hook-execution bookkeeping so each hook list runs exactly once per Snapshot. |
 | `job` | [object](#snapshot-status-job) | — | The mover Job backing this run; absent for discovered. |
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
-| `origin` | enum: scheduled \| manual \| discovered \| adopted | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
+| `origin` | enum: scheduled \| manual \| discovered \| adopted \| replicated | — | How a `Snapshot` came to exist. Canonical value mirrored from the `kopiur.home-operations.com/origin` label. Origin drives the deletion-policy default: `discovered` backups are forced to `Retain` because the operator did not create those snapshots. |
 | `phase` | enum: Pending \| Running \| Succeeded \| Failed \| Deleting \| Discovered \| Unchanged | — | Lifecycle phase of a `Snapshot`. |
 | `pinned` | boolean | — | The observed kopia-side pin state: `Some(true)` if pinned, `Some(false)` if unpinned, `None` before any pin reconcile. |
 | `preflightSince` | string | — | RFC 3339 timestamp of the first reconcile where the repository was `Ready` but a `spec.preflight` check was failing. The one-shot anchor for the preflight `timeout` deadline (so the budget covers preflight only, not the earlier repository-not-Ready wait). Cleared once every preflight check passes, so a later failing episode gets a fresh budget rather than a stale anchor. |
@@ -1961,6 +2024,22 @@ Externally tagged — set **exactly one** of: `pvc`.
 | `status` | string | **required** | status of the condition, one of True, False, Unknown. |
 | `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
 | `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+#### `status.copiedFrom` { #snapshot-status-copiedfrom }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `repository` | [object](#snapshot-status-copiedfrom-repository) | **required** | The SOURCE repository the snapshot was migrated from (the `SnapshotReplication`'s `sourceRef`, resolved at run time). |
+| `sourceManifestId` | string | **required** | The kopia manifest id the snapshot had in the SOURCE repository. Migrate assigns a NEW manifest id on the destination (`status.snapshot.kopiaSnapshotID`); this is the old one, kept for cross-repository correlation. |
+| `startTime` | string | **required** | The snapshot's RFC3339 `startTime` — preserved verbatim by migrate and the key (together with the identity triple) both idempotent re-migration and `pruning: mirrorSource` correlate source and destination rows on. |
+
+##### `status.copiedFrom.repository` { #snapshot-status-copiedfrom-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `status.failure` { #snapshot-status-failure }
 
@@ -2987,3 +3066,187 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `status` | string | **required** | status of the condition, one of True, False, Unknown. |
 | `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
 | `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+---
+
+## SnapshotReplication { #snapshotreplication }
+
+**Scope:** Namespaced · **Short names:** `kopiasrepl` · **Print columns:** `Source`, `Destination`, `Schedule`, `Phase`, `Last`, `Age`
+
+### `spec` { #snapshotreplication-spec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destinationRef` | [object](#snapshotreplication-spec-destinationref) | **required** | The `Repository` or `ClusterRepository` snapshots are copied INTO. A real repository CR with its own password and format (unlike a `RepositoryReplication` destination, which is a bare backend reusing the source's password). Must not resolve to the same repository as `sourceRef` (webhook-enforced structurally; the shared validator catches the literal same-ref case at admission). |
+| `schedule` | [object](#snapshotreplication-spec-schedule) | **required** | Cron and deterministic jitter for the replication runs. |
+| `sourceRef` | [object](#snapshotreplication-spec-sourceref) | **required** | The `Repository` or `ClusterRepository` snapshots are copied FROM. Opened read-only by the replication mover — a replication never writes to its source. |
+| `credentialProjection` | [object](#snapshotreplication-spec-credentialprojection) | — | Opt-in projection of BOTH repositories' credential Secrets into the mover Job's namespace (required when the destination is a `ClusterRepository` whose Secrets live elsewhere). |
+| `migrate` | [object](#snapshotreplication-spec-migrate) | — | Tuning for the underlying `kopia snapshot migrate` invocation. Absent: sequential copy, and NO policy copying (see `PolicyCopyMode`). |
+| `mover` | [object](#snapshotreplication-spec-mover) | — | Mover (Job pod) overrides for the replication run. |
+| `pruning` | [union](#snapshotreplication-spec-pruning) | — | What happens to already-replicated copies at the destination on later runs. Absent = `none`: copies accumulate forever and — like every mode here — **survive deletion of this CR** (copy `Snapshot` CRs carry no ownerReference to it). Pruning only ever considers snapshots this CR replicated (labeled at birth); it never touches the destination's own directly-written snapshots. |
+| `selection` | [object](#snapshotreplication-spec-selection) | — | Which snapshots to copy. Absent: every identity in the source repository, full history (`kopia snapshot migrate --all`). |
+| `suspend` | boolean | — | Pause this replication; a suspended replication runs no copies (default `false`). |
+
+#### `spec.destinationRef` { #snapshotreplication-spec-destinationref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+#### `spec.schedule` { #snapshotreplication-spec-schedule }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cron` | string | **required** | The cron expression, parsed by `croner`; may contain an `H` placeholder for deterministic jitter. |
+| `jitter` | string | — | Optional deterministic jitter window as a Go-style duration string (e.g. `30m`). |
+| `timezone` | string | — | IANA timezone the cron is evaluated in (e.g. `America/Chicago`); absent uses the enclosing schedule's timezone, else the controller default (UTC). |
+
+#### `spec.sourceRef` { #snapshotreplication-spec-sourceref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+#### `spec.credentialProjection` { #snapshotreplication-spec-credentialprojection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default. |
+
+#### `spec.migrate` { #snapshotreplication-spec-migrate }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
+| `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether kopia **policies** attached to the copied sources are also copied to the destination. Defaults to `PolicyCopyMode::None`. |
+
+#### `spec.mover` { #snapshotreplication-spec-mover }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cache` | [object](#snapshotreplication-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
+| `inheritSecurityContextFrom` | [union](#snapshotreplication-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
+| `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
+| `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
+| `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
+
+##### `spec.mover.cache` { #snapshotreplication-spec-mover-cache }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
+| `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+##### `spec.mover.inheritSecurityContextFrom` { #snapshotreplication-spec-mover-inheritsecuritycontextfrom }
+
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pvcConsumer` | [object](#snapshotreplication-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
+| `workloadSelector` | [object](#snapshotreplication-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
+
+###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #snapshotreplication-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `container` | string | — | Which container within the matched consumer pod to inherit from; absent uses the first/only. |
+
+###### `spec.mover.inheritSecurityContextFrom.workloadSelector` { #snapshotreplication-spec-mover-inheritsecuritycontextfrom-workloadselector }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `podSelector` | core/v1 LabelSelector | **required** | Label selector matching the workload pod(s) to read context/hooks from. |
+| `container` | string | — | Which container within the matched pod; absent uses the first/only container. |
+
+#### `spec.pruning` { #snapshotreplication-spec-pruning }
+
+Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `retention`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mirrorSource` | object | — | Mirror the source: delete a copy when its `(identity, startTime)` has vanished from the source repository. |
+| `none` | object | — | Never prune: copies accumulate until deleted by hand (the default when `spec.pruning` is absent). |
+| `retention` | [object](#snapshotreplication-spec-pruning-retention) | — | Keep copies under an independent GFS retention at the destination, regardless of what the source still holds. |
+
+##### `spec.pruning.retention` { #snapshotreplication-spec-pruning-retention }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `keepAnnual` | integer | —<br><sub>min 0</sub> | Keep one snapshot per year for the most-recent N years. |
+| `keepDaily` | integer | —<br><sub>min 0</sub> | Keep one snapshot per day for the most-recent N days. |
+| `keepHourly` | integer | —<br><sub>min 0</sub> | Keep one snapshot per hour for the most-recent N hours. |
+| `keepLatest` | integer | —<br><sub>min 0</sub> | Keep the N most-recent snapshots regardless of age. |
+| `keepMonthly` | integer | —<br><sub>min 0</sub> | Keep one snapshot per month for the most-recent N months. |
+| `keepWeekly` | integer | —<br><sub>min 0</sub> | Keep one snapshot per week for the most-recent N weeks. |
+
+#### `spec.selection` { #snapshotreplication-spec-selection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `identities` | [object](#snapshotreplication-spec-selection-identities) | — | Select source identities (`username@hostname:path`) to copy. Absent: all identities in the source repository. |
+| `latestOnly` | boolean | — | Copy only each selected identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false`. |
+
+##### `spec.selection.identities` { #snapshotreplication-spec-selection-identities }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `exclude` | [][object](#snapshotreplication-spec-selection-identities-exclude) | — | Identities to skip, applied after `include`. Exclude wins on overlap. |
+| `include` | [][object](#snapshotreplication-spec-selection-identities-include) | — | Identities to copy. Empty/absent: every identity in the source. |
+
+###### `spec.selection.identities.exclude[]` { #snapshotreplication-spec-selection-identities-exclude }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `hostname` | string | — | Glob for the `hostname` component; absent matches any hostname. |
+| `sourcePath` | string | — | Glob for the `sourcePath` component; absent matches any path. |
+| `username` | string | — | Glob for the `username` component; absent matches any username. |
+
+###### `spec.selection.identities.include[]` { #snapshotreplication-spec-selection-identities-include }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `hostname` | string | — | Glob for the `hostname` component; absent matches any hostname. |
+| `sourcePath` | string | — | Glob for the `sourcePath` component; absent matches any path. |
+| `username` | string | — | Glob for the `username` component; absent matches any username. |
+
+### `status` { #snapshotreplication-status }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `conditions` | [][object](#snapshotreplication-status-conditions) | — | Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`). |
+| `lastReplicated` | string | — | RFC3339 timestamp of the most recent successful replication run (also the scheduling anchor for the next slot). |
+| `lastRun` | [object](#snapshotreplication-status-lastrun) | — | Counters from the most recent run. |
+| `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection / kstatus. |
+| `phase` | enum: Pending \| Replicating \| Succeeded \| Failed \| Suspended | — | Lifecycle phase of a snapshot replication. |
+
+#### `status.conditions[]` { #snapshotreplication-status-conditions }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `lastTransitionTime` | string | **required** | lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable. |
+| `message` | string | **required** | message is a human readable message indicating details about the transition. This may be an empty string. |
+| `reason` | string | **required** | reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty. |
+| `status` | string | **required** | status of the condition, one of True, False, Unknown. |
+| `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
+| `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+#### `status.lastRun` { #snapshotreplication-status-lastrun }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `alreadyPresent` | integer | —<br><sub>min 0</sub> | Selected snapshots that were already present at the destination (skipped). |
+| `failed` | integer | —<br><sub>min 0</sub> | Selected snapshots that failed to copy (kopia migrate exits 0 on per-source failures; the mover's post-verify counts them here). |
+| `identitiesSelected` | integer | —<br><sub>min 0</sub> | Source identities the selector matched this run. |
+| `pruned` | integer | —<br><sub>min 0</sub> | Copies pruned this run per `spec.pruning`. |
+| `snapshotsCopied` | integer | —<br><sub>min 0</sub> | Snapshots newly copied to the destination this run. |

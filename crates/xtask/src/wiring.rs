@@ -204,6 +204,7 @@ pub fn schema_fields(prune: &Allowlist) -> Vec<Field> {
         kopiur_api::Restore::crd(),
         kopiur_api::Maintenance::crd(),
         kopiur_api::RepositoryReplication::crd(),
+        kopiur_api::SnapshotReplication::crd(),
     ];
     let mut out = Vec::new();
     for crd in &crds {

@@ -133,6 +133,34 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // the whole repo runs at uid/gid 3001 (bootstrap AND backup — kopia's 0600 control
     // files must share one owner), so it cannot share the restore shard's 65532 seed repo.
     "recrestore",
+    // SnapshotReplication (issue #368, crates/e2e/tests/snapshot_replication.rs):
+    // logical fs→fs replication. Each scenario needs its OWN source AND destination
+    // kopia repository so copy/prune/idempotency counts never leak between scenarios:
+    // full-history + different-password dest (`srepl-src`/`srepl-dst`), coexistence
+    // with direct backups at the destination (`srepl-coex-*`), selection + latestOnly
+    // + mirrorSource pruning (`srepl-sel-*`), and suspend (`srepl-susp-*`).
+    "srepl-src",
+    "srepl-dst",
+    "srepl-coex-src",
+    "srepl-coex-dst",
+    "srepl-sel-src",
+    "srepl-sel-dst",
+    "srepl-susp-src",
+    "srepl-susp-dst",
+    // SnapshotPolicy multi-repository fan-out (issue #368 Feature B,
+    // crates/e2e/tests/multi_repository.rs): every scenario needs TWO isolated
+    // repositories (the whole point is per-repo children/manifests), and the
+    // scenarios must not share repos with each other so per-repo snapshot
+    // counts (fan-out, keepLatest-per-repo, partial-progress, restore
+    // selection) never leak between them.
+    "mrepo-a",
+    "mrepo-b",
+    "mrepo-ret-a",
+    "mrepo-ret-b",
+    "mrepo-down-a",
+    "mrepo-down-b",
+    "mrepo-rest-a",
+    "mrepo-rest-b",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per

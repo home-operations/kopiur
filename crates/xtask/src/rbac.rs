@@ -40,6 +40,15 @@ const DEFAULT_NAMESPACE: &str = "kopiur-system";
 /// `kopiur-mover` ServiceAccount by a controller-minted RoleBinding; the SA and
 /// binding are created at runtime, so only the role itself is shipped here.
 const MOVER_CLUSTERROLE_NAME: &str = "kopiur-mover";
+/// The dedicated snapshot-replication mover role (issue #368). The replication
+/// mover creates and DELETES `Snapshot` CRs (copy-CR reconciliation + pruning),
+/// verbs the generic `kopiur-mover` role must NEVER hold: a compromised generic
+/// mover pod holding namespace-wide Snapshot delete could erase every backup
+/// record in its namespace. So those verbs live on this separate role, bound
+/// only to the equally dedicated `kopiur-snapshot-replication-mover`
+/// ServiceAccount the controller mints per namespace for snapshot-replication
+/// Jobs alone (`io::ensure_snapshot_replication_mover_identity`).
+const SNAPSHOT_REPLICATION_MOVER_NAME: &str = "kopiur-snapshot-replication-mover";
 /// Name of the leader-election Role + RoleBinding the cluster artifact pairs
 /// with its ClusterRole (the Lease is namespace-local; see [`leader_election_rules`]).
 const LEADER_ROLE_NAME: &str = "kopiur-leader-election";
@@ -61,6 +70,9 @@ const MOVER_STATUS_CRDS: &[&str] = &[
     // covered here.
     "snapshotpolicies",
     "repositoryreplications",
+    // The snapshot-replication mover PATCHes SnapshotReplication/status at the
+    // end of a run (issue #368).
+    "snapshotreplications",
 ];
 
 const KOPIA_GROUP: &str = "kopiur.home-operations.com";
@@ -74,7 +86,7 @@ const WEBHOOK_VALIDATING_CONFIG: &str = "kopiur-validating";
 const WEBHOOK_MUTATING_CONFIG: &str = "kopiur-mutating";
 const WEBHOOK_TLS_SECRET: &str = "kopiur-webhook-tls";
 
-/// All 8 CRD plurals in `kopiur.home-operations.com`. `clusterrepositories` is cluster-scoped.
+/// All 9 CRD plurals in `kopiur.home-operations.com`. `clusterrepositories` is cluster-scoped.
 const NAMESPACED_CRDS: &[&str] = &[
     "repositories",
     "snapshotpolicies",
@@ -83,6 +95,7 @@ const NAMESPACED_CRDS: &[&str] = &[
     "restores",
     "maintenances",
     "repositoryreplications",
+    "snapshotreplications",
 ];
 const CLUSTER_CRDS: &[&str] = &["clusterrepositories"];
 
@@ -346,6 +359,41 @@ fn mover_rules(cluster: bool) -> Vec<PolicyRule> {
     ]
 }
 
+/// The dedicated snapshot-replication mover's RBAC, verified against
+/// `crates/mover/src/replicate.rs` + `main.rs`:
+///
+/// - `snapshots` get/list/create/patch/delete: the copy-CR reconciliation
+///   LISTs the dest repo's rows, server-side-APPLIES each copy CR (SSA is a
+///   `patch`, plus `create` for a first write — m:217cd0be), and deletes
+///   discovered duplicates / pruned copies.
+/// - `snapshots/status` get/patch: the atomic per-copy status body.
+/// - `snapshotreplications/status` get/patch: the terminal run stamp
+///   (phase/lastReplicated/lastRun).
+/// - `configmaps` get/patch: parity with the generic mover role (the shared
+///   result-channel machinery), nothing broader.
+///
+/// **Deliberately NOT a widening of the generic mover role**: namespace-wide
+/// `snapshots` create/delete must never reach every mover pod — see
+/// [`SNAPSHOT_REPLICATION_MOVER_NAME`].
+fn snapshot_replication_mover_rules() -> Vec<PolicyRule> {
+    vec![
+        rule(
+            &[KOPIA_GROUP],
+            &["snapshots".into()],
+            &["get", "list", "create", "patch", "delete"],
+        ),
+        rule(
+            &[KOPIA_GROUP],
+            &[
+                "snapshots/status".into(),
+                "snapshotreplications/status".into(),
+            ],
+            &["get", "patch"],
+        ),
+        rule(&[""], &["configmaps".into()], &["get", "patch"]),
+    ]
+}
+
 /// Splice `apiVersion`/`kind` into a serialized k8s-openapi object and render
 /// it as a YAML document body (no leading header).
 fn render<T: Serialize + Resource>(obj: &T) -> Result<String> {
@@ -561,7 +609,15 @@ fn mover_cluster_artifact() -> Result<Artifact> {
         rules: Some(mover_rules(true)),
         ..Default::default()
     };
-    let content = document(&[render(&clusterrole)?]);
+    // The dedicated snapshot-replication mover role ships alongside (same
+    // runtime minting model: SA + RoleBinding created per namespace by the
+    // controller, only for snapshot-replication Jobs).
+    let srepl_clusterrole = ClusterRole {
+        metadata: metadata(SNAPSHOT_REPLICATION_MOVER_NAME, None),
+        rules: Some(snapshot_replication_mover_rules()),
+        ..Default::default()
+    };
+    let content = document(&[render(&clusterrole)?, render(&srepl_clusterrole)?]);
     Ok(Artifact::new(
         "rbac/mover-clusterrole.yaml".to_string(),
         content,
@@ -578,7 +634,14 @@ fn mover_namespaced_artifact() -> Result<Artifact> {
         metadata: metadata(MOVER_ROLE_NAME, Some(DEFAULT_NAMESPACE)),
         rules: Some(mover_rules(false)),
     };
-    let content = document(&[render(&role)?]);
+    // Same rules in both flavours: everything the snapshot-replication mover
+    // touches is namespaced, so no `clusterrepositories/status`-style
+    // escalation-prevention carve-out applies here.
+    let srepl_role = Role {
+        metadata: metadata(SNAPSHOT_REPLICATION_MOVER_NAME, Some(DEFAULT_NAMESPACE)),
+        rules: Some(snapshot_replication_mover_rules()),
+    };
+    let content = document(&[render(&role)?, render(&srepl_role)?]);
     Ok(Artifact::new("rbac/mover-role.yaml".to_string(), content))
 }
 

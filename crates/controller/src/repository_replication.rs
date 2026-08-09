@@ -310,6 +310,14 @@ async fn spawn_replication_job(
     {
         return Err(Error::Validation(e.to_string()));
     }
+    if let Some(path) = kopiur_api::validate::replication_filesystem_mount_collision(
+        &repo.backend,
+        &repl.spec.destination,
+    ) {
+        return Err(Error::Validation(
+            kopiur_api::ValidationError::ReplicationMountPathCollision { path }.to_string(),
+        ));
+    }
     if let Err(e) = kopiur_api::validate::validate_replication_destination_secret_namespace(
         &repl.spec.destination,
         namespace,
@@ -411,6 +419,7 @@ async fn spawn_replication_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         cache_volume: Default::default(),
         scratch_volume: None,

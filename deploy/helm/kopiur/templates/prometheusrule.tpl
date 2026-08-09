@@ -15,6 +15,12 @@ spec:
     - name: kopiur.rules
       rules:
         - alert: KopiurBackupConsecutiveFailures
+          # Multi-repo fan-out (#368): the gauge carries an extra `repository`
+          # label on repo-pinned rows only, so a multi-repo policy alerts PER
+          # REPOSITORY (a permanently-failing repo B fires even while repo A's
+          # interleaved successes keep landing — the streaks are independent
+          # series). Single-repo series are unchanged. A bare vector match, so
+          # the repository label rides into the alert identity automatically.
           expr: kopiur_snapshot_consecutive_failures >= 3
           for: 15m
           labels:
@@ -46,6 +52,10 @@ spec:
           # new terminal runs), so the last-success age keeps growing until it
           # crosses the threshold. KopiurRepositoryBreakerOpen / KopiurSnapshotsGated
           # below explain the pause earlier; they do not replace this alert.
+          # The `unless` joins on `repository` too (#368): both sides carry the
+          # label only on repo-pinned (multi-repo) series and neither does on
+          # legacy series, so single-repo behavior is unchanged — while a
+          # never-succeeded repo B is NOT suppressed by repo A's success series.
           expr: >-
             (
               time() - kopiur_policy_last_backup_success_timestamp_seconds > {{ .Values.monitoring.prometheusRule.backupStaleAfterSeconds }}
@@ -53,7 +63,7 @@ spec:
             or
             (
               label_replace(kopiur_snapshot_consecutive_failures, "policy", "$1", "name", "(.*)") > 0
-              unless on (namespace, policy) kopiur_policy_last_backup_success_timestamp_seconds
+              unless on (namespace, policy, repository) kopiur_policy_last_backup_success_timestamp_seconds
             )
           for: 30m
           labels:
@@ -74,7 +84,12 @@ spec:
           # missed-alert direction is data-loss-shaped), while the converse
           # transient — a stale 0 against a fresh 1 — is evicted by scrape
           # staleness (~5m) before `for: 10m` completes, so it never pages.
-          expr: min by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 0
+          # `repository` in the by-clause (#368): legacy series lack the label
+          # (Prometheus drops the empty group label, so their alert identity is
+          # byte-identical), while a multi-repo policy alerts per repository —
+          # repo B's failed latest fires its own alert naming the repo instead
+          # of being min-merged into one flat policy bit.
+          expr: min by (namespace, policy, repository) (kopiur_snapshotpolicy_last_backup_success) == 0
           for: 10m
           labels:
             severity: warning
@@ -107,6 +122,11 @@ spec:
           # min-by demands unanimity across scrape targets before suppressing;
           # the converse stale-0 transient is evicted by scrape staleness (~5m)
           # before `for: 10m` completes.
+          # `repository` is deliberately NOT in this join (#368): the phase
+          # series on the LHS has no repository label, and min-by over the now
+          # per-repo health series means a failed CR is suppressed only when
+          # EVERY repository's latest backup succeeded — the conservative
+          # direction (a failing repo B keeps its failed CRs alerting).
           expr: >-
             max by (namespace, name, policy) (kopiur_resource_phase{kind="Snapshot", phase="Failed"}) == 1
             unless on (namespace, policy) (min by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success) == 1)

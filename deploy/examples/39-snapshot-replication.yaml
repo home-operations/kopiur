@@ -1,0 +1,124 @@
+# Example 39 — Snapshot replication (copy snapshots between repositories)
+#
+# A SnapshotReplication copies snapshot MANIFESTS (and the content they
+# reference) from one repository into another on a schedule, wrapping
+# `kopia snapshot migrate`. Contrast with example 19's RepositoryReplication,
+# which mirrors a repository's BLOBS verbatim: here source and destination are
+# BOTH real repository CRs with their OWN passwords and formats, and a selector
+# picks which kopia identities (optionally only their latest snapshots) get
+# copied — e.g. consolidating several team repositories into one off-site
+# repository, or seeding a new repository from an old one.
+#
+# Each copied snapshot appears as a `Snapshot` CR (origin: replicated) in this
+# CR's namespace, with NO ownerReference back to this CR: deleting the
+# SnapshotReplication never deletes the copies. Only `spec.pruning` (or deleting
+# the copy Snapshot CRs yourself) removes replicated data — and pruning only
+# ever considers snapshots THIS replication created, never the destination's own
+# directly-written snapshots.
+#
+# Field shapes verified against crates/api: sourceRef/destinationRef are
+# RepositoryRefs (kind defaults to Repository); selection matchers glob per
+# identity component (`*`/`?`, anchored); pruning is exactly one of
+# none / mirrorSource / retention.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section
+# markers (the docs pull the SnapshotReplication CR on its own). Plain YAML
+# comments — the file stays `kubectl apply -f`-able as-is.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: offsite-repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  # Credentials for the DESTINATION repository's backend…
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # …and its OWN encryption password — unlike RepositoryReplication, the
+  # destination is an independent repository that does NOT reuse the source's
+  # password.
+  KOPIA_PASSWORD: "a-long-random-password-distinct-from-the-source"
+---
+# The destination: a real Repository CR (an off-site S3 bucket). A cluster-wide
+# shared ClusterRepository works here too (`destinationRef.kind:
+# ClusterRepository`) — that is the flagship consolidation setup.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: offsite-s3
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: offsite-snapshots
+      prefix: prod/
+      region: us-west-2
+      auth:
+        secretRef:
+          name: offsite-repo-creds
+  encryption:
+    passwordSecretRef:
+      name: offsite-repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+# --8<-- [start:snapshot-replication]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotReplication
+metadata:
+  name: nas-primary-to-offsite
+  namespace: billing
+spec:
+  # Copy FROM this repository (must already exist — see example 01). Opened
+  # read-only; a replication never writes to its source.
+  sourceRef:
+    kind: Repository
+    name: nas-primary
+  # Copy INTO this repository (the Repository above). Must be a different
+  # repository — replicating a repository into itself is rejected at admission.
+  destinationRef:
+    kind: Repository
+    name: offsite-s3
+  schedule:
+    cron: "0 6 * * *" # nightly, after the 02:xx backups have landed
+    jitter: 30m
+  # Which snapshots to copy. Omit `selection` entirely to copy EVERY identity's
+  # full history (`kopia snapshot migrate --all`).
+  selection:
+    identities:
+      # Matchers glob per identity component (`*` any run, `?` one character,
+      # anchored to the whole component). Every SET component must match; an
+      # unset component matches anything. Exclude wins over include.
+      include:
+        - username: "pg-*" # all the postgres policies…
+      exclude:
+        - sourcePath: "/scratch/*" # …but never scratch paths
+    # true = only each identity's most recent snapshot (a cheap seed);
+    # false/omitted = full history.
+    latestOnly: false
+  migrate:
+    # Snapshots migrated concurrently (kopia default: 1, sequential). The main
+    # knob for large first runs.
+    parallel: 4
+    # Whether kopia POLICIES ride along: none (default — a Kopiur-managed
+    # destination keeps retention CR-driven), copy, or copyOverwrite.
+    policies: none
+  # What happens to already-replicated copies on later runs. Exactly one of:
+  #   none:         never prune (the default when `pruning` is omitted)
+  #   mirrorSource: delete a copy when its snapshot vanished from the source
+  #                 (a bulk source-side vanish is HELD by the destination
+  #                 repository's deletion breaker — ransomware at the source
+  #                 cannot empty the off-site copy in one wave)
+  #   retention:    independent GFS retention at the destination, regardless of
+  #                 what the source still holds
+  # Whatever the mode, copies SURVIVE deletion of this CR.
+  pruning:
+    retention:
+      keepDaily: 14
+      keepWeekly: 8
+      keepMonthly: 6
+  # Pause replication without deleting the CR.
+  suspend: false
+# --8<-- [end:snapshot-replication]

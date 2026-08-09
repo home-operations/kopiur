@@ -286,17 +286,103 @@ pub fn build_wi_rolebinding(
 /// `kopiur-mover-wi-<sa>`, truncating the SA component and appending a stable
 /// hash when the full name would overflow.
 pub fn wi_rolebinding_name(wi_sa: &str) -> String {
-    const PREFIX: &str = "kopiur-mover-wi-";
+    wi_rolebinding_named("kopiur-mover-wi-", wi_sa)
+}
+
+/// The [`wi_rolebinding_name`] scheme under an arbitrary prefix (shared with
+/// the snapshot-replication mover's distinct WI binding).
+fn wi_rolebinding_named(prefix: &str, wi_sa: &str) -> String {
     const MAX: usize = 253;
-    let budget = MAX - PREFIX.len();
+    let budget = MAX - prefix.len();
     if wi_sa.len() <= budget {
-        format!("{PREFIX}{wi_sa}")
+        format!("{prefix}{wi_sa}")
     } else {
         let hash = short_hash(wi_sa); // 8 hex chars
         let keep = budget.saturating_sub(hash.len() + 1); // room for "-<hash>"
         let trunc: String = wi_sa.chars().take(keep).collect();
-        format!("{PREFIX}{trunc}-{hash}")
+        format!("{prefix}{trunc}-{hash}")
     }
+}
+
+/// Derive the dedicated snapshot-replication mover role/ServiceAccount name
+/// from the configured generic mover role name (`ctx.mover_clusterrole`, the
+/// chart's `<fullname>-mover`). The default `kopiur-mover` yields
+/// `kopiur-snapshot-replication-mover` — the exact name `cargo xtask gen-rbac`
+/// ships and the Helm `kopiur.snapshotReplicationMoverName` helper renders, so
+/// the runtime RoleBinding always references the role the install actually
+/// carries. A custom role name without the `-mover` suffix gets a plain
+/// `-snapshot-replication` suffix (a deliberate, documented derivation — there
+/// is no separate config knob).
+pub fn snapshot_replication_mover_name(base: &str) -> String {
+    match base.strip_suffix("-mover") {
+        Some(stem) => format!("{stem}-snapshot-replication-mover"),
+        None => format!("{base}-snapshot-replication"),
+    }
+}
+
+/// Resolve the identity the **snapshot-replication** mover Job runs as and
+/// ensure its RBAC — the dedicated-SA sibling of [`ensure_mover_identity`].
+///
+/// This mover creates and DELETES `Snapshot` CRs (copy-CR reconciliation +
+/// pruning), verbs the generic `kopiur-mover` role must never hold: a
+/// compromised generic mover pod holding namespace-wide Snapshot delete could
+/// erase every backup record in the namespace. So this Job runs as a dedicated
+/// `…-snapshot-replication-mover` ServiceAccount bound to the equally dedicated
+/// role (shipped by `gen-rbac` / the chart), minted here per namespace exactly
+/// like the generic pair.
+///
+/// Workload-identity backends still win the SA choice (the cloud federation
+/// names the SA the pod must run as); the DEDICATED role is then bound to the
+/// user's SA under a distinct `kopiur-srepl-mover-wi-<sa>` binding name —
+/// RoleBinding `roleRef` is immutable, so reusing the generic
+/// `kopiur-mover-wi-<sa>` binding would 422 (or silently fight) whenever both
+/// movers share one WI ServiceAccount.
+pub async fn ensure_snapshot_replication_mover_identity(
+    client: &kube::Client,
+    ns: &str,
+    backends: &[&kopiur_api::backend::Backend],
+    mover_role_base: &str,
+    role_kind: &str,
+) -> Result<MoverRunIdentity> {
+    use kopiur_api::creds::{WorkloadIdentityCloud, backend_workload_identity};
+    let dedicated = snapshot_replication_mover_name(mover_role_base);
+    let wi: Vec<_> = backends
+        .iter()
+        .filter_map(|b| backend_workload_identity(b))
+        .collect();
+    let Some((first, first_cloud)) = wi.first() else {
+        ensure_mover_rbac(client, ns, &dedicated, role_kind, &dedicated).await?;
+        return Ok(MoverRunIdentity {
+            service_account: Some(dedicated),
+            azure_workload_identity: false,
+        });
+    };
+    let sa_name = first.service_account_name.clone();
+    let azure = wi
+        .iter()
+        .any(|(_, cloud)| *cloud == WorkloadIdentityCloud::Azure);
+    // Preflight: the SA must already exist (user-created, cloud-annotated) —
+    // same contract as `ensure_mover_identity`.
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+    if sa_api
+        .get_opt(&sa_name)
+        .await
+        .map_err(Error::Kube)?
+        .is_none()
+    {
+        return Err(Error::MissingDependency(
+            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud),
+        ));
+    }
+    let mut rb = build_mover_rolebinding(ns, &sa_name, role_kind, &dedicated);
+    rb.metadata.name = Some(wi_rolebinding_named("kopiur-srepl-mover-wi-", &sa_name));
+    let rb_name = rb.metadata.name.clone().unwrap_or_default();
+    let rb_api: Api<RoleBinding> = Api::namespaced(client.clone(), ns);
+    apply(&rb_api, &rb_name, &rb).await?;
+    Ok(MoverRunIdentity {
+        service_account: Some(sa_name),
+        azure_workload_identity: azure,
+    })
 }
 
 /// 8-hex-char content hash for name truncation (same idiom as the

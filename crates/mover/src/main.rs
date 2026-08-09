@@ -23,8 +23,8 @@ use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
 use kopiur_kopia::{
-    ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, SnapshotSource, filter_as_of,
-    pick_offset,
+    ConnectOptions, ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MigrateSources,
+    SnapshotMigrateOptions, SnapshotSource, filter_as_of, pick_offset,
 };
 use tracing::{error, info, warn};
 
@@ -35,18 +35,20 @@ use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
 use kopiur_mover::env::{RESULT_CONFIGMAP, WORK_SPEC_PATH};
 use kopiur_mover::error::{KopiaOp, MoverError, Result};
+use kopiur_mover::replicate as srepl;
 use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
-    StatusReporter, StatusUpdate, lease_blocked_body, maintenance_failed_body,
-    maintenance_ran_body, replicate_failed_body, replicate_ok_body, split_api_version,
+    SnapshotReplicationRunStats, StatusReporter, StatusUpdate, lease_blocked_body,
+    maintenance_failed_body, maintenance_ran_body, replicate_failed_body, replicate_ok_body,
+    snapshot_replicate_failed_body, snapshot_replicate_ok_body, split_api_version,
     verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, VerifyOp, VerifyTier,
-    maintenance_restamp_target,
+    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, VerifyOp,
+    VerifyTier, maintenance_restamp_target,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -240,6 +242,13 @@ async fn run(cli: &MoverCli) -> Result<()> {
             // Replicate connects to the source, then `repository sync-to` the
             // destination; PATCHes the RepositoryReplication `.status` (ADR-0005 §13(d)).
             Operation::Replicate(op) => run_replicate_flow(&client, &spec, op, &connect).await,
+            // SnapshotReplicate owns a DUAL connect lifecycle (source read-only
+            // + destination read-write under separate kopia configs) and builds
+            // its own clients, so the generic `client` is not used; PATCHes the
+            // SnapshotReplication `.status`.
+            Operation::SnapshotReplicate(op) => {
+                run_snapshot_replicate_flow(&spec, op, &connect, cli.kopia_binary()).await
+            }
             // BrowseSession owns its own (read-only) connect lifecycle and has
             // no status to PATCH — its targetRef names nothing the controller
             // owns; the CLI surfaces failures from the pod logs.
@@ -592,6 +601,11 @@ async fn run_operation(
         }
         Operation::BrowseSession(_) => {
             unreachable!("BrowseSession is handled by run_browse_session_flow, not execute()")
+        }
+        Operation::SnapshotReplicate(_) => {
+            unreachable!(
+                "SnapshotReplicate is handled by run_snapshot_replicate_flow, not execute()"
+            )
         }
     }
 }
@@ -1765,7 +1779,11 @@ async fn run_verify_flow(
 
     patch_verify_status(
         &spec.target_ref,
-        &verify_ok_body(op.tier.kind_str(), &chrono::Utc::now()),
+        &verify_ok_body(
+            op.tier.kind_str(),
+            op.repository_key.as_deref(),
+            &chrono::Utc::now(),
+        ),
     )
     .await;
     info!(tier = op.tier.kind_str(), "verification succeeded");
@@ -1903,6 +1921,520 @@ async fn run_replicate_flow(
 /// `.status` (best-effort; logged on failure). Reuses the dynamic-API pattern.
 async fn patch_replicate_status(target: &workspec::TargetRef, body: &serde_json::Value) {
     patch_maintenance_status(target, body).await;
+}
+
+/// PATCH a raw `{ "status": ... }` merge body onto the `SnapshotReplication`
+/// `.status` (best-effort; logged on failure). Reuses the dynamic-API pattern.
+async fn patch_snapshot_replicate_status(target: &workspec::TargetRef, body: &serde_json::Value) {
+    patch_maintenance_status(target, body).await;
+}
+
+/// Base kopia-client builder for the snapshot-replication clients: binary
+/// override, update-check suppression, and the run's operation timeout —
+/// the same knobs [`build_client`] applies, minus any config/cache pinning
+/// (each replication client sets its OWN).
+fn srepl_client_builder(
+    spec: &MoverWorkSpec,
+    kopia_binary: Option<&str>,
+) -> kopiur_kopia::KopiaClientBuilder {
+    let mut builder = KopiaClient::builder();
+    if let Some(bin) = kopia_binary {
+        builder = builder.binary(bin);
+    }
+    builder = builder.env("KOPIA_CHECK_FOR_UPDATES", "false");
+    if let Some(t) = spec.options.operation_timeout_secs {
+        builder = builder.default_timeout(Duration::from_secs(t));
+    }
+    builder
+}
+
+/// PATCH a terminal failure body for a kopia-op failure in the snapshot
+/// replication flow and return the typed error (non-zero exit → Job Failed).
+async fn srepl_terminal_kopia(
+    target: &workspec::TargetRef,
+    op: kopiur_mover::error::KopiaOp,
+    source: KopiaError,
+) -> Result<()> {
+    let err = MoverError::Kopia { op, source };
+    patch_snapshot_replicate_status(
+        target,
+        &snapshot_replicate_failed_body(&err.to_string(), None),
+    )
+    .await;
+    error!(class = %err.kopia_class(), "{err}");
+    Err(err)
+}
+
+/// PATCH a terminal failure body for a typed mover error in the snapshot
+/// replication flow (with whatever run counters exist) and return it.
+async fn srepl_terminal(
+    target: &workspec::TargetRef,
+    err: MoverError,
+    stats: Option<&SnapshotReplicationRunStats>,
+) -> Result<()> {
+    patch_snapshot_replicate_status(
+        target,
+        &snapshot_replicate_failed_body(&err.to_string(), stats),
+    )
+    .await;
+    error!("{err}");
+    Err(err)
+}
+
+/// Drive a `SnapshotReplicate` run: logical (snapshot-level) replication via
+/// `kopia snapshot migrate --source-config`, then dest-side copy-CR
+/// reconciliation and pruning. PATCHes the `SnapshotReplication` `.status`.
+///
+/// Two kopia clients under DISTINCT config files (the source's password is
+/// persisted beside its config — that is what migrate's source open reads):
+///
+/// - **source**: `srepl-source.config`, its own `KOPIA_CACHE_DIRECTORY`
+///   (per-client env override; this client only ever opens the source).
+/// - **dest** (the migrating client): `srepl-dest.config`,
+///   `KOPIA_CACHE_DIRECTORY` REMOVED + `XDG_CACHE_HOME` isolation instead. A
+///   process-wide cache-dir override applies to EVERY repository the process
+///   opens, so migrate's source open would read the DESTINATION's cached
+///   format blob and fail with "invalid repository password" — pinned by
+///   `crates/kopia/tests/integration_migrate.rs`.
+///
+/// Per-run file locations for the two-repository replicate flow. Everything
+/// lives under the writable cache emptyDir; the two config paths are what keep
+/// the source and destination connections from clobbering each other.
+struct SreplPaths {
+    source_config: String,
+    dest_config: String,
+    source_cache: String,
+    dest_xdg: String,
+}
+
+impl SreplPaths {
+    fn new() -> Self {
+        let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+        Self {
+            source_config: format!("{base}/srepl-source.config"),
+            dest_config: format!("{base}/srepl-dest.config"),
+            source_cache: format!("{base}/srepl-source-cache"),
+            dest_xdg: format!("{base}/srepl-dest-xdg"),
+        }
+    }
+}
+
+/// Steps 1–3 of the replicate flow: connect the SOURCE read-only with its
+/// password persisted beside the config, then prove the persistence with the
+/// no-env-password probe. Every failure PATCHes the terminal failed body
+/// before returning, so callers just `?`.
+///
+/// Probe polarity (pinned by the M0 integration test): env KOPIA_PASSWORD WINS
+/// over the persisted password on a normal open, while migrate's source open
+/// reads the persisted password FIRST — so the only probe that proves migrate
+/// will succeed is `repository status` with KOPIA_PASSWORD REMOVED.
+async fn srepl_connect_source(
+    spec: &MoverWorkSpec,
+    source_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SreplPaths,
+) -> Result<KopiaClient> {
+    use kopiur_mover::error::KopiaOp as Op;
+
+    // Source creds are the ambient pod env (the work-spec `repository` IS the
+    // source); file-based ones were materialized by `prepare_connect_spec`.
+    let source_client = srepl_client_builder(spec, kopia_binary)
+        .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.source_config)
+        .env(kopiur_kopia::env::CACHE_DIRECTORY_ENV, &paths.source_cache)
+        .build();
+    if let Err(e) = source_client
+        .repository_connect_with(
+            source_connect,
+            spec.cache,
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: true,
+            },
+        )
+        .await
+    {
+        srepl_terminal_kopia(&spec.target_ref, Op::SnapshotReplicateSourceConnect, e).await?;
+        unreachable!("srepl_terminal_kopia always errors");
+    }
+
+    let probe_client = srepl_client_builder(spec, kopia_binary)
+        .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.source_config)
+        .env(kopiur_kopia::env::CACHE_DIRECTORY_ENV, &paths.source_cache)
+        .env_remove("KOPIA_PASSWORD")
+        .build();
+    if let Err(e) = probe_client.repository_status().await {
+        let err = MoverError::Kopia {
+            op: Op::SourcePasswordProbe,
+            source: e,
+        };
+        let msg = format!(
+            "{err}. `kopia snapshot migrate` opens the SOURCE repository with the password \
+             persisted beside {} (the env KOPIA_PASSWORD is not consulted for that \
+             open), so a failing probe means the migrate itself would fail the same way. Check \
+             the source repository's encryption Secret and that the source connect above \
+             persisted its credentials",
+            paths.source_config
+        );
+        patch_snapshot_replicate_status(
+            &spec.target_ref,
+            &snapshot_replicate_failed_body(&msg, None),
+        )
+        .await;
+        error!("{msg}");
+        return Err(err);
+    }
+    Ok(source_client)
+}
+
+/// Step 4: build + connect the DESTINATION client (read-write). Creds arrive
+/// KOPIUR_DEST_-prefixed (issue #200); file-based ones stage into a separate
+/// dir; the kopia password rides the dedicated env name. The overlay sets what
+/// the destination provides and UNSETS what it doesn't, so a source credential
+/// can never leak into the destination auth. The migrate client must NOT carry
+/// a process-wide cache-dir override (it poisons the source open — pinned by
+/// the M0 integration test); per-repository cache isolation comes from
+/// XDG_CACHE_HOME under the writable emptyDir instead. Failures PATCH the
+/// terminal body before returning.
+async fn srepl_connect_dest(
+    spec: &MoverWorkSpec,
+    op: &SnapshotReplicateOp,
+    kopia_binary: Option<&str>,
+    paths: &SreplPaths,
+) -> Result<KopiaClient> {
+    use kopiur_mover::error::KopiaOp as Op;
+
+    let raw_env = |key: &str| std::env::var(key).ok();
+    let mut dest = op.destination.to_connect_spec();
+    if let Err(e) = credentials::materialize_with(
+        &mut dest,
+        &credential_staging_dir().join("srepl-dest"),
+        &|key| credentials::dest_materialize_lookup(key, &raw_env),
+    ) {
+        srepl_terminal(&spec.target_ref, e, None).await?;
+        unreachable!("srepl_terminal always errors");
+    }
+    let dest_password = match std::env::var(kopiur_mover::env::DEST_KOPIA_PASSWORD) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            let err = MoverError::DestPasswordMissing {
+                env_key: kopiur_mover::env::DEST_KOPIA_PASSWORD,
+            };
+            srepl_terminal(&spec.target_ref, err, None).await?;
+            unreachable!("srepl_terminal always errors");
+        }
+    };
+    let mut dest_builder = srepl_client_builder(spec, kopia_binary)
+        .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.dest_config)
+        .env_remove(kopiur_kopia::env::CACHE_DIRECTORY_ENV)
+        .env("XDG_CACHE_HOME", &paths.dest_xdg)
+        .env("KOPIA_PASSWORD", dest_password);
+    for (key, value) in credentials::dest_env_overlay(&dest, &raw_env) {
+        dest_builder = match value {
+            Some(v) => dest_builder.env(key, v),
+            None => dest_builder.env_remove(key),
+        };
+    }
+    let dest_client = dest_builder.build();
+    if let Err(e) = dest_client.repository_connect(&dest, spec.cache).await {
+        srepl_terminal_kopia(&spec.target_ref, Op::SnapshotReplicateDestConnect, e).await?;
+        unreachable!("srepl_terminal_kopia always errors");
+    }
+    Ok(dest_client)
+}
+
+/// Everything steps 5–7 computed that the rest of the flow consumes.
+struct SreplRunData {
+    source_list: Vec<kopiur_kopia::SnapshotListEntry>,
+    selected: std::collections::BTreeSet<srepl::IdentityTriple>,
+    dest_after: Vec<kopiur_kopia::SnapshotListEntry>,
+    missing: Vec<srepl::SnapKey>,
+    expected_len: usize,
+    stats: SnapshotReplicationRunStats,
+}
+
+/// Steps 5–7 of the replicate flow: enumerate the source (`snapshot list
+/// --all` — foreign identities too; incomplete checkpoints never appear,
+/// kopia's list omits them without `--incomplete`), select identities, run the
+/// migrate (`--all` when unfiltered, else one `--sources` per selected
+/// triple), then the mandatory post-verify (kopia exits 0 even when a
+/// per-source migration failed, so the dest listing is the real success
+/// signal). Returns `None` after patching the ok body when nothing matched;
+/// PATCHes the terminal failed body on any error.
+async fn srepl_migrate_and_verify(
+    spec: &MoverWorkSpec,
+    op: &SnapshotReplicateOp,
+    source_client: &KopiaClient,
+    dest_client: &KopiaClient,
+    paths: &SreplPaths,
+) -> Result<Option<SreplRunData>> {
+    use kopiur_mover::error::KopiaOp as Op;
+
+    let source_list = match source_client.snapshot_list_all().await {
+        Ok(l) => l,
+        Err(e) => {
+            srepl_terminal_kopia(&spec.target_ref, Op::SourceSnapshotList, e).await?;
+            unreachable!("srepl_terminal_kopia always errors");
+        }
+    };
+    let selected = srepl::select_identities(&op.include, &op.exclude, &source_list);
+    if selected.is_empty() {
+        let stats = SnapshotReplicationRunStats::default();
+        patch_snapshot_replicate_status(
+            &spec.target_ref,
+            &snapshot_replicate_ok_body(
+                op.destination.kind_str(),
+                &chrono::Utc::now(),
+                &stats,
+                "NoIdentitiesMatched",
+                "no source identities matched the selection; nothing to replicate",
+            ),
+        )
+        .await;
+        info!("no source identities matched the selection; nothing to replicate");
+        return Ok(None);
+    }
+    let dest_before = match dest_client.snapshot_list_all().await {
+        Ok(l) => l,
+        Err(e) => {
+            srepl_terminal_kopia(&spec.target_ref, Op::DestSnapshotList, e).await?;
+            unreachable!("srepl_terminal_kopia always errors");
+        }
+    };
+    let dest_before_keys = srepl::dest_keys(&dest_before, &selected);
+
+    let sources = if op.include.is_empty() && op.exclude.is_empty() {
+        MigrateSources::All
+    } else {
+        MigrateSources::List(selected.iter().map(srepl::triple_spec).collect())
+    };
+    if let Err(e) = dest_client
+        .snapshot_migrate(&SnapshotMigrateOptions {
+            source_config_path: paths.source_config.clone(),
+            sources,
+            latest_only: op.latest_only,
+            parallel: op.parallel,
+            policies: op.policies.to_kopia(),
+        })
+        .await
+    {
+        srepl_terminal_kopia(&spec.target_ref, Op::SnapshotMigrate, e).await?;
+        unreachable!("srepl_terminal_kopia always errors");
+    }
+
+    let dest_after = match dest_client.snapshot_list_all().await {
+        Ok(l) => l,
+        Err(e) => {
+            srepl_terminal_kopia(&spec.target_ref, Op::DestSnapshotList, e).await?;
+            unreachable!("srepl_terminal_kopia always errors");
+        }
+    };
+    let missing =
+        srepl::missing_after_migrate(&source_list, &selected, &dest_after, op.latest_only);
+    let expected = srepl::expected_keys(&source_list, &selected, op.latest_only);
+    let dest_after_keys = srepl::dest_keys(&dest_after, &selected);
+    let stats = SnapshotReplicationRunStats {
+        identities_selected: selected.len(),
+        snapshots_copied: dest_after_keys.difference(&dest_before_keys).count(),
+        already_present: expected.intersection(&dest_before_keys).count(),
+        failed: missing.len(),
+        pruned: 0,
+    };
+    let expected_len = expected.len();
+    Ok(Some(SreplRunData {
+        source_list,
+        selected,
+        dest_after,
+        missing,
+        expected_len,
+        stats,
+    }))
+}
+
+/// Steps 8–9 of the replicate flow: copy-CR reconciliation over the FULL
+/// correspondence set (runs even when the migrate partially failed — a mover
+/// that died between migrate and CR creation heals here on the next run, and
+/// a partial run's arrived copies get their CRs immediately), the post-verify
+/// and copy-CR failure terminals, then pruning per the carried mode over the
+/// three-label candidate set (mirror-source correlates against the source's
+/// FULL key set so narrowing the selection never deletes copies whose
+/// snapshots still exist). Every failure PATCHes the terminal failed body with
+/// the stats gathered so far; callers just `?`.
+#[allow(clippy::too_many_arguments)]
+async fn srepl_sync_and_prune(
+    spec: &MoverWorkSpec,
+    op: &SnapshotReplicateOp,
+    source_list: &[kopiur_kopia::SnapshotListEntry],
+    selected: &std::collections::BTreeSet<srepl::IdentityTriple>,
+    dest_after: &[kopiur_kopia::SnapshotListEntry],
+    missing: &[srepl::SnapKey],
+    expected_len: usize,
+    stats: &mut SnapshotReplicationRunStats,
+) -> Result<()> {
+    let kube_client = match kube::Client::try_default().await {
+        Ok(c) => c,
+        Err(e) => {
+            let err = MoverError::KubeClient {
+                source: Box::new(e),
+            };
+            srepl_terminal(&spec.target_ref, err, Some(stats)).await?;
+            unreachable!("srepl_terminal always errors");
+        }
+    };
+    let api: kube::Api<kopiur_api::snapshot::Snapshot> =
+        kube::Api::namespaced(kube_client, &spec.target_ref.namespace);
+    let correspondence = srepl::correspondence_set(source_list, selected, dest_after);
+    let sync = match srepl::reconcile_copy_crs(
+        &api,
+        &spec.target_ref.name,
+        &spec.target_ref.namespace,
+        &op.destination_repository,
+        &op.source_repository,
+        &correspondence,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            let err = MoverError::ReplicationCrList {
+                context: "copy-CR reconciliation",
+                source: Box::new(e),
+            };
+            srepl_terminal(&spec.target_ref, err, Some(stats)).await?;
+            unreachable!("srepl_terminal always errors");
+        }
+    };
+    info!(
+        ensured = sync.ensured,
+        failed = sync.failed,
+        total = sync.total,
+        "reconciled replicated copy Snapshot CRs"
+    );
+
+    // Post-verify misses are the more fundamental failure; copy-CR failures
+    // surface only when the data itself all arrived.
+    if !missing.is_empty() {
+        let err = MoverError::MigrateIncomplete {
+            missing: missing.len(),
+            expected: expected_len,
+            sample: srepl::missing_sample(missing, kopiur_mover::error::MISSING_SAMPLE_CAP),
+        };
+        srepl_terminal(&spec.target_ref, err, Some(stats)).await?;
+        unreachable!("srepl_terminal always errors");
+    }
+    if sync.failed > 0 {
+        let err = MoverError::CopyCrSyncIncomplete {
+            failed: sync.failed,
+            total: sync.total,
+        };
+        srepl_terminal(&spec.target_ref, err, Some(stats)).await?;
+        unreachable!("srepl_terminal always errors");
+    }
+
+    let source_keys = srepl::all_keys(source_list);
+    match srepl::prune_copy_crs(
+        &api,
+        &spec.target_ref.name,
+        &op.destination_repository.uid,
+        &op.pruning,
+        &source_keys,
+    )
+    .await
+    {
+        Ok((pruned, 0)) => {
+            stats.pruned = pruned;
+            Ok(())
+        }
+        Ok((pruned, failed)) => {
+            stats.pruned = pruned;
+            let err = MoverError::PruneIncomplete {
+                failed,
+                total: pruned + failed,
+            };
+            srepl_terminal(&spec.target_ref, err, Some(stats)).await
+        }
+        Err(e) => {
+            let err = MoverError::ReplicationCrList {
+                context: "pruning",
+                source: Box::new(e),
+            };
+            srepl_terminal(&spec.target_ref, err, Some(stats)).await
+        }
+    }
+}
+
+async fn run_snapshot_replicate_flow(
+    spec: &MoverWorkSpec,
+    op: &SnapshotReplicateOp,
+    source_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+) -> Result<()> {
+    info!(
+        source_backend = spec.repository.kind_str(),
+        destination_backend = op.destination.kind_str(),
+        replication = %spec.target_ref.name,
+        latest_only = op.latest_only,
+        "replicating snapshots (logical)"
+    );
+
+    let paths = SreplPaths::new();
+    let source_client = srepl_connect_source(spec, source_connect, kopia_binary, &paths).await?;
+    let dest_client = srepl_connect_dest(spec, op, kopia_binary, &paths).await?;
+
+    // 5–7. Enumerate + select + migrate + mandatory post-verify.
+    let Some(mut run) =
+        srepl_migrate_and_verify(spec, op, &source_client, &dest_client, &paths).await?
+    else {
+        return Ok(()); // NoIdentitiesMatched: ok body already patched.
+    };
+    let stats = &mut run.stats;
+
+    // 8+9. Copy-CR reconciliation + pruning (extracted; PATCHes terminal
+    // bodies itself — the flow just propagates).
+    srepl_sync_and_prune(
+        spec,
+        op,
+        &run.source_list,
+        &run.selected,
+        &run.dest_after,
+        &run.missing,
+        run.expected_len,
+        stats,
+    )
+    .await?;
+
+    // 10. Terminal success PATCH. observedGeneration stays 0 — the controller
+    // heals it (and Ready) on its next pass; the success arm there must not
+    // re-patch (the two-pass contract).
+    patch_snapshot_replicate_status(
+        &spec.target_ref,
+        &snapshot_replicate_ok_body(
+            op.destination.kind_str(),
+            &chrono::Utc::now(),
+            stats,
+            "ReplicationSucceeded",
+            &format!(
+                "replicated {} snapshot(s) across {} identit{} ({} already present, {} pruned)",
+                stats.snapshots_copied,
+                stats.identities_selected,
+                if stats.identities_selected == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                stats.already_present,
+                stats.pruned,
+            ),
+        ),
+    )
+    .await;
+    info!(
+        destination = op.destination.kind_str(),
+        copied = stats.snapshots_copied,
+        already_present = stats.already_present,
+        pruned = stats.pruned,
+        "snapshot replication succeeded"
+    );
+    Ok(())
 }
 
 /// Drive a `BrowseSession` run (M7a): connect to the repository **read-only**

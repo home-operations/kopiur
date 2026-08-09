@@ -15,7 +15,9 @@ tests:
           value: KopiurLastBackupFailed
       - matchRegex:
           path: spec.groups[0].rules[2].expr
-          pattern: min by \(namespace, policy\) \(kopiur_snapshotpolicy_last_backup_success\) == 0
+          # `repository` in the by-clause (#368): absent on legacy series (so
+          # their alert identity is unchanged), per-repo for multi-repo policies.
+          pattern: min by \(namespace, policy, repository\) \(kopiur_snapshotpolicy_last_backup_success\) == 0
   - it: gates the per-CR snapshot alert on policy recovery
     set:
       monitoring.prometheusRule.enabled: true

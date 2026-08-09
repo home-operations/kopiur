@@ -410,6 +410,7 @@ async fn create_session_job(
         // credential.
         service_account: workload_identity.map(|(wi, _)| wi.service_account_name.as_str()),
         passthrough_env: Vec::new(),
+        extra_env: Vec::new(),
         annotations: Default::default(),
         cache_volume: Default::default(),
         scratch_volume: None,

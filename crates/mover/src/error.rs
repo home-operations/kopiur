@@ -57,6 +57,23 @@ pub enum KopiaOp {
     RepositorySyncTo,
     /// `repository connect --readonly` for a browse session.
     BrowseConnect,
+    /// `repository connect --readonly --persist-credentials` to the snapshot
+    /// replication SOURCE (under the dedicated `srepl-source` config).
+    SnapshotReplicateSourceConnect,
+    /// `repository connect` to the snapshot replication DESTINATION (under the
+    /// dedicated `srepl-dest` config, read-write).
+    SnapshotReplicateDestConnect,
+    /// The persisted-password probe: `repository status` on the source config
+    /// with `KOPIA_PASSWORD` REMOVED. Must succeed — it proves the persisted
+    /// password alone opens the source, which is what `snapshot migrate`'s
+    /// source open reads FIRST (env wins only for normal opens).
+    SourcePasswordProbe,
+    /// `snapshot migrate --source-config` into the destination.
+    SnapshotMigrate,
+    /// `snapshot list --all` on the replication SOURCE.
+    SourceSnapshotList,
+    /// `snapshot list --all` on the replication DESTINATION.
+    DestSnapshotList,
 }
 
 impl KopiaOp {
@@ -83,9 +100,21 @@ impl KopiaOp {
             KopiaOp::ReplicateConnect => "replication connect",
             KopiaOp::RepositorySyncTo => "repository sync-to",
             KopiaOp::BrowseConnect => "browse session connect",
+            KopiaOp::SnapshotReplicateSourceConnect => "snapshot replication source connect",
+            KopiaOp::SnapshotReplicateDestConnect => "snapshot replication destination connect",
+            KopiaOp::SourcePasswordProbe => "source password probe",
+            KopiaOp::SnapshotMigrate => "snapshot migrate",
+            KopiaOp::SourceSnapshotList => "source snapshot list",
+            KopiaOp::DestSnapshotList => "destination snapshot list",
         }
     }
 }
+
+/// How many missing `(identity, startTime)` pairs a
+/// [`MoverError::MigrateIncomplete`] message lists before truncating — the
+/// status message must stay readable (and under the apiserver's limits) even
+/// when a whole first-full-history run failed.
+pub const MISSING_SAMPLE_CAP: usize = 10;
 
 /// Everything the mover binary can fail on. Replaces the old `anyhow` paths so
 /// the typed cause (and the kopia class behind it) is preserved until the
@@ -355,6 +384,87 @@ pub enum MoverError {
         source: Box<kube::Error>,
     },
 
+    /// The replication destination's kopia password env var is unset. The
+    /// controller injects it via a `secretKeyRef` under the dedicated name so
+    /// it can never collide with the source's `KOPIA_PASSWORD`.
+    #[error(
+        "the replication destination's kopia password is missing: ${env_key} is unset. The \
+         controller injects it from the destination repository's encryption Secret — check the \
+         mover Job's env and that the destination Secret (or its projected copy) exists"
+    )]
+    DestPasswordMissing {
+        /// The env var that should carry the destination password
+        /// ([`crate::env::DEST_KOPIA_PASSWORD`]).
+        env_key: &'static str,
+    },
+
+    /// `kopia snapshot migrate` exited 0 but the post-verify listing found
+    /// expected `(identity, startTime)` pairs missing on the destination.
+    /// kopia's per-source migration goroutines only LOG their errors, so exit
+    /// code 0 does not mean every selected snapshot arrived — the post-verify
+    /// is the real success gate.
+    #[error(
+        "snapshot replication is incomplete: {missing} of {expected} expected snapshot(s) did \
+         not arrive on the destination after `kopia snapshot migrate` (which exits 0 even when \
+         a per-source migration fails — see the mover pod logs for kopia's per-source errors). \
+         Missing (up to {sample_cap} shown): {sample}. The run will be retried; migrate is \
+         idempotent by (identity, startTime), so a retry only copies what is still missing",
+        sample_cap = MISSING_SAMPLE_CAP
+    )]
+    MigrateIncomplete {
+        /// How many expected snapshots are missing on the destination.
+        missing: usize,
+        /// How many snapshots were expected in total.
+        expected: usize,
+        /// A capped, human-readable `identity@startTime` sample list.
+        sample: String,
+    },
+
+    /// Some dest-side copy `Snapshot` CRs could not be created/stamped/deduped
+    /// this run. The reconciliation is SSA-idempotent and re-runs over the full
+    /// correspondence set every run, so a retry converges.
+    #[error(
+        "snapshot replication copied data but {failed} of {total} destination-side copy \
+         Snapshot CR(s) could not be reconciled; see the mover pod logs for the per-CR kube \
+         errors. The reconciliation is idempotent (server-side apply over the full \
+         correspondence set), so the next run re-attempts only what is still missing"
+    )]
+    CopyCrSyncIncomplete {
+        /// How many copy-CR reconciliations failed.
+        failed: usize,
+        /// The correspondence set's size.
+        total: usize,
+    },
+
+    /// A copy-CR LIST (the reconciliation's or pruning's candidate read)
+    /// failed, so the whole wave could not even start.
+    #[error(
+        "snapshot replication could not list Snapshot CRs for {context}: {source}. Check the \
+         dedicated snapshot-replication mover Role (get/list/create/patch/delete on snapshots \
+         + snapshots/status patch) and the apiserver's availability; the run will be retried"
+    )]
+    ReplicationCrList {
+        /// Which wave needed the LIST ("copy-CR reconciliation" / "pruning").
+        context: &'static str,
+        /// The underlying kube error (boxed, see [`MoverError::KubeClient`]).
+        #[source]
+        source: Box<kube::Error>,
+    },
+
+    /// Some prune deletes (retention/mirrorSource) failed this run. Pruning
+    /// re-selects from live state every run, so a retry converges.
+    #[error(
+        "snapshot replication pruning completed incompletely: {failed} of {total} copy \
+         Snapshot CR delete(s) failed; see the mover pod logs for the per-CR kube errors. \
+         Pruning re-selects from live state each run, so the next run re-attempts what remains"
+    )]
+    PruneIncomplete {
+        /// How many prune deletes failed.
+        failed: usize,
+        /// How many prune deletes were attempted.
+        total: usize,
+    },
+
     /// Telemetry init failed under `KOPIUR_OTEL_STRICT` (without strict mode it
     /// degrades inside `init_tracing` and never reaches here).
     #[error(transparent)]
@@ -416,7 +526,12 @@ impl MoverError {
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
             | MoverError::Telemetry(_)
-            | MoverError::BatchDeleteIncomplete { .. } => KopiaErrorClass::Unknown,
+            | MoverError::BatchDeleteIncomplete { .. }
+            | MoverError::DestPasswordMissing { .. }
+            | MoverError::MigrateIncomplete { .. }
+            | MoverError::CopyCrSyncIncomplete { .. }
+            | MoverError::ReplicationCrList { .. }
+            | MoverError::PruneIncomplete { .. } => KopiaErrorClass::Unknown,
         }
     }
 
@@ -458,6 +573,12 @@ mod tests {
             KopiaOp::ReplicateConnect,
             KopiaOp::RepositorySyncTo,
             KopiaOp::BrowseConnect,
+            KopiaOp::SnapshotReplicateSourceConnect,
+            KopiaOp::SnapshotReplicateDestConnect,
+            KopiaOp::SourcePasswordProbe,
+            KopiaOp::SnapshotMigrate,
+            KopiaOp::SourceSnapshotList,
+            KopiaOp::DestSnapshotList,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in all {
@@ -657,6 +778,57 @@ mod tests {
         // fix: retrying only re-attempts what's outstanding (idempotent deletes)
         assert!(msg.contains("idempotent"), "{msg}");
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+    }
+
+    #[test]
+    fn dest_password_missing_names_the_env_var_and_the_fix() {
+        let err = MoverError::DestPasswordMissing {
+            env_key: crate::env::DEST_KOPIA_PASSWORD,
+        };
+        let msg = err.to_string();
+        // what: the exact env var
+        assert!(msg.contains("$KOPIUR_DEST_KOPIA_PASSWORD"), "{msg}");
+        // fix: where the value comes from
+        assert!(msg.contains("encryption Secret"), "{msg}");
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+        assert!(!err.retry_recommended());
+    }
+
+    #[test]
+    fn migrate_incomplete_names_counts_sample_and_the_exit_zero_caveat() {
+        let err = MoverError::MigrateIncomplete {
+            missing: 3,
+            expected: 12,
+            sample: "a@h:/p@2026-08-01T00:00:00Z, b@h:/q@2026-08-02T00:00:00Z".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("3 of 12"), "{msg}");
+        // why: kopia exits 0 on per-source failures — the caveat that makes
+        // the post-verify mandatory must be stated to the reader.
+        assert!(msg.contains("exits 0"), "{msg}");
+        // sample list is present, retry guidance names the idempotency key.
+        assert!(msg.contains("a@h:/p@2026-08-01T00:00:00Z"), "{msg}");
+        assert!(msg.contains("(identity, startTime)"), "{msg}");
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+    }
+
+    #[test]
+    fn copy_cr_and_prune_incompletes_name_counts_and_convergence() {
+        let sync = MoverError::CopyCrSyncIncomplete {
+            failed: 2,
+            total: 40,
+        };
+        let msg = sync.to_string();
+        assert!(msg.contains("2 of 40"), "{msg}");
+        assert!(msg.contains("idempotent"), "{msg}");
+
+        let prune = MoverError::PruneIncomplete {
+            failed: 1,
+            total: 5,
+        };
+        let msg = prune.to_string();
+        assert!(msg.contains("1 of 5"), "{msg}");
+        assert!(msg.contains("re-selects from live state"), "{msg}");
     }
 
     #[test]

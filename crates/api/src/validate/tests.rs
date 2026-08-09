@@ -10,6 +10,7 @@ use crate::repository_replication::RepositoryReplicationSpec;
 use crate::restore::{RestoreSource, RestoreSpec, RestoreTarget};
 use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{Hook, HttpHeader, SnapshotPolicySpec, Source};
+use crate::snapshot_replication::SnapshotReplicationSpec;
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -168,17 +169,21 @@ fn produced_origins_accept_any_policy() {
 }
 
 #[test]
-fn adopted_accepts_any_policy() {
+fn adopted_and_replicated_accept_any_policy() {
     // Unlike `discovered`, an adopted row was deliberately re-attached to a
     // SnapshotPolicy so it is managed like a produced backup — any deletionPolicy
-    // (including None/Delete/Orphan) is legal.
-    for p in [
-        None,
-        Some(DeletionPolicy::Delete),
-        Some(DeletionPolicy::Retain),
-        Some(DeletionPolicy::Orphan),
-    ] {
-        assert!(validate_backup_deletion_policy(Origin::Adopted, p).is_ok());
+    // (including None/Delete/Orphan) is legal. A replicated copy CR is likewise
+    // operator-managed (its replication run minted BOTH the dest manifest and
+    // the CR), so any policy is legal there too.
+    for o in [Origin::Adopted, Origin::Replicated] {
+        for p in [
+            None,
+            Some(DeletionPolicy::Delete),
+            Some(DeletionPolicy::Retain),
+            Some(DeletionPolicy::Orphan),
+        ] {
+            assert!(validate_backup_deletion_policy(o, p).is_ok(), "{o:?}");
+        }
     }
 }
 
@@ -1625,7 +1630,11 @@ fn repository_inline_retention_hook_passes_today() {
 #[test]
 fn backup_config_aggregate_collects_multiple_errors() {
     let spec = SnapshotPolicySpec {
-        repository: repo_ref(RepositoryKind::ClusterRepository, Some("forbidden")),
+        repository: Some(repo_ref(
+            RepositoryKind::ClusterRepository,
+            Some("forbidden"),
+        )),
+        repositories: vec![],
         identity: Some(Identity::default()),
         sources: vec![], // missing required
         copy_method: Default::default(),
@@ -1661,11 +1670,148 @@ fn backup_config_aggregate_collects_multiple_errors() {
     );
 }
 
+/// Build a policy spec via the cluster's parse path (YAML → JSON value →
+/// typed) with an arbitrary repository surface, for the exactly-one-of /
+/// multi-repository admission matrix below.
+fn policy_spec_yaml(repo_surface: &str, extra: &str) -> SnapshotPolicySpec {
+    let yaml = format!("{repo_surface}sources: [ {{ pvc: {{ name: d }} }} ]\n{extra}");
+    let value: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn policy_repository_exactly_one_matrix() {
+    // Single-repo: accepted unchanged (no repository-surface errors at all).
+    let single = policy_spec_yaml("repository: { kind: Repository, name: r }\n", "");
+    assert!(validate_backup_config(&single).is_empty());
+
+    // Neither: the shared validator mirrors the CEL rule (covers objects
+    // stored before the CRD carried it).
+    let neither = policy_spec_yaml("", "");
+    let errs = validate_backup_config(&neither);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::PolicyRepositoryExactlyOne { got: "neither" }
+        )),
+        "{errs:?}"
+    );
+
+    // Both: refused as ambiguous.
+    let both = policy_spec_yaml(
+        "repository: { name: r }\nrepositories: [ { name: a } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&both);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::PolicyRepositoryExactlyOne { got: "both" }
+        )),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn policy_repositories_well_formed_multi_repo_is_accepted() {
+    // The M7 feature gate is LIFTED (M11): a well-formed multi-repo spec —
+    // distinct entries, no hooks — is admitted with no errors at all. This is
+    // the e2e-visible admission contract for multi-repository fan-out.
+    let multi = policy_spec_yaml("repositories: [ { name: a }, { name: b } ]\n", "");
+    assert_eq!(validate_backup_config(&multi), vec![]);
+
+    // A single-entry `repositories:` list is equally legal (the exactly-one-of
+    // rule is about which FIELD is set, not the entry count).
+    let one_entry = policy_spec_yaml("repositories: [ { name: a } ]\n", "");
+    assert_eq!(validate_backup_config(&one_entry), vec![]);
+
+    // The single-repo-only accessor still refuses multi loudly, with a message
+    // that points at per-child/per-operation repository selection.
+    let msg = ValidationError::PolicySingleRepositoryRequired.to_string();
+    assert!(msg.contains("spec.repositories"), "{msg}");
+    assert!(msg.contains("spec.repository pin"), "{msg}");
+}
+
+#[test]
+fn policy_repositories_duplicate_key_is_refused() {
+    // Same normalized key twice (kind defaults to Repository; both entries
+    // leave namespace unset → identical repo_key under the "" sentinel).
+    let dup = policy_spec_yaml(
+        "repositories: [ { name: a }, { name: b }, { name: a } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&dup);
+    let dup_err = errs
+        .iter()
+        .find_map(|e| match e {
+            ValidationError::PolicyRepositoriesDuplicate { key, first, second } => {
+                Some((key.clone(), *first, *second))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected PolicyRepositoriesDuplicate, got {errs:?}"));
+    assert_eq!(dup_err, ("Repository//a".to_string(), 0, 2));
+
+    // Same name under DIFFERENT kinds is NOT a duplicate (distinct keys).
+    let distinct = policy_spec_yaml(
+        "repositories: [ { name: a }, { kind: ClusterRepository, name: a } ]\n",
+        "",
+    );
+    assert!(
+        !validate_backup_config(&distinct)
+            .iter()
+            .any(|e| matches!(e, ValidationError::PolicyRepositoriesDuplicate { .. }))
+    );
+}
+
+#[test]
+fn policy_hooks_with_repositories_is_refused() {
+    // Added alongside the gate so lifting it can't forget the quiesce-contract
+    // refusal: hooks quiesce ONE capture, N concurrent children void that.
+    let hooked = policy_spec_yaml(
+        "repositories: [ { name: a }, { name: b } ]\n",
+        "hooks:\n  beforeSnapshot:\n    - workloadExec:\n        podSelector: { matchLabels: { app: pg } }\n        command: [\"true\"]\n",
+    );
+    let errs = validate_backup_config(&hooked);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::PolicyHooksWithRepositories)),
+        "{errs:?}"
+    );
+    // The refusal points at the supported alternative.
+    let msg = ValidationError::PolicyHooksWithRepositories.to_string();
+    assert!(msg.contains("SnapshotReplication"), "{msg}");
+
+    // Hooks with a SINGLE repository stay perfectly legal.
+    let single_hooked = policy_spec_yaml(
+        "repository: { name: r }\n",
+        "hooks:\n  beforeSnapshot:\n    - workloadExec:\n        podSelector: { matchLabels: { app: pg } }\n        command: [\"true\"]\n",
+    );
+    assert!(validate_backup_config(&single_hooked).is_empty());
+}
+
+#[test]
+fn policy_repositories_each_ref_is_shape_validated() {
+    // Per-ref shape validity runs over the tolerant iterator: a
+    // ClusterRepository entry with a namespace is refused per-entry.
+    let bad = policy_spec_yaml(
+        "repositories: [ { kind: ClusterRepository, name: a, namespace: x } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&bad);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterRepoNamespaceForbidden { .. })),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn backup_config_valid_spec_has_no_errors() {
     use crate::snapshot_policy::{PvcSource, Source};
     let spec = SnapshotPolicySpec {
-        repository: repo_ref(RepositoryKind::Repository, Some("backups")),
+        repository: Some(repo_ref(RepositoryKind::Repository, Some("backups"))),
+        repositories: vec![],
         identity: None,
         sources: vec![Source {
             pvc: Some(PvcSource {
@@ -1704,6 +1850,7 @@ fn backup_config_valid_spec_has_no_errors() {
 fn backup_aggregate_rejects_discovered_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: None,
         failure_policy: None,
@@ -1712,7 +1859,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         on_schedule_delete: None,
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Discovered);
+    let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert_eq!(errs.len(), 1);
     assert!(matches!(
         errs[0],
@@ -1820,6 +1967,7 @@ fn snapshot_tags_accumulate_every_problem() {
 fn backup_aggregate_rejects_reserved_tags() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: Some(tags_of(&[("kopiur-meta", "{}")])),
         failure_policy: None,
@@ -1828,7 +1976,7 @@ fn backup_aggregate_rejects_reserved_tags() {
         on_schedule_delete: None,
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Manual);
+    let errs = validate_backup(&spec, Some(Origin::Manual));
     assert!(
         errs.iter().any(|e| e.to_string().contains("reserved")),
         "{errs:?}"
@@ -1839,7 +1987,7 @@ fn backup_aggregate_rejects_reserved_tags() {
 
 #[test]
 fn discovered_and_adopted_on_schedule_delete_is_rejected_for_either_variant() {
-    for origin in [Origin::Discovered, Origin::Adopted] {
+    for origin in [Origin::Discovered, Origin::Adopted, Origin::Replicated] {
         for v in [ScheduleDeletePolicy::Retain, ScheduleDeletePolicy::Delete] {
             let err = validate_backup_on_schedule_delete(origin, Some(v)).unwrap_err();
             match &err {
@@ -1880,6 +2028,7 @@ fn scheduled_and_manual_accept_on_schedule_delete() {
 fn backup_aggregate_rejects_discovered_on_schedule_delete() {
     let spec = SnapshotSpec {
         policy_ref: None,
+        repository: None,
         source: None,
         tags: None,
         failure_policy: None,
@@ -1888,11 +2037,42 @@ fn backup_aggregate_rejects_discovered_on_schedule_delete() {
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
     };
-    let errs = validate_backup(&spec, Origin::Discovered);
+    let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert!(errs.iter().any(|e| matches!(
         e,
         ValidationError::DiscoveredCannotSetOnScheduleDelete { .. }
     )));
+}
+
+#[test]
+fn backup_aggregate_with_unparseable_origin_skips_gated_rules_but_not_the_rest() {
+    // `None` = the caller could not parse the origin marker. The origin-GATED
+    // rules are skipped (the controller's conservative resolution makes the
+    // fields inert; refusing would wedge finalizer removal under version
+    // skew)…
+    let gated_only = SnapshotSpec {
+        policy_ref: None,
+        repository: None,
+        source: None,
+        tags: None,
+        failure_policy: None,
+        description: None,
+        deletion_policy: Some(DeletionPolicy::Delete),
+        on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
+        pin: false,
+    };
+    assert!(validate_backup(&gated_only, None).is_empty());
+
+    // …but the origin-INDEPENDENT rules still run (an empty tag key is
+    // invalid for every origin).
+    let bad_tags = SnapshotSpec {
+        tags: Some(std::collections::BTreeMap::from([(
+            String::new(),
+            "v".to_string(),
+        )])),
+        ..gated_only
+    };
+    assert!(!validate_backup(&bad_tags, None).is_empty());
 }
 
 #[test]
@@ -5607,4 +5787,416 @@ fn cluster_repository_gets_the_identical_blob_retention_rules() {
         "{base}parameters:\n  blobRetention:\n    governance:\n      period: 720h\n"
     ));
     assert!(validate_cluster_repository(&spec).is_empty());
+}
+
+// --- validate_snapshot_replication (issue #368) ---
+
+/// Helper: a named `RepositoryRef` (the shared `repo_ref` pins the name to "r",
+/// which the self-target tests need to vary).
+fn srepl_ref(kind: RepositoryKind, name: &str, ns: Option<&str>) -> RepositoryRef {
+    RepositoryRef {
+        kind,
+        name: name.to_string(),
+        namespace: ns.map(String::from),
+    }
+}
+
+/// Helper: a minimal valid `SnapshotReplicationSpec` the matrix mutates.
+fn srepl_spec(source: RepositoryRef, dest: RepositoryRef, cron: &str) -> SnapshotReplicationSpec {
+    SnapshotReplicationSpec {
+        source_ref: source,
+        destination_ref: dest,
+        schedule: crate::common::CronSpec {
+            cron: cron.into(),
+            jitter: None,
+            timezone: None,
+        },
+        selection: None,
+        migrate: None,
+        pruning: None,
+        mover: None,
+        credential_projection: None,
+        suspend: false,
+    }
+}
+
+#[test]
+fn srepl_valid_full_spec_has_no_errors() {
+    use crate::snapshot_replication::{
+        IdentityMatcher, IdentitySelection, MigrateOptions, PolicyCopyMode, Pruning, SelectionSpec,
+    };
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "offsite", None),
+        "0 6 * * *",
+    );
+    spec.schedule.jitter = Some("30m".into());
+    spec.schedule.timezone = Some("America/Chicago".into());
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![IdentityMatcher {
+                username: Some("pg-*".into()),
+                hostname: None,
+                source_path: None,
+            }],
+            exclude: vec![IdentityMatcher {
+                username: None,
+                hostname: None,
+                source_path: Some("/scratch/*".into()),
+            }],
+        }),
+        latest_only: true,
+    });
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(4),
+        policies: PolicyCopyMode::Copy,
+    });
+    spec.pruning = Some(Pruning::Retention(Retention {
+        keep_daily: Some(7),
+        ..Default::default()
+    }));
+    assert_eq!(validate_snapshot_replication(&spec), vec![]);
+}
+
+#[test]
+fn srepl_rejects_bad_refs_on_both_sides() {
+    // A namespace on a ClusterRepository ref is rejected for EACH offending ref
+    // independently — the aggregate accumulates rather than stopping at the first.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::ClusterRepository, "a", Some("oops-src")),
+        srepl_ref(RepositoryKind::ClusterRepository, "b", Some("oops-dst")),
+        "0 6 * * *",
+    );
+    let errs = validate_snapshot_replication(&spec);
+    let forbidden: Vec<_> = errs
+        .iter()
+        .filter(|e| matches!(e, ValidationError::ClusterRepoNamespaceForbidden { .. }))
+        .collect();
+    assert_eq!(
+        forbidden.len(),
+        2,
+        "both refs must be flagged, got {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_rejects_literal_self_target() {
+    // Same kind + name, both namespaces absent → both resolve to this CR's own
+    // namespace → self-target.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        srepl_ref(RepositoryKind::Repository, "nas-primary", None),
+        "0 6 * * *",
+    );
+    let errs = validate_snapshot_replication(&spec);
+    match errs.as_slice() {
+        [ValidationError::SnapshotReplicationSelfTarget { kind, name }] => {
+            assert_eq!(kind, "Repository");
+            assert_eq!(name, "nas-primary");
+        }
+        other => panic!("expected exactly the self-target error, got {other:?}"),
+    }
+    // The message is what/why/fix for a rejected kubectl apply.
+    let msg = errs[0].to_string();
+    assert!(msg.contains("nas-primary"), "{msg}");
+    assert!(msg.contains("different repository"), "{msg}");
+
+    // Same for a shared ClusterRepository (namespace is structurally absent).
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        "0 6 * * *",
+    );
+    assert!(
+        validate_snapshot_replication(&spec)
+            .iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. }))
+    );
+    // Same kind+name with an explicit equal namespace on both sides.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "nas-primary", Some("backups")),
+        srepl_ref(RepositoryKind::Repository, "nas-primary", Some("backups")),
+        "0 6 * * *",
+    );
+    assert!(
+        validate_snapshot_replication(&spec)
+            .iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. }))
+    );
+}
+
+#[test]
+fn srepl_self_target_needs_kind_name_and_namespace_to_all_match() {
+    // Different kind: a Repository and a ClusterRepository sharing a name are
+    // different objects.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "shared", None),
+        srepl_ref(RepositoryKind::ClusterRepository, "shared", None),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    // Different explicit namespaces.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "repo", Some("a")),
+        srepl_ref(RepositoryKind::Repository, "repo", Some("b")),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    // None vs Some is undecidable spec-only (Some(ns) may or may not be this
+    // CR's namespace) — the pure validator must NOT guess; the webhook's
+    // resolved-backend comparison is the backstop.
+    let spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "repo", None),
+        srepl_ref(RepositoryKind::Repository, "repo", Some("elsewhere")),
+        "0 6 * * *",
+    );
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_rejects_bad_cron_timezone_and_jitter_together() {
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "not a cron",
+    );
+    spec.schedule.timezone = Some("America/Chicgo".into());
+    spec.schedule.jitter = Some("30 parsecs".into());
+    let errs = validate_snapshot_replication(&spec);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidCron { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidTimezone { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotReplication spec.schedule.jitter"
+        )),
+        "{errs:?}"
+    );
+    assert_eq!(errs.len(), 3, "all three problems in one apply: {errs:?}");
+}
+
+#[test]
+fn srepl_mover_inherit_is_rejected_with_the_adapted_message() {
+    use crate::common::{InheritSecurityContextFrom, SnapshotInherit};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.mover = Some(mover_with_inherit(InheritSecurityContextFrom::Snapshot(
+        SnapshotInherit {},
+    )));
+    let errs = validate_snapshot_replication(&spec);
+    match errs.as_slice() {
+        [ValidationError::InvalidFieldValue { field, reason }] => {
+            assert_eq!(
+                field,
+                "SnapshotReplication spec.mover.inheritSecurityContextFrom"
+            );
+            assert!(reason.contains("snapshot manifests"), "{reason}");
+            assert!(
+                reason.contains("never reads a workload's files"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected the inherit rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn srepl_plain_mover_is_accepted() {
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.mover = Some(crate::common::MoverSpec::default());
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_empty_matcher_is_rejected_in_both_lists_with_indexed_paths() {
+    use crate::snapshot_replication::{IdentityMatcher, IdentitySelection, SelectionSpec};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![
+                IdentityMatcher {
+                    username: Some("pg-*".into()),
+                    hostname: None,
+                    source_path: None,
+                },
+                IdentityMatcher::default(), // empty → rejected, include[1]
+            ],
+            exclude: vec![IdentityMatcher::default()], // empty → rejected, exclude[0]
+        }),
+        latest_only: false,
+    });
+    let errs = validate_snapshot_replication(&spec);
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::EmptyIdentityMatcher { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.selection.identities.include[1]",
+            "SnapshotReplication spec.selection.identities.exclude[0]",
+        ],
+        "got {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_bad_glob_component_is_rejected_per_component() {
+    use crate::snapshot_replication::{IdentityMatcher, IdentitySelection, SelectionSpec};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.selection = Some(SelectionSpec {
+        identities: Some(IdentitySelection {
+            include: vec![IdentityMatcher {
+                username: Some("data[0-9]".into()), // unsupported character class
+                hostname: Some("ok-*".into()),
+                source_path: Some("".into()), // empty pattern
+            }],
+            exclude: vec![],
+        }),
+        latest_only: false,
+    });
+    let errs = validate_snapshot_replication(&spec);
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.selection.identities.include[0].username",
+            "SnapshotReplication spec.selection.identities.include[0].sourcePath",
+        ],
+        "each bad component flagged, the good one not: {errs:?}"
+    );
+}
+
+#[test]
+fn srepl_migrate_parallel_zero_is_rejected() {
+    use crate::snapshot_replication::MigrateOptions;
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(0),
+        ..Default::default()
+    });
+    let errs = validate_snapshot_replication(&spec);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "SnapshotReplication spec.migrate.parallel"
+        )),
+        "{errs:?}"
+    );
+    // >= 1 passes.
+    spec.migrate = Some(MigrateOptions {
+        parallel: Some(1),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_retention_that_keeps_nothing_is_rejected() {
+    use crate::snapshot_replication::{MirrorSourcePruning, NoPruning, Pruning};
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    spec.pruning = Some(Pruning::Retention(Retention::default()));
+    let errs = validate_snapshot_replication(&spec);
+    assert_eq!(
+        errs,
+        vec![ValidationError::RetentionKeepsNothing],
+        "an all-absent retention keeps nothing"
+    );
+
+    // Any keep* bucket satisfies it.
+    spec.pruning = Some(Pruning::Retention(Retention {
+        keep_annual: Some(1),
+        ..Default::default()
+    }));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+
+    // The marker modes carry no retention and are always fine.
+    spec.pruning = Some(Pruning::None(NoPruning {}));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+    spec.pruning = Some(Pruning::MirrorSource(MirrorSourcePruning {}));
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+/// The same rejections, through the REAL wire shape users apply: YAML → JSON →
+/// typed, then the aggregate validator (mirrors the RepositoryReplication
+/// entry-point test above).
+#[test]
+fn srepl_yaml_entry_point_rejects_and_accepts() {
+    let bad: SnapshotReplicationSpec = crate::testutil::from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { name: nas-primary }
+schedule: { cron: "0 6 * * *" }
+pruning: { retention: {} }
+"#,
+    );
+    let errs = validate_snapshot_replication(&bad);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::SnapshotReplicationSelfTarget { .. })),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::RetentionKeepsNothing)),
+        "{errs:?}"
+    );
+
+    let ok: SnapshotReplicationSpec = crate::testutil::from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { kind: ClusterRepository, name: offsite }
+schedule: { cron: "0 6 * * *", jitter: 30m }
+selection:
+  identities:
+    include:
+      - username: pg-*
+  latestOnly: true
+migrate: { parallel: 2, policies: none }
+pruning: { mirrorSource: {} }
+"#,
+    );
+    assert!(validate_snapshot_replication(&ok).is_empty());
 }

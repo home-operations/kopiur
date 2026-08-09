@@ -188,12 +188,15 @@ fn plan_ns_terminating(f: &DeletionFacts<'_>) -> DeletionPlan {
 ///   reclaim. So an explicit ns-delete opt-in WINS over the implicit stamp.
 ///   (The retain-wins-ties rule is only for schedule-vs-policy cascade races,
 ///   NOT for an explicit namespace-delete opt-in.)
-/// - `Some(Retention | FailedHistory)` → a genuine operator prune keeps its
-///   prune semantics ([`plan_prune`]): never held; effective policy decides.
+/// - `Some(Retention | FailedHistory | ReplicationRetention)` → a genuine
+///   operator prune keeps its prune semantics ([`plan_prune`]): never held;
+///   effective policy decides.
 fn plan_ns_delete(f: &DeletionFacts<'_>) -> DeletionPlan {
     match pruned_by(f.annotations) {
         None | Some(PrunedBy::PolicyCascade) => plan_external(f.policy, f.breaker),
-        Some(p @ (PrunedBy::Retention | PrunedBy::FailedHistory)) => plan_prune(p, f.policy),
+        Some(
+            p @ (PrunedBy::Retention | PrunedBy::FailedHistory | PrunedBy::ReplicationRetention),
+        ) => plan_prune(p, f.policy),
     }
 }
 
@@ -249,7 +252,7 @@ fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
 /// Step 4: operator prune. NEVER held — retention/history-limit pruning must
 /// keep working during an incident; its own rate is bounded elsewhere.
 ///
-/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 3×3
+/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 4×3
 /// match, no catch-all): a new variant of either enum fails to compile until
 /// every cell is decided (ADR §5.5).
 ///
@@ -258,6 +261,7 @@ fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
 /// | `Retention` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
 /// | `FailedHistory` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
 /// | `PolicyCascade` | [`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete) | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `ReplicationRetention` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
 ///
 /// The `PolicyCascade`/`Delete` cell is the one loud downgrade: a policy
 /// cascade prune under `onPolicyDelete: Retain` never contacts the
@@ -277,6 +281,13 @@ fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
         }
         (PrunedBy::PolicyCascade, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
         (PrunedBy::PolicyCascade, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        // A SnapshotReplication's own retention prune of its dest-side copies:
+        // an operator prune exactly like `Retention` (bounded, deliberate,
+        // never held). Copy CRs are minted with `deletionPolicy: Delete`, so
+        // the `Delete` cell is the one that fires in practice.
+        (PrunedBy::ReplicationRetention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
+        (PrunedBy::ReplicationRetention, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
+        (PrunedBy::ReplicationRetention, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
     }
 }
 
@@ -328,9 +339,10 @@ pub fn owner_state_from(fetched: Option<&SnapshotSchedule>, owner: &OwnerReferen
 /// The `pruned-by` stamp is **exhaustively** classified (no catch-all), because
 /// not every stamp is breaker-exempt:
 ///
-/// - `Retention` / `FailedHistory` are OPERATOR prunes — bounded, deliberate,
-///   steady-state deletes whose rate is governed elsewhere; they are exempt
-///   EVERYWHERE (retention must keep working during an incident, never held).
+/// - `Retention` / `FailedHistory` / `ReplicationRetention` are OPERATOR
+///   prunes — bounded, deliberate, steady-state deletes whose rate is governed
+///   elsewhere; they are exempt EVERYWHERE (retention must keep working during
+///   an incident, never held).
 /// - `PolicyCascade` and unstamped (`None`) are NOT exempt: they fall through to
 ///   the plan check. A `policy-cascade`-stamped child is quiet-retained in
 ///   steady state (its plan is `RetainSnapshotOnPolicyDelete`, not
@@ -359,7 +371,12 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
 /// — as opposed to an exempt OPERATOR prune. **Exhaustive over [`PrunedBy`]** (no
 /// catch-all):
 ///
-/// - `Retention` / `FailedHistory` → `false`: operator prunes, exempt everywhere.
+/// - `Retention` / `FailedHistory` / `ReplicationRetention` → `false`:
+///   operator prunes, exempt everywhere. `ReplicationRetention` mirrors
+///   `Retention` deliberately: a replication's own bounded GFS prune of its
+///   copies must keep working during an incident. (Its `mirrorSource` sibling
+///   mode stamps NOTHING, so a mass source-vanish classifies EXTERNAL and the
+///   dest breaker holds it — that asymmetry is the ransomware guard.)
 /// - `None` (unstamped) / `PolicyCascade` → `true`: breaker-relevant. A
 ///   `PolicyCascade` member only ever reaches the destructive `DeleteSnapshot`
 ///   plan (and so the counting set) under an `onNamespaceDelete: Delete` namespace
@@ -373,7 +390,9 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
 /// breaker relevance is decided here (ADR §5.5).
 pub fn breaker_relevant(pruned: Option<PrunedBy>) -> bool {
     match pruned {
-        Some(PrunedBy::Retention | PrunedBy::FailedHistory) => false,
+        Some(PrunedBy::Retention | PrunedBy::FailedHistory | PrunedBy::ReplicationRetention) => {
+            false
+        }
         None | Some(PrunedBy::PolicyCascade) => true,
     }
 }
@@ -738,18 +757,9 @@ pub fn batch_job_placement(
 /// after the recipe is gone; a `ClusterRepository` ref pins none (the webhook
 /// forbids one). Exhaustive over [`RepositoryKind`] (ADR §5.5).
 pub fn pinned_repository_ref(r: &RepositoryRef, config_ns: &str) -> RepositoryRef {
-    match r.kind {
-        RepositoryKind::Repository => RepositoryRef {
-            kind: RepositoryKind::Repository,
-            name: r.name.clone(),
-            namespace: Some(r.namespace.clone().unwrap_or_else(|| config_ns.to_string())),
-        },
-        RepositoryKind::ClusterRepository => RepositoryRef {
-            kind: RepositoryKind::ClusterRepository,
-            name: r.name.clone(),
-            namespace: None,
-        },
-    }
+    // The one shared normal form (hoisted to the api crate so mint-time pins —
+    // schedule fan-out, CLI `snapshot now`, adoption — normalize identically).
+    kopiur_api::common::normalized_repository_ref(r, config_ns)
 }
 
 pub use crate::naming::capped_name;
@@ -762,6 +772,7 @@ pub fn resolved_run_status(
     config: &SnapshotPolicy,
     namespace: &str,
     work_spec: &MoverWorkSpec,
+    repo_ref: &RepositoryRef,
 ) -> kopiur_api::snapshot::ResolvedSnapshot {
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
     let pvc = config
@@ -771,7 +782,9 @@ pub fn resolved_run_status(
         .and_then(|s| s.pvc.as_ref())
         .map(|p| format!("{namespace}/{}", p.name));
     kopiur_api::snapshot::ResolvedSnapshot {
-        repository: Some(pinned_repository_ref(&config.spec.repository, &config_ns)),
+        // `repo_ref` is threaded by the caller (pure fn, no error path):
+        // multi-repo pin selection lands in M8.
+        repository: Some(pinned_repository_ref(repo_ref, &config_ns)),
         sources: vec![kopiur_api::snapshot::ResolvedSource {
             pvc,
             source_path: Some(work_spec.identity.source_path.clone()),
@@ -838,13 +851,27 @@ pub(super) fn needs_repository_backfill(backup: &Snapshot) -> bool {
 /// backfilling, so a `Snapshot` needing just one of the two pins never
 /// clobbers (or redundantly re-writes) the other. `None` when neither pin
 /// needs backfilling — the caller skips the patch entirely.
+///
+/// `repo_ref` is the row's EFFECTIVE repository
+/// ([`kopiur_api::snapshot::effective_repository_ref`] — the spec pin for a
+/// multi-repo fan-out child). `None` means the repository is UNKNOWABLE for
+/// this row (a pre-feature child of a now-multi-repo policy with no pin):
+/// the repository half is then SKIPPED — never guessed — and the row stays in
+/// the breaker's conservative unpinned bucket until the policy reconciler's
+/// spec-pin backfill (or deletion) resolves it.
 pub(super) fn backfill_patch_body(
     config: &SnapshotPolicy,
     namespace: &str,
     needs_projection: bool,
     needs_repository: bool,
+    repo_ref: Option<&RepositoryRef>,
 ) -> Option<serde_json::Value> {
-    if !needs_projection && !needs_repository {
+    let repo_backfill = match (needs_repository, repo_ref) {
+        (true, Some(r)) => Some(r),
+        // Unknowable (multi-repo + unpinned pre-feature row): skip, never guess.
+        (true, None) | (false, _) => None,
+    };
+    if !needs_projection && repo_backfill.is_none() {
         return None;
     }
     let mut resolved = serde_json::Map::new();
@@ -854,11 +881,11 @@ pub(super) fn backfill_patch_body(
             serde_json::json!(projection_to_pin(config)),
         );
     }
-    if needs_repository {
+    if let Some(repo_ref) = repo_backfill {
         let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
         resolved.insert(
             "repository".to_string(),
-            serde_json::json!(pinned_repository_ref(&config.spec.repository, &config_ns)),
+            serde_json::json!(pinned_repository_ref(repo_ref, &config_ns)),
         );
     }
     Some(serde_json::json!({ "resolved": resolved }))
@@ -1089,15 +1116,26 @@ fn snapshot_ready_status_over(
 /// Compute the effective `DeletionPolicy` for a `Snapshot`, honoring the
 /// origin-aware default (ADR §4.5): discovered backups are forced to `Retain`,
 /// produced backups default to `Delete` when unset.
+///
+/// `origin` is [`resolve_origin`]'s output: `None` means the row carries an
+/// origin marker this build cannot parse — forced `Retain`, exactly like
+/// `Discovered`. Conservative in the only direction that matters for backup
+/// software: the finalizer of a row we cannot classify must never contact the
+/// repository and delete a manifest that may belong to someone else, while
+/// `Retain` still releases the CR (never wedges deletion).
 pub fn effective_deletion_policy(
     spec_policy: Option<DeletionPolicy>,
-    origin: Origin,
+    origin: Option<Origin>,
 ) -> DeletionPolicy {
     match origin {
-        // Discovered snapshots are never ours to delete — forced Retain.
-        Origin::Discovered => DeletionPolicy::Retain,
-        // Adopted rows are managed like any produced backup: same fallback default.
-        Origin::Scheduled | Origin::Manual | Origin::Adopted => {
+        // Discovered snapshots are never ours to delete — forced Retain. An
+        // UNPARSEABLE origin gets the same treatment (see doc above).
+        Some(Origin::Discovered) | None => DeletionPolicy::Retain,
+        // Adopted rows are managed like any produced backup: same fallback
+        // default. Replicated copies too — the replication run minted the
+        // dest-side manifest AND stamps `deletionPolicy: Delete` at create, so
+        // the produced-row default is the correct fallback.
+        Some(Origin::Scheduled | Origin::Manual | Origin::Adopted | Origin::Replicated) => {
             spec_policy.unwrap_or(DeletionPolicy::Delete)
         }
     }
@@ -1132,20 +1170,30 @@ pub fn pin_decision(desired: bool, observed: Option<bool>) -> PinAction {
 }
 
 /// Resolve a `Snapshot`'s origin from its status (canonical) or its
-/// `kopiur.home-operations.com/origin` label, defaulting to `Manual` when neither is present
-/// (a bare `kubectl create`).
-pub fn resolve_origin(b: &Snapshot) -> Origin {
+/// `kopiur.home-operations.com/origin` label, via the total [`Origin::parse`].
+///
+/// - No marker at all (no `status.origin`, no label) ⇒ `Some(Manual)`: a bare
+///   `kubectl create` — unchanged from the pre-parse behavior.
+/// - A label that parses ⇒ that origin — unchanged.
+/// - A label that does NOT parse ⇒ **`None`**. This is the one behavior
+///   change: the old `_ => Origin::Manual` arm classified an unrecognized
+///   origin string (a typo, a forged label, or a row written by a NEWER
+///   operator during version skew) as `Manual` — routing a foreign row into
+///   the backup-run machinery, where `reconcile_inner` mints a mover Job for a
+///   snapshot this build does not understand. Every caller must handle `None`
+///   conservatively (warn + inert handling — the `Discovered`-shaped
+///   direction: never mint a Job, never delete, never retain-count), and must
+///   NEVER fold it back to `Manual`.
+pub fn resolve_origin(b: &Snapshot) -> Option<Origin> {
     if let Some(o) = b.status.as_ref().and_then(|s| s.origin) {
-        return o;
+        return Some(o);
     }
     match b
         .labels()
         .get(crate::consts::ORIGIN_LABEL)
         .map(String::as_str)
     {
-        Some("scheduled") => Origin::Scheduled,
-        Some("discovered") => Origin::Discovered,
-        Some("adopted") => Origin::Adopted,
-        _ => Origin::Manual,
+        None => Some(Origin::Manual),
+        Some(label) => Origin::parse(label),
     }
 }

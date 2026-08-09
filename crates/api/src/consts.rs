@@ -33,6 +33,15 @@ pub const CONFIG_LABEL: &str = "kopiur.home-operations.com/config";
 /// under `policySelector` fan-out).
 pub const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
 
+/// Label naming the `SnapshotReplication` CR that minted an
+/// `origin: replicated` dest-side copy `Snapshot` — the selector a replication
+/// run (and its pruning pass) uses to find its own copies. Stamped at CREATE,
+/// alongside [`ORIGIN_LABEL`]/[`SNAPSHOT_ID_LABEL`]/[`REPOSITORY_UID_LABEL`].
+/// Lives in `kopiur-api` because the CLI and user automation must agree on it
+/// byte-for-byte. (Nothing stamps it yet — reserved by the shared-foundations
+/// milestone of #368.)
+pub const SNAPSHOT_REPLICATION_LABEL: &str = "kopiur.home-operations.com/snapshot-replication";
+
 /// Label naming the shared CSI `VolumeGroupSnapshot` a fanned-out `Snapshot`
 /// stages from — carried by BOTH the member `Snapshot` CRs and the
 /// `VolumeGroupSnapshot` object itself.
@@ -107,7 +116,8 @@ pub const ALLOW_IDENTITY_CHANGE_ANNOTATION: &str =
 
 /// Marks a `Snapshot` the OPERATOR is deleting as part of its own lifecycle,
 /// stamped immediately before the delete call. Values: `PrunedBy` annotation
-/// values (`retention`, `failed-history`). The Snapshot finalizer uses it to
+/// values (`retention`, `failed-history`, `policy-cascade`,
+/// `replication-retention`). The Snapshot finalizer uses it to
 /// distinguish Kopiur's own prunes from external deletions (GC cascades,
 /// kubectl, third-party controllers); external destructive deletions are
 /// subject to the schedule-cascade guard and the mass-deletion breaker,
@@ -329,6 +339,32 @@ pub const MISSING_CA_BUNDLE_REASON: &str = "MissingCaBundle";
 /// same reference client-side and must agree on the default (centralize-config).
 pub const DEFAULT_CA_BUNDLE_KEY: &str = "ca.crt";
 
+/// `SnapshotPolicy` condition recording whether every repository the policy
+/// targets is `Ready`. Set `False` (with [`REPOSITORY_NOT_READY_REASON`]) when
+/// at least one referenced `Repository`/`ClusterRepository` is not `Ready`:
+/// backups, retention, adoption and verification against the not-ready
+/// subset are deferred (the ready subset keeps processing), and nothing about
+/// the policy's phase-less surface would otherwise say so — the silent-wedge
+/// shape of #359 for the recipe kind. Structural
+/// ([`crate::gates::POLICY_REPOSITORY_NOT_READY_GATE`]): a repository that
+/// never recovers never self-heals this condition.
+pub const REPOSITORIES_READY_CONDITION: &str = "RepositoriesReady";
+/// `reason` for [`REPOSITORIES_READY_CONDITION`] = `False` — the same string
+/// the `Snapshot` reconciler stamps on a child parked behind a not-Ready
+/// repository (one string, both surfaces; the controller re-exports it).
+pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
+
+/// `SnapshotSchedule` condition recording whether a fired slot minted its full
+/// members × repositories fan-out. `True` (with [`FANOUT_TOO_LARGE_REASON`])
+/// = the cross-product exceeded the fan-out cap and the slot was SKIPPED — and
+/// it will keep skipping every slot until the selector is narrowed or the
+/// repository list shrunk, which is squarely "needs a human". Structural
+/// ([`crate::gates::SCHEDULE_FANOUT_CAPPED_GATE`], promoted here by the #368
+/// M10 gates/doctor checklist from a controller-internal condition).
+pub const SCHEDULE_FANOUT_CAPPED_CONDITION: &str = "FanoutCapped";
+/// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `True`.
+pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
+
 /// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
 /// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
 /// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the
@@ -359,6 +395,7 @@ mod tests {
             REPOSITORY_UID_LABEL,
             CONFIG_LABEL,
             SCHEDULE_LABEL,
+            SNAPSHOT_REPLICATION_LABEL,
             GROUP_LABEL,
             OP_LABEL,
             SESSION_LABEL,

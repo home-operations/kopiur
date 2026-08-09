@@ -361,6 +361,7 @@ pub fn build_adopted_snapshot(
     policy: &SnapshotPolicy,
     repo_uid: &str,
     candidate: &AdoptionCandidate,
+    repo_ref: &kopiur_api::common::RepositoryRef,
 ) -> (Snapshot, SnapshotStatus) {
     let policy_name = policy.name_any();
     let namespace = policy.namespace().unwrap_or_default();
@@ -377,9 +378,20 @@ pub fn build_adopted_snapshot(
 
     let deletion_policy = effective_deletion_policy(policy);
 
+    // `repo_ref` is threaded by the caller (pure fn, no error path here): the
+    // repository the row was DISCOVERED in. Normalized once and used for both
+    // pins below.
+    let pinned_repo = crate::snapshot::pinned_repository_ref(repo_ref, &namespace);
+    // The mint-time spec pin (#368): stamped only when the policy is
+    // multi-repo — the retention buckets key on it, and the row must land in
+    // the bucket of the repository it actually lives in. Single-repo adopted
+    // rows stay unpinned, byte-identical to the pre-multi-repo wire.
+    let spec_pin = kopiur_api::is_multi_repo(&policy.spec).then(|| pinned_repo.clone());
+
     let mut snapshot = Snapshot::new(
         &cr_name,
         SnapshotSpec {
+            repository: spec_pin,
             source: None,
             policy_ref: Some(PolicyRef {
                 name: policy_name.clone(),
@@ -397,7 +409,6 @@ pub fn build_adopted_snapshot(
     // NO ownerReferences (inv. 5).
     snapshot.metadata = crate::io::child_meta(&cr_name, &namespace, labels, None);
 
-    let pinned_repo = crate::snapshot::pinned_repository_ref(&policy.spec.repository, &namespace);
     let status = SnapshotStatus {
         phase: Some(SnapshotPhase::Succeeded),
         origin: Some(Origin::Adopted),
@@ -1153,7 +1164,12 @@ mod tests {
             identity("app", "billing", Some("/data")),
             false,
         );
-        let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
         assert_eq!(
             snap.name_any(),
             adopted_cr_name("app", "0123456789abcdef0123")
@@ -1201,7 +1217,12 @@ mod tests {
             }),
             description: Some("kept description".into()),
         };
-        let (snap, status) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap, status) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
 
         // Name: <policy>-adopted-<first16(id)>-<hash8(full id)>, in the policy's
         // namespace. The trailing hash is over the FULL id (not just the
@@ -1226,6 +1247,9 @@ mod tests {
         );
 
         // Spec: policyRef, deletionPolicy default = Delete, pin carried, no onScheduleDelete.
+        // A SINGLE-repo policy's adopted row carries NO spec.repository pin —
+        // byte-identical to the pre-multi-repo wire (#368).
+        assert!(snap.spec.repository.is_none());
         assert_eq!(snap.spec.policy_ref.as_ref().unwrap().name, "app");
         assert_eq!(snap.spec.deletion_policy, Some(DeletionPolicy::Delete));
         assert!(snap.spec.pin, "candidate.pinned is carried");
@@ -1261,11 +1285,72 @@ mod tests {
         assert_eq!(pinned.namespace.as_deref(), Some("billing"));
     }
 
+    /// Multi-repo fan-out (#368): an adopted row of a multi-repo policy stamps
+    /// `spec.repository` = the repository it was DISCOVERED in (normalized) —
+    /// the pin the (source, repo) retention buckets and deletion batching key
+    /// on. Spec constructed directly — the same shape admission accepts now
+    /// that the M7 feature gate is lifted.
+    #[test]
+    fn build_adopted_snapshot_pins_the_discovered_repository_for_multi_repo() {
+        let spec: SnapshotPolicySpec = serde_json::from_value(serde_json::json!({
+            "repositories": [
+                { "kind": "Repository", "name": "nas" },
+                { "kind": "ClusterRepository", "name": "offsite" },
+            ],
+            "sources": [{ "pvc": { "name": "data" } }],
+        }))
+        .unwrap();
+        let mut policy = SnapshotPolicy::new("app", spec);
+        policy.metadata.namespace = Some("billing".into());
+        let cand = candidate("aaa", identity("app", "billing", Some("/data")), false);
+
+        // Discovered in the second member (the cluster-scoped repo).
+        let (snap, status) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-2",
+            &cand,
+            &kopiur_api::common::RepositoryRef {
+                kind: RepositoryKind::ClusterRepository,
+                name: "offsite".into(),
+                namespace: None,
+            },
+        );
+        let pin = snap.spec.repository.as_ref().expect("spec pin stamped");
+        assert_eq!(pin.kind, RepositoryKind::ClusterRepository);
+        assert_eq!(pin.name, "offsite");
+        assert_eq!(pin.namespace, None, "cluster refs normalize namespace-free");
+        // Spec pin and status pin agree (one normalization).
+        assert_eq!(
+            Some(pin),
+            status.resolved.as_ref().unwrap().repository.as_ref()
+        );
+
+        // Discovered in the namespaced member: the pin carries the EFFECTIVE
+        // namespace explicitly.
+        let (snap, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            &kopiur_api::common::RepositoryRef {
+                kind: RepositoryKind::Repository,
+                name: "nas".into(),
+                namespace: None,
+            },
+        );
+        let pin = snap.spec.repository.as_ref().expect("spec pin stamped");
+        assert_eq!(pin.namespace.as_deref(), Some("billing"));
+    }
+
     #[test]
     fn build_adopted_snapshot_honors_default_deletion_policy() {
         let policy = policy_fixture(Some(DeletionPolicy::Orphan));
         let cand = candidate("aaa", identity("app", "billing", Some("/data")), false);
-        let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
         assert_eq!(snap.spec.deletion_policy, Some(DeletionPolicy::Orphan));
     }
 
@@ -1291,8 +1376,9 @@ mod tests {
         );
         let cand_a = candidate(id_a, ident.clone(), false);
         let cand_b = candidate(id_b, ident, false);
-        let (snap_a, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_a);
-        let (snap_b, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_b);
+        let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
+        let (snap_a, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_a, repo_ref);
+        let (snap_b, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand_b, repo_ref);
         assert_ne!(
             snap_a.name_any(),
             snap_b.name_any(),
@@ -1305,8 +1391,18 @@ mod tests {
         let policy = policy_fixture(None);
         let ident = identity("app", "billing", Some("/data"));
         let cand = candidate("0123456789abcdef0123", ident, false);
-        let (snap_1, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
-        let (snap_2, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap_1, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
+        let (snap_2, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
         assert_eq!(
             snap_1.name_any(),
             snap_2.name_any(),
@@ -1322,7 +1418,12 @@ mod tests {
         let ident = identity("app", "billing", Some("/data"));
         let long_id = "9".repeat(200);
         let cand = candidate(&long_id, ident, false);
-        let (snap, _) = build_adopted_snapshot(&policy, "repo-uid-1", &cand);
+        let (snap, _) = build_adopted_snapshot(
+            &policy,
+            "repo-uid-1",
+            &cand,
+            kopiur_api::single_repository_ref(&policy.spec).unwrap(),
+        );
         let name = snap.name_any();
         assert!(
             name.len() <= 63,

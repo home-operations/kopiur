@@ -8,6 +8,7 @@ pub mod identity_collision;
 pub mod identity_fork;
 pub mod identity_repo_edit;
 pub mod metrics;
+pub mod replication_overlap;
 pub mod routes;
 pub mod secctx;
 pub mod tenancy;

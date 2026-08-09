@@ -40,5 +40,6 @@ webhooks:
           - restores
           - maintenances
           - repositoryreplications
+          - snapshotreplications
         scope: "*"
 {{- end }}

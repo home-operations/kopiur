@@ -515,6 +515,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrecognized_origin_marker_is_admitted_inert_with_a_warning() {
+        // An origin label this build cannot parse (typo / forged / written by a
+        // NEWER operator during version skew) must be ADMITTED — refusing would
+        // wedge finalizer removal on such rows — but with a loud warning and
+        // NONE of the Manual-origin surface: no `Delete` deletionPolicy
+        // default, no config label stamp (a policyRef is present to prove the
+        // stamp is withheld deliberately).
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "frobnicated" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true, "{v:?}");
+        let warnings = v["response"]["warnings"]
+            .as_array()
+            .expect("a warning must surface the unclassifiable origin");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or_default().contains("origin")),
+            "{warnings:?}"
+        );
+        let patch = decode_patch(&v);
+        assert!(
+            !patch.iter().any(|op| op["path"] == "/spec/deletionPolicy"),
+            "no deletionPolicy default for an unclassifiable origin: {patch:?}"
+        );
+        assert!(
+            !patch
+                .iter()
+                .any(|op| op["path"].as_str().unwrap_or_default().contains("config")),
+            "no config label stamp for an unclassifiable origin: {patch:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_labeled_create_defaults_delete_but_never_the_config_label() {
+        // A (hand-made) `origin: replicated` row gets the produced-row Delete
+        // default — the controller manages the dest-side manifest lifecycle —
+        // but must NEVER earn the policy config label, even with a policyRef:
+        // GFS retention must never select replicated rows.
+        let mut body = review_body(
+            "Snapshot",
+            "billing",
+            "u",
+            json!({ "policyRef": { "name": "nightly" } }),
+        );
+        body["request"]["object"]["metadata"]["labels"] =
+            json!({ "kopiur.home-operations.com/origin": "replicated" });
+        let (_s, v) = post_review(body).await;
+        assert_eq!(v["response"]["allowed"], true, "{v:?}");
+        let patch = decode_patch(&v);
+        assert!(
+            patch
+                .iter()
+                .any(|op| op["path"] == "/spec/deletionPolicy" && op["value"] == "Delete"),
+            "expected the produced-row Delete default: {patch:?}"
+        );
+        assert!(
+            !patch
+                .iter()
+                .any(|op| op["path"].as_str().unwrap_or_default().contains("config")),
+            "replicated rows must never earn the config label: {patch:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_identity_without_repository_denied() {
         let spec = json!({
             "source": { "identity": { "username": "u", "hostname": "h" } },

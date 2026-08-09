@@ -21,6 +21,7 @@ rules:
       - restores
       - maintenances
       - repositoryreplications
+      - snapshotreplications
       - clusterrepositories
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups:
@@ -40,6 +41,8 @@ rules:
       - maintenances/finalizers
       - repositoryreplications/status
       - repositoryreplications/finalizers
+      - snapshotreplications/status
+      - snapshotreplications/finalizers
       - clusterrepositories/status
       - clusterrepositories/finalizers
     verbs: [get, update, patch]

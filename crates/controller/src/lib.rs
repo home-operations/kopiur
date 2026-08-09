@@ -26,6 +26,7 @@ pub mod restore;
 pub mod server;
 pub mod snapshot;
 pub mod snapshot_policy;
+pub mod snapshot_replication;
 pub mod snapshot_schedule;
 mod startup;
 pub mod sweep;

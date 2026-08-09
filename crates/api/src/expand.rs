@@ -218,21 +218,115 @@ pub fn label_selector_string(
 /// assert!(n.len() <= 63);
 /// ```
 pub fn fanout_child_name(base: &str, policy_ns: &str, pvc_ns: &str, pvc_name: &str) -> String {
-    // The tag hashes the BASE as well as the PVC. That is not belt-and-braces:
-    // `base` is `<schedule>-<YYYYMMDDHHMMSS>` and it is the part that gets
-    // CLIPPED when the name is too long, so a tag over the PVC alone leaves two
-    // different slots of the same schedule+PVC with byte-identical names. The
-    // schedule server-side-applies with force and only skips *terminating*
-    // twins, so the second fire would re-apply onto the already-`Succeeded`
-    // first Snapshot, `run_decision` would return `SucceededSteadyState`, and no
-    // mover Job would ever launch — a whole backup slot vanishing with no error
-    // anywhere.
+    fanout_child_name_for(base, policy_ns, Some((pvc_ns, pvc_name)), None)
+}
+
+/// The marker segment naming the target repository in a multi-repo child name.
+const REPO_MARKER: &str = "-repo-";
+
+/// 8 hex chars of FNV-1a over `input` — the never-clipped injectivity tag
+/// shared by every fan-out naming scheme in this module. One definition so
+/// the hash function can never drift between the schemes.
+fn fnv8(input: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in format!("{base}\n{pvc_ns}/{pvc_name}").as_bytes() {
+    for b in input.as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
-    let tag = format!("{:08x}", (hash & 0xffff_ffff) as u32);
+    format!("{:08x}", (hash & 0xffff_ffff) as u32)
+}
+
+/// The deterministic child `Snapshot` name for one (source-member, repository)
+/// cell of a fan-out — the general form behind [`fanout_child_name`].
+///
+/// * `member`: `Some((pvc_ns, pvc_name))` for a selector-expanded member,
+///   `None` for a policy whose single source needs no per-PVC expansion.
+/// * `repo`: `Some(ref)` for a multi-repository fan-out child, `None` for the
+///   classic single-repo shapes.
+///
+/// The four combinations produce:
+///
+/// | member | repo | name |
+/// |--------|------|------|
+/// | `None` | `None` | `<base>` — the legacy non-fanned name, byte-identical |
+/// | `Some` | `None` | `<base>-pvc-<pslug>-<h8>` — byte-identical to the legacy [`fanout_child_name`] |
+/// | `None` | `Some` | `<base>-repo-<rslug>-<h8>` |
+/// | `Some` | `Some` | `<base>-pvc-<pslug>-repo-<rslug>-<h8>` |
+///
+/// `<h8>` is FNV-1a over the newline-framed FULL unclipped tuple — `base`,
+/// then (when present) `"<pvc_ns>/<pvc_name>"`, then (when present) the
+/// normalized [`repo_key`](crate::common::repo_key) — so clipping any legible
+/// segment never merges two distinct cells, and a policy slug that happens to
+/// contain `-repo-` (pslug `x-repo-y` vs pslug `x` + rslug `y`) still yields
+/// distinct names because the hash inputs differ. Markers and the tag are
+/// NEVER clipped; when over budget the clip order is base → pslug → rslug.
+/// Always ≤ [`MAX_CHILD_NAME`] (63).
+///
+/// The legacy hash input for `repo: None` is exactly the pre-multi-repo
+/// `"{base}\n{pvc_ns}/{pvc_name}"` — pinned by golden tests.
+pub fn fanout_child_name_for(
+    base: &str,
+    policy_ns: &str,
+    member: Option<(&str, &str)>,
+    repo: Option<&crate::common::RepositoryRef>,
+) -> String {
+    // (normalized repo_key for the hash, legible slug for the name).
+    let repo = repo.map(|r| (crate::common::repo_key(r, policy_ns), r.name.as_str()));
+    match (member, repo) {
+        // Legacy single child: the name IS the base (already ≤63 for every
+        // caller-produced base; clipped defensively, identical when in budget).
+        (None, None) => clip(base, MAX_CHILD_NAME).trim_matches('-').to_string(),
+        (Some((pvc_ns, pvc_name)), repo) => {
+            member_child_name(base, policy_ns, pvc_ns, pvc_name, repo.as_ref())
+        }
+        (None, Some((rkey, repo_name))) => {
+            // <base>-repo-<rslug>-<h8>
+            let tag = fnv8(&format!("{base}\n{rkey}"));
+            let rslug = sanitize_dns1123(repo_name);
+            let fixed = REPO_MARKER.len() + 1 + tag.len();
+            let mut base_keep = base.len();
+            let mut rslug_keep = rslug.len();
+            if fixed + base_keep + rslug_keep > MAX_CHILD_NAME {
+                let room = MAX_CHILD_NAME.saturating_sub(fixed);
+                // Clip base first (every sibling shares it), rslug second.
+                rslug_keep = rslug_keep.min(room / 3);
+                base_keep = base_keep.min(room.saturating_sub(rslug_keep));
+            }
+            format!(
+                "{}{REPO_MARKER}{}-{tag}",
+                clip(base, base_keep),
+                clip(&rslug, rslug_keep)
+            )
+            .trim_matches('-')
+            .to_string()
+        }
+    }
+}
+
+/// The `member: Some(..)` arm of [`fanout_child_name_for`]: the legacy
+/// `-pvc-` form (`rkey: None`, byte-identical to the pre-multi-repo
+/// [`fanout_child_name`]) and the combined `-pvc-…-repo-…` form.
+fn member_child_name(
+    base: &str,
+    policy_ns: &str,
+    pvc_ns: &str,
+    pvc_name: &str,
+    repo: Option<&(String, &str)>,
+) -> String {
+    // The tag hashes the BASE as well as the PVC (and, for a multi-repo child,
+    // the repo key). That is not belt-and-braces: `base` is
+    // `<schedule>-<YYYYMMDDHHMMSS>` and it is the part that gets CLIPPED when
+    // the name is too long, so a tag over the PVC alone leaves two different
+    // slots of the same schedule+PVC with byte-identical names. The schedule
+    // server-side-applies with force and only skips *terminating* twins, so
+    // the second fire would re-apply onto the already-`Succeeded` first
+    // Snapshot, `run_decision` would return `SucceededSteadyState`, and no
+    // mover Job would ever launch — a whole backup slot vanishing with no
+    // error anywhere.
+    let tag = match repo {
+        None => fnv8(&format!("{base}\n{pvc_ns}/{pvc_name}")),
+        Some((rkey, _)) => fnv8(&format!("{base}\n{pvc_ns}/{pvc_name}\n{rkey}")),
+    };
 
     let slug_full = if pvc_ns == policy_ns {
         pvc_name.to_string()
@@ -241,25 +335,106 @@ pub fn fanout_child_name(base: &str, policy_ns: &str, pvc_ns: &str, pvc_name: &s
     };
     let slug = sanitize_dns1123(&slug_full);
 
-    // Budget: base + "-pvc-" + slug + "-" + tag. Clip `base` first (it is the
-    // most redundant part — every sibling shares it), then the slug. Never the
-    // tag or the marker.
-    let fixed = FANOUT_MARKER.len() + 1 + tag.len();
-    let mut base_keep = base.len();
-    let mut slug_keep = slug.len();
-    if fixed + base_keep + slug_keep > MAX_CHILD_NAME {
-        let room = MAX_CHILD_NAME.saturating_sub(fixed);
-        // Give the slug up to a third of the room, the base the rest.
-        slug_keep = slug_keep.min(room / 3);
-        base_keep = base_keep.min(room.saturating_sub(slug_keep));
+    match repo {
+        None => {
+            // Budget: base + "-pvc-" + slug + "-" + tag. Clip `base` first (it
+            // is the most redundant part — every sibling shares it), then the
+            // slug. Never the tag or the marker.
+            let fixed = FANOUT_MARKER.len() + 1 + tag.len();
+            let mut base_keep = base.len();
+            let mut slug_keep = slug.len();
+            if fixed + base_keep + slug_keep > MAX_CHILD_NAME {
+                let room = MAX_CHILD_NAME.saturating_sub(fixed);
+                // Give the slug up to a third of the room, the base the rest.
+                slug_keep = slug_keep.min(room / 3);
+                base_keep = base_keep.min(room.saturating_sub(slug_keep));
+            }
+            let name = format!(
+                "{}{FANOUT_MARKER}{}-{tag}",
+                clip(base, base_keep),
+                clip(&slug, slug_keep)
+            );
+            // A clip can leave a trailing '-', which is not a legal DNS-1123 name.
+            name.trim_matches('-').to_string()
+        }
+        Some((_, repo_name)) => {
+            // Combined form: base + "-pvc-" + pslug + "-repo-" + rslug + "-" +
+            // tag. Overhead 5+6+1+8 = 20, room 43. Clip base → pslug → rslug.
+            let rslug = sanitize_dns1123(repo_name);
+            let fixed = FANOUT_MARKER.len() + REPO_MARKER.len() + 1 + tag.len();
+            let mut base_keep = base.len();
+            let mut pslug_keep = slug.len();
+            let mut rslug_keep = rslug.len();
+            if fixed + base_keep + pslug_keep + rslug_keep > MAX_CHILD_NAME {
+                let room = MAX_CHILD_NAME.saturating_sub(fixed);
+                rslug_keep = rslug_keep.min(room / 3);
+                pslug_keep = pslug_keep.min(room.saturating_sub(rslug_keep) / 2);
+                base_keep = base_keep.min(room.saturating_sub(rslug_keep + pslug_keep));
+            }
+            format!(
+                "{}{FANOUT_MARKER}{}{REPO_MARKER}{}-{tag}",
+                clip(base, base_keep),
+                clip(&slug, pslug_keep),
+                clip(&rslug, rslug_keep)
+            )
+            .trim_matches('-')
+            .to_string()
+        }
     }
-    let name = format!(
-        "{}{FANOUT_MARKER}{}-{tag}",
-        clip(base, base_keep),
-        clip(&slug, slug_keep)
-    );
-    // A clip can leave a trailing '-', which is not a legal DNS-1123 name.
-    name.trim_matches('-').to_string()
+}
+
+/// The kopia-cache PVC name for one (policy, repository) cell.
+///
+/// A kopia client cache is REPOSITORY-SPECIFIC state (indexes, metadata, owned
+/// blobs of ONE repository), and the mover mounts it at a fixed
+/// `KOPIA_CACHE_DIRECTORY` — so a multi-repo policy's children must not share
+/// one PVC or they poison each other's cache. Hence:
+///
+/// * `repo: None` — the classic single-repo cache: `kopiur-cache-<policy>`,
+///   byte-identical to the pre-multi-repo name (including its historical lack
+///   of a length cap — an existing PVC must keep matching by name).
+/// * `repo: Some(_)` — a pinned child of a multi-repo policy:
+///   `kopiur-cache-<policy>-<rslug>-<h6>`, where `<h6>` is 6 hex of FNV-1a
+///   over the normalized [`repo_key`](crate::common::repo_key) (never
+///   clipped — the injectivity guarantee, same family as
+///   [`fanout_child_name_for`]) and the whole name is capped at 63 (RFC 1123
+///   label, the same Job-label bound child names honor). Clip order:
+///   policy slug first, then rslug; marker dashes and the tag never.
+///
+/// Ownership stays the policy in both shapes (the caller's concern).
+pub fn cache_pvc_name(
+    policy_name: &str,
+    policy_ns: &str,
+    repo: Option<&crate::common::RepositoryRef>,
+) -> String {
+    const PREFIX: &str = "kopiur-cache-";
+    let Some(repo) = repo else {
+        return format!("{PREFIX}{policy_name}");
+    };
+    let rkey = crate::common::repo_key(repo, policy_ns);
+    // h6: the fnv8 family hash, truncated to 6 hex — enough to disambiguate a
+    // policy's ≤8 repositories while keeping the legible slugs roomy.
+    let tag: String = fnv8(&rkey).chars().take(6).collect();
+    let pslug = sanitize_dns1123(policy_name);
+    let rslug = sanitize_dns1123(&repo.name);
+    let fixed = PREFIX.len() + 2 + tag.len(); // two joining dashes + tag
+    let mut pslug_keep = pslug.len();
+    let mut rslug_keep = rslug.len();
+    if fixed + pslug_keep + rslug_keep > MAX_CHILD_NAME {
+        let room = MAX_CHILD_NAME.saturating_sub(fixed);
+        rslug_keep = rslug_keep.min(room / 3);
+        pslug_keep = pslug_keep.min(room.saturating_sub(rslug_keep));
+    }
+    // Trim any clip-produced trailing '-' per segment (a doubled dash is not a
+    // legal-name problem, but keeping segments clean avoids `--` cosmetics; the
+    // never-clipped tag carries injectivity regardless).
+    format!(
+        "{PREFIX}{}-{}-{tag}",
+        clip(&pslug, pslug_keep).trim_end_matches('-'),
+        clip(&rslug, rslug_keep).trim_end_matches('-')
+    )
+    .trim_matches('-')
+    .to_string()
 }
 
 /// Truncate on a char boundary.
@@ -308,24 +483,135 @@ pub struct ExpandedMember {
 ///
 /// Bounded to 63 chars for the same reason child names are — see
 /// [`fanout_child_name`].
-pub fn group_name(base: &str, namespace: &str, source_index: usize) -> String {
+/// `repo_key` adds the repository dimension for multi-repo fan-out — one
+/// VolumeGroupSnapshot per (repository, slot), because each repo's members are
+/// an independent capture wave (independent-captures semantics: the N groups
+/// are N separate point-in-time CSI snapshots, at N× the CSI quota/load).
+/// Existing callers pass `None` and get the byte-identical legacy name.
+pub fn group_name(
+    base: &str,
+    namespace: &str,
+    source_index: usize,
+    repo_key: Option<&str>,
+) -> String {
     let suffix = "-grp";
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     // The SOURCE INDEX is part of the key, not just the namespace. Two selector
     // sources in one policy have DIFFERENT label selectors, and
     // `resolve_group_stage` builds the VolumeGroupSnapshot's `source.selector`
     // from `sources[sourceIndex]`. Sharing a name across them would have the two
     // members force-SSA conflicting selectors onto one object, so the loser's
     // PVC is never captured and it fails with `GroupMemberMissing`.
-    for b in format!("{namespace}#{source_index}").as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    let tag = format!("{:08x}", (hash & 0xffff_ffff) as u32);
+    let tag = match repo_key {
+        None => fnv8(&format!("{namespace}#{source_index}")),
+        Some(k) => fnv8(&format!("{namespace}#{source_index}#{k}")),
+    };
     let room = MAX_CHILD_NAME - suffix.len() - tag.len() - 1;
     format!("{}-{tag}{suffix}", clip(base, room))
         .trim_matches('-')
         .to_string()
+}
+
+/// One `Snapshot` to mint for a slot/invocation: its deterministic name, the
+/// source pin (for a `pvcSelector` member) and the repository pin (for a
+/// multi-repo fan-out child, NORMALIZED via
+/// [`normalized_repository_ref`](crate::common::normalized_repository_ref)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintCell {
+    /// Deterministic child `Snapshot` name.
+    pub name: String,
+    /// The `spec.source` pin recording which PVC this child covers.
+    pub source: Option<SnapshotSourceRef>,
+    /// The `spec.repository` pin recording which repository this child targets
+    /// (multi-repo fan-out only; `None` keeps the legacy unpinned wire).
+    pub repository: Option<crate::common::RepositoryRef>,
+}
+
+/// **Pure.** Cross one policy's expanded source members with its repository
+/// dimension (#368) into the exact set of `Snapshot`s to mint for one slot or
+/// one `snapshot now` invocation. Lives here so the `SnapshotSchedule`
+/// reconciler and `kubectl kopiur snapshot now` mint byte-identical sets — a
+/// divergence would give the same recipe different children depending on who
+/// fired it.
+///
+/// * Single-repo policy: byte-identical to the pre-multi-repo behavior — the
+///   bare `base_name` child (no pins) for a selector-less recipe, or one
+///   unpinned per-member child.
+/// * Multi-repo policy: one child per (member × repository), named via
+///   [`fanout_child_name_for`] with the repo dimension, `spec.repository`
+///   stamped NORMALIZED; a grouped member's shared `VolumeGroupSnapshot` name
+///   is re-derived PER REPOSITORY ([`group_name`] with the repo key) — each
+///   repo's members are an independent capture wave, so N repos = N groups.
+///
+/// `members: Some(vec![])` (a selector that matched nothing) yields no cells —
+/// the caller warns, as before.
+pub fn mint_cells(
+    policy: &SnapshotPolicy,
+    base_name: &str,
+    members: Option<Vec<ExpandedMember>>,
+) -> Vec<MintCell> {
+    use crate::common::{normalized_repository_ref, repo_key};
+    let policy_ns = policy.namespace().unwrap_or_default();
+    let repos: Option<Vec<&crate::common::RepositoryRef>> =
+        crate::snapshot_policy::is_multi_repo(&policy.spec)
+            .then(|| policy.spec.repositories.iter().collect());
+    match (members, repos) {
+        // Single-repo, no selector: the legacy bare child.
+        (None, None) => vec![MintCell {
+            name: base_name.to_string(),
+            source: None,
+            repository: None,
+        }],
+        // Single-repo selector fan-out: unpinned members, byte-identical.
+        (Some(members), None) => members
+            .into_iter()
+            .map(|m| MintCell {
+                name: m.name,
+                source: Some(m.source),
+                repository: None,
+            })
+            .collect(),
+        // Multi-repo, no selector: one child per repository.
+        (None, Some(repos)) => repos
+            .into_iter()
+            .map(|r| MintCell {
+                name: fanout_child_name_for(base_name, &policy_ns, None, Some(r)),
+                source: None,
+                repository: Some(normalized_repository_ref(r, &policy_ns)),
+            })
+            .collect(),
+        // Multi-repo selector fan-out: members × repositories.
+        (Some(members), Some(repos)) => members
+            .iter()
+            .flat_map(|m| {
+                let policy_ns = policy_ns.clone();
+                let target = match &m.source.target {
+                    SnapshotSourceTarget::Pvc(t) => t.clone(),
+                };
+                repos.iter().map(move |r| {
+                    let rkey = repo_key(r, &policy_ns);
+                    let mut source = m.source.clone();
+                    if let Some(group) = source.group.as_mut() {
+                        group.volume_group_snapshot_name = group_name(
+                            base_name,
+                            &group.namespace,
+                            source.source_index as usize,
+                            Some(&rkey),
+                        );
+                    }
+                    MintCell {
+                        name: fanout_child_name_for(
+                            base_name,
+                            &policy_ns,
+                            Some((&target.namespace, &target.name)),
+                            Some(r),
+                        ),
+                        source: Some(source),
+                        repository: Some(normalized_repository_ref(r, &policy_ns)),
+                    }
+                })
+            })
+            .collect(),
+    }
 }
 
 /// **Pure.** Expand one policy's sources against an already-matched PVC set.
@@ -460,7 +746,17 @@ pub fn expand_sources(
                             > 1)
                     .then(|| SnapshotSourceGroup {
                         namespace: target.namespace.clone(),
-                        volume_group_snapshot_name: group_name(base_name, &target.namespace, index),
+                        // Repo dimension: none HERE — `expand_sources` emits
+                        // repo-agnostic members, and `mint_cells` re-derives
+                        // this name with `Some(repo_key)` per repository for a
+                        // multi-repo policy. Passing None keeps single-repo
+                        // names byte-identical to the legacy form.
+                        volume_group_snapshot_name: group_name(
+                            base_name,
+                            &target.namespace,
+                            index,
+                            None,
+                        ),
                     }),
                 },
             });

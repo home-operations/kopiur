@@ -99,6 +99,18 @@ runtime-minted objects match the chart-shipped role.
 {{- end }}
 
 {{/*
+Dedicated snapshot-replication mover identity (issue #368). The controller
+DERIVES this name from KOPIUR_MOVER_CLUSTERROLE by replacing the `-mover`
+suffix (`io::snapshot_replication_mover_name`), so this helper MUST stay
+`<fullname>-snapshot-replication-mover` — renaming either side alone breaks the
+runtime RoleBinding's roleRef. The controller mints the same-named SA +
+RoleBinding per namespace, only for snapshot-replication mover Jobs.
+*/}}
+{{- define "kopiur.snapshotReplicationMoverName" -}}
+{{- printf "%s-snapshot-replication-mover" (include "kopiur.fullname" .) | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Webhook component name.
 */}}
 {{- define "kopiur.webhook.fullname" -}}

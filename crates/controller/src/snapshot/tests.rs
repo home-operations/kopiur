@@ -254,11 +254,12 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
     kopiur_api::SnapshotPolicy::new(
         "pg",
         kopiur_api::SnapshotPolicySpec {
-            repository: kopiur_api::common::RepositoryRef {
+            repository: Some(kopiur_api::common::RepositoryRef {
                 kind: Default::default(),
                 name: "r".into(),
                 namespace: None,
-            },
+            }),
+            repositories: vec![],
             identity: None,
             sources: vec![],
             copy_method: Default::default(),
@@ -391,6 +392,7 @@ fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>
     let mut backup = Snapshot::new(
         "b1",
         kopiur_api::snapshot::SnapshotSpec {
+            repository: None,
             source: None,
             policy_ref: Some(kopiur_api::common::PolicyRef {
                 name: "pg".into(),
@@ -441,8 +443,9 @@ fn needs_repository_backfill_is_false_without_a_policy_ref() {
 #[test]
 fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
     let policy = sample_policy();
+    let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
     assert_eq!(
-        super::plan::backfill_patch_body(&policy, "ns", false, false),
+        super::plan::backfill_patch_body(&policy, "ns", false, false, Some(repo_ref)),
         None
     );
 }
@@ -450,9 +453,10 @@ fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
 #[test]
 fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     let policy = sample_policy();
+    let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
 
     // Only the repository pin needs backfilling: the body carries just that key.
-    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true)
+    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true, Some(repo_ref))
         .expect("repository backfill needed");
     let resolved = repo_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("credentialProjection"));
@@ -462,17 +466,41 @@ fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     assert_eq!(resolved["repository"]["namespace"], "ns");
 
     // Only the projection pin needs backfilling: the body carries just that key.
-    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false)
-        .expect("projection backfill needed");
+    let projection_only =
+        super::plan::backfill_patch_body(&policy, "ns", true, false, Some(repo_ref))
+            .expect("projection backfill needed");
     let resolved = projection_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("repository"));
     assert_eq!(resolved["credentialProjection"]["enabled"], false);
 
     // Both needed: both keys present.
-    let both = super::plan::backfill_patch_body(&policy, "ns", true, true).expect("both needed");
+    let both = super::plan::backfill_patch_body(&policy, "ns", true, true, Some(repo_ref))
+        .expect("both needed");
     let resolved = both["resolved"].as_object().expect("object");
     assert!(resolved.contains_key("credentialProjection"));
     assert!(resolved.contains_key("repository"));
+}
+
+#[test]
+fn backfill_patch_body_skips_the_repository_when_it_is_unknowable() {
+    // A pre-feature (unpinned) child of a now-multi-repo policy: the effective
+    // repository is unknowable (`effective_repository_ref` refuses), so the
+    // caller passes `None` — the repository half must be SKIPPED (never
+    // guessed), while the projection half still backfills.
+    let policy = sample_policy();
+    assert_eq!(
+        super::plan::backfill_patch_body(&policy, "ns", false, true, None),
+        None,
+        "repository-only backfill with an unknowable repo must be a no-op"
+    );
+    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, true, None)
+        .expect("projection backfill still applies");
+    let resolved = projection_only["resolved"].as_object().expect("object");
+    assert!(resolved.contains_key("credentialProjection"));
+    assert!(
+        !resolved.contains_key("repository"),
+        "an unknowable repository must never be guessed into the pin"
+    );
 }
 
 // backend_to_repository_connect's exhaustive every-variant test moved with
@@ -522,11 +550,12 @@ fn config_with_source(name: &str, source: kopiur_api::snapshot_policy::Source) -
     SnapshotPolicy::new(
         name,
         SnapshotPolicySpec {
-            repository: RepositoryRef {
+            repository: Some(RepositoryRef {
                 kind: RepositoryKind::Repository,
                 name: "repo".into(),
                 namespace: None,
-            },
+            }),
+            repositories: vec![],
             identity: None,
             sources: vec![source],
             copy_method: Default::default(),
@@ -556,6 +585,7 @@ fn dummy_backup() -> Snapshot {
     Snapshot::new(
         "b1",
         kopiur_api::snapshot::SnapshotSpec {
+            repository: None,
             source: None,
             policy_ref: None,
             tags: None,
@@ -1279,7 +1309,11 @@ fn single_external_delete_with_live_schedule_unchanged() {
 
 #[test]
 fn operator_pruned_bypasses_guard_and_breaker() {
-    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+    for kind in [
+        PrunedBy::Retention,
+        PrunedBy::FailedHistory,
+        PrunedBy::ReplicationRetention,
+    ] {
         let a = pruned(kind);
         let plan = plan_deletion(DeletionFacts {
             owner: OwnerState::GoneOrReplaced, // would otherwise trigger the guard
@@ -1291,7 +1325,7 @@ fn operator_pruned_bypasses_guard_and_breaker() {
     }
 }
 
-// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 3×3 matrix (M2) --
+// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 4×3 matrix (M2) --
 
 #[test]
 fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
@@ -1343,7 +1377,26 @@ fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
             DeletionPolicy::Orphan,
             DeletionPlan::OrphanSnapshot,
         ),
+        // A SnapshotReplication's own retention prune of its dest-side copies:
+        // classifies OPERATOR exactly like Retention (bypasses guard+breaker).
+        (
+            PrunedBy::ReplicationRetention,
+            DeletionPolicy::Delete,
+            DeletionPlan::DeleteSnapshot,
+        ),
+        (
+            PrunedBy::ReplicationRetention,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::ReplicationRetention,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
     ];
+    // The matrix is total: every PrunedBy variant × every DeletionPolicy.
+    assert_eq!(cases.len(), kopiur_api::snapshot::PrunedBy::ALL.len() * 3);
     for (kind, policy, expected) in cases {
         let a = pruned(kind);
         // Every operator prune bypasses BOTH the schedule cascade guard and
@@ -1539,7 +1592,11 @@ fn ns_terminating_retention_prune_keeps_prune_semantics_never_held() {
     // `plan_external`, so the ns-teardown opt-in does not turn retention into a
     // breaker-gated mass deletion — retention must keep working during an
     // incident. This is the invariant the PolicyCascade fix must not disturb.
-    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+    for kind in [
+        PrunedBy::Retention,
+        PrunedBy::FailedHistory,
+        PrunedBy::ReplicationRetention,
+    ] {
         let a = pruned(kind);
         let plan = plan_deletion(DeletionFacts {
             ns_terminating: true,
@@ -1589,7 +1646,7 @@ fn orphaned_ownerref_children_get_their_own_policy() {
 // `Origin::Adopted` rows run through `plan_deletion` exactly like a produced
 // (Scheduled/Manual) row once `effective_deletion_policy` has resolved their
 // policy — unlike Discovered, they are NOT forced to Retain. These lock that
-// in end-to-end: `effective_deletion_policy(_, Origin::Adopted)` feeding
+// in end-to-end: `effective_deletion_policy(_, Some(Origin::Adopted))` feeding
 // `plan_deletion`/`counts_toward_breaker`.
 
 #[test]
@@ -1598,7 +1655,7 @@ fn adopted_external_delete_with_no_schedule_owner_deletes() {
     // with no schedule owner and the breaker allowed deletes exactly like a
     // produced row's would.
     let a = BTreeMap::new();
-    let policy = effective_deletion_policy(None, Origin::Adopted);
+    let policy = effective_deletion_policy(None, Some(Origin::Adopted));
     assert_eq!(policy, DeletionPolicy::Delete);
     let plan = plan_deletion(DeletionFacts {
         policy,
@@ -1614,7 +1671,7 @@ fn adopted_external_delete_counts_toward_and_is_held_by_the_breaker() {
     // Adopted external deletes count toward the per-repo mass-deletion breaker
     // exactly like produced ones — the breaker doesn't special-case origin.
     let a = BTreeMap::new();
-    let policy = effective_deletion_policy(None, Origin::Adopted);
+    let policy = effective_deletion_policy(None, Some(Origin::Adopted));
 
     assert!(counts_toward_breaker(DeletionFacts {
         policy,
@@ -1638,7 +1695,7 @@ fn adopted_retention_prune_deletes_never_held() {
     // an adopted row deletes even with the breaker Held (operator prunes always
     // bypass the breaker, same as any produced row).
     let a = pruned(PrunedBy::Retention);
-    let policy = effective_deletion_policy(Some(DeletionPolicy::Delete), Origin::Adopted);
+    let policy = effective_deletion_policy(Some(DeletionPolicy::Delete), Some(Origin::Adopted));
     let plan = plan_deletion(DeletionFacts {
         policy,
         owner: OwnerState::NoScheduleOwner,
@@ -1654,7 +1711,7 @@ fn adopted_policy_cascade_prune_retains_kopia_data() {
     // row: the loud downgrade (RetainSnapshotOnPolicyDelete) fires for Adopted
     // exactly as it does for a produced row under an effective Delete policy.
     let a = pruned(PrunedBy::PolicyCascade);
-    let policy = effective_deletion_policy(None, Origin::Adopted);
+    let policy = effective_deletion_policy(None, Some(Origin::Adopted));
     let plan = plan_deletion(DeletionFacts {
         policy,
         ..base_facts(&a)
@@ -2304,7 +2361,11 @@ fn counts_toward_breaker_retention_prune_stays_exempt_even_under_ns_teardown_del
     // keep working during an incident and are NEVER held. That exemption holds
     // EVERYWHERE — including a terminating namespace under `Delete` — so an
     // operator prune never trips the breaker.
-    for kind in [PrunedBy::Retention, PrunedBy::FailedHistory] {
+    for kind in [
+        PrunedBy::Retention,
+        PrunedBy::FailedHistory,
+        PrunedBy::ReplicationRetention,
+    ] {
         let a = pruned(kind);
         assert!(
             !counts_toward_breaker(DeletionFacts {
@@ -2316,6 +2377,33 @@ fn counts_toward_breaker_retention_prune_stays_exempt_even_under_ns_teardown_del
             "{kind:?} must stay breaker-exempt under ns-teardown Delete"
         );
     }
+}
+
+#[test]
+fn breaker_relevant_classifies_every_pruned_by_variant() {
+    // The single source of truth for stamp exemption, pinned over PrunedBy::ALL
+    // so a new variant cannot ship without a deliberate row here (the match in
+    // `breaker_relevant` won't compile until classified, and this won't pass
+    // until the expected set is updated). Operator prunes (retention,
+    // failed-history, replication-retention) are exempt; unstamped and
+    // policy-cascade count.
+    use kopiur_api::snapshot::PrunedBy;
+    assert!(super::plan::breaker_relevant(None), "unstamped is external");
+    let relevant: Vec<_> = PrunedBy::ALL
+        .iter()
+        .filter(|p| super::plan::breaker_relevant(Some(**p)))
+        .map(|p| p.annotation_value())
+        .collect();
+    assert_eq!(relevant, ["policy-cascade"]);
+    let exempt: Vec<_> = PrunedBy::ALL
+        .iter()
+        .filter(|p| !super::plan::breaker_relevant(Some(**p)))
+        .map(|p| p.annotation_value())
+        .collect();
+    assert_eq!(
+        exempt,
+        ["retention", "failed-history", "replication-retention"]
+    );
 }
 
 #[test]
@@ -2790,7 +2878,12 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
     let repo = resolved_s3_repo();
     let (ws, _, _, _) =
         build_backup_run(&dummy_backup(), &cfg, &repo, "media-ns", "media").unwrap();
-    let resolved = resolved_run_status(&cfg, "media-ns", &ws);
+    let resolved = resolved_run_status(
+        &cfg,
+        "media-ns",
+        &ws,
+        kopiur_api::single_repository_ref(&cfg.spec).unwrap(),
+    );
     // The deletion path re-resolves the repo from this pinned ref alone, so
     // it must carry the namespace the recipe resolved against.
     let pinned = resolved.repository.expect("repository pinned");
@@ -2819,7 +2912,7 @@ fn discovered_is_forced_to_retain_regardless_of_spec() {
         Some(DeletionPolicy::Retain),
     ] {
         assert_eq!(
-            effective_deletion_policy(p, Origin::Discovered),
+            effective_deletion_policy(p, Some(Origin::Discovered)),
             DeletionPolicy::Retain
         );
     }
@@ -2828,11 +2921,11 @@ fn discovered_is_forced_to_retain_regardless_of_spec() {
 #[test]
 fn produced_defaults_to_delete_when_unset() {
     assert_eq!(
-        effective_deletion_policy(None, Origin::Scheduled),
+        effective_deletion_policy(None, Some(Origin::Scheduled)),
         DeletionPolicy::Delete
     );
     assert_eq!(
-        effective_deletion_policy(None, Origin::Manual),
+        effective_deletion_policy(None, Some(Origin::Manual)),
         DeletionPolicy::Delete
     );
 }
@@ -2840,11 +2933,11 @@ fn produced_defaults_to_delete_when_unset() {
 #[test]
 fn produced_honors_explicit_spec_policy() {
     assert_eq!(
-        effective_deletion_policy(Some(DeletionPolicy::Orphan), Origin::Manual),
+        effective_deletion_policy(Some(DeletionPolicy::Orphan), Some(Origin::Manual)),
         DeletionPolicy::Orphan
     );
     assert_eq!(
-        effective_deletion_policy(Some(DeletionPolicy::Retain), Origin::Scheduled),
+        effective_deletion_policy(Some(DeletionPolicy::Retain), Some(Origin::Scheduled)),
         DeletionPolicy::Retain
     );
 }
@@ -2855,13 +2948,42 @@ fn adopted_defaults_to_delete_like_produced_not_retain() {
     // NOT forced to Retain like Discovered — retention is the whole point of
     // adoption, so the default must be Delete when the spec leaves it unset.
     assert_eq!(
-        effective_deletion_policy(None, Origin::Adopted),
+        effective_deletion_policy(None, Some(Origin::Adopted)),
         DeletionPolicy::Delete
     );
     assert_eq!(
-        effective_deletion_policy(Some(DeletionPolicy::Orphan), Origin::Adopted),
+        effective_deletion_policy(Some(DeletionPolicy::Orphan), Some(Origin::Adopted)),
         DeletionPolicy::Orphan
     );
+}
+
+#[test]
+fn replicated_defaults_to_delete_like_produced() {
+    // A replication copy CR is minted WITH `deletionPolicy: Delete`; the
+    // produced-row fallback matches that contract for hand-made rows too.
+    assert_eq!(
+        effective_deletion_policy(None, Some(Origin::Replicated)),
+        DeletionPolicy::Delete
+    );
+    assert_eq!(
+        effective_deletion_policy(Some(DeletionPolicy::Retain), Some(Origin::Replicated)),
+        DeletionPolicy::Retain
+    );
+}
+
+#[test]
+fn unparseable_origin_is_forced_to_retain_regardless_of_spec() {
+    // `None` = resolve_origin could not parse the origin marker: the finalizer
+    // of a row this build cannot classify must never delete a manifest, while
+    // Retain still releases the CR (never wedges deletion).
+    for p in [
+        None,
+        Some(DeletionPolicy::Delete),
+        Some(DeletionPolicy::Orphan),
+        Some(DeletionPolicy::Retain),
+    ] {
+        assert_eq!(effective_deletion_policy(p, None), DeletionPolicy::Retain);
+    }
 }
 
 // --- resolve_origin: status-first precedence over the origin label (M5) ----
@@ -2889,7 +3011,7 @@ fn backup_with_origin(status_origin: Option<Origin>, label: Option<&str>) -> Sna
 fn resolve_origin_defaults_to_manual_with_no_status_or_label() {
     assert_eq!(
         resolve_origin(&backup_with_origin(None, None)),
-        Origin::Manual
+        Some(Origin::Manual)
     );
 }
 
@@ -2899,7 +3021,7 @@ fn resolve_origin_status_wins_over_a_conflicting_label() {
     // from before an M6 adoption re-stamped status) must never demote an
     // already-adopted row back to Discovered.
     let backup = backup_with_origin(Some(Origin::Adopted), Some("discovered"));
-    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+    assert_eq!(resolve_origin(&backup), Some(Origin::Adopted));
 }
 
 #[test]
@@ -2907,7 +3029,32 @@ fn resolve_origin_reads_adopted_from_the_label_when_status_is_unset() {
     // Label-only adoption (status not yet stamped, e.g. mid-reconcile) still
     // resolves to Adopted — the label is the fallback, not just Discovered's.
     let backup = backup_with_origin(None, Some("adopted"));
-    assert_eq!(resolve_origin(&backup), Origin::Adopted);
+    assert_eq!(resolve_origin(&backup), Some(Origin::Adopted));
+}
+
+#[test]
+fn resolve_origin_every_canonical_label_value_resolves() {
+    // Driven off Origin::ALL so a new variant (e.g. `replicated`) cannot ship
+    // without label-fallback resolution.
+    for origin in Origin::ALL {
+        let backup = backup_with_origin(None, Some(origin.label_value()));
+        assert_eq!(resolve_origin(&backup), Some(*origin), "{origin:?}");
+    }
+}
+
+#[test]
+fn resolve_origin_unrecognized_label_is_none_never_manual() {
+    // THE safety fix: an origin label this build cannot parse (typo, forgery,
+    // or a NEWER operator's value during version skew) must resolve to None —
+    // the old `_ => Origin::Manual` arm routed such a row into the backup-run
+    // machinery and minted a mover Job for a foreign snapshot.
+    for garbage in ["Replicated", "frobnicated", "", "manual "] {
+        let backup = backup_with_origin(None, Some(garbage));
+        assert_eq!(resolve_origin(&backup), None, "{garbage:?}");
+    }
+    // status.origin stays canonical: a decoded status wins over a broken label.
+    let backup = backup_with_origin(Some(Origin::Scheduled), Some("frobnicated"));
+    assert_eq!(resolve_origin(&backup), Some(Origin::Scheduled));
 }
 
 // --- needs_terminal_pin: shared idempotence gate for the Discovered/Adopted
@@ -2970,7 +3117,7 @@ fn adopted_row_has_provenance_gates_the_succeeded_pin() {
     // `has_history` (suppressing a recreated policy's scan). On HEAD
     // `pin_adopted_row` pinned ANY Adopted-resolving row.
     let forged = backup_with_origin(None, Some("adopted"));
-    assert_eq!(resolve_origin(&forged), Origin::Adopted);
+    assert_eq!(resolve_origin(&forged), Some(Origin::Adopted));
     assert!(
         !super::plan::adopted_row_has_provenance(&forged),
         "a bare origin:adopted label carries no provenance"

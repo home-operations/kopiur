@@ -5,12 +5,61 @@ use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{CopyMethod, Hook, HttpRequestHook, SnapshotPolicySpec};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 
+/// Validate the `spec.repository` / `spec.repositories` surface of a
+/// `SnapshotPolicy`, accumulating every independent problem:
+///
+///   1. **Exactly one of** the two shapes (mirrors the spec-level CEL rule, so
+///      the refusal also covers objects stored before the CRD carried it).
+///   2. Per-ref shape validity ([`validate_repository_ref`] over whatever
+///      refs exist — tolerant iteration, one error per bad ref).
+///   3. **Duplicate rejection** over `spec.repositories`, normalized via
+///      [`crate::common::repo_key`]. Validators are spec-only (no owner
+///      namespace here), so the key uses a fixed `""` owner-namespace
+///      sentinel: it is identical for every entry of ONE policy, which is all
+///      duplicate detection needs. (A `namespace`-omitted and an explicit
+///      same-namespace ref to one repository are not caught here; the webhook
+///      guards that identity-level collision separately.)
+///   4. `hooks` × `repositories` mutual exclusion
+///      ([`ValidationError::PolicyHooksWithRepositories`]) — hooks quiesce a
+///      workload around ONE capture; N concurrent fan-out children void that
+///      contract (use a single-repo policy + `SnapshotReplication` instead).
+///
+/// A well-formed multi-repo spec is ACCEPTED — the M7 "not yet enabled"
+/// feature gate was lifted once the fan-out data path (per-child pins,
+/// per-repo retention/cache/verification) landed end-to-end.
+fn validate_policy_repositories(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    if let Err(e) = crate::snapshot_policy::policy_repositories(spec) {
+        errs.push(e);
+    }
+    for r in crate::snapshot_policy::repository_refs(spec) {
+        if let Err(e) = validate_repository_ref(r) {
+            errs.push(e);
+        }
+    }
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (i, r) in spec.repositories.iter().enumerate() {
+        let key = crate::common::repo_key(r, "");
+        if let Some(&first) = seen.get(&key) {
+            errs.push(ValidationError::PolicyRepositoriesDuplicate {
+                key,
+                first,
+                second: i,
+            });
+        } else {
+            seen.insert(key, i);
+        }
+    }
+    if crate::snapshot_policy::is_multi_repo(spec) && spec.hooks.is_some() {
+        errs.push(ValidationError::PolicyHooksWithRepositories);
+    }
+    errs
+}
+
 /// Validate a `SnapshotPolicy` spec, accumulating all problems.
 pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     let mut errs = Vec::new();
-    if let Err(e) = validate_repository_ref(&spec.repository) {
-        errs.push(e);
-    }
+    errs.extend(validate_policy_repositories(spec));
     if spec.sources.is_empty() {
         errs.push(ValidationError::MissingRequiredField {
             field: "spec.sources (at least one source required)".to_string(),
@@ -566,14 +615,24 @@ fn validate_http_hook_headers(
 /// Validate a `Snapshot` spec for a given origin, accumulating all problems.
 ///
 /// `origin` is supplied by the caller because the canonical value lives in
-/// `status.origin` / the `kopiur.home-operations.com/origin` label, not in `spec` (ADR §3.4).
-pub fn validate_backup(spec: &SnapshotSpec, origin: Origin) -> Vec<ValidationError> {
+/// `status.origin` / the `kopiur.home-operations.com/origin` label, not in
+/// `spec` (ADR §3.4). `None` means the row carries an origin marker the caller
+/// could not parse (`Origin::parse` returned `None`): the origin-GATED rules
+/// (deletionPolicy legality, onScheduleDelete) are **skipped, not failed** —
+/// refusing would wedge metadata-only writes (finalizer removal above all) on
+/// rows written under a newer operator during version skew, while skipping is
+/// safe because the controller's conservative resolution of an unparseable
+/// origin (forced `Retain`, never scheduled, never run) makes both gated
+/// fields inert at reconcile time. The origin-independent rules still run.
+pub fn validate_backup(spec: &SnapshotSpec, origin: Option<Origin>) -> Vec<ValidationError> {
     let mut errs = Vec::new();
-    if let Err(e) = validate_backup_deletion_policy(origin, spec.deletion_policy) {
-        errs.push(e);
-    }
-    if let Err(e) = validate_backup_on_schedule_delete(origin, spec.on_schedule_delete) {
-        errs.push(e);
+    if let Some(origin) = origin {
+        if let Err(e) = validate_backup_deletion_policy(origin, spec.deletion_policy) {
+            errs.push(e);
+        }
+        if let Err(e) = validate_backup_on_schedule_delete(origin, spec.on_schedule_delete) {
+            errs.push(e);
+        }
     }
     if let Some(fp) = &spec.failure_policy
         && let Err(e) = validate_failure_policy(fp, "Snapshot")
@@ -672,13 +731,15 @@ pub fn validate_snapshot_tags(
 /// policy on one is meaningless (their owner is a repository, not a schedule)
 /// and forbidden, like a non-Retain deletionPolicy. `origin: adopted` is
 /// forbidden for the same reason: an adopted row's owner is the
-/// `SnapshotPolicy` it was re-attached to, never a `SnapshotSchedule`.
+/// `SnapshotPolicy` it was re-attached to, never a `SnapshotSchedule`. So is
+/// `origin: replicated`: a copy CR belongs to its `SnapshotReplication`, and
+/// no `SnapshotSchedule` ever fires (or cascades onto) one.
 pub fn validate_backup_on_schedule_delete(
     origin: Origin,
     value: Option<ScheduleDeletePolicy>,
 ) -> ValidationResult {
     match origin {
-        Origin::Discovered | Origin::Adopted => match value {
+        Origin::Discovered | Origin::Adopted | Origin::Replicated => match value {
             None => Ok(()),
             Some(v) => Err(ValidationError::DiscoveredCannotSetOnScheduleDelete {
                 origin: origin.label_value(),

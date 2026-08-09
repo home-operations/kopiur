@@ -24,15 +24,39 @@ use serde::{Deserialize, Serialize};
     shortname = "kopiasp",
     category = "kopiur",
     printcolumn = r#"{"name":"Repository","type":"string","jsonPath":".spec.repository.name"}"#,
+    printcolumn = r#"{"name":"Repositories","type":"string","jsonPath":".status.repositorySummary"}"#,
     printcolumn = r#"{"name":"Last-Snapshot","type":"date","jsonPath":".status.lastSuccessfulSnapshot"}"#,
     printcolumn = r#"{"name":"Last-Verified","type":"date","jsonPath":".status.lastVerified"}"#,
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// §15: operator-authored spec-level CEL — exactly one of `repository` /
+// `repositories` (apiserver + CI validation, complementing the shared
+// validator's [`crate::validate::validate_backup_config`] check). Both are
+// optional at the type level so old single-repo objects keep decoding; the
+// integer-sum form matches the per-item `Source` rule's cheap-constant style.
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1",
+    "message": "exactly one of repository, repositories"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotPolicySpec {
     /// Discriminated reference to a `Repository` or `ClusterRepository`.
-    pub repository: RepositoryRef,
+    /// Mutually exclusive with `repositories` (exactly one of the two is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRef>,
+    /// Multi-repository fan-out: every listed `Repository`/`ClusterRepository`
+    /// receives its own independent backup of each source — one `Snapshot` CR +
+    /// one mover Job per (source, repository) pair, so the captures are separate
+    /// kopia snapshots, not copies of one another. Identity resolves per-repo
+    /// under that repository's `identityDefaults`. Mutually exclusive with
+    /// `repository` (exactly one of the two is set) AND with `hooks`: with N
+    /// concurrent children the first finisher would run the thaw hook while the
+    /// other N-1 movers still read — use a single-repo policy plus a
+    /// `SnapshotReplication` when hooks are needed for a second target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(min = 1, max = 8))]
+    pub repositories: Vec<RepositoryRef>,
     /// Identity overrides — what kopia records as `username@hostname:path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
@@ -107,6 +131,153 @@ pub struct SnapshotPolicySpec {
     /// `catalog.adoption` (see [`effective_adoption`](crate::common::effective_adoption)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adoption: Option<crate::common::SnapshotAdoption>,
+}
+
+/// The repository target(s) of a `SnapshotPolicy`, as an exactly-one-of view
+/// over `spec.repository` / `spec.repositories`. Borrowed so consumers match
+/// without cloning; produced by [`policy_repositories`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRepositories<'a> {
+    /// The classic single-repo shape (`spec.repository`).
+    Single(&'a RepositoryRef),
+    /// The multi-repository fan-out shape (`spec.repositories`, 1–8 entries).
+    Multi(&'a [RepositoryRef]),
+}
+
+/// THE exactly-one-of resolver for a policy's repository target(s).
+///
+/// Never panics: a stored CR can carry garbage (both set, or neither — e.g. a
+/// write that raced an old CRD schema), so the invalid shapes come back as
+/// [`ValidationError::PolicyRepositoryExactlyOne`] for the caller's defensive
+/// error path rather than as an `unwrap` in a reconciler.
+///
+/// ```
+/// use kopiur_api::snapshot_policy::{PolicyRepositories, policy_repositories};
+///
+/// let spec: kopiur_api::SnapshotPolicySpec = serde_json::from_value(serde_json::json!({
+///     "repository": { "kind": "Repository", "name": "r" },
+///     "sources": [ { "pvc": { "name": "d" } } ],
+/// }))
+/// .unwrap();
+/// assert!(matches!(
+///     policy_repositories(&spec),
+///     Ok(PolicyRepositories::Single(r)) if r.name == "r"
+/// ));
+/// ```
+pub fn policy_repositories(
+    spec: &SnapshotPolicySpec,
+) -> Result<PolicyRepositories<'_>, crate::error::ValidationError> {
+    match (&spec.repository, spec.repositories.is_empty()) {
+        (Some(single), true) => Ok(PolicyRepositories::Single(single)),
+        (None, false) => Ok(PolicyRepositories::Multi(&spec.repositories)),
+        (Some(_), false) => {
+            Err(crate::error::ValidationError::PolicyRepositoryExactlyOne { got: "both" })
+        }
+        (None, true) => {
+            Err(crate::error::ValidationError::PolicyRepositoryExactlyOne { got: "neither" })
+        }
+    }
+}
+
+/// The single repository a policy targets, for code paths that genuinely
+/// cannot take a multi-repository policy.
+///
+/// The multi-repo arm returns
+/// [`ValidationError::PolicySingleRepositoryRequired`](crate::error::ValidationError::PolicySingleRepositoryRequired)
+/// so a consumer that needs "the one repository" fails LOUDLY instead of silently picking
+/// repository #1. Multi-repo policies address per-repository work through
+/// each child `Snapshot`'s `spec.repository` pin
+/// ([`crate::snapshot::effective_repository_ref`]); callers that can handle
+/// both shapes should match [`policy_repositories`] instead. Callers that
+/// treat multi as "no single answer" (e.g. the restore readiness gate's
+/// non-fatal repository lookup) `.ok()` this deliberately.
+pub fn single_repository_ref(
+    spec: &SnapshotPolicySpec,
+) -> Result<&RepositoryRef, crate::error::ValidationError> {
+    match policy_repositories(spec)? {
+        PolicyRepositories::Single(r) => Ok(r),
+        PolicyRepositories::Multi(_) => {
+            Err(crate::error::ValidationError::PolicySingleRepositoryRequired)
+        }
+    }
+}
+
+/// Tolerant iterator over every repository ref a policy names — whatever
+/// exists, in `repository`-then-`repositories` order, no validity judgment.
+/// For any-of predicates (watch mappers, repo-edit guards, tenancy loops)
+/// that must not error on a malformed stored CR.
+pub fn repository_refs(spec: &SnapshotPolicySpec) -> impl Iterator<Item = &RepositoryRef> {
+    spec.repository.iter().chain(spec.repositories.iter())
+}
+
+/// Whether this policy uses the multi-repository fan-out shape.
+pub fn is_multi_repo(spec: &SnapshotPolicySpec) -> bool {
+    !spec.repositories.is_empty()
+}
+
+/// The repository a `fromPolicy` restore reads, resolved from the policy's
+/// repository set + the restore's optional explicit `spec.repository`.
+/// **Pure** — the resolver backstop shared with the M9 webhook mirror, so the
+/// two can never disagree.
+///
+/// - **Explicit selection** — it must be a MEMBER of the policy's repository
+///   set (compared by normalized [`repo_key`](crate::common::repo_key); the
+///   explicit ref resolves relative to `restore_ns`, the members relative to
+///   `policy_ns`), else
+///   [`ValidationError`](crate::error::ValidationError::RestoreRepositoryNotInPolicy):
+///   a typo'd ref must not silently read a repository the recipe never wrote
+///   to. A member ref is returned verbatim (the caller resolves it in the
+///   restore's namespace, exactly as an explicit ref always has been).
+/// - **No selection, single-repo** — the policy's one repository, verbatim.
+/// - **No selection, multi-repo** —
+///   [`ValidationError::RestoreRepositorySelectionRequired`](crate::error::ValidationError::RestoreRepositorySelectionRequired),
+///   naming every valid choice; repository #1 is never guessed (the N
+///   repositories are independent captures that can diverge).
+pub fn select_restore_repository(
+    policy: &SnapshotPolicySpec,
+    policy_name: &str,
+    policy_ns: &str,
+    explicit: Option<&RepositoryRef>,
+    restore_ns: &str,
+) -> Result<RepositoryRef, crate::error::ValidationError> {
+    use crate::common::repo_key;
+    let repos = policy_repositories(policy)?;
+    let members: Vec<&RepositoryRef> = match repos {
+        PolicyRepositories::Single(r) => vec![r],
+        PolicyRepositories::Multi(rs) => rs.iter().collect(),
+    };
+    let valid = || {
+        members
+            .iter()
+            .map(|m| repo_key(m, policy_ns))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match explicit {
+        Some(given) => {
+            let given_key = repo_key(given, restore_ns);
+            if members.iter().any(|m| repo_key(m, policy_ns) == given_key) {
+                Ok(given.clone())
+            } else {
+                Err(
+                    crate::error::ValidationError::RestoreRepositoryNotInPolicy {
+                        given: given_key,
+                        policy: policy_name.to_string(),
+                        valid: valid(),
+                    },
+                )
+            }
+        }
+        None => match repos {
+            PolicyRepositories::Single(r) => Ok(r.clone()),
+            PolicyRepositories::Multi(_) => Err(
+                crate::error::ValidationError::RestoreRepositorySelectionRequired {
+                    policy: policy_name.to_string(),
+                    valid: valid(),
+                },
+            ),
+        },
+    }
 }
 
 /// Deletion semantics for the `Snapshot`s carrying a `SnapshotPolicy`'s config
@@ -702,11 +873,54 @@ pub struct SnapshotPolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
     /// RFC3339 timestamp of the most recent successful verification (any tier).
+    /// Single-repo: stamped directly by the verify mover. Multi-repo: computed
+    /// by the controller as the MINIMUM `lastVerified` across the CURRENT
+    /// repositories ("everything is verified as of T"), absent until every
+    /// current repository has verified at least once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
+    /// Per-repository verification records for a multi-repository policy
+    /// (#368): one entry per CURRENT `spec.repositories` member, maintained by
+    /// the controller (single writer — entries for repositories no longer in
+    /// the spec are pruned). Empty (elided) for the single-repo shape, whose
+    /// wire stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification: Vec<RepoVerification>,
+    /// Internal write channel for per-repository verification (#368): RFC3339
+    /// markers keyed by the normalized repository key
+    /// ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
+    /// ONLY its own key — a JSON merge patch merges map keys, so two concurrent
+    /// per-repo verifies can never clobber one another (a Vec would be replaced
+    /// wholesale). The controller folds these into `verification` on its next
+    /// pass and prunes keys for repositories no longer in the spec. Never
+    /// written for the single-repo shape.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub verification_stamps: std::collections::BTreeMap<String, String>,
+    /// Human-readable summary of the policy's repository target(s) for the
+    /// `Repositories` print column: the comma-joined repository names (the one
+    /// name for the single-repo shape), capped near a kubectl column width
+    /// with a `+N` overflow marker. Written by the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_summary: Option<String>,
     /// Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+/// One repository's verification record on a multi-repository policy
+/// (`status.verification`). Entry-keyed by the (normalized) repository ref so
+/// per-repo verify results never collapse into one flat timestamp.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoVerification {
+    /// The repository this record covers, normalized
+    /// ([`normalized_repository_ref`](crate::common::normalized_repository_ref))
+    /// so it re-resolves from anywhere.
+    pub repository: RepositoryRef,
+    /// RFC3339 timestamp of the most recent successful verification (any tier)
+    /// against THIS repository; absent until its first successful verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<String>,
 }
 
 /// The recipe as kopia would see it, pinned at admission and never re-rendered.
@@ -719,6 +933,35 @@ pub struct ResolvedPolicy {
     /// The concrete PVCs + source paths after selector expansion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<ResolvedPolicySource>,
+    /// Per-repository resolution for a MULTI-repository policy
+    /// (`spec.repositories`): one entry per member, each carrying the identity
+    /// resolved under THAT repository's `identityDefaults` (the unit of
+    /// identity is the `(repository, identity)` pair — N members means N
+    /// independent kopia lineages). Empty — and elided from the wire — for the
+    /// classic single-repo shape, whose resolution stays in the top-level
+    /// `identity`/`sources` fields exactly as before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<ResolvedPolicyRepository>,
+}
+
+/// One member repository's resolution within a multi-repository policy: which
+/// repository, and what kopia identity this policy resolves to **under that
+/// repository's `identityDefaults`**. Consumed by the admission fork guard as
+/// the per-repo baseline (`repo_key` → previously-resolved identity), so an
+/// edit that would re-identify ONE member's lineage is caught even though the
+/// other members are unaffected.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPolicyRepository {
+    /// The member repository this entry resolves for (by value, as listed in
+    /// `spec.repositories`).
+    pub repository: RepositoryRef,
+    /// The `username@hostname` identity resolved under this repository's
+    /// `identityDefaults`; absent when it could not be resolved (the guard
+    /// treats an absent baseline as "no baseline" and degrades to allow for
+    /// that member only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ResolvedIdentity>,
 }
 
 /// One resolved source — a concrete PVC and the path kopia records for it.
@@ -789,6 +1032,88 @@ mod tests {
     use crate::common::RepositoryKind;
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn resolved_policy_single_repo_status_wire_is_byte_identical() {
+        // Golden: a single-repo policy's ResolvedPolicy serializes EXACTLY as
+        // it did before `repositories` existed — the empty vec is elided — so
+        // stored single-repo statuses round-trip byte-identically.
+        let resolved = ResolvedPolicy {
+            identity: Some(crate::common::ResolvedIdentity {
+                username: "pg".into(),
+                hostname: "billing".into(),
+                source_path: Some("/pvc/data".into()),
+            }),
+            sources: vec![ResolvedPolicySource {
+                pvc: Some("billing/data".into()),
+                source_path: Some("/pvc/data".into()),
+            }],
+            repositories: vec![],
+        };
+        let wire = serde_json::to_value(&resolved).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "identity": {
+                    "username": "pg",
+                    "hostname": "billing",
+                    "sourcePath": "/pvc/data",
+                },
+                "sources": [ { "pvc": "billing/data", "sourcePath": "/pvc/data" } ],
+            })
+        );
+
+        // …and a pre-feature stored status (no `repositories` key) decodes to
+        // the empty vec, not an error.
+        let decoded: ResolvedPolicy = serde_json::from_value(wire).expect("decodes");
+        assert!(decoded.repositories.is_empty());
+    }
+
+    #[test]
+    fn resolved_policy_per_repo_entries_round_trip() {
+        let resolved = ResolvedPolicy {
+            identity: None,
+            sources: vec![],
+            repositories: vec![
+                ResolvedPolicyRepository {
+                    repository: RepositoryRef {
+                        kind: RepositoryKind::Repository,
+                        name: "nas".into(),
+                        namespace: None,
+                    },
+                    identity: Some(crate::common::ResolvedIdentity {
+                        username: "pg".into(),
+                        hostname: "billing".into(),
+                        source_path: None,
+                    }),
+                },
+                ResolvedPolicyRepository {
+                    repository: RepositoryRef {
+                        kind: RepositoryKind::ClusterRepository,
+                        name: "offsite".into(),
+                        namespace: None,
+                    },
+                    // Unresolvable member: entry present, identity elided.
+                    identity: None,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&resolved).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "repositories": [
+                    {
+                        "repository": { "kind": "Repository", "name": "nas" },
+                        "identity": { "username": "pg", "hostname": "billing" },
+                    },
+                    { "repository": { "kind": "ClusterRepository", "name": "offsite" } },
+                ],
+            })
+        );
+        let decoded: ResolvedPolicy = serde_json::from_value(wire).expect("decodes");
+        assert_eq!(decoded, resolved);
+    }
 
     #[test]
     fn snapshot_policy_crd_metadata_is_correct() {
@@ -1114,8 +1439,9 @@ mover:
     fsGroupChangePolicy: OnRootMismatch
 "#;
         let spec: SnapshotPolicySpec = from_yaml(yaml);
-        assert_eq!(spec.repository.kind, RepositoryKind::Repository);
-        assert_eq!(spec.repository.name, "nas-primary");
+        let repo = spec.repository.as_ref().expect("repository");
+        assert_eq!(repo.kind, RepositoryKind::Repository);
+        assert_eq!(repo.name, "nas-primary");
         assert_eq!(spec.sources.len(), 1);
         assert_eq!(spec.sources[0].pvc.as_ref().unwrap().name, "postgres-data");
         assert_eq!(
@@ -1563,6 +1889,78 @@ preflight:
     }
 
     #[test]
+    fn snapshot_policy_has_repositories_summary_column() {
+        // #368 B1: the REPOSITORIES column renders status.repositorySummary so a
+        // multi-repo policy (whose `.spec.repository.name` column is empty) still
+        // names its targets in `kubectl get`.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .expect("printer columns");
+        let col = cols
+            .iter()
+            .find(|c| c["name"] == "Repositories")
+            .expect("Repositories column");
+        assert_eq!(col["jsonPath"], ".status.repositorySummary");
+    }
+
+    #[test]
+    fn status_verification_fields_elide_when_empty_and_roundtrip() {
+        // The golden-byte contract for every new Vec/map status field (#368):
+        // an empty `verification` / `verificationStamps` / absent
+        // `repositorySummary` must emit NOTHING, so a single-repo policy's
+        // status wire is byte-identical to pre-feature operators.
+        let bare = SnapshotPolicyStatus::default();
+        let json = serde_json::to_value(&bare).expect("serialize");
+        assert!(json.get("verification").is_none(), "empty vec must elide");
+        assert!(
+            json.get("verificationStamps").is_none(),
+            "empty map must elide"
+        );
+        assert!(
+            json.get("repositorySummary").is_none(),
+            "absent summary must elide"
+        );
+
+        // Populated: parse the cluster's way and round-trip.
+        let status: SnapshotPolicyStatus = serde_json::from_value(serde_json::json!({
+            "lastVerified": "2026-08-01T00:00:00Z",
+            "repositorySummary": "nas, offsite",
+            "verification": [
+                {
+                    "repository": { "kind": "Repository", "name": "nas", "namespace": "backups" },
+                    "lastVerified": "2026-08-01T00:00:00Z"
+                },
+                { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            ],
+            "verificationStamps": {
+                "Repository/backups/nas": "2026-08-01T00:00:00Z"
+            }
+        }))
+        .expect("status parses");
+        assert_eq!(status.verification.len(), 2);
+        assert_eq!(
+            status.verification[0].last_verified.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert!(status.verification[1].last_verified.is_none());
+        assert_eq!(
+            status
+                .verification_stamps
+                .get("Repository/backups/nas")
+                .map(String::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+        let out = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(
+            out["verification"][0]["repository"]["name"], "nas",
+            "camelCase wire shape"
+        );
+        assert_eq!(out["repositorySummary"], "nas, offsite");
+    }
+
+    #[test]
     fn status_last_successful_snapshot_roundtrips() {
         let status: SnapshotPolicyStatus =
             from_yaml("lastSuccessfulSnapshot: 2026-06-09T02:00:00Z\n");
@@ -1700,6 +2098,238 @@ preflight:
             "spec.adoption must NOT carry a schema default: {prop}"
         );
         assert_eq!(prop["enum"].as_array().map(|a| a.len()), Some(2), "{prop}");
+    }
+
+    // --- M7 multi-repository fan-out: golden byte-compat + accessors ---------
+
+    /// THE golden byte-compat proof for the `repository: Option` flip: a legacy
+    /// single-repo spec's wire encoding is pinned as a COMMITTED fixture string
+    /// (the pre-change encoding), not constructed by round-tripping — so any
+    /// serialization drift (a leaked `repositories` key above all) fails here.
+    #[test]
+    fn legacy_single_repo_spec_wire_is_byte_identical() {
+        const LEGACY_WIRE: &str = r#"{"repository":{"kind":"Repository","name":"nas-primary","namespace":"backups"},"sources":[{"pvc":{"name":"pgdata"}}],"copyMethod":"Snapshot","retention":{"keepLatest":3}}"#;
+        assert!(
+            !LEGACY_WIRE.contains("repositories"),
+            "fixture precondition"
+        );
+
+        // A legacy YAML parses to the same struct shape it always did…
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: nas-primary, namespace: backups }\n\
+             sources: [ { pvc: { name: pgdata } } ]\n\
+             retention: { keepLatest: 3 }\n",
+        );
+        assert_eq!(spec.repository.as_ref().unwrap().name, "nas-primary");
+        assert!(spec.repositories.is_empty());
+
+        // …and re-serializes to the exact pre-change bytes: no `repositories`
+        // key (Vec::is_empty skip), `repository` unwrapped exactly as before.
+        assert_eq!(serde_json::to_string(&spec).unwrap(), LEGACY_WIRE);
+
+        // The committed wire decodes back to the identical struct.
+        let reparsed: SnapshotPolicySpec = serde_json::from_str(LEGACY_WIRE).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn repositories_roundtrip_and_absent_stays_off_the_wire() {
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repositories:\n\
+             - { kind: Repository, name: a }\n\
+             - { kind: ClusterRepository, name: b }\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(spec.repository.is_none());
+        assert_eq!(spec.repositories.len(), 2);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json.get("repository").is_none());
+        assert_eq!(json["repositories"][1]["kind"], "ClusterRepository");
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn policy_repositories_accessors_cover_all_four_shapes() {
+        use crate::error::ValidationError;
+
+        let single: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(matches!(
+            policy_repositories(&single),
+            Ok(PolicyRepositories::Single(r)) if r.name == "r"
+        ));
+        assert!(!is_multi_repo(&single));
+        assert_eq!(repository_refs(&single).count(), 1);
+        assert_eq!(single_repository_ref(&single).unwrap().name, "r");
+
+        let multi: SnapshotPolicySpec = from_yaml(
+            "repositories: [ { name: a }, { name: b } ]\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(matches!(
+            policy_repositories(&multi),
+            Ok(PolicyRepositories::Multi(refs)) if refs.len() == 2
+        ));
+        assert!(is_multi_repo(&multi));
+        assert_eq!(
+            repository_refs(&multi)
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        // The single-repo-only accessor refuses multi loudly — never a
+        // silent repository #1.
+        assert_eq!(
+            single_repository_ref(&multi).unwrap_err(),
+            ValidationError::PolicySingleRepositoryRequired
+        );
+
+        // Neither / both: named errors, never a panic — a stored CR can be
+        // garbage relative to the current CRD schema.
+        let neither: SnapshotPolicySpec = from_yaml("sources: [ { pvc: { name: d } } ]\n");
+        assert_eq!(
+            policy_repositories(&neither).unwrap_err(),
+            ValidationError::PolicyRepositoryExactlyOne { got: "neither" }
+        );
+        assert_eq!(repository_refs(&neither).count(), 0);
+
+        let both: SnapshotPolicySpec = from_yaml(
+            "repository: { name: r }\nrepositories: [ { name: a } ]\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        assert_eq!(
+            policy_repositories(&both).unwrap_err(),
+            ValidationError::PolicyRepositoryExactlyOne { got: "both" }
+        );
+        // Tolerant iterator yields whatever exists, in repository-then-list order.
+        assert_eq!(
+            repository_refs(&both)
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r", "a"]
+        );
+    }
+
+    #[test]
+    fn select_restore_repository_covers_every_selection_shape() {
+        use super::select_restore_repository;
+        use crate::common::{RepositoryKind, RepositoryRef};
+        use crate::error::ValidationError;
+        let single: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        let multi: SnapshotPolicySpec = from_yaml(
+            "repositories:\n  - { kind: Repository, name: a }\n  - { kind: ClusterRepository, name: b }\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        let rref = |kind, name: &str, ns: Option<&str>| RepositoryRef {
+            kind,
+            name: name.into(),
+            namespace: ns.map(str::to_string),
+        };
+
+        // No selection, single-repo → the policy's one ref, verbatim.
+        let r = select_restore_repository(&single, "pol", "backups", None, "apps").unwrap();
+        assert_eq!(r.name, "r");
+
+        // No selection, multi-repo → refusal naming every valid choice.
+        match select_restore_repository(&multi, "pol", "backups", None, "apps").unwrap_err() {
+            ValidationError::RestoreRepositorySelectionRequired { policy, valid } => {
+                assert_eq!(policy, "pol");
+                assert_eq!(valid, "Repository/backups/a, ClusterRepository/b");
+            }
+            other => panic!("expected RestoreRepositorySelectionRequired, got {other:?}"),
+        }
+
+        // Explicit member (namespace-qualified to the policy's namespace) → honored.
+        let explicit = rref(RepositoryKind::Repository, "a", Some("backups"));
+        let r =
+            select_restore_repository(&multi, "pol", "backups", Some(&explicit), "apps").unwrap();
+        assert_eq!(r.name, "a");
+
+        // Explicit cluster-scoped member: namespace-free key matches from any
+        // restore namespace.
+        let cluster = rref(RepositoryKind::ClusterRepository, "b", None);
+        assert!(
+            select_restore_repository(&multi, "pol", "backups", Some(&cluster), "apps").is_ok()
+        );
+
+        // Explicit NON-member → typed refusal naming what was given and what's
+        // valid. (An unqualified Repository ref resolves in the RESTORE's
+        // namespace — `apps/a` is not the policy's `backups/a`.)
+        let typo = rref(RepositoryKind::Repository, "a", None);
+        match select_restore_repository(&multi, "pol", "backups", Some(&typo), "apps").unwrap_err()
+        {
+            ValidationError::RestoreRepositoryNotInPolicy {
+                given,
+                policy,
+                valid,
+            } => {
+                assert_eq!(given, "Repository/apps/a");
+                assert_eq!(policy, "pol");
+                assert_eq!(valid, "Repository/backups/a, ClusterRepository/b");
+            }
+            other => panic!("expected RestoreRepositoryNotInPolicy, got {other:?}"),
+        }
+
+        // Explicit non-member against a SINGLE-repo policy is refused too (the
+        // audit-m4 backstop: a typo must not silently read the wrong repo).
+        let elsewhere = rref(RepositoryKind::ClusterRepository, "offsite", None);
+        assert!(matches!(
+            select_restore_repository(&single, "pol", "backups", Some(&elsewhere), "apps")
+                .unwrap_err(),
+            ValidationError::RestoreRepositoryNotInPolicy { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_policy_spec_carries_exactly_one_of_repository_cel_rule() {
+        // The spec-level CEL rule must survive kube's structural-schema
+        // rewriter (mirrors restore.rs / snapshot_schedule.rs precedents).
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let rules = spec["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec-level x-kubernetes-validations present");
+        assert!(
+            rules.iter().any(|r| {
+                r["rule"]
+                    == "(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1"
+                    && r["message"] == "exactly one of repository, repositories"
+            }),
+            "missing the exactly-one-of CEL rule; got {rules:?}"
+        );
+        // `repository` is no longer structurally required…
+        let required = spec["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|f| f == "repository"),
+            "repository must not be schema-required anymore; got {required:?}"
+        );
+        // …and `repositories` carries the 1..=8 bounds (minItems 1 makes an
+        // explicit `repositories: []` a structural rejection, so the CEL rule
+        // never has to reason about a present-but-empty list).
+        let repos = &spec["properties"]["repositories"];
+        assert_eq!(repos["minItems"], 1, "{repos}");
+        assert_eq!(repos["maxItems"], 8, "{repos}");
+    }
+
+    #[test]
+    fn snapshot_policy_repository_print_column_is_unchanged() {
+        // The `Repository` column stays `.spec.repository.name` (renders
+        // empty for a multi-repo policy — the `Repositories` summary column
+        // covers that shape; documented in docs/backups.md).
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .expect("printer columns");
+        let col = cols
+            .iter()
+            .find(|c| c["name"] == "Repository")
+            .expect("Repository column");
+        assert_eq!(col["jsonPath"], ".spec.repository.name");
     }
 
     #[test]

@@ -847,6 +847,33 @@ async fn bootstrap_via_mover(
         probe_enabled && bootstrapped_before && already_ready && !reverify && !spec_changed;
 
     if let Some(job) = job_api.get_opt(&job_name).await? {
+        // A terminal Job launched for an OLDER generation is stale evidence:
+        // its result describes a spec the user has since edited (e.g. fixing a
+        // wrong credential ref on a terminally-`Failed` repository). Recycle it
+        // immediately so the next pass launches a fresh bootstrap for the live
+        // spec — without this, `bootstrap_recycle_due`'s `!phase_is_ready`
+        // short-circuit re-reads the same failed result until the Job's TTL
+        // (up to an hour of spurious `Failed`). Comparing the JOB's stamped
+        // generation (not `observedGeneration`) is what keeps this
+        // livelock-free: the replacement Job carries the current generation,
+        // so its own result — success OR failure — is always consumed.
+        if crate::snapshot::job_terminal_state(&job).is_some()
+            && stale_bootstrap_job(
+                job.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_GENERATION_ANNOTATION))
+                    .map(String::as_str),
+                repo.metadata.generation,
+            )
+        {
+            tracing::info!(
+                repo = %name,
+                "recycling a terminal bootstrap Job launched for an older generation"
+            );
+            io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
         return match crate::snapshot::job_terminal_state(&job) {
             // Still running: surface progress and poll. A catalog-refresh
             // re-run of an already-Ready repo keeps its phase — flapping
@@ -1200,13 +1227,14 @@ async fn bootstrap_via_mover(
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
         labels,
+        annotations: bootstrap_generation_annotation(repo.metadata.generation),
         source_volume: None,
         repo_volume,
         creds_secrets,
         result_configmap: Some(&job_name),
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
-        annotations: Default::default(),
+        extra_env: Vec::new(),
         // Bootstrap is a short connect/create probe: an emptyDir cache suffices.
         cache_volume: Default::default(),
         scratch_volume: None,
@@ -1401,6 +1429,36 @@ fn bootstrap_work_spec(
         cache: Default::default(),
         // Apply the repo throttle on the bootstrap connection too (§13(e)).
         throttle: io::throttle_spec(mover_defaults),
+    }
+}
+
+/// The metadata annotation stamped on every bootstrap Job: the `Repository`
+/// generation the launch was FOR (see
+/// [`crate::consts::BOOTSTRAP_GENERATION_ANNOTATION`]).
+pub(crate) fn bootstrap_generation_annotation(generation: Option<i64>) -> BTreeMap<String, String> {
+    generation
+        .map(|g| {
+            BTreeMap::from([(
+                crate::consts::BOOTSTRAP_GENERATION_ANNOTATION.to_string(),
+                g.to_string(),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+/// Is this terminal bootstrap Job stale evidence — launched for a generation
+/// other than the live one? Pure decision for the recycle gate above.
+///
+/// * `None` stamp (a Job from a pre-annotation operator, mid-upgrade) ⇒ NOT
+///   stale: fall through to the existing consume path rather than recycling a
+///   result whose provenance we can't read.
+/// * Unparseable stamp ⇒ stale (the annotation is controller-written; garbage
+///   means something rewrote it, and a fresh bootstrap is the safe read).
+/// * Stamp != live generation ⇒ stale.
+pub(crate) fn stale_bootstrap_job(stamped: Option<&str>, live_generation: Option<i64>) -> bool {
+    match (stamped, live_generation) {
+        (None, _) | (_, None) => false,
+        (Some(s), Some(live)) => s.parse::<i64>().map(|g| g != live).unwrap_or(true),
     }
 }
 
@@ -2212,6 +2270,39 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use kopiur_kopia::{SnapshotSource, SnapshotStats};
+
+    /// The stale-terminal-Job recycle gate: a spec edit must re-bootstrap even
+    /// a terminally-`Failed` repository at once (not after the failed Job's
+    /// TTL), while a Job stamped with the LIVE generation — the replacement
+    /// launch itself — must always be consumed, success or failure, so a
+    /// persistently-broken spec still parks `Failed` instead of livelocking.
+    #[test]
+    fn stale_bootstrap_job_recycles_only_older_generations() {
+        // Old-generation terminal Job + edited spec ⇒ stale, recycle.
+        assert!(stale_bootstrap_job(Some("2"), Some(3)));
+        // The replacement Job (stamped with the live generation) is never
+        // stale — its failure result must reach finalize and park `Failed`.
+        assert!(!stale_bootstrap_job(Some("3"), Some(3)));
+        // Pre-annotation Job (operator upgrade window): provenance unreadable,
+        // fall through to the existing consume path.
+        assert!(!stale_bootstrap_job(None, Some(3)));
+        // No live generation (never set by the apiserver in practice): inert.
+        assert!(!stale_bootstrap_job(Some("2"), None));
+        // Garbage stamp: controller-written annotation was rewritten; a fresh
+        // bootstrap is the safe read.
+        assert!(stale_bootstrap_job(Some("not-a-number"), Some(3)));
+    }
+
+    #[test]
+    fn bootstrap_generation_annotation_stamps_the_launch_generation() {
+        let a = bootstrap_generation_annotation(Some(7));
+        assert_eq!(
+            a.get(crate::consts::BOOTSTRAP_GENERATION_ANNOTATION)
+                .map(String::as_str),
+            Some("7")
+        );
+        assert!(bootstrap_generation_annotation(None).is_empty());
+    }
 
     fn entry(id: &str) -> SnapshotListEntry {
         SnapshotListEntry {

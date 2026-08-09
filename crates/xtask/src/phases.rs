@@ -137,6 +137,7 @@ pub const API_PHASE_ENUMS: &[&str] = &[
     "RepositoryReplicationPhase",
     "RestorePhase",
     "SnapshotPhase",
+    "SnapshotReplicationPhase",
 ];
 
 /// The mover's own job-outcome phase, which lives in `crates/mover` rather than

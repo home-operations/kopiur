@@ -33,7 +33,7 @@ use kopiur_mover::workspec::{
 
 use crate::consts::{
     API_VERSION, COMPONENT_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL, VERIFY_COMPONENT,
-    VERIFY_INSTANCE_LABEL, VERIFY_SLOT_ANNOTATION,
+    VERIFY_INSTANCE_LABEL, VERIFY_REPO_LABEL, VERIFY_SLOT_ANNOTATION,
 };
 use crate::context::Context;
 use crate::error::Result;
@@ -259,9 +259,23 @@ fn idle_requeue(
 /// Deterministic, ≤52-char, DNS-1123-safe per-slot verify Job name:
 /// `<policy>-vfy-<q|d>-<unix_slot>` (truncate+hash long policy names, like
 /// maintenance).
-fn verify_job_name(policy: &str, tier: VerifyTierKind, slot: DateTime<Utc>) -> String {
+///
+/// `repo6` is the 6-hex per-repository tag ([`crate::naming::repo_tag6`]),
+/// present ONLY for a multi-repository policy: `<policy>-vfy-<q|d>-<r6>-<unix>`.
+/// The single-repo shape (`None`) stays byte-identical to every prior operator,
+/// so an in-flight slot's Job is still found by name across an upgrade (slot
+/// continuity — a renamed slot would double-spawn).
+fn verify_job_name(
+    policy: &str,
+    tier: VerifyTierKind,
+    slot: DateTime<Utc>,
+    repo6: Option<&str>,
+) -> String {
     const MAX: usize = 52;
-    let suffix = format!("-vfy-{}-{}", tier.tag(), slot.timestamp());
+    let suffix = match repo6 {
+        None => format!("-vfy-{}-{}", tier.tag(), slot.timestamp()),
+        Some(r6) => format!("-vfy-{}-{r6}-{}", tier.tag(), slot.timestamp()),
+    };
     let budget = MAX.saturating_sub(suffix.len());
     if policy.len() <= budget {
         format!("{policy}{suffix}")
@@ -273,29 +287,54 @@ fn verify_job_name(policy: &str, tier: VerifyTierKind, slot: DateTime<Utc>) -> S
     }
 }
 
+/// One repository's verify-scheduling inputs, prepared by the `SnapshotPolicy`
+/// reconciler per target. The single-repo shape passes exactly one with
+/// `repo_key: None` (byte-identical behavior — flat `status.lastVerified`
+/// anchor, un-suffixed Job names, mover stamps the flat field); a multi-repo
+/// policy passes one per READY repository with `repo_key: Some(_)`.
+pub struct VerifyTarget<'a> {
+    /// The spec's ref for this repository, as written (creds naming + resolution).
+    pub rref: &'a kopiur_api::common::RepositoryRef,
+    /// The resolved repository surface.
+    pub repo: &'a ResolvedRepository,
+    /// `Some(normalized repo key)` for a multi-repo policy — flows into the
+    /// Job name's `<r6>` segment, the [`VERIFY_REPO_LABEL`] single-flight
+    /// scope, and the work spec (so the mover stamps the entry-keyed
+    /// `verificationStamps[<key>]` instead of the flat field). `None` =
+    /// single-repo.
+    pub repo_key: Option<String>,
+    /// This target's last-verified anchor: the flat `status.lastVerified` for
+    /// single-repo; the folded per-repo entry for multi (each repository
+    /// catches up on its own schedule, so a fresh repo B is immediately due
+    /// without repo A's recent verify deferring it).
+    pub last_verified: Option<DateTime<Utc>>,
+    /// Whether THIS repository holds a verifiable snapshot from this policy
+    /// (#168 gate input).
+    pub has_successful: bool,
+}
+
 /// The verification scheduling step, called by the `SnapshotPolicy` reconciler
-/// (after it has confirmed the policy is non-suspended and its Repository is Ready).
+/// (after it has confirmed the policy is non-suspended and this target's
+/// repository is Ready) — once for the single-repo shape, once per READY
+/// repository for a multi-repo policy.
 /// Returns `Some(requeue)` when verification is configured (so the caller honors the
 /// verify cadence), or `None` when `spec.verification` is absent (no behavior change).
 pub async fn verify_step(
     config: &SnapshotPolicy,
     ctx: &Context,
-    repo: &ResolvedRepository,
+    target: &VerifyTarget<'_>,
     namespace: &str,
-    has_successful: bool,
 ) -> Result<Option<Duration>> {
     let Some(verification) = config.spec.verification.as_ref() else {
         return Ok(None);
     };
+    let repo = target.repo;
+    let has_successful = target.has_successful;
     let name = config.name_any();
     let seed = config.uid().unwrap_or_else(|| name.clone());
     let now = Utc::now();
-    let last_verified = config
-        .status
-        .as_ref()
-        .and_then(|s| s.last_verified.as_deref())
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+    let last_verified = target.last_verified;
+    let repo6 = target.repo_key.as_deref().map(crate::naming::repo_tag6);
     // GitHub #174 item 3: a per-cron `timezone` wins; else the repository's
     // `scheduleDefaults.timezone`; else UTC.
     let repo_tz = repo
@@ -306,7 +345,8 @@ pub async fn verify_step(
     // #168 gate: never schedule a verify before a verifiable snapshot exists — the
     // tier_after catch-up would otherwise fire a Job on the first reconcile, before
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
-    // snapshot OR its repo already carries discovered (adopted) snapshots. The
+    // snapshot OR its repo already carries discovered (adopted) or replicated
+    // snapshots (a replication DEST repo holding only copies is not empty). The
     // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
     // entirely once a successful backup already unlocks the gate. Probed in the
     // repository's OWN namespace (not the policy's — `RepositoryRef` allows a
@@ -340,7 +380,7 @@ pub async fn verify_step(
         )));
     };
 
-    let job_name = verify_job_name(&name, tier, slot);
+    let job_name = verify_job_name(&name, tier, slot, repo6.as_deref());
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
@@ -356,13 +396,13 @@ pub async fn verify_step(
             None => Ok(Some(REQUEUE_RUNNING)),
         },
         None => {
-            if has_active_verify_job(&job_api, &name).await? {
+            if has_active_verify_job(&job_api, &name, repo6.as_deref()).await? {
                 return Ok(Some(REQUEUE_RUNNING));
             }
             spawn_verify_job(
                 config,
                 ctx,
-                repo,
+                target,
                 namespace,
                 &name,
                 &job_name,
@@ -371,7 +411,7 @@ pub async fn verify_step(
                 slot,
             )
             .await?;
-            tracing::info!(policy = %name, ?tier, slot = %slot.to_rfc3339(), "spawned verification Job");
+            tracing::info!(policy = %name, ?tier, repo = target.repo_key.as_deref().unwrap_or("<single>"), slot = %slot.to_rfc3339(), "spawned verification Job");
             Ok(Some(REQUEUE_RUNNING))
         }
     }
@@ -382,7 +422,7 @@ pub async fn verify_step(
 async fn spawn_verify_job(
     config: &SnapshotPolicy,
     ctx: &Context,
-    repo: &ResolvedRepository,
+    target: &VerifyTarget<'_>,
     namespace: &str,
     policy_name: &str,
     job_name: &str,
@@ -390,12 +430,27 @@ async fn spawn_verify_job(
     tier: VerifyTierKind,
     slot: DateTime<Utc>,
 ) -> Result<()> {
-    let work_spec =
-        build_verify_work_spec(config, repo, namespace, policy_name, verification, tier);
+    let repo = target.repo;
+    let work_spec = build_verify_work_spec(
+        config,
+        repo,
+        namespace,
+        policy_name,
+        verification,
+        tier,
+        target.repo_key.clone(),
+    );
 
     let mut labels = BTreeMap::new();
     labels.insert(COMPONENT_LABEL.to_string(), VERIFY_COMPONENT.to_string());
     labels.insert(VERIFY_INSTANCE_LABEL.to_string(), policy_name.to_string());
+    // Multi-repo: scope the single-flight selector per (policy, repository) so
+    // the N per-repo verifies run concurrently while each repository still gets
+    // at most one Job. Single-repo Jobs deliberately stay unlabeled, matching
+    // in-flight Jobs from older operators.
+    if let Some(r6) = target.repo_key.as_deref().map(crate::naming::repo_tag6) {
+        labels.insert(VERIFY_REPO_LABEL.to_string(), r6);
+    }
     let mut annotations = BTreeMap::new();
     annotations.insert(VERIFY_SLOT_ANNOTATION.to_string(), slot.to_rfc3339());
 
@@ -420,10 +475,18 @@ async fn spawn_verify_job(
     .await?;
     mover_identity.decorate_labels(&mut labels);
 
+    // Per-repo creds prefix for multi (`<policy>-vfy-<r6>`): N concurrent
+    // per-repo verifies must never share a projected-Secret name for different
+    // repositories. Single-repo keeps the classic `<policy>-vfy` prefix so
+    // projected Secret names stay byte-identical.
+    let creds_prefix = match target.repo_key.as_deref().map(crate::naming::repo_tag6) {
+        Some(r6) => io::CredsPrefix::verification_for_repo(policy_name, &r6),
+        None => io::CredsPrefix::verification(policy_name),
+    };
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
         namespace,
-        &io::CredsPrefix::verification(policy_name),
+        &creds_prefix,
         &owner,
         repo,
         config
@@ -431,8 +494,8 @@ async fn spawn_verify_job(
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(target.rref.kind),
+        &target.rref.name,
     )
     .await?;
     if creds.projected > 0 {
@@ -497,6 +560,7 @@ async fn spawn_verify_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         // Inherit moverDefaults.cache (overlaid by the recipe's mover.cache) for the
         // kopia cache volume — but always per-run ephemeral, never the backup's warm
@@ -528,6 +592,12 @@ async fn spawn_verify_job(
 /// Build the verify mover work spec for a tier. Pure (no IO) so the tier→work-spec
 /// mapping is unit-testable; the identity is the recipe's resolved source identity
 /// so the deep tier restores the right snapshot.
+///
+/// `repository_key` is `Some(normalized repo key)` for a multi-repo policy's
+/// per-repo run: the mover then stamps `status.verificationStamps[<key>]`
+/// (entry-keyed, clobber-free) instead of the flat `lastVerified`. `None` keeps
+/// the single-repo wire byte-identical.
+#[allow(clippy::too_many_arguments)]
 pub fn build_verify_work_spec(
     config: &SnapshotPolicy,
     repo: &ResolvedRepository,
@@ -535,6 +605,7 @@ pub fn build_verify_work_spec(
     policy_name: &str,
     verification: &Verification,
     tier: VerifyTierKind,
+    repository_key: Option<String>,
 ) -> MoverWorkSpec {
     let tier = match tier {
         // M3 (issue #216 category sweep): quick.parallel/fileParallelism/
@@ -565,6 +636,7 @@ pub fn build_verify_work_spec(
         operation: Operation::Verify(VerifyOp {
             tier,
             success_expr: verification.success_expr.clone(),
+            repository_key,
         }),
         identity,
         repository: backend_to_repository_connect(&repo.backend, repo.ca_bundle_pem.clone()),
@@ -651,6 +723,97 @@ pub fn scratch_storage_class_state(
     })
 }
 
+/// The controller-side fold of per-repo verification state (#368): the
+/// authoritative `status.verification` Vec + flat `lastVerified`, derived from
+/// the CURRENT repository set, the previous Vec, and the movers' entry-keyed
+/// `verificationStamps`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldedVerification {
+    /// One entry per CURRENT repository, in spec order — entries for
+    /// repositories no longer in the spec are PRUNED (audit m10: a stale entry
+    /// would pin the flat MIN forever).
+    pub entries: Vec<kopiur_api::snapshot_policy::RepoVerification>,
+    /// The flat `status.lastVerified` for the multi-repo shape: the MINIMUM
+    /// across the current repositories' timestamps — "everything is verified
+    /// as of T" — and `None` until EVERY current repository has verified at
+    /// least once (a partially-verified fleet must not display a reassuring
+    /// timestamp).
+    pub flat: Option<String>,
+}
+
+/// **Pure.** Fold the movers' entry-keyed stamps into the per-repo Vec the
+/// controller owns (single writer: movers only ever merge-patch their own
+/// `verificationStamps[<key>]` — a map key merge that cannot clobber a sibling
+/// — and this fold is the only writer of `verification` itself).
+///
+/// Design note (the race the plan demands a decision on): SSA with per-entry
+/// managers was rejected because `verification` is keyed by the `repository`
+/// SUB-OBJECT, which cannot be an `x-kubernetes-list-map-keys` key (map keys
+/// must be scalars), so per-entry SSA merging would have forced a redundant
+/// scalar key field into the user-facing API. The stamp map gets the same
+/// clobber-freedom from plain RFC 7396 map-key merging with no API distortion;
+/// the race test lives in `kopiur-mover`'s
+/// `concurrent_per_repo_stamps_both_survive_merge_patching` (write side) and
+/// [`tests::fold_folds_both_concurrent_stamps`] (read side).
+///
+/// Per-repo timestamps are monotonic: an entry's `lastVerified` only advances
+/// (`max` of the prior entry and the stamp), so re-reading a stale stamp is
+/// idempotent and stamps never need deleting on consumption — only a repo's
+/// REMOVAL from the spec prunes its entry (and its stamp key, by the caller
+/// writing the pruned map back).
+pub fn fold_verification(
+    current: &[(kopiur_api::common::RepositoryRef, String)],
+    existing: &[kopiur_api::snapshot_policy::RepoVerification],
+    stamps: &BTreeMap<String, String>,
+    ns: &str,
+) -> FoldedVerification {
+    use kopiur_api::snapshot_policy::RepoVerification;
+    let entries: Vec<RepoVerification> = current
+        .iter()
+        .map(|(rref, key)| {
+            let prior = existing
+                .iter()
+                .find(|e| kopiur_api::common::repo_key(&e.repository, ns) == *key)
+                .and_then(|e| e.last_verified.as_deref());
+            RepoVerification {
+                repository: rref.clone(),
+                last_verified: later_rfc3339(prior, stamps.get(key).map(String::as_str)),
+            }
+        })
+        .collect();
+    let flat = entries
+        .iter()
+        .map(|e| e.last_verified.as_deref())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|all| all.into_iter().min_by_key(|ts| rfc3339_or_min(ts)))
+        .map(str::to_string);
+    FoldedVerification { entries, flat }
+}
+
+/// **Pure.** The later of two RFC3339 timestamps (an unparseable side loses to
+/// a parseable one; both unparseable/absent → `None`).
+fn later_rfc3339(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if rfc3339_or_min(a) >= rfc3339_or_min(b) {
+                Some(a.to_string())
+            } else {
+                Some(b.to_string())
+            }
+        }
+        (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// RFC3339 → `DateTime<Utc>`, with an unparseable value sorting first (so it
+/// never wins a `max` and never anchors a `min` reassuringly late).
+fn rfc3339_or_min(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
 /// Resolve the recipe's source identity for the verify run (reuses the api kernel),
 /// falling back to a sentinel for the quick tier (which does not restore).
 fn verify_identity(
@@ -689,13 +852,18 @@ fn verify_identity(
     }
 }
 
-/// Whether the policy's resolved repository already carries **discovered** (adopted)
-/// snapshots — the #168 verification escape hatch. A cheap labeled LIST scoped by the
-/// repo-uid + `origin=discovered` labels the catalog scanner stamps on every
-/// materialized foreign snapshot (`crate::catalog`); `true` as soon as one exists.
-/// The [`DiscoveredProbeScope`] (from [`discovered_probe_scope`]) selects namespaced
-/// vs cluster-wide so an adopted `ClusterRepository`'s scattered rows are seen. Thin
-/// IO over the pure [`verification_unlocked`] gate.
+/// Whether the policy's resolved repository already carries **discovered**
+/// (adopted) or **replicated** snapshots — the #168 verification escape hatch.
+/// A cheap labeled LIST scoped by the repo-uid label plus a SET-BASED origin
+/// selector (`origin in (discovered, replicated)`): discovered rows are what
+/// the catalog scanner stamps on every materialized foreign snapshot
+/// (`crate::catalog`), and replicated rows are the dest-side copy CRs a
+/// `SnapshotReplication` mints — a destination repository holding ONLY copies
+/// has verifiable content and must not look empty to this gate. `true` as soon
+/// as one of either exists. The [`DiscoveredProbeScope`] (from
+/// [`discovered_probe_scope`]) selects namespaced vs cluster-wide so an
+/// adopted `ClusterRepository`'s scattered rows are seen. Thin IO over the
+/// pure [`verification_unlocked`] gate.
 async fn repo_has_discovered_snapshots(
     client: &kube::Client,
     scope: &DiscoveredProbeScope,
@@ -706,17 +874,30 @@ async fn repo_has_discovered_snapshots(
         DiscoveredProbeScope::ClusterWide => Api::all(client.clone()),
     };
     let selector = format!(
-        "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL}={}",
-        Origin::Discovered.label_value()
+        "{REPOSITORY_UID_LABEL}={repo_uid},{ORIGIN_LABEL} in ({},{})",
+        Origin::Discovered.label_value(),
+        Origin::Replicated.label_value()
     );
     let lp = ListParams::default().labels(&selector).limit(1);
     Ok(!api.list(&lp).await?.items.is_empty())
 }
 
-/// Whether any non-terminal verify Job is owned by this policy (single-flight gate).
-async fn has_active_verify_job(job_api: &Api<Job>, policy_name: &str) -> Result<bool> {
-    let selector =
+/// Whether any non-terminal verify Job is owned by this policy (single-flight
+/// gate). `repo6` (a multi-repo policy's per-repo run) narrows the selector by
+/// [`VERIFY_REPO_LABEL`] so the gate is per (policy, repository) — repo A's
+/// in-flight verify must not block repo B's. The single-repo shape (`None`)
+/// keeps the policy-wide selector, which also matches in-flight Jobs from
+/// older operators that predate the repo label.
+async fn has_active_verify_job(
+    job_api: &Api<Job>,
+    policy_name: &str,
+    repo6: Option<&str>,
+) -> Result<bool> {
+    let mut selector =
         format!("{COMPONENT_LABEL}={VERIFY_COMPONENT},{VERIFY_INSTANCE_LABEL}={policy_name}");
+    if let Some(r6) = repo6 {
+        selector.push_str(&format!(",{VERIFY_REPO_LABEL}={r6}"));
+    }
     let jobs = job_api
         .list(&ListParams::default().labels(&selector))
         .await?;
@@ -991,21 +1172,181 @@ mod tests {
         let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let n = verify_job_name("postgres-data", VerifyTierKind::Quick, slot);
+        let n = verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None);
         assert!(n.len() <= 52);
         assert!(n.starts_with("postgres-data-vfy-q-"));
         assert_eq!(
             n,
-            verify_job_name("postgres-data", VerifyTierKind::Quick, slot)
+            verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None)
         );
         // Quick vs deep differ.
         assert_ne!(
             n,
-            verify_job_name("postgres-data", VerifyTierKind::Deep, slot)
+            verify_job_name("postgres-data", VerifyTierKind::Deep, slot, None)
         );
         // Long names truncate+hash within budget.
         let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
-        assert!(verify_job_name(long, VerifyTierKind::Deep, slot).len() <= 52);
+        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, None).len() <= 52);
+    }
+
+    #[test]
+    fn verify_job_name_multi_repo_gains_r6_segment_single_repo_byte_identical() {
+        // #368: the <r6> segment exists ONLY for the multi-repo shape. The
+        // single-repo name must stay byte-identical to the pre-feature format
+        // (slot continuity: an in-flight Job must still be found by name across
+        // the upgrade), so the tag is spliced BETWEEN the tier and the unix
+        // slot, never appended to the single-repo form.
+        let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let unix = slot.timestamp();
+        assert_eq!(
+            verify_job_name("pg", VerifyTierKind::Quick, slot, None),
+            format!("pg-vfy-q-{unix}"),
+            "single-repo name is the exact legacy format"
+        );
+        let r6 = crate::naming::repo_tag6("Repository/backups/nas");
+        let multi = verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&r6));
+        assert_eq!(multi, format!("pg-vfy-q-{r6}-{unix}"));
+        assert!(multi.len() <= 52);
+        // Distinct repos → distinct per-slot names (concurrent Jobs coexist).
+        let other = crate::naming::repo_tag6("ClusterRepository/offsite");
+        assert_ne!(
+            multi,
+            verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&other))
+        );
+        // Long policy names stay within budget with the tag present.
+        let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
+        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, Some(&r6)).len() <= 52);
+    }
+
+    #[test]
+    fn verify_repo_label_is_group_prefixed() {
+        // A typo'd prefix would silently break the per-repo single-flight
+        // selector (same tripwire as kopiur_api's label test).
+        assert!(
+            VERIFY_REPO_LABEL.starts_with("kopiur.home-operations.com/"),
+            "{VERIFY_REPO_LABEL} must be group-prefixed"
+        );
+        assert_ne!(
+            VERIFY_REPO_LABEL, VERIFY_INSTANCE_LABEL,
+            "repo scope must not collide with the policy scope"
+        );
+    }
+
+    // --- #368 fold: entry-keyed per-repo verification state -------------------
+
+    fn rref(kind: &str, ns: Option<&str>, name: &str) -> kopiur_api::common::RepositoryRef {
+        serde_json::from_value(serde_json::json!({
+            "kind": kind,
+            "name": name,
+            "namespace": ns,
+        }))
+        .expect("ref")
+    }
+
+    fn keyed(
+        refs: &[kopiur_api::common::RepositoryRef],
+    ) -> Vec<(kopiur_api::common::RepositoryRef, String)> {
+        refs.iter()
+            .map(|r| (r.clone(), kopiur_api::common::repo_key(r, "ns")))
+            .collect()
+    }
+
+    #[test]
+    fn fold_folds_both_concurrent_stamps() {
+        // Read side of the clobber race test: two per-repo movers stamped
+        // concurrently (map-key merge, proven non-clobbering on the write side
+        // in kopiur-mover); the fold must surface BOTH.
+        let repos = [
+            rref("Repository", Some("ns"), "nas"),
+            rref("ClusterRepository", None, "offsite"),
+        ];
+        let stamps: BTreeMap<String, String> = [
+            (
+                "Repository/ns/nas".to_string(),
+                "2026-08-02T00:00:00+00:00".to_string(),
+            ),
+            (
+                "ClusterRepository/offsite".to_string(),
+                "2026-08-01T00:00:00+00:00".to_string(),
+            ),
+        ]
+        .into();
+        let folded = fold_verification(&keyed(&repos), &[], &stamps, "ns");
+        assert_eq!(folded.entries.len(), 2);
+        assert_eq!(
+            folded.entries[0].last_verified.as_deref(),
+            Some("2026-08-02T00:00:00+00:00")
+        );
+        assert_eq!(
+            folded.entries[1].last_verified.as_deref(),
+            Some("2026-08-01T00:00:00+00:00")
+        );
+        // Flat = MIN across current repos ("everything verified as of T").
+        assert_eq!(folded.flat.as_deref(), Some("2026-08-01T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn fold_is_monotonic_and_flat_absent_until_every_repo_verified() {
+        let repos = [
+            rref("Repository", Some("ns"), "nas"),
+            rref("ClusterRepository", None, "offsite"),
+        ];
+        // Only repo A has ever verified → flat must stay absent (a
+        // partially-verified fleet must not display a reassuring timestamp).
+        let existing = vec![kopiur_api::snapshot_policy::RepoVerification {
+            repository: repos[0].clone(),
+            last_verified: Some("2026-08-02T00:00:00+00:00".into()),
+        }];
+        let folded = fold_verification(&keyed(&repos), &existing, &BTreeMap::new(), "ns");
+        assert_eq!(folded.entries.len(), 2);
+        assert!(folded.entries[1].last_verified.is_none());
+        assert!(folded.flat.is_none(), "flat requires EVERY current repo");
+
+        // A stale stamp (older than the entry) never regresses the entry.
+        let stale: BTreeMap<String, String> = [(
+            "Repository/ns/nas".to_string(),
+            "2026-07-01T00:00:00+00:00".to_string(),
+        )]
+        .into();
+        let folded = fold_verification(&keyed(&repos), &existing, &stale, "ns");
+        assert_eq!(
+            folded.entries[0].last_verified.as_deref(),
+            Some("2026-08-02T00:00:00+00:00"),
+            "per-repo timestamps are monotonic"
+        );
+    }
+
+    #[test]
+    fn fold_prunes_entries_for_repos_no_longer_in_spec() {
+        // Audit m10: a stale entry for a REMOVED repo would pin the flat MIN
+        // forever. The fold keys everything off the CURRENT repo set.
+        let current = [rref("Repository", Some("ns"), "nas")];
+        let existing = vec![
+            kopiur_api::snapshot_policy::RepoVerification {
+                repository: rref("Repository", Some("ns"), "nas"),
+                last_verified: Some("2026-08-02T00:00:00+00:00".into()),
+            },
+            kopiur_api::snapshot_policy::RepoVerification {
+                repository: rref("ClusterRepository", None, "removed"),
+                last_verified: Some("2020-01-01T00:00:00+00:00".into()),
+            },
+        ];
+        // The removed repo also left a stamp behind — it must not resurrect.
+        let stamps: BTreeMap<String, String> = [(
+            "ClusterRepository/removed".to_string(),
+            "2026-08-03T00:00:00+00:00".to_string(),
+        )]
+        .into();
+        let folded = fold_verification(&keyed(&current), &existing, &stamps, "ns");
+        assert_eq!(folded.entries.len(), 1);
+        assert_eq!(folded.entries[0].repository.name, "nas");
+        assert_eq!(
+            folded.flat.as_deref(),
+            Some("2026-08-02T00:00:00+00:00"),
+            "the removed repo's ancient timestamp must not pin the MIN"
+        );
     }
 
     // --- work-spec mapping (tier → VerifyOp) ---
@@ -1015,11 +1356,12 @@ mod tests {
         SnapshotPolicy::new(
             "pg",
             kopiur_api::SnapshotPolicySpec {
-                repository: kopiur_api::common::RepositoryRef {
+                repository: Some(kopiur_api::common::RepositoryRef {
                     kind: Default::default(),
                     name: "r".into(),
                     namespace: None,
-                },
+                }),
+                repositories: vec![],
                 identity: None,
                 sources: vec![Source {
                     pvc: Some(PvcSource {
@@ -1091,7 +1433,8 @@ mod tests {
         v.verify_files_percent = Some(10);
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick);
+        let ws =
+            build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick, None);
         match &ws.operation {
             Operation::Verify(op) => {
                 assert_eq!(op.success_expr.as_deref(), Some("stats.errors == 0"));
@@ -1129,7 +1472,8 @@ mod tests {
         });
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick);
+        let ws =
+            build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick, None);
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Quick(q) => {
@@ -1157,7 +1501,7 @@ mod tests {
         let v = verification(None, Some("0 5 * * 0"));
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep);
+        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep, None);
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Deep(d) => {
@@ -1187,7 +1531,7 @@ mod tests {
         });
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep);
+        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep, None);
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Deep(d) => {

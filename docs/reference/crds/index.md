@@ -1,6 +1,6 @@
 # CRD reference
 
-Per-CRD, per-field reference for the eight CRDs in
+Per-CRD, per-field reference for the nine CRDs in
 `kopiur.home-operations.com/v1alpha1`. Each page explains, field by field, what a
 field does, its default, the allowed values, and when you'd set it — the detail
 that used to live in the CRD `description` text.
@@ -30,4 +30,5 @@ The design *rationale* behind why these fields are shaped the way they are
 - [Restore](restore.md) — restore data from a repository.
 - [Maintenance](maintenance.md) — repository maintenance (quick/full).
 - [RepositoryReplication](repository-replication.md) — off-site mirror.
+- [SnapshotReplication](snapshot-replication.md) — copy snapshots between repositories.
 - [Shared sub-objects](shared-types.md) — types reused across CRDs (Backend, MoverSpec, …).

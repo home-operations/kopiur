@@ -5,10 +5,11 @@ the Kopia-native Kubernetes backup operator ([ADR-0003]).
 
 ## Role in the workspace
 
-This crate holds the **7 CRD types** in API group `kopiur.home-operations.com`,
+This crate holds the **9 CRD types** in API group `kopiur.home-operations.com`,
 version `v1alpha1` — [`Repository`] (ns), [`ClusterRepository`] (cluster),
-[`SnapshotPolicy`], [`Snapshot`], [`SnapshotSchedule`], [`Restore`], and
-[`Maintenance`] — together with the **shared pure logic** every consumer needs:
+[`SnapshotPolicy`], [`Snapshot`], [`SnapshotSchedule`], [`Restore`],
+[`Maintenance`], [`RepositoryReplication`], and [`SnapshotReplication`] —
+together with the **shared pure logic** every consumer needs:
 validation ([`validate`]), identity resolution ([`resolve_identity`]), schedule
 jitter ([`jitter`]), and GFS retention ([`select_kept`]).
 

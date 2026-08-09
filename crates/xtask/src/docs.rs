@@ -27,7 +27,7 @@ use kube::core::CustomResourceExt;
 
 use crate::artifact::{Artifact, DOCS_GEN_HEADER};
 
-/// Generate the single `docs/field-reference.md` artifact for all 8 CRDs.
+/// Generate the single `docs/field-reference.md` artifact for all 9 CRDs.
 pub fn artifacts() -> Result<Vec<Artifact>> {
     // Same order as `crds::artifacts()` so the page reads spec-first, simple to
     // complex, and stays stable.
@@ -40,6 +40,7 @@ pub fn artifacts() -> Result<Vec<Artifact>> {
         kopiur_api::Restore::crd(),
         kopiur_api::Maintenance::crd(),
         kopiur_api::RepositoryReplication::crd(),
+        kopiur_api::SnapshotReplication::crd(),
     ];
 
     let mut page = String::new();
@@ -55,7 +56,7 @@ pub fn artifacts() -> Result<Vec<Artifact>> {
 /// The hand-authored page preamble (title + how it is generated + conventions).
 const INTRO: &str = "# Field reference\n\
 \n\
-Every spec and status field of all eight CRDs in \
+Every spec and status field of all nine CRDs in \
 `kopiur.home-operations.com/v1alpha1`, with its type, schema default, and a \
 one-line meaning taken straight from the Rust doc comments.\n\
 \n\

@@ -24,23 +24,26 @@ pub fn build_snapshot(args: &SnapshotNowArgs, namespace: &str, now: DateTime<Utc
     build_snapshot_for(args, namespace, now, None)
 }
 
-/// [`build_snapshot`] for one member of a `pvcSelector` expansion.
+/// [`build_snapshot`] for one cell of a fan-out (`pvcSelector` member and/or
+/// multi-repository dimension, #368).
 ///
-/// `member` carries the child's deterministic name and the `spec.source` pin
-/// saying which PVC it covers. `None` is the ordinary single-source case.
+/// `cell` carries the child's deterministic name, the `spec.source` pin saying
+/// which PVC it covers, and — for a child of a multi-repo policy — the
+/// normalized `spec.repository` pin saying which repository it targets. `None`
+/// is the ordinary single-source, single-repo case.
 pub fn build_snapshot_for(
     args: &SnapshotNowArgs,
     namespace: &str,
     now: DateTime<Utc>,
-    member: Option<(&str, &kopiur_api::SnapshotSourceRef)>,
+    cell: Option<&kopiur_api::expand::MintCell>,
 ) -> Snapshot {
     let base = args
         .name
         .clone()
         .unwrap_or_else(|| format!("{}-manual-{}", args.policy, now.format("%Y%m%d%H%M%S")));
-    let (name, source) = match member {
-        Some((child, src)) => (child.to_string(), Some(src.clone())),
-        None => (base, None),
+    let (name, source, repository) = match cell {
+        Some(c) => (c.name.clone(), c.source.clone(), c.repository.clone()),
+        None => (base, None, None),
     };
     let failure_policy = if args.backoff_limit.is_some()
         || args.active_deadline_seconds.is_some()
@@ -57,6 +60,7 @@ pub fn build_snapshot_for(
     let mut snapshot = Snapshot::new(
         &name,
         SnapshotSpec {
+            repository,
             source,
             policy_ref: Some(PolicyRef {
                 name: args.policy.clone(),
@@ -240,13 +244,58 @@ async fn plan_snapshots(
             message: e.to_string(),
         }
     })?;
-    Ok(match members {
-        None => vec![build_snapshot(args, ns, now)],
-        Some(members) => members
+    let cells = planned_cells(
+        policy,
+        &args.policy,
+        &base,
+        members,
+        args.repository.as_deref(),
+    )?;
+    Ok(match &cells[..] {
+        // The single legacy cell keeps the exact pre-fan-out builder path.
+        [cell] if cell.source.is_none() && cell.repository.is_none() => {
+            vec![build_snapshot(args, ns, now)]
+        }
+        _ => cells
             .iter()
-            .map(|m| build_snapshot_for(args, ns, now, Some((&m.name, &m.source))))
+            .map(|c| build_snapshot_for(args, ns, now, Some(c)))
             .collect(),
     })
+}
+
+/// **Pure.** The mint cells for one `snapshot now` invocation: the members ×
+/// repositories cross product (#368) via the SAME
+/// [`kopiur_api::expand::mint_cells`] the `SnapshotSchedule` uses — so a
+/// manual run and a scheduled slot mint byte-identical sets — optionally
+/// restricted by `--repository`.
+///
+/// `--repository` must name one of the policy's repositories (unknown names
+/// are refused, listing the valid ones). Against a multi-repo policy it keeps
+/// only that repository's pinned cells; against a single-repo policy the
+/// (validated) name is the policy's one repository, and the minted child stays
+/// unpinned exactly as a single-repo child always is.
+fn planned_cells(
+    policy: &SnapshotPolicy,
+    policy_name: &str,
+    base: &str,
+    members: Option<Vec<kopiur_api::expand::ExpandedMember>>,
+    repository: Option<&str>,
+) -> Result<Vec<kopiur_api::expand::MintCell>, CliError> {
+    let mut cells = kopiur_api::expand::mint_cells(policy, base, members);
+    if let Some(repo_name) = repository {
+        let valid: Vec<&str> = kopiur_api::repository_refs(&policy.spec)
+            .map(|r| r.name.as_str())
+            .collect();
+        if !valid.contains(&repo_name) {
+            return Err(CliError::UnknownPolicyRepository {
+                given: repo_name.to_string(),
+                policy: policy_name.to_string(),
+                valid: valid.join(", "),
+            });
+        }
+        cells.retain(|c| c.repository.as_ref().is_none_or(|r| r.name == repo_name));
+    }
+    Ok(cells)
 }
 
 /// Run `snapshot now`.
@@ -436,6 +485,7 @@ mod tests {
             backoff_limit: None,
             active_deadline_seconds: None,
             pod_startup_deadline_seconds: None,
+            repository: None,
             wait: false,
             logs: false,
             timeout: None,
@@ -561,5 +611,101 @@ mod tests {
         assert!(detail.contains("snapshot s failed (AuthFailure): credentials rejected"));
         assert!(detail.contains("--- kopia stderr tail ---\naccess denied"));
         assert!(detail.contains("--- log tail ---\nlast lines"));
+    }
+
+    // --- multi-repo fan-out (#368): planned cells + the pin on the wire -----
+
+    fn multi_repo_policy() -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "nightly", "namespace": "media" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "nas" },
+                    { "kind": "ClusterRepository", "name": "offsite" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("multi-repo policy fixture")
+    }
+
+    fn single_repo_policy() -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "nightly", "namespace": "media" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("single-repo policy fixture")
+    }
+
+    #[test]
+    fn planned_cells_single_repo_is_the_one_legacy_cell() {
+        let cells = planned_cells(&single_repo_policy(), "nightly", "base", None, None).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].name, "base");
+        assert!(cells[0].source.is_none() && cells[0].repository.is_none());
+        // --repository naming the single repo is accepted and changes nothing.
+        let restricted =
+            planned_cells(&single_repo_policy(), "nightly", "base", None, Some("nas")).unwrap();
+        assert_eq!(restricted, cells);
+    }
+
+    #[test]
+    fn planned_cells_multi_repo_crosses_and_restricts() {
+        let all = planned_cells(&multi_repo_policy(), "nightly", "base", None, None).unwrap();
+        assert_eq!(all.len(), 2, "one child per repository");
+        assert!(all.iter().all(|c| c.repository.is_some()));
+
+        let only_nas =
+            planned_cells(&multi_repo_policy(), "nightly", "base", None, Some("nas")).unwrap();
+        assert_eq!(only_nas.len(), 1);
+        assert_eq!(only_nas[0].repository.as_ref().unwrap().name, "nas");
+    }
+
+    #[test]
+    fn planned_cells_refuses_an_unknown_repository_listing_valid_ones() {
+        let err =
+            planned_cells(&multi_repo_policy(), "nightly", "base", None, Some("typo")).unwrap_err();
+        match err {
+            CliError::UnknownPolicyRepository {
+                given,
+                policy,
+                valid,
+            } => {
+                assert_eq!(given, "typo");
+                assert_eq!(policy, "nightly");
+                assert_eq!(valid, "nas, offsite");
+            }
+            other => panic!("expected UnknownPolicyRepository, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pinned_cell_lands_spec_repository_on_the_wire() {
+        let cells = planned_cells(&multi_repo_policy(), "nightly", "base", None, None).unwrap();
+        let nas_cell = cells
+            .iter()
+            .find(|c| c.repository.as_ref().unwrap().name == "nas")
+            .unwrap();
+        let snap = build_snapshot_for(&args(), "media", at(), Some(nas_cell));
+        let wire = serde_json::to_value(&snap).unwrap();
+        assert_eq!(wire["metadata"]["name"], nas_cell.name);
+        // The pin is stamped NORMALIZED: the namespaced member carries the
+        // policy's namespace explicitly.
+        assert_eq!(
+            wire["spec"]["repository"],
+            serde_json::json!({ "kind": "Repository", "name": "nas", "namespace": "media" })
+        );
+        // Manual children keep the manual origin + config labels.
+        assert_eq!(
+            wire["metadata"]["labels"]["kopiur.home-operations.com/origin"],
+            "manual"
+        );
     }
 }

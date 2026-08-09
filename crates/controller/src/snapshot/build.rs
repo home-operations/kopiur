@@ -471,6 +471,7 @@ pub(super) fn origin_str(origin: Origin) -> &'static str {
         Origin::Manual => "manual",
         Origin::Discovered => "discovered",
         Origin::Adopted => "adopted",
+        Origin::Replicated => "replicated",
     }
 }
 

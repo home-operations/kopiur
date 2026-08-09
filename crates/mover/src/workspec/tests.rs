@@ -973,11 +973,12 @@ fn s3_ca_bundle_pem_roundtrips_and_reaches_the_kopia_connect_spec() {
 fn policy_args_from_policy_maps_all_flattened_knobs() {
     use kopiur_api::snapshot_policy::{Compression, ErrorHandling, Files, Upload};
     let spec = kopiur_api::SnapshotPolicySpec {
-        repository: kopiur_api::common::RepositoryRef {
+        repository: Some(kopiur_api::common::RepositoryRef {
             kind: Default::default(),
             name: "r".into(),
             namespace: None,
-        },
+        }),
+        repositories: vec![],
         identity: None,
         sources: vec![],
         copy_method: Default::default(),
@@ -1065,11 +1066,12 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
 /// glue tests below (and easy to spot the ONE field each varies).
 fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
     kopiur_api::SnapshotPolicySpec {
-        repository: kopiur_api::common::RepositoryRef {
+        repository: Some(kopiur_api::common::RepositoryRef {
             kind: Default::default(),
             name: "r".into(),
             namespace: None,
-        },
+        }),
+        repositories: vec![],
         identity: None,
         sources: vec![],
         copy_method: Default::default(),
@@ -1356,6 +1358,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
                 file_queue_length: None,
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
+            repository_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -1389,6 +1392,11 @@ fn verify_quick_roundtrip_and_wire_shape() {
         v["operation"]["verify"]["successExpr"],
         "stats.files > 0 && stats.errors == 0"
     );
+    // Single-repo golden byte: no repositoryKey key at all when None.
+    assert!(
+        v["operation"]["verify"].get("repositoryKey").is_none(),
+        "repository_key: None must elide"
+    );
     // The quick tier maps to the kopia client VerifyOptions.
     if let Operation::Verify(op) = &spec.operation {
         assert_eq!(op.tier.kind_str(), "quick");
@@ -1415,6 +1423,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
                 parallel: None,
             }),
             success_expr: None,
+            repository_key: Some("Repository/backups/nas".into()),
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -1438,6 +1447,11 @@ fn verify_deep_roundtrip_and_wire_shape() {
     assert_eq!(
         v["operation"]["verify"]["tier"]["deep"]["snapshotId"],
         "k99"
+    );
+    // Multi-repo: the per-repo key rides the wire camelCased.
+    assert_eq!(
+        v["operation"]["verify"]["repositoryKey"],
+        "Repository/backups/nas"
     );
     if let Operation::Verify(op) = &spec.operation {
         assert_eq!(op.tier.kind_str(), "deep");
@@ -1626,6 +1640,176 @@ fn replicate_op_old_wire_decodes_with_sync_fields_defaulted() {
             ..Default::default()
         }
     );
+}
+
+// --- snapshot replication op (SnapshotReplication CRD, M4) ---
+
+fn sample_snapshot_replicate_op() -> SnapshotReplicateOp {
+    SnapshotReplicateOp {
+        destination: RepositoryConnect::S3 {
+            bucket: "offsite".into(),
+            endpoint: Some("https://minio.remote".into()),
+            prefix: Some("copies/".into()),
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ca_bundle_pem: None,
+            ambient_credentials: false,
+        },
+        destination_repository: ReplicationRepositoryRef {
+            kind: "ClusterRepository".into(),
+            name: "offsite".into(),
+            namespace: None,
+            uid: "dest-uid-1".into(),
+        },
+        source_repository: ReplicationSourceRef {
+            kind: "Repository".into(),
+            name: "nas-primary".into(),
+            namespace: Some("backups".into()),
+        },
+        include: vec![IdentityMatcherSpec {
+            username: Some("my*".into()),
+            hostname: None,
+            source_path: None,
+        }],
+        exclude: vec![IdentityMatcherSpec {
+            username: None,
+            hostname: Some("staging".into()),
+            source_path: None,
+        }],
+        latest_only: true,
+        parallel: Some(4),
+        policies: PolicyCopyModeSpec::Copy,
+        pruning: PruningSpec::Retention(ReplicationRetentionSpec {
+            keep_daily: Some(7),
+            keep_weekly: Some(4),
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn snapshot_replicate_roundtrip_and_wire_shape() {
+    let spec = MoverWorkSpec {
+        version: 2,
+        operation: Operation::SnapshotReplicate(sample_snapshot_replicate_op()),
+        identity: sample_identity(),
+        repository: RepositoryConnect::Filesystem {
+            path: "/repo".into(),
+        },
+        target_ref: TargetRef {
+            api_version: "kopiur.home-operations.com/v1alpha1".into(),
+            kind: "SnapshotReplication".into(),
+            name: "offsite-mirror".into(),
+            namespace: "backups".into(),
+        },
+        hook_plan: HookPlanSummary::default(),
+        options: MoverOptions::default(),
+        cache: Default::default(),
+        throttle: Default::default(),
+    };
+    assert_eq!(roundtrip(&spec), spec);
+    assert_eq!(spec.operation.kind_str(), "SnapshotReplicate");
+
+    // Externally tagged, camelCase wire shape — typed via the JSON path, the
+    // same way the cluster parses it.
+    let v: serde_json::Value = serde_json::to_value(&spec).unwrap();
+    let op = &v["operation"]["snapshotReplicate"];
+    assert_eq!(op["destination"]["s3"]["bucket"], "offsite");
+    assert_eq!(op["destinationRepository"]["kind"], "ClusterRepository");
+    assert_eq!(op["destinationRepository"]["uid"], "dest-uid-1");
+    assert!(op["destinationRepository"].get("namespace").is_none());
+    assert_eq!(op["sourceRepository"]["name"], "nas-primary");
+    assert_eq!(op["sourceRepository"]["namespace"], "backups");
+    assert_eq!(op["include"][0]["username"], "my*");
+    assert!(op["include"][0].get("hostname").is_none());
+    assert_eq!(op["exclude"][0]["hostname"], "staging");
+    assert_eq!(op["latestOnly"], true);
+    assert_eq!(op["parallel"], 4);
+    assert_eq!(op["policies"], "copy");
+    // Pruning is externally tagged: { "retention": { "keepDaily": 7, ... } }.
+    assert_eq!(op["pruning"]["retention"]["keepDaily"], 7);
+    assert_eq!(op["pruning"]["retention"]["keepWeekly"], 4);
+    assert!(op["pruning"]["retention"].get("keepLatest").is_none());
+}
+
+#[test]
+fn snapshot_replicate_pruning_marker_variants_roundtrip() {
+    // The empty marker sub-objects round-trip as `{ "none": {} }` /
+    // `{ "mirrorSource": {} }` (external tagging; future knobs slot in).
+    for (pruning, key) in [
+        (PruningSpec::None(NoPruningSpec {}), "none"),
+        (
+            PruningSpec::MirrorSource(MirrorSourcePruningSpec {}),
+            "mirrorSource",
+        ),
+    ] {
+        let v = serde_json::to_value(&pruning).unwrap();
+        assert_eq!(v[key], serde_json::json!({}), "{key}: {v}");
+        let back: PruningSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back, pruning);
+    }
+    assert!(PruningSpec::default().is_none());
+}
+
+#[test]
+fn snapshot_replicate_old_wire_decodes_with_selection_and_pruning_defaulted() {
+    // A minimal wire payload (just the repository blocks) must decode with
+    // every optional knob at its default: include/exclude empty, full history,
+    // policies none, pruning none — serde(default) is the guard.
+    let legacy = serde_json::json!({
+        "destination": { "filesystem": { "path": "/mirror" } },
+        "destinationRepository": { "kind": "Repository", "name": "offsite", "uid": "u1" },
+        "sourceRepository": { "kind": "Repository", "name": "nas" },
+    });
+    let op: SnapshotReplicateOp =
+        serde_json::from_value(legacy).expect("minimal snapshot-replicate op decodes");
+    assert!(op.include.is_empty());
+    assert!(op.exclude.is_empty());
+    assert!(!op.latest_only);
+    assert_eq!(op.parallel, None);
+    assert_eq!(op.policies, PolicyCopyModeSpec::None);
+    assert!(op.pruning.is_none());
+    assert_eq!(op.destination_repository.namespace, None);
+    assert_eq!(op.source_repository.namespace, None);
+}
+
+#[test]
+fn policy_copy_mode_maps_every_variant_to_the_kopia_mode() {
+    // Exhaustive mapping — kopia's own default for --policies is TRUE, so the
+    // None arm rendering an explicit --no-policies downstream depends on this
+    // mapping never silently dropping a variant.
+    use kopiur_kopia::MigratePolicies;
+    assert_eq!(PolicyCopyModeSpec::None.to_kopia(), MigratePolicies::None);
+    assert_eq!(PolicyCopyModeSpec::Copy.to_kopia(), MigratePolicies::Copy);
+    assert_eq!(
+        PolicyCopyModeSpec::CopyOverwrite.to_kopia(),
+        MigratePolicies::CopyOverwrite
+    );
+    // Wire values are camelCase strings.
+    assert_eq!(
+        serde_json::to_value(PolicyCopyModeSpec::CopyOverwrite).unwrap(),
+        "copyOverwrite"
+    );
+}
+
+#[test]
+fn replication_retention_maps_onto_the_api_gfs_policy_field_for_field() {
+    let spec = ReplicationRetentionSpec {
+        keep_latest: Some(1),
+        keep_hourly: Some(2),
+        keep_daily: Some(3),
+        keep_weekly: Some(4),
+        keep_monthly: Some(5),
+        keep_annual: Some(6),
+    };
+    let r = spec.to_retention();
+    assert_eq!(r.keep_latest, Some(1));
+    assert_eq!(r.keep_hourly, Some(2));
+    assert_eq!(r.keep_daily, Some(3));
+    assert_eq!(r.keep_weekly, Some(4));
+    assert_eq!(r.keep_monthly, Some(5));
+    assert_eq!(r.keep_annual, Some(6));
 }
 
 // --- M6: maintenance-owner restamp policy (connect-to-existing self-heal) --

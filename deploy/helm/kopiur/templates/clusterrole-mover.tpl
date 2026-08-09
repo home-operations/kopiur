@@ -26,6 +26,41 @@ rules:
       - maintenances/status
       - snapshotpolicies/status
       - repositoryreplications/status
+      - snapshotreplications/status
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: [get, patch]
+---
+# Dedicated snapshot-replication mover ClusterRole (issue #368). RBAC rules
+# SYNCED from `cargo xtask gen-rbac` (deploy/rbac/mover-clusterrole.yaml,
+# second document) — that xtask is the SOURCE OF TRUTH; edit it and re-run,
+# then re-sync these rules.
+#
+# The replication mover creates and DELETES Snapshot CRs (copy-CR
+# reconciliation + pruning) — verbs the generic mover role above must NEVER
+# hold (a compromised generic mover pod holding namespace-wide Snapshot delete
+# could erase every backup record in its namespace). The controller mints the
+# same-named ServiceAccount + a RoleBinding to THIS role per namespace, only
+# for snapshot-replication mover Jobs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kopiur.snapshotReplicationMoverName" . }}
+  labels:
+    {{- include "kopiur.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots
+    verbs: [get, list, create, patch, delete]
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots/status
+      - snapshotreplications/status
     verbs: [get, patch]
   - apiGroups: [""]
     resources:

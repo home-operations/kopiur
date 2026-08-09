@@ -265,15 +265,20 @@ pub enum ValidationError {
     /// repository. Two recipes interleaving snapshots into one kopia identity corrupts
     /// the snapshot history, so the webhook rejects the second one (ADR-0005 §6).
     #[error(
-        "resolved identity {identity:?} collides with existing SnapshotPolicy {conflict:?} in the \
-         same repository; two policies must not share a kopia identity (give this policy a distinct \
-         spec.identity, or target a different repository)"
+        "resolved identity {identity:?} collides with existing SnapshotPolicy {conflict:?} in \
+         repository {repo}; two policies must not share a kopia identity in the same repository \
+         (give this policy a distinct spec.identity, or target a different repository)"
     )]
     IdentityCollision {
         /// The resolved `username@hostname[:path]` identity that collided.
         identity: String,
         /// `namespace/name` of the already-admitted conflicting `SnapshotPolicy`.
         conflict: String,
+        /// Normalized key (`Kind[/namespace]/name`) of the repository BOTH
+        /// policies resolve that identity in — for a multi-repository policy
+        /// this names WHICH member pair collided (the other members may be
+        /// perfectly fine).
+        repo: String,
     },
 
     /// A kopia identity component (`username` or `hostname`) — whether an explicit
@@ -350,6 +355,31 @@ pub enum ValidationError {
         /// The previously-pinned identity (or source path).
         old: String,
         /// The new identity (or source path) this edit would resolve to.
+        new: String,
+    },
+
+    /// The multi-repository analogue of [`Self::IdentityWouldFork`]: an UPDATE
+    /// to a `SnapshotPolicy` would change the kopia identity it resolves to
+    /// **in one of its member repositories** (each member resolves its own
+    /// identity under that repository's `identityDefaults`) while the policy
+    /// already has snapshot history. The message names WHICH repository's
+    /// lineage would fork — with N members, the other N-1 may be unaffected.
+    /// Same acknowledgement release as the single-repo variant.
+    #[error(
+        "this edit changes the policy's resolved kopia identity in repository {repo} from \
+         {old:?} to {new:?}, but the policy already has snapshot history; new snapshots would \
+         land under a new kopia source while the old lineage's Snapshot CRs keep competing in \
+         the same GFS retention timeline (not independent retention), and restore/verify \
+         resolve only the new identity. To intentionally re-identify, set annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value)"
+    )]
+    IdentityWouldForkInRepository {
+        /// Normalized key (`Kind[/namespace]/name`) of the member repository
+        /// whose lineage this edit would fork.
+        repo: String,
+        /// The previously-resolved `username@hostname` in that repository.
+        old: String,
+        /// The `username@hostname` this edit would resolve to in that repository.
         new: String,
     },
 
@@ -474,6 +504,267 @@ pub enum ValidationError {
         backend: String,
     },
 
+    /// Two distinct filesystem repositories in one replication share the same
+    /// in-pod `backend.path`, so the mover Job would carry two volumeMounts at
+    /// one `mountPath` — an invalid pod spec that otherwise fails only at
+    /// Job-create time. Different volumes make them pass the self-target check;
+    /// the mount topology is the problem.
+    #[error(
+        "the source and destination filesystem repositories both mount at {path:?} inside the \
+         replication mover pod; two volumes cannot share one mountPath. Give one of them a \
+         distinct backend.path (e.g. /repo-dst) — the path is where the volume mounts inside \
+         kopiur's pods, so changing it does not move any data"
+    )]
+    ReplicationMountPathCollision {
+        /// The shared in-pod mount path.
+        path: String,
+    },
+
+    /// A `SnapshotReplication`'s `sourceRef` and `destinationRef` are the same
+    /// reference (same kind, name, and effective namespace) — copying a
+    /// repository's snapshots into itself is a no-op at best and duplicates
+    /// every manifest at worst. The pure validator catches the literal same-ref
+    /// case; the webhook additionally rejects two *different* refs that resolve
+    /// to the same storage target (`backend_target_key`).
+    #[error(
+        "SnapshotReplication sourceRef and destinationRef point at the same {kind} {name:?} — \
+         a replication cannot copy a repository's snapshots into itself. Point destinationRef \
+         at a different repository (typically the off-site one)"
+    )]
+    SnapshotReplicationSelfTarget {
+        /// The shared repository kind (`Repository` or `ClusterRepository`).
+        kind: String,
+        /// The shared repository name both refs point at.
+        name: String,
+    },
+
+    /// A `SnapshotReplication`'s `sourceRef` and `destinationRef` are two
+    /// *different* references that resolve to the **same storage target**
+    /// (`backend_target_key` — e.g. a namespaced `Repository` and a
+    /// `ClusterRepository` both pointing at one bucket+prefix). The pure
+    /// validator's [`Self::SnapshotReplicationSelfTarget`] catches the literal
+    /// same-ref case; this is the webhook's resolved-backend backstop.
+    #[error(
+        "SnapshotReplication sourceRef ({source_ref}) and destinationRef ({destination_ref}) \
+         resolve to the same {backend} storage target — a replication cannot copy a \
+         repository's snapshots into its own storage (source and destination would be one \
+         repository). Point destinationRef at a repository backed by different storage \
+         (typically the off-site one)"
+    )]
+    SnapshotReplicationSameStorage {
+        /// The source reference, rendered as `Kind name` (with namespace when set).
+        source_ref: String,
+        /// The destination reference, rendered the same way.
+        destination_ref: String,
+        /// The backend kind both refs resolved to (e.g. `s3`).
+        backend: String,
+    },
+
+    /// A `SnapshotReplication` combines `pruning: mirrorSource` with a
+    /// `spec.selection` that overlaps kopia identities the DESTINATION's own
+    /// `SnapshotPolicy`s write directly. Replicated copies would interleave
+    /// with directly-written snapshots in those identities' histories, and
+    /// mirror-source pruning deletes any copy whose `(identity, startTime)`
+    /// vanished from the source — so a source-side deletion cascades into
+    /// identities the destination does NOT merely mirror. Rejected as a
+    /// data-loss combination.
+    #[error(
+        "spec.selection overlaps {} — this replication would copy snapshots into kopia \
+         identities the destination's own SnapshotPolicies also write directly, and \
+         pruning: mirrorSource deletes any copy whose (identity, startTime) has vanished \
+         from the source, so a source-side deletion cascades into identities the destination \
+         does not merely mirror (a data-loss combination). Fix: exclude these identities via \
+         spec.selection.identities.exclude, or drop pruning: mirrorSource",
+        describe_overlapping_identities(identities)
+    )]
+    SnapshotReplicationOverlapMirrorSource {
+        /// Every overlapping `username@hostname[:path]` identity (the message
+        /// truncates the rendered list to 5; this field carries all of them).
+        identities: Vec<String>,
+    },
+
+    /// A `SnapshotReplication` identity matcher set none of
+    /// `username`/`hostname`/`sourcePath`. An empty matcher constrains nothing —
+    /// in an `include` list it would silently select EVERY identity, and in an
+    /// `exclude` list it would silently exclude everything — so the intent must
+    /// be spelled out instead.
+    #[error(
+        "identity matcher {field} sets none of username/hostname/sourcePath — an empty matcher \
+         constrains nothing (it would match every identity). Set at least one component \
+         (globs allowed, e.g. username: \"pg-*\"), or remove the matcher"
+    )]
+    EmptyIdentityMatcher {
+        /// The offending matcher's field path (e.g.
+        /// `"SnapshotReplication spec.selection.identities.include[0]"`).
+        field: String,
+    },
+
+    /// A `SnapshotReplication` `pruning.retention` block set no `keep*` bucket.
+    /// A retention that keeps nothing would prune every replicated copy on the
+    /// next run — almost certainly a typo'd field name, so it is rejected
+    /// rather than honored.
+    #[error(
+        "spec.pruning.retention sets no keep* bucket (keepLatest/keepHourly/keepDaily/\
+         keepWeekly/keepMonthly/keepAnnual) — a retention that keeps nothing would prune \
+         every replicated snapshot on the next run. Set at least one keep* count, or use \
+         `pruning: {{ none: {{}} }}` (or omit pruning) to keep copies forever"
+    )]
+    RetentionKeepsNothing,
+
+    /// A `SnapshotPolicy` set neither or both of `spec.repository` /
+    /// `spec.repositories`. Exactly one of the two shapes must be present —
+    /// neither leaves the recipe with no target at all, and both leaves it
+    /// ambiguous whether the single ref is a ninth member or a leftover.
+    /// Mirrors the spec-level CEL rule on `SnapshotPolicySpec`.
+    #[error(
+        "exactly one of spec.repository and spec.repositories must be set (got {got}); \
+         set spec.repository to name the single target repository, or spec.repositories \
+         to list 1-8 targets for multi-repository fan-out"
+    )]
+    PolicyRepositoryExactlyOne {
+        /// Which invalid shape was found: `"neither"` or `"both"`.
+        got: &'static str,
+    },
+
+    /// `SnapshotPolicy.spec.repositories` lists the same repository twice
+    /// (after normalizing kind + effective namespace + name). Each run would
+    /// back the source into that repository twice under one kopia identity —
+    /// two interleaved writers corrupting one snapshot history, exactly the
+    /// hazard the identity-collision guard exists to prevent.
+    #[error(
+        "spec.repositories[{first}] and spec.repositories[{second}] both name {key} — each \
+         listed repository must be distinct, or the two fan-out children would interleave \
+         writes into one kopia identity in that repository. Remove the duplicate entry"
+    )]
+    PolicyRepositoriesDuplicate {
+        /// The normalized repository key both entries resolve to
+        /// (`Kind[/namespace]/name`).
+        key: String,
+        /// Index of the first occurrence in `spec.repositories`.
+        first: usize,
+        /// Index of the duplicate occurrence in `spec.repositories`.
+        second: usize,
+    },
+
+    /// A code path that genuinely requires a SINGLE repository (the
+    /// [`single_repository_ref`](crate::snapshot_policy::single_repository_ref)
+    /// accessor's `Multi` arm) was handed a multi-repository policy. This is
+    /// NOT an admission refusal — `spec.repositories` is fully supported; a
+    /// multi-repo policy's per-repository work is addressed through each
+    /// child `Snapshot`'s `spec.repository` pin, never through a policy-level
+    /// "the one repository" read, so any consumer still asking for one fails
+    /// loudly here instead of silently picking repository #1.
+    #[error(
+        "this operation reads a policy-level single repository, but the SnapshotPolicy \
+         uses spec.repositories (multi-repository fan-out) — select the repository \
+         explicitly (the per-child Snapshot spec.repository pin, or the operation's own \
+         repository selector) instead of relying on a single policy repository"
+    )]
+    PolicySingleRepositoryRequired,
+
+    /// A `SnapshotPolicy` combines `spec.hooks` with `spec.repositories`.
+    /// Hooks quiesce the workload around ONE capture; with N concurrent
+    /// fan-out children the first finisher runs the after-snapshot (thaw)
+    /// hooks while the other N-1 movers are still reading — voiding the
+    /// quiesce guarantee — and serializing the children would multiply the
+    /// freeze window by N. Refused as an unsatisfiable consistency contract.
+    #[error(
+        "spec.hooks cannot be combined with spec.repositories: the first fan-out child to \
+         finish would run the after-snapshot (thaw) hooks while the other children's movers \
+         are still reading, so the quiesce contract cannot be honored. Use a single-repo \
+         policy (spec.repository) with hooks, plus a SnapshotReplication to copy its \
+         snapshots into the second repository"
+    )]
+    PolicyHooksWithRepositories,
+
+    /// A `Snapshot`'s repository pin (`spec.repository`) names a repository
+    /// that is not in its `SnapshotPolicy`'s repository set — either the pin is
+    /// wrong (a hand-written CREATE with a typo, refused at admission) or the
+    /// recipe was edited out from under an existing Snapshot's mint-time pin
+    /// (terminal for that CR). Proceeding against any OTHER repository would
+    /// silently act on the wrong backend, and guessing is the one thing a
+    /// backup operator must never do.
+    #[error(
+        "Snapshot spec.repository pins {pin}, but SnapshotPolicy `{policy}` does not list \
+         that repository (current set: {valid}). Fix the pin to a listed member, restore the \
+         repository entry on the policy, or — for an existing Snapshot whose recipe was \
+         edited out from under it — delete it and let the schedule re-fire against the \
+         current recipe"
+    )]
+    SnapshotPinNotInPolicy {
+        /// Normalized key of the pinned repository (`Kind[/namespace]/name`).
+        pin: String,
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's current repository set.
+        valid: String,
+    },
+
+    /// A `Snapshot` referencing a MULTI-repository `SnapshotPolicy` carries no
+    /// `spec.repository` pin, so there is no way to know which of the N
+    /// repositories this run targets. Raised both at admission (refusing to
+    /// CREATE such a child) and as the controller-side backstop for stored
+    /// rows; picking repository #1 silently is never an option.
+    #[error(
+        "Snapshot has no spec.repository pin, but SnapshotPolicy `{policy}` lists multiple \
+         repositories (spec.repositories) — a multi-repo child must pin exactly one member \
+         at mint time. Let a SnapshotSchedule fire it, or use `kubectl kopiur snapshot now` \
+         — both stamp the repository (an already-created unpinned Snapshot must be deleted \
+         and re-minted)"
+    )]
+    MultiRepoSnapshotUnpinned {
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+    },
+
+    /// A `Snapshot` with no `policyRef` (e.g. a `SnapshotReplication` copy CR
+    /// or a discovered row) has no derivable repository: neither a
+    /// `status.resolved.repository` pin, nor a `spec.repository` pin, nor a
+    /// `Repository`/`ClusterRepository` owner reference.
+    #[error(
+        "cannot determine the repository for Snapshot `{snapshot}`: it has no policyRef and \
+         carries neither a status.resolved.repository pin, a spec.repository pin, nor a \
+         Repository/ClusterRepository owner reference"
+    )]
+    SnapshotRepositoryUnresolvable {
+        /// The `Snapshot`'s name.
+        snapshot: String,
+    },
+
+    /// A `fromPolicy` restore names an explicit `spec.repository` that is not a
+    /// member of the referenced `SnapshotPolicy`'s repository set — most likely
+    /// a typo, and honoring it would silently read a repository the recipe
+    /// never wrote to.
+    #[error(
+        "restore.spec.repository names {given}, which is not a repository of SnapshotPolicy \
+         `{policy}` — a fromPolicy restore must read one of the policy's own repositories \
+         (set restore.spec.repository to one of: {valid}), or use a snapshotRef/identity \
+         source to restore from elsewhere"
+    )]
+    RestoreRepositoryNotInPolicy {
+        /// Normalized key of the repository the restore named.
+        given: String,
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's repository set.
+        valid: String,
+    },
+
+    /// A `fromPolicy` restore references a MULTI-repository `SnapshotPolicy`
+    /// without selecting which repository to read — the operator must never
+    /// guess (the N repositories are independent captures that can diverge).
+    #[error(
+        "SnapshotPolicy `{policy}` lists multiple repositories (spec.repositories), so a \
+         fromPolicy restore must say which one to read: set restore.spec.repository to one \
+         of: {valid}"
+    )]
+    RestoreRepositorySelectionRequired {
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's repository set.
+        valid: String,
+    },
+
     /// A namespaced `Repository` set `spec.maintenance.namespace`, which only
     /// applies to a cluster-scoped `ClusterRepository` (a namespaced
     /// `Repository`'s managed `Maintenance` always lives in the repository's own
@@ -552,6 +843,39 @@ pub fn describe_identity_change_consumers(consumers: &[String]) -> String {
 /// How many consumer names [`describe_identity_change_consumers`] spells out
 /// before collapsing the rest into `"and N more"`.
 const CONSUMER_LIST_SHOWN: usize = 5;
+
+/// Render the overlap list for
+/// [`ValidationError::SnapshotReplicationOverlapMirrorSource`]: the count, then
+/// up to [`CONSUMER_LIST_SHOWN`] identities, then `"and N more"`. Also reused
+/// verbatim by the webhook to build the non-blocking admission WARNING for the
+/// same overlap without `mirrorSource`, so the deny message and the warning
+/// always name the same identities the same way.
+///
+/// ```
+/// use kopiur_api::error::describe_overlapping_identities;
+///
+/// assert_eq!(
+///     describe_overlapping_identities(&["pg@billing:/pvc/data".to_string()]),
+///     "1 destination-side SnapshotPolicy identity(ies) (pg@billing:/pvc/data)",
+/// );
+/// let many: Vec<String> = (0..7).map(|i| format!("pg-{i}@ns:/p")).collect();
+/// let rendered = describe_overlapping_identities(&many);
+/// assert!(rendered.starts_with("7 destination-side"));
+/// assert!(rendered.ends_with("and 2 more)"), "{rendered}");
+/// ```
+pub fn describe_overlapping_identities(identities: &[String]) -> String {
+    let total = identities.len();
+    let mut names = identities
+        .iter()
+        .take(CONSUMER_LIST_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > CONSUMER_LIST_SHOWN {
+        names.push_str(&format!(", and {} more", total - CONSUMER_LIST_SHOWN));
+    }
+    format!("{total} destination-side SnapshotPolicy identity(ies) ({names})")
+}
 
 /// Result alias for validators. Defaults to `()` for the common "pass/fail with no
 /// value" case.

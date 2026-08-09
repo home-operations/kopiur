@@ -28,6 +28,7 @@ rules:
       - restores
       - maintenances
       - repositoryreplications
+      - snapshotreplications
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups:
       - kopiur.home-operations.com
@@ -46,6 +47,8 @@ rules:
       - maintenances/finalizers
       - repositoryreplications/status
       - repositoryreplications/finalizers
+      - snapshotreplications/status
+      - snapshotreplications/finalizers
     verbs: [get, update, patch]
   - apiGroups: [""]
     resources:

@@ -1539,6 +1539,27 @@ fn wi_rolebinding_name_truncates_long_sa_names_with_a_stable_hash() {
 }
 
 #[test]
+fn snapshot_replication_mover_name_derives_from_the_generic_role() {
+    // The default chart wiring (`<fullname>-mover`) yields the exact name
+    // `gen-rbac` ships and the chart's snapshotReplicationMoverName helper
+    // renders, so the runtime binding always references an existing role.
+    assert_eq!(
+        snapshot_replication_mover_name("kopiur-mover"),
+        "kopiur-snapshot-replication-mover"
+    );
+    assert_eq!(
+        snapshot_replication_mover_name("myrelease-kopiur-mover"),
+        "myrelease-kopiur-snapshot-replication-mover"
+    );
+    // A custom role name without the conventional suffix still derives
+    // deterministically (and distinctly from the generic role).
+    assert_eq!(
+        snapshot_replication_mover_name("custom-role"),
+        "custom-role-snapshot-replication"
+    );
+}
+
+#[test]
 fn missing_wi_sa_message_is_actionable_per_cloud() {
     use kopiur_api::creds::WorkloadIdentityCloud;
     for (cloud, annotation) in [
@@ -3252,6 +3273,24 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         false,
         crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
         "snapshot_schedule::schedule_ready_status (computed polarity)",
+    ),
+    // `snapshot_schedule::schedule_ready_status` (fire passes), which asserts
+    // BOTH polarities so a slot that mints fully clears the gate. Promoted into
+    // the registry by the #368 M10 gates/doctor checklist.
+    (
+        crate::consts::SCHEDULE_FANOUT_CAPPED_CONDITION,
+        true,
+        crate::consts::FANOUT_TOO_LARGE_REASON,
+        "snapshot_schedule::schedule_ready_status fan-out cap (computed polarity)",
+    ),
+    // `snapshot_policy::policy_ready_conditions`, via
+    // io::upsert_gate(&POLICY_REPOSITORY_NOT_READY_GATE, …) on the not-ready
+    // side; the all-ready side clears it (True) when present.
+    (
+        crate::consts::REPOSITORIES_READY_CONDITION,
+        false,
+        crate::consts::REPOSITORY_NOT_READY_REASON,
+        "snapshot_policy::policy_ready_conditions (upsert_gate)",
     ),
 ];
 

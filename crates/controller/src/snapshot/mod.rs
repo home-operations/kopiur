@@ -240,6 +240,48 @@ async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> 
     Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
 }
 
+/// `Origin::Replicated` steady-state pin, modeled on [`pin_adopted_row`]: a
+/// dest-side copy CR a `SnapshotReplication` run minted for a kopia snapshot it
+/// `snapshot migrate`d — catalog history, NEVER a run, so like
+/// `Discovered`/`Adopted` it must never enter the backup-run machinery or mint
+/// a mover Job. It gets exactly what an adopted row gets: cleanup-finalizer
+/// upkeep (its CR deletion cascades to the dest manifest via the normal batched
+/// snapdel path) plus an idempotent, PROVENANCE-GATED terminal pin.
+///
+/// The provenance gate is the same one `pin_adopted_row` uses
+/// ([`plan::adopted_row_has_provenance`]: controller/mover-written
+/// `status.snapshot`): the replication mover stamps the copy's status (phase
+/// `Succeeded` + `snapshot` + `resolved.repository`) in ONE atomic body right
+/// after CREATE, so a genuine copy is only transiently phase-less and this pin
+/// is a heal for a mover that died between its status patch landing and the
+/// phase converging. A user-applied BARE `origin: replicated` label with no
+/// `status.snapshot` must stay phase-less — a phantom `Succeeded` row would
+/// otherwise claim history it does not have (the same forgery shape
+/// `pin_adopted_row` guards against).
+///
+/// Nothing produces `replicated` rows yet (#368 shared-foundations milestone);
+/// this arm exists so the reconciler is total over `Origin` the moment the
+/// first copy CR appears.
+async fn pin_replicated_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> Result<Action> {
+    io::ensure_finalizer(api, backup, SNAPSHOT_CLEANUP_FINALIZER).await?;
+    if plan::adopted_row_has_provenance(backup)
+        && needs_terminal_pin(
+            backup.status.as_ref().and_then(|s| s.phase.as_ref()),
+            &SnapshotPhase::Succeeded,
+        )
+    {
+        let mut status = snapshot_ready_status(
+            backup,
+            SnapshotPhase::Succeeded,
+            "Replicated",
+            "replicated snapshot: a dest-side copy minted by a SnapshotReplication run",
+        );
+        status["origin"] = serde_json::json!("replicated");
+        io::patch_status(api, name, status).await?;
+    }
+    Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE))
+}
+
 async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let origin = resolve_origin(backup);
     let policy = effective_deletion_policy(backup.spec.deletion_policy, origin);
@@ -250,17 +292,38 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
 
     if backup.metadata.deletion_timestamp.is_some() {
+        // `policy` is already conservative for an unparseable origin
+        // (`effective_deletion_policy(_, None)` = forced Retain): the finalizer
+        // releases the CR without ever contacting the repository.
         return handle_deletion(backup, ctx, &api, &namespace, &name, policy).await;
     }
 
-    // Exhaustive over `Origin` (ADR §5.5): `Discovered` and `Adopted` rows are
-    // catalog history, not runs, and must return BEFORE any of the backup-run
-    // machinery below (`run_decision`, post-hooks, staged reap, pin jobs) —
-    // `Scheduled`/`Manual` are the only origins that ever mint a mover Job, so
-    // they fall through to it.
+    // An origin marker this build cannot parse (a typo, a forged label, or a
+    // row written by a NEWER operator during version skew): warn and HOLD —
+    // never fall through to the backup-run machinery (the old behavior folded
+    // unknown to Manual, which minted a mover Job for a foreign row). Inert on
+    // purpose: no finalizer, no phase pin, no Job — just surface it and keep
+    // re-checking at the steady cadence in case a newer writer completes it.
+    let Some(origin) = origin else {
+        tracing::warn!(
+            backup = %name, namespace = %namespace,
+            label = backup.labels().get(crate::consts::ORIGIN_LABEL).map(String::as_str).unwrap_or(""),
+            "unrecognized origin label on Snapshot: this build cannot classify the row, so it \
+             will not run, retain-count, or delete it; fix (or remove) the \
+             kopiur.home-operations.com/origin label, or upgrade the operator"
+        );
+        return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
+    };
+
+    // Exhaustive over `Origin` (ADR §5.5): `Discovered`, `Adopted`, and
+    // `Replicated` rows are catalog history, not runs, and must return BEFORE
+    // any of the backup-run machinery below (`run_decision`, post-hooks,
+    // staged reap, pin jobs) — `Scheduled`/`Manual` are the only origins that
+    // ever mint a mover Job, so they fall through to it.
     match origin {
         Origin::Discovered => return pin_discovered_row(backup, &api, &name).await,
         Origin::Adopted => return pin_adopted_row(backup, &api, &name).await,
+        Origin::Replicated => return pin_replicated_row(backup, &api, &name).await,
         Origin::Scheduled | Origin::Manual => {}
     }
 
@@ -418,7 +481,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 return Ok(Action::await_change());
             }
             // §13(c): spec.pin stays live after the mover Job is gone.
-            return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
+            return reconcile_pin(backup, ctx, &api, &namespace, &name, origin).await;
         }
         RunDecision::TerminalFailed => {
             // Resume hooks run even for a FAILED backup (quiesce/resume pairing —
@@ -656,7 +719,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 // §13(c): reconcile kopia-side pin state with spec.pin once the
                 // snapshot exists. A no-op when already in the desired state.
-                return reconcile_pin(backup, ctx, &api, &namespace, &name).await;
+                return reconcile_pin(backup, ctx, &api, &namespace, &name, origin).await;
             }
             Some(false) => {
                 // Resume hooks run even when the backup FAILED — the canonical
@@ -841,7 +904,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // CredentialsAvailable gate (MISSING_CA_BUNDLE_GATE): the retry is
     // transient, but a ConfigMap nobody creates never self-heals, and the park
     // at `Pending` must be visible to doctor (#359).
-    let (config, repo) = match resolve_recipe(ctx, backup, &namespace).await {
+    let (config, effective_repo, repo) = match resolve_recipe(ctx, backup, &namespace).await {
         Ok(resolved) => resolved,
         Err(Error::MissingCaBundle(msg)) => {
             let existing = backup
@@ -866,6 +929,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
         Err(e) => return Err(e),
     };
+    // The EFFECTIVE repository this child runs against (the mint-time pin for
+    // a multi-repo fan-out child; the recipe's single ref otherwise) — the one
+    // decision `resolve_recipe` already made, reused for every gate below,
+    // including the preflight gather (audit M8: the CHILD's repo, never a
+    // policy-level guess).
+    let repo_ref = &effective_repo;
 
     // §11: a ReadOnly repository serves restores only — refuse to create a backup
     // Job. Surface a clear condition + Event and stop (not an error: it's a
@@ -881,7 +950,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         let conditions = io::upsert_gate(
             &conds,
             &kopiur_api::gates::REPOSITORY_READ_ONLY_GATE,
-            &readonly_backup_message(&config.spec.repository.name),
+            &readonly_backup_message(&repo_ref.name),
             backup.meta().generation,
         );
         // Guard the write so the Event + counter + warn fire once per real
@@ -907,14 +976,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &Event {
                         type_: EventType::Warning,
                         reason: crate::consts::REPOSITORY_READ_ONLY_REASON.into(),
-                        note: Some(readonly_backup_message(&config.spec.repository.name)),
+                        note: Some(readonly_backup_message(&repo_ref.name)),
                         action: "RefuseBackupReadOnlyRepository".into(),
                         secondary: None,
                     },
                     &io::event_ref(backup),
                 )
                 .await;
-            tracing::warn!(backup = %name, repository = %config.spec.repository.name, "refusing backup: repository is ReadOnly");
+            tracing::warn!(backup = %name, repository = %repo_ref.name, "refusing backup: repository is ReadOnly");
         }
         return Ok(Action::await_change());
     }
@@ -925,7 +994,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
     // A cheap single GET — independent of preflight, so it's evaluated FIRST and the
     // repository-not-ready reason is always surfaced before any preflight machinery.
-    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
+    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
@@ -935,7 +1004,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 backup,
                 SnapshotPhase::Pending,
                 crate::consts::REPOSITORY_NOT_READY_REASON,
-                &repository_not_ready_message(&config.spec.repository.name),
+                &repository_not_ready_message(&repo_ref.name),
             ),
         )
         .await?;
@@ -984,7 +1053,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // so the common no-preflight backup never pays for it.
         let (pf_inputs, _ready) = io::gather_preflight_inputs(
             &ctx.client,
-            &config.spec.repository,
+            repo_ref,
             &namespace,
             &ctx.maintenance_store,
             now,
@@ -1190,7 +1259,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         | Operation::SnapshotPin(_)
         | Operation::Verify(_)
         | Operation::Replicate(_)
-        | Operation::BrowseSession(_) => {
+        | Operation::BrowseSession(_)
+        | Operation::SnapshotReplicate(_) => {
             return Err(Error::Invariant(
                 "build_backup_run produced a non-Snapshot operation".into(),
             ));
@@ -1334,8 +1404,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(repo_ref.kind),
+        &repo_ref.name,
     )
     .await
     {
@@ -1645,12 +1715,23 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
     // Resolve the cache VOLUME (emptyDir / sized-ephemeral / persistent PVC). A
     // persistent cache PVC is owned by the SnapshotPolicy so a warm cache survives
-    // across individual Snapshot runs (ADR §3.1).
+    // across individual Snapshot runs (ADR §3.1). A pinned child of a MULTI-repo
+    // policy gets a per-repository PVC (`kopiur-cache-<policy>-<rslug>-<h6>`,
+    // `kopiur_api::expand::cache_pvc_name`): the kopia cache is repository-specific
+    // state, so N fan-out children sharing one PVC would poison each other's
+    // cache. Single-repo children keep the legacy name byte-identical.
+    let cache_pvc = kopiur_api::expand::cache_pvc_name(
+        &config.name_any(),
+        config.namespace().as_deref().unwrap_or(&namespace),
+        kopiur_api::is_multi_repo(&config.spec)
+            .then_some(backup.spec.repository.as_ref())
+            .flatten(),
+    );
     let cache_volume = crate::cache::resolve_cache_volume(
         &ctx.client,
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
-        &format!("kopiur-cache-{}", config.name_any()),
+        &cache_pvc,
         crate::cache::effective_cache(
             &repo,
             config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
@@ -1718,6 +1799,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations: Default::default(),
         cache_volume,
         scratch_volume: None,
@@ -1736,7 +1818,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // reads `resolved.repository` so cleanup still works once the
             // recipe is gone — the namespace-deletion cascade usually reaps the
             // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
-            "resolved": resolved_run_status(&config, &namespace, &work_spec),
+            "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref),
             // The SAME value written into the kopia `kopiur-meta` tag above —
             // single source, so tag and status cannot diverge.
             "recorded": recorded,
@@ -2649,12 +2731,9 @@ async fn resolve_repo_for_deletion(
         .await?;
         return Ok((pinned.clone(), repo));
     }
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
-    Ok((
-        pinned_repository_ref(&config.spec.repository, &config_ns),
-        repo,
-    ))
+    Ok((pinned_repository_ref(&effective_repo, &config_ns), repo))
 }
 
 /// Append the deletion-path escape hatch to a credentials error message.
@@ -3468,6 +3547,7 @@ async fn build_batch_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         cache_volume: Default::default(),
         scratch_volume: None,
@@ -3507,6 +3587,12 @@ async fn reconcile_pin(
     api: &Api<Snapshot>,
     namespace: &str,
     name: &str,
+    // The origin `reconcile_inner` already resolved (always `Scheduled` or
+    // `Manual` — the catalog origins return from their pin arms long before
+    // this). Threaded through rather than re-resolved so this Job-label stamp
+    // can never disagree with the dispatch decision (and never needs a default
+    // for an unparseable label, which cannot reach here).
+    origin: Origin,
 ) -> Result<Action> {
     let desired = backup.spec.pin;
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
@@ -3543,7 +3629,10 @@ async fn reconcile_pin(
     };
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    // The child's effective repository (pin-aware — a pinned child of a
+    // multi-repo policy pins/unpins in ITS repository).
+    let repo_ref = &effective_repo;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -3562,8 +3651,8 @@ async fn reconcile_pin(
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(repo_ref.kind),
+        &repo_ref.name,
     )
     .await?;
     if creds.projected > 0 {
@@ -3593,7 +3682,7 @@ async fn reconcile_pin(
         cache: Default::default(),
         throttle: Default::default(),
     };
-    let mut labels = run_labels(&config, resolve_origin(backup));
+    let mut labels = run_labels(&config, origin);
     labels.insert(
         "kopiur.home-operations.com/op".to_string(),
         "snapshot-pin".to_string(),
@@ -3654,6 +3743,7 @@ async fn reconcile_pin(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         cache_volume: Default::default(),
         scratch_volume: None,
@@ -3913,7 +4003,7 @@ async fn resolve_succeeded_snapshot(
     backup: &Snapshot,
     namespace: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, _effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -3958,14 +4048,22 @@ async fn resolve_succeeded_snapshot(
     }
 }
 
-/// Resolve a `Snapshot`'s referenced `SnapshotPolicy` and that config's
-/// `Repository`. Cluster references and non-filesystem backends still resolve
-/// here; backend-specific behavior is decided downstream.
+/// Resolve a `Snapshot`'s referenced `SnapshotPolicy`, the EFFECTIVE repository
+/// this child runs against, and that repository's resolved surface. Cluster
+/// references and non-filesystem backends still resolve here; backend-specific
+/// behavior is decided downstream.
+///
+/// The repository is the shared pin-aware decision
+/// ([`kopiur_api::snapshot::effective_repository_ref`]): a pinned child of a
+/// multi-repo policy proceeds against ITS pinned member; an unpinned child of a
+/// multi-repo policy — or a pin the recipe no longer lists — is a terminal
+/// validation error, never a silent repository #1 pick. Single-repo children
+/// resolve exactly as before.
 async fn resolve_recipe(
     ctx: &Context,
     backup: &Snapshot,
     namespace: &str,
-) -> Result<(SnapshotPolicy, ResolvedRepository)> {
+) -> Result<(SnapshotPolicy, RepositoryRef, ResolvedRepository)> {
     let policy_ref = backup
         .spec
         .policy_ref
@@ -3977,18 +4075,20 @@ async fn resolve_recipe(
         Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", policy_ref.name))
     })?;
 
+    let repo_ref = kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     // Honor `repository.kind`: namespaced `Repository` (cross-ns via
     // `ref.namespace`, defaulting to the config's namespace) vs. cluster-scoped
     // `ClusterRepository` (`Api::all`). The discriminated kind is matched
     // exhaustively in the resolver (ADR §5.5).
     let repo = io::resolve_repository_ref(
         &ctx.client,
-        &config.spec.repository,
+        &repo_ref,
         cfg_ns,
         ctx.operator_namespace.as_deref(),
     )
     .await?;
-    Ok((config, repo))
+    Ok((config, repo_ref, repo))
 }
 
 /// Best-effort, **positive-only** securityContext check for a backup source PVC. Lists the
@@ -4571,9 +4671,24 @@ async fn backfill_projection_pin(
     let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
         return Ok(());
     };
-    let Some(body) =
-        plan::backfill_patch_body(&config, namespace, needs_projection, needs_repository)
-    else {
+    // The row's effective repository (the spec pin for a multi-repo child).
+    // A pre-feature row of a now-multi-repo policy has NO pin, so its
+    // repository is unknowable — the repository half is SKIPPED (never
+    // guessed; `backfill_patch_body` documents the contract). The projection
+    // half still backfills.
+    let repo_ref =
+        match kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns) {
+            Ok(r) => Some(r),
+            Err(kopiur_api::error::ValidationError::MultiRepoSnapshotUnpinned { .. }) => None,
+            Err(other) => return Err(Error::Validation(other.to_string())),
+        };
+    let Some(body) = plan::backfill_patch_body(
+        &config,
+        namespace,
+        needs_projection,
+        needs_repository,
+        repo_ref.as_ref(),
+    ) else {
         return Ok(());
     };
     io::patch_status(api, name, body).await?;

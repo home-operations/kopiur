@@ -1592,6 +1592,7 @@ mod tests {
             let mut s = Snapshot::new(
                 name,
                 SnapshotSpec {
+                    repository: None,
                     source: None,
                     policy_ref: None,
                     tags: None,
@@ -1620,6 +1621,7 @@ mod tests {
             let mut s = Snapshot::new(
                 uid,
                 SnapshotSpec {
+                    repository: None,
                     source: None,
                     policy_ref: None,
                     tags: None,

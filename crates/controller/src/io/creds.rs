@@ -169,6 +169,14 @@ impl CredsPrefix {
     pub fn verification(policy: &str) -> Self {
         Self(format!("{policy}-vfy"))
     }
+    /// Per-repository verify mover of a MULTI-repo `SnapshotPolicy` (#368):
+    /// `{policy}-vfy-{r6}` with `r6` = [`crate::naming::repo_tag6`] over the
+    /// normalized repo key, so the N concurrent per-repo verifies never share
+    /// a projected-Secret name for different repositories. The single-repo
+    /// shape keeps [`Self::verification`]'s byte-identical prefix.
+    pub fn verification_for_repo(policy: &str, repo6: &str) -> Self {
+        Self(format!("{policy}-vfy-{repo6}"))
+    }
     /// Replication mover of a `RepositoryReplication` (never projects today;
     /// the slug exists so a future opt-in cannot collide — the cleanup GETs
     /// under this prefix are guaranteed misses, an accepted per-run cost).
@@ -178,6 +186,19 @@ impl CredsPrefix {
     /// Bootstrap mover of a `Repository` (never projects; same-namespace).
     pub fn bootstrap(repo: &str) -> Self {
         Self(format!("{repo}-bootstrap"))
+    }
+    /// SOURCE-side credentials of a `SnapshotReplication`'s mover (issue #368).
+    /// One mover pod touches TWO repository CRs, each with its own credential
+    /// Secrets, so the two sides get DISTINCT stable prefixes — a shared prefix
+    /// would make the second projection clobber the first's `-creds-0` copy.
+    pub fn snapshot_replication_src(cr: &str) -> Self {
+        Self(format!("{cr}-srepl-src"))
+    }
+    /// DESTINATION-side credentials of a `SnapshotReplication`'s mover (the
+    /// `KOPIUR_DEST_`-prefixed envFrom side). See
+    /// [`Self::snapshot_replication_src`].
+    pub fn snapshot_replication_dst(cr: &str) -> Self {
+        Self(format!("{cr}-srepl-dst"))
     }
 
     /// The projected copy's Secret name for the `idx`-th credential source,
@@ -1000,6 +1021,8 @@ mod tests {
             CredsPrefix::verification("app").secret_name(0),
             CredsPrefix::replication("app").secret_name(0),
             CredsPrefix::bootstrap("app").secret_name(0),
+            CredsPrefix::snapshot_replication_src("app").secret_name(0),
+            CredsPrefix::snapshot_replication_dst("app").secret_name(0),
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -1022,6 +1045,15 @@ mod tests {
         assert_eq!(
             CredsPrefix::restore("app").secret_name(0),
             "app-restore-creds-0"
+        );
+        // The two snapshot-replication sides must never share a copy name.
+        assert_eq!(
+            CredsPrefix::snapshot_replication_src("offsite").secret_name(0),
+            "offsite-srepl-src-creds-0"
+        );
+        assert_eq!(
+            CredsPrefix::snapshot_replication_dst("offsite").secret_name(0),
+            "offsite-srepl-dst-creds-0"
         );
     }
 

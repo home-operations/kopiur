@@ -40,3 +40,15 @@ fn snapshot_repository_replication_crd() {
         body(&artifacts, "repositoryreplications")
     );
 }
+
+#[test]
+fn snapshot_snapshot_replication_crd() {
+    // Issue #368: pin the generated schema for the snapshot-level replication
+    // CRD so any accidental drift in its fields shows up as a reviewable
+    // snapshot diff.
+    let artifacts = xtask::crds::artifacts().expect("generate CRDs");
+    insta::assert_snapshot!(
+        "snapshot_replication_crd",
+        body(&artifacts, "snapshotreplications")
+    );
+}

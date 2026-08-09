@@ -56,6 +56,47 @@ tests:
             exp_annotations:
               summary: "Latest backup for apps/daily failed"
               description: "The most recent completed backup for SnapshotPolicy apps/daily failed. Resolves automatically once a newer backup succeeds."
+  # 2b. Multi-repo fan-out (#368, audit M3): the health gauge is per repository
+  #     for repo-pinned rows. Repo A's latest succeeded while repo B's latest
+  #     failed → KopiurLastBackupFailed fires ONCE, carrying the failing repo's
+  #     label — repo A's healthy series must neither suppress it (the pre-fix
+  #     flat `min by (namespace, policy)` DID fire but could not name the repo,
+  #     and the flat health bit flapped with interleaved runs) nor fire its own.
+  #     Also proves KopiurBackupConsecutiveFailures alerts on repo B's
+  #     independent streak while repo A interleaves successes.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="fan", repository="Repository/apps/nas"}'
+        values: "1x60"
+      - series: 'kopiur_snapshotpolicy_last_backup_success{namespace="apps", policy="fan", repository="Repository/apps/offsite"}'
+        values: "0x60"
+      - series: 'kopiur_snapshot_consecutive_failures{namespace="apps", name="fan", repository="Repository/apps/offsite"}'
+        values: "3x60"
+      - series: 'kopiur_snapshot_consecutive_failures{namespace="apps", name="fan", repository="Repository/apps/nas"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KopiurLastBackupFailed
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              policy: fan
+              repository: Repository/apps/offsite
+              severity: warning
+            exp_annotations:
+              summary: "Latest backup for apps/fan failed"
+              description: "The most recent completed backup for SnapshotPolicy apps/fan failed. Resolves automatically once a newer backup succeeds."
+      - eval_time: 30m
+        alertname: KopiurBackupConsecutiveFailures
+        exp_alerts:
+          - exp_labels:
+              namespace: apps
+              name: fan
+              repository: Repository/apps/offsite
+              severity: warning
+            exp_annotations:
+              summary: "Backups for apps/fan are failing"
+              description: "3 consecutive backup failures (>=3) for SnapshotPolicy apps/fan."
   # 3. A Failed Snapshot with no policyRef has no recovery signal → still fires.
   - interval: 1m
     input_series:

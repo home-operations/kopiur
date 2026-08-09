@@ -95,7 +95,7 @@
       },
       "targets": [
         {
-          "expr": "count(kopiur_snapshotpolicy_last_backup_success{namespace=~\"$namespace\"} == 1) or vector(0)",
+          "expr": "count(min by (namespace, policy) (kopiur_snapshotpolicy_last_backup_success{namespace=~\"$namespace\"}) == 1) or vector(0)",
           "refId": "A"
         }
       ]
@@ -195,7 +195,7 @@
       "targets": [
         {
           "expr": "topk(1, time() - kopiur_policy_last_backup_success_timestamp_seconds{namespace=~\"$namespace\"})",
-          "legendFormat": "{{namespace}}/{{policy}}",
+          "legendFormat": "{{namespace}}/{{policy}} {{repository}}",
           "instant": true,
           "refId": "A"
         }
@@ -713,7 +713,7 @@
       "targets": [
         {
           "expr": "time() - kopiur_policy_last_backup_success_timestamp_seconds{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{policy}}",
+          "legendFormat": "{{namespace}}/{{policy}} {{repository}}",
           "refId": "A"
         }
       ]
@@ -740,7 +740,7 @@
       "targets": [
         {
           "expr": "kopiur_policy_last_backup_size_bytes{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{policy}}",
+          "legendFormat": "{{namespace}}/{{policy}} {{repository}}",
           "refId": "A"
         }
       ]
@@ -767,7 +767,7 @@
       "targets": [
         {
           "expr": "kopiur_policy_last_backup_duration_seconds{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{policy}}",
+          "legendFormat": "{{namespace}}/{{policy}} {{repository}}",
           "refId": "A"
         }
       ]
@@ -794,7 +794,7 @@
       "targets": [
         {
           "expr": "kopiur_policy_last_backup_files{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{policy}}",
+          "legendFormat": "{{namespace}}/{{policy}} {{repository}}",
           "refId": "A"
         }
       ]
@@ -816,7 +816,7 @@
       "targets": [
         {
           "expr": "kopiur_snapshot_consecutive_failures{namespace=~\"$namespace\"}",
-          "legendFormat": "{{namespace}}/{{name}}",
+          "legendFormat": "{{namespace}}/{{name}} {{repository}}",
           "refId": "A"
         }
       ]

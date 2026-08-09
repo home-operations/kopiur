@@ -113,12 +113,19 @@ async fn affected_consumers(client: &Client, self_key: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|p| {
             let ns = p.namespace()?;
-            let key = crate::identity_collision::repo_key(&p.spec.repository, &ns);
             let has_history = p
                 .status
                 .as_ref()
                 .is_some_and(|s| s.last_successful_snapshot.is_some());
-            is_affected(&key, self_key, has_history, p.spec.identity.as_ref())
+            // Any-of over every ref the policy names (tolerant iterator): a
+            // multi-repo policy is a consumer of the edited repository when
+            // ANY of its refs matches (plan B5's repo-edit guard semantics;
+            // single-repo behavior is unchanged).
+            api::repository_refs(&p.spec)
+                .any(|r| {
+                    let key = crate::identity_collision::repo_key(r, &ns);
+                    is_affected(&key, self_key, has_history, p.spec.identity.as_ref())
+                })
                 .then(|| format!("{ns}/{}", p.name_any()))
         })
         .collect()
@@ -249,6 +256,45 @@ mod tests {
             true,
             Some(&half_pinned)
         ));
+    }
+
+    #[tokio::test]
+    async fn multi_repo_consumer_is_flagged_when_any_ref_matches() {
+        // A multi-repo policy lists the edited repository SECOND — the any-of
+        // predicate over `repository_refs` must still flag it as a consumer
+        // (plan B5's repo-edit guard semantics). The fully-pinned exemption in
+        // `is_affected` stays repo-independent: a policy pinning both username
+        // AND hostname never consults ANY member's identityDefaults.
+        let list = serde_json::json!({ "items": [{
+            "metadata": { "name": "pg", "namespace": "billing" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "primary" },
+                    { "kind": "Repository", "name": "edited" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ]
+            },
+            "status": { "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z" }
+        }] });
+        let svc = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+            let body = list.clone();
+            async move {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let client = Client::new(svc, "test-ns");
+
+        // Editing the SECOND-listed member flags the policy…
+        let consumers = affected_consumers(&client, "Repository/billing/edited").await;
+        assert_eq!(consumers, vec!["billing/pg".to_string()]);
+        // …and an unrelated repository does not.
+        let consumers = affected_consumers(&client, "Repository/billing/unrelated").await;
+        assert!(consumers.is_empty(), "{consumers:?}");
     }
 
     #[tokio::test]

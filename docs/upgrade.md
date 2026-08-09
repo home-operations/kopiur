@@ -6,40 +6,67 @@ the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which mo
 the CRDs between two Helm mechanisms and needs one deliberate step to avoid data
 loss. Read that section before you cross it.
 
-## 0.10.0: new RBAC and a new Snapshot phase
+## 0.10.0: SnapshotReplication, multi-repository fan-out, new RBAC, and a new Snapshot phase
 
-Two things to know before you cross this release.
+Four things to know before you cross this release.
 
 ### Apply the CRDs before rolling the operator
 
-`Snapshot.status.phase` gains a new value, `Unchanged` (see
-[#351](https://github.com/home-operations/kopiur/issues/351)). The mover writes
-the phase directly onto the status subresource, so a mover image that knows the
-new value talking to an apiserver whose CRD does not will have its status PATCH
-**rejected by schema validation**.
-
-Helm handles this for you — chart CRDs are applied before the Deployment rolls.
-If you manage CRDs yourself (`deploy/crds/`), apply them first:
+Three schema changes ride this release, and **Helm's `crds/` directory is
+install-only** — a plain `helm upgrade` never updates CRD schemas (see
+[CRD lifecycle](install.md#crd-lifecycle)), so on a helm-CLI install you must
+apply them yourself:
 
 ```bash
-kubectl apply -f deploy/crds/
+kubectl apply --server-side -f deploy/crds/
 helm upgrade kopiur ...
 ```
 
+(GitOps tooling with a `CreateReplace` CRD policy — Flux, Argo — upgrades them
+for you.) What breaks, per change, if you skip this:
+
+- **`Snapshot.status.phase` gains `Unchanged`** (see
+  [#351](https://github.com/home-operations/kopiur/issues/351)). The mover
+  writes the phase directly onto the status subresource, so a mover image that
+  knows the new value talking to an apiserver whose CRD does not will have its
+  status PATCH **rejected by schema validation**.
+- **`SnapshotPolicy.spec.repositories`** (multi-repository fan-out,
+  [#368](https://github.com/home-operations/kopiur/issues/368)): with the old
+  CRD the apiserver **prunes** the unknown field from every applied object, and
+  admission then refuses the policy — neither `repository` nor `repositories`
+  is set, the exactly-one-of rule fails. Loud, not silent — but the fix is the
+  CRD apply above, not the manifest. `kubectl kopiur doctor` flags a live
+  `snapshotpolicies` CRD whose schema is missing the field.
+- **The new `snapshotreplications` CRD**
+  ([snapshot replication](snapshot-replication.md)) simply does not exist until
+  applied — `kubectl apply` of a `SnapshotReplication` fails with "no matches
+  for kind".
+
+### The webhook now covers `snapshotreplications`
+
+The chart's `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration`
+gained the `snapshotreplications` resource — `helm upgrade` applies both. If
+you maintain webhook configurations out-of-band, add the resource to each, or
+`SnapshotReplication` objects are admitted with **no validation or defaulting**.
+
 ### Non-Helm installs need the new RBAC
 
-`groupBy: VolumeGroupSnapshot` ([#346](https://github.com/home-operations/kopiur/issues/346))
-adds two grants:
+Re-apply `deploy/rbac/*.yaml` if you apply RBAC directly rather than through
+the chart. Two additions:
 
-- `patch` on `groupsnapshot.storage.k8s.io/volumegroupsnapshots` — the members
+- **`groupBy: VolumeGroupSnapshot`** ([#346](https://github.com/home-operations/kopiur/issues/346)):
+  `patch` on `groupsnapshot.storage.k8s.io/volumegroupsnapshots` (the members
   of one expansion converge the shared capture by server-side apply, which is a
-  PATCH;
-- read on the cluster-scoped `volumegroupsnapshotclasses`.
-
-If you apply `deploy/rbac/*.yaml` directly rather than through the chart,
-re-apply them, or group staging fails with opaque 403s. Nothing else needs
-these: a policy without a `pvcSelector`, or with `groupBy: None`, never touches
-that API group.
+  PATCH) and read on the cluster-scoped `volumegroupsnapshotclasses`. Without
+  them, group staging fails with opaque 403s. Nothing else needs these: a
+  policy without a `pvcSelector`, or with `groupBy: None`, never touches that
+  API group.
+- **The dedicated snapshot-replication mover Role** (`kopiur-snapshot-replication-mover`,
+  plus its ServiceAccount/binding): replication movers create the copy
+  `Snapshot` CRs themselves, so they run under their own narrowly-scoped Role
+  (get/list/create/patch/delete on `snapshots` + status patch) — deliberately
+  **not** granted to the ordinary backup/restore mover. Without it, every
+  `SnapshotReplication` run fails with 403s on `snapshots`.
 
 ## After 0.7.0: per-run work-spec ConfigMaps no longer exist (no action needed)
 

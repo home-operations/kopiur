@@ -345,6 +345,14 @@ pub struct MoverJobInputs<'a> {
     /// vars (`RUST_LOG`, `KOPIUR_LOG_FORMAT`) so the mover inherits the
     /// controller's level/format. `(name, value)` pairs; may be empty.
     pub passthrough_env: Vec<(String, String)>,
+    /// Extra fully-formed env vars (literal or `valueFrom`) rendered after the
+    /// fixed work-spec/cache/config envs. Exists for env that CANNOT be a plain
+    /// `(name, value)` pair: the snapshot-replication mover's destination
+    /// repository password arrives as `KOPIUR_DEST_KOPIA_PASSWORD` via
+    /// `valueFrom.secretKeyRef` (the resolved — possibly projected — Secret
+    /// name + key), so the plaintext never rides the Job spec. Empty for every
+    /// other mover.
+    pub extra_env: Vec<k8s_openapi::api::core::v1::EnvVar>,
     /// Extra annotations on the `Job` metadata (e.g. the maintenance scheduled
     /// slot — an RFC3339 timestamp, which is not a valid *label* value). Usually
     /// empty for backup/restore/bootstrap.
@@ -572,6 +580,10 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
             value_from: None,
         });
     }
+    // Caller-supplied extra env (e.g. a `valueFrom.secretKeyRef` the plain
+    // passthrough pairs cannot express) lands after the fixed set, before the
+    // observability passthrough.
+    env.extend(inputs.extra_env.iter().cloned());
     env.extend(
         inputs
             .passthrough_env
@@ -893,6 +905,7 @@ mod tests {
             result_configmap: None,
             service_account: Some("kopiur-operator"),
             passthrough_env: Vec::new(),
+            extra_env: Vec::new(),
             annotations: Default::default(),
             cache_volume: CacheVolume::EmptyDir,
             scratch_volume: None,
@@ -957,6 +970,56 @@ mod tests {
         // The serialized spec round-trips back to the same MoverWorkSpec.
         let parsed: MoverWorkSpec = serde_json::from_str(env.value.as_deref().unwrap()).unwrap();
         assert_eq!(parsed, ws);
+    }
+
+    #[test]
+    fn extra_env_renders_after_the_fixed_envs_and_supports_value_from() {
+        use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.extra_env = vec![EnvVar {
+            name: "KOPIUR_DEST_KOPIA_PASSWORD".to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: "offsite-srepl-dst-creds-0".to_string(),
+                    key: "KOPIA_PASSWORD".to_string(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+        }];
+        i.passthrough_env = vec![("RUST_LOG".to_string(), "info".to_string())];
+        let job = build_job(&i).unwrap();
+        let env = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        let idx = |name: &str| {
+            env.iter()
+                .position(|e| e.name == name)
+                .unwrap_or_else(|| panic!("env {name} missing"))
+        };
+        // The extra env is a real valueFrom entry (no literal value)...
+        let dest = &env[idx("KOPIUR_DEST_KOPIA_PASSWORD")];
+        assert!(dest.value.is_none(), "must ride valueFrom, never a literal");
+        let sel = dest
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .expect("secretKeyRef");
+        assert_eq!(sel.name, "offsite-srepl-dst-creds-0");
+        assert_eq!(sel.key, "KOPIA_PASSWORD");
+        // ...rendered AFTER the fixed work-spec/cache envs and BEFORE passthrough.
+        assert!(idx(WORK_SPEC_ENV) < idx("KOPIUR_DEST_KOPIA_PASSWORD"));
+        assert!(idx("KOPIUR_DEST_KOPIA_PASSWORD") < idx("RUST_LOG"));
+        // An empty extra_env changes nothing (every other mover).
+        let bare = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        let bare_env = bare.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        assert!(bare_env.iter().all(|e| e.value_from.is_none()));
     }
 
     #[test]

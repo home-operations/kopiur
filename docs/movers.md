@@ -27,6 +27,8 @@ The `kopiur-mover` role grants only what a mover actually uses: `patch` on the o
 
 ///
 
+The one exception: a [`SnapshotReplication`](snapshot-replication.md) mover runs as the dedicated **`kopiur-snapshot-replication-mover`** SA instead (minted the same way) — it creates the copy `Snapshot` CRs, a grant the ordinary mover deliberately lacks. See the [RBAC reference](rbac.md#the-snapshot-replication-mover-kopiur-snapshot-replication-mover).
+
 You don't create or manage these — they're applied idempotently on every reconcile, labelled `app.kubernetes.io/managed-by: kopiur`. To see them:
 
 ```console

@@ -41,6 +41,9 @@ use crate::consts;
 /// // A schedule-level block lives on the SnapshotSchedule itself.
 /// assert!(GateScope::SnapshotSchedule.covers_snapshot_schedule());
 /// assert!(!GateScope::Snapshot.covers_snapshot_schedule());
+/// // A recipe-level block lives on the SnapshotPolicy itself.
+/// assert!(GateScope::SnapshotPolicy.covers_snapshot_policy());
+/// assert!(!GateScope::SnapshotPolicy.covers_snapshot());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GateScope {
@@ -54,6 +57,9 @@ pub enum GateScope {
     /// Written on `SnapshotSchedule` CRs only — the schedule itself is blocked,
     /// as opposed to any individual run being blocked.
     SnapshotSchedule,
+    /// Written on `SnapshotPolicy` CRs only — the recipe itself is (partially)
+    /// blocked, as opposed to any individual run being blocked.
+    SnapshotPolicy,
 }
 
 impl GateScope {
@@ -61,7 +67,7 @@ impl GateScope {
     pub fn covers_snapshot(self) -> bool {
         match self {
             Self::SnapshotOrRestore | Self::Snapshot => true,
-            Self::Repository | Self::SnapshotSchedule => false,
+            Self::Repository | Self::SnapshotSchedule | Self::SnapshotPolicy => false,
         }
     }
 
@@ -69,7 +75,9 @@ impl GateScope {
     pub fn covers_restore(self) -> bool {
         match self {
             Self::SnapshotOrRestore => true,
-            Self::Snapshot | Self::Repository | Self::SnapshotSchedule => false,
+            Self::Snapshot | Self::Repository | Self::SnapshotSchedule | Self::SnapshotPolicy => {
+                false
+            }
         }
     }
 
@@ -78,7 +86,10 @@ impl GateScope {
     pub fn covers_repository(self) -> bool {
         match self {
             Self::Repository => true,
-            Self::SnapshotOrRestore | Self::Snapshot | Self::SnapshotSchedule => false,
+            Self::SnapshotOrRestore
+            | Self::Snapshot
+            | Self::SnapshotSchedule
+            | Self::SnapshotPolicy => false,
         }
     }
 
@@ -86,7 +97,20 @@ impl GateScope {
     pub fn covers_snapshot_schedule(self) -> bool {
         match self {
             Self::SnapshotSchedule => true,
-            Self::SnapshotOrRestore | Self::Snapshot | Self::Repository => false,
+            Self::SnapshotOrRestore | Self::Snapshot | Self::Repository | Self::SnapshotPolicy => {
+                false
+            }
+        }
+    }
+
+    /// Whether a `SnapshotPolicy` can carry a gate of this scope. Exhaustive.
+    pub fn covers_snapshot_policy(self) -> bool {
+        match self {
+            Self::SnapshotPolicy => true,
+            Self::SnapshotOrRestore
+            | Self::Snapshot
+            | Self::Repository
+            | Self::SnapshotSchedule => false,
         }
     }
 }
@@ -328,6 +352,39 @@ pub const SCHEDULE_BLOCKED_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// A `SnapshotPolicy` referencing at least one repository that is not `Ready`.
+/// The policy reconciler keeps processing the READY subset (multi-repository
+/// fan-out, #368) but defers backups/retention/adoption/verification against
+/// the rest, and requeues until every repository recovers. Warn, not Fail: a
+/// repository deliberately taken down (a migration, a powered-off NAS target)
+/// is a plausible operator choice, the ready subset keeps working, and the
+/// per-child parks behind the same outage already carry their own reporting
+/// (`kopiur_snapshot_gated`, `KopiurRepositoryNotReady`) — so this gate must
+/// explain, not independently turn a diagnostic red.
+pub const POLICY_REPOSITORY_NOT_READY_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotPolicy,
+    condition: consts::REPOSITORIES_READY_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::REPOSITORY_NOT_READY_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// A `SnapshotSchedule` whose members × repositories cross-product exceeds the
+/// fan-out cap: the fired slot was SKIPPED, and every future slot will keep
+/// skipping until the selector is narrowed or the policy's repository list
+/// shrunk — no backups run while everything else looks healthy, the exact
+/// silent-wedge shape of #359. The writer asserts BOTH polarities each fire
+/// pass, so the gate self-clears the moment a slot mints fully. Promoted into
+/// the registry by the #368 M10 gates/doctor checklist (previously a
+/// controller-internal condition doctor could not see).
+pub const SCHEDULE_FANOUT_CAPPED_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotSchedule,
+    condition: consts::SCHEDULE_FANOUT_CAPPED_CONDITION,
+    blocked_status: CONDITION_TRUE,
+    reason: consts::FANOUT_TOO_LARGE_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -356,6 +413,8 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     MASS_DELETION_HELD_GATE,
     REPOSITORY_READ_ONLY_GATE,
     SCHEDULE_BLOCKED_GATE,
+    SCHEDULE_FANOUT_CAPPED_GATE,
+    POLICY_REPOSITORY_NOT_READY_GATE,
 ];
 
 #[cfg(test)]
@@ -562,6 +621,20 @@ mod tests {
                 GateScope::SnapshotSchedule,
                 GateSeverity::Fail,
             ),
+            (
+                consts::SCHEDULE_FANOUT_CAPPED_CONDITION,
+                CONDITION_TRUE,
+                consts::FANOUT_TOO_LARGE_REASON,
+                GateScope::SnapshotSchedule,
+                GateSeverity::Fail,
+            ),
+            (
+                consts::REPOSITORIES_READY_CONDITION,
+                CONDITION_FALSE,
+                consts::REPOSITORY_NOT_READY_REASON,
+                GateScope::SnapshotPolicy,
+                GateSeverity::Warn,
+            ),
         ];
         assert_eq!(
             STRUCTURAL_GATES.len(),
@@ -582,20 +655,23 @@ mod tests {
 
     #[test]
     fn every_scope_classifier_is_consistent() {
-        // Each scope covers exactly one of the three kind families a consumer
-        // reads from separate lists (work CRs, repositories, schedules), so a
-        // diagnostic can dispatch on scope without double-listing a gate.
+        // Each scope covers exactly one of the four kind families a consumer
+        // reads from separate lists (work CRs, repositories, schedules,
+        // policies), so a diagnostic can dispatch on scope without
+        // double-listing a gate.
         for scope in [
             GateScope::SnapshotOrRestore,
             GateScope::Snapshot,
             GateScope::Repository,
             GateScope::SnapshotSchedule,
+            GateScope::SnapshotPolicy,
         ] {
             let work = scope.covers_snapshot() || scope.covers_restore();
             let families = [
                 work,
                 scope.covers_repository(),
                 scope.covers_snapshot_schedule(),
+                scope.covers_snapshot_policy(),
             ];
             assert_eq!(
                 families.iter().filter(|f| **f).count(),

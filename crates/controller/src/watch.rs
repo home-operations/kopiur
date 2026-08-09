@@ -27,7 +27,7 @@ use kopiur_api::backend::Backend;
 use kopiur_api::common::{Encryption, PolicyRef, RepositoryKind, RepositoryRef};
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryReplication, Restore, Snapshot,
-    SnapshotPolicy, SnapshotSchedule,
+    SnapshotPolicy, SnapshotReplication, SnapshotSchedule,
 };
 
 use crate::io;
@@ -55,7 +55,7 @@ fn repo_references_secret(
 /// Whether a consumer's [`RepositoryRef`] targets the namespaced `Repository`
 /// `(repo_ns, repo_name)`. `consumer_ns` is the referrer's own namespace, used
 /// when the ref omits one. A `ClusterRepository` ref never matches a `Repository`.
-fn ref_targets_repository(
+pub(crate) fn ref_targets_repository(
     r: &RepositoryRef,
     consumer_ns: Option<&str>,
     repo_ns: &str,
@@ -68,7 +68,7 @@ fn ref_targets_repository(
 
 /// Whether a consumer's [`RepositoryRef`] targets the `ClusterRepository` `name`
 /// (cluster-scoped: namespace is meaningless and ignored).
-fn ref_targets_cluster(r: &RepositoryRef, name: &str) -> bool {
+pub(crate) fn ref_targets_cluster(r: &RepositoryRef, name: &str) -> bool {
     matches!(r.kind, RepositoryKind::ClusterRepository) && r.name == name
 }
 
@@ -250,7 +250,9 @@ pub fn configmap_to_cluster_repositories(
 
 // --- M3: repository -> consumers --------------------------------------------
 
-/// SnapshotPolicies whose `spec.repository` targets the changed `Repository`.
+/// SnapshotPolicies ANY of whose repository refs (`spec.repository` /
+/// `spec.repositories`) target the changed `Repository` — the tolerant any-of
+/// predicate a watch mapper needs (it must never error on a malformed CR).
 pub fn repository_to_policies(
     store: &Store<SnapshotPolicy>,
     repo: &Repository,
@@ -259,18 +261,21 @@ pub fn repository_to_policies(
         return Vec::new();
     };
     select(store, |c: &SnapshotPolicy| {
-        ref_targets_repository(&c.spec.repository, c.namespace().as_deref(), &ns, &name)
+        kopiur_api::repository_refs(&c.spec)
+            .any(|r| ref_targets_repository(r, c.namespace().as_deref(), &ns, &name))
     })
 }
 
-/// SnapshotPolicies whose `spec.repository` targets the changed `ClusterRepository`.
+/// SnapshotPolicies ANY of whose repository refs target the changed
+/// `ClusterRepository` (any-of for the same reason as
+/// [`repository_to_policies`]).
 pub fn cluster_repository_to_policies(
     store: &Store<SnapshotPolicy>,
     repo: &ClusterRepository,
 ) -> Vec<ObjectRef<SnapshotPolicy>> {
     let name = repo.name_any();
     select(store, |c: &SnapshotPolicy| {
-        ref_targets_cluster(&c.spec.repository, &name)
+        kopiur_api::repository_refs(&c.spec).any(|r| ref_targets_cluster(r, &name))
     })
 }
 
@@ -371,6 +376,175 @@ pub fn cluster_repository_to_replications(
     let name = repo.name_any();
     select(store, |c: &RepositoryReplication| {
         ref_targets_cluster(&c.spec.source_ref, &name)
+    })
+}
+
+/// Whether a `SnapshotReplication`'s `sourceRef` OR `destinationRef` targets
+/// the namespaced `Repository` `(repo_ns, repo_name)` — both endpoints gate its
+/// reconcile (readiness, writability, credentials), so a change to EITHER must
+/// re-trigger it.
+fn srepl_targets_repository(s: &SnapshotReplication, repo_ns: &str, repo_name: &str) -> bool {
+    let sns = s.namespace();
+    ref_targets_repository(&s.spec.source_ref, sns.as_deref(), repo_ns, repo_name)
+        || ref_targets_repository(&s.spec.destination_ref, sns.as_deref(), repo_ns, repo_name)
+}
+
+/// Whether a `SnapshotReplication`'s `sourceRef` OR `destinationRef` targets
+/// the `ClusterRepository` `name`.
+fn srepl_targets_cluster(s: &SnapshotReplication, name: &str) -> bool {
+    ref_targets_cluster(&s.spec.source_ref, name)
+        || ref_targets_cluster(&s.spec.destination_ref, name)
+}
+
+/// SnapshotReplications whose `sourceRef` OR `destinationRef` targets the
+/// changed namespaced `Repository` (issue #368): a repository flipping Ready —
+/// on either end — resumes a waiting replication at once instead of on its
+/// requeue.
+pub fn repository_to_snapshot_replications(
+    store: &Store<SnapshotReplication>,
+    repo: &Repository,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let (Some(ns), name) = (repo.namespace(), repo.name_any()) else {
+        return Vec::new();
+    };
+    select(store, |s: &SnapshotReplication| {
+        srepl_targets_repository(s, &ns, &name)
+    })
+}
+
+/// SnapshotReplications whose `sourceRef` OR `destinationRef` targets the
+/// changed `ClusterRepository`.
+pub fn cluster_repository_to_snapshot_replications(
+    store: &Store<SnapshotReplication>,
+    repo: &ClusterRepository,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let name = repo.name_any();
+    select(store, |s: &SnapshotReplication| {
+        srepl_targets_cluster(s, &name)
+    })
+}
+
+/// SnapshotReplications whose SOURCE or DESTINATION repository references the
+/// changed credential `secret` — a **two-hop join** (secret → referencing
+/// `Repository` → replications targeting it), unlike the single-hop
+/// [`secret_to_replications`] whose destination is an inline backend. Both hops
+/// scan in-memory reflector stores, never `Api::list`. A fixed credential thus
+/// re-triggers the replication promptly even when the repository's own reconcile
+/// produces no status transition (e.g. it was already `Ready`).
+pub fn secret_to_snapshot_replications(
+    srepl_store: &Store<SnapshotReplication>,
+    repo_store: &Store<Repository>,
+    secret: &PartialObjectMeta<Secret>,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let (Some(sec_ns), sec_name) = (secret.namespace(), secret.name_any()) else {
+        return Vec::new();
+    };
+    let hit: Vec<(String, String)> = repo_store
+        .state()
+        .iter()
+        .filter(|r| {
+            repo_references_secret(
+                &r.spec.backend,
+                &r.spec.encryption,
+                r.namespace().as_deref(),
+                &sec_ns,
+                &sec_name,
+            )
+        })
+        .filter_map(|r| r.namespace().map(|ns| (ns, r.name_any())))
+        .collect();
+    if hit.is_empty() {
+        return Vec::new();
+    }
+    select(srepl_store, |s: &SnapshotReplication| {
+        hit.iter()
+            .any(|(ns, name)| srepl_targets_repository(s, ns, name))
+    })
+}
+
+/// As [`secret_to_snapshot_replications`] but joining through the changed
+/// secret's referencing `ClusterRepository`s (cluster scope only — the store
+/// exists only there).
+pub fn secret_to_snapshot_replications_via_cluster(
+    srepl_store: &Store<SnapshotReplication>,
+    crepo_store: &Store<ClusterRepository>,
+    secret: &PartialObjectMeta<Secret>,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let (Some(sec_ns), sec_name) = (secret.namespace(), secret.name_any()) else {
+        return Vec::new();
+    };
+    let hit: Vec<String> = crepo_store
+        .state()
+        .iter()
+        .filter(|r| {
+            repo_references_secret(
+                &r.spec.backend,
+                &r.spec.encryption,
+                None,
+                &sec_ns,
+                &sec_name,
+            )
+        })
+        .map(|r| r.name_any())
+        .collect();
+    if hit.is_empty() {
+        return Vec::new();
+    }
+    select(srepl_store, |s: &SnapshotReplication| {
+        hit.iter().any(|name| srepl_targets_cluster(s, name))
+    })
+}
+
+/// SnapshotReplications whose SOURCE or DESTINATION repository references the
+/// changed TLS-CA `configmap` (same two-hop join as
+/// [`secret_to_snapshot_replications`]; a namespaced `Repository`'s bundle must
+/// live in the repository's own namespace).
+pub fn configmap_to_snapshot_replications(
+    srepl_store: &Store<SnapshotReplication>,
+    repo_store: &Store<Repository>,
+    configmap: &PartialObjectMeta<ConfigMap>,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let (Some(cm_ns), cm_name) = (configmap.namespace(), configmap.name_any()) else {
+        return Vec::new();
+    };
+    let hit: Vec<(String, String)> = repo_store
+        .state()
+        .iter()
+        .filter(|r| {
+            io::backend_tls_ca_configmap(&r.spec.backend) == Some(cm_name.as_str())
+                && r.namespace().as_deref() == Some(cm_ns.as_str())
+        })
+        .filter_map(|r| r.namespace().map(|ns| (ns, r.name_any())))
+        .collect();
+    if hit.is_empty() {
+        return Vec::new();
+    }
+    select(srepl_store, |s: &SnapshotReplication| {
+        hit.iter()
+            .any(|(ns, name)| srepl_targets_repository(s, ns, name))
+    })
+}
+
+/// As [`configmap_to_snapshot_replications`] but joining through
+/// `ClusterRepository`s (name-only match, like
+/// [`configmap_to_cluster_repositories`]).
+pub fn configmap_to_snapshot_replications_via_cluster(
+    srepl_store: &Store<SnapshotReplication>,
+    crepo_store: &Store<ClusterRepository>,
+    configmap: &PartialObjectMeta<ConfigMap>,
+) -> Vec<ObjectRef<SnapshotReplication>> {
+    let cm_name = configmap.name_any();
+    let hit: Vec<String> = crepo_store
+        .state()
+        .iter()
+        .filter(|r| io::backend_tls_ca_configmap(&r.spec.backend) == Some(cm_name.as_str()))
+        .map(|r| r.name_any())
+        .collect();
+    if hit.is_empty() {
+        return Vec::new();
+    }
+    select(srepl_store, |s: &SnapshotReplication| {
+        hit.iter().any(|name| srepl_targets_cluster(s, name))
     })
 }
 
@@ -748,6 +922,7 @@ mod tests {
         let mut s = Snapshot::new(
             name,
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,
@@ -814,6 +989,7 @@ mod tests {
         let mut s = Snapshot::new(
             name,
             SnapshotSpec {
+                repository: None,
                 source: None,
                 policy_ref: None,
                 tags: None,
@@ -1073,6 +1249,272 @@ mod tests {
             "metadata": { "name": name, "namespace": ns },
         }))
         .expect("configmap meta fixture")
+    }
+
+    // --- SnapshotReplication mappers (issue #368) ----------------------------
+
+    fn srepl(
+        name: &str,
+        ns: &str,
+        source: RepositoryRef,
+        dest: RepositoryRef,
+    ) -> SnapshotReplication {
+        use kopiur_api::SnapshotReplicationSpec;
+        use kopiur_api::common::CronSpec;
+        let mut s = SnapshotReplication::new(
+            name,
+            SnapshotReplicationSpec {
+                source_ref: source,
+                destination_ref: dest,
+                schedule: CronSpec {
+                    cron: "0 6 * * *".into(),
+                    jitter: None,
+                    timezone: None,
+                },
+                selection: None,
+                migrate: None,
+                pruning: None,
+                mover: None,
+                credential_projection: None,
+                suspend: false,
+            },
+        );
+        s.metadata.namespace = Some(ns.into());
+        s
+    }
+
+    /// A minimal namespaced `Repository` fixture parsed the cluster's way
+    /// (`RepositorySpec` derives no `Default`, so a literal would need every field).
+    fn repo_fixture(name: &str, ns: &str, secret: &str) -> Repository {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Repository",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": secret } },
+            }
+        }))
+        .expect("repository fixture")
+    }
+
+    /// A minimal `ClusterRepository` fixture (password Secret pinned to a namespace).
+    fn crepo_fixture(name: &str, secret: &str, secret_ns: &str) -> ClusterRepository {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "ClusterRepository",
+            "metadata": { "name": name },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": secret, "namespace": secret_ns } },
+                "allowedNamespaces": { "all": true },
+            }
+        }))
+        .expect("cluster repository fixture")
+    }
+
+    #[test]
+    fn snapshot_replication_repo_mapper_matches_source_or_destination() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<SnapshotReplication>();
+        for s in [
+            // Source targets the changed repo (same-namespace default).
+            srepl(
+                "by-source",
+                "backups",
+                rref(RepositoryKind::Repository, "nas", None),
+                rref(RepositoryKind::ClusterRepository, "offsite", None),
+            ),
+            // DESTINATION targets it (explicit cross-namespace ref).
+            srepl(
+                "by-dest",
+                "media",
+                rref(RepositoryKind::Repository, "other", None),
+                rref(RepositoryKind::Repository, "nas", Some("backups")),
+            ),
+            // Neither endpoint targets it.
+            srepl(
+                "unrelated",
+                "backups",
+                rref(RepositoryKind::Repository, "other", None),
+                rref(RepositoryKind::ClusterRepository, "offsite", None),
+            ),
+        ] {
+            writer.apply_watcher_event(&Event::Apply(s));
+        }
+        let repo = repo_fixture("nas", "backups", "pw");
+
+        let mut hits: Vec<String> = repository_to_snapshot_replications(&reader, &repo)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits.sort();
+        assert_eq!(hits, vec!["by-dest", "by-source"]);
+
+        // The ClusterRepository mapper matches only ClusterRepository refs.
+        let crepo = crepo_fixture("offsite", "pw", "kopiur-system");
+        let mut hits: Vec<String> = cluster_repository_to_snapshot_replications(&reader, &crepo)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits.sort();
+        assert_eq!(hits, vec!["by-source", "unrelated"]);
+    }
+
+    /// Multi-repo fan-out (#368): a policy listing repositories A and B must be
+    /// requeued when EITHER changes — the any-of predicate over
+    /// `repository_refs`, exercised through the real mappers + store.
+    #[test]
+    fn multi_repo_policy_mapper_requeues_on_any_listed_repository() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<SnapshotPolicy>();
+        let multi: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "backups" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "nas-a" },
+                    { "kind": "ClusterRepository", "name": "offsite-b" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("multi-repo policy fixture");
+        let single: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "solo", "namespace": "backups" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "other" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("single-repo policy fixture");
+        writer.apply_watcher_event(&Event::Apply(multi));
+        writer.apply_watcher_event(&Event::Apply(single));
+
+        // Repo A (a member, namespaced) requeues the multi-repo policy.
+        let hits = repository_to_policies(&reader, &repo_fixture("nas-a", "backups", "pw"));
+        assert_eq!(
+            hits.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["pg"]
+        );
+        // Repo B (a member, cluster-scoped) requeues the SAME policy: an
+        // event on the SECOND listed repository must not be invisible.
+        let hits =
+            cluster_repository_to_policies(&reader, &crepo_fixture("offsite-b", "pw", "sys"));
+        assert_eq!(
+            hits.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["pg"]
+        );
+        // A member's name under the WRONG scope matches nothing: `nas-a` is a
+        // namespaced member, not a cluster one.
+        assert!(
+            cluster_repository_to_policies(&reader, &crepo_fixture("nas-a", "pw", "sys"))
+                .is_empty()
+        );
+        // An unrelated repository requeues nothing from the multi set.
+        assert!(
+            repository_to_policies(&reader, &repo_fixture("unrelated", "backups", "pw")).is_empty()
+        );
+    }
+
+    fn secret_meta(name: &str, ns: &str) -> PartialObjectMeta<Secret> {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": ns },
+        }))
+        .expect("secret meta fixture")
+    }
+
+    #[test]
+    fn snapshot_replication_secret_mapper_joins_through_the_repository() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        // A Repository in `backups` whose password Secret is `nas-pw` (same ns).
+        let (repo_reader, mut repo_writer) = store::<Repository>();
+        repo_writer.apply_watcher_event(&Event::Apply(repo_fixture("nas", "backups", "nas-pw")));
+
+        let (srepl_reader, mut srepl_writer) = store::<SnapshotReplication>();
+        srepl_writer.apply_watcher_event(&Event::Apply(srepl(
+            "offsite",
+            "backups",
+            rref(RepositoryKind::Repository, "nas", None),
+            rref(RepositoryKind::ClusterRepository, "shared", None),
+        )));
+        srepl_writer.apply_watcher_event(&Event::Apply(srepl(
+            "unrelated",
+            "backups",
+            rref(RepositoryKind::Repository, "other", None),
+            rref(RepositoryKind::ClusterRepository, "shared", None),
+        )));
+
+        // The repo's Secret maps exactly the replication referencing that repo.
+        let hits = secret_to_snapshot_replications(
+            &srepl_reader,
+            &repo_reader,
+            &secret_meta("nas-pw", "backups"),
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "offsite");
+        // Same name in another namespace, or an unrelated Secret: nothing.
+        assert!(
+            secret_to_snapshot_replications(
+                &srepl_reader,
+                &repo_reader,
+                &secret_meta("nas-pw", "media")
+            )
+            .is_empty()
+        );
+        assert!(
+            secret_to_snapshot_replications(
+                &srepl_reader,
+                &repo_reader,
+                &secret_meta("nope", "backups")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_replication_cluster_secret_mapper_joins_through_the_cluster_repo() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (crepo_reader, mut crepo_writer) = store::<ClusterRepository>();
+        crepo_writer.apply_watcher_event(&Event::Apply(crepo_fixture(
+            "shared",
+            "shared-pw",
+            "kopiur-system",
+        )));
+        let (srepl_reader, mut srepl_writer) = store::<SnapshotReplication>();
+        // The DESTINATION targets the ClusterRepository — a dest-side credential
+        // fix must re-trigger too.
+        srepl_writer.apply_watcher_event(&Event::Apply(srepl(
+            "offsite",
+            "backups",
+            rref(RepositoryKind::Repository, "nas", None),
+            rref(RepositoryKind::ClusterRepository, "shared", None),
+        )));
+        let hits = secret_to_snapshot_replications_via_cluster(
+            &srepl_reader,
+            &crepo_reader,
+            &secret_meta("shared-pw", "kopiur-system"),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "offsite");
+        assert!(
+            secret_to_snapshot_replications_via_cluster(
+                &srepl_reader,
+                &crepo_reader,
+                &secret_meta("shared-pw", "elsewhere"),
+            )
+            .is_empty(),
+            "a ClusterRepository's Secret ref pins its namespace"
+        );
     }
 
     #[test]

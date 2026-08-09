@@ -3,12 +3,13 @@
 Everything Kopiur is allowed to do in your cluster, in one place — for security
 review, for scoping a namespaced install, and for debugging `Forbidden` errors.
 
-Kopiur runs as **two principals**:
+Kopiur runs as **three principals**:
 
 | ServiceAccount | Who uses it | Bound to |
 | --- | --- | --- |
 | `kopiur-controller` | The controller Deployment **and** the admission webhook Deployment (they share one ServiceAccount) | `kopiur-controller` ClusterRole (cluster scope) or Role (namespaced scope) |
-| `kopiur-mover` | Every mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete) | `kopiur-mover` ClusterRole/Role |
+| `kopiur-mover` | Every ordinary mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete) | `kopiur-mover` ClusterRole/Role |
+| `kopiur-snapshot-replication-mover` | Only `SnapshotReplication` mover Jobs | `kopiur-snapshot-replication-mover` ClusterRole/Role |
 
 The authoritative definitions are **generated** by `cargo xtask gen-rbac` into
 `deploy/rbac/` (`operator-clusterrole.yaml`, `operator-role.yaml`,
@@ -24,7 +25,7 @@ What each rule is **for**, grouped by purpose:
 
 | API group → resources | Verbs | Why |
 | --- | --- | --- |
-| `kopiur.home-operations.com` → all 8 CRDs (`repositories`, `snapshotpolicies`, `snapshots`, `snapshotschedules`, `restores`, `maintenances`, `repositoryreplications`, `clusterrepositories`†) | get, list, watch, create, update, patch, delete | Reconcile every kind; schedules **create** `Snapshot` CRs; repositories **create** owned `Maintenance` CRs; retention **deletes** pruned `Snapshot` CRs. |
+| `kopiur.home-operations.com` → all 9 CRDs (`repositories`, `snapshotpolicies`, `snapshots`, `snapshotschedules`, `restores`, `maintenances`, `repositoryreplications`, `snapshotreplications`, `clusterrepositories`†) | get, list, watch, create, update, patch, delete | Reconcile every kind; schedules **create** `Snapshot` CRs; repositories **create** owned `Maintenance` CRs; retention **deletes** pruned `Snapshot` CRs. |
 | same group → each CRD's `/status` and `/finalizers` | get, update, patch | Status is written via server-side apply (**a PATCH — `patch` is required, not just `update`**); finalizers gate snapshot deletion. |
 | core → `pods`, `persistentvolumeclaims`, `configmaps` | get, list, watch, create, update, patch, delete | Resolve workload pods for `inheritSecurityContextFrom` and hooks; create restore-target / cache PVCs; write the bootstrap result ConfigMap and sweep legacy work-spec ConfigMaps. |
 | core → `pods/exec` | create, get | Run `hooks.beforeSnapshot/afterSnapshot` `workloadExec` commands inside the workload pod (quiesce/resume). |
@@ -55,6 +56,23 @@ The mover is deliberately tiny — it can **only** report its result:
 
 It cannot read Secrets (credentials arrive via `envFrom` on the Job), cannot
 create or delete anything, and cannot touch other namespaces.
+
+### The snapshot-replication mover (`kopiur-snapshot-replication-mover`)
+
+A [`SnapshotReplication`](snapshot-replication.md) run materializes each copied
+snapshot as a `Snapshot` CR (and reaps discovered duplicates), so its mover
+needs verbs no other mover may have — which is exactly why it is a **separate**
+principal rather than a widening of `kopiur-mover` (a compromised backup mover
+pod must not be able to delete every `Snapshot` CR in the namespace):
+
+| API group → resources | Verbs | Why |
+| --- | --- | --- |
+| `kopiur.home-operations.com` → `snapshots` | get, list, create, patch, delete | Create the copy `Snapshot` CRs (`origin: replicated`), stamp the `pruned-by` annotation before a `retention`-mode prune, delete pruned copies and race-window duplicates. |
+| same group → `snapshots/status`, `snapshotreplications/status` | get, patch | Write each copy's status atomically; report the run's terminal result and `lastRun` counters. |
+| core → `configmaps` | get, patch | Same result-reporting channel as the ordinary mover. |
+
+Like `kopiur-mover`, its ServiceAccount + RoleBinding are minted per-namespace
+on demand, and it cannot read Secrets.
 
 ### The runtime-minted per-namespace mover identity
 

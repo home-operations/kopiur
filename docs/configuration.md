@@ -112,7 +112,7 @@ is worth losing cluster-scoped repositories.
 
 /// info | How the CRDs are installed
 
-The 8 CRDs ship in the chart's special `crds/` directory: `helm install`
+The 9 CRDs ship in the chart's special `crds/` directory: `helm install`
 installs them, but `helm upgrade` **never** touches them (a Helm rule for the
 `crds/` directory). For a **helm-CLI upgrade** that carries a schema change you
 must apply the new CRDs yourself:

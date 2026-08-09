@@ -961,12 +961,19 @@ fn connect_args_appends_readonly_only_for_readonly_connects() {
     };
     // Read-write (every mover but browse): NO --readonly anywhere.
     assert_eq!(
-        connect_args(&spec, CacheTuning::default(), false),
+        connect_args(&spec, CacheTuning::default(), ConnectOptions::default()),
         vec!["repository", "connect", "filesystem", "--path", "/repo"]
     );
     // Read-only (browse sessions): --readonly appended after backend+cache args.
     assert_eq!(
-        connect_args(&spec, CacheTuning::default(), true),
+        connect_args(
+            &spec,
+            CacheTuning::default(),
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: false,
+            }
+        ),
         vec![
             "repository",
             "connect",
@@ -983,7 +990,10 @@ fn connect_args_appends_readonly_only_for_readonly_connects() {
             content_cache_size_mb: Some(100),
             metadata_cache_size_mb: None,
         },
-        true,
+        ConnectOptions {
+            readonly: true,
+            persist_credentials: false,
+        },
     );
     assert_eq!(
         tuned.last().map(String::as_str),
@@ -991,6 +1001,210 @@ fn connect_args_appends_readonly_only_for_readonly_connects() {
         "{tuned:?}"
     );
     assert!(tuned.iter().any(|a| a == "--content-cache-size-mb"));
+}
+
+#[test]
+fn connect_args_matrix_readonly_by_persist_credentials() {
+    // The full 2×2 ConnectOptions matrix, exact argv each. The two legacy
+    // combinations (default, readonly-only) are byte-identical to what
+    // `repository_connect` / `repository_connect_readonly` produced before
+    // `ConnectOptions` existed — that identity is the delegation proof.
+    let spec = ConnectSpec::Filesystem {
+        path: PathBuf::from("/repo"),
+    };
+    let base = vec!["repository", "connect", "filesystem", "--path", "/repo"];
+    let cases = [
+        (false, false, vec![]),
+        (true, false, vec!["--readonly"]),
+        (false, true, vec!["--persist-credentials"]),
+        // --readonly precedes --persist-credentials (stable order).
+        (true, true, vec!["--readonly", "--persist-credentials"]),
+    ];
+    for (readonly, persist_credentials, tail) in cases {
+        let mut want = base.clone();
+        want.extend(tail);
+        assert_eq!(
+            connect_args(
+                &spec,
+                CacheTuning::default(),
+                ConnectOptions {
+                    readonly,
+                    persist_credentials,
+                }
+            ),
+            want,
+            "readonly={readonly} persist_credentials={persist_credentials}"
+        );
+    }
+    // ConnectOptions::default() is the read-write, non-persisted connect.
+    assert_eq!(
+        ConnectOptions::default(),
+        ConnectOptions {
+            readonly: false,
+            persist_credentials: false,
+        }
+    );
+}
+
+#[test]
+fn snapshot_list_all_args_passes_all() {
+    // `--all` is the whole point: without it kopia scopes the list to the
+    // connected identity and misses foreign (e.g. migrated) identities.
+    assert_eq!(
+        snapshot_list_all_args(),
+        vec!["snapshot", "list", "--json", "--all"]
+    );
+}
+
+#[test]
+fn snapshot_migrate_args_all_sources_and_no_policies_default() {
+    // The kopiur-default shape: --all + the MANDATORY EXPLICIT --no-policies
+    // (kopia's own --policies default is TRUE; omission would import the
+    // source repository's kopia policies).
+    let opts = SnapshotMigrateOptions {
+        source_config_path: "/cfg/src.config".into(),
+        sources: MigrateSources::All,
+        latest_only: false,
+        parallel: None,
+        policies: MigratePolicies::None,
+    };
+    assert_eq!(
+        snapshot_migrate_args(&opts),
+        vec![
+            "snapshot",
+            "migrate",
+            "--source-config",
+            "/cfg/src.config",
+            "--all",
+            "--no-policies"
+        ]
+    );
+    // MigratePolicies defaults to None — the operator owns policy.
+    assert_eq!(MigratePolicies::default(), MigratePolicies::None);
+}
+
+#[test]
+fn snapshot_migrate_args_sources_list_latest_only_and_parallel() {
+    // One --sources per list entry, in order; --latest-only and --parallel
+    // between the sources and the policy mode.
+    let opts = SnapshotMigrateOptions {
+        source_config_path: "/cfg/src.config".into(),
+        sources: MigrateSources::List(vec!["alice@hosta:/data".into(), "bob@hostb:/other".into()]),
+        latest_only: true,
+        parallel: Some(4),
+        policies: MigratePolicies::None,
+    };
+    assert_eq!(
+        snapshot_migrate_args(&opts),
+        vec![
+            "snapshot",
+            "migrate",
+            "--source-config",
+            "/cfg/src.config",
+            "--sources",
+            "alice@hosta:/data",
+            "--sources",
+            "bob@hostb:/other",
+            "--latest-only",
+            "--parallel",
+            "4",
+            "--no-policies"
+        ]
+    );
+}
+
+#[test]
+fn snapshot_migrate_args_policy_modes() {
+    // Every MigratePolicies variant renders explicitly — None is NEVER an
+    // omission (kopia defaults --policies true), Copy is the bare flag, and
+    // CopyOverwrite adds --overwrite-policies after it.
+    let base = |policies| SnapshotMigrateOptions {
+        source_config_path: "/cfg/src.config".into(),
+        sources: MigrateSources::All,
+        latest_only: false,
+        parallel: None,
+        policies,
+    };
+    let tail_for = |policies| {
+        let args = snapshot_migrate_args(&base(policies));
+        args[5..].to_vec()
+    };
+    assert_eq!(tail_for(MigratePolicies::None), vec!["--no-policies"]);
+    assert_eq!(tail_for(MigratePolicies::Copy), vec!["--policies"]);
+    assert_eq!(
+        tail_for(MigratePolicies::CopyOverwrite),
+        vec!["--policies", "--overwrite-policies"]
+    );
+}
+
+#[test]
+fn builder_records_env_remove_keys() {
+    // env_remove records keys to UNSET on every spawned command. A key both
+    // set and removed stays recorded on both sides; the removal wins at spawn
+    // (applied after common_env) — the spawn-level test below proves that.
+    let c = KopiaClient::builder()
+        .env("KOPIA_PASSWORD", "dest-pass")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("KOPIA_PASSWORD")
+        .build();
+    assert!(c.common_env_remove().contains("AWS_SESSION_TOKEN"));
+    assert!(c.common_env_remove().contains("KOPIA_PASSWORD"));
+    assert_eq!(
+        c.common_env().get("KOPIA_PASSWORD").map(String::as_str),
+        Some("dest-pass")
+    );
+    // Default: nothing recorded.
+    assert!(
+        KopiaClient::builder()
+            .build()
+            .common_env_remove()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn env_remove_unsets_the_variable_at_spawn_even_when_env_set_it() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A shim standing in for `kopia`: records the two env vars it was spawned
+    // with, then exits 0. Same pattern as the sync-to overlay test above.
+    let dir = std::env::temp_dir().join(format!("kopiur-envremove-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("kopia");
+    let out = dir.join("env.out");
+    {
+        let mut f = std::fs::File::create(&shim).unwrap();
+        write!(
+            f,
+            "#!/bin/sh\necho \"PW=${{KOPIA_PASSWORD:-<unset>}} KEEP=${{KOPIUR_KEEP_VAR:-<unset>}}\" > \"$KOPIUR_ENVREMOVE_OUT\"\nexit 0\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // The removal must win over the builder's own env for the same key
+    // (mirroring the overlay's `None` semantics), while other builder env
+    // survives — this is how a dest-configured replication client keeps the
+    // source KOPIA_PASSWORD structurally out of its subprocesses.
+    let client = KopiaClient::builder()
+        .binary(&shim)
+        .env("KOPIA_PASSWORD", "must-not-leak")
+        .env("KOPIUR_KEEP_VAR", "kept")
+        .env("KOPIUR_ENVREMOVE_OUT", out.to_str().unwrap())
+        .env_remove("KOPIA_PASSWORD")
+        .build();
+    client
+        .run_ok(&["repository".into(), "status".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "PW=<unset> KEEP=kept"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

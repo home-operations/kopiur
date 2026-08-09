@@ -27,6 +27,39 @@ rules:
       - maintenances/status
       - snapshotpolicies/status
       - repositoryreplications/status
+      - snapshotreplications/status
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: [get, patch]
+---
+# Dedicated snapshot-replication mover Role (namespaced-install mode, issue
+# #368). RBAC rules SYNCED from `cargo xtask gen-rbac`
+# (deploy/rbac/mover-role.yaml, second document) — that xtask is the SOURCE OF
+# TRUTH; edit it and re-run, then re-sync these rules.
+#
+# Same rules as its cluster-scoped sibling (everything the snapshot-replication
+# mover touches is namespaced, so no escalation-prevention carve-out applies).
+# See clusterrole-mover.tpl for why these verbs live on a SEPARATE role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kopiur.snapshotReplicationMoverName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kopiur.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots
+    verbs: [get, list, create, patch, delete]
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots/status
+      - snapshotreplications/status
     verbs: [get, patch]
   - apiGroups: [""]
     resources:
