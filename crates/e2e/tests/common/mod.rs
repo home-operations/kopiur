@@ -225,6 +225,45 @@ pub fn snapshot_policy_json(
     )
 }
 
+/// A MULTI-repository `SnapshotPolicy` (#368 Feature B) over the shared
+/// `e2e-src` source: `spec.repositories` lists the given namespaced
+/// `Repository` names in order. Same defaults as [`snapshot_policy_json`]
+/// (`copyMethod: Direct` for the non-CSI `e2e-src` PVC, `keepLatest: 5`),
+/// with `extra_spec` merged on top via [`merge_spec`] (bare spec fields, no
+/// `{"spec": ...}` wrapper — see the merge_spec docs for why the wrapper is
+/// silently catastrophic).
+///
+/// Callers should read the created CR back and assert
+/// `spec.repositories.len()` — the same discipline as
+/// `multi_pvc_group::assert_selector_landed`: a policy that quietly kept a
+/// single-repo shape (e.g. the field pruned by a stale CRD schema) produces
+/// one child and fails far away from the real fault.
+pub fn multi_repo_policy_json(
+    ns: &str,
+    name: &str,
+    repos: &[&str],
+    extra_spec: serde_json::Value,
+) -> serde_json::Value {
+    let repositories: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| serde_json::json!({ "kind": "Repository", "name": r }))
+        .collect();
+    merge_spec(
+        serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "repositories": repositories,
+                "sources": [ { "pvc": { "name": "e2e-src" } } ],
+                "copyMethod": "Direct",
+                "retention": { "keepLatest": 5 }
+            }
+        }),
+        extra_spec,
+    )
+}
+
 /// A `Snapshot` referencing `policy` (default `deletionPolicy: Retain`).
 ///
 /// Carries the `kopiur.home-operations.com/config=<policy>` label — the same label a

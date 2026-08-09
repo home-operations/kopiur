@@ -147,6 +147,20 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "srepl-sel-dst",
     "srepl-susp-src",
     "srepl-susp-dst",
+    // SnapshotPolicy multi-repository fan-out (issue #368 Feature B,
+    // crates/e2e/tests/multi_repository.rs): every scenario needs TWO isolated
+    // repositories (the whole point is per-repo children/manifests), and the
+    // scenarios must not share repos with each other so per-repo snapshot
+    // counts (fan-out, keepLatest-per-repo, partial-progress, restore
+    // selection) never leak between them.
+    "mrepo-a",
+    "mrepo-b",
+    "mrepo-ret-a",
+    "mrepo-ret-b",
+    "mrepo-down-a",
+    "mrepo-down-b",
+    "mrepo-rest-a",
+    "mrepo-rest-b",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per

@@ -239,10 +239,14 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
         ids
     };
 
-    // 2. Destination repo with its OWN password Secret. Managed maintenance
-    //    stays ON but is pinned to a Jan-1-only schedule, so the
-    //    "no maintenance Job for the dest" guard below cannot be tripped by a
-    //    legitimate 6-hourly slot crossing the test window.
+    // 2. Destination repo with its OWN password Secret. Managed maintenance is
+    //    DISABLED outright: a cron pin cannot make the guard below flake-free,
+    //    because the scheduling kernel anchors a never-run Maintenance CR at
+    //    now-365d — the FIRST slot of any cron is always immediately due, so a
+    //    "Jan-1-only" schedule still fires once right after the repo comes up
+    //    (observed in-cluster as `<repo>-f-1767225600`). With maintenance off,
+    //    any maintenance Job for the dest could only come from the
+    //    replication path — the exact thing the guard exists to catch.
     {
         use kopiur_e2e::apply::{Fixture, apply_all};
         use kopiur_e2e::builders;
@@ -265,10 +269,7 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
         "srepl-dst",
         DST_SECRET,
         serde_json::json!({
-            "maintenance": { "schedule": {
-                "quick": { "cron": "0 0 1 1 *" },
-                "full": { "cron": "0 0 1 1 *" }
-            } }
+            "maintenance": { "enabled": false }
         }),
     )
     .await;
@@ -612,8 +613,8 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
     }
 
     // 10. No maintenance ran for the DESTINATION as a k8s Job (its managed
-    //     Maintenance CR shares the repo's name; its schedule is pinned to
-    //     Jan 1 above, so any Job here could only have come from the
+    //     Maintenance CR shares the repo's name; managed maintenance is
+    //     disabled above, so any Job here could only have come from the
     //     replication path). kopia-side auto-maintenance (which migrate's CLI
     //     would run) never surfaces as a Job — its suppression via
     //     `--no-auto-maintenance` is pinned by the kopia-crate integration tests.

@@ -206,6 +206,17 @@ jobs:
           - shard: snapshot-replication
             bins: "snapshot_replication"
             backends: false
+          # SnapshotPolicy multi-repository fan-out (issue #368 Feature B): one
+          # policy fanning every slot into TWO repositories — per-repo children
+          # + spec pins, keepLatest-per-repo retention, the one-repo-down
+          # partial-progress gate + recovery, per-repo verification, and the
+          # fromPolicy-selection / unpinned-child / hooks×repositories admission
+          # refusals. Filesystem only; several scenarios each provisioning a
+          # two-repository fixture — like snapshot-replication, its own shard
+          # keeps it under the job timeout.
+          - shard: multi-repository
+            bins: "multi_repository"
+            backends: false
           # Staging deadline + staged-PVC overrides/bind race (#198, #223): the
           # deadline tests quiesce kube-system/snapshot-controller (they own
           # VolumeSnapshot status while it's down), which no other test may
