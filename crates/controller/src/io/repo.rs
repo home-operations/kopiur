@@ -23,8 +23,11 @@ pub const DEFAULT_PASSWORD_KEY: &str = "KOPIA_PASSWORD";
 /// controller's defensive-validation error path
 /// ([`Error::Validation`], the same class the reconcilers' spec re-validation
 /// uses). The multi-repo shape errors here rather than silently picking
-/// repository #1 — its consumers land in M8/M10, and until the admission
-/// feature gate lifts (M11) no admitted policy reaches that arm.
+/// repository #1. Post-M8, its remaining callers are the DELIBERATELY
+/// single-repo policy-LEVEL consumers — the verification scheduler (per-repo
+/// verification lands M10) and the schedule's repository-timezone default —
+/// both of which the multi-repo path bypasses; per-CHILD repository selection
+/// goes through [`kopiur_api::snapshot::effective_repository_ref`] instead.
 pub fn recipe_repo_ref(config: &kopiur_api::SnapshotPolicy) -> Result<&RepositoryRef> {
     kopiur_api::single_repository_ref(&config.spec).map_err(|e| Error::Validation(e.to_string()))
 }

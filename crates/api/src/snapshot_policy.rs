@@ -211,6 +211,71 @@ pub fn is_multi_repo(spec: &SnapshotPolicySpec) -> bool {
     !spec.repositories.is_empty()
 }
 
+/// The repository a `fromPolicy` restore reads, resolved from the policy's
+/// repository set + the restore's optional explicit `spec.repository`.
+/// **Pure** — the resolver backstop shared with the M9 webhook mirror, so the
+/// two can never disagree.
+///
+/// - **Explicit selection** — it must be a MEMBER of the policy's repository
+///   set (compared by normalized [`repo_key`](crate::common::repo_key); the
+///   explicit ref resolves relative to `restore_ns`, the members relative to
+///   `policy_ns`), else
+///   [`ValidationError`](crate::error::ValidationError::RestoreRepositoryNotInPolicy):
+///   a typo'd ref must not silently read a repository the recipe never wrote
+///   to. A member ref is returned verbatim (the caller resolves it in the
+///   restore's namespace, exactly as an explicit ref always has been).
+/// - **No selection, single-repo** — the policy's one repository, verbatim.
+/// - **No selection, multi-repo** —
+///   [`ValidationError::RestoreRepositorySelectionRequired`](crate::error::ValidationError::RestoreRepositorySelectionRequired),
+///   naming every valid choice; repository #1 is never guessed (the N
+///   repositories are independent captures that can diverge).
+pub fn select_restore_repository(
+    policy: &SnapshotPolicySpec,
+    policy_name: &str,
+    policy_ns: &str,
+    explicit: Option<&RepositoryRef>,
+    restore_ns: &str,
+) -> Result<RepositoryRef, crate::error::ValidationError> {
+    use crate::common::repo_key;
+    let repos = policy_repositories(policy)?;
+    let members: Vec<&RepositoryRef> = match repos {
+        PolicyRepositories::Single(r) => vec![r],
+        PolicyRepositories::Multi(rs) => rs.iter().collect(),
+    };
+    let valid = || {
+        members
+            .iter()
+            .map(|m| repo_key(m, policy_ns))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match explicit {
+        Some(given) => {
+            let given_key = repo_key(given, restore_ns);
+            if members.iter().any(|m| repo_key(m, policy_ns) == given_key) {
+                Ok(given.clone())
+            } else {
+                Err(
+                    crate::error::ValidationError::RestoreRepositoryNotInPolicy {
+                        given: given_key,
+                        policy: policy_name.to_string(),
+                        valid: valid(),
+                    },
+                )
+            }
+        }
+        None => match repos {
+            PolicyRepositories::Single(r) => Ok(r.clone()),
+            PolicyRepositories::Multi(_) => Err(
+                crate::error::ValidationError::RestoreRepositorySelectionRequired {
+                    policy: policy_name.to_string(),
+                    valid: valid(),
+                },
+            ),
+        },
+    }
+}
+
 /// Deletion semantics for the `Snapshot`s carrying a `SnapshotPolicy`'s config
 /// label (sub-object per docs/dev/api-conventions.md §4 so future deletion
 /// knobs slot in without API breakage). Mirrors `SnapshotSchedule`'s
@@ -1914,6 +1979,78 @@ preflight:
                 .collect::<Vec<_>>(),
             vec!["r", "a"]
         );
+    }
+
+    #[test]
+    fn select_restore_repository_covers_every_selection_shape() {
+        use super::select_restore_repository;
+        use crate::common::{RepositoryKind, RepositoryRef};
+        use crate::error::ValidationError;
+        let single: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        let multi: SnapshotPolicySpec = from_yaml(
+            "repositories:\n  - { kind: Repository, name: a }\n  - { kind: ClusterRepository, name: b }\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        let rref = |kind, name: &str, ns: Option<&str>| RepositoryRef {
+            kind,
+            name: name.into(),
+            namespace: ns.map(str::to_string),
+        };
+
+        // No selection, single-repo → the policy's one ref, verbatim.
+        let r = select_restore_repository(&single, "pol", "backups", None, "apps").unwrap();
+        assert_eq!(r.name, "r");
+
+        // No selection, multi-repo → refusal naming every valid choice.
+        match select_restore_repository(&multi, "pol", "backups", None, "apps").unwrap_err() {
+            ValidationError::RestoreRepositorySelectionRequired { policy, valid } => {
+                assert_eq!(policy, "pol");
+                assert_eq!(valid, "Repository/backups/a, ClusterRepository/b");
+            }
+            other => panic!("expected RestoreRepositorySelectionRequired, got {other:?}"),
+        }
+
+        // Explicit member (namespace-qualified to the policy's namespace) → honored.
+        let explicit = rref(RepositoryKind::Repository, "a", Some("backups"));
+        let r =
+            select_restore_repository(&multi, "pol", "backups", Some(&explicit), "apps").unwrap();
+        assert_eq!(r.name, "a");
+
+        // Explicit cluster-scoped member: namespace-free key matches from any
+        // restore namespace.
+        let cluster = rref(RepositoryKind::ClusterRepository, "b", None);
+        assert!(
+            select_restore_repository(&multi, "pol", "backups", Some(&cluster), "apps").is_ok()
+        );
+
+        // Explicit NON-member → typed refusal naming what was given and what's
+        // valid. (An unqualified Repository ref resolves in the RESTORE's
+        // namespace — `apps/a` is not the policy's `backups/a`.)
+        let typo = rref(RepositoryKind::Repository, "a", None);
+        match select_restore_repository(&multi, "pol", "backups", Some(&typo), "apps").unwrap_err()
+        {
+            ValidationError::RestoreRepositoryNotInPolicy {
+                given,
+                policy,
+                valid,
+            } => {
+                assert_eq!(given, "Repository/apps/a");
+                assert_eq!(policy, "pol");
+                assert_eq!(valid, "Repository/backups/a, ClusterRepository/b");
+            }
+            other => panic!("expected RestoreRepositoryNotInPolicy, got {other:?}"),
+        }
+
+        // Explicit non-member against a SINGLE-repo policy is refused too (the
+        // audit-m4 backstop: a typo must not silently read the wrong repo).
+        let elsewhere = rref(RepositoryKind::ClusterRepository, "offsite", None);
+        assert!(matches!(
+            select_restore_repository(&single, "pol", "backups", Some(&elsewhere), "apps")
+                .unwrap_err(),
+            ValidationError::RestoreRepositoryNotInPolicy { .. }
+        ));
     }
 
     #[test]

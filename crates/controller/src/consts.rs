@@ -462,6 +462,19 @@ pub const SCHEDULE_TIMEZONE_AMBIGUOUS_REASON: &str = "RepositoryDefaultsDisagree
 /// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `False`.
 pub const SCHEDULE_TIMEZONE_RESOLVED_REASON: &str = "TimezoneResolved";
 
+/// `SnapshotSchedule` condition: the last fired slot SKIPPED one or more target
+/// policies because their source-members × repositories cross product exceeded
+/// the fan-out cap (#368 multi-repo fan-out). `True` = at least one policy's
+/// slot was skipped (Stalled-style: it will keep skipping every slot until the
+/// selector is narrowed or the repository list shrunk); `False` = every fired
+/// slot minted fully. Only fire passes assert this condition either way —
+/// wait/hold passes leave it untouched so it persists between slots.
+pub const SCHEDULE_FANOUT_CAPPED_CONDITION: &str = "FanoutCapped";
+/// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `True`.
+pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
+/// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `False`.
+pub const FANOUT_WITHIN_CAP_REASON: &str = "FanoutWithinCap";
+
 /// Machine-readable `reason` (condition + Warning Event) when a bootstrap connect
 /// found **no** repository at the backend and `spec.create.enabled` is `false`, so
 /// kopiur declined to initialize one. Distinct from a kopia error class so the

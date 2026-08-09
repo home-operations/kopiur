@@ -445,7 +445,7 @@ fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
     let policy = sample_policy();
     let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
     assert_eq!(
-        super::plan::backfill_patch_body(&policy, "ns", false, false, repo_ref),
+        super::plan::backfill_patch_body(&policy, "ns", false, false, Some(repo_ref)),
         None
     );
 }
@@ -456,7 +456,7 @@ fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
 
     // Only the repository pin needs backfilling: the body carries just that key.
-    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true, repo_ref)
+    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true, Some(repo_ref))
         .expect("repository backfill needed");
     let resolved = repo_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("credentialProjection"));
@@ -466,18 +466,41 @@ fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     assert_eq!(resolved["repository"]["namespace"], "ns");
 
     // Only the projection pin needs backfilling: the body carries just that key.
-    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false, repo_ref)
-        .expect("projection backfill needed");
+    let projection_only =
+        super::plan::backfill_patch_body(&policy, "ns", true, false, Some(repo_ref))
+            .expect("projection backfill needed");
     let resolved = projection_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("repository"));
     assert_eq!(resolved["credentialProjection"]["enabled"], false);
 
     // Both needed: both keys present.
-    let both =
-        super::plan::backfill_patch_body(&policy, "ns", true, true, repo_ref).expect("both needed");
+    let both = super::plan::backfill_patch_body(&policy, "ns", true, true, Some(repo_ref))
+        .expect("both needed");
     let resolved = both["resolved"].as_object().expect("object");
     assert!(resolved.contains_key("credentialProjection"));
     assert!(resolved.contains_key("repository"));
+}
+
+#[test]
+fn backfill_patch_body_skips_the_repository_when_it_is_unknowable() {
+    // A pre-feature (unpinned) child of a now-multi-repo policy: the effective
+    // repository is unknowable (`effective_repository_ref` refuses), so the
+    // caller passes `None` — the repository half must be SKIPPED (never
+    // guessed), while the projection half still backfills.
+    let policy = sample_policy();
+    assert_eq!(
+        super::plan::backfill_patch_body(&policy, "ns", false, true, None),
+        None,
+        "repository-only backfill with an unknowable repo must be a no-op"
+    );
+    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, true, None)
+        .expect("projection backfill still applies");
+    let resolved = projection_only["resolved"].as_object().expect("object");
+    assert!(resolved.contains_key("credentialProjection"));
+    assert!(
+        !resolved.contains_key("repository"),
+        "an unknowable repository must never be guessed into the pin"
+    );
 }
 
 // backend_to_repository_connect's exhaustive every-variant test moved with

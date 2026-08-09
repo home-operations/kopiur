@@ -28,8 +28,8 @@ use kube::runtime::reflector::ObjectRef;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::{
-    DeletionPolicy, PolicyRef, ScheduleDeletePolicy, TimezoneAmbiguity, effective_timezone,
-    resolve_tz,
+    DeletionPolicy, PolicyRef, RepositoryRef, ScheduleDeletePolicy, TimezoneAmbiguity,
+    effective_timezone, repo_key, resolve_tz,
 };
 use kopiur_api::snapshot::{PrunedBy, SnapshotSpec};
 use kopiur_api::{
@@ -329,9 +329,11 @@ fn schedule_ready_status(
     schedule: &SnapshotSchedule,
     ambiguity: Option<&TimezoneAmbiguity>,
     blocked: Option<&UnreadableRun>,
+    fanout_cap: Option<&[FanoutCapSkip]>,
 ) -> (serde_json::Value, i64) {
     use crate::consts::{
-        BLOCKED_ON_UNREADABLE_RUN_REASON, SCHEDULE_RUNNABLE_CONDITION,
+        BLOCKED_ON_UNREADABLE_RUN_REASON, FANOUT_TOO_LARGE_REASON, FANOUT_WITHIN_CAP_REASON,
+        SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_RUNNABLE_CONDITION,
         SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION, SCHEDULE_TIMEZONE_AMBIGUOUS_REASON,
         SCHEDULE_TIMEZONE_RESOLVED_REASON,
     };
@@ -405,6 +407,49 @@ fn schedule_ready_status(
         &runnable_message,
         Some(generation),
     );
+    // Fan-out cap condition (#368): asserted (both polarities, so a fixed
+    // recipe self-clears) ONLY on fire passes — `None` on wait/hold passes
+    // leaves the recorded value untouched, so the condition persists between
+    // slots instead of flapping set→cleared each requeue.
+    let conditions = match fanout_cap {
+        None => conditions,
+        Some([]) => io::upsert_condition(
+            &conditions,
+            SCHEDULE_FANOUT_CAPPED_CONDITION,
+            false,
+            FANOUT_WITHIN_CAP_REASON,
+            "every fired slot's fan-out stayed within the cap",
+            Some(generation),
+        ),
+        Some(skips) => {
+            let detail: Vec<String> = skips
+                .iter()
+                .map(|sk| {
+                    format!(
+                        "policy `{}`: {} member(s) x {} repositorie(s) = {} children",
+                        sk.policy,
+                        sk.members,
+                        sk.repos,
+                        sk.members.saturating_mul(sk.repos)
+                    )
+                })
+                .collect();
+            io::upsert_condition(
+                &conditions,
+                SCHEDULE_FANOUT_CAPPED_CONDITION,
+                true,
+                FANOUT_TOO_LARGE_REASON,
+                &format!(
+                    "this slot was SKIPPED for {}: the source-members x repositories cross \
+                     product exceeds the fan-out cap ({FANOUT_CAP} children per slot). No \
+                     backups were minted for the listed polic(ies) and none will be until the \
+                     pvcSelector is narrowed or spec.repositories shrunk.",
+                    detail.join("; ")
+                ),
+                Some(generation),
+            )
+        }
+    };
     (serde_json::json!(conditions), generation)
 }
 
@@ -533,7 +578,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             // still there when the new slot comes due, the concurrency path below
             // re-sets the gate (and re-Events) then.
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), None, None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -572,7 +617,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         if disposition == SlotDisposition::SkipExpired {
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker, None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -607,16 +652,20 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             // Fire one Snapshot per resolved policy (single policyRef, or each
             // policySelector match — ADR-0005 §10). The single-ref form keeps the
             // slot-stamped name for lastSchedule.snapshotRef.
-            let fanned_out = fire_for_targets(ctx, schedule, &namespace, slot).await?;
+            let outcome = fire_for_targets(ctx, schedule, &namespace, slot).await?;
             let snapshot_ref = schedule
                 .spec
                 .policy_ref
                 .as_ref()
-                .filter(|_| !fanned_out)
+                .filter(|_| !outcome.fanned_out)
                 .map(|_| scheduled_backup_name(&sched_name, slot));
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
-            let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
+            let (conditions, generation) = schedule_ready_status(
+                schedule,
+                tz_ambiguity.as_ref(),
+                blocker,
+                Some(&outcome.cap_skipped),
+            );
             io::patch_status(
                 &api,
                 &sched_name,
@@ -642,7 +691,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // structural gate (`ScheduleRunnable=False`) plus a one-shot Warning Event.
         if let Some(blocked) = blocker {
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), Some(blocked));
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), Some(blocked), None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -695,7 +744,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 || recorded_blocked_on_unreadable(schedule))
         {
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker);
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker, None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -733,15 +782,20 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             .creation_timestamp()
             .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
             .unwrap_or(now);
-        let fanned_out = fire_for_targets(ctx, schedule, &namespace, anchor).await?;
+        let outcome = fire_for_targets(ctx, schedule, &namespace, anchor).await?;
         let snapshot_ref = schedule
             .spec
             .policy_ref
             .as_ref()
-            .filter(|_| !fanned_out)
+            .filter(|_| !outcome.fanned_out)
             .map(|_| scheduled_backup_name(&sched_name, anchor));
         // First reconcile: no prior run of this schedule exists, so no blocker.
-        let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
+        let (conditions, generation) = schedule_ready_status(
+            schedule,
+            tz_ambiguity.as_ref(),
+            None,
+            Some(&outcome.cap_skipped),
+        );
         io::patch_status(
             &api,
             &sched_name,
@@ -759,7 +813,8 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     }
 
     // No runOnCreate: pin the next slot without firing (GitOps-friendly default).
-    let (conditions, generation) = schedule_ready_status(schedule, tz_ambiguity.as_ref(), None);
+    let (conditions, generation) =
+        schedule_ready_status(schedule, tz_ambiguity.as_ref(), None, None);
     io::patch_status(
         &api,
         &sched_name,
@@ -870,8 +925,19 @@ fn snapshot_terminal_time(s: &Snapshot) -> Option<DateTime<Utc>> {
 }
 
 /// **Pure.** Names of the `Failed` snapshots to delete so at most `limit` (the
-/// newest, by terminal time) are retained. Skips snapshots already terminating.
-/// Mirrors `snapshot_policy::backups_to_delete` (GFS retention) but for failures.
+/// newest, by terminal time) are retained PER REPOSITORY. Skips snapshots
+/// already terminating. Mirrors `snapshot_policy::backups_to_delete` (GFS
+/// retention) but for failures.
+///
+/// **Bucketing is by REPOSITORY ONLY** (the mint-time `spec.repository` pin's
+/// [`repo_key`]; unpinned rows share one bucket), deliberately NOT by source:
+/// single-repo and `pvcSelector` populations are all unpinned, so they land in
+/// the one "" bucket — today's flat behavior byte-identical (bucketing by
+/// source here would have 20×'d the retained failure rows for a 20-PVC
+/// fan-out). What the repo dimension prevents is cross-repo eviction: with two
+/// repositories, an outage of repo B fails every B child each slot, and a flat
+/// bound would evict repo A's (rarer, still-diagnostic) failure records while
+/// keeping only B's flood.
 ///
 /// **Data-safety:** never prunes a `Failed` snapshot that owns a kopia snapshot
 /// (`status.snapshot` set) — a backup can end `Failed` *after* its kopia snapshot
@@ -881,37 +947,48 @@ fn snapshot_terminal_time(s: &Snapshot) -> Option<DateTime<Utc>> {
 /// pre-snapshot errors) are history-bounded here.
 pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> Vec<String> {
     use kopiur_api::SnapshotPhase;
-    let mut failed: Vec<&Snapshot> = snapshots
-        .iter()
-        .filter(|s| {
-            let st = s.status.as_ref();
-            // Exhaustive, not `== Failed`: this set's members get DELETED, so
-            // every phase must say out loud whether it belongs in the
-            // failure-history bound rather than inheriting an answer.
-            let is_failed_history = st.and_then(|s| s.phase.as_ref()).is_some_and(|p| match p {
-                SnapshotPhase::Failed => true,
-                SnapshotPhase::Pending
-                | SnapshotPhase::Running
-                | SnapshotPhase::Succeeded
-                | SnapshotPhase::Deleting
-                | SnapshotPhase::Discovered
-                | SnapshotPhase::Unchanged => false,
-                // Never delete a CR whose phase this build cannot read.
-                SnapshotPhase::Unknown(_) => false,
-            });
-            is_failed_history
-                && s.metadata.deletion_timestamp.is_none()
-                // Never auto-delete a Failed snapshot that produced a kopia snapshot.
-                && st.and_then(|s| s.snapshot.as_ref()).is_none()
+    let failed = snapshots.iter().filter(|s| {
+        let st = s.status.as_ref();
+        // Exhaustive, not `== Failed`: this set's members get DELETED, so
+        // every phase must say out loud whether it belongs in the
+        // failure-history bound rather than inheriting an answer.
+        let is_failed_history = st.and_then(|s| s.phase.as_ref()).is_some_and(|p| match p {
+            SnapshotPhase::Failed => true,
+            SnapshotPhase::Pending
+            | SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged => false,
+            // Never delete a CR whose phase this build cannot read.
+            SnapshotPhase::Unknown(_) => false,
+        });
+        is_failed_history
+            && s.metadata.deletion_timestamp.is_none()
+            // Never auto-delete a Failed snapshot that produced a kopia snapshot.
+            && st.and_then(|s| s.snapshot.as_ref()).is_none()
+    });
+    let mut buckets: BTreeMap<String, Vec<&Snapshot>> = BTreeMap::new();
+    for s in failed {
+        let key = s
+            .spec
+            .repository
+            .as_ref()
+            .map(|r| repo_key(r, s.namespace().as_deref().unwrap_or_default()))
+            .unwrap_or_default();
+        buckets.entry(key).or_default().push(s);
+    }
+    buckets
+        .into_values()
+        .flat_map(|mut rows| {
+            // Newest first; an unknown terminal time (`None`) sorts last
+            // (treated as oldest) → pruned first.
+            rows.sort_by_key(|s| std::cmp::Reverse(snapshot_terminal_time(s)));
+            rows.into_iter()
+                .skip(limit as usize)
+                .filter_map(|s| s.metadata.name.clone())
+                .collect::<Vec<_>>()
         })
-        .collect();
-    // Newest first; an unknown terminal time (`None`) sorts last (treated as oldest)
-    // → pruned first.
-    failed.sort_by_key(|s| std::cmp::Reverse(snapshot_terminal_time(s)));
-    failed
-        .into_iter()
-        .skip(limit as usize)
-        .filter_map(|s| s.metadata.name.clone())
         .collect()
 }
 
@@ -1129,12 +1206,14 @@ fn scheduled_backup_spec(
     default_deletion_policy: Option<DeletionPolicy>,
     on_schedule_delete: ScheduleDeletePolicy,
     source: Option<kopiur_api::SnapshotSourceRef>,
+    repository: Option<RepositoryRef>,
 ) -> SnapshotSpec {
     SnapshotSpec {
-        // The mint-time repository pin: stamped only by a MULTI-repository
-        // policy fan-out (#368, not built yet) — single-repo children stay
-        // unpinned so their wire shape is byte-identical to pre-feature CRs.
-        repository: None,
+        // The mint-time repository pin: stamped (NORMALIZED, see `mint_cells`)
+        // only for a MULTI-repository policy fan-out child (#368) — single-repo
+        // children stay unpinned so their wire shape is byte-identical to
+        // pre-feature CRs.
+        repository,
         // Which PVC this child covers, for a `pvcSelector` expansion. `None`
         // for the ordinary single-source policy (#346).
         source,
@@ -1242,16 +1321,19 @@ async fn policy_default_deletion_policy(
 
 /// Create a scheduled Snapshot CR for `policy_ref` (owner-ref to the schedule,
 /// origin=scheduled). Server-side applied so re-firing the same slot converges
-/// instead of erroring. `backup_name` is the per-policy slot-stamped name.
+/// instead of erroring. `cell` carries the per-child name, source pin, and —
+/// for a multi-repo fan-out child — the repository pin.
+/// `default_deletion_policy` is resolved ONCE per policy by the caller
+/// ([`fire_for_targets`], the audit-M10 GET hoist), not re-fetched per child.
 async fn create_scheduled_backup(
     ctx: &Context,
     schedule: &SnapshotSchedule,
     namespace: &str,
-    backup_name: &str,
+    cell: &MintCell,
     policy_ref: &PolicyRef,
-    source: Option<&kopiur_api::SnapshotSourceRef>,
+    default_deletion_policy: Option<DeletionPolicy>,
 ) -> Result<()> {
-    let source = source.cloned();
+    let backup_name = cell.name.as_str();
     let owner = io::owner_ref_for(schedule, "SnapshotSchedule")?;
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(
@@ -1267,12 +1349,6 @@ async fn create_scheduled_backup(
         policy_ref.name.clone(),
     );
 
-    // Inherit the recipe's defaultDeletionPolicy so the produced Snapshot carries
-    // it BEFORE admission (else the webhook stamps its origin default) — #238. A
-    // read failure/missing policy propagates so the fire is skipped and retried,
-    // never firing with a wrong (destructive) default (mirrors target resolution).
-    let default_deletion_policy =
-        policy_default_deletion_policy(&ctx.client, policy_ref, namespace).await?;
     // The schedule's effective cascade policy, stamped explicitly onto the child.
     let on_schedule_delete = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
         schedule.spec.deletion.as_ref(),
@@ -1292,7 +1368,8 @@ async fn create_scheduled_backup(
             policy_ref,
             default_deletion_policy,
             on_schedule_delete,
-            source.clone(),
+            cell.source.clone(),
+            cell.repository.clone(),
         ),
     );
     backup.metadata = io::child_meta(backup_name, namespace, labels, Some(owner));
@@ -1305,22 +1382,97 @@ async fn create_scheduled_backup(
     Ok(())
 }
 
-/// Fire one `Snapshot` per resolved target policy for the slot `slot_name_part`
-/// (the slot-stamp). Each Snapshot's name is `<schedule>-<policy>-<slot>` for the
-/// fan-out form (so a multi-policy schedule doesn't collide), or `<schedule>-<slot>`
-/// for the single `policyRef` form (preserving the existing idempotent name).
+pub(crate) use kopiur_api::expand::{MintCell, mint_cells};
+
+/// Hard cap on one slot's members × repositories cross product. Above it the
+/// slot is SKIPPED for that policy (Stalled-style condition + warning), never
+/// partially minted: 400+ children per slot is a config mistake, and minting
+/// them would bury the namespace in CRs and mover Jobs faster than anyone can
+/// react.
+const FANOUT_CAP: usize = 400;
+
+/// **Pure.** The cap guard: whether crossing `members` source members with
+/// `repos` repositories exceeds [`FANOUT_CAP`].
+pub(crate) fn fanout_cap_exceeded(members: usize, repos: usize) -> bool {
+    members.saturating_mul(repos) > FANOUT_CAP
+}
+
+/// A slot skipped by the fan-out cap, surfaced on the schedule's status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FanoutCapSkip {
+    pub policy: String,
+    pub members: usize,
+    pub repos: usize,
+}
+
+/// What [`fire_for_targets`] did with a slot.
+pub(crate) struct FireOutcome {
+    /// Whether ANY target minted children whose names differ from the bare
+    /// slot-stamped reconstruction (pvcSelector and/or multi-repo fan-out) —
+    /// the `status.lastSchedule.snapshotRef` suppression input.
+    pub fanned_out: bool,
+    /// Slots skipped because members × repos exceeded [`FANOUT_CAP`].
+    pub cap_skipped: Vec<FanoutCapSkip>,
+}
+
+/// **Pure.** What to do with one policy's slot, given its expanded members:
+/// mint nothing (empty selector match), skip on the fan-out cap, or mint the
+/// exact [`mint_cells`] cross product. Extracted so the fire loop's IO stays a
+/// straight dispatch and the decision is unit-testable.
+enum SlotMintPlan {
+    /// The `pvcSelector` matched nothing — warn, mint nothing.
+    NothingMatched,
+    /// members × repos exceeds [`FANOUT_CAP`] — skip the whole slot for this
+    /// policy (a partial mint would silently protect some members-on-some-repos
+    /// with no record of which) and surface the condition.
+    CapSkipped(FanoutCapSkip),
+    /// Mint exactly these cells.
+    Mint(Vec<MintCell>),
+}
+
+fn slot_mint_plan(
+    policy: &SnapshotPolicy,
+    policy_name: &str,
+    base_name: &str,
+    members: Option<Vec<kopiur_api::expand::ExpandedMember>>,
+) -> SlotMintPlan {
+    if members.as_ref().is_some_and(Vec::is_empty) {
+        return SlotMintPlan::NothingMatched;
+    }
+    let member_count = members.as_ref().map_or(1, Vec::len);
+    let repo_count = policy.spec.repositories.len().max(1);
+    if fanout_cap_exceeded(member_count, repo_count) {
+        return SlotMintPlan::CapSkipped(FanoutCapSkip {
+            policy: policy_name.to_string(),
+            members: member_count,
+            repos: repo_count,
+        });
+    }
+    SlotMintPlan::Mint(mint_cells(policy, base_name, members))
+}
+
+/// Fire one `Snapshot` per (resolved target policy × source member ×
+/// repository) for the slot. Each single-repo Snapshot's name is
+/// `<schedule>-<policy>-<slot>` for the fan-out form (so a multi-policy
+/// schedule doesn't collide), or `<schedule>-<slot>` for the single `policyRef`
+/// form (preserving the existing idempotent name); multi-repo children ride
+/// [`mint_cells`]' naming.
 async fn fire_for_targets(
     ctx: &Context,
     schedule: &SnapshotSchedule,
     namespace: &str,
     slot: DateTime<Utc>,
-) -> Result<bool> {
-    // Whether ANY target policy expanded a `pvcSelector`. The caller needs this
-    // because `status.lastSchedule.snapshotRef` is reconstructed from the slot
-    // stamp alone — under fan-out the real children are named
-    // `<base>-pvc-<slug>-<h8>`, so that reconstruction would point at an object
+) -> Result<FireOutcome> {
+    // Whether ANY target policy fanned out (pvcSelector members and/or a
+    // multi-repo dimension). The caller needs this because
+    // `status.lastSchedule.snapshotRef` is reconstructed from the slot stamp
+    // alone — under fan-out the real children are named `<base>-pvc-<slug>-<h8>`
+    // (or `<base>-repo-…`), so that reconstruction would point at an object
     // that does not exist. A dangling ref is worse than none.
-    let mut fanned_out = false;
+    let mut outcome = FireOutcome {
+        fanned_out: false,
+        cap_skipped: Vec::new(),
+    };
     let targets = target_policy_refs(ctx, schedule, namespace).await?;
     let single = schedule.spec.policy_ref.is_some();
     let sched_name = schedule.name_any();
@@ -1338,12 +1490,9 @@ async fn fire_for_targets(
         let matched = crate::expand::match_pvcs(&ctx.client, &policy).await?;
         let members = crate::expand::expand_sources(&policy, &base_name, &matched)
             .map_err(|e| Error::Validation(e.to_string()))?;
-        match members {
-            None => {
-                create_scheduled_backup(ctx, schedule, namespace, &base_name, pref, None).await?;
-            }
-            Some(members) if members.is_empty() => {
-                fanned_out = true;
+        match slot_mint_plan(&policy, &pref.name, &base_name, members) {
+            SlotMintPlan::NothingMatched => {
+                outcome.fanned_out = true;
                 // A selector that matched nothing is NOT an error — PVCs come
                 // and go — but it is silent data loss if nobody says so, since
                 // the schedule would look like it fired successfully.
@@ -1353,23 +1502,47 @@ async fn fire_for_targets(
                     "pvcSelector matched no PersistentVolumeClaims; this slot backed up nothing"
                 );
             }
-            Some(members) => {
-                fanned_out = true;
-                for m in &members {
+            SlotMintPlan::CapSkipped(skip) => {
+                tracing::warn!(
+                    schedule = %sched_name,
+                    policy = %pref.name,
+                    members = skip.members,
+                    repos = skip.repos,
+                    cap = FANOUT_CAP,
+                    "fan-out cross product exceeds the cap; skipping this slot for the policy"
+                );
+                outcome.fanned_out = true;
+                outcome.cap_skipped.push(skip);
+            }
+            SlotMintPlan::Mint(cells) => {
+                // Inherit the recipe's defaultDeletionPolicy so the produced
+                // Snapshot carries it BEFORE admission (else the webhook stamps
+                // its origin default) — #238. Resolved ONCE PER POLICY (audit
+                // M10: it is a per-policy fact — the old per-child GET
+                // multiplied apiserver reads by the fan-out width). A read
+                // failure/missing/terminating policy propagates so the fire is
+                // skipped and retried, never firing with a wrong (destructive)
+                // default.
+                let default_deletion_policy =
+                    policy_default_deletion_policy(&ctx.client, pref, namespace).await?;
+                if cells.len() != 1 || cells[0].name != base_name {
+                    outcome.fanned_out = true;
+                }
+                for cell in &cells {
                     create_scheduled_backup(
                         ctx,
                         schedule,
                         namespace,
-                        &m.name,
+                        cell,
                         pref,
-                        Some(&m.source),
+                        default_deletion_policy,
                     )
                     .await?;
                 }
             }
         }
     }
-    Ok(fanned_out)
+    Ok(outcome)
 }
 
 /// `error_policy` for the `SnapshotSchedule` controller.
@@ -1482,6 +1655,7 @@ mod tests {
             Some(DeletionPolicy::Retain),
             ScheduleDeletePolicy::Retain,
             None,
+            None,
         );
         assert_eq!(retain.deletion_policy, Some(DeletionPolicy::Retain));
         assert_eq!(
@@ -1494,12 +1668,13 @@ mod tests {
             Some(DeletionPolicy::Orphan),
             ScheduleDeletePolicy::Retain,
             None,
+            None,
         );
         assert_eq!(orphan.deletion_policy, Some(DeletionPolicy::Orphan));
 
         // An unset recipe default leaves the field None, so the webhook's
         // safe origin-aware Delete default still applies (no behavior change).
-        let unset = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None);
+        let unset = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None, None);
         assert_eq!(unset.deletion_policy, None);
     }
 
@@ -1511,12 +1686,12 @@ mod tests {
         };
         // The cascade policy is stamped EXPLICITLY (never left None) so the
         // finalizer's cascade guard reads a concrete value — both defaults.
-        let retain = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None);
+        let retain = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None, None);
         assert_eq!(
             retain.on_schedule_delete,
             Some(ScheduleDeletePolicy::Retain)
         );
-        let delete = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Delete, None);
+        let delete = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Delete, None, None);
         assert_eq!(
             delete.on_schedule_delete,
             Some(ScheduleDeletePolicy::Delete)
@@ -1526,6 +1701,7 @@ mod tests {
             &pref,
             Some(DeletionPolicy::Orphan),
             ScheduleDeletePolicy::Delete,
+            None,
             None,
         );
         assert_eq!(threaded.deletion_policy, Some(DeletionPolicy::Orphan));
@@ -1547,6 +1723,7 @@ mod tests {
                 },
                 None,
                 stamped.unwrap_or(ScheduleDeletePolicy::Retain),
+                None,
                 None,
             ),
         );
@@ -2118,6 +2295,167 @@ mod tests {
         assert!(failed_snapshots_to_prune(&all, 10).is_empty());
     }
 
+    /// Multi-repo fan-out (#368): the failure-history bound is PER REPOSITORY
+    /// (spec-pin repo_key; unpinned = one bucket). Two properties: each repo
+    /// keeps `limit` of its own failures, and a flood of repo-B failures (an
+    /// outage) can never evict repo-A's rarer, still-diagnostic records.
+    #[test]
+    fn failed_snapshots_to_prune_buckets_per_repository_pin() {
+        use kopiur_api::common::{RepositoryKind, RepositoryRef};
+        use kopiur_api::snapshot::{SnapshotPhase, SnapshotStatus, SnapshotTiming};
+
+        fn snap(name: &str, repo: Option<&str>, end: &str) -> Snapshot {
+            let mut s = Snapshot::new(
+                name,
+                SnapshotSpec {
+                    repository: repo.map(|r| RepositoryRef {
+                        kind: RepositoryKind::Repository,
+                        name: r.into(),
+                        namespace: Some("apps".into()),
+                    }),
+                    source: None,
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            s.metadata.namespace = Some("apps".into());
+            s.status = Some(SnapshotStatus {
+                phase: Some(SnapshotPhase::Failed),
+                timing: Some(SnapshotTiming {
+                    end_time: Some(end.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s
+        }
+
+        // Repo A: two old failures. Repo B: a newer four-failure flood.
+        let all = vec![
+            snap("a1", Some("repo-a"), "2026-01-01T01:00:00Z"),
+            snap("a2", Some("repo-a"), "2026-01-01T02:00:00Z"),
+            snap("b1", Some("repo-b"), "2026-01-02T01:00:00Z"),
+            snap("b2", Some("repo-b"), "2026-01-02T02:00:00Z"),
+            snap("b3", Some("repo-b"), "2026-01-02T03:00:00Z"),
+            snap("b4", Some("repo-b"), "2026-01-02T04:00:00Z"),
+        ];
+        let mut prune = failed_snapshots_to_prune(&all, 1);
+        prune.sort();
+        // Each repo keeps ITS newest: a2 and b4 survive. Under the old flat
+        // bound, limit 1 would have kept only b4 — repo B's outage flood
+        // evicting every repo-A record.
+        assert_eq!(prune, vec!["a1", "b1", "b2", "b3"]);
+
+        // Unpinned rows are one flat bucket alongside the pinned ones.
+        let mixed = vec![
+            snap("u1", None, "2026-01-01T01:00:00Z"),
+            snap("u2", None, "2026-01-01T02:00:00Z"),
+            snap("b1", Some("repo-b"), "2026-01-02T01:00:00Z"),
+        ];
+        assert_eq!(failed_snapshots_to_prune(&mixed, 1), vec!["u1"]);
+    }
+
+    /// The fan-out cap guard (#368): the boundary arithmetic and the
+    /// Stalled-style `FanoutCapped` condition wiring.
+    #[test]
+    fn fanout_cap_guard_and_condition() {
+        // Boundary: exactly the cap is allowed; one past it is not.
+        assert!(!fanout_cap_exceeded(400, 1));
+        assert!(!fanout_cap_exceeded(50, 8));
+        assert!(fanout_cap_exceeded(401, 1));
+        assert!(fanout_cap_exceeded(51, 8));
+        assert!(!fanout_cap_exceeded(0, 8));
+        // Overflow-safe.
+        assert!(fanout_cap_exceeded(usize::MAX, 2));
+
+        let sched: SnapshotSchedule = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotSchedule",
+            "metadata": { "name": "nightly", "namespace": "apps", "generation": 3 },
+            "spec": { "schedule": { "cron": "0 3 * * *" }, "policyRef": { "name": "pg" } }
+        }))
+        .expect("schedule fixture");
+        let skips = vec![FanoutCapSkip {
+            policy: "pg".into(),
+            members: 60,
+            repos: 8,
+        }];
+        let (conds, _) = schedule_ready_status(&sched, None, None, Some(&skips));
+        let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(conds).expect("conditions decode");
+        let capped = conds
+            .iter()
+            .find(|c| c.type_ == crate::consts::SCHEDULE_FANOUT_CAPPED_CONDITION)
+            .expect("FanoutCapped present");
+        assert_eq!(capped.status, "True");
+        assert_eq!(capped.reason, crate::consts::FANOUT_TOO_LARGE_REASON);
+        assert!(capped.message.contains("pg"), "{}", capped.message);
+        assert!(capped.message.contains("480"), "{}", capped.message);
+
+        // A clean fire (Some(&[])) self-clears it…
+        let (conds, _) = schedule_ready_status(&sched, None, None, Some(&[]));
+        let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(conds).expect("conditions decode");
+        let capped = conds
+            .iter()
+            .find(|c| c.type_ == crate::consts::SCHEDULE_FANOUT_CAPPED_CONDITION)
+            .expect("FanoutCapped present");
+        assert_eq!(capped.status, "False");
+        // …while a wait/hold pass (None) asserts nothing about it.
+        let (conds, _) = schedule_ready_status(&sched, None, None, None);
+        let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
+            serde_json::from_value(conds).expect("conditions decode");
+        assert!(
+            !conds
+                .iter()
+                .any(|c| c.type_ == crate::consts::SCHEDULE_FANOUT_CAPPED_CONDITION)
+        );
+    }
+
+    /// Golden: a single-repo scheduled child's spec is byte-identical to the
+    /// pre-multi-repo wire (NO `repository` key), and a multi-repo cell's pin
+    /// lands verbatim.
+    #[test]
+    fn scheduled_backup_spec_repository_pin_wire_golden() {
+        use kopiur_api::common::{RepositoryKind, RepositoryRef};
+        let pref = PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        };
+        let single = scheduled_backup_spec(&pref, None, ScheduleDeletePolicy::Retain, None, None);
+        let wire = serde_json::to_value(&single).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "policyRef": { "name": "pg" },
+                "onScheduleDelete": "Retain",
+            }),
+            "single-repo scheduled spec must stay byte-identical (no repository key)"
+        );
+
+        let pinned = scheduled_backup_spec(
+            &pref,
+            None,
+            ScheduleDeletePolicy::Retain,
+            None,
+            Some(RepositoryRef {
+                kind: RepositoryKind::Repository,
+                name: "nas".into(),
+                namespace: Some("apps".into()),
+            }),
+        );
+        let wire = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(
+            wire["repository"],
+            serde_json::json!({ "kind": "Repository", "name": "nas", "namespace": "apps" })
+        );
+    }
+
     // --- concurrency gate: the version-skew livelock (#359 class) ------------
 
     fn run_in_phase(name: &str, phase: Option<SnapshotPhase>, deleting: bool) -> Snapshot {
@@ -2257,7 +2595,7 @@ mod tests {
             snapshot: "nightly-20260807".into(),
             phase: "Quiescing".into(),
         };
-        let (conditions, _) = schedule_ready_status(&sched, None, Some(&blocked));
+        let (conditions, _) = schedule_ready_status(&sched, None, Some(&blocked), None);
         let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
             serde_json::from_value(conditions).unwrap();
         let gate = conds
@@ -2290,7 +2628,7 @@ mod tests {
             ..Default::default()
         });
         assert!(recorded_blocked_on_unreadable(&sched));
-        let (cleared, _) = schedule_ready_status(&sched, None, None);
+        let (cleared, _) = schedule_ready_status(&sched, None, None, None);
         let cleared: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
             serde_json::from_value(cleared).unwrap();
         let gate = cleared

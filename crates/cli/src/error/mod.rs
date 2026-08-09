@@ -20,6 +20,22 @@ pub enum CliError {
         namespace: String,
     },
 
+    /// `--repository` named a repository that is not one of the policy's
+    /// targets (multi-repo fan-out, #368) — refused rather than silently
+    /// backing up into nothing.
+    #[error(
+        "--repository {given} does not name a repository of SnapshotPolicy {policy}; \
+         valid: {valid}"
+    )]
+    UnknownPolicyRepository {
+        /// The `--repository` value given.
+        given: String,
+        /// The recipe whose repository set was checked.
+        policy: String,
+        /// Comma-joined valid repository names.
+        valid: String,
+    },
+
     /// The kubeconfig could not be loaded or the requested context resolved.
     #[error(
         "could not load a Kubernetes client configuration: {source}. \

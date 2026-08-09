@@ -625,6 +625,91 @@ pub enum ValidationError {
     )]
     PolicyHooksWithRepositories,
 
+    /// A `Snapshot`'s mint-time repository pin (`spec.repository`) names a
+    /// repository that is no longer in its `SnapshotPolicy`'s repository set —
+    /// the recipe was edited out from under this Snapshot's pin. Terminal for
+    /// this CR: proceeding against any OTHER repository would silently act on
+    /// the wrong backend, and guessing is the one thing a backup operator must
+    /// never do.
+    #[error(
+        "Snapshot spec.repository pins {pin}, but SnapshotPolicy `{policy}` no longer lists \
+         that repository (current set: {valid}) — the recipe was edited out from under this \
+         Snapshot's pin. Delete this Snapshot and let the schedule re-fire against the \
+         current recipe, or restore the repository entry on the policy"
+    )]
+    SnapshotPinNotInPolicy {
+        /// Normalized key of the pinned repository (`Kind[/namespace]/name`).
+        pin: String,
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's current repository set.
+        valid: String,
+    },
+
+    /// A `Snapshot` referencing a MULTI-repository `SnapshotPolicy` carries no
+    /// `spec.repository` pin, so there is no way to know which of the N
+    /// repositories this run targets. The controller-side backstop of the
+    /// admission rule that refuses minting such a child; picking repository #1
+    /// silently is never an option.
+    #[error(
+        "Snapshot has no spec.repository pin, but SnapshotPolicy `{policy}` lists multiple \
+         repositories (spec.repositories) — a multi-repo child must pin exactly one member \
+         at mint time. Delete this Snapshot and let the schedule (or `kubectl kopiur \
+         snapshot now`) re-mint it with the pin stamped"
+    )]
+    MultiRepoSnapshotUnpinned {
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+    },
+
+    /// A `Snapshot` with no `policyRef` (e.g. a `SnapshotReplication` copy CR
+    /// or a discovered row) has no derivable repository: neither a
+    /// `status.resolved.repository` pin, nor a `spec.repository` pin, nor a
+    /// `Repository`/`ClusterRepository` owner reference.
+    #[error(
+        "cannot determine the repository for Snapshot `{snapshot}`: it has no policyRef and \
+         carries neither a status.resolved.repository pin, a spec.repository pin, nor a \
+         Repository/ClusterRepository owner reference"
+    )]
+    SnapshotRepositoryUnresolvable {
+        /// The `Snapshot`'s name.
+        snapshot: String,
+    },
+
+    /// A `fromPolicy` restore names an explicit `spec.repository` that is not a
+    /// member of the referenced `SnapshotPolicy`'s repository set — most likely
+    /// a typo, and honoring it would silently read a repository the recipe
+    /// never wrote to.
+    #[error(
+        "restore.spec.repository names {given}, which is not a repository of SnapshotPolicy \
+         `{policy}` — a fromPolicy restore must read one of the policy's own repositories \
+         (set restore.spec.repository to one of: {valid}), or use a snapshotRef/identity \
+         source to restore from elsewhere"
+    )]
+    RestoreRepositoryNotInPolicy {
+        /// Normalized key of the repository the restore named.
+        given: String,
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's repository set.
+        valid: String,
+    },
+
+    /// A `fromPolicy` restore references a MULTI-repository `SnapshotPolicy`
+    /// without selecting which repository to read — the operator must never
+    /// guess (the N repositories are independent captures that can diverge).
+    #[error(
+        "SnapshotPolicy `{policy}` lists multiple repositories (spec.repositories), so a \
+         fromPolicy restore must say which one to read: set restore.spec.repository to one \
+         of: {valid}"
+    )]
+    RestoreRepositorySelectionRequired {
+        /// The referenced `SnapshotPolicy`'s name.
+        policy: String,
+        /// Comma-joined normalized keys of the policy's repository set.
+        valid: String,
+    },
+
     /// A namespaced `Repository` set `spec.maintenance.namespace`, which only
     /// applies to a cluster-scoped `ClusterRepository` (a namespaced
     /// `Repository`'s managed `Maintenance` always lives in the repository's own

@@ -3277,8 +3277,46 @@ async fn resolve_restore_repository(
     restore: &Restore,
     namespace: &str,
 ) -> Result<ResolvedRepository> {
-    // Explicit `spec.repository` wins. Honors `kind` (namespaced vs.
-    // ClusterRepository) via the shared resolver (ADR §5.5).
+    // FromPolicy: the policy's repository SET governs (multi-repo fan-out,
+    // #368). The pure selection rule is shared with the M9 webhook mirror
+    // (`kopiur_api::snapshot_policy::select_restore_repository`):
+    // - explicit `spec.repository` must be a MEMBER of the set (audit m4 — a
+    //   typo'd ref must not silently read a repository the recipe never wrote
+    //   to), and resolves relative to the RESTORE's namespace as an explicit
+    //   ref always has;
+    // - no explicit + single-repo → the policy's one ref (as before, resolved
+    //   in the policy's namespace);
+    // - no explicit + multi-repo → fail closed, naming every valid choice.
+    if let RestoreSource::FromPolicy(c) = &restore.spec.source {
+        use kopiur_api::SnapshotPolicy;
+        let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
+        let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
+        let config = cfg_api.get_opt(&c.name).await?.ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", c.name))
+        })?;
+        let selected = kopiur_api::snapshot_policy::select_restore_repository(
+            &config.spec,
+            &c.name,
+            cfg_ns,
+            restore.spec.repository.as_ref(),
+            namespace,
+        )
+        .map_err(|e| Error::Validation(e.to_string()))?;
+        let base_ns = if restore.spec.repository.is_some() {
+            namespace
+        } else {
+            cfg_ns
+        };
+        return io::resolve_repository_ref(
+            &ctx.client,
+            &selected,
+            base_ns,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await;
+    }
+    // Explicit `spec.repository` wins for the other sources. Honors `kind`
+    // (namespaced vs. ClusterRepository) via the shared resolver (ADR §5.5).
     if let Some(rref) = &restore.spec.repository {
         return io::resolve_repository_ref(
             &ctx.client,
@@ -3311,22 +3349,6 @@ async fn resolve_restore_repository(
             &ctx.client,
             &rref,
             snap_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
-    }
-    // FromPolicy: resolve via the SnapshotPolicy's repository.
-    if let RestoreSource::FromPolicy(c) = &restore.spec.source {
-        use kopiur_api::SnapshotPolicy;
-        let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
-        let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
-        let config = cfg_api.get_opt(&c.name).await?.ok_or_else(|| {
-            Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", c.name))
-        })?;
-        return io::resolve_repository_ref(
-            &ctx.client,
-            io::recipe_repo_ref(&config)?,
-            cfg_ns,
             ctx.operator_namespace.as_deref(),
         )
         .await;
@@ -3379,11 +3401,11 @@ async fn restore_repository_ref(
             let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
             let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
             Ok(cfg_api.get_opt(&c.name).await?.and_then(|cfg| {
-                // Multi-repo fromPolicy: the readiness gate cannot know which
-                // repository to wait on, and this contract is deliberately
-                // NON-FATAL — return None (never guess repository #1); the
-                // resolver above errors loudly downstream. Multi-repo restore
-                // selection lands in M8.
+                // Multi-repo fromPolicy with no explicit selection: the
+                // readiness gate cannot know which repository to wait on, and
+                // this contract is deliberately NON-FATAL — return None (never
+                // guess repository #1); `resolve_restore_repository` fails
+                // closed downstream with the valid choices listed.
                 kopiur_api::single_repository_ref(&cfg.spec)
                     .ok()
                     .map(|r| (r.clone(), cfg_ns.to_string()))

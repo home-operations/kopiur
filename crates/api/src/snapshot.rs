@@ -815,6 +815,91 @@ pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
     })
 }
 
+/// THE repository a policy-child `Snapshot` runs against, resolved from the
+/// mint-time pin + the referenced policy's repository set. **Pure.** This is
+/// the single decision every launch/deletion/pin/preflight path shares, so
+/// multi-repo pin semantics cannot fork between consumers.
+///
+/// The rule, in order:
+///
+/// 1. **No `policyRef`** — this is NOT a policy child (a `SnapshotReplication`
+///    copy CR, or a discovered row): the `policy` argument is not this row's
+///    recipe and is ignored; the row's own derivation
+///    ([`repository_ref_for`]: status pin → spec pin → owner ref) answers, or
+///    [`ValidationError::SnapshotRepositoryUnresolvable`] when it has none.
+/// 2. **Pin present** (`spec.repository`) — the pin wins, but it must still be
+///    a member of the policy's CURRENT repository set (compared by normalized
+///    [`repo_key`](crate::common::repo_key) against `policy_ns`); a pin the
+///    recipe no longer lists is the terminal
+///    [`ValidationError::SnapshotPinNotInPolicy`] ("the recipe was edited out
+///    from under this Snapshot's pin"), never a silent re-target.
+/// 3. **No pin, single-repo policy** — the policy's one `spec.repository`,
+///    verbatim (byte-identical to the pre-multi-repo behavior).
+/// 4. **No pin, multi-repo policy** —
+///    [`ValidationError::MultiRepoSnapshotUnpinned`]: the controller-side
+///    backstop of the admission rule; repository #1 is never guessed.
+///
+/// A malformed policy (neither/both repository shapes) surfaces as its
+/// [`ValidationError::PolicyRepositoryExactlyOne`].
+pub fn effective_repository_ref(
+    snap: &Snapshot,
+    policy: &crate::snapshot_policy::SnapshotPolicySpec,
+    policy_ns: &str,
+) -> Result<RepositoryRef, crate::error::ValidationError> {
+    use crate::common::repo_key;
+    use crate::snapshot_policy::{PolicyRepositories, policy_repositories};
+    use kube::ResourceExt;
+
+    if snap.spec.policy_ref.is_none() {
+        return repository_ref_for(snap).ok_or_else(|| {
+            crate::error::ValidationError::SnapshotRepositoryUnresolvable {
+                snapshot: snap.name_any(),
+            }
+        });
+    }
+    let repos = policy_repositories(policy)?;
+    if let Some(pin) = snap.spec.repository.as_ref() {
+        // The pin was stamped NORMALIZED at mint, so keying it against the
+        // policy's namespace is stable; the members normalize against the same
+        // namespace the policy resolves them in.
+        let pin_key = repo_key(pin, policy_ns);
+        let members: Vec<&RepositoryRef> = match repos {
+            PolicyRepositories::Single(r) => vec![r],
+            PolicyRepositories::Multi(rs) => rs.iter().collect(),
+        };
+        return match members.iter().find(|m| repo_key(m, policy_ns) == pin_key) {
+            Some(_) => Ok(pin.clone()),
+            None => Err(crate::error::ValidationError::SnapshotPinNotInPolicy {
+                pin: pin_key,
+                policy: snap
+                    .spec
+                    .policy_ref
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+                valid: members
+                    .iter()
+                    .map(|m| repo_key(m, policy_ns))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        };
+    }
+    match repos {
+        PolicyRepositories::Single(r) => Ok(r.clone()),
+        PolicyRepositories::Multi(_) => {
+            Err(crate::error::ValidationError::MultiRepoSnapshotUnpinned {
+                policy: snap
+                    .spec
+                    .policy_ref
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +987,176 @@ mod tests {
             .collect();
         // `Deleting` stays here on purpose: a wedged finalizer is in-flight work.
         assert_eq!(in_flight, ["Pending", "Running", "Deleting"]);
+    }
+
+    /// The 5-way contract of [`effective_repository_ref`] — the single
+    /// launch/deletion/pin/preflight repository decision (multi-repo fan-out,
+    /// #368). Specs are constructed directly (the admission feature gate is
+    /// deliberately bypassed): this is exactly how the un-admittable multi-repo
+    /// behavior is proven until the gate lifts.
+    mod effective_repository {
+        use super::super::effective_repository_ref;
+        use crate::error::ValidationError;
+        use crate::{Snapshot, SnapshotPolicySpec};
+
+        fn snap(v: serde_json::Value) -> Snapshot {
+            serde_json::from_value(v).expect("snapshot fixture")
+        }
+
+        fn policy(v: serde_json::Value) -> SnapshotPolicySpec {
+            serde_json::from_value(v).expect("policy fixture")
+        }
+
+        fn multi_policy() -> SnapshotPolicySpec {
+            policy(serde_json::json!({
+                "repositories": [
+                    { "kind": "Repository", "name": "a" },
+                    { "kind": "ClusterRepository", "name": "b" },
+                ],
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }))
+        }
+
+        #[test]
+        fn no_policy_ref_short_circuits_to_the_rows_own_derivation() {
+            // A replication copy CR: no policyRef, spec pin present. The policy
+            // argument (a multi-repo recipe that does NOT list the pin) is
+            // ignored — it is not this row's recipe.
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "copy", "namespace": "media" },
+                "spec": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            }));
+            let r = effective_repository_ref(&s, &multi_policy(), "media").unwrap();
+            assert_eq!(r.name, "offsite");
+
+            // …and a bare row with nothing to derive from is a NAMED error,
+            // never a guess.
+            let bare = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "bare", "namespace": "media" },
+                "spec": {}
+            }));
+            assert!(matches!(
+                effective_repository_ref(&bare, &multi_policy(), "media").unwrap_err(),
+                ValidationError::SnapshotRepositoryUnresolvable { snapshot } if snapshot == "bare"
+            ));
+        }
+
+        #[test]
+        fn pin_that_is_a_member_wins() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    // Normalized pin: the Repository member resolves to
+                    // media/a, and so does this explicit-namespace pin.
+                    "repository": { "kind": "Repository", "name": "a", "namespace": "media" }
+                }
+            }));
+            let r = effective_repository_ref(&s, &multi_policy(), "media").unwrap();
+            assert_eq!(r.name, "a");
+            assert_eq!(r.namespace.as_deref(), Some("media"));
+        }
+
+        #[test]
+        fn pin_edited_out_of_the_policy_is_terminal() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "gone", "namespace": "media" }
+                }
+            }));
+            let err = effective_repository_ref(&s, &multi_policy(), "media").unwrap_err();
+            match err {
+                ValidationError::SnapshotPinNotInPolicy { pin, policy, valid } => {
+                    assert_eq!(pin, "Repository/media/gone");
+                    assert_eq!(policy, "pol");
+                    assert_eq!(valid, "Repository/media/a, ClusterRepository/b");
+                }
+                other => panic!("expected SnapshotPinNotInPolicy, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn unpinned_single_repo_child_uses_the_single_ref() {
+            let single = policy(serde_json::json!({
+                "repository": { "kind": "Repository", "name": "r" },
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }));
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "policyRef": { "name": "pol" } }
+            }));
+            // Verbatim — byte-identical to the pre-multi-repo behavior (no
+            // namespace materialized that the spec didn't carry).
+            let r = effective_repository_ref(&s, &single, "media").unwrap();
+            assert_eq!(r.name, "r");
+            assert_eq!(r.namespace, None);
+        }
+
+        #[test]
+        fn unpinned_multi_repo_child_is_refused_never_guessed() {
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": { "policyRef": { "name": "pol" } }
+            }));
+            assert!(matches!(
+                effective_repository_ref(&s, &multi_policy(), "media").unwrap_err(),
+                ValidationError::MultiRepoSnapshotUnpinned { policy } if policy == "pol"
+            ));
+        }
+
+        #[test]
+        fn pin_against_a_single_repo_policy_still_checks_membership() {
+            // A multi→single edit that removed the pinned repo is the same
+            // "edited out from under the pin" terminal error, not a silent
+            // re-target onto the surviving repository.
+            let single = policy(serde_json::json!({
+                "repository": { "kind": "Repository", "name": "kept" },
+                "sources": [ { "pvc": { "name": "d" } } ],
+            }));
+            let s = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "removed", "namespace": "media" }
+                }
+            }));
+            assert!(matches!(
+                effective_repository_ref(&s, &single, "media").unwrap_err(),
+                ValidationError::SnapshotPinNotInPolicy { .. }
+            ));
+            // …while a pin that matches the single ref proceeds.
+            let matching = snap(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": { "name": "s", "namespace": "media" },
+                "spec": {
+                    "policyRef": { "name": "pol" },
+                    "repository": { "kind": "Repository", "name": "kept", "namespace": "media" }
+                }
+            }));
+            assert_eq!(
+                effective_repository_ref(&matching, &single, "media")
+                    .unwrap()
+                    .name,
+                "kept"
+            );
+        }
     }
 
     /// Regression for the inert "derived from source" contract (found by the

@@ -757,18 +757,9 @@ pub fn batch_job_placement(
 /// after the recipe is gone; a `ClusterRepository` ref pins none (the webhook
 /// forbids one). Exhaustive over [`RepositoryKind`] (ADR §5.5).
 pub fn pinned_repository_ref(r: &RepositoryRef, config_ns: &str) -> RepositoryRef {
-    match r.kind {
-        RepositoryKind::Repository => RepositoryRef {
-            kind: RepositoryKind::Repository,
-            name: r.name.clone(),
-            namespace: Some(r.namespace.clone().unwrap_or_else(|| config_ns.to_string())),
-        },
-        RepositoryKind::ClusterRepository => RepositoryRef {
-            kind: RepositoryKind::ClusterRepository,
-            name: r.name.clone(),
-            namespace: None,
-        },
-    }
+    // The one shared normal form (hoisted to the api crate so mint-time pins —
+    // schedule fan-out, CLI `snapshot now`, adoption — normalize identically).
+    kopiur_api::common::normalized_repository_ref(r, config_ns)
 }
 
 pub use crate::naming::capped_name;
@@ -860,14 +851,27 @@ pub(super) fn needs_repository_backfill(backup: &Snapshot) -> bool {
 /// backfilling, so a `Snapshot` needing just one of the two pins never
 /// clobbers (or redundantly re-writes) the other. `None` when neither pin
 /// needs backfilling — the caller skips the patch entirely.
+///
+/// `repo_ref` is the row's EFFECTIVE repository
+/// ([`kopiur_api::snapshot::effective_repository_ref`] — the spec pin for a
+/// multi-repo fan-out child). `None` means the repository is UNKNOWABLE for
+/// this row (a pre-feature child of a now-multi-repo policy with no pin):
+/// the repository half is then SKIPPED — never guessed — and the row stays in
+/// the breaker's conservative unpinned bucket until the policy reconciler's
+/// spec-pin backfill (or deletion) resolves it.
 pub(super) fn backfill_patch_body(
     config: &SnapshotPolicy,
     namespace: &str,
     needs_projection: bool,
     needs_repository: bool,
-    repo_ref: &RepositoryRef,
+    repo_ref: Option<&RepositoryRef>,
 ) -> Option<serde_json::Value> {
-    if !needs_projection && !needs_repository {
+    let repo_backfill = match (needs_repository, repo_ref) {
+        (true, Some(r)) => Some(r),
+        // Unknowable (multi-repo + unpinned pre-feature row): skip, never guess.
+        (true, None) | (false, _) => None,
+    };
+    if !needs_projection && repo_backfill.is_none() {
         return None;
     }
     let mut resolved = serde_json::Map::new();
@@ -877,12 +881,10 @@ pub(super) fn backfill_patch_body(
             serde_json::json!(projection_to_pin(config)),
         );
     }
-    if needs_repository {
+    if let Some(repo_ref) = repo_backfill {
         let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
         resolved.insert(
             "repository".to_string(),
-            // Threaded by the caller (pure fn); multi-repo backfill (per-row
-            // pin from status.resolved) lands in M8.
             serde_json::json!(pinned_repository_ref(repo_ref, &config_ns)),
         );
     }

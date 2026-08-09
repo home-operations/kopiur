@@ -1362,6 +1362,66 @@ mod tests {
         assert_eq!(hits, vec!["by-source", "unrelated"]);
     }
 
+    /// Multi-repo fan-out (#368): a policy listing repositories A and B must be
+    /// requeued when EITHER changes — the any-of predicate over
+    /// `repository_refs`, exercised through the real mappers + store.
+    #[test]
+    fn multi_repo_policy_mapper_requeues_on_any_listed_repository() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<SnapshotPolicy>();
+        let multi: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "backups" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "nas-a" },
+                    { "kind": "ClusterRepository", "name": "offsite-b" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("multi-repo policy fixture");
+        let single: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "solo", "namespace": "backups" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "other" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        }))
+        .expect("single-repo policy fixture");
+        writer.apply_watcher_event(&Event::Apply(multi));
+        writer.apply_watcher_event(&Event::Apply(single));
+
+        // Repo A (a member, namespaced) requeues the multi-repo policy.
+        let hits = repository_to_policies(&reader, &repo_fixture("nas-a", "backups", "pw"));
+        assert_eq!(
+            hits.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["pg"]
+        );
+        // Repo B (a member, cluster-scoped) requeues the SAME policy: an
+        // event on the SECOND listed repository must not be invisible.
+        let hits =
+            cluster_repository_to_policies(&reader, &crepo_fixture("offsite-b", "pw", "sys"));
+        assert_eq!(
+            hits.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["pg"]
+        );
+        // A member's name under the WRONG scope matches nothing: `nas-a` is a
+        // namespaced member, not a cluster one.
+        assert!(
+            cluster_repository_to_policies(&reader, &crepo_fixture("nas-a", "pw", "sys"))
+                .is_empty()
+        );
+        // An unrelated repository requeues nothing from the multi set.
+        assert!(
+            repository_to_policies(&reader, &repo_fixture("unrelated", "backups", "pw")).is_empty()
+        );
+    }
+
     fn secret_meta(name: &str, ns: &str) -> PartialObjectMeta<Secret> {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",

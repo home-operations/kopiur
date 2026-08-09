@@ -904,7 +904,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // CredentialsAvailable gate (MISSING_CA_BUNDLE_GATE): the retry is
     // transient, but a ConfigMap nobody creates never self-heals, and the park
     // at `Pending` must be visible to doctor (#359).
-    let (config, repo) = match resolve_recipe(ctx, backup, &namespace).await {
+    let (config, effective_repo, repo) = match resolve_recipe(ctx, backup, &namespace).await {
         Ok(resolved) => resolved,
         Err(Error::MissingCaBundle(msg)) => {
             let existing = backup
@@ -929,10 +929,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
         Err(e) => return Err(e),
     };
-    // The single repository the recipe targets (defensive: multi-repo
-    // consumers land in M8/M10; this routes that arm to the reconciler's
-    // validation error path instead of silently picking repository #1).
-    let repo_ref = io::recipe_repo_ref(&config)?;
+    // The EFFECTIVE repository this child runs against (the mint-time pin for
+    // a multi-repo fan-out child; the recipe's single ref otherwise) — the one
+    // decision `resolve_recipe` already made, reused for every gate below,
+    // including the preflight gather (audit M8: the CHILD's repo, never a
+    // policy-level guess).
+    let repo_ref = &effective_repo;
 
     // §11: a ReadOnly repository serves restores only — refuse to create a backup
     // Job. Surface a clear condition + Event and stop (not an error: it's a
@@ -1713,12 +1715,23 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
     // Resolve the cache VOLUME (emptyDir / sized-ephemeral / persistent PVC). A
     // persistent cache PVC is owned by the SnapshotPolicy so a warm cache survives
-    // across individual Snapshot runs (ADR §3.1).
+    // across individual Snapshot runs (ADR §3.1). A pinned child of a MULTI-repo
+    // policy gets a per-repository PVC (`kopiur-cache-<policy>-<rslug>-<h6>`,
+    // `kopiur_api::expand::cache_pvc_name`): the kopia cache is repository-specific
+    // state, so N fan-out children sharing one PVC would poison each other's
+    // cache. Single-repo children keep the legacy name byte-identical.
+    let cache_pvc = kopiur_api::expand::cache_pvc_name(
+        &config.name_any(),
+        config.namespace().as_deref().unwrap_or(&namespace),
+        kopiur_api::is_multi_repo(&config.spec)
+            .then_some(backup.spec.repository.as_ref())
+            .flatten(),
+    );
     let cache_volume = crate::cache::resolve_cache_volume(
         &ctx.client,
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
-        &format!("kopiur-cache-{}", config.name_any()),
+        &cache_pvc,
         crate::cache::effective_cache(
             &repo,
             config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
@@ -2718,12 +2731,9 @@ async fn resolve_repo_for_deletion(
         .await?;
         return Ok((pinned.clone(), repo));
     }
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
-    Ok((
-        pinned_repository_ref(io::recipe_repo_ref(&config)?, &config_ns),
-        repo,
-    ))
+    Ok((pinned_repository_ref(&effective_repo, &config_ns), repo))
 }
 
 /// Append the deletion-path escape hatch to a credentials error message.
@@ -3619,9 +3629,10 @@ async fn reconcile_pin(
     };
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
-    // Defensive single-repo resolution (multi-repo consumers land in M8/M10).
-    let repo_ref = io::recipe_repo_ref(&config)?;
+    let (config, effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    // The child's effective repository (pin-aware — a pinned child of a
+    // multi-repo policy pins/unpins in ITS repository).
+    let repo_ref = &effective_repo;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -3992,7 +4003,7 @@ async fn resolve_succeeded_snapshot(
     backup: &Snapshot,
     namespace: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
-    let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, _effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -4037,14 +4048,22 @@ async fn resolve_succeeded_snapshot(
     }
 }
 
-/// Resolve a `Snapshot`'s referenced `SnapshotPolicy` and that config's
-/// `Repository`. Cluster references and non-filesystem backends still resolve
-/// here; backend-specific behavior is decided downstream.
+/// Resolve a `Snapshot`'s referenced `SnapshotPolicy`, the EFFECTIVE repository
+/// this child runs against, and that repository's resolved surface. Cluster
+/// references and non-filesystem backends still resolve here; backend-specific
+/// behavior is decided downstream.
+///
+/// The repository is the shared pin-aware decision
+/// ([`kopiur_api::snapshot::effective_repository_ref`]): a pinned child of a
+/// multi-repo policy proceeds against ITS pinned member; an unpinned child of a
+/// multi-repo policy — or a pin the recipe no longer lists — is a terminal
+/// validation error, never a silent repository #1 pick. Single-repo children
+/// resolve exactly as before.
 async fn resolve_recipe(
     ctx: &Context,
     backup: &Snapshot,
     namespace: &str,
-) -> Result<(SnapshotPolicy, ResolvedRepository)> {
+) -> Result<(SnapshotPolicy, RepositoryRef, ResolvedRepository)> {
     let policy_ref = backup
         .spec
         .policy_ref
@@ -4056,18 +4075,20 @@ async fn resolve_recipe(
         Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", policy_ref.name))
     })?;
 
+    let repo_ref = kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     // Honor `repository.kind`: namespaced `Repository` (cross-ns via
     // `ref.namespace`, defaulting to the config's namespace) vs. cluster-scoped
     // `ClusterRepository` (`Api::all`). The discriminated kind is matched
     // exhaustively in the resolver (ADR §5.5).
     let repo = io::resolve_repository_ref(
         &ctx.client,
-        io::recipe_repo_ref(&config)?,
+        &repo_ref,
         cfg_ns,
         ctx.operator_namespace.as_deref(),
     )
     .await?;
-    Ok((config, repo))
+    Ok((config, repo_ref, repo))
 }
 
 /// Best-effort, **positive-only** securityContext check for a backup source PVC. Lists the
@@ -4650,13 +4671,23 @@ async fn backfill_projection_pin(
     let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
         return Ok(());
     };
-    let repo_ref = io::recipe_repo_ref(&config)?;
+    // The row's effective repository (the spec pin for a multi-repo child).
+    // A pre-feature row of a now-multi-repo policy has NO pin, so its
+    // repository is unknowable — the repository half is SKIPPED (never
+    // guessed; `backfill_patch_body` documents the contract). The projection
+    // half still backfills.
+    let repo_ref =
+        match kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns) {
+            Ok(r) => Some(r),
+            Err(kopiur_api::error::ValidationError::MultiRepoSnapshotUnpinned { .. }) => None,
+            Err(other) => return Err(Error::Validation(other.to_string())),
+        };
     let Some(body) = plan::backfill_patch_body(
         &config,
         namespace,
         needs_projection,
         needs_repository,
-        repo_ref,
+        repo_ref.as_ref(),
     ) else {
         return Ok(());
     };

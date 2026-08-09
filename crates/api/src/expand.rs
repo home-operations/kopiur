@@ -383,6 +383,60 @@ fn member_child_name(
     }
 }
 
+/// The kopia-cache PVC name for one (policy, repository) cell.
+///
+/// A kopia client cache is REPOSITORY-SPECIFIC state (indexes, metadata, owned
+/// blobs of ONE repository), and the mover mounts it at a fixed
+/// `KOPIA_CACHE_DIRECTORY` — so a multi-repo policy's children must not share
+/// one PVC or they poison each other's cache. Hence:
+///
+/// * `repo: None` — the classic single-repo cache: `kopiur-cache-<policy>`,
+///   byte-identical to the pre-multi-repo name (including its historical lack
+///   of a length cap — an existing PVC must keep matching by name).
+/// * `repo: Some(_)` — a pinned child of a multi-repo policy:
+///   `kopiur-cache-<policy>-<rslug>-<h6>`, where `<h6>` is 6 hex of FNV-1a
+///   over the normalized [`repo_key`](crate::common::repo_key) (never
+///   clipped — the injectivity guarantee, same family as
+///   [`fanout_child_name_for`]) and the whole name is capped at 63 (RFC 1123
+///   label, the same Job-label bound child names honor). Clip order:
+///   policy slug first, then rslug; marker dashes and the tag never.
+///
+/// Ownership stays the policy in both shapes (the caller's concern).
+pub fn cache_pvc_name(
+    policy_name: &str,
+    policy_ns: &str,
+    repo: Option<&crate::common::RepositoryRef>,
+) -> String {
+    const PREFIX: &str = "kopiur-cache-";
+    let Some(repo) = repo else {
+        return format!("{PREFIX}{policy_name}");
+    };
+    let rkey = crate::common::repo_key(repo, policy_ns);
+    // h6: the fnv8 family hash, truncated to 6 hex — enough to disambiguate a
+    // policy's ≤8 repositories while keeping the legible slugs roomy.
+    let tag: String = fnv8(&rkey).chars().take(6).collect();
+    let pslug = sanitize_dns1123(policy_name);
+    let rslug = sanitize_dns1123(&repo.name);
+    let fixed = PREFIX.len() + 2 + tag.len(); // two joining dashes + tag
+    let mut pslug_keep = pslug.len();
+    let mut rslug_keep = rslug.len();
+    if fixed + pslug_keep + rslug_keep > MAX_CHILD_NAME {
+        let room = MAX_CHILD_NAME.saturating_sub(fixed);
+        rslug_keep = rslug_keep.min(room / 3);
+        pslug_keep = pslug_keep.min(room.saturating_sub(rslug_keep));
+    }
+    // Trim any clip-produced trailing '-' per segment (a doubled dash is not a
+    // legal-name problem, but keeping segments clean avoids `--` cosmetics; the
+    // never-clipped tag carries injectivity regardless).
+    format!(
+        "{PREFIX}{}-{}-{tag}",
+        clip(&pslug, pslug_keep).trim_end_matches('-'),
+        clip(&rslug, rslug_keep).trim_end_matches('-')
+    )
+    .trim_matches('-')
+    .to_string()
+}
+
 /// Truncate on a char boundary.
 fn clip(s: &str, keep: usize) -> &str {
     if keep >= s.len() {
@@ -455,6 +509,109 @@ pub fn group_name(
     format!("{}-{tag}{suffix}", clip(base, room))
         .trim_matches('-')
         .to_string()
+}
+
+/// One `Snapshot` to mint for a slot/invocation: its deterministic name, the
+/// source pin (for a `pvcSelector` member) and the repository pin (for a
+/// multi-repo fan-out child, NORMALIZED via
+/// [`normalized_repository_ref`](crate::common::normalized_repository_ref)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintCell {
+    /// Deterministic child `Snapshot` name.
+    pub name: String,
+    /// The `spec.source` pin recording which PVC this child covers.
+    pub source: Option<SnapshotSourceRef>,
+    /// The `spec.repository` pin recording which repository this child targets
+    /// (multi-repo fan-out only; `None` keeps the legacy unpinned wire).
+    pub repository: Option<crate::common::RepositoryRef>,
+}
+
+/// **Pure.** Cross one policy's expanded source members with its repository
+/// dimension (#368) into the exact set of `Snapshot`s to mint for one slot or
+/// one `snapshot now` invocation. Lives here so the `SnapshotSchedule`
+/// reconciler and `kubectl kopiur snapshot now` mint byte-identical sets — a
+/// divergence would give the same recipe different children depending on who
+/// fired it.
+///
+/// * Single-repo policy: byte-identical to the pre-multi-repo behavior — the
+///   bare `base_name` child (no pins) for a selector-less recipe, or one
+///   unpinned per-member child.
+/// * Multi-repo policy: one child per (member × repository), named via
+///   [`fanout_child_name_for`] with the repo dimension, `spec.repository`
+///   stamped NORMALIZED; a grouped member's shared `VolumeGroupSnapshot` name
+///   is re-derived PER REPOSITORY ([`group_name`] with the repo key) — each
+///   repo's members are an independent capture wave, so N repos = N groups.
+///
+/// `members: Some(vec![])` (a selector that matched nothing) yields no cells —
+/// the caller warns, as before.
+pub fn mint_cells(
+    policy: &SnapshotPolicy,
+    base_name: &str,
+    members: Option<Vec<ExpandedMember>>,
+) -> Vec<MintCell> {
+    use crate::common::{normalized_repository_ref, repo_key};
+    let policy_ns = policy.namespace().unwrap_or_default();
+    let repos: Option<Vec<&crate::common::RepositoryRef>> =
+        crate::snapshot_policy::is_multi_repo(&policy.spec)
+            .then(|| policy.spec.repositories.iter().collect());
+    match (members, repos) {
+        // Single-repo, no selector: the legacy bare child.
+        (None, None) => vec![MintCell {
+            name: base_name.to_string(),
+            source: None,
+            repository: None,
+        }],
+        // Single-repo selector fan-out: unpinned members, byte-identical.
+        (Some(members), None) => members
+            .into_iter()
+            .map(|m| MintCell {
+                name: m.name,
+                source: Some(m.source),
+                repository: None,
+            })
+            .collect(),
+        // Multi-repo, no selector: one child per repository.
+        (None, Some(repos)) => repos
+            .into_iter()
+            .map(|r| MintCell {
+                name: fanout_child_name_for(base_name, &policy_ns, None, Some(r)),
+                source: None,
+                repository: Some(normalized_repository_ref(r, &policy_ns)),
+            })
+            .collect(),
+        // Multi-repo selector fan-out: members × repositories.
+        (Some(members), Some(repos)) => members
+            .iter()
+            .flat_map(|m| {
+                let policy_ns = policy_ns.clone();
+                let target = match &m.source.target {
+                    SnapshotSourceTarget::Pvc(t) => t.clone(),
+                };
+                repos.iter().map(move |r| {
+                    let rkey = repo_key(r, &policy_ns);
+                    let mut source = m.source.clone();
+                    if let Some(group) = source.group.as_mut() {
+                        group.volume_group_snapshot_name = group_name(
+                            base_name,
+                            &group.namespace,
+                            source.source_index as usize,
+                            Some(&rkey),
+                        );
+                    }
+                    MintCell {
+                        name: fanout_child_name_for(
+                            base_name,
+                            &policy_ns,
+                            Some((&target.namespace, &target.name)),
+                            Some(r),
+                        ),
+                        source: Some(source),
+                        repository: Some(normalized_repository_ref(r, &policy_ns)),
+                    }
+                })
+            })
+            .collect(),
+    }
 }
 
 /// **Pure.** Expand one policy's sources against an already-matched PVC set.

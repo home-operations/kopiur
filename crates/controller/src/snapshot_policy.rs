@@ -19,7 +19,7 @@ use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::{PolicyDeletePolicy, Retention};
+use kopiur_api::common::{PolicyDeletePolicy, RepositoryRef, Retention};
 use kopiur_api::retention::{SnapshotLike, select_kept};
 use kopiur_api::snapshot::PrunedBy;
 use kopiur_api::{Origin, Snapshot, SnapshotPolicy, validate};
@@ -119,7 +119,13 @@ pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
 /// Decide which `Snapshot` CR names to delete under a GFS `policy`. Wraps
 /// `api::retention::select_kept`; returns the `delete` set. Snapshots that are not
 /// terminal-successful are ignored entirely (never selected for deletion here).
-pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String> {
+/// `policy_is_multi` is [`kopiur_api::is_multi_repo`] over the CURRENT spec —
+/// see [`retention_group_key`] for how it shapes the buckets.
+pub fn backups_to_delete(
+    backups: &[Snapshot],
+    policy: &Retention,
+    policy_is_multi: bool,
+) -> Vec<String> {
     // GFS is applied PER SOURCE, not per policy. `select_kept` has no grouping
     // key, so feeding one policy's whole child set through it once would make a
     // 7-PVC `pvcSelector` fan-out under `keepDaily: 7` keep SEVEN SNAPSHOTS
@@ -132,7 +138,10 @@ pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String
     let mut buckets: BTreeMap<String, Vec<SnapshotRetentionView>> = BTreeMap::new();
     for b in backups {
         if let Some(v) = retention_view(b) {
-            buckets.entry(retention_group_key(b)).or_default().push(v);
+            buckets
+                .entry(retention_group_key(b, policy_is_multi))
+                .or_default()
+                .push(v);
         }
     }
     buckets
@@ -147,13 +156,45 @@ pub fn backups_to_delete(backups: &[Snapshot], policy: &Retention) -> Vec<String
 /// each PVC* rather than `keepDaily` snapshots across all of them. Empty for an
 /// un-fanned Snapshot, which is what makes a single-source policy one bucket
 /// and therefore unchanged.
-pub fn retention_group_key(b: &Snapshot) -> String {
-    match b.spec.source.as_ref().map(|s| &s.target) {
+///
+/// **Multi-repo fan-out (#368):** while the policy is CURRENTLY multi-repo
+/// (`policy_is_multi`), the key also carries the child's mint-time repository
+/// pin (`spec.repository`, normalized at mint), so GFS keeps `keepDaily` days
+/// per (source, repository) — the N repositories are independent captures and
+/// must retain independently. The repo component comes from the SPEC pin ONLY
+/// (never `status.resolved` — a status-derived key would flap with backfills),
+/// and applies ONLY while the policy is multi-repo:
+///
+/// - single-repo policy (including after a multi→single edit): source-only
+///   buckets, byte-identical to today. Old pinned children merge back into the
+///   flat buckets — a documented TRANSIENT GFS mixing (the surviving repo's
+///   rows and the removed repo's leftovers compete in one bucket) that
+///   self-resolves as the removed repo's rows age out of every keep window.
+/// - multi-repo policy: (source, pin) buckets. Rows with NO pin (pre-feature
+///   children minted before the single→multi edit) land in the ""-repo bucket
+///   and age out; the policy reconciler's spec-pin backfill
+///   ([`repository_pin_backfill_patches`]) converges them into their real
+///   buckets first, so the ""-bucket is a shrinking transition set, not a
+///   steady state.
+pub fn retention_group_key(b: &Snapshot, policy_is_multi: bool) -> String {
+    let source = match b.spec.source.as_ref().map(|s| &s.target) {
         Some(kopiur_api::SnapshotSourceTarget::Pvc(t)) => {
             format!("pvc/{}/{}", t.namespace, t.name)
         }
         None => String::new(),
+    };
+    if !policy_is_multi {
+        return source;
     }
+    let repo = b
+        .spec
+        .repository
+        .as_ref()
+        .map(|r| kopiur_api::common::repo_key(r, b.namespace().as_deref().unwrap_or_default()))
+        .unwrap_or_default();
+    // '\n' can appear in neither component (DNS names / repo keys), so the
+    // joined key is injective over (source, repo).
+    format!("{source}\n{repo}")
 }
 
 /// **Pure.** The `Unchanged` Snapshots to prune: everything past the newest
@@ -172,18 +213,26 @@ pub fn retention_group_key(b: &Snapshot) -> String {
 /// rather than a new knob, and applied here — over the policy's `CONFIG_LABEL`
 /// children — so manual `kubectl kopiur snapshot now` runs are bounded too, not
 /// just scheduled ones.
-pub fn unchanged_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<String> {
+pub fn unchanged_snapshots_to_prune(
+    backups: &[Snapshot],
+    limit: u32,
+    policy_is_multi: bool,
+) -> Vec<String> {
     use kopiur_api::SnapshotPhase;
-    // Bucketed by source, exactly like `backups_to_delete` above and for the
-    // same reason: a flat bound over a 20-PVC fan-out would keep 10 rows TOTAL,
-    // so most volumes would retain no record that the schedule ran at all, and
-    // every pass would churn ~10 finalizer-guarded deletes.
+    // Bucketed by source (and, for a multi-repo policy, the repository pin),
+    // exactly like `backups_to_delete` above and for the same reason: a flat
+    // bound over a 20-PVC fan-out would keep 10 rows TOTAL, so most volumes
+    // would retain no record that the schedule ran at all, and every pass
+    // would churn ~10 finalizer-guarded deletes.
     let mut buckets: BTreeMap<String, Vec<&Snapshot>> = BTreeMap::new();
     for s in backups.iter().filter(|s| {
         s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)
             && s.metadata.deletion_timestamp.is_none()
     }) {
-        buckets.entry(retention_group_key(s)).or_default().push(s);
+        buckets
+            .entry(retention_group_key(s, policy_is_multi))
+            .or_default()
+            .push(s);
     }
     buckets
         .into_values()
@@ -196,6 +245,48 @@ pub fn unchanged_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<Str
                 .filter_map(|s| s.metadata.name.clone())
                 .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+/// Upper bound on spec-pin backfill patches issued per reconcile pass — keeps
+/// a thousand-child policy's single→multi edit from turning one reconcile into
+/// a thousand-write burst; the steady requeue drains the rest.
+const PIN_BACKFILL_BATCH: usize = 50;
+
+/// **Pure.** The single→multi edit backfill decision (#368): which existing
+/// produced children of a NOW-multi-repo policy should get `spec.repository`
+/// patched on, and with what. Rows in → `(name, spec merge-patch body)` out;
+/// the reconciler executes them (bounded by [`PIN_BACKFILL_BATCH`]).
+///
+/// A row is selected iff it has a `policyRef` (produced/adopted — discovered
+/// rows have no recipe), NO `spec.repository` pin yet, IS NOT terminating, and
+/// its `status.resolved.repository` names the repository it actually ran
+/// against — that run-time pin is controller-written truth, so promoting it to
+/// the spec pin is a record of fact, not a guess. Rows with NEITHER pin stay
+/// unpinned (the ""-repo retention bucket) and age out — their repository is
+/// genuinely unknowable and is never invented. Idempotent: once patched, the
+/// spec pin exists and the row is never selected again.
+///
+/// The patch body is a JSON merge over `spec` carrying only `repository`
+/// (already normalized — the run-time pin is written normalized), applied via
+/// SSA under a dedicated field manager so this backfill owns exactly that one
+/// field and can never shed or clobber the minting manager's other spec fields.
+pub fn repository_pin_backfill_patches(backups: &[Snapshot]) -> Vec<(String, serde_json::Value)> {
+    backups
+        .iter()
+        .filter(|b| {
+            b.spec.policy_ref.is_some()
+                && b.spec.repository.is_none()
+                && b.metadata.deletion_timestamp.is_none()
+        })
+        .filter_map(|b| {
+            let pinned = b.status.as_ref()?.resolved.as_ref()?.repository.as_ref()?;
+            Some((
+                b.metadata.name.clone()?,
+                serde_json::json!({ "spec": { "repository": pinned } }),
+            ))
+        })
+        .take(PIN_BACKFILL_BATCH)
         .collect()
 }
 
@@ -628,12 +719,17 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     if let Some(first) = errs.into_iter().next() {
         return Err(Error::Validation(first.to_string()));
     }
-    // The single repository this recipe targets. The validator above already
-    // refused the multi-repo shape (feature-gated until its data path lands —
-    // multi-repo consumers land in M8/M10) and the neither/both shapes, so
-    // this is a defensive re-check, never a silent repo#1 pick.
-    let repo_ref = kopiur_api::single_repository_ref(&config.spec)
-        .map_err(|e| Error::Validation(e.to_string()))?;
+    // Every repository this recipe targets: one for the classic single-repo
+    // shape, 1-8 for the multi-repository fan-out. The neither/both shapes come
+    // back as the exactly-one-of validation error (defensive re-check — the
+    // validator above already refused them).
+    let repo_targets: Vec<&RepositoryRef> = match kopiur_api::policy_repositories(&config.spec)
+        .map_err(|e| Error::Validation(e.to_string()))?
+    {
+        kopiur_api::PolicyRepositories::Single(r) => vec![r],
+        kopiur_api::PolicyRepositories::Multi(rs) => rs.iter().collect(),
+    };
+    let is_multi = kopiur_api::is_multi_repo(&config.spec);
 
     let namespace = config
         .namespace()
@@ -682,30 +778,46 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         return Ok(Action::requeue(std::time::Duration::from_secs(300)));
     }
 
-    // 1. Resolve identity (per-source PVC + overrides + the repository's CEL
-    //    identityDefaults) and pin status.resolved. This runs on EVERY reconcile,
-    //    not just once at admission: it re-renders from the LIVE repository's
-    //    `identityDefaults` (ADR-0004 §5) each time, so `status.resolved` mirrors
-    //    the current resolution rather than freezing the first one. Resolving the
-    //    repository first means the freshest `identityDefaults` are always used.
-    //    What keeps an already-snapshotted policy from silently re-identifying is
-    //    the fork guard at admission (`IdentityWouldFork`/
+    // 1. Resolve each target repository and the identity UNDER that repository's
+    //    CEL `identityDefaults` (the unit of identity is (repo, identity) — a
+    //    multi-repo policy legitimately has N identities). This runs on EVERY
+    //    reconcile, not just once at admission: it re-renders from the LIVE
+    //    repository's `identityDefaults` (ADR-0004 §5) each time, so
+    //    `status.resolved` mirrors the current resolution rather than freezing
+    //    the first one. What keeps an already-snapshotted policy from silently
+    //    re-identifying is the fork guard at admission (`IdentityWouldFork`/
     //    `RepositoryIdentityWouldFork`), not this pin.
-    let repo = io::resolve_repository_ref(
-        &ctx.client,
-        repo_ref,
-        &namespace,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
-    let resolved = resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
-    io::patch_status_if_changed(
-        &api,
-        &name,
-        current.as_ref(),
-        serde_json::json!({ "resolved": resolved }),
-    )
-    .await?;
+    let mut targets: Vec<PolicyRepoTarget> = Vec::with_capacity(repo_targets.len());
+    for rref in &repo_targets {
+        let repo = io::resolve_repository_ref(
+            &ctx.client,
+            rref,
+            &namespace,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await?;
+        let resolved =
+            resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
+        targets.push(PolicyRepoTarget {
+            rref: (*rref).clone(),
+            repo,
+            resolved,
+        });
+    }
+    // status.resolved mirror: the single-repo shape pins its one resolution,
+    // exactly as before. For a multi-repo policy the honest mirror is the
+    // per-repo `ResolvedPolicy.repositories` wire (lands M9/M10) — until then
+    // NOTHING is pinned rather than silently mirroring repository #1's identity
+    // as "the" identity.
+    if let (false, Some(single)) = (is_multi, targets.first()) {
+        io::patch_status_if_changed(
+            &api,
+            &name,
+            current.as_ref(),
+            serde_json::json!({ "resolved": single.resolved }),
+        )
+        .await?;
+    }
 
     // LIST this policy's Snapshots BEFORE the repository-readiness gate below:
     // retention (further down) needs the population even while the repository is
@@ -720,25 +832,29 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     let backups = backup_api.list(&lp).await?.items;
 
     // §2 dependent gating: a SnapshotPolicy should not be Ready (and schedules
-    // shouldn't fire it productively) until its Repository is Ready. Read readiness
-    // from the existing helper and REQUEUE (not error) until then, surfacing a
+    // shouldn't fire it productively) until its Repository is Ready — for the
+    // multi-repo shape, until EVERY listed repository is Ready (conservative;
+    // the per-child ready-subset gate is M10's refinement). Read readiness from
+    // the existing helper and REQUEUE (not error) until then, surfacing a
     // `Reconciling` condition. This makes `kubectl wait` and Flux/Argo health behave.
-    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
-        let conditions = io::set_ready(
-            &existing,
-            generation,
-            io::ReadyOutcome::Reconciling,
-            "RepositoryNotReady",
-            "waiting for the referenced Repository to become Ready before reconciling",
-        );
-        io::patch_status_if_changed(
-            &api,
-            &name,
-            current.as_ref(),
-            serde_json::json!({ "observedGeneration": generation, "conditions": conditions }),
-        )
-        .await?;
-        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    for t in &targets {
+        if !io::repository_ready(&ctx.client, &t.rref, &namespace).await? {
+            let conditions = io::set_ready(
+                &existing,
+                generation,
+                io::ReadyOutcome::Reconciling,
+                "RepositoryNotReady",
+                "waiting for the referenced Repository to become Ready before reconciling",
+            );
+            io::patch_status_if_changed(
+                &api,
+                &name,
+                current.as_ref(),
+                serde_json::json!({ "observedGeneration": generation, "conditions": conditions }),
+            )
+            .await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
     }
 
     // §3: surface the most recent successful child Snapshot timestamp (backs the
@@ -757,9 +873,23 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // whether or not `spec.retention` is configured, because GFS never sees
     // them (no manifest, so no retention view). `retention: None` means "never
     // prune real restore points" — it does not mean "hoard empty ones".
+    // Single→multi edit convergence (#368): promote each produced child's
+    // run-time repository pin (`status.resolved.repository`) to the mint-time
+    // spec pin the multi-repo retention buckets key on. Pure decision
+    // ([`repository_pin_backfill_patches`]), SSA execution under a dedicated
+    // field manager, bounded batch, idempotent — a no-op for every already-
+    // pinned (or pin-less) row, so steady state issues zero writes.
+    if is_multi {
+        for (cr_name, body) in repository_pin_backfill_patches(&backups) {
+            backfill_spec_repository_pin(&backup_api, &cr_name, body).await?;
+            tracing::info!(config = %name, backup = %cr_name, "backfilled spec.repository pin from status.resolved (single→multi edit)");
+        }
+    }
+
     for cr_name in unchanged_snapshots_to_prune(
         &backups,
         kopiur_api::consts::effective_failed_jobs_history_limit(None),
+        is_multi,
     ) {
         // Stamp `pruned-by` THEN delete, exactly like every other operator
         // prune, so the finalizer classifies it as ours and the mass-deletion
@@ -769,7 +899,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     }
 
     if let Some(retention) = config.spec.retention.as_ref() {
-        let selected = backups_to_delete(&backups, retention);
+        let selected = backups_to_delete(&backups, retention, is_multi);
         // Split the selected set: normal (live) prunes get stamp-then-delete;
         // an ALREADY-terminating selected CR that lacks a valid pruned-by
         // annotation (an old-operator prune straddling this upgrade) is
@@ -838,8 +968,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         config,
         &namespace,
         &name,
-        &repo,
-        &resolved,
+        &targets,
         &backups,
         current.as_ref(),
     )
@@ -855,6 +984,11 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         "Reconciled",
         "SnapshotPolicy reconciled; retention enforced",
     );
+    // Verification is repository-scoped, and the per-repo verification loop
+    // (per-repo Jobs, entry-keyed `status.verification`) lands in M10 — until
+    // then a MULTI-repo policy runs no verification step and no scratch check,
+    // rather than verifying repository #1 and calling the policy verified.
+    let single_target = if is_multi { None } else { targets.first() };
     // Warn-only: surface a deep-verify scratch `storageClassName` that is a silent
     // no-op (set with no effective `capacity` → an `emptyDir`, which has no
     // StorageClass). Folded into the SAME status patch as set_ready (single writer,
@@ -865,7 +999,8 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         .spec
         .verification
         .as_ref()
-        .and_then(|v| crate::verification::scratch_storage_class_state(&repo, v))
+        .zip(single_target)
+        .and_then(|(v, t)| crate::verification::scratch_storage_class_state(&t.repo, v))
     {
         Some(state) => {
             let was_ignored = existing
@@ -927,15 +1062,22 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // requeue on the shorter of the steady cadence and the verify cadence so a due
     // verification fires on time.
     let steady = std::time::Duration::from_secs(300);
-    let base = match crate::verification::verify_step(
-        config,
-        ctx,
-        &repo,
-        &namespace,
-        has_successful_snapshot,
-    )
-    .await?
-    {
+    // Multi-repo: no verify step until the per-repo verification loop lands
+    // (M10) — see `single_target` above.
+    let verify_requeue = match single_target {
+        Some(t) => {
+            crate::verification::verify_step(
+                config,
+                ctx,
+                &t.repo,
+                &namespace,
+                has_successful_snapshot,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let base = match verify_requeue {
         Some(verify_requeue) => steady.min(verify_requeue),
         None => steady,
     };
@@ -948,75 +1090,98 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     Ok(Action::requeue(requeue))
 }
 
-/// Run one auto-adoption pass for a live `SnapshotPolicy` (M6, fixes #210),
-/// AFTER the retention block (inv. 6). `reconcile_inner` only gains the call.
-///
-/// Returns `Some(requeue)` when this pass adopted rows OR stamped an on-demand
-/// catalog-scan request (a belt requeue so the wave settles promptly); `None`
-/// means nothing happened — fall through to the normal steady-state return.
-///
-/// `backups` is the retention pass's `CONFIG_LABEL` child LIST, reused here to
-/// derive this policy's own kopia ids + whether it has any history (never
-/// re-LISTed). The discovered candidates come from a SEPARATE cluster-wide LIST.
-#[allow(clippy::too_many_arguments)]
-async fn run_adoption(
+/// One (repository, identity-under-that-repository) target of a live
+/// `SnapshotPolicy`, resolved by `reconcile_inner` once per reconcile. The
+/// unit of identity is the PAIR — a multi-repo policy legitimately resolves N
+/// identities, one under each repository's `identityDefaults`.
+pub(crate) struct PolicyRepoTarget {
+    /// The spec's ref for this repository, as written.
+    rref: RepositoryRef,
+    /// The resolved repository surface.
+    repo: io::ResolvedRepository,
+    /// The policy's identity + sources resolved under THIS repository's
+    /// `identityDefaults`.
+    resolved: kopiur_api::snapshot_policy::ResolvedPolicy,
+}
+
+/// Server-side-apply ONLY `spec.repository` onto a child `Snapshot`, under a
+/// dedicated field manager. A dedicated manager (not the shared apply manager)
+/// is load-bearing: SSA treats an apply as the manager's FULL intent, so
+/// applying this one field under the minting manager would shed its ownership
+/// of every other spec field. Force is safe — no other manager claims
+/// `spec.repository` on a produced child (mint stamps it only on new
+/// multi-repo children, under the same value).
+async fn backfill_spec_repository_pin(
+    api: &Api<Snapshot>,
+    cr_name: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    use kube::api::{Patch, PatchParams};
+    let mut patch = body;
+    patch["apiVersion"] = serde_json::json!(kopiur_api::consts::API_VERSION);
+    patch["kind"] = serde_json::json!("Snapshot");
+    patch["metadata"] = serde_json::json!({ "name": cr_name });
+    api.patch(
+        cr_name,
+        &PatchParams::apply("kopiur-repo-pin-backfill").force(),
+        &Patch::Apply(&patch),
+    )
+    .await?;
+    Ok(())
+}
+
+/// What one target's adoption pass contributed, aggregated by [`run_adoption`].
+struct AdoptionOutcome {
+    adopted: u64,
+    requested_scan: bool,
+    skipped_by_retention: u64,
+    identity: String,
+}
+
+/// Shared, per-pass inputs threaded to each target's adoption pass — one
+/// struct so [`adoption_pass_for_target`] stays under the argument lint and a
+/// new shared input cannot be threaded to only SOME targets.
+struct AdoptionShared<'a> {
+    own_ids: &'a std::collections::BTreeSet<String>,
+    has_history: bool,
+    scan_requested_identity: Option<&'a str>,
+    gate: &'a crate::adoption::AdoptionRetentionGate<'a>,
+    now: &'a str,
+    multi: bool,
+}
+
+/// One repository's slice of the adoption pass: gate → candidate LIST → pure
+/// plan → execute → scan request + wave observability. `Ok(None)` when this
+/// target's gates keep adoption inert (effective policy `Ignore`, or no
+/// resolvable identity to match against).
+async fn adoption_pass_for_target(
     ctx: &Context,
-    api: &Api<SnapshotPolicy>,
     config: &SnapshotPolicy,
     namespace: &str,
     name: &str,
-    repo: &io::ResolvedRepository,
-    resolved: &kopiur_api::snapshot_policy::ResolvedPolicy,
-    backups: &[Snapshot],
-    current: Option<&serde_json::Value>,
-) -> Result<Option<std::time::Duration>> {
+    t: &PolicyRepoTarget,
+    shared: AdoptionShared<'_>,
+) -> Result<Option<AdoptionOutcome>> {
     use kopiur_api::common::{SnapshotAdoption, effective_adoption};
 
     // 1. Gate: only when the effective adoption policy (policy → repo → default)
     //    is Adopt. An unresolved identity (nothing to match against) is inert.
-    if effective_adoption(config.spec.adoption, repo.catalog.as_ref()) != SnapshotAdoption::Adopt {
+    if effective_adoption(config.spec.adoption, t.repo.catalog.as_ref()) != SnapshotAdoption::Adopt
+    {
         return Ok(None);
     }
-    let Some(policy_identity) = resolved.identity.as_ref() else {
+    let Some(policy_identity) = t.resolved.identity.as_ref() else {
         return Ok(None);
     };
 
-    // The single repository this recipe targets — defensive re-check on the
-    // reconciler's validation error path (multi-repo consumers land in
-    // M8/M10; the admission feature gate keeps that arm unreachable here).
-    let repo_ref = kopiur_api::single_repository_ref(&config.spec)
-        .map_err(|e| Error::Validation(e.to_string()))?;
-
     // 2. LIST discovered candidates cluster-wide (inv. 1), scoped to THIS repo.
-    let repo_uid = repo.owner_ref.uid.as_str();
+    let repo_uid = t.repo.owner_ref.uid.as_str();
     let candidates = list_adoption_candidates(ctx, repo_uid).await?;
-
-    // 3. Own kopia ids + history from the retention child LIST (no re-LIST).
-    let (own_ids, has_history) = own_snapshot_ids_and_history(backups);
-    let scan_requested_identity = config
-        .status
-        .as_ref()
-        .and_then(|s| s.adoption.as_ref())
-        .and_then(|a| a.scan_requested_identity.as_deref());
-    let repo_cluster = repo
+    let repo_cluster = t
+        .repo
         .identity_defaults
         .as_ref()
         .and_then(|d| d.cluster.as_deref());
-
-    // Retention gate inputs (adoption inv. 8), from the SAME pre-prune `backups`
-    // slice the retention pass just evaluated. That pre-prune evaluation matches
-    // what the next retention pass will decide because `select_kept` is
-    // time-invariant (buckets derive purely from end times), removing a non-kept
-    // row never changes any other row's bucket outcome, and equal-end_time ties
-    // break by id — with candidate views carrying the future adopted CR name, so
-    // gate-time and next-pass tie-breaks are bit-identical.
-    let own_views: Vec<SnapshotRetentionView> = backups.iter().filter_map(retention_view).collect();
-    let gate = crate::adoption::AdoptionRetentionGate {
-        retention: config.spec.retention.as_ref(),
-        deletion_policy: crate::adoption::effective_deletion_policy(config),
-        own_views: &own_views,
-        policy_name: name,
-    };
 
     // 4. Plan (pure).
     let plan = crate::adoption::plan_adoption(
@@ -1025,24 +1190,33 @@ async fn run_adoption(
         repo_cluster,
         candidates,
         &crate::adoption::AdoptionHistory {
-            own_snapshot_ids: &own_ids,
-            has_history,
-            scan_requested_identity,
+            own_snapshot_ids: shared.own_ids,
+            has_history: shared.has_history,
+            scan_requested_identity: shared.scan_requested_identity,
         },
-        &gate,
+        shared.gate,
     );
 
     // 5. Execute adoptions (inv. 4: create → ensure-status → delete discovered).
-    let adopted = execute_adoptions(ctx, config, namespace, repo_uid, &plan.adopt).await?;
-
-    // A single token for this pass: stamped on the repository AND recorded in
-    // `status.adoption` so the two agree.
-    let now = Utc::now().to_rfc3339();
+    let adopted = execute_adoptions(ctx, config, namespace, repo_uid, &t.rref, &plan.adopt).await?;
     let identity_str = kopiur_api::identity_string(policy_identity);
 
+    // Multi-repo: `status.adoption.scanRequestedIdentity` is single-valued, so
+    // the once-per-(policy, identity) no-match scan arm cannot keep its
+    // guarantee across N per-repo identities (two repos would alternate the
+    // stamp and re-request forever). Restrict that arm to the single-repo
+    // shape — byte-identical there; adoption-WAVE scan requests (adopted > 0)
+    // keep firing for every repo and converge on their own. Per-repo scan
+    // bookkeeping rides M10's per-repo status wire.
+    let request_scan = if shared.multi {
+        !plan.adopt.is_empty()
+    } else {
+        plan.request_scan
+    };
+
     // 6. On-demand catalog-scan request (stamp + Normal event).
-    if plan.request_scan {
-        io::request_catalog_scan(&ctx.client, repo_ref, namespace, &now).await?;
+    if request_scan {
+        io::request_catalog_scan(&ctx.client, &t.rref, namespace, shared.now).await?;
         io::publish_normal_event(
             ctx,
             config,
@@ -1051,7 +1225,7 @@ async fn run_adoption(
             &format!(
                 "requested an on-demand catalog scan on repository {} so newly-recreated \
                  snapshots matching identity {identity_str} materialize for adoption",
-                repo_ref.name
+                t.rref.name
             ),
         )
         .await;
@@ -1071,6 +1245,111 @@ async fn run_adoption(
         tracing::info!(policy = %name, adopted, identity = %identity_str, "auto-adopted discovered snapshots");
     }
 
+    Ok(Some(AdoptionOutcome {
+        adopted,
+        requested_scan: request_scan,
+        skipped_by_retention: plan.skipped_by_retention,
+        identity: identity_str,
+    }))
+}
+
+/// Run one auto-adoption pass for a live `SnapshotPolicy` (M6, fixes #210),
+/// AFTER the retention block (inv. 6). `reconcile_inner` only gains the call.
+///
+/// Loops the (repository, per-repo identity) pairs `reconcile_inner` resolved
+/// (#368): each repository's discovered rows are matched against the identity
+/// resolved under THAT repository's `identityDefaults`. For the single-repo
+/// shape this is exactly one iteration — behavior byte-identical to before.
+///
+/// Returns `Some(requeue)` when this pass adopted rows OR stamped an on-demand
+/// catalog-scan request (a belt requeue so the wave settles promptly); `None`
+/// means nothing happened — fall through to the normal steady-state return.
+///
+/// `backups` is the retention pass's `CONFIG_LABEL` child LIST, reused here to
+/// derive this policy's own kopia ids + whether it has any history (never
+/// re-LISTed). The discovered candidates come from a SEPARATE cluster-wide
+/// LIST per repository.
+#[allow(clippy::too_many_arguments)]
+async fn run_adoption(
+    ctx: &Context,
+    api: &Api<SnapshotPolicy>,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+    targets: &[PolicyRepoTarget],
+    backups: &[Snapshot],
+    current: Option<&serde_json::Value>,
+) -> Result<Option<std::time::Duration>> {
+    // Own kopia ids + history from the retention child LIST (no re-LIST) —
+    // shared across targets: kopia snapshot ids are unique per row regardless
+    // of which repository holds them.
+    let (own_ids, has_history) = own_snapshot_ids_and_history(backups);
+    let scan_requested_identity = config
+        .status
+        .as_ref()
+        .and_then(|s| s.adoption.as_ref())
+        .and_then(|a| a.scan_requested_identity.as_deref());
+
+    // Retention gate inputs (adoption inv. 8), from the SAME pre-prune `backups`
+    // slice the retention pass just evaluated. That pre-prune evaluation matches
+    // what the next retention pass will decide because `select_kept` is
+    // time-invariant (buckets derive purely from end times), removing a non-kept
+    // row never changes any other row's bucket outcome, and equal-end_time ties
+    // break by id — with candidate views carrying the future adopted CR name, so
+    // gate-time and next-pass tie-breaks are bit-identical. (Multi-repo note:
+    // the gate simulates GFS flat over the policy's whole child set — a
+    // conservative approximation of the per-(source, repo) buckets; the
+    // per-repo gate refinement rides M10's per-repo status wire.)
+    let own_views: Vec<SnapshotRetentionView> = backups.iter().filter_map(retention_view).collect();
+    let gate = crate::adoption::AdoptionRetentionGate {
+        retention: config.spec.retention.as_ref(),
+        deletion_policy: crate::adoption::effective_deletion_policy(config),
+        own_views: &own_views,
+        policy_name: name,
+    };
+
+    // A single token for this pass: stamped on the repository AND recorded in
+    // `status.adoption` so the two agree.
+    let now = Utc::now().to_rfc3339();
+    let multi = targets.len() > 1;
+    let mut outcomes: Vec<AdoptionOutcome> = Vec::new();
+    for t in targets {
+        if let Some(outcome) = adoption_pass_for_target(
+            ctx,
+            config,
+            namespace,
+            name,
+            t,
+            AdoptionShared {
+                own_ids: &own_ids,
+                has_history,
+                scan_requested_identity,
+                gate: &gate,
+                now: &now,
+                multi,
+            },
+        )
+        .await?
+        {
+            outcomes.push(outcome);
+        }
+    }
+    // No target passed the adoption gates (Ignore, or no resolvable identity):
+    // nothing ran, nothing to record — preserves the pre-#368 early return.
+    if outcomes.is_empty() {
+        return Ok(None);
+    }
+    let adopted = outcomes.iter().map(|o| o.adopted).sum::<u64>();
+    let any_scan = outcomes.iter().any(|o| o.requested_scan);
+    let identity_str = outcomes
+        .iter()
+        .rev()
+        .find(|o| o.requested_scan)
+        .or(outcomes.last())
+        .map(|o| o.identity.clone())
+        .unwrap_or_default();
+    let plan_skipped = outcomes.iter().map(|o| o.skipped_by_retention).sum::<u64>();
+
     // 7b. Retention-gate observability (adoption inv. 8). Transition-gated: the
     //     event and the status write fire when the withheld COUNT changes, so a
     //     steady fully-withheld state publishes once and then stays byte-silent
@@ -1083,11 +1362,11 @@ async fn run_adoption(
             .and_then(|a| a.skipped_by_retention)
             .unwrap_or(0),
     );
-    let skipped_changed = plan.skipped_by_retention != prior_skipped;
-    if plan.skipped_by_retention > 0 {
+    let skipped_changed = plan_skipped != prior_skipped;
+    if plan_skipped > 0 {
         tracing::debug!(
             policy = %name,
-            skipped = plan.skipped_by_retention,
+            skipped = plan_skipped,
             identity = %identity_str,
             "adoption withheld by the retention gate (inv. 8)"
         );
@@ -1097,10 +1376,7 @@ async fn run_adoption(
                 config,
                 crate::consts::ADOPTION_SKIPPED_BY_RETENTION_REASON,
                 crate::consts::REVIEW_RETENTION_ACTION,
-                &crate::adoption::adoption_skipped_event_message(
-                    plan.skipped_by_retention,
-                    &identity_str,
-                ),
+                &crate::adoption::adoption_skipped_event_message(plan_skipped, &identity_str),
             )
             .await;
         }
@@ -1108,15 +1384,15 @@ async fn run_adoption(
 
     // 8. `status.adoption` summary (guarded, prior-carrying — only touched when
     //    there is activity, so a steady-state pass writes nothing).
-    if adopted > 0 || plan.request_scan || skipped_changed {
+    if adopted > 0 || any_scan || skipped_changed {
         write_adoption_status(
             api,
             name,
             current,
             config,
             adopted,
-            plan.request_scan,
-            plan.skipped_by_retention,
+            any_scan,
+            plan_skipped,
             &now,
             &identity_str,
         )
@@ -1190,11 +1466,12 @@ async fn execute_adoptions(
     config: &SnapshotPolicy,
     namespace: &str,
     repo_uid: &str,
+    repo_ref: &RepositoryRef,
     adopt: &[crate::adoption::AdoptionCandidate],
 ) -> Result<u64> {
     let mut count = 0u64;
     for candidate in adopt {
-        adopt_one(ctx, config, namespace, repo_uid, candidate).await?;
+        adopt_one(ctx, config, namespace, repo_uid, repo_ref, candidate).await?;
         count += 1;
     }
     Ok(count)
@@ -1230,9 +1507,9 @@ async fn adopt_one(
     config: &SnapshotPolicy,
     namespace: &str,
     repo_uid: &str,
+    repo_ref: &RepositoryRef,
     candidate: &crate::adoption::AdoptionCandidate,
 ) -> Result<()> {
-    let repo_ref = io::recipe_repo_ref(config)?;
     let (adopted, status) =
         crate::adoption::build_adopted_snapshot(config, repo_uid, candidate, repo_ref);
     let cr_name = adopted.name_any();
@@ -1541,7 +1818,7 @@ mod tests {
                 backups.push(fanned_backup(&format!("{pvc}-{d}"), pvc, day(d)));
             }
         }
-        let del = backups_to_delete(&backups, &policy(None, Some(3)));
+        let del = backups_to_delete(&backups, &policy(None, Some(3)), false);
         assert!(
             del.is_empty(),
             "3 days × 3 PVCs under keepDaily=3 must keep everything, got deletes: {del:?}"
@@ -1553,7 +1830,7 @@ mod tests {
             backups.push(fanned_backup(&format!("{pvc}-6"), pvc, day(6)));
         }
         let del: std::collections::BTreeSet<String> =
-            backups_to_delete(&backups, &policy(None, Some(3)))
+            backups_to_delete(&backups, &policy(None, Some(3)), false)
                 .into_iter()
                 .collect();
         assert_eq!(
@@ -1573,9 +1850,9 @@ mod tests {
             .map(|d| succeeded_backup(&format!("d{d}"), day(d)))
             .collect();
         for b in &backups {
-            assert_eq!(retention_group_key(b), "");
+            assert_eq!(retention_group_key(b, false), "");
         }
-        let del = backups_to_delete(&backups, &policy(None, Some(2)));
+        let del = backups_to_delete(&backups, &policy(None, Some(2)), false);
         assert_eq!(del.len(), 2, "keepDaily=2 over 4 days deletes the oldest 2");
     }
 
@@ -1616,7 +1893,7 @@ mod tests {
         assert!(retention_view(&dedup).is_none());
 
         // keepLatest: 1 with one real + one unchanged must keep the REAL one.
-        let del = backups_to_delete(&[real, dedup], &policy(Some(1), None));
+        let del = backups_to_delete(&[real, dedup], &policy(Some(1), None), false);
         assert!(
             del.is_empty(),
             "the only real snapshot must survive keepLatest=1, got {del:?}"
@@ -1632,7 +1909,7 @@ mod tests {
         let rows: Vec<Snapshot> = (0..5)
             .map(|i| unchanged_backup(&format!("u{i}"), t(i)))
             .collect();
-        let pruned = unchanged_snapshots_to_prune(&rows, 2);
+        let pruned = unchanged_snapshots_to_prune(&rows, 2, false);
         // Newest two kept (u4, u3); the three oldest pruned.
         assert_eq!(pruned.len(), 3);
         assert!(!pruned.contains(&"u4".to_string()));
@@ -1654,7 +1931,7 @@ mod tests {
             terminating,
         ];
         // Limit 0 would prune every Unchanged row — but none of these qualify.
-        assert!(unchanged_snapshots_to_prune(&rows, 0).is_empty());
+        assert!(unchanged_snapshots_to_prune(&rows, 0, false).is_empty());
     }
 
     #[test]
@@ -1709,7 +1986,7 @@ mod tests {
             succeeded_backup("d23", at(2026, 5, 23)),
             succeeded_backup("d22", at(2026, 5, 22)),
         ];
-        let del: BTreeSet<String> = backups_to_delete(&backups, &policy(Some(1), None))
+        let del: BTreeSet<String> = backups_to_delete(&backups, &policy(Some(1), None), false)
             .into_iter()
             .collect();
         assert_eq!(
@@ -2055,7 +2332,7 @@ mod tests {
             succeeded_backup("d22", at(2026, 5, 22)),
         ];
         // keepDaily:2 → newest two days kept, oldest deleted.
-        let del = backups_to_delete(&backups, &policy(None, Some(2)));
+        let del = backups_to_delete(&backups, &policy(None, Some(2)), false);
         assert_eq!(del, vec!["d22".to_string()]);
     }
 
@@ -2082,7 +2359,7 @@ mod tests {
             ..Default::default()
         });
         let succeeded = succeeded_backup("done", at(2026, 5, 24));
-        let del = backups_to_delete(&[running, succeeded], &policy(Some(1), None));
+        let del = backups_to_delete(&[running, succeeded], &policy(Some(1), None), false);
         assert!(del.is_empty(), "single succeeded kept, running ignored");
     }
 
@@ -2092,7 +2369,7 @@ mod tests {
             succeeded_backup("a", at(2026, 5, 24)),
             succeeded_backup("b", at(2026, 5, 23)),
         ];
-        let del: BTreeSet<String> = backups_to_delete(&backups, &Retention::default())
+        let del: BTreeSet<String> = backups_to_delete(&backups, &Retention::default(), false)
             .into_iter()
             .collect();
         assert_eq!(
@@ -2112,7 +2389,7 @@ mod tests {
             pinned,
             succeeded_backup("old", at(2026, 5, 19)),
         ];
-        let del: BTreeSet<String> = backups_to_delete(&backups, &policy(Some(1), None))
+        let del: BTreeSet<String> = backups_to_delete(&backups, &policy(Some(1), None), false)
             .into_iter()
             .collect();
         assert!(del.contains("old"), "unpinned old snapshot is pruned");
@@ -2138,5 +2415,164 @@ mod tests {
             latest_successful_end_time(&[failed_backup("f", at(2026, 5, 25))]),
             None
         );
+    }
+
+    // --- multi-repo retention bucketing + the spec-pin backfill (#368) -------
+
+    /// Pin a mint-time `spec.repository` onto a fixture row (normalized form,
+    /// as mint stamps it).
+    fn pin(mut b: Snapshot, repo: &str) -> Snapshot {
+        b.metadata.namespace = Some("apps".into());
+        b.spec.repository = Some(kopiur_api::common::RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: repo.into(),
+            namespace: Some("apps".into()),
+        });
+        b
+    }
+
+    /// keepLatest-style bucketing keeps N EACH per (source, repo) for a pinned
+    /// multi-repo population — the N repositories are independent captures.
+    #[test]
+    fn multi_repo_retention_keeps_n_per_source_repo_bucket() {
+        let backups = vec![
+            pin(succeeded_backup("a-old", at(2026, 5, 1)), "repo-a"),
+            pin(succeeded_backup("a-new", at(2026, 5, 2)), "repo-a"),
+            pin(succeeded_backup("b-old", at(2026, 5, 1)), "repo-b"),
+            pin(succeeded_backup("b-new", at(2026, 5, 2)), "repo-b"),
+        ];
+        // keepLatest: 1, multi-repo buckets: each repo keeps ITS newest.
+        let mut del = backups_to_delete(&backups, &policy(Some(1), None), true);
+        del.sort();
+        assert_eq!(del, vec!["a-old", "b-old"]);
+        // The SAME population under a FLAT (single-repo) evaluation keeps one
+        // TOTAL (a-new survives the equal-endTime tie-break) — which is
+        // exactly why the repo dimension is load-bearing.
+        let mut flat = backups_to_delete(&backups, &policy(Some(1), None), false);
+        flat.sort();
+        assert_eq!(flat, vec!["a-old", "b-new", "b-old"]);
+    }
+
+    /// Single→multi edit: pre-feature unpinned rows share the ""-repo bucket
+    /// (transition state) until the backfill pass promotes their run-time pin;
+    /// the pure decision selects exactly the promotable rows.
+    #[test]
+    fn repository_pin_backfill_selects_only_promotable_rows() {
+        use kopiur_api::PolicyRef;
+        // Promotable: policyRef + status pin + no spec pin.
+        let mut promotable = succeeded_backup("p", at(2026, 5, 1));
+        promotable.spec.policy_ref = Some(PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        });
+        promotable.status.as_mut().unwrap().resolved =
+            Some(kopiur_api::snapshot::ResolvedSnapshot {
+                repository: Some(kopiur_api::common::RepositoryRef {
+                    kind: kopiur_api::common::RepositoryKind::Repository,
+                    name: "repo-a".into(),
+                    namespace: Some("apps".into()),
+                }),
+                ..Default::default()
+            });
+        // Already pinned: never re-selected (idempotence).
+        let mut pinned_row = promotable.clone();
+        pinned_row.metadata.name = Some("already".into());
+        pinned_row.spec.repository = Some(kopiur_api::common::RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: "repo-a".into(),
+            namespace: Some("apps".into()),
+        });
+        // Neither pin: repository unknowable — stays unpinned, ages out.
+        let neither = succeeded_backup("neither", at(2026, 5, 1));
+        // Terminating: skipped (its finalizer already runs on captured state).
+        let mut terminating = promotable.clone();
+        terminating.metadata.name = Some("terminating".into());
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+            ));
+        // No policyRef (discovered/copy rows): not a policy child, never touched.
+        let mut foreign = promotable.clone();
+        foreign.metadata.name = Some("foreign".into());
+        foreign.spec.policy_ref = None;
+
+        let patches = repository_pin_backfill_patches(&[
+            promotable,
+            pinned_row,
+            neither,
+            terminating,
+            foreign,
+        ]);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "p");
+        assert_eq!(
+            patches[0].1,
+            serde_json::json!({ "spec": { "repository": {
+                "kind": "Repository", "name": "repo-a", "namespace": "apps"
+            } } })
+        );
+    }
+
+    /// Multi→single edit: the flag comes from the CURRENT spec, so leftover
+    /// pinned children merge back into the flat source-only buckets — the
+    /// documented TRANSIENT GFS mixing that self-resolves as the removed
+    /// repo's rows age out of every keep window.
+    #[test]
+    fn multi_to_single_edit_merges_pinned_rows_into_flat_buckets() {
+        let backups = vec![
+            // Leftovers pinned to the removed repo, plus the surviving repo's
+            // rows — after the edit they all compete in ONE bucket.
+            pin(succeeded_backup("removed-1", at(2026, 5, 3)), "removed"),
+            pin(succeeded_backup("kept-1", at(2026, 5, 2)), "kept"),
+            pin(succeeded_backup("kept-2", at(2026, 5, 1)), "kept"),
+        ];
+        let mut del = backups_to_delete(&backups, &policy(Some(1), None), false);
+        del.sort();
+        // Flat keepLatest:1 keeps only the newest overall ("removed-1", the
+        // stale repo's row!) — the transient mixing this test documents. The
+        // same rows under the multi flag would keep one per repo.
+        assert_eq!(del, vec!["kept-1", "kept-2"]);
+        assert_eq!(
+            backups_to_delete(&backups, &policy(Some(1), None), true).len(),
+            1,
+            "multi buckets keep one per repo (only kept-2 falls out)"
+        );
+        // Pins are byte-ignored by the flat key: the delete set equals that of
+        // the identical UNPINNED population (single-repo goldens hold even
+        // when stray pins exist).
+        let unpinned = vec![
+            succeeded_backup("removed-1", at(2026, 5, 3)),
+            succeeded_backup("kept-1", at(2026, 5, 2)),
+            succeeded_backup("kept-2", at(2026, 5, 1)),
+        ];
+        let mut del_unpinned = backups_to_delete(&unpinned, &policy(Some(1), None), false);
+        del_unpinned.sort();
+        assert_eq!(del, del_unpinned);
+    }
+
+    /// `unchanged_snapshots_to_prune` inherits the (source, repo) key: each
+    /// repo's Unchanged history is bounded independently under the multi flag.
+    #[test]
+    fn unchanged_prune_buckets_per_repo_under_the_multi_flag() {
+        fn unchanged(name: &str, end: DateTime<Utc>) -> Snapshot {
+            let mut b = succeeded_backup(name, end);
+            if let Some(s) = b.status.as_mut() {
+                s.phase = Some(SnapshotPhase::Unchanged);
+                s.snapshot = None;
+            }
+            b
+        }
+        let rows = vec![
+            pin(unchanged("a1", at(2026, 5, 1)), "repo-a"),
+            pin(unchanged("a2", at(2026, 5, 2)), "repo-a"),
+            pin(unchanged("b1", at(2026, 5, 1)), "repo-b"),
+            pin(unchanged("b2", at(2026, 5, 2)), "repo-b"),
+        ];
+        let mut multi = unchanged_snapshots_to_prune(&rows, 1, true);
+        multi.sort();
+        assert_eq!(multi, vec!["a1", "b1"], "limit applies per repo");
+        let mut flat = unchanged_snapshots_to_prune(&rows, 1, false);
+        flat.sort();
+        assert_eq!(flat, vec!["a1", "b1", "b2"], "flat keeps one total");
     }
 }

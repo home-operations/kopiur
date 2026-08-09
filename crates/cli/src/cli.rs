@@ -718,6 +718,12 @@ pub struct SnapshotNowArgs {
     #[arg(long, value_name = "SECS")]
     pub pod_startup_deadline_seconds: Option<i64>,
 
+    /// For a multi-repository policy: back up into this ONE repository (by
+    /// name) instead of fanning out to all of them. Refused if the name is not
+    /// one of the policy's repositories.
+    #[arg(long, value_name = "NAME")]
+    pub repository: Option<String>,
+
     /// Wait for the Snapshot to reach Succeeded (exit 0) or Failed (exit 1).
     #[arg(long)]
     pub wait: bool,

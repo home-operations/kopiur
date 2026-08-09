@@ -79,6 +79,16 @@ allow:
       a backup back, so a CLI that cannot see it still reports the backup's real
       state.
   - file: crates/controller/src/consts.rs
+    snippet: SCHEDULE_FANOUT_CAPPED_CONDITION
+    reason: >-
+      Asserted BOTH polarities on every fire pass (schedule_ready_status), so it
+      self-clears the moment a slot mints fully; while `True` it is a
+      deliberate, loudly-conditioned refusal (members x repositories over the
+      fan-out cap) that also warn-logs each skipped slot. The M10 gates/doctor
+      checklist (#368 plan B9) promotes cap visibility into the structural-gate
+      registry + doctor; until then the condition is the Stalled-style surface
+      the M8 data path ships with.
+  - file: crates/controller/src/consts.rs
     snippet: SOURCE_STAGED_CONDITION
     reason: >-
       Bounded, not structural. `StagingOutcome::Waiting` parks at `Pending` for

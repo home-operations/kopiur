@@ -318,6 +318,35 @@ pub fn repo_key(repo: &RepositoryRef, owner_namespace: &str) -> String {
     }
 }
 
+/// Normalize a [`RepositoryRef`] against the namespace it resolves relative to
+/// (`owner_namespace`, the consuming CR's namespace): a namespaced `Repository`
+/// ref carries its EFFECTIVE namespace explicitly (so a later reader can
+/// re-resolve it from anywhere — e.g. after the owning recipe is gone); a
+/// cluster-scoped `ClusterRepository` ref carries none (the webhook forbids
+/// one). This is the one normal form every pin uses — `status.resolved.repository`
+/// (the controller's run-time pin) and `Snapshot.spec.repository` (the
+/// mint-time pin a multi-repo fan-out child or replication copy CR carries) —
+/// so [`repo_key`] over a normalized ref is namespace-independent. Exhaustive
+/// over [`RepositoryKind`].
+pub fn normalized_repository_ref(r: &RepositoryRef, owner_namespace: &str) -> RepositoryRef {
+    match r.kind {
+        RepositoryKind::Repository => RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: r.name.clone(),
+            namespace: Some(
+                r.namespace
+                    .clone()
+                    .unwrap_or_else(|| owner_namespace.to_string()),
+            ),
+        },
+        RepositoryKind::ClusterRepository => RepositoryRef {
+            kind: RepositoryKind::ClusterRepository,
+            name: r.name.clone(),
+            namespace: None,
+        },
+    }
+}
+
 /// Repository encryption settings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
