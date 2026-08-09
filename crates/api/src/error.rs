@@ -265,15 +265,20 @@ pub enum ValidationError {
     /// repository. Two recipes interleaving snapshots into one kopia identity corrupts
     /// the snapshot history, so the webhook rejects the second one (ADR-0005 §6).
     #[error(
-        "resolved identity {identity:?} collides with existing SnapshotPolicy {conflict:?} in the \
-         same repository; two policies must not share a kopia identity (give this policy a distinct \
-         spec.identity, or target a different repository)"
+        "resolved identity {identity:?} collides with existing SnapshotPolicy {conflict:?} in \
+         repository {repo}; two policies must not share a kopia identity in the same repository \
+         (give this policy a distinct spec.identity, or target a different repository)"
     )]
     IdentityCollision {
         /// The resolved `username@hostname[:path]` identity that collided.
         identity: String,
         /// `namespace/name` of the already-admitted conflicting `SnapshotPolicy`.
         conflict: String,
+        /// Normalized key (`Kind[/namespace]/name`) of the repository BOTH
+        /// policies resolve that identity in — for a multi-repository policy
+        /// this names WHICH member pair collided (the other members may be
+        /// perfectly fine).
+        repo: String,
     },
 
     /// A kopia identity component (`username` or `hostname`) — whether an explicit
@@ -350,6 +355,31 @@ pub enum ValidationError {
         /// The previously-pinned identity (or source path).
         old: String,
         /// The new identity (or source path) this edit would resolve to.
+        new: String,
+    },
+
+    /// The multi-repository analogue of [`Self::IdentityWouldFork`]: an UPDATE
+    /// to a `SnapshotPolicy` would change the kopia identity it resolves to
+    /// **in one of its member repositories** (each member resolves its own
+    /// identity under that repository's `identityDefaults`) while the policy
+    /// already has snapshot history. The message names WHICH repository's
+    /// lineage would fork — with N members, the other N-1 may be unaffected.
+    /// Same acknowledgement release as the single-repo variant.
+    #[error(
+        "this edit changes the policy's resolved kopia identity in repository {repo} from \
+         {old:?} to {new:?}, but the policy already has snapshot history; new snapshots would \
+         land under a new kopia source while the old lineage's Snapshot CRs keep competing in \
+         the same GFS retention timeline (not independent retention), and restore/verify \
+         resolve only the new identity. To intentionally re-identify, set annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value)"
+    )]
+    IdentityWouldForkInRepository {
+        /// Normalized key (`Kind[/namespace]/name`) of the member repository
+        /// whose lineage this edit would fork.
+        repo: String,
+        /// The previously-resolved `username@hostname` in that repository.
+        old: String,
+        /// The `username@hostname` this edit would resolve to in that repository.
         new: String,
     },
 
@@ -625,17 +655,19 @@ pub enum ValidationError {
     )]
     PolicyHooksWithRepositories,
 
-    /// A `Snapshot`'s mint-time repository pin (`spec.repository`) names a
-    /// repository that is no longer in its `SnapshotPolicy`'s repository set —
-    /// the recipe was edited out from under this Snapshot's pin. Terminal for
-    /// this CR: proceeding against any OTHER repository would silently act on
-    /// the wrong backend, and guessing is the one thing a backup operator must
-    /// never do.
+    /// A `Snapshot`'s repository pin (`spec.repository`) names a repository
+    /// that is not in its `SnapshotPolicy`'s repository set — either the pin is
+    /// wrong (a hand-written CREATE with a typo, refused at admission) or the
+    /// recipe was edited out from under an existing Snapshot's mint-time pin
+    /// (terminal for that CR). Proceeding against any OTHER repository would
+    /// silently act on the wrong backend, and guessing is the one thing a
+    /// backup operator must never do.
     #[error(
-        "Snapshot spec.repository pins {pin}, but SnapshotPolicy `{policy}` no longer lists \
-         that repository (current set: {valid}) — the recipe was edited out from under this \
-         Snapshot's pin. Delete this Snapshot and let the schedule re-fire against the \
-         current recipe, or restore the repository entry on the policy"
+        "Snapshot spec.repository pins {pin}, but SnapshotPolicy `{policy}` does not list \
+         that repository (current set: {valid}). Fix the pin to a listed member, restore the \
+         repository entry on the policy, or — for an existing Snapshot whose recipe was \
+         edited out from under it — delete it and let the schedule re-fire against the \
+         current recipe"
     )]
     SnapshotPinNotInPolicy {
         /// Normalized key of the pinned repository (`Kind[/namespace]/name`).
@@ -648,14 +680,15 @@ pub enum ValidationError {
 
     /// A `Snapshot` referencing a MULTI-repository `SnapshotPolicy` carries no
     /// `spec.repository` pin, so there is no way to know which of the N
-    /// repositories this run targets. The controller-side backstop of the
-    /// admission rule that refuses minting such a child; picking repository #1
-    /// silently is never an option.
+    /// repositories this run targets. Raised both at admission (refusing to
+    /// CREATE such a child) and as the controller-side backstop for stored
+    /// rows; picking repository #1 silently is never an option.
     #[error(
         "Snapshot has no spec.repository pin, but SnapshotPolicy `{policy}` lists multiple \
          repositories (spec.repositories) — a multi-repo child must pin exactly one member \
-         at mint time. Delete this Snapshot and let the schedule (or `kubectl kopiur \
-         snapshot now`) re-mint it with the pin stamped"
+         at mint time. Let a SnapshotSchedule fire it, or use `kubectl kopiur snapshot now` \
+         — both stamp the repository (an already-created unpinned Snapshot must be deleted \
+         and re-minted)"
     )]
     MultiRepoSnapshotUnpinned {
         /// The referenced `SnapshotPolicy`'s name.

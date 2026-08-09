@@ -62,8 +62,9 @@ pub enum DoctorCheck {
     /// silently suspended, none is `Failed`, and any identity-overlap
     /// condition the operator raised is surfaced.
     SnapshotReplications,
-    /// No Snapshot/Restore/SnapshotSchedule is parked on a structural gate, and
-    /// no Snapshot/Restore has been non-terminal longer than the threshold.
+    /// No Snapshot/Restore/SnapshotSchedule/SnapshotPolicy is parked on a
+    /// structural gate, and no Snapshot/Restore has been non-terminal longer
+    /// than the threshold.
     NoStuckWork,
     /// No Snapshot/Restore failed within `--failure-lookback` (older retained
     /// failures warn instead).
@@ -1056,12 +1057,34 @@ fn restore_stuck(
 /// A schedule has no phase and no age to be overdue against; what it can have
 /// is `ScheduleRunnable=False`, which under the default
 /// `concurrencyPolicy: Forbid` means NO further backups will run while every
-/// object involved still looks healthy.
+/// object involved still looks healthy — or `FanoutCapped=True`, a fired slot
+/// SKIPPED because its members × repositories cross-product exceeded the
+/// fan-out cap (and every future slot will keep skipping until the selector is
+/// narrowed or the repository list shrunk).
 fn schedule_stuck(s: &SnapshotSchedule) -> Option<StuckKind> {
     classify_stuck(
         &PhaseView::phaseless(),
         conditions_of(s.status.as_ref().map(|st| &st.conditions)),
         GateScope::covers_snapshot_schedule,
+        None,
+        chrono::Duration::zero(),
+    )
+}
+
+/// `classify_stuck` for a `SnapshotPolicy` — gates only. Pure.
+///
+/// A policy is phase-less like a schedule; what it can carry is
+/// `RepositoriesReady=False` (`GateScope::SnapshotPolicy`): part of a
+/// multi-repository fan-out's fleet — or a single-repo policy's one repository
+/// — is not `Ready`, so backups/retention/adoption/verification against the
+/// not-ready subset are deferred while everything else looks healthy. The
+/// registry row is Warn-severity (a deliberately-parked repository is a
+/// plausible configuration), so it surfaces without failing the run on its own.
+fn policy_stuck(p: &SnapshotPolicy) -> Option<StuckKind> {
+    classify_stuck(
+        &PhaseView::phaseless(),
+        conditions_of(p.status.as_ref().map(|st| &st.conditions)),
+        GateScope::covers_snapshot_policy,
         None,
         chrono::Duration::zero(),
     )
@@ -1109,6 +1132,7 @@ struct Work {
     snapshots: Vec<Snapshot>,
     restores: Vec<Restore>,
     schedules: Vec<SnapshotSchedule>,
+    policies: Vec<SnapshotPolicy>,
     /// Kinds that could not be listed, as the outcome their error mapped to.
     ///
     /// Degradation is **per kind**, never all-or-nothing. A kubeconfig scoped
@@ -1146,6 +1170,7 @@ async fn list_work(ctx: &KubeCtx) -> Work {
         snapshots: listed::<Snapshot>(ctx, "snapshots", &mut degraded).await,
         restores: listed::<Restore>(ctx, "restores", &mut degraded).await,
         schedules: listed::<SnapshotSchedule>(ctx, "snapshotschedules", &mut degraded).await,
+        policies: listed::<SnapshotPolicy>(ctx, "snapshotpolicies", &mut degraded).await,
         degraded,
     }
 }
@@ -1206,7 +1231,8 @@ fn object_label(kind: &str, meta: &kube::core::ObjectMeta) -> String {
     )
 }
 
-/// Blocked or stuck work across `Snapshot`, `Restore` and `SnapshotSchedule`.
+/// Blocked or stuck work across `Snapshot`, `Restore`, `SnapshotSchedule` and
+/// `SnapshotPolicy`.
 fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Utc>) -> Outcome {
     let threshold_label = format!("{}s", threshold.as_secs());
     let threshold = chrono::Duration::from_std(threshold).unwrap_or(chrono::Duration::hours(1));
@@ -1231,6 +1257,14 @@ fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Utc>) 
         if let Some(kind) = schedule_stuck(s) {
             entries.push(StuckEntry {
                 object: object_label("snapshotschedule", &s.metadata),
+                kind,
+            });
+        }
+    }
+    for p in &work.policies {
+        if let Some(kind) = policy_stuck(p) {
+            entries.push(StuckEntry {
+                object: object_label("snapshotpolicy", &p.metadata),
                 kind,
             });
         }
@@ -2036,6 +2070,7 @@ mod tests {
             snapshots,
             restores,
             schedules: Vec::new(),
+            policies: Vec::new(),
             degraded: Vec::new(),
         }
     }
@@ -2346,6 +2381,7 @@ mod tests {
             snapshots: vec![],
             restores: vec![],
             degraded: vec![],
+            policies: vec![],
             schedules: vec![schedule_with(vec![condition(
                 kopiur_api::consts::SCHEDULE_RUNNABLE_CONDITION,
                 "False",
@@ -2371,6 +2407,69 @@ mod tests {
                 "True",
                 "Runnable",
                 "the schedule's concurrency gate is clear",
+            )])),
+            None
+        );
+    }
+
+    // --- snapshot policies (#368 M10: the RepositoriesReady gate) ------------
+
+    fn policy_with(conditions: Vec<serde_json::Value>) -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "media" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "nas" },
+                    { "kind": "Repository", "name": "offsite" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            },
+            "status": { "conditions": conditions },
+        }))
+        .expect("policy fixture")
+    }
+
+    #[test]
+    fn a_repo_gated_policy_warns_and_names_the_not_ready_repos() {
+        // The recipe-level park (#368): part of a multi-repo fleet is down, the
+        // ready subset keeps processing, and nothing phase-shaped says so. The
+        // registry row is Warn-severity (a deliberately-parked repository is a
+        // plausible configuration), so doctor surfaces it without going red.
+        let w = Work {
+            snapshots: vec![],
+            restores: vec![],
+            schedules: vec![],
+            degraded: vec![],
+            policies: vec![policy_with(vec![condition(
+                kopiur_api::consts::REPOSITORIES_READY_CONDITION,
+                "False",
+                kopiur_api::consts::REPOSITORY_NOT_READY_REASON,
+                "repository(ies) not Ready: Repository/media/offsite — backups, retention, \
+                 adoption and verification against them are deferred until they recover",
+            )])],
+        };
+        let outcome = check_stuck(&w, std::time::Duration::from_secs(3600), now());
+        let Outcome::Warn(msg) = outcome else {
+            panic!("expected Warn, got {outcome:?}");
+        };
+        assert!(msg.contains("snapshotpolicy media/pg"), "{msg}");
+        assert!(msg.contains("RepositoriesReady=False"), "{msg}");
+        assert!(msg.contains("Repository/media/offsite"), "{msg}");
+    }
+
+    #[test]
+    fn a_healthy_or_cleared_policy_is_not_reported() {
+        // No conditions at all (a never-gated policy)…
+        assert_eq!(policy_stuck(&policy_with(vec![])), None);
+        // …and a cleared gate (True) both stay silent.
+        assert_eq!(
+            policy_stuck(&policy_with(vec![condition(
+                kopiur_api::consts::REPOSITORIES_READY_CONDITION,
+                "True",
+                "AllRepositoriesReady",
+                "every referenced repository is Ready",
             )])),
             None
         );

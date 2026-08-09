@@ -17,23 +17,19 @@
 
 pub use kopiur_api::consts::{
     ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, BLOCKED_ON_UNREADABLE_RUN_REASON, CONFIG_LABEL,
-    CREDENTIALS_AVAILABLE_CONDITION, DELETION_HELD_CONDITION, INDEX_BLOB_HEALTH_CONDITION,
-    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
+    CREDENTIALS_AVAILABLE_CONDITION, DELETION_HELD_CONDITION, FANOUT_TOO_LARGE_REASON,
+    INDEX_BLOB_HEALTH_CONDITION, MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL,
+    MANAGED_BY_VALUE, MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
     MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CA_BUNDLE_REASON, MISSING_CREDENTIALS_REASON,
     MISSING_SERVICE_ACCOUNT_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_RESTORE,
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     PRIVILEGED_MOVERS_ANNOTATION, READY_CONDITION, RECONCILING_CONDITION,
-    REPOSITORY_READ_ONLY_REASON, REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION,
-    RUN_MODE_ANNOTATION, RUN_REQUESTED_ANNOTATION, SCHEDULE_LABEL, SCHEDULE_RUNNABLE_CONDITION,
-    SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER, SNAPSHOT_ID_LABEL,
-    STALLED_CONDITION,
+    REPOSITORIES_READY_CONDITION, REPOSITORY_NOT_READY_REASON, REPOSITORY_READ_ONLY_REASON,
+    REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RUN_MODE_ANNOTATION,
+    RUN_REQUESTED_ANNOTATION, SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL,
+    SCHEDULE_RUNNABLE_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER,
+    SNAPSHOT_ID_LABEL, STALLED_CONDITION,
 };
-
-/// `reason` when a backup is held in `Pending` because its referenced repository
-/// is not `Ready` (backend unreachable). Mirrors the readiness gate Maintenance,
-/// `SnapshotPolicy`, and `RepositoryReplication` already apply.
-pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
 
 /// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
 /// because a `SnapshotPolicy.spec.preflight` check is not satisfied. The backup
@@ -84,6 +80,17 @@ pub const VERIFY_COMPONENT: &str = "verify";
 pub const VERIFY_INSTANCE_LABEL: &str = "kopiur.home-operations.com/verify";
 /// Annotation on a verification Job recording the scheduled slot it runs (RFC3339).
 pub const VERIFY_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/verify-slot";
+/// Label tying a verification Job to the ONE repository it verifies (#368
+/// multi-repo fan-out). Value: the stable 6-hex repo tag
+/// ([`crate::naming::repo_tag6`]) over the normalized repo key — label-safe
+/// where the raw `Kind/ns/name` key (slashes) is not. Scopes the single-flight
+/// selector per (policy, repository), so a multi-repo policy's N per-repo
+/// verify Jobs run concurrently while each repository still gets at most one.
+/// Stamped on every verify Job; single-repo single-flight deliberately keeps
+/// selecting on [`VERIFY_INSTANCE_LABEL`] alone so in-flight Jobs from an
+/// older operator (which lack this label) still hold the gate across an
+/// upgrade.
+pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).
 pub const REPLICATION_COMPONENT: &str = "replication";
@@ -462,16 +469,11 @@ pub const SCHEDULE_TIMEZONE_AMBIGUOUS_REASON: &str = "RepositoryDefaultsDisagree
 /// `reason` for [`SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION`] = `False`.
 pub const SCHEDULE_TIMEZONE_RESOLVED_REASON: &str = "TimezoneResolved";
 
-/// `SnapshotSchedule` condition: the last fired slot SKIPPED one or more target
-/// policies because their source-members × repositories cross product exceeded
-/// the fan-out cap (#368 multi-repo fan-out). `True` = at least one policy's
-/// slot was skipped (Stalled-style: it will keep skipping every slot until the
-/// selector is narrowed or the repository list shrunk); `False` = every fired
-/// slot minted fully. Only fire passes assert this condition either way —
-/// wait/hold passes leave it untouched so it persists between slots.
-pub const SCHEDULE_FANOUT_CAPPED_CONDITION: &str = "FanoutCapped";
-/// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `True`.
-pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
+// `SCHEDULE_FANOUT_CAPPED_CONDITION` / `FANOUT_TOO_LARGE_REASON` moved to
+// `kopiur_api::consts` (re-exported above): the M10 gates/doctor checklist
+// promoted the fan-out cap into `kopiur_api::gates::SCHEDULE_FANOUT_CAPPED_GATE`,
+// so both sides of the doctor contract read one row. The clear-side reason stays
+// controller-internal (remediation copy, like `Settled`).
 /// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `False`.
 pub const FANOUT_WITHIN_CAP_REASON: &str = "FanoutWithinCap";
 

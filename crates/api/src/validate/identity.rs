@@ -64,6 +64,68 @@ pub fn detect_identity_collision(
         .map(|e| e.name.clone())
 }
 
+/// A detected identity collision, naming WHICH `(identity, repository)` pair
+/// collided — with a multi-repository policy contributing N pairs, the deny
+/// message must say which member repository is the problem (the others may be
+/// perfectly fine). Produced by [`detect_identity_collision_multi`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollisionHit {
+    /// `namespace/name` of the already-admitted conflicting policy.
+    pub conflict: String,
+    /// The resolved `username@hostname[:path]` identity that collided.
+    pub identity: String,
+    /// The normalized repository key the collision happened in.
+    pub repo_key: String,
+}
+
+/// The N-pair generalization of [`detect_identity_collision`]: the candidate
+/// policy contributes one `(identity, repo_key)` pair per member repository
+/// (each identity resolved under THAT repository's `identityDefaults`), and a
+/// collision is the FIRST pair that matches an existing pair. Loops the
+/// single-pair kernel, so `N = 1` is exactly the old behavior.
+///
+/// ```
+/// use kopiur_api::validate::{detect_identity_collision_multi, CollisionHit, ExistingIdentity};
+///
+/// let existing = vec![ExistingIdentity {
+///     identity: "pg@billing:/pvc/data".into(),
+///     repo_key: "ClusterRepository/shared".into(),
+///     name: "billing/pg-a".into(),
+/// }];
+/// // The same identity in a DIFFERENT repository is fine; the pair that also
+/// // lands in `ClusterRepository/shared` collides — and the hit names it.
+/// let pairs = vec![
+///     ("pg@billing:/pvc/data".to_string(), "Repository/billing/nas".to_string()),
+///     ("pg@billing:/pvc/data".to_string(), "ClusterRepository/shared".to_string()),
+/// ];
+/// assert_eq!(
+///     detect_identity_collision_multi(&pairs, "billing/pg-b", &existing),
+///     Some(CollisionHit {
+///         conflict: "billing/pg-a".into(),
+///         identity: "pg@billing:/pvc/data".into(),
+///         repo_key: "ClusterRepository/shared".into(),
+///     }),
+/// );
+/// // Disjoint repositories → no collision at all.
+/// let disjoint = vec![("pg@billing:/pvc/data".to_string(), "Repository/billing/nas".to_string())];
+/// assert_eq!(detect_identity_collision_multi(&disjoint, "billing/pg-b", &existing), None);
+/// ```
+pub fn detect_identity_collision_multi(
+    self_pairs: &[(String, String)],
+    self_name: &str,
+    existing: &[ExistingIdentity],
+) -> Option<CollisionHit> {
+    self_pairs.iter().find_map(|(identity, repo_key)| {
+        detect_identity_collision(identity, repo_key, self_name, existing).map(|conflict| {
+            CollisionHit {
+                conflict,
+                identity: identity.clone(),
+                repo_key: repo_key.clone(),
+            }
+        })
+    })
+}
+
 // --- Identity shape validation (kopia username@hostname:path contract) -------
 
 /// Generous byte cap for a single identity component. kopia imposes none; this only
@@ -234,6 +296,71 @@ pub fn detect_identity_fork(
             old: old_identity.to_string(),
             new: new_identity.to_string(),
         }
+    })
+}
+
+/// The per-repository generalization of [`detect_identity_fork`] for
+/// multi-repository policies (plan B5). The unit of identity is the
+/// `(repo_key, identity-under-that-repo's-identityDefaults)` pair, so:
+///
+/// - `old_baselines` maps each repo_key the OLD object had a resolved identity
+///   for (from `status.resolved.repositories`, with the top-level identity as
+///   the single-repo fallback) to its `username@hostname`;
+/// - `new_identities` maps each repo_key of the NEW spec's repository set to
+///   the freshly-resolved `username@hostname` under that repository's defaults;
+/// - the edit **forks** iff any repo_key present in BOTH maps resolves
+///   differently (the error names that repository). An ADDED repository (in
+///   `new` only) has no history to orphan — no fork. A REMOVED repository (in
+///   `old` only) is not a fork either (the caller surfaces it as a warning).
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use kopiur_api::error::ValidationError;
+/// use kopiur_api::validate::detect_identity_fork_multi;
+///
+/// let old: BTreeMap<String, String> = [
+///     ("Repository/billing/a".to_string(), "pg@east".to_string()),
+///     ("Repository/billing/b".to_string(), "pg@west".to_string()),
+/// ].into();
+/// let mut new = old.clone();
+///
+/// // Unchanged → allowed.
+/// assert!(detect_identity_fork_multi(&old, &new, true, false).is_none());
+///
+/// // Repo b re-resolves differently → fork naming b.
+/// new.insert("Repository/billing/b".to_string(), "pg@flipped".to_string());
+/// assert!(matches!(
+///     detect_identity_fork_multi(&old, &new, true, false),
+///     Some(ValidationError::IdentityWouldForkInRepository { repo, .. })
+///         if repo == "Repository/billing/b"
+/// ));
+/// // No history / acknowledged → allowed.
+/// assert!(detect_identity_fork_multi(&old, &new, false, false).is_none());
+/// assert!(detect_identity_fork_multi(&old, &new, true, true).is_none());
+///
+/// // An ADDED repository (no old baseline) never forks.
+/// new = old.clone();
+/// new.insert("ClusterRepository/offsite".to_string(), "pg@east".to_string());
+/// assert!(detect_identity_fork_multi(&old, &new, true, false).is_none());
+/// ```
+pub fn detect_identity_fork_multi(
+    old_baselines: &BTreeMap<String, String>,
+    new_identities: &BTreeMap<String, String>,
+    has_history: bool,
+    acknowledged: bool,
+) -> Option<ValidationError> {
+    if !has_history || acknowledged {
+        return None;
+    }
+    new_identities.iter().find_map(|(repo_key, new_uh)| {
+        old_baselines
+            .get(repo_key)
+            .filter(|old_uh| *old_uh != new_uh)
+            .map(|old_uh| ValidationError::IdentityWouldForkInRepository {
+                repo: repo_key.clone(),
+                old: old_uh.clone(),
+                new: new_uh.clone(),
+            })
     })
 }
 

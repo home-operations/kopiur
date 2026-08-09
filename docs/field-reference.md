@@ -1445,7 +1445,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 ## SnapshotPolicy { #snapshotpolicy }
 
-**Scope:** Namespaced · **Short names:** `kopiasp` · **Print columns:** `Repository`, `Last-Snapshot`, `Last-Verified`, `Suspended`, `Age`
+**Scope:** Namespaced · **Short names:** `kopiasp` · **Print columns:** `Repository`, `Repositories`, `Last-Snapshot`, `Last-Verified`, `Suspended`, `Age`
 
 ### `spec` { #snapshotpolicy-spec }
 
@@ -1813,10 +1813,13 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `adoption` | [object](#snapshotpolicy-status-adoption) | — | Summary of automatic adoption of discovered snapshots into this recipe. |
 | `conditions` | [][object](#snapshotpolicy-status-conditions) | — | Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`). |
 | `lastSuccessfulSnapshot` | string | — | RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe. |
-| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). Single-repo: stamped directly by the verify mover. Multi-repo: computed by the controller as the MINIMUM `lastVerified` across the CURRENT repositories ("everything is verified as of T"), absent until every current repository has verified at least once. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
+| `repositorySummary` | string | — | Human-readable summary of the policy's repository target(s) for the `Repositories` print column: the comma-joined repository names (the one name for the single-repo shape), capped near a kubectl column width with a `+N` overflow marker. Written by the controller. |
 | `resolved` | [object](#snapshotpolicy-status-resolved) | — | What would be passed to kopia — pinned at admission. |
 | `retention` | [object](#snapshotpolicy-status-retention) | — | Summary of GFS retention pruning against this config's `Snapshot` CRs. |
+| `verification` | [][object](#snapshotpolicy-status-verification) | — | Per-repository verification records for a multi-repository policy (#368): one entry per CURRENT `spec.repositories` member, maintained by the controller (single writer — entries for repositories no longer in the spec are pruned). Empty (elided) for the single-repo shape, whose wire stays byte-identical. |
+| `verificationStamps` | map[string]string | — | Internal write channel for per-repository verification (#368): RFC3339 markers keyed by the normalized repository key (`repo_key`). Each verify mover merge-patches ONLY its own key — a JSON merge patch merges map keys, so two concurrent per-repo verifies can never clobber one another (a Vec would be replaced wholesale). The controller folds these into `verification` on its next pass and prunes keys for repositories no longer in the spec. Never written for the single-repo shape. |
 
 #### `status.adoption` { #snapshotpolicy-status-adoption }
 
@@ -1845,9 +1848,33 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `identity` | [object](#snapshotpolicy-status-resolved-identity) | — | The resolved `username@hostname` identity. |
+| `repositories` | [][object](#snapshotpolicy-status-resolved-repositories) | — | Per-repository resolution for a MULTI-repository policy (`spec.repositories`): one entry per member, each carrying the identity resolved under THAT repository's `identityDefaults` (the unit of identity is the `(repository, identity)` pair — N members means N independent kopia lineages). Empty — and elided from the wire — for the classic single-repo shape, whose resolution stays in the top-level `identity`/`sources` fields exactly as before this field existed. |
 | `sources` | [][object](#snapshotpolicy-status-resolved-sources) | — | The concrete PVCs + source paths after selector expansion. |
 
 ##### `status.resolved.identity` { #snapshotpolicy-status-resolved-identity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `hostname` | string | **required** | The final `hostname` kopia records, fixed at admission. |
+| `username` | string | **required** | The final `username` kopia records, fixed at admission. |
+| `sourcePath` | string | — | The resolved snapshot source path, when applicable (`username@hostname:path`). |
+
+##### `status.resolved.repositories[]` { #snapshotpolicy-status-resolved-repositories }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `repository` | [object](#snapshotpolicy-status-resolved-repositories-repository) | **required** | The member repository this entry resolves for (by value, as listed in `spec.repositories`). |
+| `identity` | [object](#snapshotpolicy-status-resolved-repositories-identity) | — | The `username@hostname` identity resolved under this repository's `identityDefaults`; absent when it could not be resolved (the guard treats an absent baseline as "no baseline" and degrades to allow for that member only). |
+
+###### `status.resolved.repositories[].repository` { #snapshotpolicy-status-resolved-repositories-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+###### `status.resolved.repositories[].identity` { #snapshotpolicy-status-resolved-repositories-identity }
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -1869,6 +1896,21 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `activeSnapshotCount` | integer | — | CRs currently inside the GFS window. |
 | `lastPruneAt` | string | — | RFC3339 timestamp of the last prune pass. |
 | `lastPruneDeleted` | integer | — | Number of `Snapshot` CRs deleted by the last prune pass. |
+
+#### `status.verification[]` { #snapshotpolicy-status-verification }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `repository` | [object](#snapshotpolicy-status-verification-repository) | **required** | The repository this record covers, normalized (`normalized_repository_ref`) so it re-resolves from anywhere. |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier) against THIS repository; absent until its first successful verify. |
+
+##### `status.verification[].repository` { #snapshotpolicy-status-verification-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 ---
 

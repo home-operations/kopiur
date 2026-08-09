@@ -1779,7 +1779,11 @@ async fn run_verify_flow(
 
     patch_verify_status(
         &spec.target_ref,
-        &verify_ok_body(op.tier.kind_str(), &chrono::Utc::now()),
+        &verify_ok_body(
+            op.tier.kind_str(),
+            op.repository_key.as_deref(),
+            &chrono::Utc::now(),
+        ),
     )
     .await;
     info!(tier = op.tier.kind_str(), "verification succeeded");

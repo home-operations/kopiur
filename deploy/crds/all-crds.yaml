@@ -6111,6 +6111,9 @@ spec:
     - jsonPath: .spec.repository.name
       name: Repository
       type: string
+    - jsonPath: .status.repositorySummary
+      name: Repositories
+      type: string
     - jsonPath: .status.lastSuccessfulSnapshot
       name: Last-Snapshot
       type: date
@@ -7490,7 +7493,12 @@ spec:
                 nullable: true
                 type: string
               lastVerified:
-                description: RFC3339 timestamp of the most recent successful verification (any tier).
+                description: |-
+                  RFC3339 timestamp of the most recent successful verification (any tier).
+                  Single-repo: stamped directly by the verify mover. Multi-repo: computed
+                  by the controller as the MINIMUM `lastVerified` across the CURRENT
+                  repositories ("everything is verified as of T"), absent until every
+                  current repository has verified at least once.
                 nullable: true
                 type: string
               observedGeneration:
@@ -7498,6 +7506,14 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              repositorySummary:
+                description: |-
+                  Human-readable summary of the policy's repository target(s) for the
+                  `Repositories` print column: the comma-joined repository names (the one
+                  name for the single-repo shape), capped near a kubectl column width
+                  with a `+N` overflow marker. Written by the controller.
+                nullable: true
+                type: string
               resolved:
                 description: What would be passed to kopia — pinned at admission.
                 nullable: true
@@ -7520,6 +7536,72 @@ spec:
                     - hostname
                     - username
                     type: object
+                  repositories:
+                    description: |-
+                      Per-repository resolution for a MULTI-repository policy
+                      (`spec.repositories`): one entry per member, each carrying the identity
+                      resolved under THAT repository's `identityDefaults` (the unit of
+                      identity is the `(repository, identity)` pair — N members means N
+                      independent kopia lineages). Empty — and elided from the wire — for the
+                      classic single-repo shape, whose resolution stays in the top-level
+                      `identity`/`sources` fields exactly as before this field existed.
+                    items:
+                      description: |-
+                        One member repository's resolution within a multi-repository policy: which
+                        repository, and what kopia identity this policy resolves to **under that
+                        repository's `identityDefaults`**. Consumed by the admission fork guard as
+                        the per-repo baseline (`repo_key` → previously-resolved identity), so an
+                        edit that would re-identify ONE member's lineage is caught even though the
+                        other members are unaffected.
+                      properties:
+                        identity:
+                          description: |-
+                            The `username@hostname` identity resolved under this repository's
+                            `identityDefaults`; absent when it could not be resolved (the guard
+                            treats an absent baseline as "no baseline" and degrades to allow for
+                            that member only).
+                          nullable: true
+                          properties:
+                            hostname:
+                              description: The final `hostname` kopia records, fixed at admission.
+                              type: string
+                            sourcePath:
+                              description: The resolved snapshot source path, when applicable (`username@hostname:path`).
+                              nullable: true
+                              type: string
+                            username:
+                              description: The final `username` kopia records, fixed at admission.
+                              type: string
+                          required:
+                          - hostname
+                          - username
+                          type: object
+                        repository:
+                          description: |-
+                            The member repository this entry resolves for (by value, as listed in
+                            `spec.repositories`).
+                          properties:
+                            kind:
+                              default: Repository
+                              description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                              enum:
+                              - Repository
+                              - ClusterRepository
+                              type: string
+                            name:
+                              description: Name of the referenced `Repository`/`ClusterRepository`.
+                              type: string
+                            namespace:
+                              description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                              nullable: true
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      required:
+                      - repository
+                      type: object
+                    type: array
                   sources:
                     description: The concrete PVCs + source paths after selector expansion.
                     items:
@@ -7554,6 +7636,65 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                type: object
+              verification:
+                description: |-
+                  Per-repository verification records for a multi-repository policy
+                  (#368): one entry per CURRENT `spec.repositories` member, maintained by
+                  the controller (single writer — entries for repositories no longer in
+                  the spec are pruned). Empty (elided) for the single-repo shape, whose
+                  wire stays byte-identical.
+                items:
+                  description: |-
+                    One repository's verification record on a multi-repository policy
+                    (`status.verification`). Entry-keyed by the (normalized) repository ref so
+                    per-repo verify results never collapse into one flat timestamp.
+                  properties:
+                    lastVerified:
+                      description: |-
+                        RFC3339 timestamp of the most recent successful verification (any tier)
+                        against THIS repository; absent until its first successful verify.
+                      nullable: true
+                      type: string
+                    repository:
+                      description: |-
+                        The repository this record covers, normalized
+                        ([`normalized_repository_ref`](crate::common::normalized_repository_ref))
+                        so it re-resolves from anywhere.
+                      properties:
+                        kind:
+                          default: Repository
+                          description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                          enum:
+                          - Repository
+                          - ClusterRepository
+                          type: string
+                        name:
+                          description: Name of the referenced `Repository`/`ClusterRepository`.
+                          type: string
+                        namespace:
+                          description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                          nullable: true
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  required:
+                  - repository
+                  type: object
+                type: array
+              verificationStamps:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Internal write channel for per-repository verification (#368): RFC3339
+                  markers keyed by the normalized repository key
+                  ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
+                  ONLY its own key — a JSON merge patch merges map keys, so two concurrent
+                  per-repo verifies can never clobber one another (a Vec would be replaced
+                  wholesale). The controller folds these into `verification` on its next
+                  pass and prunes keys for repositories no longer in the spec. Never
+                  written for the single-repo shape.
                 type: object
             type: object
         required:

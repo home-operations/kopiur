@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
     shortname = "kopiasp",
     category = "kopiur",
     printcolumn = r#"{"name":"Repository","type":"string","jsonPath":".spec.repository.name"}"#,
+    printcolumn = r#"{"name":"Repositories","type":"string","jsonPath":".status.repositorySummary"}"#,
     printcolumn = r#"{"name":"Last-Snapshot","type":"date","jsonPath":".status.lastSuccessfulSnapshot"}"#,
     printcolumn = r#"{"name":"Last-Verified","type":"date","jsonPath":".status.lastVerified"}"#,
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
@@ -869,11 +870,54 @@ pub struct SnapshotPolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
     /// RFC3339 timestamp of the most recent successful verification (any tier).
+    /// Single-repo: stamped directly by the verify mover. Multi-repo: computed
+    /// by the controller as the MINIMUM `lastVerified` across the CURRENT
+    /// repositories ("everything is verified as of T"), absent until every
+    /// current repository has verified at least once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
+    /// Per-repository verification records for a multi-repository policy
+    /// (#368): one entry per CURRENT `spec.repositories` member, maintained by
+    /// the controller (single writer — entries for repositories no longer in
+    /// the spec are pruned). Empty (elided) for the single-repo shape, whose
+    /// wire stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification: Vec<RepoVerification>,
+    /// Internal write channel for per-repository verification (#368): RFC3339
+    /// markers keyed by the normalized repository key
+    /// ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
+    /// ONLY its own key — a JSON merge patch merges map keys, so two concurrent
+    /// per-repo verifies can never clobber one another (a Vec would be replaced
+    /// wholesale). The controller folds these into `verification` on its next
+    /// pass and prunes keys for repositories no longer in the spec. Never
+    /// written for the single-repo shape.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub verification_stamps: std::collections::BTreeMap<String, String>,
+    /// Human-readable summary of the policy's repository target(s) for the
+    /// `Repositories` print column: the comma-joined repository names (the one
+    /// name for the single-repo shape), capped near a kubectl column width
+    /// with a `+N` overflow marker. Written by the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_summary: Option<String>,
     /// Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+/// One repository's verification record on a multi-repository policy
+/// (`status.verification`). Entry-keyed by the (normalized) repository ref so
+/// per-repo verify results never collapse into one flat timestamp.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoVerification {
+    /// The repository this record covers, normalized
+    /// ([`normalized_repository_ref`](crate::common::normalized_repository_ref))
+    /// so it re-resolves from anywhere.
+    pub repository: RepositoryRef,
+    /// RFC3339 timestamp of the most recent successful verification (any tier)
+    /// against THIS repository; absent until its first successful verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<String>,
 }
 
 /// The recipe as kopia would see it, pinned at admission and never re-rendered.
@@ -886,6 +930,35 @@ pub struct ResolvedPolicy {
     /// The concrete PVCs + source paths after selector expansion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<ResolvedPolicySource>,
+    /// Per-repository resolution for a MULTI-repository policy
+    /// (`spec.repositories`): one entry per member, each carrying the identity
+    /// resolved under THAT repository's `identityDefaults` (the unit of
+    /// identity is the `(repository, identity)` pair — N members means N
+    /// independent kopia lineages). Empty — and elided from the wire — for the
+    /// classic single-repo shape, whose resolution stays in the top-level
+    /// `identity`/`sources` fields exactly as before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<ResolvedPolicyRepository>,
+}
+
+/// One member repository's resolution within a multi-repository policy: which
+/// repository, and what kopia identity this policy resolves to **under that
+/// repository's `identityDefaults`**. Consumed by the admission fork guard as
+/// the per-repo baseline (`repo_key` → previously-resolved identity), so an
+/// edit that would re-identify ONE member's lineage is caught even though the
+/// other members are unaffected.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPolicyRepository {
+    /// The member repository this entry resolves for (by value, as listed in
+    /// `spec.repositories`).
+    pub repository: RepositoryRef,
+    /// The `username@hostname` identity resolved under this repository's
+    /// `identityDefaults`; absent when it could not be resolved (the guard
+    /// treats an absent baseline as "no baseline" and degrades to allow for
+    /// that member only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ResolvedIdentity>,
 }
 
 /// One resolved source — a concrete PVC and the path kopia records for it.
@@ -956,6 +1029,88 @@ mod tests {
     use crate::common::RepositoryKind;
     use crate::testutil::from_yaml;
     use kube::core::CustomResourceExt;
+
+    #[test]
+    fn resolved_policy_single_repo_status_wire_is_byte_identical() {
+        // Golden: a single-repo policy's ResolvedPolicy serializes EXACTLY as
+        // it did before `repositories` existed — the empty vec is elided — so
+        // stored single-repo statuses round-trip byte-identically.
+        let resolved = ResolvedPolicy {
+            identity: Some(crate::common::ResolvedIdentity {
+                username: "pg".into(),
+                hostname: "billing".into(),
+                source_path: Some("/pvc/data".into()),
+            }),
+            sources: vec![ResolvedPolicySource {
+                pvc: Some("billing/data".into()),
+                source_path: Some("/pvc/data".into()),
+            }],
+            repositories: vec![],
+        };
+        let wire = serde_json::to_value(&resolved).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "identity": {
+                    "username": "pg",
+                    "hostname": "billing",
+                    "sourcePath": "/pvc/data",
+                },
+                "sources": [ { "pvc": "billing/data", "sourcePath": "/pvc/data" } ],
+            })
+        );
+
+        // …and a pre-feature stored status (no `repositories` key) decodes to
+        // the empty vec, not an error.
+        let decoded: ResolvedPolicy = serde_json::from_value(wire).expect("decodes");
+        assert!(decoded.repositories.is_empty());
+    }
+
+    #[test]
+    fn resolved_policy_per_repo_entries_round_trip() {
+        let resolved = ResolvedPolicy {
+            identity: None,
+            sources: vec![],
+            repositories: vec![
+                ResolvedPolicyRepository {
+                    repository: RepositoryRef {
+                        kind: RepositoryKind::Repository,
+                        name: "nas".into(),
+                        namespace: None,
+                    },
+                    identity: Some(crate::common::ResolvedIdentity {
+                        username: "pg".into(),
+                        hostname: "billing".into(),
+                        source_path: None,
+                    }),
+                },
+                ResolvedPolicyRepository {
+                    repository: RepositoryRef {
+                        kind: RepositoryKind::ClusterRepository,
+                        name: "offsite".into(),
+                        namespace: None,
+                    },
+                    // Unresolvable member: entry present, identity elided.
+                    identity: None,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&resolved).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "repositories": [
+                    {
+                        "repository": { "kind": "Repository", "name": "nas" },
+                        "identity": { "username": "pg", "hostname": "billing" },
+                    },
+                    { "repository": { "kind": "ClusterRepository", "name": "offsite" } },
+                ],
+            })
+        );
+        let decoded: ResolvedPolicy = serde_json::from_value(wire).expect("decodes");
+        assert_eq!(decoded, resolved);
+    }
 
     #[test]
     fn snapshot_policy_crd_metadata_is_correct() {
@@ -1728,6 +1883,78 @@ preflight:
             .find(|c| c["name"] == "Last-Verified")
             .expect("Last-Verified column");
         assert_eq!(col["jsonPath"], ".status.lastVerified");
+    }
+
+    #[test]
+    fn snapshot_policy_has_repositories_summary_column() {
+        // #368 B1: the REPOSITORIES column renders status.repositorySummary so a
+        // multi-repo policy (whose `.spec.repository.name` column is empty) still
+        // names its targets in `kubectl get`.
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .expect("printer columns");
+        let col = cols
+            .iter()
+            .find(|c| c["name"] == "Repositories")
+            .expect("Repositories column");
+        assert_eq!(col["jsonPath"], ".status.repositorySummary");
+    }
+
+    #[test]
+    fn status_verification_fields_elide_when_empty_and_roundtrip() {
+        // The golden-byte contract for every new Vec/map status field (#368):
+        // an empty `verification` / `verificationStamps` / absent
+        // `repositorySummary` must emit NOTHING, so a single-repo policy's
+        // status wire is byte-identical to pre-feature operators.
+        let bare = SnapshotPolicyStatus::default();
+        let json = serde_json::to_value(&bare).expect("serialize");
+        assert!(json.get("verification").is_none(), "empty vec must elide");
+        assert!(
+            json.get("verificationStamps").is_none(),
+            "empty map must elide"
+        );
+        assert!(
+            json.get("repositorySummary").is_none(),
+            "absent summary must elide"
+        );
+
+        // Populated: parse the cluster's way and round-trip.
+        let status: SnapshotPolicyStatus = serde_json::from_value(serde_json::json!({
+            "lastVerified": "2026-08-01T00:00:00Z",
+            "repositorySummary": "nas, offsite",
+            "verification": [
+                {
+                    "repository": { "kind": "Repository", "name": "nas", "namespace": "backups" },
+                    "lastVerified": "2026-08-01T00:00:00Z"
+                },
+                { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            ],
+            "verificationStamps": {
+                "Repository/backups/nas": "2026-08-01T00:00:00Z"
+            }
+        }))
+        .expect("status parses");
+        assert_eq!(status.verification.len(), 2);
+        assert_eq!(
+            status.verification[0].last_verified.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert!(status.verification[1].last_verified.is_none());
+        assert_eq!(
+            status
+                .verification_stamps
+                .get("Repository/backups/nas")
+                .map(String::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+        let out = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(
+            out["verification"][0]["repository"]["name"], "nas",
+            "camelCase wire shape"
+        );
+        assert_eq!(out["repositorySummary"], "nas, offsite");
     }
 
     #[test]

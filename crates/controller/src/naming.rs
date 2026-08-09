@@ -27,6 +27,17 @@ pub fn short_hash(s: &str) -> String {
     format!("{:08x}", (fnv1a(s) & 0xffff_ffff))
 }
 
+/// The stable 6-hex per-repository tag used by multi-repo verify Job names
+/// (`<policy>-vfy-<q|d>-<r6>-<unix>`) and the [`crate::consts::VERIFY_REPO_LABEL`]
+/// value: [`short_hash`] over the normalized repo key
+/// ([`kopiur_api::common::repo_key`]), truncated to 6. Six hex disambiguates a
+/// policy's ≤8 repositories with room to spare (same budget reasoning as
+/// `kopiur_api::expand::cache_pvc_name`'s h6) while keeping the Job-name slug
+/// legible; label-safe where the raw `Kind/ns/name` key is not.
+pub fn repo_tag6(repo_key: &str) -> String {
+    short_hash(repo_key).chars().take(6).collect()
+}
+
 /// 64-bit FNV-1a over the string's bytes.
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -74,5 +85,23 @@ mod tests {
         // Same reasoning: maintenance/verify/replication Job names embed this
         // hash when the CR name exceeds the budget. Pin a literal.
         assert_eq!(short_hash("postgres-data"), "5a5d7a49");
+    }
+
+    // --- repo_tag6 ------------------------------------------------------------
+
+    #[test]
+    fn repo_tag6_is_pinned_stable_and_label_safe() {
+        // Names on-cluster Jobs and rides a label value: pin a literal so an
+        // algorithm change can never silently rename verify slots on upgrade.
+        let tag = repo_tag6("Repository/backups/nas");
+        assert_eq!(tag, &short_hash("Repository/backups/nas")[..6]);
+        assert_eq!(tag.len(), 6);
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(tag, repo_tag6("Repository/backups/nas"), "deterministic");
+        assert_ne!(
+            tag,
+            repo_tag6("ClusterRepository/nas"),
+            "distinct repos stay distinct"
+        );
     }
 }

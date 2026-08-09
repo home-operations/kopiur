@@ -880,10 +880,15 @@ impl Metrics {
                 )
                 .with_callback(move |o| {
                     for h in policy_backup_health(&snapshots.state()) {
-                        let attrs = [
+                        let mut attrs = vec![
                             KeyValue::new("namespace", h.namespace.clone()),
                             KeyValue::new("policy", h.policy.clone()),
                         ];
+                        // Per-repo health for multi-repo fan-out rows (#368,
+                        // audit M3); legacy rows keep the exact two-label set.
+                        if let Some(repo) = &h.repository {
+                            attrs.push(KeyValue::new("repository", repo.clone()));
+                        }
                         o.observe(i64::from(h.healthy), &attrs);
                     }
                 })
@@ -964,7 +969,7 @@ impl Metrics {
                 )
                 .with_callback(move |o| {
                     for p in policy_snapshot_counts(&snapshots.state()) {
-                        o.observe(p.consecutive_failures, &ns_name(&p.namespace, &p.policy));
+                        o.observe(p.consecutive_failures, &policy_population_attrs(&p));
                     }
                 })
                 .build();
@@ -983,7 +988,7 @@ impl Metrics {
                 )
                 .with_callback(move |o| {
                     for p in policy_snapshot_counts(&snapshots.state()) {
-                        o.observe(p.live, &ns_name(&p.namespace, &p.policy));
+                        o.observe(p.live, &policy_population_attrs(&p));
                     }
                 })
                 .build();
@@ -1516,12 +1521,44 @@ fn snapshot_stat_attrs(s: &Snapshot) -> Vec<KeyValue> {
     attrs
 }
 
-/// Attributes for a per-policy "latest" series: `namespace`, `policy`.
-fn policy_attrs(p: &PolicyLatest) -> [KeyValue; 2] {
-    [
+/// Attributes for the store-backed per-policy population gauges
+/// (`kopiur_snapshots_live` / `kopiur_snapshot_consecutive_failures`):
+/// `namespace`/`name` for series continuity with the old sync gauges, plus
+/// `repository` only for a repo-pinned (multi-repo) group.
+fn policy_population_attrs(p: &PolicySnapshots) -> Vec<KeyValue> {
+    let mut attrs = ns_name(&p.namespace, &p.policy).to_vec();
+    if let Some(repo) = &p.repository {
+        attrs.push(KeyValue::new("repository", repo.clone()));
+    }
+    attrs
+}
+
+/// The mint-time repository pin of a Snapshot, as the normalized repo key —
+/// the per-repo metrics dimension (#368). `Some` ONLY when the row carries a
+/// `spec.repository` pin, which only multi-repo fan-out children (and
+/// replication copies, which have no `policyRef` and never reach the policy
+/// families) do — so every legacy row yields `None` and its series keep their
+/// exact pre-feature label sets.
+fn snapshot_repo_pin(s: &Snapshot) -> Option<String> {
+    s.spec
+        .repository
+        .as_ref()
+        .map(|pin| kopiur_api::common::repo_key(pin, &s.namespace().unwrap_or_default()))
+}
+
+/// Attributes for a per-policy "latest" series: `namespace`, `policy`, and —
+/// only for a repo-pinned (multi-repo) group — `repository`. A `Vec` rather
+/// than the old fixed `[KeyValue; 2]` (audit M4) so the optional dimension
+/// can exist at all; unpinned groups emit exactly the legacy two-label set.
+fn policy_attrs(p: &PolicyLatest) -> Vec<KeyValue> {
+    let mut attrs = vec![
         KeyValue::new("namespace", p.namespace.clone()),
         KeyValue::new("policy", p.policy.clone()),
-    ]
+    ];
+    if let Some(repo) = &p.repository {
+        attrs.push(KeyValue::new("repository", repo.clone()));
+    }
+    attrs
 }
 
 /// File count for a Snapshot's stats, preserving the "unknown != 0" rule: `Some`
@@ -1574,11 +1611,17 @@ fn snapshot_success_unix(s: &Snapshot) -> Option<i64> {
         .and_then(parse_unix_seconds)
 }
 
-/// The latest successful backup for one (namespace, policy) group.
+/// The latest successful backup for one (namespace, policy[, repository])
+/// group. `repository` is the mint-time spec pin ([`snapshot_repo_pin`]):
+/// `Some` only for a multi-repo fan-out group, `None` for every legacy row —
+/// which is what keeps single-repo series byte-identical while a multi-repo
+/// policy reports the latest backup PER REPOSITORY (interleaved per-repo runs
+/// would otherwise make one flat "latest" flap between repos, audit M3).
 #[derive(Debug, Clone, PartialEq)]
 struct PolicyLatest {
     namespace: String,
     policy: String,
+    repository: Option<String>,
     /// `status.timing.endTime` (unix seconds) of the winning Snapshot.
     end_unix: i64,
     duration_seconds: Option<i64>,
@@ -1593,7 +1636,7 @@ struct PolicyLatest {
 /// off-cluster. Output is sorted by (namespace, policy) for deterministic tests.
 fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
     use std::collections::HashMap;
-    let mut best: HashMap<(String, String), PolicyLatest> = HashMap::new();
+    let mut best: HashMap<(String, String, Option<String>), PolicyLatest> = HashMap::new();
     for s in snapshots {
         let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
             continue;
@@ -1632,15 +1675,17 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
             continue;
         };
         let namespace = s.namespace().unwrap_or_default();
+        let repository = snapshot_repo_pin(s);
         let candidate = PolicyLatest {
             namespace: namespace.clone(),
             policy: policy.clone(),
+            repository: repository.clone(),
             end_unix,
             duration_seconds: status.timing.as_ref().and_then(|t| t.duration_seconds),
             size_bytes: status.stats.as_ref().and_then(|st| st.size_bytes),
             files: status.stats.as_ref().and_then(snapshot_file_count),
         };
-        best.entry((namespace, policy))
+        best.entry((namespace, policy, repository))
             .and_modify(|cur| {
                 if candidate.end_unix > cur.end_unix {
                     *cur = candidate.clone();
@@ -1650,7 +1695,11 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
     }
     let mut out: Vec<PolicyLatest> = best.into_values().collect();
     out.sort_by(|a, b| {
-        (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
+        (a.namespace.as_str(), a.policy.as_str(), &a.repository).cmp(&(
+            b.namespace.as_str(),
+            b.policy.as_str(),
+            &b.repository,
+        ))
     });
     out
 }
@@ -1660,6 +1709,11 @@ fn latest_per_policy(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyLatest> {
 struct PolicyHealth {
     namespace: String,
     policy: String,
+    /// The mint-time spec pin ([`snapshot_repo_pin`]): per-repo health for a
+    /// multi-repo fan-out (audit M3 — interleaved per-repo results would
+    /// otherwise flap one flat health bit, so a permanently-failing repo B
+    /// among repo A successes could never alert). `None` for legacy rows.
+    repository: Option<String>,
     /// `true` when the latest terminal (Succeeded/Failed) Snapshot for this policy
     /// is Succeeded.
     healthy: bool,
@@ -1681,8 +1735,10 @@ struct PolicyHealth {
 /// the reduction is unit-tested off-cluster; output sorted for deterministic tests.
 fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
     use std::collections::HashMap;
-    // (ns, policy) -> (creation_unix of the winning terminal snapshot, healthy).
-    let mut best: HashMap<(String, String), (i64, bool)> = HashMap::new();
+    // (ns, policy, repo pin) -> (creation_unix of the winning terminal
+    // snapshot, healthy). The pin dimension keeps each repository's health
+    // independent (audit M3); legacy unpinned rows all share the `None` group.
+    let mut best: HashMap<(String, String, Option<String>), (i64, bool)> = HashMap::new();
     for s in snapshots {
         let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
             continue;
@@ -1716,7 +1772,7 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
             .map(|t| t.0.as_second())
             .unwrap_or(0);
         let namespace = s.namespace().unwrap_or_default();
-        best.entry((namespace, policy))
+        best.entry((namespace, policy, snapshot_repo_pin(s)))
             .and_modify(|cur| {
                 if created >= cur.0 {
                     *cur = (created, healthy);
@@ -1726,14 +1782,21 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
     }
     let mut out: Vec<PolicyHealth> = best
         .into_iter()
-        .map(|((namespace, policy), (_, healthy))| PolicyHealth {
-            namespace,
-            policy,
-            healthy,
-        })
+        .map(
+            |((namespace, policy, repository), (_, healthy))| PolicyHealth {
+                namespace,
+                policy,
+                repository,
+                healthy,
+            },
+        )
         .collect();
     out.sort_by(|a, b| {
-        (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
+        (a.namespace.as_str(), a.policy.as_str(), &a.repository).cmp(&(
+            b.namespace.as_str(),
+            b.policy.as_str(),
+            &b.repository,
+        ))
     });
     out
 }
@@ -1744,6 +1807,12 @@ fn policy_backup_health(snapshots: &[Arc<Snapshot>]) -> Vec<PolicyHealth> {
 struct PolicySnapshots {
     namespace: String,
     policy: String,
+    /// The mint-time spec pin ([`snapshot_repo_pin`]): per-repo streaks for a
+    /// multi-repo fan-out (audit M3 — with one flat group, repo A's
+    /// interleaved successes RESET the streak repo B's failures were building,
+    /// so a permanently-failing repo B never crossed the `>= 3` alert). `None`
+    /// for legacy rows, whose flat group is unchanged.
+    repository: Option<String>,
     /// Snapshot CRs currently carrying this policy's `spec.policyRef`.
     live: i64,
     /// Trailing Failed streak before the latest Succeeded terminal backup
@@ -1758,21 +1827,26 @@ struct PolicySnapshots {
 /// for deterministic tests.
 fn policy_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<PolicySnapshots> {
     use std::collections::HashMap;
-    let mut groups: HashMap<(String, String), Vec<&Snapshot>> = HashMap::new();
+    let mut groups: HashMap<(String, String, Option<String>), Vec<&Snapshot>> = HashMap::new();
     for s in snapshots {
         let Some(policy) = s.spec.policy_ref.as_ref().map(|p| p.name.clone()) else {
             continue;
         };
         groups
-            .entry((s.namespace().unwrap_or_default(), policy))
+            .entry((
+                s.namespace().unwrap_or_default(),
+                policy,
+                snapshot_repo_pin(s),
+            ))
             .or_default()
             .push(s.as_ref());
     }
     let mut out: Vec<PolicySnapshots> = groups
         .into_iter()
-        .map(|((namespace, policy), group)| PolicySnapshots {
+        .map(|((namespace, policy, repository), group)| PolicySnapshots {
             namespace,
             policy,
+            repository,
             live: group.len() as i64,
             consecutive_failures: crate::snapshot_policy::consecutive_failures(
                 group.iter().copied(),
@@ -1780,7 +1854,11 @@ fn policy_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<PolicySnapshots> {
         })
         .collect();
     out.sort_by(|a, b| {
-        (a.namespace.as_str(), a.policy.as_str()).cmp(&(b.namespace.as_str(), b.policy.as_str()))
+        (a.namespace.as_str(), a.policy.as_str(), &a.repository).cmp(&(
+            b.namespace.as_str(),
+            b.policy.as_str(),
+            &b.repository,
+        ))
     });
     out
 }
@@ -2415,16 +2493,19 @@ mod tests {
                 PolicyHealth {
                     namespace: "apps".into(),
                     policy: "a".into(),
+                    repository: None,
                     healthy: false
                 },
                 PolicyHealth {
                     namespace: "apps".into(),
                     policy: "b".into(),
+                    repository: None,
                     healthy: true
                 },
                 PolicyHealth {
                     namespace: "apps".into(),
                     policy: "c".into(),
+                    repository: None,
                     healthy: true
                 },
             ]
@@ -2432,6 +2513,189 @@ mod tests {
         // The user's question: "how many of my policies are OK?" — a count of states,
         // NOT a run count (which would grow with every scheduled fire).
         assert_eq!(health.iter().filter(|h| h.healthy).count(), 2);
+    }
+
+    /// A pinned (multi-repo fan-out) Snapshot: `snapshot_cr` plus the
+    /// mint-time `spec.repository` pin and an explicit creationTimestamp (the
+    /// health reduction orders by creation).
+    fn pinned_snapshot(
+        name: &str,
+        policy: &str,
+        repo: &str,
+        phase: &str,
+        created: &str,
+        end_time: &str,
+    ) -> Snapshot {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Snapshot",
+            "metadata": { "name": name, "namespace": "apps", "creationTimestamp": created },
+            "spec": {
+                "policyRef": { "name": policy },
+                "repository": { "kind": "Repository", "name": repo, "namespace": "apps" },
+            },
+            "status": {
+                "phase": phase,
+                "timing": { "endTime": end_time, "durationSeconds": 1 },
+                "stats": { "sizeBytes": 10 },
+            },
+        }))
+        .expect("valid Snapshot")
+    }
+
+    #[test]
+    fn policy_attrs_unpinned_series_are_byte_identical_legacy_sets() {
+        // The #368 continuity contract: an UNPINNED group's attribute set is
+        // EXACTLY the legacy pair — same labels, same order, nothing appended —
+        // so every existing single-repo series keeps its identity. A pinned
+        // group appends `repository` and nothing else.
+        let legacy = PolicyLatest {
+            namespace: "apps".into(),
+            policy: "daily".into(),
+            repository: None,
+            end_unix: 1,
+            duration_seconds: None,
+            size_bytes: None,
+            files: None,
+        };
+        let attrs = policy_attrs(&legacy);
+        assert_eq!(
+            attrs,
+            vec![
+                KeyValue::new("namespace", "apps"),
+                KeyValue::new("policy", "daily"),
+            ],
+            "unpinned attr set must be byte-identical to the pre-#368 pair"
+        );
+        let pinned = PolicyLatest {
+            repository: Some("Repository/apps/nas".into()),
+            ..legacy
+        };
+        assert_eq!(
+            policy_attrs(&pinned),
+            vec![
+                KeyValue::new("namespace", "apps"),
+                KeyValue::new("policy", "daily"),
+                KeyValue::new("repository", "Repository/apps/nas"),
+            ]
+        );
+        // Same contract for the population gauges' {namespace, name} sets.
+        let pop = PolicySnapshots {
+            namespace: "apps".into(),
+            policy: "daily".into(),
+            repository: None,
+            live: 1,
+            consecutive_failures: 0,
+        };
+        assert_eq!(
+            policy_population_attrs(&pop),
+            vec![
+                KeyValue::new("namespace", "apps"),
+                KeyValue::new("name", "daily"),
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_b_failure_streak_survives_interleaved_repo_a_successes() {
+        // Audit M3's interleaved-reset bug: with one flat per-policy group,
+        // repo A's successes RESET the consecutive-failure streak repo B's
+        // failures were building, so a permanently-failing repo B never crossed
+        // the `>= 3` alert threshold. Per-(policy, repo-pin) grouping keeps
+        // the streaks independent — this fails on the flat grouping.
+        let t = |h: u32| format!("2026-08-05T{h:02}:00:00Z");
+        let mut rows: Vec<Arc<Snapshot>> = Vec::new();
+        for (i, h) in (1..=6).enumerate() {
+            let (repo, phase) = if h % 2 == 1 {
+                ("nas", "Succeeded")
+            } else {
+                ("offsite", "Failed")
+            };
+            rows.push(Arc::new(pinned_snapshot(
+                &format!("r{i}"),
+                "daily",
+                repo,
+                phase,
+                &t(h),
+                &t(h),
+            )));
+        }
+        let counts = policy_snapshot_counts(&rows);
+        let by_repo = |name: &str| {
+            counts
+                .iter()
+                .find(|p| p.repository.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing group for {name}: {counts:?}"))
+        };
+        assert_eq!(
+            by_repo("Repository/apps/offsite").consecutive_failures,
+            3,
+            "repo B's streak must accumulate despite repo A's interleaved successes"
+        );
+        assert_eq!(by_repo("Repository/apps/nas").consecutive_failures, 0);
+        // ...and per-repo HEALTH is independent too: B unhealthy, A healthy.
+        let health = policy_backup_health(&rows);
+        let healthy_of = |name: &str| {
+            health
+                .iter()
+                .find(|h| h.repository.as_deref() == Some(name))
+                .unwrap()
+                .healthy
+        };
+        assert!(healthy_of("Repository/apps/nas"));
+        assert!(!healthy_of("Repository/apps/offsite"));
+    }
+
+    #[test]
+    fn pinned_rows_gain_repository_label_and_unpinned_series_stay_unlabeled() {
+        // End-to-end through the exporter: a pinned row's per-policy series
+        // carry `repository="…"`; an unpinned legacy row's series carry NO
+        // repository label at all (series-identity continuity).
+        let m = Metrics::new();
+        let snaps = make_store(vec![
+            snapshot_cr(
+                "apps",
+                "legacy-1",
+                Some("legacy"),
+                succeeded_status(100, 10, END_TIME),
+            ),
+            pinned_snapshot(
+                "fan-1",
+                "fan",
+                "nas",
+                "Succeeded",
+                "2026-05-25T00:00:00Z",
+                END_TIME,
+            ),
+        ]);
+        let (_, repos, crepos, restores) = empty_stores();
+        let text = gather_with(
+            &m,
+            ResourceStores {
+                snapshots: snaps.0,
+                repositories: repos.0,
+                cluster_repositories: crepos.0,
+                restores: restores.0,
+            },
+        );
+        let line = |policy: &str| -> &str {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("kopiur_policy_last_backup_success_timestamp_seconds{")
+                        && l.contains(&format!("policy=\"{policy}\""))
+                })
+                .unwrap_or_else(|| panic!("missing series for {policy}: {text}"))
+        };
+        assert!(
+            line("fan").contains("repository=\"Repository/apps/nas\""),
+            "pinned: {}",
+            line("fan")
+        );
+        assert!(
+            !line("legacy").contains("repository="),
+            "unpinned series must stay label-free: {}",
+            line("legacy")
+        );
     }
 
     #[test]

@@ -169,6 +169,14 @@ impl CredsPrefix {
     pub fn verification(policy: &str) -> Self {
         Self(format!("{policy}-vfy"))
     }
+    /// Per-repository verify mover of a MULTI-repo `SnapshotPolicy` (#368):
+    /// `{policy}-vfy-{r6}` with `r6` = [`crate::naming::repo_tag6`] over the
+    /// normalized repo key, so the N concurrent per-repo verifies never share
+    /// a projected-Secret name for different repositories. The single-repo
+    /// shape keeps [`Self::verification`]'s byte-identical prefix.
+    pub fn verification_for_repo(policy: &str, repo6: &str) -> Self {
+        Self(format!("{policy}-vfy-{repo6}"))
+    }
     /// Replication mover of a `RepositoryReplication` (never projects today;
     /// the slug exists so a future opt-in cannot collide — the cleanup GETs
     /// under this prefix are guaranteed misses, an accepted per-run cost).

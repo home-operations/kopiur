@@ -3274,6 +3274,24 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
         "snapshot_schedule::schedule_ready_status (computed polarity)",
     ),
+    // `snapshot_schedule::schedule_ready_status` (fire passes), which asserts
+    // BOTH polarities so a slot that mints fully clears the gate. Promoted into
+    // the registry by the #368 M10 gates/doctor checklist.
+    (
+        crate::consts::SCHEDULE_FANOUT_CAPPED_CONDITION,
+        true,
+        crate::consts::FANOUT_TOO_LARGE_REASON,
+        "snapshot_schedule::schedule_ready_status fan-out cap (computed polarity)",
+    ),
+    // `snapshot_policy::policy_ready_conditions`, via
+    // io::upsert_gate(&POLICY_REPOSITORY_NOT_READY_GATE, …) on the not-ready
+    // side; the all-ready side clears it (True) when present.
+    (
+        crate::consts::REPOSITORIES_READY_CONDITION,
+        false,
+        crate::consts::REPOSITORY_NOT_READY_REASON,
+        "snapshot_policy::policy_ready_conditions (upsert_gate)",
+    ),
 ];
 
 #[test]

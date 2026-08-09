@@ -186,6 +186,13 @@ allow:
     reason: >-
       Never written; lastSchedule/nextSchedule ARE written and read, only the
       success variant was left unwired..
+  - path: SnapshotPolicy.status.repositorySummary
+    reason: >-
+      Status OUTPUT, not input: written every reconcile by
+      controller/src/snapshot_policy.rs::final_status_body (as the merge-patch
+      JSON key) solely to back the `Repositories` CRD print column (#368 B1) —
+      its consumer is `kubectl get snapshotpolicies`, not a Rust crate. No
+      controller behavior may ever key off it.
 
   # ==========================================================================
   # (d) The two shipped bugs this ratchet exists to prevent. Drained by the

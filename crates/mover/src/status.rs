@@ -553,23 +553,47 @@ impl StatusUpdate {
     }
 }
 
-/// `{ "status": ... }` body for a successful verification: stamp `lastVerified`
-/// and a `Verified=True` condition.
-pub fn verify_ok_body(tier: &str, now: &chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+/// `{ "status": ... }` body for a successful verification.
+///
+/// `repository_key: None` (the classic single-repo flow): stamp the flat
+/// `lastVerified` and a `Verified=True` condition — byte-identical to every
+/// prior operator.
+///
+/// `repository_key: Some(key)` (a multi-repository policy's per-repo verify,
+/// #368): stamp ONLY `verificationStamps[<key>]`. A JSON merge patch merges
+/// *map keys* but replaces *arrays*, so the entry-keyed map is what lets two
+/// concurrent per-repo verifies land without clobbering each other — writing
+/// the flat field or the `status.verification` Vec from here would lose one
+/// repo's result (and the flat field's multi-repo meaning is the controller's
+/// MIN across repos, which one mover cannot compute). No condition either:
+/// the conditions array is replace-on-merge, so concurrent per-repo writers
+/// must not touch it — the controller folds the stamps and owns conditions.
+pub fn verify_ok_body(
+    tier: &str,
+    repository_key: Option<&str>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    serde_json::json!({
-        "status": {
-            "lastVerified": ts,
-            "conditions": [{
-                "type": "Verified",
-                "status": "True",
-                "reason": "VerificationSucceeded",
-                "message": format!("{tier} verification succeeded"),
-                "lastTransitionTime": ts,
-                "observedGeneration": 0,
-            }],
-        }
-    })
+    match repository_key {
+        None => serde_json::json!({
+            "status": {
+                "lastVerified": ts,
+                "conditions": [{
+                    "type": "Verified",
+                    "status": "True",
+                    "reason": "VerificationSucceeded",
+                    "message": format!("{tier} verification succeeded"),
+                    "lastTransitionTime": ts,
+                    "observedGeneration": 0,
+                }],
+            }
+        }),
+        Some(key) => serde_json::json!({
+            "status": {
+                "verificationStamps": { key: ts },
+            }
+        }),
+    }
 }
 
 /// `{ "status": ... }` body for a failed verification: a `Verified=False` condition.
@@ -1610,5 +1634,78 @@ mod tests {
         assert_eq!(body["status"]["ownership"]["owner"], "other/owner");
         assert_eq!(body["status"]["conditions"][0]["status"], "False");
         assert_eq!(body["status"]["conditions"][0]["type"], "LeaseOwned");
+    }
+
+    // --- §4 verify status bodies (single-repo flat vs #368 entry-keyed) -------
+
+    #[test]
+    fn verify_ok_body_single_repo_stays_flat_and_byte_identical() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let body = verify_ok_body("quick", None, &now);
+        assert_eq!(body["status"]["lastVerified"], "2026-08-01T00:00:00+00:00");
+        assert_eq!(body["status"]["conditions"][0]["type"], "Verified");
+        assert_eq!(body["status"]["conditions"][0]["status"], "True");
+        assert!(
+            body["status"].get("verificationStamps").is_none(),
+            "single-repo must never write the multi-repo stamp map"
+        );
+    }
+
+    #[test]
+    fn verify_ok_body_multi_repo_writes_only_its_own_stamp_key() {
+        let now = chrono::Utc::now();
+        let body = verify_ok_body("deep", Some("Repository/backups/nas"), &now);
+        let stamps = &body["status"]["verificationStamps"];
+        assert!(stamps["Repository/backups/nas"].is_string());
+        assert!(
+            body["status"].get("lastVerified").is_none(),
+            "multi-repo flat lastVerified is the controller's MIN, never a mover write"
+        );
+        assert!(
+            body["status"].get("conditions").is_none(),
+            "the conditions array is replace-on-merge; concurrent per-repo \
+             writers must not touch it"
+        );
+    }
+
+    /// THE race the entry-keyed design exists for: two per-repo verify movers
+    /// finish concurrently and both merge-patch the policy status. A JSON merge
+    /// patch (RFC 7396) merges OBJECT keys but replaces ARRAYS wholesale, so
+    /// stamping a Vec would lose whichever repo patched first; the map keeps
+    /// both. Simulated with a real RFC 7396 apply in either order.
+    #[test]
+    fn concurrent_per_repo_stamps_both_survive_merge_patching() {
+        fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+            // RFC 7396.
+            if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+                for (k, v) in p {
+                    if v.is_null() {
+                        t.remove(k);
+                    } else if v.is_object() && t.get(k).is_some_and(|c| c.is_object()) {
+                        merge(t.get_mut(k).unwrap(), v);
+                    } else {
+                        t.insert(k.clone(), v.clone());
+                    }
+                }
+            } else {
+                *target = patch.clone();
+            }
+        }
+        let now = chrono::Utc::now();
+        let a = verify_ok_body("quick", Some("Repository/backups/nas"), &now);
+        let b = verify_ok_body("deep", Some("ClusterRepository/offsite"), &now);
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            let mut status = serde_json::json!({});
+            merge(&mut status, first);
+            merge(&mut status, second);
+            let stamps = &status["status"]["verificationStamps"];
+            assert!(
+                stamps["Repository/backups/nas"].is_string()
+                    && stamps["ClusterRepository/offsite"].is_string(),
+                "both concurrent stamps must survive in either order: {status}"
+            );
+        }
     }
 }

@@ -1358,6 +1358,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
                 file_queue_length: None,
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
+            repository_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -1391,6 +1392,11 @@ fn verify_quick_roundtrip_and_wire_shape() {
         v["operation"]["verify"]["successExpr"],
         "stats.files > 0 && stats.errors == 0"
     );
+    // Single-repo golden byte: no repositoryKey key at all when None.
+    assert!(
+        v["operation"]["verify"].get("repositoryKey").is_none(),
+        "repository_key: None must elide"
+    );
     // The quick tier maps to the kopia client VerifyOptions.
     if let Operation::Verify(op) = &spec.operation {
         assert_eq!(op.tier.kind_str(), "quick");
@@ -1417,6 +1423,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
                 parallel: None,
             }),
             success_expr: None,
+            repository_key: Some("Repository/backups/nas".into()),
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -1440,6 +1447,11 @@ fn verify_deep_roundtrip_and_wire_shape() {
     assert_eq!(
         v["operation"]["verify"]["tier"]["deep"]["snapshotId"],
         "k99"
+    );
+    // Multi-repo: the per-repo key rides the wire camelCased.
+    assert_eq!(
+        v["operation"]["verify"]["repositoryKey"],
+        "Repository/backups/nas"
     );
     if let Operation::Verify(op) = &spec.operation {
         assert_eq!(op.tier.kind_str(), "deep");

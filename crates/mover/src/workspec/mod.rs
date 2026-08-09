@@ -1287,6 +1287,14 @@ pub struct VerifyOp {
     /// Validated at admission; when set and it evaluates `false`, the run fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_expr: Option<String>,
+    /// The normalized repository key (`kopiur_api::common::repo_key`) this run
+    /// verifies, set ONLY for a multi-repository policy (#368): the mover then
+    /// stamps its success into `status.verificationStamps[<key>]` (an
+    /// entry-keyed merge-patch, so concurrent per-repo verifies never clobber)
+    /// instead of the flat `status.lastVerified`. `None` = the classic
+    /// single-repo flow, whose status write stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
 }
 
 /// Payload for a repository-replication run (ADR-0005 §13(d)). The mover connects

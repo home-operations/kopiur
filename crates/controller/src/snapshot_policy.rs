@@ -290,6 +290,108 @@ pub fn repository_pin_backfill_patches(backups: &[Snapshot]) -> Vec<(String, ser
         .collect()
 }
 
+/// **Pure.** Restrict a prune-execution set to rows the reconciler can act on
+/// while part of a multi-repo policy's fleet is down (#368 M10).
+///
+/// `all_ready` short-circuits to the full set — which is every single-repo
+/// pass that reaches pruning at all (a not-ready single repo parks earlier),
+/// so the classic shape is byte-identical. With a not-ready subset, only rows
+/// whose mint-time pin (`spec.repository`) names a READY repository execute: a
+/// delete fires the Snapshot finalizer, which contacts the row's repository —
+/// against a down repo that just parks the row in `Deleting`. Unpinned rows
+/// (pre-fan-out history whose repository is not knowable from the spec) are
+/// deferred too, conservatively. Deferred rows are simply re-selected by the
+/// next pass once their repository recovers — GFS selection is deterministic.
+fn executable_prunes(
+    selected: Vec<String>,
+    backups: &[Snapshot],
+    ready_keys: &std::collections::BTreeSet<String>,
+    all_ready: bool,
+) -> Vec<String> {
+    if all_ready {
+        return selected;
+    }
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &Snapshot> = backups
+        .iter()
+        .filter_map(|b| b.metadata.name.as_deref().map(|n| (n, b)))
+        .collect();
+    selected
+        .into_iter()
+        .filter(|name| {
+            by_name.get(name.as_str()).is_some_and(|b| {
+                b.spec.repository.as_ref().is_some_and(|pin| {
+                    let ns = b.namespace().unwrap_or_default();
+                    ready_keys.contains(&kopiur_api::common::repo_key(pin, &ns))
+                })
+            })
+        })
+        .collect()
+}
+
+/// **Pure.** The actionable message for the `RepositoriesReady=False` gate,
+/// naming every not-ready repository. Deterministic (spec order) so the guarded
+/// status write stays a no-op while the outage persists.
+fn policy_repo_gate_message(not_ready_keys: &[String]) -> String {
+    format!(
+        "repository(ies) not Ready: {} — backups, retention, adoption and verification \
+         against them are deferred until they recover (the ready subset keeps processing)",
+        not_ready_keys.join(", ")
+    )
+}
+
+/// **Pure.** The `status.repositorySummary` print-column value (#368 B1): the
+/// comma-joined repository names — the one name for the single-repo shape —
+/// capped near a kubectl column width with a ` +N` overflow marker.
+pub fn repository_summary_string(names: &[&str]) -> String {
+    const CAP: usize = 63;
+    let mut out = String::new();
+    let mut included = 0usize;
+    for (i, n) in names.iter().enumerate() {
+        let candidate = if out.is_empty() {
+            (*n).to_string()
+        } else {
+            format!("{out}, {n}")
+        };
+        let remaining_after = names.len() - i - 1;
+        let suffix = if remaining_after > 0 {
+            format!(" +{remaining_after}").len()
+        } else {
+            0
+        };
+        // The first name always renders (a DNS-1123 name fits the cap alone).
+        if i > 0 && candidate.len() + suffix > CAP {
+            break;
+        }
+        out = candidate;
+        included = i + 1;
+    }
+    let more = names.len() - included;
+    if more > 0 {
+        format!("{out} +{more}")
+    } else {
+        out
+    }
+}
+
+/// **Pure.** Whether THIS repository holds a verifiable snapshot from this
+/// policy — the per-repo #168 verification-gate input for the multi-repo
+/// shape: a retention-visible (`Succeeded` + provenance) row whose mint-time
+/// pin names the repository. Unpinned successes (pre-fan-out history) count
+/// for NO repo — their repository is not knowable from the spec, and unlocking
+/// a repo with no snapshot would only mint a mover Job that fails "no snapshot
+/// to verify"; the spec-pin backfill converges old rows onto pins quickly, and
+/// the discovered-row probe covers adopted repositories meanwhile.
+fn multi_repo_has_success(backups: &[Snapshot], repo_key: &str) -> bool {
+    backups.iter().any(|b| {
+        retention_view(b).is_some()
+            && b.spec.repository.as_ref().is_some_and(|pin| {
+                let ns = b.namespace().unwrap_or_default();
+                kopiur_api::common::repo_key(pin, &ns) == repo_key
+            })
+    })
+}
+
 /// The terminal ordering key for a Snapshot: `status.timing.endTime`, falling
 /// back to `metadata.creationTimestamp`.
 fn snapshot_end_or_creation(b: &Snapshot) -> Option<DateTime<Utc>> {
@@ -805,19 +907,20 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         });
     }
     // status.resolved mirror: the single-repo shape pins its one resolution,
-    // exactly as before. For a multi-repo policy the honest mirror is the
-    // per-repo `ResolvedPolicy.repositories` wire (lands M9/M10) — until then
-    // NOTHING is pinned rather than silently mirroring repository #1's identity
-    // as "the" identity.
-    if let (false, Some(single)) = (is_multi, targets.first()) {
-        io::patch_status_if_changed(
-            &api,
-            &name,
-            current.as_ref(),
-            serde_json::json!({ "resolved": single.resolved }),
-        )
-        .await?;
-    }
+    // exactly as before (byte-identical wire — `repositories` elides empty).
+    // A multi-repo policy mirrors the per-repo `ResolvedPolicy.repositories`
+    // wire (#368 M9/M10): one entry per member carrying the identity resolved
+    // under THAT repository's `identityDefaults` — the admission fork guard's
+    // per-repo baseline — with the top-level `identity` deliberately absent
+    // rather than silently mirroring repository #1's identity as "the" identity.
+    let resolved_mirror = resolved_policy_mirror(is_multi, &targets);
+    io::patch_status_if_changed(
+        &api,
+        &name,
+        current.as_ref(),
+        serde_json::json!({ "resolved": resolved_mirror }),
+    )
+    .await?;
 
     // LIST this policy's Snapshots BEFORE the repository-readiness gate below:
     // retention (further down) needs the population even while the repository is
@@ -831,31 +934,55 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
     let backups = backup_api.list(&lp).await?.items;
 
-    // §2 dependent gating: a SnapshotPolicy should not be Ready (and schedules
-    // shouldn't fire it productively) until its Repository is Ready — for the
-    // multi-repo shape, until EVERY listed repository is Ready (conservative;
-    // the per-child ready-subset gate is M10's refinement). Read readiness from
-    // the existing helper and REQUEUE (not error) until then, surfacing a
-    // `Reconciling` condition. This makes `kubectl wait` and Flux/Argo health behave.
+    // §2 dependent gating, refined to the READY SUBSET (#368 M10): partition
+    // the targets by repository readiness. The ready subset keeps processing
+    // (retention, adoption, verification); the not-ready subset is surfaced via
+    // the registered structural gate (`RepositoriesReady=False` /
+    // `RepositoryNotReady`, `kopiur_api::gates::POLICY_REPOSITORY_NOT_READY_GATE`)
+    // so `kubectl kopiur doctor` sees the park (#359). With NO ready repository
+    // — which is every not-ready single-repo policy — the reconciler parks
+    // exactly as before (Reconciling + 15s requeue), now with the gate as the
+    // one condition truth for the block.
+    let mut ready: Vec<&PolicyRepoTarget> = Vec::new();
+    let mut not_ready_keys: Vec<String> = Vec::new();
     for t in &targets {
-        if !io::repository_ready(&ctx.client, &t.rref, &namespace).await? {
-            let conditions = io::set_ready(
-                &existing,
-                generation,
-                io::ReadyOutcome::Reconciling,
-                "RepositoryNotReady",
-                "waiting for the referenced Repository to become Ready before reconciling",
-            );
-            io::patch_status_if_changed(
-                &api,
-                &name,
-                current.as_ref(),
-                serde_json::json!({ "observedGeneration": generation, "conditions": conditions }),
-            )
-            .await?;
-            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        if io::repository_ready(&ctx.client, &t.rref, &namespace).await? {
+            ready.push(t);
+        } else {
+            not_ready_keys.push(kopiur_api::common::repo_key(&t.rref, &namespace));
         }
     }
+    let all_ready = not_ready_keys.is_empty();
+    let gate_message = policy_repo_gate_message(&not_ready_keys);
+    if ready.is_empty() {
+        let conditions = io::set_ready(
+            &existing,
+            generation,
+            io::ReadyOutcome::Reconciling,
+            crate::consts::REPOSITORY_NOT_READY_REASON,
+            "waiting for the referenced Repository to become Ready before reconciling",
+        );
+        let conditions = io::upsert_gate(
+            &conditions,
+            &kopiur_api::gates::POLICY_REPOSITORY_NOT_READY_GATE,
+            &gate_message,
+            generation,
+        );
+        io::patch_status_if_changed(
+            &api,
+            &name,
+            current.as_ref(),
+            serde_json::json!({ "observedGeneration": generation, "conditions": conditions }),
+        )
+        .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    }
+    // The normalized repo keys the ready subset covers — the execution filter
+    // for repo-touching work (prunes) while part of the fleet is down.
+    let ready_keys: std::collections::BTreeSet<String> = ready
+        .iter()
+        .map(|t| kopiur_api::common::repo_key(&t.rref, &namespace))
+        .collect();
 
     // §3: surface the most recent successful child Snapshot timestamp (backs the
     // LAST-SNAPSHOT column + the staleness alert). Deterministic (the max endTime
@@ -886,11 +1013,17 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         }
     }
 
-    for cr_name in unchanged_snapshots_to_prune(
+    let unchanged_prunes = executable_prunes(
+        unchanged_snapshots_to_prune(
+            &backups,
+            kopiur_api::consts::effective_failed_jobs_history_limit(None),
+            is_multi,
+        ),
         &backups,
-        kopiur_api::consts::effective_failed_jobs_history_limit(None),
-        is_multi,
-    ) {
+        &ready_keys,
+        all_ready,
+    );
+    for cr_name in unchanged_prunes {
         // Stamp `pruned-by` THEN delete, exactly like every other operator
         // prune, so the finalizer classifies it as ours and the mass-deletion
         // breaker stays out of the way.
@@ -906,6 +1039,14 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         // reclassified by stamping the annotation only, so its finalizer drains
         // as a prune rather than being held as an external mass deletion.
         let (to_delete, to_stamp_only) = partition_retention_prune(&backups, &selected);
+        // Execute deletes only against the READY repo subset (#368 M10): a
+        // delete fires the Snapshot finalizer, which contacts the row's
+        // repository — against a down repo that parks the row in `Deleting`
+        // for nothing. Deferred rows are re-selected next pass. `to_stamp_only`
+        // is NOT filtered: a stamp is a pure annotation write (the row is
+        // already terminating), and deferring it would hold the very
+        // reclassification that keeps breaker-held drains moving.
+        let to_delete = executable_prunes(to_delete, &backups, &ready_keys, all_ready);
         for cr_name in &to_delete {
             // Stamp `pruned-by: retention` THEN delete, so the finalizer bypasses
             // the mass-deletion breaker + cascade guard (this is an operator prune,
@@ -968,40 +1109,33 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         config,
         &namespace,
         &name,
-        &targets,
+        &ready,
+        is_multi,
         &backups,
         current.as_ref(),
     )
     .await?;
 
-    // Final status: Ready (the policy is reconciled and its repo is Ready), the
-    // observedGeneration, and the §3 lastSuccessfulSnapshot. Only set the timestamp
-    // when known so we never thrash it with null.
-    let conditions = io::set_ready(
-        &existing,
-        generation,
-        io::ReadyOutcome::Ready,
-        "Reconciled",
-        "SnapshotPolicy reconciled; retention enforced",
-    );
-    // Verification is repository-scoped, and the per-repo verification loop
-    // (per-repo Jobs, entry-keyed `status.verification`) lands in M10 — until
-    // then a MULTI-repo policy runs no verification step and no scratch check,
-    // rather than verifying repository #1 and calling the policy verified.
-    let single_target = if is_multi { None } else { targets.first() };
+    // #368 M10: fold the verify movers' entry-keyed stamps into the per-repo
+    // `status.verification` Vec (multi only; the controller is the vec's single
+    // writer — see `verification::fold_verification`). `None` for the classic
+    // single-repo shape, whose flat `lastVerified` the mover stamps directly.
+    let folded = fold_multi_verification(config, is_multi, &repo_targets, &namespace);
+
+    // Final status: Ready when every repository is (Reconciling + the
+    // registered `RepositoriesReady` gate otherwise), the observedGeneration,
+    // the §3 lastSuccessfulSnapshot, the `repositorySummary` print column, and
+    // the folded per-repo verification state.
+    let conditions = policy_ready_conditions(&existing, generation, all_ready, &gate_message);
     // Warn-only: surface a deep-verify scratch `storageClassName` that is a silent
     // no-op (set with no effective `capacity` → an `emptyDir`, which has no
     // StorageClass). Folded into the SAME status patch as set_ready (single writer,
     // no two-writer flip-flop) and upserted in place so it self-clears (True→False)
     // when a capacity is added. The Warning Event fires only on the flip to True, so
-    // a steady Ignored state doesn't re-publish every reconcile.
-    let conditions = match config
-        .spec
-        .verification
-        .as_ref()
-        .zip(single_target)
-        .and_then(|(v, t)| crate::verification::scratch_storage_class_state(&t.repo, v))
-    {
+    // a steady Ignored state doesn't re-publish every reconcile. Evaluated over
+    // every READY repository for the multi-repo shape (any repo whose merged
+    // scratch config is a no-op flags it).
+    let conditions = match select_scratch_state(config, &ready) {
         Some(state) => {
             let was_ignored = existing
                 .iter()
@@ -1032,54 +1166,57 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         }
         None => conditions,
     };
-    let mut status = serde_json::json!({
-        "observedGeneration": generation,
-        "conditions": conditions,
-    });
-    if let Some(ts) = last_successful {
-        status["lastSuccessfulSnapshot"] = serde_json::json!(ts);
-    }
+    let status = final_status_body(
+        config,
+        generation,
+        conditions,
+        last_successful.as_deref(),
+        &repo_targets,
+        folded.as_ref(),
+    )?;
     io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
 
     // §4: surface the most recent successful verify as a gauge for staleness
     // alerting (mirrors kopiur_snapshot_last_success_timestamp_seconds). The mover
-    // stamps `status.lastVerified` on a successful quick/deep verify; reading it
-    // from status here keeps the gauge fresh on the status-change reconcile and on
-    // the periodic verify requeue below. No-op until a first verify lands.
-    if let Some(ts) = config
-        .status
-        .as_ref()
-        .and_then(|s| s.last_verified.as_deref())
-        .and_then(rfc3339_unix_secs)
-    {
+    // stamps `status.lastVerified` on a successful quick/deep verify (single-repo);
+    // for multi the folded MIN across current repos is the honest fleet-wide age.
+    // No-op until a first verify lands.
+    let flat_verified = match folded.as_ref() {
+        Some(f) => f.folded.flat.clone(),
+        None => config.status.as_ref().and_then(|s| s.last_verified.clone()),
+    };
+    if let Some(ts) = flat_verified.as_deref().and_then(rfc3339_unix_secs) {
         ctx.metrics.set_snapshot_verified(&namespace, &name, ts);
     }
 
     // §4: first-class verification scheduling. When `spec.verification` is set, the
     // policy reconciler doubles as the verify scheduler (mirroring the Maintenance
-    // kernel): it spawns per-slot quick/deep verify Jobs and tracks them. When absent,
-    // `verify_step` is a no-op (None) and the steady 300s requeue applies. Otherwise
-    // requeue on the shorter of the steady cadence and the verify cadence so a due
-    // verification fires on time.
+    // kernel): it spawns per-slot quick/deep verify Jobs and tracks them — one per
+    // READY repository for the multi-repo shape (#368 M10), each anchored on ITS
+    // OWN per-repo lastVerified. When absent, `verify_step` is a no-op (None) and
+    // the steady 300s requeue applies. Otherwise requeue on the shorter of the
+    // steady cadence and the verify cadence so a due verification fires on time.
     let steady = std::time::Duration::from_secs(300);
-    // Multi-repo: no verify step until the per-repo verification loop lands
-    // (M10) — see `single_target` above.
-    let verify_requeue = match single_target {
-        Some(t) => {
-            crate::verification::verify_step(
-                config,
-                ctx,
-                &t.repo,
-                &namespace,
-                has_successful_snapshot,
-            )
-            .await?
-        }
-        None => None,
-    };
+    let verify_requeue = run_verify_steps(
+        config,
+        ctx,
+        &namespace,
+        &ready,
+        folded.as_ref(),
+        &backups,
+        has_successful_snapshot,
+    )
+    .await?;
     let base = match verify_requeue {
         Some(verify_requeue) => steady.min(verify_requeue),
         None => steady,
+    };
+    // A not-ready subset keeps the prompt readiness-poll cadence so recovery is
+    // observed quickly (same 15s the all-parked path uses).
+    let base = if all_ready {
+        base
+    } else {
+        base.min(std::time::Duration::from_secs(15))
     };
     // A fresh adoption wave / scan request pulls the next reconcile in sooner
     // (belt — the policy/repository watches usually re-trigger before this).
@@ -1088,6 +1225,266 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         None => base,
     };
     Ok(Action::requeue(requeue))
+}
+
+/// The multi-repo verification fold inputs + result: the CURRENT repo set as
+/// `(normalized ref, key)` pairs and the folded per-repo state. `None` for the
+/// single-repo shape. Extracted so `reconcile_inner` only gains a call
+/// (complexity ratchet).
+struct MultiVerification {
+    /// `(normalized ref, normalized repo key)` per current repo, spec order.
+    current_repos: Vec<(RepositoryRef, String)>,
+    folded: crate::verification::FoldedVerification,
+}
+
+/// See [`MultiVerification`].
+fn fold_multi_verification(
+    config: &SnapshotPolicy,
+    is_multi: bool,
+    repo_targets: &[&RepositoryRef],
+    namespace: &str,
+) -> Option<MultiVerification> {
+    if !is_multi {
+        return None;
+    }
+    let current_repos: Vec<(RepositoryRef, String)> = repo_targets
+        .iter()
+        .map(|r| {
+            (
+                kopiur_api::common::normalized_repository_ref(r, namespace),
+                kopiur_api::common::repo_key(r, namespace),
+            )
+        })
+        .collect();
+    let existing_entries = config
+        .status
+        .as_ref()
+        .map(|s| s.verification.clone())
+        .unwrap_or_default();
+    let stamps = config
+        .status
+        .as_ref()
+        .map(|s| s.verification_stamps.clone())
+        .unwrap_or_default();
+    let folded = crate::verification::fold_verification(
+        &current_repos,
+        &existing_entries,
+        &stamps,
+        namespace,
+    );
+    Some(MultiVerification {
+        current_repos,
+        folded,
+    })
+}
+
+/// **Pure.** The kstatus conditions for the final policy status write: Ready
+/// when every repository is, Reconciling (reason `RepositoryNotReady`) plus the
+/// BLOCKED `RepositoriesReady` gate otherwise. On the all-ready side the gate
+/// is cleared to `True` only when the condition already exists — a policy that
+/// was never gated never grows the condition, keeping the healthy single-repo
+/// status wire byte-identical.
+fn policy_ready_conditions(
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    generation: Option<i64>,
+    all_ready: bool,
+    gate_message: &str,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    if all_ready {
+        let conditions = io::set_ready(
+            existing,
+            generation,
+            io::ReadyOutcome::Ready,
+            "Reconciled",
+            "SnapshotPolicy reconciled; retention enforced",
+        );
+        if existing
+            .iter()
+            .any(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
+        {
+            io::upsert_condition(
+                &conditions,
+                crate::consts::REPOSITORIES_READY_CONDITION,
+                true,
+                "AllRepositoriesReady",
+                "every referenced repository is Ready",
+                generation,
+            )
+        } else {
+            conditions
+        }
+    } else {
+        let conditions = io::set_ready(
+            existing,
+            generation,
+            io::ReadyOutcome::Reconciling,
+            crate::consts::REPOSITORY_NOT_READY_REASON,
+            gate_message,
+        );
+        io::upsert_gate(
+            &conditions,
+            &kopiur_api::gates::POLICY_REPOSITORY_NOT_READY_GATE,
+            gate_message,
+            generation,
+        )
+    }
+}
+
+/// **Pure-ish** (no IO): the deep-verify scratch no-op state to surface, over
+/// every READY target — any repo whose MERGED scratch config ignores its
+/// storageClass flags the policy; else the first evaluable state so the
+/// condition self-clears.
+fn select_scratch_state(
+    config: &SnapshotPolicy,
+    ready: &[&PolicyRepoTarget],
+) -> Option<crate::verification::ScratchStorageClassState> {
+    let v = config.spec.verification.as_ref()?;
+    let mut first = None;
+    for t in ready {
+        match crate::verification::scratch_storage_class_state(&t.repo, v) {
+            Some(st) if st.ignored => return Some(st),
+            Some(st) if first.is_none() => first = Some(st),
+            Some(_) | None => {}
+        }
+    }
+    first
+}
+
+/// Build the final guarded status body: observedGeneration + conditions +
+/// `lastSuccessfulSnapshot` (only when known — never thrashed with null) +
+/// `repositorySummary` + the folded multi-repo verification state.
+///
+/// Multi-repo verification writes: the folded `verification` Vec, the flat
+/// `lastVerified` (the fold's MIN — explicit `null` ONCE when it regresses to
+/// unknown while a prior value exists, e.g. a just-added unverified repo),
+/// and per-key `null`s pruning `verificationStamps` entries for repositories
+/// no longer in the spec. A single-repo policy that previously was multi gets
+/// its multi-only surfaces (`verification`, `verificationStamps`) nulled once.
+/// Every conditional is keyed off the PRIOR status so the steady-state body
+/// compares equal and the guarded write stays a no-op.
+fn final_status_body(
+    config: &SnapshotPolicy,
+    generation: Option<i64>,
+    conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
+    last_successful: Option<&str>,
+    repo_targets: &[&RepositoryRef],
+    folded: Option<&MultiVerification>,
+) -> Result<serde_json::Value> {
+    let names: Vec<&str> = repo_targets.iter().map(|r| r.name.as_str()).collect();
+    let mut status = serde_json::json!({
+        "observedGeneration": generation,
+        "conditions": conditions,
+        "repositorySummary": repository_summary_string(&names),
+    });
+    if let Some(ts) = last_successful {
+        status["lastSuccessfulSnapshot"] = serde_json::json!(ts);
+    }
+    let prior = config.status.as_ref();
+    match folded {
+        Some(mv) => {
+            status["verification"] = serde_json::to_value(&mv.folded.entries)?;
+            let prior_flat = prior.is_some_and(|s| s.last_verified.is_some());
+            match (&mv.folded.flat, prior_flat) {
+                (Some(ts), _) => status["lastVerified"] = serde_json::json!(ts),
+                // Regressed to unknown (a current repo has never verified)
+                // while a prior value exists: clear it once, then stay silent.
+                (None, true) => status["lastVerified"] = serde_json::Value::Null,
+                (None, false) => {}
+            }
+            let current_keys: std::collections::BTreeSet<&str> =
+                mv.current_repos.iter().map(|(_, k)| k.as_str()).collect();
+            let stale: serde_json::Map<String, serde_json::Value> = prior
+                .map(|s| {
+                    s.verification_stamps
+                        .keys()
+                        .filter(|k| !current_keys.contains(k.as_str()))
+                        .map(|k| (k.clone(), serde_json::Value::Null))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !stale.is_empty() {
+                status["verificationStamps"] = serde_json::Value::Object(stale);
+            }
+        }
+        None => {
+            // multi→single edit: the multi-only surfaces would otherwise
+            // linger forever. Null them exactly once (conditional on the prior
+            // status actually carrying them).
+            if prior.is_some_and(|s| !s.verification.is_empty()) {
+                status["verification"] = serde_json::Value::Null;
+            }
+            if prior.is_some_and(|s| !s.verification_stamps.is_empty()) {
+                status["verificationStamps"] = serde_json::Value::Null;
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// The per-target verification scheduling loop (thin orchestration over
+/// [`crate::verification::verify_step`]): the single-repo shape runs exactly
+/// one step with the flat `lastVerified` anchor (byte-identical behavior); a
+/// multi-repo policy runs one step per READY repository, each anchored on its
+/// own folded entry and gated on ITS OWN #168 input. Returns the minimum
+/// requested requeue.
+async fn run_verify_steps(
+    config: &SnapshotPolicy,
+    ctx: &Context,
+    namespace: &str,
+    ready: &[&PolicyRepoTarget],
+    folded: Option<&MultiVerification>,
+    backups: &[Snapshot],
+    has_successful_snapshot: bool,
+) -> Result<Option<std::time::Duration>> {
+    let parse_ts = |s: &str| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    };
+    let mut min_requeue: Option<std::time::Duration> = None;
+    match folded {
+        None => {
+            if let Some(t) = ready.first() {
+                let vt = crate::verification::VerifyTarget {
+                    rref: &t.rref,
+                    repo: &t.repo,
+                    repo_key: None,
+                    last_verified: config
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.last_verified.as_deref())
+                        .and_then(parse_ts),
+                    has_successful: has_successful_snapshot,
+                };
+                min_requeue = crate::verification::verify_step(config, ctx, &vt, namespace).await?;
+            }
+        }
+        Some(mv) => {
+            for t in ready {
+                let key = kopiur_api::common::repo_key(&t.rref, namespace);
+                let last = mv
+                    .folded
+                    .entries
+                    .iter()
+                    .find(|e| kopiur_api::common::repo_key(&e.repository, namespace) == key)
+                    .and_then(|e| e.last_verified.as_deref())
+                    .and_then(parse_ts);
+                let vt = crate::verification::VerifyTarget {
+                    rref: &t.rref,
+                    repo: &t.repo,
+                    has_successful: multi_repo_has_success(backups, &key),
+                    repo_key: Some(key),
+                    last_verified: last,
+                };
+                if let Some(rq) =
+                    crate::verification::verify_step(config, ctx, &vt, namespace).await?
+                {
+                    min_requeue = Some(min_requeue.map_or(rq, |c| c.min(rq)));
+                }
+            }
+        }
+    }
+    Ok(min_requeue)
 }
 
 /// One (repository, identity-under-that-repository) target of a live
@@ -1257,9 +1654,17 @@ async fn adoption_pass_for_target(
 /// AFTER the retention block (inv. 6). `reconcile_inner` only gains the call.
 ///
 /// Loops the (repository, per-repo identity) pairs `reconcile_inner` resolved
-/// (#368): each repository's discovered rows are matched against the identity
-/// resolved under THAT repository's `identityDefaults`. For the single-repo
-/// shape this is exactly one iteration — behavior byte-identical to before.
+/// (#368) — the READY subset only, since adopting against a down repository
+/// has nothing to match and its discovered rows aren't going anywhere: each
+/// repository's discovered rows are matched against the identity resolved
+/// under THAT repository's `identityDefaults`. For the single-repo shape this
+/// is exactly one iteration — behavior byte-identical to before.
+///
+/// `policy_is_multi` is the POLICY shape ([`kopiur_api::is_multi_repo`]), not
+/// `targets.len() > 1`: a two-repo policy with one repo down still has a
+/// single-valued `status.adoption.scanRequestedIdentity` that cannot keep the
+/// once-per-identity no-match-scan guarantee, so the multi restriction must
+/// not silently lift while the fleet is degraded.
 ///
 /// Returns `Some(requeue)` when this pass adopted rows OR stamped an on-demand
 /// catalog-scan request (a belt requeue so the wave settles promptly); `None`
@@ -1276,7 +1681,8 @@ async fn run_adoption(
     config: &SnapshotPolicy,
     namespace: &str,
     name: &str,
-    targets: &[PolicyRepoTarget],
+    targets: &[&PolicyRepoTarget],
+    policy_is_multi: bool,
     backups: &[Snapshot],
     current: Option<&serde_json::Value>,
 ) -> Result<Option<std::time::Duration>> {
@@ -1311,9 +1717,9 @@ async fn run_adoption(
     // A single token for this pass: stamped on the repository AND recorded in
     // `status.adoption` so the two agree.
     let now = Utc::now().to_rfc3339();
-    let multi = targets.len() > 1;
+    let multi = policy_is_multi;
     let mut outcomes: Vec<AdoptionOutcome> = Vec::new();
-    for t in targets {
+    for t in targets.iter().copied() {
         if let Some(outcome) = adoption_pass_for_target(
             ctx,
             config,
@@ -1663,6 +2069,41 @@ pub fn config_identity(
     kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))
 }
 
+/// **Pure.** The `status.resolved` mirror body for this pass (#368): the
+/// single-repo shape pins its one resolution verbatim (byte-identical wire);
+/// the multi shape pins one `repositories` entry per member — the repository
+/// as listed plus the identity resolved under ITS `identityDefaults`, which is
+/// the admission fork guard's per-repo baseline — and deliberately leaves the
+/// top-level `identity` absent (no member is "the" identity).
+fn resolved_policy_mirror(
+    is_multi: bool,
+    targets: &[PolicyRepoTarget],
+) -> kopiur_api::snapshot_policy::ResolvedPolicy {
+    use kopiur_api::snapshot_policy::{ResolvedPolicy, ResolvedPolicyRepository};
+    if !is_multi {
+        return targets
+            .first()
+            .map(|t| t.resolved.clone())
+            .unwrap_or_default();
+    }
+    ResolvedPolicy {
+        identity: None,
+        // Sources resolve purely from the spec (PVC names / path overrides),
+        // identically under every repository — mirrored once.
+        sources: targets
+            .first()
+            .map(|t| t.resolved.sources.clone())
+            .unwrap_or_default(),
+        repositories: targets
+            .iter()
+            .map(|t| ResolvedPolicyRepository {
+                repository: t.rref.clone(),
+                identity: t.resolved.identity.clone(),
+            })
+            .collect(),
+    }
+}
+
 /// Resolve the config's identity + per-source paths into a `ResolvedPolicy`
 /// status body. Reuses `api::identity::resolve_identity` (tested kernel).
 fn resolve_config_identity(
@@ -1704,6 +2145,9 @@ fn resolve_config_identity(
     Ok(ResolvedPolicy {
         identity: Some(identity),
         sources,
+        // Per-target resolution: the multi-repo `repositories` mirror is
+        // assembled across targets by `resolved_policy_mirror`, never here.
+        repositories: Vec::new(),
     })
 }
 
@@ -2574,5 +3018,137 @@ mod tests {
         let mut flat = unchanged_snapshots_to_prune(&rows, 1, false);
         flat.sort();
         assert_eq!(flat, vec!["a1", "b1", "b2"], "flat keeps one total");
+    }
+
+    // --- M10: ready-subset execution filter -------------------------------
+
+    #[test]
+    fn executable_prunes_all_ready_passes_everything_through() {
+        // The single-repo / fully-healthy path: byte-identical, never filtered
+        // (including unpinned legacy rows and even names with no live row).
+        let rows = vec![succeeded_backup("keep", at(2026, 5, 1))];
+        let selected = vec!["keep".to_string(), "already-gone".to_string()];
+        let ready = std::collections::BTreeSet::new();
+        assert_eq!(
+            executable_prunes(selected.clone(), &rows, &ready, true),
+            selected
+        );
+    }
+
+    #[test]
+    fn executable_prunes_defers_down_repo_and_unpinned_rows() {
+        // With repo-b down, only rows pinned to a READY repo execute: a delete
+        // fires the finalizer, which contacts the row's repository. Unpinned
+        // rows (repository unknowable from the spec) are deferred too.
+        let rows = vec![
+            pin(succeeded_backup("a1", at(2026, 5, 1)), "repo-a"),
+            pin(succeeded_backup("b1", at(2026, 5, 1)), "repo-b"),
+            succeeded_backup("legacy", at(2026, 5, 1)),
+        ];
+        let ready: std::collections::BTreeSet<String> =
+            ["Repository/apps/repo-a".to_string()].into();
+        let selected = vec!["a1".to_string(), "b1".to_string(), "legacy".to_string()];
+        assert_eq!(
+            executable_prunes(selected, &rows, &ready, false),
+            vec!["a1".to_string()],
+            "only the ready repo's pinned rows may prune while part of the fleet is down"
+        );
+    }
+
+    // --- M10: repositorySummary print column ------------------------------
+
+    #[test]
+    fn repository_summary_renders_single_multi_and_overflow() {
+        assert_eq!(repository_summary_string(&["nas"]), "nas");
+        assert_eq!(
+            repository_summary_string(&["nas", "offsite"]),
+            "nas, offsite"
+        );
+        // Overflow: cap near a kubectl column width with a +N marker.
+        let long: Vec<String> = (0..8).map(|i| format!("repository-target-{i}")).collect();
+        let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        let summary = repository_summary_string(&refs);
+        assert!(summary.len() <= 63, "{} chars: {summary}", summary.len());
+        assert!(
+            summary.starts_with("repository-target-0"),
+            "spec order preserved: {summary}"
+        );
+        assert!(summary.contains(" +"), "overflow marker present: {summary}");
+        // The names shown + the +N count always account for every repo.
+        let shown = summary.split(" +").next().unwrap().split(", ").count();
+        let more: usize = summary.rsplit(" +").next().unwrap().parse().unwrap();
+        assert_eq!(shown + more, 8);
+        // Deterministic.
+        assert_eq!(summary, repository_summary_string(&refs));
+    }
+
+    // --- M10: the RepositoriesReady gate conditions ------------------------
+
+    #[test]
+    fn policy_ready_conditions_write_and_clear_the_registered_gate() {
+        use kopiur_api::gates::POLICY_REPOSITORY_NOT_READY_GATE;
+        let generation = Some(3);
+        // Not ready: the gate is written FROM the registry row (blocked
+        // polarity False, reason RepositoryNotReady) and Ready=False/
+        // Reconciling=True carry the same reason — one truth.
+        let msg = policy_repo_gate_message(&["Repository/apps/repo-b".to_string()]);
+        let blocked = policy_ready_conditions(&[], generation, false, &msg);
+        let gate = blocked
+            .iter()
+            .find(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
+            .expect("gate condition written");
+        assert!(POLICY_REPOSITORY_NOT_READY_GATE.matches(&gate.type_, &gate.status, &gate.reason));
+        assert!(gate.message.contains("Repository/apps/repo-b"));
+        let ready_cond = blocked
+            .iter()
+            .find(|c| c.type_ == crate::consts::READY_CONDITION)
+            .unwrap();
+        assert_eq!(ready_cond.status, "False");
+        assert_eq!(
+            ready_cond.reason,
+            crate::consts::REPOSITORY_NOT_READY_REASON
+        );
+
+        // Recovery: the gate self-clears to True (because it exists) and Ready
+        // returns.
+        let healed = policy_ready_conditions(&blocked, generation, true, "");
+        let gate = healed
+            .iter()
+            .find(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
+            .expect("gate cleared, not dropped");
+        assert_eq!(gate.status, "True");
+        assert!(
+            !POLICY_REPOSITORY_NOT_READY_GATE.trips(&gate.type_, &gate.status),
+            "a cleared gate must not read as blocked"
+        );
+
+        // A never-gated policy never grows the condition: the healthy
+        // single-repo status wire stays byte-identical.
+        let never_gated = policy_ready_conditions(&[], generation, true, "");
+        assert!(
+            !never_gated
+                .iter()
+                .any(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION),
+            "healthy-always policies must not grow the gate condition"
+        );
+    }
+
+    // --- M10: per-repo #168 verification-gate input -------------------------
+
+    #[test]
+    fn multi_repo_has_success_matches_pins_only() {
+        let rows = vec![
+            pin(succeeded_backup("a1", at(2026, 5, 1)), "repo-a"),
+            pin(failed_backup("b1", at(2026, 5, 1)), "repo-b"),
+            succeeded_backup("legacy", at(2026, 5, 1)),
+        ];
+        assert!(multi_repo_has_success(&rows, "Repository/apps/repo-a"));
+        assert!(
+            !multi_repo_has_success(&rows, "Repository/apps/repo-b"),
+            "a failed run is not a verifiable snapshot"
+        );
+        // Unpinned successes count for NO repo (their repository is not
+        // knowable from the spec; the backfill pass pins them promptly).
+        assert!(!multi_repo_has_success(&rows, "Repository/apps/repo-c"));
     }
 }

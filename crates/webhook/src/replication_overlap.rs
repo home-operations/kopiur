@@ -62,7 +62,7 @@ pub async fn dest_policy_identities(
         if !api::repository_refs(&p.spec).any(|r| repo_key(r, &ns) == dest_key) {
             continue;
         }
-        let base = match pinned_identity(&p) {
+        let base = match pinned_identity(&p, &dest_key, &ns) {
             Some(id) => Some(id),
             None => {
                 let d = match &defaults {
@@ -90,12 +90,23 @@ pub async fn dest_policy_identities(
     out
 }
 
-/// The identity the controller pinned in `status.resolved.identity`, if any.
-fn pinned_identity(p: &SnapshotPolicy) -> Option<ResolvedIdentity> {
-    p.status
-        .as_ref()
-        .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.identity.clone())
+/// The identity the controller pinned for the DESTINATION repository, if any:
+/// a multi-repo policy pins per-repo identities in
+/// `status.resolved.repositories` (its top-level `resolved.identity` is
+/// `None`), so the entry whose repository resolves to `dest_key` wins; the
+/// top-level `status.resolved.identity` is the single-repo shape. `None` for a
+/// multi-repo policy with no pinned entry for the destination — the caller
+/// then falls back to live resolution under the DESTINATION's own
+/// `identityDefaults`, which is exactly the per-repo resolution the overlap
+/// check needs (honest, not a silent skip).
+fn pinned_identity(p: &SnapshotPolicy, dest_key: &str, ns: &str) -> Option<ResolvedIdentity> {
+    let resolved = p.status.as_ref()?.resolved.as_ref()?;
+    resolved
+        .repositories
+        .iter()
+        .find(|e| repo_key(&e.repository, ns) == dest_key)
+        .and_then(|e| e.identity.clone())
+        .or_else(|| resolved.identity.clone())
 }
 
 /// Expand one policy's base identity across its resolved source paths: a
@@ -149,13 +160,53 @@ mod tests {
                 ]
             } }
         }));
-        let base = pinned_identity(&p).expect("pinned identity");
+        let base =
+            pinned_identity(&p, "Repository/billing/dst", "billing").expect("pinned identity");
         let ids = expand_per_source(&p, base);
         let paths: Vec<Option<&str>> = ids.iter().map(|i| i.source_path.as_deref()).collect();
         assert_eq!(paths, vec![Some("/pvc/data-0"), Some("/pvc/data-1")]);
         assert!(
             ids.iter()
                 .all(|i| i.username == "pg" && i.hostname == "billing")
+        );
+    }
+
+    #[test]
+    fn pinned_identity_prefers_the_destinations_per_repo_entry() {
+        // A multi-repo policy pins per-repo identities; its top-level
+        // resolved.identity is None. The destination's OWN entry must win —
+        // the other member's identity may differ under different
+        // identityDefaults.
+        let p = policy(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "billing" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "other" },
+                    { "kind": "Repository", "name": "dst" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ]
+            },
+            "status": { "resolved": { "repositories": [
+                {
+                    "repository": { "kind": "Repository", "name": "other" },
+                    "identity": { "username": "pg", "hostname": "elsewhere" },
+                },
+                {
+                    "repository": { "kind": "Repository", "name": "dst" },
+                    "identity": { "username": "pg", "hostname": "billing.dest" },
+                },
+            ] } }
+        }));
+        let id = pinned_identity(&p, "Repository/billing/dst", "billing").expect("dest entry");
+        assert_eq!(id.hostname, "billing.dest");
+        // No entry for the destination (and no top-level identity) → None, so
+        // the caller falls back to live resolution under the destination's
+        // identityDefaults.
+        assert_eq!(
+            pinned_identity(&p, "Repository/billing/absent", "billing"),
+            None
         );
     }
 

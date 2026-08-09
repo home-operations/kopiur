@@ -256,15 +256,20 @@ async fn handle_snapshot_policy(
                 ValidationError::IdentityCollision {
                     identity: collision.identity,
                     conflict: collision.conflict,
+                    repo: collision.repo_key,
                 },
             ]));
         }
     }
 
+    let mut warnings = Vec::new();
+
     // Fork-on-edit guard: on UPDATE, reject a change that would re-identify a policy
     // with existing snapshot history (orphaning the old kopia source) unless it is
     // acknowledged with the allow-identity-change annotation. Reads the old object's
-    // pinned identity + history; degrades to allow when it can't decide confidently.
+    // pinned identity/per-repo baselines + history; degrades to allow when it can't
+    // decide confidently. Non-blocking warnings (e.g. a repository removed from a
+    // policy with history) ride the allowed response.
     if req.operation == Operation::Update
         && let (Some(old_spec), Some(old_status)) = (
             decode_old_spec::<SnapshotPolicySpec>(req),
@@ -273,7 +278,7 @@ async fn handle_snapshot_policy(
     {
         let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
         let ns = req.namespace.as_deref().unwrap_or_default();
-        if let Some(err) = crate::identity_fork::check_identity_fork(
+        let outcome = crate::identity_fork::check_identity_fork(
             client,
             name,
             ns,
@@ -283,20 +288,23 @@ async fn handle_snapshot_policy(
             &old_spec,
             &old_status,
         )
-        .await
-        {
+        .await;
+        if let Some(err) = outcome.error {
             return Err(AdmissionError::Invalid(vec![err]));
         }
+        warnings.extend(outcome.warnings);
     }
 
     // Best-effort, non-blocking securityContext-compatibility warning (the earliest surface).
-    let warnings = crate::secctx::backup_warnings(
-        client,
-        req.namespace.as_deref(),
-        spec.mover.as_ref(),
-        &spec.sources,
-    )
-    .await;
+    warnings.extend(
+        crate::secctx::backup_warnings(
+            client,
+            req.namespace.as_deref(),
+            spec.mover.as_ref(),
+            &spec.sources,
+        )
+        .await,
+    );
     Ok(with_warnings(resp, warnings))
 }
 
@@ -348,19 +356,15 @@ async fn handle_snapshot(
     // recipe is enforced on the SnapshotPolicy. We still default deletionPolicy and the
     // finalizer.
 
-    // A `pvcSelector` recipe expands to one Snapshot per matched PVC, so a
-    // Snapshot against one MUST say which PVC it covers. Refuse at apply time
-    // rather than letting it fail at reconcile: the operator will not pick a
-    // volume on the user's behalf, and silently backing up one of N looks
-    // exactly like success (#346).
-    //
-    // Referent read, so it is best-effort by design: no client (unit tests, a
-    // webhook running without one) or an unreadable/absent policy means the
-    // controller's own defensive check is the backstop. Failing admission on a
-    // transient GET would take out every Snapshot CREATE in the cluster, which
-    // is a far worse outcome than a late, actionable reconcile error.
+    // Referent-policy checks at CREATE. Both are best-effort by design: no
+    // client (unit tests, a webhook running without one) or an unreadable/
+    // absent policy means the controller's own defensive check is the backstop.
+    // Failing admission on a transient GET would take out every Snapshot
+    // CREATE in the cluster, which is a far worse outcome than a late,
+    // actionable reconcile error. Both are gated on `policyRef` being present,
+    // so rows that carry none — `SnapshotReplication` copy CRs above all —
+    // never enter this branch.
     if req.operation == Operation::Create
-        && spec.source.is_none()
         && let Some(client) = client
         && let Some(policy_ref) = spec.policy_ref.as_ref()
     {
@@ -371,22 +375,46 @@ async fn handle_snapshot(
             .or(req.namespace.as_deref())
             .unwrap_or_default();
         let api: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), ns);
-        if let Ok(Some(policy)) = api.get_opt(&policy_ref.name).await
-            && policy.spec.sources.iter().any(|s| s.pvc_selector.is_some())
-        {
-            return Err(AdmissionError::Invalid(vec![
-                ValidationError::InvalidFieldValue {
-                    field: "spec.source".to_string(),
-                    reason: format!(
-                        "SnapshotPolicy `{}` uses a pvcSelector, which expands to one Snapshot \
-                         per matched PersistentVolumeClaim — so a Snapshot against it must carry \
-                         `spec.source` naming the PVC it covers, and this one does not. Fix: run \
-                         `kubectl kopiur snapshot now --policy {}`, or let a SnapshotSchedule \
-                         fire it; both expand the selector for you.",
-                        policy_ref.name, policy_ref.name,
-                    ),
-                },
-            ]));
+        if let Ok(Some(policy)) = api.get_opt(&policy_ref.name).await {
+            // A `pvcSelector` recipe expands to one Snapshot per matched PVC,
+            // so a Snapshot against one MUST say which PVC it covers. Refuse at
+            // apply time rather than letting it fail at reconcile: the operator
+            // will not pick a volume on the user's behalf, and silently backing
+            // up one of N looks exactly like success (#346).
+            if spec.source.is_none() && policy.spec.sources.iter().any(|s| s.pvc_selector.is_some())
+            {
+                return Err(AdmissionError::Invalid(vec![
+                    ValidationError::InvalidFieldValue {
+                        field: "spec.source".to_string(),
+                        reason: format!(
+                            "SnapshotPolicy `{}` uses a pvcSelector, which expands to one Snapshot \
+                             per matched PersistentVolumeClaim — so a Snapshot against it must carry \
+                             `spec.source` naming the PVC it covers, and this one does not. Fix: run \
+                             `kubectl kopiur snapshot now --policy {}`, or let a SnapshotSchedule \
+                             fire it; both expand the selector for you.",
+                            policy_ref.name, policy_ref.name,
+                        ),
+                    },
+                ]));
+            }
+            // Multi-repo pin refusals (#368, mirrors the rule above): a child
+            // of a MULTI-repository policy must pin exactly one member
+            // (`spec.repository`), and any pin — multi or single — must be a
+            // member of the policy's current repository set. Decided by the
+            // shared `effective_repository_ref` kernel, so this refusal and
+            // the controller's backstop can never disagree. Legacy unpinned
+            // single-repo children skip the call entirely — byte-identical
+            // admission for everything that exists today.
+            if api::is_multi_repo(&policy.spec) || spec.repository.is_some() {
+                let snap = api::Snapshot {
+                    metadata: obj.metadata.clone(),
+                    spec: spec.clone(),
+                    status: None,
+                };
+                if let Err(e) = api::snapshot::effective_repository_ref(&snap, &policy.spec, ns) {
+                    return Err(AdmissionError::Invalid(vec![e]));
+                }
+            }
         }
     }
 
@@ -620,6 +648,42 @@ async fn handle_restore(
             tenancy_for(repo, req.namespace.as_deref(), client).await
     {
         return Err(denial.into());
+    }
+
+    // `fromPolicy` repository selection (#368): decided by the shared
+    // `select_restore_repository` kernel — the resolver backstop uses the same
+    // function, so the webhook and the controller can never disagree. Refuses:
+    // a multi-repository policy with no `spec.repository` selection (the N
+    // members are independent captures; repository #1 is never guessed), and
+    // an explicit `spec.repository` that is not a member of the policy's set
+    // (a typo must not silently read a repository the recipe never wrote to —
+    // this check applies to the single-repo shape too). Best-effort referent
+    // read: no client or an unreadable/absent policy degrades to admit (the
+    // controller's resolver is the backstop), same posture as the Snapshot
+    // referent checks above.
+    if req.operation == Operation::Create
+        && let api::restore::RestoreSource::FromPolicy(fp) = &spec.source
+        && let Some(client) = client
+    {
+        let restore_ns = obj
+            .metadata
+            .namespace
+            .as_deref()
+            .or(req.namespace.as_deref())
+            .unwrap_or_default();
+        let policy_ns = fp.namespace.as_deref().unwrap_or(restore_ns);
+        let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), policy_ns);
+        if let Ok(Some(policy)) = policies.get_opt(&fp.name).await
+            && let Err(e) = api::snapshot_policy::select_restore_repository(
+                &policy.spec,
+                &fp.name,
+                policy_ns,
+                spec.repository.as_ref(),
+                restore_ns,
+            )
+        {
+            return Err(AdmissionError::Invalid(vec![e]));
+        }
     }
 
     // Best-effort, non-blocking restore-direction securityContext warning.
@@ -2310,5 +2374,216 @@ mod tests {
         let msg = resp.result.message;
         assert!(msg.contains("replicated"), "{msg:?}");
         assert!(msg.contains("onScheduleDelete"), "{msg:?}");
+    }
+
+    // --- Snapshot CREATE against a multi-repo policy (M9, plan B2) --------------
+
+    /// A stored MULTI-repository `SnapshotPolicy` object body, as a policy GET
+    /// returns it (repos `a` (Repository) + `b` (ClusterRepository), one PVC
+    /// source, in the Snapshot's own `billing` namespace).
+    fn multi_repo_policy_body() -> Value {
+        json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "nightly", "namespace": "billing" },
+            "spec": {
+                "repositories": [
+                    { "kind": "Repository", "name": "a" },
+                    { "kind": "ClusterRepository", "name": "b" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn snapshot_create_against_multi_repo_policy_without_pin_is_refused() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let req = snapshot_create_request(json!({}), json!({ "policyRef": { "name": "nightly" } }));
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(!resp.allowed, "unpinned multi-repo child must be refused");
+        let msg = resp.result.message;
+        assert!(msg.contains("must pin exactly one member"), "{msg:?}");
+        assert!(msg.contains("kubectl kopiur snapshot now"), "{msg:?}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_create_with_member_pin_is_admitted() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let req = snapshot_create_request(
+            json!({}),
+            json!({
+                "policyRef": { "name": "nightly" },
+                "repository": { "kind": "Repository", "name": "a" },
+            }),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn snapshot_create_with_non_member_pin_is_refused_naming_the_set() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let req = snapshot_create_request(
+            json!({}),
+            json!({
+                "policyRef": { "name": "nightly" },
+                "repository": { "kind": "Repository", "name": "zzz" },
+            }),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(!resp.allowed, "non-member pin must be refused");
+        let msg = resp.result.message;
+        assert!(msg.contains("Repository/billing/zzz"), "{msg:?}");
+        assert!(msg.contains("does not list that repository"), "{msg:?}");
+        assert!(
+            msg.contains("Repository/billing/a") && msg.contains("ClusterRepository/b"),
+            "the valid set must be named: {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_copy_cr_never_enters_the_pin_branch() {
+        // A `SnapshotReplication` copy CR carries a pin but NO policyRef — the
+        // refusal branch is policyRef-gated, so it must be admitted untouched
+        // even with a client that would serve a multi-repo policy.
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let req = snapshot_create_request(
+            json!({ api::consts::ORIGIN_LABEL: "replicated" }),
+            json!({
+                "repository": { "kind": "ClusterRepository", "name": "offsite" },
+                "deletionPolicy": "Delete",
+            }),
+        );
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn snapshot_create_degrades_to_admit_when_the_policy_get_fails() {
+        // The unmatched route serves a body that does not decode as a
+        // SnapshotPolicy → the best-effort GET fails → admit (the controller's
+        // effective_repository_ref backstop reports the same error at
+        // reconcile).
+        let client = mock_path_client(vec![]);
+        let req = snapshot_create_request(json!({}), json!({ "policyRef": { "name": "nightly" } }));
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    // --- Restore fromPolicy repository selection (M9, plan B8) ------------------
+
+    /// A CREATE `AdmissionRequest` for a `Restore` in `billing` with the given
+    /// spec.
+    fn restore_create_request(spec: Value) -> AdmissionRequest<DynamicObject> {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "test-uid",
+                "kind": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "kind": "Restore" },
+                "resource": { "group": "kopiur.home-operations.com", "version": "v1alpha1", "resource": "restores" },
+                "name": "r1",
+                "namespace": "billing",
+                "operation": "CREATE",
+                "userInfo": { "username": "tester" },
+                "object": {
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "Restore",
+                    "metadata": { "name": "r1", "namespace": "billing" },
+                    "spec": spec,
+                }
+            }
+        });
+        let review: kube::core::admission::AdmissionReview<DynamicObject> =
+            serde_json::from_value(review).unwrap();
+        review.try_into().unwrap()
+    }
+
+    fn from_policy_restore(repository: Option<Value>) -> Value {
+        let mut spec = json!({
+            "source": { "fromPolicy": { "name": "nightly" } },
+            "target": { "pvcRef": { "name": "out" } },
+        });
+        if let Some(repo) = repository {
+            spec["repository"] = repo;
+        }
+        spec
+    }
+
+    #[tokio::test]
+    async fn from_policy_restore_against_multi_repo_policy_requires_selection() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let resp = dispatch(
+            &restore_create_request(from_policy_restore(None)),
+            Some(&client),
+        )
+        .await;
+        assert!(
+            !resp.allowed,
+            "selection-free multi-repo restore must be refused"
+        );
+        let msg = resp.result.message;
+        assert!(msg.contains("must say which one to read"), "{msg:?}");
+        assert!(
+            msg.contains("Repository/billing/a") && msg.contains("ClusterRepository/b"),
+            "the valid set must be named: {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_policy_restore_with_member_selection_is_admitted() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let spec = from_policy_restore(Some(json!({ "kind": "Repository", "name": "a" })));
+        let resp = dispatch(&restore_create_request(spec), Some(&client)).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn from_policy_restore_with_non_member_selection_is_refused() {
+        let client = mock_path_client(vec![("snapshotpolicies", multi_repo_policy_body())]);
+        let spec = from_policy_restore(Some(json!({ "kind": "Repository", "name": "zzz" })));
+        let resp = dispatch(&restore_create_request(spec), Some(&client)).await;
+        assert!(!resp.allowed, "non-member selection must be refused");
+        let msg = resp.result.message;
+        assert!(msg.contains("Repository/billing/zzz"), "{msg:?}");
+        assert!(
+            msg.contains("not a repository of SnapshotPolicy"),
+            "{msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_policy_restore_membership_applies_to_single_repo_policies_too() {
+        // Audit m4: an explicit spec.repository on a fromPolicy restore used to
+        // be validated against nothing — a typo silently read the wrong
+        // repository. The membership check applies to the single-repo shape.
+        let single = json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "nightly", "namespace": "billing" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "a" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            }
+        });
+        let client = mock_path_client(vec![("snapshotpolicies", single)]);
+        let spec = from_policy_restore(Some(json!({ "kind": "Repository", "name": "typo" })));
+        let resp = dispatch(&restore_create_request(spec), Some(&client)).await;
+        assert!(
+            !resp.allowed,
+            "single-repo non-member selection must be refused"
+        );
+        assert!(
+            resp.result.message.contains("Repository/billing/typo"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn from_policy_restore_degrades_to_admit_without_a_client() {
+        let resp = dispatch(&restore_create_request(from_policy_restore(None)), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
     }
 }

@@ -131,10 +131,16 @@ async fn cluster_repo_defaults(
     defaults
 }
 
-/// Resolve a policy's `(identity, repo_key)` pair for collision comparison, using
-/// the (cached) ClusterRepository identity defaults. `None` when the identity can't
-/// be resolved (skip — the per-field validators handle malformed expressions).
-async fn policy_pair(
+/// Resolve a policy's `(identity, repo_key)` pairs for collision comparison —
+/// **one pair per repository the policy names** (plan B5: the unit of identity
+/// is the pair, so a multi-repo policy contributes N pairs, each identity
+/// resolved under THAT repository's `identityDefaults`; the repo_key-keyed
+/// `cache` amortizes the defaults lookups). Single-repo yields exactly the one
+/// pair it always did. Uses the tolerant [`api::repository_refs`] iterator so
+/// a malformed stored shape still contributes whatever pairs it can. A member
+/// whose identity can't be resolved is skipped (the per-field validators
+/// handle malformed expressions).
+pub(crate) async fn policy_pairs(
     client: &Client,
     name: &str,
     namespace: &str,
@@ -142,32 +148,36 @@ async fn policy_pair(
     labels: Option<&BTreeMap<String, String>>,
     annotations: Option<&BTreeMap<String, String>>,
     cache: &mut BTreeMap<String, Option<IdentityDefaults>>,
-) -> Option<(String, String)> {
-    // Multi-repo policies resolve N (identity, repo_key) pairs — that loop
-    // lands in M9. Until then SKIP the pair (like an unresolvable identity):
-    // the admission feature gate keeps multi-repo un-admittable in this
-    // build, so no admitted policy reaches this arm.
-    let repo = api::single_repository_ref(spec).ok()?;
-    let defaults = cluster_repo_defaults(client, repo, namespace, cache).await;
-    let identity = policy_identity_string(
-        name,
-        namespace,
-        spec,
-        labels,
-        annotations,
-        defaults.as_ref(),
-    )?;
-    Some((identity, repo_key(repo, namespace)))
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for repo in api::repository_refs(spec) {
+        let defaults = cluster_repo_defaults(client, repo, namespace, cache).await;
+        if let Some(identity) = policy_identity_string(
+            name,
+            namespace,
+            spec,
+            labels,
+            annotations,
+            defaults.as_ref(),
+        ) {
+            pairs.push((identity, repo_key(repo, namespace)));
+        }
+    }
+    pairs
 }
 
-/// A detected identity collision: the conflicting policy's `namespace/name` and the
-/// resolved identity string that collided (so the rejection message is exact).
+/// A detected identity collision: the conflicting policy's `namespace/name`, the
+/// resolved identity string that collided, and the repository it collided in
+/// (so the rejection message is exact — with a multi-repo policy only ONE of
+/// the N pairs may be the problem).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collision {
     /// `namespace/name` of the already-admitted policy with the same identity.
     pub conflict: String,
     /// The resolved `username@hostname[:path]` identity that collided.
     pub identity: String,
+    /// Normalized key of the repository the collision happened in.
+    pub repo_key: String,
 }
 
 /// Check the incoming `SnapshotPolicy` for an identity collision with an
@@ -191,7 +201,7 @@ pub async fn check_identity_collision(
     let client = client?;
     let mut cache: BTreeMap<String, Option<IdentityDefaults>> = BTreeMap::new();
 
-    let (self_identity, self_repo_key) = policy_pair(
+    let self_pairs = policy_pairs(
         client,
         self_name,
         self_namespace,
@@ -200,7 +210,10 @@ pub async fn check_identity_collision(
         self_annotations,
         &mut cache,
     )
-    .await?;
+    .await;
+    if self_pairs.is_empty() {
+        return None; // nothing resolvable to compare (same skip as before)
+    }
 
     let api: Api<SnapshotPolicy> = Api::all(client.clone());
     let policies = api.list(&Default::default()).await.ok()?;
@@ -214,7 +227,9 @@ pub async fn check_identity_collision(
         if full == self_full {
             continue; // self
         }
-        if let Some((identity, key)) = policy_pair(
+        // A stored multi-repo policy contributes one ExistingIdentity entry
+        // per member — same expansion as the candidate side.
+        for (identity, key) in policy_pairs(
             client,
             &name,
             &ns,
@@ -228,16 +243,18 @@ pub async fn check_identity_collision(
             existing.push(ExistingIdentity {
                 identity,
                 repo_key: key,
-                name: full,
+                name: full.clone(),
             });
         }
     }
 
-    api::validate::detect_identity_collision(&self_identity, &self_repo_key, &self_full, &existing)
-        .map(|conflict| Collision {
-            conflict,
-            identity: self_identity,
-        })
+    api::validate::detect_identity_collision_multi(&self_pairs, &self_full, &existing).map(|hit| {
+        Collision {
+            conflict: hit.conflict,
+            identity: hit.identity,
+            repo_key: hit.repo_key,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -357,6 +374,158 @@ mod tests {
             }
         });
         Client::new(svc, "test-ns")
+    }
+
+    /// A `Client` that routes by URI-path substring (first matching fragment
+    /// wins; unmatched paths get an empty list body). Mirrors
+    /// `handlers::tests::mock_path_client`.
+    fn mock_path_client(routes: Vec<(&'static str, Value)>) -> Client {
+        let svc = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let path = req.uri().path().to_string();
+            let body = routes
+                .iter()
+                .find(|(fragment, _)| path.contains(fragment))
+                .map(|(_, b)| b.clone())
+                .unwrap_or_else(|| json!({ "items": [] }));
+            async move {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    /// Routes serving both referenced repositories (no `identityDefaults`) and
+    /// a stored single-repo policy `billing/pg-a` targeting
+    /// `ClusterRepository/shared` with a pinned explicit identity `pg@host`.
+    fn multi_collision_routes() -> Vec<(&'static str, Value)> {
+        vec![
+            // NOTE: listed before any bare "repositories/" fragment — the
+            // cluster-scoped path also contains that substring.
+            (
+                "clusterrepositories/shared",
+                json!({
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "ClusterRepository",
+                    "metadata": { "name": "shared" },
+                    "spec": {
+                        "backend": { "filesystem": { "path": "/r" } },
+                        "encryption": { "passwordSecretRef": { "name": "s", "namespace": "kopiur-system" } },
+                        "allowedNamespaces": { "all": true },
+                    }
+                }),
+            ),
+            (
+                "repositories/nas",
+                json!({
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "Repository",
+                    "metadata": { "name": "nas", "namespace": "billing" },
+                    "spec": {
+                        "backend": { "filesystem": { "path": "/r" } },
+                        "encryption": { "passwordSecretRef": { "name": "s" } },
+                    }
+                }),
+            ),
+            (
+                "snapshotpolicies",
+                json!({ "items": [{
+                    "metadata": { "name": "pg-a", "namespace": "billing" },
+                    "spec": {
+                        "repository": { "kind": "ClusterRepository", "name": "shared" },
+                        "identity": { "username": "pg", "hostname": "host" },
+                        "sources": [ { "pvc": { "name": "data" } } ],
+                    }
+                }] }),
+            ),
+        ]
+    }
+
+    fn multi_spec(identity: Option<Identity>) -> SnapshotPolicySpec {
+        let mut v = json!({
+            "repositories": [
+                { "kind": "Repository", "name": "nas" },
+                { "kind": "ClusterRepository", "name": "shared" },
+            ],
+            "sources": [ { "pvc": { "name": "data" } } ],
+        });
+        if let Some(id) = identity {
+            v["identity"] = serde_json::to_value(id).unwrap();
+        }
+        serde_json::from_value(v).expect("spec fixture decodes")
+    }
+
+    #[tokio::test]
+    async fn multi_repo_overlap_in_one_repo_collides_naming_that_repo() {
+        // The candidate resolves TWO (identity, repo_key) pairs; only the
+        // `ClusterRepository/shared` pair overlaps the stored policy — the hit
+        // names that member, not the harmless `Repository/billing/nas` one.
+        let client = mock_path_client(multi_collision_routes());
+        let spec = multi_spec(Some(Identity {
+            username: Some("pg".into()),
+            hostname: Some("host".into()),
+        }));
+        let collision =
+            check_identity_collision(Some(&client), "pg-b", "billing", &spec, None, None)
+                .await
+                .expect("must collide");
+        assert_eq!(collision.conflict, "billing/pg-a");
+        assert_eq!(collision.repo_key, "ClusterRepository/shared");
+        assert_eq!(collision.identity, "pg@host:/pvc/data");
+    }
+
+    #[tokio::test]
+    async fn same_identity_in_different_repositories_does_not_collide() {
+        // Identical identity, but the candidate only targets
+        // `Repository/billing/nas` while the stored policy writes
+        // `ClusterRepository/shared` — separate snapshot histories, no
+        // collision.
+        let client = mock_path_client(multi_collision_routes());
+        let spec = spec_with(
+            RepositoryRef {
+                kind: RepositoryKind::Repository,
+                name: "nas".into(),
+                namespace: None,
+            },
+            Some(Identity {
+                username: Some("pg".into()),
+                hostname: Some("host".into()),
+            }),
+            "data",
+        );
+        assert_eq!(
+            check_identity_collision(Some(&client), "pg-b", "billing", &spec, None, None).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn single_repo_collision_behaves_exactly_as_before() {
+        // N = 1 ≡ the old behavior: a single-repo candidate colliding with the
+        // stored single-repo policy in the same repository.
+        let client = mock_path_client(multi_collision_routes());
+        let spec = spec_with(
+            RepositoryRef {
+                kind: RepositoryKind::ClusterRepository,
+                name: "shared".into(),
+                namespace: None,
+            },
+            Some(Identity {
+                username: Some("pg".into()),
+                hostname: Some("host".into()),
+            }),
+            "data",
+        );
+        let collision =
+            check_identity_collision(Some(&client), "pg-b", "billing", &spec, None, None)
+                .await
+                .expect("must collide");
+        assert_eq!(collision.conflict, "billing/pg-a");
+        assert_eq!(collision.repo_key, "ClusterRepository/shared");
     }
 
     #[tokio::test]

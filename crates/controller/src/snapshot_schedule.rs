@@ -1148,7 +1148,10 @@ async fn resolve_effective_timezone(
     let mut defaults: Vec<Option<String>> = Vec::with_capacity(policy_refs.len());
     for pref in &policy_refs {
         match policy_repo_timezone_default(ctx, pref, namespace).await {
-            Ok(tz) => defaults.push(tz),
+            // One entry per repository of the policy (#368): a multi-repo
+            // policy's members feed the same agree-or-UTC kernel below, so
+            // within-policy disagreement is UTC + the ambiguity condition.
+            Ok(tzs) => defaults.extend(tzs),
             Err(e) => {
                 tracing::debug!(policy = %pref.name, error = %e, "resolving policy repository timezone default failed; degrading (established pin preserved)");
                 return TimezoneResolution::Degraded;
@@ -1160,28 +1163,40 @@ async fn resolve_effective_timezone(
     TimezoneResolution::Resolved { tz, ambiguity }
 }
 
-/// GET one target policy and resolve its repository's `scheduleDefaults.timezone`.
-/// Honors `policyRef.namespace` for a cross-namespace ref; the policy's repository
-/// is resolved in the policy's own namespace (matching how the policy itself
-/// resolves it). `Ok(None)` = the policy's repository sets no default.
+/// GET one target policy and resolve its repository/-ies'
+/// `scheduleDefaults.timezone`, one entry PER REPOSITORY (#368 audit M9: a
+/// multi-repo policy contributes each member's default, so the entries flow
+/// through the SAME agree-or-UTC + ambiguity kernel
+/// ([`effective_timezone`]) as cross-policy defaults do — all members agree ⇒
+/// that value; disagreement ⇒ UTC + the existing `TimezoneDefaultAmbiguous`
+/// warning condition, deterministically, with no new admission machinery).
+/// The single-repo shape returns exactly one entry — behavior unchanged.
+/// Honors `policyRef.namespace` for a cross-namespace ref; the policy's
+/// repositories resolve in the policy's own namespace (matching how the policy
+/// itself resolves them). An entry is `None` when that repository sets no
+/// default.
 async fn policy_repo_timezone_default(
     ctx: &Context,
     policy_ref: &PolicyRef,
     schedule_ns: &str,
-) -> Result<Option<String>> {
+) -> Result<Vec<Option<String>>> {
     let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
     let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), policy_ns);
     let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
         Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
     })?;
-    let repo = io::resolve_repository_ref(
-        &ctx.client,
-        io::recipe_repo_ref(&policy)?,
-        policy_ns,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
-    Ok(repo.schedule_defaults.and_then(|d| d.timezone))
+    let mut defaults = Vec::new();
+    for rref in kopiur_api::repository_refs(&policy.spec) {
+        let repo = io::resolve_repository_ref(
+            &ctx.client,
+            rref,
+            policy_ns,
+            ctx.operator_namespace.as_deref(),
+        )
+        .await?;
+        defaults.push(repo.schedule_defaults.and_then(|d| d.timezone));
+    }
+    Ok(defaults)
 }
 
 /// Build the `SnapshotSpec` for a scheduled backup of `policy_ref`. Pure so the
@@ -1954,6 +1969,35 @@ mod tests {
             None,
             "Pacific/Kiritimati".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn multi_repo_policy_disagreeing_repo_defaults_resolve_utc_with_ambiguity() {
+        use kopiur_api::common::effective_timezone;
+        // #368 audit M9: ONE policy, two repositories, disagreeing
+        // `scheduleDefaults.timezone`. `policy_repo_timezone_default` now
+        // contributes one entry per member, and those entries flow through the
+        // SAME agree-or-UTC kernel as cross-policy defaults — so the outcome
+        // is deterministic UTC plus the ambiguity that drives the existing
+        // `TimezoneDefaultAmbiguous` warning condition.
+        let per_repo = [
+            Some("Europe/Berlin".to_string()),
+            Some("America/Chicago".to_string()),
+        ];
+        let (tz, amb) = effective_timezone(None, &per_repo);
+        assert_eq!(tz, chrono_tz::Tz::UTC);
+        assert!(
+            amb.is_some(),
+            "within-policy disagreement must surface the warning ambiguity"
+        );
+        // All members agree → that value, no warning.
+        let agree = [
+            Some("Europe/Berlin".to_string()),
+            Some("Europe/Berlin".to_string()),
+        ];
+        let (tz, amb) = effective_timezone(None, &agree);
+        assert_eq!(tz.name(), "Europe/Berlin");
+        assert!(amb.is_none());
     }
 
     fn resolved(name: &str) -> TimezoneResolution {
