@@ -3325,7 +3325,7 @@ async fn resolve_restore_repository(
         })?;
         return io::resolve_repository_ref(
             &ctx.client,
-            &config.spec.repository,
+            io::recipe_repo_ref(&config)?,
             cfg_ns,
             ctx.operator_namespace.as_deref(),
         )
@@ -3378,10 +3378,16 @@ async fn restore_repository_ref(
             use kopiur_api::SnapshotPolicy;
             let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
             let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
-            Ok(cfg_api
-                .get_opt(&c.name)
-                .await?
-                .map(|cfg| (cfg.spec.repository.clone(), cfg_ns.to_string())))
+            Ok(cfg_api.get_opt(&c.name).await?.and_then(|cfg| {
+                // Multi-repo fromPolicy: the readiness gate cannot know which
+                // repository to wait on, and this contract is deliberately
+                // NON-FATAL — return None (never guess repository #1); the
+                // resolver above errors loudly downstream. Multi-repo restore
+                // selection lands in M8.
+                kopiur_api::single_repository_ref(&cfg.spec)
+                    .ok()
+                    .map(|r| (r.clone(), cfg_ns.to_string()))
+            }))
         }
         RestoreSource::Identity(_) => Ok(None),
     }

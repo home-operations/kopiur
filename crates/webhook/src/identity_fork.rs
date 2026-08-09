@@ -86,12 +86,17 @@ pub async fn check_identity_fork(
     let old_uh = format!("{}@{}", old_id.username, old_id.hostname);
 
     let client = client?;
-    let defaults = crate::identity_collision::cluster_repo_defaults_for(
-        client,
-        &new_spec.repository,
-        namespace,
-    )
-    .await;
+    // The multi-repo fork guard (a hard branch over every per-repo identity)
+    // lands in M9. Until then the admission feature gate refuses
+    // spec.repositories before this guard can run, so this arm only fires on
+    // a garbage stored shape — deny with the same validator error rather than
+    // silently admitting a re-identifying edit.
+    let repo_ref = match api::single_repository_ref(new_spec) {
+        Ok(r) => r,
+        Err(e) => return Some(e),
+    };
+    let defaults =
+        crate::identity_collision::cluster_repo_defaults_for(client, repo_ref, namespace).await;
     let new_id = crate::identity_collision::resolve_policy_identity(
         name,
         namespace,

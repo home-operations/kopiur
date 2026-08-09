@@ -929,6 +929,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
         Err(e) => return Err(e),
     };
+    // The single repository the recipe targets (defensive: multi-repo
+    // consumers land in M8/M10; this routes that arm to the reconciler's
+    // validation error path instead of silently picking repository #1).
+    let repo_ref = io::recipe_repo_ref(&config)?;
 
     // §11: a ReadOnly repository serves restores only — refuse to create a backup
     // Job. Surface a clear condition + Event and stop (not an error: it's a
@@ -944,7 +948,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         let conditions = io::upsert_gate(
             &conds,
             &kopiur_api::gates::REPOSITORY_READ_ONLY_GATE,
-            &readonly_backup_message(&config.spec.repository.name),
+            &readonly_backup_message(&repo_ref.name),
             backup.meta().generation,
         );
         // Guard the write so the Event + counter + warn fire once per real
@@ -970,14 +974,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &Event {
                         type_: EventType::Warning,
                         reason: crate::consts::REPOSITORY_READ_ONLY_REASON.into(),
-                        note: Some(readonly_backup_message(&config.spec.repository.name)),
+                        note: Some(readonly_backup_message(&repo_ref.name)),
                         action: "RefuseBackupReadOnlyRepository".into(),
                         secondary: None,
                     },
                     &io::event_ref(backup),
                 )
                 .await;
-            tracing::warn!(backup = %name, repository = %config.spec.repository.name, "refusing backup: repository is ReadOnly");
+            tracing::warn!(backup = %name, repository = %repo_ref.name, "refusing backup: repository is ReadOnly");
         }
         return Ok(Action::await_change());
     }
@@ -988,7 +992,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
     // A cheap single GET — independent of preflight, so it's evaluated FIRST and the
     // repository-not-ready reason is always surfaced before any preflight machinery.
-    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
+    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
@@ -998,7 +1002,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 backup,
                 SnapshotPhase::Pending,
                 crate::consts::REPOSITORY_NOT_READY_REASON,
-                &repository_not_ready_message(&config.spec.repository.name),
+                &repository_not_ready_message(&repo_ref.name),
             ),
         )
         .await?;
@@ -1047,7 +1051,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // so the common no-preflight backup never pays for it.
         let (pf_inputs, _ready) = io::gather_preflight_inputs(
             &ctx.client,
-            &config.spec.repository,
+            repo_ref,
             &namespace,
             &ctx.maintenance_store,
             now,
@@ -1398,8 +1402,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(repo_ref.kind),
+        &repo_ref.name,
     )
     .await
     {
@@ -1801,7 +1805,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // reads `resolved.repository` so cleanup still works once the
             // recipe is gone — the namespace-deletion cascade usually reaps the
             // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
-            "resolved": resolved_run_status(&config, &namespace, &work_spec),
+            "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref),
             // The SAME value written into the kopia `kopiur-meta` tag above —
             // single source, so tag and status cannot diverge.
             "recorded": recorded,
@@ -2717,7 +2721,7 @@ async fn resolve_repo_for_deletion(
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
     Ok((
-        pinned_repository_ref(&config.spec.repository, &config_ns),
+        pinned_repository_ref(io::recipe_repo_ref(&config)?, &config_ns),
         repo,
     ))
 }
@@ -3616,6 +3620,8 @@ async fn reconcile_pin(
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
     let (config, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    // Defensive single-repo resolution (multi-repo consumers land in M8/M10).
+    let repo_ref = io::recipe_repo_ref(&config)?;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -3634,8 +3640,8 @@ async fn reconcile_pin(
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(repo_ref.kind),
+        &repo_ref.name,
     )
     .await?;
     if creds.projected > 0 {
@@ -4056,7 +4062,7 @@ async fn resolve_recipe(
     // exhaustively in the resolver (ADR §5.5).
     let repo = io::resolve_repository_ref(
         &ctx.client,
-        &config.spec.repository,
+        io::recipe_repo_ref(&config)?,
         cfg_ns,
         ctx.operator_namespace.as_deref(),
     )
@@ -4644,9 +4650,14 @@ async fn backfill_projection_pin(
     let Some(config) = cfg_api.get_opt(&policy_ref.name).await? else {
         return Ok(());
     };
-    let Some(body) =
-        plan::backfill_patch_body(&config, namespace, needs_projection, needs_repository)
-    else {
+    let repo_ref = io::recipe_repo_ref(&config)?;
+    let Some(body) = plan::backfill_patch_body(
+        &config,
+        namespace,
+        needs_projection,
+        needs_repository,
+        repo_ref,
+    ) else {
         return Ok(());
     };
     io::patch_status(api, name, body).await?;

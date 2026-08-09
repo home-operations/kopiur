@@ -781,6 +781,7 @@ pub fn resolved_run_status(
     config: &SnapshotPolicy,
     namespace: &str,
     work_spec: &MoverWorkSpec,
+    repo_ref: &RepositoryRef,
 ) -> kopiur_api::snapshot::ResolvedSnapshot {
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
     let pvc = config
@@ -790,7 +791,9 @@ pub fn resolved_run_status(
         .and_then(|s| s.pvc.as_ref())
         .map(|p| format!("{namespace}/{}", p.name));
     kopiur_api::snapshot::ResolvedSnapshot {
-        repository: Some(pinned_repository_ref(&config.spec.repository, &config_ns)),
+        // `repo_ref` is threaded by the caller (pure fn, no error path):
+        // multi-repo pin selection lands in M8.
+        repository: Some(pinned_repository_ref(repo_ref, &config_ns)),
         sources: vec![kopiur_api::snapshot::ResolvedSource {
             pvc,
             source_path: Some(work_spec.identity.source_path.clone()),
@@ -862,6 +865,7 @@ pub(super) fn backfill_patch_body(
     namespace: &str,
     needs_projection: bool,
     needs_repository: bool,
+    repo_ref: &RepositoryRef,
 ) -> Option<serde_json::Value> {
     if !needs_projection && !needs_repository {
         return None;
@@ -877,7 +881,9 @@ pub(super) fn backfill_patch_body(
         let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
         resolved.insert(
             "repository".to_string(),
-            serde_json::json!(pinned_repository_ref(&config.spec.repository, &config_ns)),
+            // Threaded by the caller (pure fn); multi-repo backfill (per-row
+            // pin from status.resolved) lands in M8.
+            serde_json::json!(pinned_repository_ref(repo_ref, &config_ns)),
         );
     }
     Some(serde_json::json!({ "resolved": resolved }))

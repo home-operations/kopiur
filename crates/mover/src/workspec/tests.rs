@@ -973,11 +973,12 @@ fn s3_ca_bundle_pem_roundtrips_and_reaches_the_kopia_connect_spec() {
 fn policy_args_from_policy_maps_all_flattened_knobs() {
     use kopiur_api::snapshot_policy::{Compression, ErrorHandling, Files, Upload};
     let spec = kopiur_api::SnapshotPolicySpec {
-        repository: kopiur_api::common::RepositoryRef {
+        repository: Some(kopiur_api::common::RepositoryRef {
             kind: Default::default(),
             name: "r".into(),
             namespace: None,
-        },
+        }),
+        repositories: vec![],
         identity: None,
         sources: vec![],
         copy_method: Default::default(),
@@ -1065,11 +1066,12 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
 /// glue tests below (and easy to spot the ONE field each varies).
 fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
     kopiur_api::SnapshotPolicySpec {
-        repository: kopiur_api::common::RepositoryRef {
+        repository: Some(kopiur_api::common::RepositoryRef {
             kind: Default::default(),
             name: "r".into(),
             namespace: None,
-        },
+        }),
+        repositories: vec![],
         identity: None,
         sources: vec![],
         copy_method: Default::default(),

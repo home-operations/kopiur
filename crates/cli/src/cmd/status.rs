@@ -226,24 +226,40 @@ fn repo_matches(
     }
 }
 
-/// Does a policy's repository ref match the filter? An absent ref namespace
-/// means "same as the policy" for a namespaced Repository.
+/// Render a policy's repository target for the status table. A display path
+/// has no error surface, so the invalid/multi shapes get honest placeholders
+/// instead of a silent repository #1 (multi-repo rendering proper lands with
+/// the fan-out data path in M8/M10).
+fn policy_repository_display(spec: &kopiur_api::SnapshotPolicySpec) -> String {
+    use kopiur_api::PolicyRepositories;
+    match kopiur_api::policy_repositories(spec) {
+        Ok(PolicyRepositories::Single(r)) => format!("{:?}/{}", r.kind, r.name),
+        Ok(PolicyRepositories::Multi(refs)) => format!("(multiple: {})", refs.len()),
+        Err(_) => "(invalid)".to_string(),
+    }
+}
+
+/// Does ANY of a policy's repository refs (`spec.repository` /
+/// `spec.repositories`) match the filter? An absent ref namespace means "same
+/// as the policy" for a namespaced Repository. Any-of, so a multi-repo policy
+/// shows up under every repository it targets.
 fn policy_matches(filter: Option<&RepoFilter>, policy: &SnapshotPolicy) -> bool {
     let Some(f) = filter else { return true };
-    let rref = &policy.spec.repository;
-    if rref.kind != f.kind || rref.name != f.name {
-        return false;
-    }
-    match f.kind {
-        RepositoryKind::ClusterRepository => true,
-        RepositoryKind::Repository => {
-            let effective = rref
-                .namespace
-                .as_deref()
-                .or(policy.metadata.namespace.as_deref());
-            effective == f.namespace.as_deref()
+    kopiur_api::repository_refs(&policy.spec).any(|rref| {
+        if rref.kind != f.kind || rref.name != f.name {
+            return false;
         }
-    }
+        match f.kind {
+            RepositoryKind::ClusterRepository => true,
+            RepositoryKind::Repository => {
+                let effective = rref
+                    .namespace
+                    .as_deref()
+                    .or(policy.metadata.namespace.as_deref());
+                effective == f.namespace.as_deref()
+            }
+        }
+    })
 }
 
 /// Does a `SnapshotReplication` touch the filtered repository — as its source
@@ -521,10 +537,7 @@ async fn gather(
         report.policies.push(PolicyRow {
             name: policy.name_any(),
             namespace: policy.metadata.namespace.clone().unwrap_or_default(),
-            repository: format!(
-                "{:?}/{}",
-                policy.spec.repository.kind, policy.spec.repository.name
-            ),
+            repository: policy_repository_display(&policy.spec),
             suspended: policy.spec.suspend,
             last_snapshot: status.and_then(|s| s.last_successful_snapshot.clone()),
             last_verified: status.and_then(|s| s.last_verified.clone()),

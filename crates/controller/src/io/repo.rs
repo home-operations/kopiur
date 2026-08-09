@@ -19,6 +19,16 @@ use crate::error::{Error, Result};
 /// Default key within the encryption password Secret when unset.
 pub const DEFAULT_PASSWORD_KEY: &str = "KOPIA_PASSWORD";
 
+/// The single repository a `SnapshotPolicy` recipe targets, on the
+/// controller's defensive-validation error path
+/// ([`Error::Validation`], the same class the reconcilers' spec re-validation
+/// uses). The multi-repo shape errors here rather than silently picking
+/// repository #1 — its consumers land in M8/M10, and until the admission
+/// feature gate lifts (M11) no admitted policy reaches that arm.
+pub fn recipe_repo_ref(config: &kopiur_api::SnapshotPolicy) -> Result<&RepositoryRef> {
+    kopiur_api::single_repository_ref(&config.spec).map_err(|e| Error::Validation(e.to_string()))
+}
+
 /// Default key within a `tls.caBundleRef` ConfigMap when unset — re-exported
 /// from [`kopiur_api::consts`] (shared with the kubectl-plugin's client-side
 /// resolver, which must agree on the default).

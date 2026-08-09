@@ -107,11 +107,12 @@ fn sample_backup_config(name: &str) -> SnapshotPolicy {
     SnapshotPolicy::new(
         name,
         SnapshotPolicySpec {
-            repository: RepositoryRef {
+            repository: Some(RepositoryRef {
                 kind: RepositoryKind::Repository,
                 name: "test-repo".into(),
                 namespace: None,
-            },
+            }),
+            repositories: vec![],
             identity: None,
             sources: vec![Source {
                 pvc: Some(PvcSource {
@@ -191,6 +192,7 @@ async fn backup_gets_finalizer_and_delete_path_removes_cr() {
         SnapshotSpec {
             source: None,
             policy_ref: None,
+            repository: None,
             tags: None,
             failure_policy: None,
             deletion_policy: Some(kopiur_api::DeletionPolicy::Orphan),

@@ -223,10 +223,16 @@ async fn handle_snapshot_policy(
     }
 
     // ClusterRepository tenancy (fail closed). namespace comes from the request.
-    if let TenancyDecision::Deny(denial) =
-        tenancy_for(&spec.repository, req.namespace.as_deref(), client).await
-    {
-        return Err(denial.into());
+    // Looped over every referenced repository: for the single-repo shape this
+    // is exactly the old one-ref check; the multi-repo shape (refused above by
+    // the validator's feature gate until the fan-out data path lands) already
+    // gets the right any-denies-fails semantics for when the gate lifts.
+    for rref in api::repository_refs(&spec) {
+        if let TenancyDecision::Deny(denial) =
+            tenancy_for(rref, req.namespace.as_deref(), client).await
+        {
+            return Err(denial.into());
+        }
     }
 
     // Identity-collision detection (ADR-0005 §6): reject a SnapshotPolicy whose

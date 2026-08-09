@@ -432,8 +432,8 @@ async fn spawn_verify_job(
             .credential_projection
             .as_ref()
             .is_some_and(|p| p.enabled),
-        io::repo_kind_str(config.spec.repository.kind),
-        &config.spec.repository.name,
+        io::repo_kind_str(io::recipe_repo_ref(config)?.kind),
+        &io::recipe_repo_ref(config)?.name,
     )
     .await?;
     if creds.projected > 0 {
@@ -1023,11 +1023,12 @@ mod tests {
         SnapshotPolicy::new(
             "pg",
             kopiur_api::SnapshotPolicySpec {
-                repository: kopiur_api::common::RepositoryRef {
+                repository: Some(kopiur_api::common::RepositoryRef {
                     kind: Default::default(),
                     name: "r".into(),
                     namespace: None,
-                },
+                }),
+                repositories: vec![],
                 identity: None,
                 sources: vec![Source {
                     pvc: Some(PvcSource {

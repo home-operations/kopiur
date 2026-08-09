@@ -254,11 +254,12 @@ fn sample_policy() -> kopiur_api::SnapshotPolicy {
     kopiur_api::SnapshotPolicy::new(
         "pg",
         kopiur_api::SnapshotPolicySpec {
-            repository: kopiur_api::common::RepositoryRef {
+            repository: Some(kopiur_api::common::RepositoryRef {
                 kind: Default::default(),
                 name: "r".into(),
                 namespace: None,
-            },
+            }),
+            repositories: vec![],
             identity: None,
             sources: vec![],
             copy_method: Default::default(),
@@ -442,8 +443,9 @@ fn needs_repository_backfill_is_false_without_a_policy_ref() {
 #[test]
 fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
     let policy = sample_policy();
+    let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
     assert_eq!(
-        super::plan::backfill_patch_body(&policy, "ns", false, false),
+        super::plan::backfill_patch_body(&policy, "ns", false, false, repo_ref),
         None
     );
 }
@@ -451,9 +453,10 @@ fn backfill_patch_body_is_none_when_neither_pin_needs_backfilling() {
 #[test]
 fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     let policy = sample_policy();
+    let repo_ref = kopiur_api::single_repository_ref(&policy.spec).unwrap();
 
     // Only the repository pin needs backfilling: the body carries just that key.
-    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true)
+    let repo_only = super::plan::backfill_patch_body(&policy, "ns", false, true, repo_ref)
         .expect("repository backfill needed");
     let resolved = repo_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("credentialProjection"));
@@ -463,14 +466,15 @@ fn backfill_patch_body_includes_only_the_keys_that_need_backfilling() {
     assert_eq!(resolved["repository"]["namespace"], "ns");
 
     // Only the projection pin needs backfilling: the body carries just that key.
-    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false)
+    let projection_only = super::plan::backfill_patch_body(&policy, "ns", true, false, repo_ref)
         .expect("projection backfill needed");
     let resolved = projection_only["resolved"].as_object().expect("object");
     assert!(!resolved.contains_key("repository"));
     assert_eq!(resolved["credentialProjection"]["enabled"], false);
 
     // Both needed: both keys present.
-    let both = super::plan::backfill_patch_body(&policy, "ns", true, true).expect("both needed");
+    let both =
+        super::plan::backfill_patch_body(&policy, "ns", true, true, repo_ref).expect("both needed");
     let resolved = both["resolved"].as_object().expect("object");
     assert!(resolved.contains_key("credentialProjection"));
     assert!(resolved.contains_key("repository"));
@@ -523,11 +527,12 @@ fn config_with_source(name: &str, source: kopiur_api::snapshot_policy::Source) -
     SnapshotPolicy::new(
         name,
         SnapshotPolicySpec {
-            repository: RepositoryRef {
+            repository: Some(RepositoryRef {
                 kind: RepositoryKind::Repository,
                 name: "repo".into(),
                 namespace: None,
-            },
+            }),
+            repositories: vec![],
             identity: None,
             sources: vec![source],
             copy_method: Default::default(),
@@ -2850,7 +2855,12 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
     let repo = resolved_s3_repo();
     let (ws, _, _, _) =
         build_backup_run(&dummy_backup(), &cfg, &repo, "media-ns", "media").unwrap();
-    let resolved = resolved_run_status(&cfg, "media-ns", &ws);
+    let resolved = resolved_run_status(
+        &cfg,
+        "media-ns",
+        &ws,
+        kopiur_api::single_repository_ref(&cfg.spec).unwrap(),
+    );
     // The deletion path re-resolves the repo from this pinned ref alone, so
     // it must carry the namespace the recipe resolved against.
     let pinned = resolved.repository.expect("repository pinned");

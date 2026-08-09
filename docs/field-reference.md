@@ -1449,9 +1449,10 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 ### `spec` { #snapshotpolicy-spec }
 
+Externally tagged — set **exactly one** of: `repositories` · `repository`.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `repository` | [object](#snapshotpolicy-spec-repository) | **required** | Discriminated reference to a `Repository` or `ClusterRepository`. |
 | `adoption` | enum: Adopt \| Ignore | — | Whether a discovered snapshot whose resolved identity matches a live `SnapshotPolicy` is automatically adopted — re-attached (stamped with that policy's config label, `status.origin` flipped to `Adopted`) so GFS retention governs it and eventually prunes it, instead of it sitting in the catalog forever as an immortal `discovered` row. |
 | `compression` | [object](#snapshotpolicy-spec-compression) | — | Compression algorithm + per-extension opt-outs. |
 | `copyMethod` | enum: Snapshot \| Clone \| Direct | `Snapshot` | How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`. |
@@ -1466,6 +1467,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `identity` | [object](#snapshotpolicy-spec-identity) | — | Identity overrides — what kopia records as `username@hostname:path`. |
 | `mover` | [object](#snapshotpolicy-spec-mover) | — | Per-recipe mover overrides (resources, cache, security context). |
 | `preflight` | [object](#snapshotpolicy-spec-preflight) | — | Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒ no preflight). A failing check holds the `Snapshot` in `Pending` (`PreflightFailed`) and, after `timeout`, fails it. |
+| `repositories` | [][object](#snapshotpolicy-spec-repositories) | —<br><sub>minItems 1; maxItems 8</sub> | Multi-repository fan-out: every listed `Repository`/`ClusterRepository` receives its own independent backup of each source — one `Snapshot` CR + one mover Job per (source, repository) pair, so the captures are separate kopia snapshots, not copies of one another. Identity resolves per-repo under that repository's `identityDefaults`. Mutually exclusive with `repository` (exactly one of the two is set) AND with `hooks`: with N concurrent children the first finisher would run the thaw hook while the other N-1 movers still read — use a single-repo policy plus a `SnapshotReplication` when hooks are needed for a second target. |
+| `repository` | [object](#snapshotpolicy-spec-repository) | — | Discriminated reference to a `Repository` or `ClusterRepository`. Mutually exclusive with `repositories` (exactly one of the two is set). |
 | `retention` | [object](#snapshotpolicy-spec-retention) | — | GFS retention, enforced by the operator pruning `Snapshot` CRs. |
 | `sources` | [][object](#snapshotpolicy-spec-sources) | —<br><sub>maxItems 100</sub> | What to back up (at least one source; webhook-enforced). |
 | `staging` | [object](#snapshotpolicy-spec-staging) | — | Staging knobs for `copyMethod: Snapshot`/`Clone` (e.g. how long to wait for the CSI capture to become ready before failing the backup). |
@@ -1473,14 +1476,6 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `upload` | [object](#snapshotpolicy-spec-upload) | — | Upload parallelism (kopia's `--max-parallel-snapshots` / `--max-parallel-file-reads`). |
 | `verification` | [object](#snapshotpolicy-spec-verification) | — | First-class backup verification; opt-in (absent ⇒ no verification runs). |
 | `volumeSnapshotClassName` | string | — | `VolumeSnapshotClass` used when `copyMethod` snapshots/clones the source. Absent or empty both mean auto-select the default class for the source PVC's CSI driver, so a GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset. |
-
-#### `spec.repository` { #snapshotpolicy-spec-repository }
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
-| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
-| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `spec.compression` { #snapshotpolicy-spec-compression }
 
@@ -1683,6 +1678,22 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `expr` | string | **required** | CEL bool predicate; the backup proceeds only when this evaluates `true`. |
 | `name` | string | **required**<br><sub>minLength 1; maxLength 63</sub> | Stable identifier surfaced in the `Snapshot`'s status when this check blocks (e.g. `maintenance-fresh`). Unique within the policy. |
 | `message` | string | — | Optional human message surfaced alongside the check name when it blocks. |
+
+#### `spec.repositories[]` { #snapshotpolicy-spec-repositories }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+#### `spec.repository` { #snapshotpolicy-spec-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
 
 #### `spec.retention` { #snapshotpolicy-spec-retention }
 

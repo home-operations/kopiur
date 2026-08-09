@@ -56,7 +56,10 @@ pub async fn dest_policy_identities(
     let mut out = Vec::new();
     for p in policies {
         let Some(ns) = p.namespace() else { continue };
-        if repo_key(&p.spec.repository, &ns) != dest_key {
+        // Any-of over every ref the policy names (tolerant iterator): a
+        // multi-repo policy writes the destination directly when ANY of its
+        // refs resolves to it. Single-repo behavior is unchanged.
+        if !api::repository_refs(&p.spec).any(|r| repo_key(r, &ns) == dest_key) {
             continue;
         }
         let base = match pinned_identity(&p) {

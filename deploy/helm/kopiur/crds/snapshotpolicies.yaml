@@ -888,8 +888,45 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              repositories:
+                description: |-
+                  Multi-repository fan-out: every listed `Repository`/`ClusterRepository`
+                  receives its own independent backup of each source — one `Snapshot` CR +
+                  one mover Job per (source, repository) pair, so the captures are separate
+                  kopia snapshots, not copies of one another. Identity resolves per-repo
+                  under that repository's `identityDefaults`. Mutually exclusive with
+                  `repository` (exactly one of the two is set) AND with `hooks`: with N
+                  concurrent children the first finisher would run the thaw hook while the
+                  other N-1 movers still read — use a single-repo policy plus a
+                  `SnapshotReplication` when hooks are needed for a second target.
+                items:
+                  description: Reference from a consumer CR to a `Repository` or `ClusterRepository`.
+                  properties:
+                    kind:
+                      default: Repository
+                      description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                      enum:
+                      - Repository
+                      - ClusterRepository
+                      type: string
+                    name:
+                      description: Name of the referenced `Repository`/`ClusterRepository`.
+                      type: string
+                    namespace:
+                      description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 8
+                minItems: 1
+                type: array
               repository:
-                description: Discriminated reference to a `Repository` or `ClusterRepository`.
+                description: |-
+                  Discriminated reference to a `Repository` or `ClusterRepository`.
+                  Mutually exclusive with `repositories` (exactly one of the two is set).
+                nullable: true
                 properties:
                   kind:
                     default: Repository
@@ -1270,9 +1307,10 @@ spec:
                   GitOps-templated value (Flux/Kustomize `${VAR}`) is safe when the variable is unset.
                 nullable: true
                 type: string
-            required:
-            - repository
             type: object
+            x-kubernetes-validations:
+            - message: exactly one of repository, repositories
+              rule: '(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1'
           status:
             description: Observed state of a `SnapshotPolicy`.
             nullable: true

@@ -412,12 +412,21 @@ fn group_by_none_never_pins_a_group() {
 
 #[test]
 fn group_names_are_deterministic_and_bounded() {
-    assert_eq!(group_name("base", "ns", 0), group_name("base", "ns", 0));
-    assert_ne!(group_name("base", "ns", 0), group_name("base", "other", 0));
+    assert_eq!(
+        group_name("base", "ns", 0, None),
+        group_name("base", "ns", 0, None)
+    );
+    assert_ne!(
+        group_name("base", "ns", 0, None),
+        group_name("base", "other", 0, None)
+    );
     // Two selector sources in ONE namespace are two separate captures, built
     // from two different label selectors — they must not share an object.
-    assert_ne!(group_name("base", "ns", 0), group_name("base", "ns", 1));
-    let n = group_name(&"a".repeat(200), "ns", 0);
+    assert_ne!(
+        group_name("base", "ns", 0, None),
+        group_name("base", "ns", 1, None)
+    );
+    let n = group_name(&"a".repeat(200), "ns", 0, None);
     assert!(n.len() <= 63, "len {} for {n}", n.len());
     assert!(n.ends_with("-grp"), "{n}");
 }
@@ -495,4 +504,209 @@ fn an_unusable_match_expression_is_refused_not_dropped() {
 
     assert!(crate::validate::validate_source(&with_expr("Exists", None)).is_ok());
     assert!(crate::validate::validate_source(&with_expr("NotIn", Some(vec!["db".into()]))).is_ok());
+}
+
+// --- M7 multi-repo naming: golden byte-compat + injectivity ------------------
+
+/// Shorthand ref builder for the naming tests.
+fn rref(kind: crate::common::RepositoryKind, name: &str) -> crate::common::RepositoryRef {
+    crate::common::RepositoryRef {
+        kind,
+        name: name.into(),
+        namespace: None,
+    }
+}
+
+/// THE byte-compat proof for `fanout_child_name_for`: the legacy forms are
+/// pinned as golden strings computed from the PRE-multi-repo algorithm, so any
+/// drift in the hash input, slug rules, or clipping fails loudly here.
+#[test]
+fn legacy_child_names_are_byte_identical_golden() {
+    // (member, no repo) — the legacy `-pvc-` scheme, both spellings agree.
+    assert_eq!(
+        fanout_child_name("nightly-20260805020000", "db", "db", "pgdata"),
+        "nightly-20260805020000-pvc-pgdata-9c07500e"
+    );
+    assert_eq!(
+        fanout_child_name_for("nightly-20260805020000", "db", Some(("db", "pgdata")), None),
+        "nightly-20260805020000-pvc-pgdata-9c07500e"
+    );
+    // Cross-namespace slug form.
+    assert_eq!(
+        fanout_child_name("nightly-20260805020000", "db", "other", "pgdata"),
+        "nightly-20260805020000-pvc-other-pgdata-e2e6bfb6"
+    );
+    // Clipping path (base + slug over budget) — pre-change clip split pinned.
+    assert_eq!(
+        fanout_child_name(
+            &format!("{}-20260805020000", "a".repeat(40)),
+            "db",
+            "db",
+            &"p".repeat(40)
+        ),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pvc-pppppppppppppppp-76e51736"
+    );
+    // (no member, no repo) — a non-fanned child IS its base (scheduled
+    // `<schedule>-<slot>` / manual `<policy>-manual-<slot>` names unchanged).
+    assert_eq!(
+        fanout_child_name_for("nightly-20260805020000", "db", None, None),
+        "nightly-20260805020000"
+    );
+    assert_eq!(
+        fanout_child_name_for("pg-manual-20260805020000", "db", None, None),
+        "pg-manual-20260805020000"
+    );
+}
+
+#[test]
+fn group_name_without_repo_is_byte_identical_golden() {
+    assert_eq!(
+        group_name("nightly-20260805020000", "db", 0, None),
+        "nightly-20260805020000-2a7a7950-grp"
+    );
+    // Long-base clipping pinned too.
+    assert_eq!(
+        group_name(&"a".repeat(80), "db", 1, None),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2a7a7b03-grp"
+    );
+    // The repo dimension changes the tag (one VolumeGroupSnapshot per
+    // (repo, slot)) and distinct repos get distinct groups.
+    let none = group_name("base", "ns", 0, None);
+    let a = group_name("base", "ns", 0, Some("Repository/ns/a"));
+    let b = group_name("base", "ns", 0, Some("Repository/ns/b"));
+    assert_ne!(none, a);
+    assert_ne!(a, b);
+    assert!(a.len() <= 63 && a.ends_with("-grp"));
+}
+
+#[test]
+fn repo_child_name_forms_carry_markers_and_stay_bounded() {
+    use crate::common::RepositoryKind;
+    let repo = rref(RepositoryKind::Repository, "offsite");
+
+    // (no member, repo): `<base>-repo-<rslug>-<h8>`.
+    let n = fanout_child_name_for("nightly-20260805020000", "db", None, Some(&repo));
+    assert!(n.starts_with("nightly-20260805020000-repo-offsite-"), "{n}");
+    assert!(n.len() <= 63);
+
+    // (member, repo): combined `-pvc-…-repo-…` form.
+    let c = fanout_child_name_for(
+        "nightly-20260805020000",
+        "db",
+        Some(("db", "pgdata")),
+        Some(&repo),
+    );
+    assert!(
+        c.starts_with("nightly-20260805020000-pvc-pgdata-repo-offsite-"),
+        "{c}"
+    );
+    assert!(c.len() <= 63);
+    // …and differs from the legacy no-repo name (the repo_key is hashed).
+    assert_ne!(
+        c,
+        fanout_child_name_for("nightly-20260805020000", "db", Some(("db", "pgdata")), None)
+    );
+
+    // Same repo NAME under a different KIND is a different repo_key → a
+    // different hash even though the legible rslug is identical.
+    let cluster = rref(RepositoryKind::ClusterRepository, "offsite");
+    let n2 = fanout_child_name_for("nightly-20260805020000", "db", None, Some(&cluster));
+    assert_ne!(n, n2);
+    assert_eq!(
+        n.rsplit_once('-').unwrap().0,
+        n2.rsplit_once('-').unwrap().0,
+        "same visible prefix — only the never-clipped hash separates them"
+    );
+}
+
+#[test]
+fn marker_ambiguity_pslug_containing_repo_marker_stays_injective() {
+    use crate::common::RepositoryKind;
+    // pslug "x-repo-y" with NO repo vs pslug "x" + rslug "y": both render as
+    // `…-pvc-x-repo-y-<h8>` up to the hash. Injectivity must come from the
+    // newline-framed hash tuple, never from parsing the markers back.
+    let a = fanout_child_name_for("base", "ns", Some(("ns", "x-repo-y")), None);
+    let b = fanout_child_name_for(
+        "base",
+        "ns",
+        Some(("ns", "x")),
+        Some(&rref(RepositoryKind::Repository, "y")),
+    );
+    assert_eq!(
+        a.rsplit_once('-').unwrap().0,
+        b.rsplit_once('-').unwrap().0,
+        "fixture precondition: identical visible prefix `base-pvc-x-repo-y`"
+    );
+    assert_ne!(a, b, "the hash tuple must disambiguate the two shapes");
+}
+
+#[test]
+fn fanout_child_name_for_length_and_injectivity_property() {
+    use crate::common::RepositoryKind;
+    use std::collections::BTreeMap;
+
+    // Deterministic pseudo-random tuples (hermetic — no proptest dep): a
+    // xorshift over a fixed seed drives lengths/shape choices.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut rand = move |bound: usize| -> usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state as usize) % bound.max(1)
+    };
+    let frag = |n: usize, c: u8| -> String { std::iter::repeat_n(c as char, n).collect() };
+
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for i in 0..2000 {
+        let base = format!("{}-2026080502{:04}", frag(1 + rand(50), b'b'), i);
+        let member_owned;
+        let member = match rand(3) {
+            0 => None,
+            _ => {
+                member_owned = (
+                    format!("ns{}", rand(4)),
+                    format!("{}-{i}", frag(1 + rand(60), b'p')),
+                );
+                Some((member_owned.0.as_str(), member_owned.1.as_str()))
+            }
+        };
+        let repo_owned;
+        let repo = match rand(3) {
+            0 => None,
+            k => {
+                repo_owned = rref(
+                    if k == 1 {
+                        RepositoryKind::Repository
+                    } else {
+                        RepositoryKind::ClusterRepository
+                    },
+                    &format!("{}{}", frag(1 + rand(40), b'r'), rand(8)),
+                );
+                Some(&repo_owned)
+            }
+        };
+        // The (None, None) arm is the legacy "name IS the base" contract:
+        // every real caller produces a ≤63 base there (schedule/manual
+        // naming), and with no member/repo there is no hash to disambiguate a
+        // clipped base. Mirror the contract in the generator.
+        let base = if member.is_none() && repo.is_none() {
+            base.chars().take(63).collect::<String>()
+        } else {
+            base
+        };
+        let key = format!("{base}|{member:?}|{repo:?}");
+        let name = fanout_child_name_for(&base, "ns0", member, repo);
+        // Length + DNS-1123 shape, always.
+        assert!(name.len() <= 63, "len {} for {name} ({key})", name.len());
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{name}"
+        );
+        assert!(!name.starts_with('-') && !name.ends_with('-'), "{name}");
+        // Injectivity: two distinct tuples never share a name.
+        if let Some(prev) = seen.insert(name.clone(), key.clone()) {
+            assert_eq!(prev, key, "collision on {name}");
+        }
+    }
 }

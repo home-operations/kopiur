@@ -250,7 +250,9 @@ pub fn configmap_to_cluster_repositories(
 
 // --- M3: repository -> consumers --------------------------------------------
 
-/// SnapshotPolicies whose `spec.repository` targets the changed `Repository`.
+/// SnapshotPolicies ANY of whose repository refs (`spec.repository` /
+/// `spec.repositories`) target the changed `Repository` — the tolerant any-of
+/// predicate a watch mapper needs (it must never error on a malformed CR).
 pub fn repository_to_policies(
     store: &Store<SnapshotPolicy>,
     repo: &Repository,
@@ -259,18 +261,21 @@ pub fn repository_to_policies(
         return Vec::new();
     };
     select(store, |c: &SnapshotPolicy| {
-        ref_targets_repository(&c.spec.repository, c.namespace().as_deref(), &ns, &name)
+        kopiur_api::repository_refs(&c.spec)
+            .any(|r| ref_targets_repository(r, c.namespace().as_deref(), &ns, &name))
     })
 }
 
-/// SnapshotPolicies whose `spec.repository` targets the changed `ClusterRepository`.
+/// SnapshotPolicies ANY of whose repository refs target the changed
+/// `ClusterRepository` (any-of for the same reason as
+/// [`repository_to_policies`]).
 pub fn cluster_repository_to_policies(
     store: &Store<SnapshotPolicy>,
     repo: &ClusterRepository,
 ) -> Vec<ObjectRef<SnapshotPolicy>> {
     let name = repo.name_any();
     select(store, |c: &SnapshotPolicy| {
-        ref_targets_cluster(&c.spec.repository, &name)
+        kopiur_api::repository_refs(&c.spec).any(|r| ref_targets_cluster(r, &name))
     })
 }
 

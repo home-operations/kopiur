@@ -73,8 +73,9 @@ pub use snapshot::{
     StagedSources,
 };
 pub use snapshot_policy::{
-    CopyMethod, DeepVerification, GroupBy, Hook, SnapshotPolicy, SnapshotPolicySpec,
-    SnapshotPolicyStatus, SourcePathStrategy, StagingSpec, Verification,
+    CopyMethod, DeepVerification, GroupBy, Hook, PolicyRepositories, SnapshotPolicy,
+    SnapshotPolicySpec, SnapshotPolicyStatus, SourcePathStrategy, StagingSpec, Verification,
+    is_multi_repo, policy_repositories, repository_refs, single_repository_ref,
 };
 pub use snapshot_replication::{
     IdentityMatcher, IdentitySelection, MigrateOptions, MirrorSourcePruning, NoPruning,

@@ -628,6 +628,12 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     if let Some(first) = errs.into_iter().next() {
         return Err(Error::Validation(first.to_string()));
     }
+    // The single repository this recipe targets. The validator above already
+    // refused the multi-repo shape (feature-gated until its data path lands —
+    // multi-repo consumers land in M8/M10) and the neither/both shapes, so
+    // this is a defensive re-check, never a silent repo#1 pick.
+    let repo_ref = kopiur_api::single_repository_ref(&config.spec)
+        .map_err(|e| Error::Validation(e.to_string()))?;
 
     let namespace = config
         .namespace()
@@ -687,7 +693,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     //    `RepositoryIdentityWouldFork`), not this pin.
     let repo = io::resolve_repository_ref(
         &ctx.client,
-        &config.spec.repository,
+        repo_ref,
         &namespace,
         ctx.operator_namespace.as_deref(),
     )
@@ -717,7 +723,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // shouldn't fire it productively) until its Repository is Ready. Read readiness
     // from the existing helper and REQUEUE (not error) until then, surfacing a
     // `Reconciling` condition. This makes `kubectl wait` and Flux/Argo health behave.
-    if !io::repository_ready(&ctx.client, &config.spec.repository, &namespace).await? {
+    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
         let conditions = io::set_ready(
             &existing,
             generation,
@@ -975,6 +981,12 @@ async fn run_adoption(
         return Ok(None);
     };
 
+    // The single repository this recipe targets — defensive re-check on the
+    // reconciler's validation error path (multi-repo consumers land in
+    // M8/M10; the admission feature gate keeps that arm unreachable here).
+    let repo_ref = kopiur_api::single_repository_ref(&config.spec)
+        .map_err(|e| Error::Validation(e.to_string()))?;
+
     // 2. LIST discovered candidates cluster-wide (inv. 1), scoped to THIS repo.
     let repo_uid = repo.owner_ref.uid.as_str();
     let candidates = list_adoption_candidates(ctx, repo_uid).await?;
@@ -1030,7 +1042,7 @@ async fn run_adoption(
 
     // 6. On-demand catalog-scan request (stamp + Normal event).
     if plan.request_scan {
-        io::request_catalog_scan(&ctx.client, &config.spec.repository, namespace, &now).await?;
+        io::request_catalog_scan(&ctx.client, repo_ref, namespace, &now).await?;
         io::publish_normal_event(
             ctx,
             config,
@@ -1039,7 +1051,7 @@ async fn run_adoption(
             &format!(
                 "requested an on-demand catalog scan on repository {} so newly-recreated \
                  snapshots matching identity {identity_str} materialize for adoption",
-                config.spec.repository.name
+                repo_ref.name
             ),
         )
         .await;
@@ -1220,7 +1232,9 @@ async fn adopt_one(
     repo_uid: &str,
     candidate: &crate::adoption::AdoptionCandidate,
 ) -> Result<()> {
-    let (adopted, status) = crate::adoption::build_adopted_snapshot(config, repo_uid, candidate);
+    let repo_ref = io::recipe_repo_ref(config)?;
+    let (adopted, status) =
+        crate::adoption::build_adopted_snapshot(config, repo_uid, candidate, repo_ref);
     let cr_name = adopted.name_any();
     let policy_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
 

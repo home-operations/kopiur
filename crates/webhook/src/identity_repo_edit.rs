@@ -113,12 +113,19 @@ async fn affected_consumers(client: &Client, self_key: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|p| {
             let ns = p.namespace()?;
-            let key = crate::identity_collision::repo_key(&p.spec.repository, &ns);
             let has_history = p
                 .status
                 .as_ref()
                 .is_some_and(|s| s.last_successful_snapshot.is_some());
-            is_affected(&key, self_key, has_history, p.spec.identity.as_ref())
+            // Any-of over every ref the policy names (tolerant iterator): a
+            // multi-repo policy is a consumer of the edited repository when
+            // ANY of its refs matches (plan B5's repo-edit guard semantics;
+            // single-repo behavior is unchanged).
+            api::repository_refs(&p.spec)
+                .any(|r| {
+                    let key = crate::identity_collision::repo_key(r, &ns);
+                    is_affected(&key, self_key, has_history, p.spec.identity.as_ref())
+                })
                 .then(|| format!("{ns}/{}", p.name_any()))
         })
         .collect()

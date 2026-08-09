@@ -5,12 +5,67 @@ use crate::snapshot::{Origin, SnapshotSpec};
 use crate::snapshot_policy::{CopyMethod, Hook, HttpRequestHook, SnapshotPolicySpec};
 use crate::snapshot_schedule::SnapshotScheduleSpec;
 
+/// Validate the `spec.repository` / `spec.repositories` surface of a
+/// `SnapshotPolicy`, accumulating every independent problem:
+///
+///   1. **Exactly one of** the two shapes (mirrors the spec-level CEL rule, so
+///      the refusal also covers objects stored before the CRD carried it).
+///   2. Per-ref shape validity ([`validate_repository_ref`] over whatever
+///      refs exist — tolerant iteration, one error per bad ref).
+///   3. **Duplicate rejection** over `spec.repositories`, normalized via
+///      [`crate::common::repo_key`]. Validators are spec-only (no owner
+///      namespace here), so the key uses a fixed `""` owner-namespace
+///      sentinel: it is identical for every entry of ONE policy, which is all
+///      duplicate detection needs. (A `namespace`-omitted and an explicit
+///      same-namespace ref to one repository are not caught here; the webhook
+///      guards that identity-level collision separately.)
+///   4. **The feature gate**: `spec.repositories` is refused outright until
+///      the multi-repository data path lands end-to-end
+///      ([`ValidationError::MultiRepositoryNotYetEnabled`]) — admitting it
+///      early would corrupt the policy's shared kopia cache and fake
+///      verification results.
+///   5. `hooks` × `repositories` mutual exclusion
+///      ([`ValidationError::PolicyHooksWithRepositories`]) — added alongside
+///      the gate so lifting it cannot forget the quiesce-contract refusal.
+fn validate_policy_repositories(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    if let Err(e) = crate::snapshot_policy::policy_repositories(spec) {
+        errs.push(e);
+    }
+    for r in crate::snapshot_policy::repository_refs(spec) {
+        if let Err(e) = validate_repository_ref(r) {
+            errs.push(e);
+        }
+    }
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (i, r) in spec.repositories.iter().enumerate() {
+        let key = crate::common::repo_key(r, "");
+        if let Some(&first) = seen.get(&key) {
+            errs.push(ValidationError::PolicyRepositoriesDuplicate {
+                key,
+                first,
+                second: i,
+            });
+        } else {
+            seen.insert(key, i);
+        }
+    }
+    if crate::snapshot_policy::is_multi_repo(spec) {
+        // THE FEATURE GATE (M7): keep multi-repo un-admittable until the full
+        // fan-out data path (pins, per-repo retention/cache/verification)
+        // lands. Removed by the milestone that lifts the gate (M11).
+        errs.push(ValidationError::MultiRepositoryNotYetEnabled);
+        if spec.hooks.is_some() {
+            errs.push(ValidationError::PolicyHooksWithRepositories);
+        }
+    }
+    errs
+}
+
 /// Validate a `SnapshotPolicy` spec, accumulating all problems.
 pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     let mut errs = Vec::new();
-    if let Err(e) = validate_repository_ref(&spec.repository) {
-        errs.push(e);
-    }
+    errs.extend(validate_policy_repositories(spec));
     if spec.sources.is_empty() {
         errs.push(ValidationError::MissingRequiredField {
             field: "spec.sources (at least one source required)".to_string(),

@@ -470,19 +470,22 @@ pub(crate) fn policy_targets_destination(
     dest_ref: &RepositoryRef,
     srepl_ns: &str,
 ) -> bool {
+    // Any-of over every ref the policy names (tolerant iterator): a
+    // multi-repo policy targets the destination when ANY ref matches.
     match dest_ref.kind {
         RepositoryKind::Repository => {
             let repo_ns = dest_ref.namespace.as_deref().unwrap_or(srepl_ns);
-            crate::watch::ref_targets_repository(
-                &policy.spec.repository,
-                policy.namespace().as_deref(),
-                repo_ns,
-                &dest_ref.name,
-            )
+            kopiur_api::repository_refs(&policy.spec).any(|r| {
+                crate::watch::ref_targets_repository(
+                    r,
+                    policy.namespace().as_deref(),
+                    repo_ns,
+                    &dest_ref.name,
+                )
+            })
         }
-        RepositoryKind::ClusterRepository => {
-            crate::watch::ref_targets_cluster(&policy.spec.repository, &dest_ref.name)
-        }
+        RepositoryKind::ClusterRepository => kopiur_api::repository_refs(&policy.spec)
+            .any(|r| crate::watch::ref_targets_cluster(r, &dest_ref.name)),
     }
 }
 

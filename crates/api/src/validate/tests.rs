@@ -1630,7 +1630,11 @@ fn repository_inline_retention_hook_passes_today() {
 #[test]
 fn backup_config_aggregate_collects_multiple_errors() {
     let spec = SnapshotPolicySpec {
-        repository: repo_ref(RepositoryKind::ClusterRepository, Some("forbidden")),
+        repository: Some(repo_ref(
+            RepositoryKind::ClusterRepository,
+            Some("forbidden"),
+        )),
+        repositories: vec![],
         identity: Some(Identity::default()),
         sources: vec![], // missing required
         copy_method: Default::default(),
@@ -1666,11 +1670,145 @@ fn backup_config_aggregate_collects_multiple_errors() {
     );
 }
 
+/// Build a policy spec via the cluster's parse path (YAML → JSON value →
+/// typed) with an arbitrary repository surface, for the M7 exactly-one-of /
+/// feature-gate matrix below.
+fn policy_spec_yaml(repo_surface: &str, extra: &str) -> SnapshotPolicySpec {
+    let yaml = format!("{repo_surface}sources: [ {{ pvc: {{ name: d }} }} ]\n{extra}");
+    let value: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn policy_repository_exactly_one_matrix() {
+    // Single-repo: accepted unchanged (no repository-surface errors at all).
+    let single = policy_spec_yaml("repository: { kind: Repository, name: r }\n", "");
+    assert!(validate_backup_config(&single).is_empty());
+
+    // Neither: the shared validator mirrors the CEL rule (covers objects
+    // stored before the CRD carried it).
+    let neither = policy_spec_yaml("", "");
+    let errs = validate_backup_config(&neither);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::PolicyRepositoryExactlyOne { got: "neither" }
+        )),
+        "{errs:?}"
+    );
+
+    // Both: refused as ambiguous.
+    let both = policy_spec_yaml(
+        "repository: { name: r }\nrepositories: [ { name: a } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&both);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::PolicyRepositoryExactlyOne { got: "both" }
+        )),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn policy_repositories_feature_gate_refuses_multi_repo() {
+    // THE M7 feature gate: a well-formed multi-repo spec is refused outright
+    // until the fan-out data path lands (lifted in M11).
+    let multi = policy_spec_yaml("repositories: [ { name: a }, { name: b } ]\n", "");
+    let errs = validate_backup_config(&multi);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::MultiRepositoryNotYetEnabled)),
+        "{errs:?}"
+    );
+    // The message tells the user what to do instead.
+    let msg = ValidationError::MultiRepositoryNotYetEnabled.to_string();
+    assert!(msg.contains("not yet enabled"), "{msg}");
+    assert!(msg.contains("use spec.repository (single)"), "{msg}");
+}
+
+#[test]
+fn policy_repositories_duplicate_key_is_refused() {
+    // Same normalized key twice (kind defaults to Repository; both entries
+    // leave namespace unset → identical repo_key under the "" sentinel).
+    let dup = policy_spec_yaml(
+        "repositories: [ { name: a }, { name: b }, { name: a } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&dup);
+    let dup_err = errs
+        .iter()
+        .find_map(|e| match e {
+            ValidationError::PolicyRepositoriesDuplicate { key, first, second } => {
+                Some((key.clone(), *first, *second))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected PolicyRepositoriesDuplicate, got {errs:?}"));
+    assert_eq!(dup_err, ("Repository//a".to_string(), 0, 2));
+
+    // Same name under DIFFERENT kinds is NOT a duplicate (distinct keys).
+    let distinct = policy_spec_yaml(
+        "repositories: [ { name: a }, { kind: ClusterRepository, name: a } ]\n",
+        "",
+    );
+    assert!(
+        !validate_backup_config(&distinct)
+            .iter()
+            .any(|e| matches!(e, ValidationError::PolicyRepositoriesDuplicate { .. }))
+    );
+}
+
+#[test]
+fn policy_hooks_with_repositories_is_refused() {
+    // Added alongside the gate so lifting it can't forget the quiesce-contract
+    // refusal: hooks quiesce ONE capture, N concurrent children void that.
+    let hooked = policy_spec_yaml(
+        "repositories: [ { name: a }, { name: b } ]\n",
+        "hooks:\n  beforeSnapshot:\n    - workloadExec:\n        podSelector: { matchLabels: { app: pg } }\n        command: [\"true\"]\n",
+    );
+    let errs = validate_backup_config(&hooked);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::PolicyHooksWithRepositories)),
+        "{errs:?}"
+    );
+    // The refusal points at the supported alternative.
+    let msg = ValidationError::PolicyHooksWithRepositories.to_string();
+    assert!(msg.contains("SnapshotReplication"), "{msg}");
+
+    // Hooks with a SINGLE repository stay perfectly legal.
+    let single_hooked = policy_spec_yaml(
+        "repository: { name: r }\n",
+        "hooks:\n  beforeSnapshot:\n    - workloadExec:\n        podSelector: { matchLabels: { app: pg } }\n        command: [\"true\"]\n",
+    );
+    assert!(validate_backup_config(&single_hooked).is_empty());
+}
+
+#[test]
+fn policy_repositories_each_ref_is_shape_validated() {
+    // Per-ref shape validity runs over the tolerant iterator: a
+    // ClusterRepository entry with a namespace is refused per-entry.
+    let bad = policy_spec_yaml(
+        "repositories: [ { kind: ClusterRepository, name: a, namespace: x } ]\n",
+        "",
+    );
+    let errs = validate_backup_config(&bad);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterRepoNamespaceForbidden { .. })),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn backup_config_valid_spec_has_no_errors() {
     use crate::snapshot_policy::{PvcSource, Source};
     let spec = SnapshotPolicySpec {
-        repository: repo_ref(RepositoryKind::Repository, Some("backups")),
+        repository: Some(repo_ref(RepositoryKind::Repository, Some("backups"))),
+        repositories: vec![],
         identity: None,
         sources: vec![Source {
             pvc: Some(PvcSource {

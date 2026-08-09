@@ -31,23 +31,10 @@ use api::validate::ExistingIdentity;
 use api::{ClusterRepository, IdentityInputs, Repository, SnapshotPolicy, SnapshotPolicySpec};
 use kube::{Api, Client, ResourceExt};
 
-/// A normalized, comparable repository key for a consumer's [`RepositoryRef`]
-/// resolved from `owner_namespace` (the consuming policy's namespace). Two policies
-/// are "the same repository" only when their keys match. Pure + exhaustive over
-/// [`RepositoryKind`].
-///
-/// - `Repository` → `"Repository/<effective-ns>/<name>"` (effective-ns is
-///   `ref.namespace` or the owner's namespace).
-/// - `ClusterRepository` → `"ClusterRepository/<name>"` (namespace-free).
-pub fn repo_key(repo: &RepositoryRef, owner_namespace: &str) -> String {
-    match repo.kind {
-        RepositoryKind::Repository => {
-            let ns = repo.namespace.as_deref().unwrap_or(owner_namespace);
-            format!("Repository/{ns}/{}", repo.name)
-        }
-        RepositoryKind::ClusterRepository => format!("ClusterRepository/{}", repo.name),
-    }
-}
+/// The normalized repository key — hoisted into `kopiur_api::common` (the
+/// shared validator's duplicate-repo check normalizes with the SAME function),
+/// re-exported here so the webhook's existing callers keep their import path.
+pub use api::common::repo_key;
 
 /// Resolve a `SnapshotPolicy`'s kopia identity string (`username@hostname[:path]`),
 /// reusing the api-crate kernel ([`api::resolve_identity`] + [`api::identity_string`]).
@@ -156,7 +143,12 @@ async fn policy_pair(
     annotations: Option<&BTreeMap<String, String>>,
     cache: &mut BTreeMap<String, Option<IdentityDefaults>>,
 ) -> Option<(String, String)> {
-    let defaults = cluster_repo_defaults(client, &spec.repository, namespace, cache).await;
+    // Multi-repo policies resolve N (identity, repo_key) pairs — that loop
+    // lands in M9. Until then SKIP the pair (like an unresolvable identity):
+    // the admission feature gate keeps multi-repo un-admittable in this
+    // build, so no admitted policy reaches this arm.
+    let repo = api::single_repository_ref(spec).ok()?;
+    let defaults = cluster_repo_defaults(client, repo, namespace, cache).await;
     let identity = policy_identity_string(
         name,
         namespace,
@@ -165,7 +157,7 @@ async fn policy_pair(
         annotations,
         defaults.as_ref(),
     )?;
-    Some((identity, repo_key(&spec.repository, namespace)))
+    Some((identity, repo_key(repo, namespace)))
 }
 
 /// A detected identity collision: the conflicting policy's `namespace/name` and the
@@ -257,7 +249,8 @@ mod tests {
 
     fn spec_with(repo: RepositoryRef, identity: Option<Identity>, pvc: &str) -> SnapshotPolicySpec {
         SnapshotPolicySpec {
-            repository: repo,
+            repository: Some(repo),
+            repositories: vec![],
             identity,
             sources: vec![Source {
                 pvc: Some(PvcSource { name: pvc.into() }),

@@ -29,10 +29,33 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// §15: operator-authored spec-level CEL — exactly one of `repository` /
+// `repositories` (apiserver + CI validation, complementing the shared
+// validator's [`crate::validate::validate_backup_config`] check). Both are
+// optional at the type level so old single-repo objects keep decoding; the
+// integer-sum form matches the per-item `Source` rule's cheap-constant style.
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1",
+    "message": "exactly one of repository, repositories"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotPolicySpec {
     /// Discriminated reference to a `Repository` or `ClusterRepository`.
-    pub repository: RepositoryRef,
+    /// Mutually exclusive with `repositories` (exactly one of the two is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRef>,
+    /// Multi-repository fan-out: every listed `Repository`/`ClusterRepository`
+    /// receives its own independent backup of each source — one `Snapshot` CR +
+    /// one mover Job per (source, repository) pair, so the captures are separate
+    /// kopia snapshots, not copies of one another. Identity resolves per-repo
+    /// under that repository's `identityDefaults`. Mutually exclusive with
+    /// `repository` (exactly one of the two is set) AND with `hooks`: with N
+    /// concurrent children the first finisher would run the thaw hook while the
+    /// other N-1 movers still read — use a single-repo policy plus a
+    /// `SnapshotReplication` when hooks are needed for a second target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(min = 1, max = 8))]
+    pub repositories: Vec<RepositoryRef>,
     /// Identity overrides — what kopia records as `username@hostname:path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
@@ -107,6 +130,85 @@ pub struct SnapshotPolicySpec {
     /// `catalog.adoption` (see [`effective_adoption`](crate::common::effective_adoption)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adoption: Option<crate::common::SnapshotAdoption>,
+}
+
+/// The repository target(s) of a `SnapshotPolicy`, as an exactly-one-of view
+/// over `spec.repository` / `spec.repositories`. Borrowed so consumers match
+/// without cloning; produced by [`policy_repositories`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRepositories<'a> {
+    /// The classic single-repo shape (`spec.repository`).
+    Single(&'a RepositoryRef),
+    /// The multi-repository fan-out shape (`spec.repositories`, 1–8 entries).
+    Multi(&'a [RepositoryRef]),
+}
+
+/// THE exactly-one-of resolver for a policy's repository target(s).
+///
+/// Never panics: a stored CR can carry garbage (both set, or neither — e.g. a
+/// write that raced an old CRD schema), so the invalid shapes come back as
+/// [`ValidationError::PolicyRepositoryExactlyOne`] for the caller's defensive
+/// error path rather than as an `unwrap` in a reconciler.
+///
+/// ```
+/// use kopiur_api::snapshot_policy::{PolicyRepositories, policy_repositories};
+///
+/// let spec: kopiur_api::SnapshotPolicySpec = serde_json::from_value(serde_json::json!({
+///     "repository": { "kind": "Repository", "name": "r" },
+///     "sources": [ { "pvc": { "name": "d" } } ],
+/// }))
+/// .unwrap();
+/// assert!(matches!(
+///     policy_repositories(&spec),
+///     Ok(PolicyRepositories::Single(r)) if r.name == "r"
+/// ));
+/// ```
+pub fn policy_repositories(
+    spec: &SnapshotPolicySpec,
+) -> Result<PolicyRepositories<'_>, crate::error::ValidationError> {
+    match (&spec.repository, spec.repositories.is_empty()) {
+        (Some(single), true) => Ok(PolicyRepositories::Single(single)),
+        (None, false) => Ok(PolicyRepositories::Multi(&spec.repositories)),
+        (Some(_), false) => {
+            Err(crate::error::ValidationError::PolicyRepositoryExactlyOne { got: "both" })
+        }
+        (None, true) => {
+            Err(crate::error::ValidationError::PolicyRepositoryExactlyOne { got: "neither" })
+        }
+    }
+}
+
+/// The single repository a policy targets, for consumers whose multi-repo
+/// support has not landed yet.
+///
+/// The multi-repo arm returns [`ValidationError::MultiRepositoryNotYetEnabled`]
+/// — the same refusal the admission-time feature gate raises — so a consumer
+/// routing this through its defensive validation path fails LOUDLY and
+/// consistently instead of silently picking repository #1. Multi-repo
+/// consumers land in M8/M10; until the gate lifts (M11) this arm is
+/// unreachable at runtime for admitted objects.
+pub fn single_repository_ref(
+    spec: &SnapshotPolicySpec,
+) -> Result<&RepositoryRef, crate::error::ValidationError> {
+    match policy_repositories(spec)? {
+        PolicyRepositories::Single(r) => Ok(r),
+        PolicyRepositories::Multi(_) => {
+            Err(crate::error::ValidationError::MultiRepositoryNotYetEnabled)
+        }
+    }
+}
+
+/// Tolerant iterator over every repository ref a policy names — whatever
+/// exists, in `repository`-then-`repositories` order, no validity judgment.
+/// For any-of predicates (watch mappers, repo-edit guards, tenancy loops)
+/// that must not error on a malformed stored CR.
+pub fn repository_refs(spec: &SnapshotPolicySpec) -> impl Iterator<Item = &RepositoryRef> {
+    spec.repository.iter().chain(spec.repositories.iter())
+}
+
+/// Whether this policy uses the multi-repository fan-out shape.
+pub fn is_multi_repo(spec: &SnapshotPolicySpec) -> bool {
+    !spec.repositories.is_empty()
 }
 
 /// Deletion semantics for the `Snapshot`s carrying a `SnapshotPolicy`'s config
@@ -1114,8 +1216,9 @@ mover:
     fsGroupChangePolicy: OnRootMismatch
 "#;
         let spec: SnapshotPolicySpec = from_yaml(yaml);
-        assert_eq!(spec.repository.kind, RepositoryKind::Repository);
-        assert_eq!(spec.repository.name, "nas-primary");
+        let repo = spec.repository.as_ref().expect("repository");
+        assert_eq!(repo.kind, RepositoryKind::Repository);
+        assert_eq!(repo.name, "nas-primary");
         assert_eq!(spec.sources.len(), 1);
         assert_eq!(spec.sources[0].pvc.as_ref().unwrap().name, "postgres-data");
         assert_eq!(
@@ -1700,6 +1803,165 @@ preflight:
             "spec.adoption must NOT carry a schema default: {prop}"
         );
         assert_eq!(prop["enum"].as_array().map(|a| a.len()), Some(2), "{prop}");
+    }
+
+    // --- M7 multi-repository fan-out: golden byte-compat + accessors ---------
+
+    /// THE golden byte-compat proof for the `repository: Option` flip: a legacy
+    /// single-repo spec's wire encoding is pinned as a COMMITTED fixture string
+    /// (the pre-change encoding), not constructed by round-tripping — so any
+    /// serialization drift (a leaked `repositories` key above all) fails here.
+    #[test]
+    fn legacy_single_repo_spec_wire_is_byte_identical() {
+        const LEGACY_WIRE: &str = r#"{"repository":{"kind":"Repository","name":"nas-primary","namespace":"backups"},"sources":[{"pvc":{"name":"pgdata"}}],"copyMethod":"Snapshot","retention":{"keepLatest":3}}"#;
+        assert!(
+            !LEGACY_WIRE.contains("repositories"),
+            "fixture precondition"
+        );
+
+        // A legacy YAML parses to the same struct shape it always did…
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: nas-primary, namespace: backups }\n\
+             sources: [ { pvc: { name: pgdata } } ]\n\
+             retention: { keepLatest: 3 }\n",
+        );
+        assert_eq!(spec.repository.as_ref().unwrap().name, "nas-primary");
+        assert!(spec.repositories.is_empty());
+
+        // …and re-serializes to the exact pre-change bytes: no `repositories`
+        // key (Vec::is_empty skip), `repository` unwrapped exactly as before.
+        assert_eq!(serde_json::to_string(&spec).unwrap(), LEGACY_WIRE);
+
+        // The committed wire decodes back to the identical struct.
+        let reparsed: SnapshotPolicySpec = serde_json::from_str(LEGACY_WIRE).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn repositories_roundtrip_and_absent_stays_off_the_wire() {
+        let spec: SnapshotPolicySpec = from_yaml(
+            "repositories:\n\
+             - { kind: Repository, name: a }\n\
+             - { kind: ClusterRepository, name: b }\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(spec.repository.is_none());
+        assert_eq!(spec.repositories.len(), 2);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json.get("repository").is_none());
+        assert_eq!(json["repositories"][1]["kind"], "ClusterRepository");
+        let reparsed: SnapshotPolicySpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn policy_repositories_accessors_cover_all_four_shapes() {
+        use crate::error::ValidationError;
+
+        let single: SnapshotPolicySpec = from_yaml(
+            "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(matches!(
+            policy_repositories(&single),
+            Ok(PolicyRepositories::Single(r)) if r.name == "r"
+        ));
+        assert!(!is_multi_repo(&single));
+        assert_eq!(repository_refs(&single).count(), 1);
+        assert_eq!(single_repository_ref(&single).unwrap().name, "r");
+
+        let multi: SnapshotPolicySpec = from_yaml(
+            "repositories: [ { name: a }, { name: b } ]\nsources: [ { pvc: { name: d } } ]\n",
+        );
+        assert!(matches!(
+            policy_repositories(&multi),
+            Ok(PolicyRepositories::Multi(refs)) if refs.len() == 2
+        ));
+        assert!(is_multi_repo(&multi));
+        assert_eq!(
+            repository_refs(&multi)
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        // The single accessor refuses multi with the feature-gate variant —
+        // never a silent repository #1.
+        assert_eq!(
+            single_repository_ref(&multi).unwrap_err(),
+            ValidationError::MultiRepositoryNotYetEnabled
+        );
+
+        // Neither / both: named errors, never a panic — a stored CR can be
+        // garbage relative to the current CRD schema.
+        let neither: SnapshotPolicySpec = from_yaml("sources: [ { pvc: { name: d } } ]\n");
+        assert_eq!(
+            policy_repositories(&neither).unwrap_err(),
+            ValidationError::PolicyRepositoryExactlyOne { got: "neither" }
+        );
+        assert_eq!(repository_refs(&neither).count(), 0);
+
+        let both: SnapshotPolicySpec = from_yaml(
+            "repository: { name: r }\nrepositories: [ { name: a } ]\n\
+             sources: [ { pvc: { name: d } } ]\n",
+        );
+        assert_eq!(
+            policy_repositories(&both).unwrap_err(),
+            ValidationError::PolicyRepositoryExactlyOne { got: "both" }
+        );
+        // Tolerant iterator yields whatever exists, in repository-then-list order.
+        assert_eq!(
+            repository_refs(&both)
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r", "a"]
+        );
+    }
+
+    #[test]
+    fn snapshot_policy_spec_carries_exactly_one_of_repository_cel_rule() {
+        // The spec-level CEL rule must survive kube's structural-schema
+        // rewriter (mirrors restore.rs / snapshot_schedule.rs precedents).
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let rules = spec["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec-level x-kubernetes-validations present");
+        assert!(
+            rules.iter().any(|r| {
+                r["rule"]
+                    == "(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1"
+                    && r["message"] == "exactly one of repository, repositories"
+            }),
+            "missing the exactly-one-of CEL rule; got {rules:?}"
+        );
+        // `repository` is no longer structurally required…
+        let required = spec["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|f| f == "repository"),
+            "repository must not be schema-required anymore; got {required:?}"
+        );
+        // …and `repositories` carries the 1..=8 bounds (minItems 1 makes an
+        // explicit `repositories: []` a structural rejection, so the CEL rule
+        // never has to reason about a present-but-empty list).
+        let repos = &spec["properties"]["repositories"];
+        assert_eq!(repos["minItems"], 1, "{repos}");
+        assert_eq!(repos["maxItems"], 8, "{repos}");
+    }
+
+    #[test]
+    fn snapshot_policy_repository_print_column_is_unchanged() {
+        // The `Repository` column stays `.spec.repository.name` (renders empty
+        // for a future multi-repo policy; documented when the gate lifts).
+        let crd = SnapshotPolicy::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .expect("printer columns");
+        let col = cols
+            .iter()
+            .find(|c| c["name"] == "Repository")
+            .expect("Repository column");
+        assert_eq!(col["jsonPath"], ".spec.repository.name");
     }
 
     #[test]

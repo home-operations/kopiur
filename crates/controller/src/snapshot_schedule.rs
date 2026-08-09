@@ -1099,7 +1099,7 @@ async fn policy_repo_timezone_default(
     })?;
     let repo = io::resolve_repository_ref(
         &ctx.client,
-        &policy.spec.repository,
+        io::recipe_repo_ref(&policy)?,
         policy_ns,
         ctx.operator_namespace.as_deref(),
     )
@@ -1695,11 +1695,12 @@ mod tests {
         let mut p = SnapshotPolicy::new(
             "pg",
             kopiur_api::SnapshotPolicySpec {
-                repository: kopiur_api::common::RepositoryRef {
+                repository: Some(kopiur_api::common::RepositoryRef {
                     kind: Default::default(),
                     name: "repo".into(),
                     namespace: None,
-                },
+                }),
+                repositories: vec![],
                 identity: None,
                 sources: vec![],
                 copy_method: Default::default(),

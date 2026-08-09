@@ -565,6 +565,66 @@ pub enum ValidationError {
     )]
     RetentionKeepsNothing,
 
+    /// A `SnapshotPolicy` set neither or both of `spec.repository` /
+    /// `spec.repositories`. Exactly one of the two shapes must be present —
+    /// neither leaves the recipe with no target at all, and both leaves it
+    /// ambiguous whether the single ref is a ninth member or a leftover.
+    /// Mirrors the spec-level CEL rule on `SnapshotPolicySpec`.
+    #[error(
+        "exactly one of spec.repository and spec.repositories must be set (got {got}); \
+         set spec.repository to name the single target repository, or spec.repositories \
+         to list 1-8 targets for multi-repository fan-out"
+    )]
+    PolicyRepositoryExactlyOne {
+        /// Which invalid shape was found: `"neither"` or `"both"`.
+        got: &'static str,
+    },
+
+    /// `SnapshotPolicy.spec.repositories` lists the same repository twice
+    /// (after normalizing kind + effective namespace + name). Each run would
+    /// back the source into that repository twice under one kopia identity —
+    /// two interleaved writers corrupting one snapshot history, exactly the
+    /// hazard the identity-collision guard exists to prevent.
+    #[error(
+        "spec.repositories[{first}] and spec.repositories[{second}] both name {key} — each \
+         listed repository must be distinct, or the two fan-out children would interleave \
+         writes into one kopia identity in that repository. Remove the duplicate entry"
+    )]
+    PolicyRepositoriesDuplicate {
+        /// The normalized repository key both entries resolve to
+        /// (`Kind[/namespace]/name`).
+        key: String,
+        /// Index of the first occurrence in `spec.repositories`.
+        first: usize,
+        /// Index of the duplicate occurrence in `spec.repositories`.
+        second: usize,
+    },
+
+    /// `SnapshotPolicy.spec.repositories` was set, but multi-repository
+    /// fan-out is not wired end-to-end in this build yet — admitting it now
+    /// would corrupt the policy's shared kopia cache and fake verification
+    /// results. The refusal is lifted once the full data path lands.
+    #[error(
+        "spec.repositories is not yet enabled in this build; use spec.repository (single) — \
+         multi-repository fan-out lands later in this release line"
+    )]
+    MultiRepositoryNotYetEnabled,
+
+    /// A `SnapshotPolicy` combines `spec.hooks` with `spec.repositories`.
+    /// Hooks quiesce the workload around ONE capture; with N concurrent
+    /// fan-out children the first finisher runs the after-snapshot (thaw)
+    /// hooks while the other N-1 movers are still reading — voiding the
+    /// quiesce guarantee — and serializing the children would multiply the
+    /// freeze window by N. Refused as an unsatisfiable consistency contract.
+    #[error(
+        "spec.hooks cannot be combined with spec.repositories: the first fan-out child to \
+         finish would run the after-snapshot (thaw) hooks while the other children's movers \
+         are still reading, so the quiesce contract cannot be honored. Use a single-repo \
+         policy (spec.repository) with hooks, plus a SnapshotReplication to copy its \
+         snapshots into the second repository"
+    )]
+    PolicyHooksWithRepositories,
+
     /// A namespaced `Repository` set `spec.maintenance.namespace`, which only
     /// applies to a cluster-scoped `ClusterRepository` (a namespaced
     /// `Repository`'s managed `Maintenance` always lives in the repository's own
