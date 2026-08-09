@@ -42,6 +42,20 @@ pub enum AdmissionError {
     #[error(transparent)]
     Tenancy(#[from] TenancyDenial),
 
+    /// A `ClusterRepository` tenancy rejection on a CR that carries TWO
+    /// repository refs (`SnapshotReplication`), prefixed with WHICH ref was
+    /// denied — a bare [`TenancyDenial`] names only the repository, and when
+    /// both refs are `ClusterRepository`s the user needs to know which one to
+    /// fix.
+    #[error("{field}: {source}")]
+    RefTenancy {
+        /// The spec path of the denied ref (`spec.sourceRef` / `spec.destinationRef`).
+        field: &'static str,
+        /// The underlying fail-closed tenancy denial.
+        #[source]
+        source: TenancyDenial,
+    },
+
     /// Building the mutating JSON patch failed (an internal bug, fail closed).
     #[error("internal error building admission patch: {source}")]
     InternalPatch {
@@ -61,6 +75,7 @@ impl AdmissionError {
             AdmissionError::SpecDecode { .. } => "spec_decode",
             AdmissionError::Invalid(_) => "invalid_spec",
             AdmissionError::Tenancy(_) => "tenancy_denied",
+            AdmissionError::RefTenancy { .. } => "tenancy_denied",
             AdmissionError::InternalPatch { .. } => "internal_patch",
         }
     }
@@ -137,6 +152,20 @@ mod tests {
     }
 
     #[test]
+    fn ref_tenancy_names_which_ref_was_denied() {
+        let err = AdmissionError::RefTenancy {
+            field: "spec.destinationRef",
+            source: TenancyDenial::NotAllowed {
+                consumer_namespace: "evil".into(),
+                repo_name: "offsite".into(),
+            },
+        };
+        let msg = err.to_string();
+        assert!(msg.starts_with("spec.destinationRef: "), "{msg}");
+        assert!(msg.contains("allowedNamespaces"), "{msg}");
+    }
+
+    #[test]
     fn missing_object_text_is_stable() {
         assert_eq!(
             AdmissionError::MissingObject.to_string(),
@@ -168,6 +197,13 @@ mod tests {
                 "invalid_spec",
             ),
             (AdmissionError::Tenancy(denial), "tenancy_denied"),
+            (
+                AdmissionError::RefTenancy {
+                    field: "spec.sourceRef",
+                    source: TenancyDenial::NoConsumerNamespace,
+                },
+                "tenancy_denied",
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.reason(), expected, "{err}");

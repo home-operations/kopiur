@@ -8,7 +8,7 @@ use kopiur_api::common::{PhaseLabel, RepositoryKind};
 use kopiur_api::consts::{MAINTENANCE_CONFIGURED_CONDITION, READY_CONDITION, STALLED_CONDITION};
 use kopiur_api::{
     ClusterRepository, Repository, Restore, RestorePhase, Snapshot, SnapshotPhase, SnapshotPolicy,
-    SnapshotSchedule,
+    SnapshotReplication, SnapshotReplicationRunStats, SnapshotSchedule,
 };
 use kube::ResourceExt;
 use kube::api::{Api, ListParams};
@@ -30,6 +30,8 @@ pub struct StatusReport {
     pub policies: Vec<PolicyRow>,
     /// SnapshotSchedules with firing detail.
     pub schedules: Vec<ScheduleRow>,
+    /// SnapshotReplications with their last run's counters.
+    pub snapshot_replications: Vec<SnapshotReplicationRow>,
     /// Snapshots/Restores currently in a non-terminal phase.
     pub in_flight: InFlight,
     /// Objects reporting the kstatus `Stalled=True` condition.
@@ -114,6 +116,36 @@ pub struct ScheduleRow {
     /// `status.consecutiveFailures` when non-zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<i64>,
+}
+
+/// One snapshot-replication line — the named consumer of
+/// `SnapshotReplication.status.lastRun` (the wiring ratchet's contract for
+/// those counters).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReplicationRow {
+    /// Object name.
+    pub name: String,
+    /// Namespace.
+    pub namespace: String,
+    /// The source repository (`kind/name`).
+    pub source: String,
+    /// The destination repository (`kind/name`).
+    pub destination: String,
+    /// `status.phase` as reported.
+    pub phase: String,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// `status.lastReplicated` (RFC3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_replicated: Option<String>,
+    /// `status.lastRun` counters (identitiesSelected / snapshotsCopied /
+    /// alreadyPresent / failed / pruned).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<SnapshotReplicationRunStats>,
+    /// The `Ready` condition message when the replication is NOT Ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// Counts of non-terminal work.
@@ -211,6 +243,50 @@ fn policy_matches(filter: Option<&RepoFilter>, policy: &SnapshotPolicy) -> bool 
                 .or(policy.metadata.namespace.as_deref());
             effective == f.namespace.as_deref()
         }
+    }
+}
+
+/// Does a `SnapshotReplication` touch the filtered repository — as its source
+/// OR its destination? An absent ref namespace means "same as the CR" for a
+/// namespaced Repository.
+fn replication_matches(filter: Option<&RepoFilter>, r: &SnapshotReplication) -> bool {
+    let Some(f) = filter else { return true };
+    let cr_ns = r.metadata.namespace.as_deref();
+    let ref_matches = |rref: &kopiur_api::common::RepositoryRef| {
+        rref.kind == f.kind
+            && rref.name == f.name
+            && match f.kind {
+                RepositoryKind::ClusterRepository => true,
+                RepositoryKind::Repository => {
+                    rref.namespace.as_deref().or(cr_ns) == f.namespace.as_deref()
+                }
+            }
+    };
+    ref_matches(&r.spec.source_ref) || ref_matches(&r.spec.destination_ref)
+}
+
+/// Build the snapshot-replication row from a typed object. Pure.
+fn snapshot_replication_row(r: &SnapshotReplication) -> SnapshotReplicationRow {
+    let status = r.status.as_ref();
+    let conditions = status.map(|s| s.conditions.as_slice()).unwrap_or_default();
+    SnapshotReplicationRow {
+        name: r.name_any(),
+        namespace: r.metadata.namespace.clone().unwrap_or_default(),
+        source: format!("{:?}/{}", r.spec.source_ref.kind, r.spec.source_ref.name),
+        destination: format!(
+            "{:?}/{}",
+            r.spec.destination_ref.kind, r.spec.destination_ref.name
+        ),
+        phase: status
+            .and_then(|s| s.phase.as_ref())
+            .map(|p| p.label().to_string())
+            .unwrap_or_else(|| EMPTY_CELL.into()),
+        suspended: r.spec.suspend,
+        last_replicated: status.and_then(|s| s.last_replicated.clone()),
+        last_run: status.and_then(|s| s.last_run),
+        problem: condition(conditions, READY_CONDITION)
+            .filter(|c| c.status != "True")
+            .map(|c| c.message.clone()),
     }
 }
 
@@ -507,6 +583,61 @@ async fn gather(
         });
     }
 
+    // SnapshotReplications. Listed by hand rather than via `list!` for one
+    // reason: the CRD is newer than the rest, so a cluster running an older
+    // operator 404s the whole resource — that must render as an empty section,
+    // not break the entire overview.
+    {
+        let api: Api<SnapshotReplication> = match &ctx.scope {
+            Scope::All => Api::all(ctx.client.clone()),
+            Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
+        };
+        let ns = match &ctx.scope {
+            Scope::All => None,
+            Scope::Namespace(ns) => Some(ns.as_str()),
+        };
+        let replications = match api.list(&ListParams::default()).await {
+            Ok(l) => l.items,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Vec::new(),
+            Err(e) => {
+                return Err(classify_kube(
+                    "list",
+                    "SnapshotReplication",
+                    "snapshotreplications",
+                    ns,
+                    None,
+                    e,
+                ));
+            }
+        };
+        for r in replications {
+            if !replication_matches(repo_filter, &r) {
+                continue;
+            }
+            if let Some(c) = r
+                .status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .find(|c| c.type_ == STALLED_CONDITION && c.status == "True")
+            {
+                report.stalled.push(StalledRow {
+                    kind: "SnapshotReplication",
+                    object: format!(
+                        "{}/{}",
+                        r.metadata.namespace.clone().unwrap_or_default(),
+                        r.name_any()
+                    ),
+                    message: c.message.clone(),
+                });
+            }
+            report
+                .snapshot_replications
+                .push(snapshot_replication_row(&r));
+        }
+    }
+
     // In-flight + stalled work.
     for snap in list!(Snapshot, "Snapshot", "snapshots") {
         let status = snap.status.as_ref();
@@ -666,6 +797,57 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
         out.push_str(&t.render());
     }
 
+    // Rendered only when at least one exists: unlike the three core sections,
+    // an optional-feature kind most installs never create earns no permanent
+    // "(none)" line on the one-screen overview.
+    if !report.snapshot_replications.is_empty() {
+        out.push_str("\nSNAPSHOT REPLICATIONS\n");
+        let mut t = Table::new(vec![
+            "NAME",
+            "NAMESPACE",
+            "SOURCE",
+            "DESTINATION",
+            "PHASE",
+            "SUSPENDED",
+            "LAST-REPLICATED",
+            "SELECTED",
+            "COPIED",
+            "PRESENT",
+            "FAILED",
+            "PRUNED",
+        ]);
+        for r in &report.snapshot_replications {
+            let count = |v: Option<u32>| {
+                v.map(|n| n.to_string())
+                    .unwrap_or_else(|| EMPTY_CELL.into())
+            };
+            let run = r.last_run.unwrap_or_default();
+            t.push(vec![
+                r.name.clone(),
+                r.namespace.clone(),
+                r.source.clone(),
+                r.destination.clone(),
+                r.phase.clone(),
+                r.suspended.to_string(),
+                humanize_rfc3339(r.last_replicated.as_deref(), now),
+                count(run.identities_selected),
+                count(run.snapshots_copied),
+                count(run.already_present),
+                count(run.failed),
+                count(run.pruned),
+            ]);
+        }
+        out.push_str(&t.render());
+        for r in &report.snapshot_replications {
+            if let Some(problem) = &r.problem {
+                out.push_str(&format!(
+                    "  ! SnapshotReplication {}/{}: {}\n",
+                    r.namespace, r.name, problem
+                ));
+            }
+        }
+    }
+
     out.push_str(&format!(
         "\nIN FLIGHT: {} snapshot(s), {} restore(s)\n",
         report.in_flight.snapshots, report.in_flight.restores
@@ -780,6 +962,23 @@ mod tests {
                 next_fire: Some("2026-06-12T03:00:00Z".into()),
                 consecutive_failures: Some(2),
             }],
+            snapshot_replications: vec![SnapshotReplicationRow {
+                name: "to-offsite".into(),
+                namespace: "media".into(),
+                source: "Repository/nas".into(),
+                destination: "ClusterRepository/offsite".into(),
+                phase: "Succeeded".into(),
+                suspended: false,
+                last_replicated: Some("2026-06-11T06:00:00Z".into()),
+                last_run: Some(SnapshotReplicationRunStats {
+                    identities_selected: Some(4),
+                    snapshots_copied: Some(12),
+                    already_present: Some(88),
+                    failed: Some(0),
+                    pruned: Some(2),
+                }),
+                problem: Some("destination repository not Ready".into()),
+            }],
             in_flight: InFlight {
                 snapshots: 1,
                 restores: 0,
@@ -829,6 +1028,98 @@ mod tests {
                 .any(|l| l.contains("0 3 * * *") && l.ends_with('2')),
             "{text}"
         );
+    }
+
+    #[test]
+    fn render_shows_the_snapshot_replication_section_with_last_run_counts() {
+        let text = render(&sample(), now());
+        assert!(text.contains("SNAPSHOT REPLICATIONS"), "{text}");
+        // source→dest, phase, lastReplicated, and the five lastRun counters.
+        assert!(
+            text.lines().any(|l| l.starts_with("to-offsite")
+                && l.contains("Repository/nas")
+                && l.contains("ClusterRepository/offsite")
+                && l.contains("Succeeded")
+                && l.contains("6h ago")),
+            "{text}"
+        );
+        for header in ["SELECTED", "COPIED", "PRESENT", "FAILED", "PRUNED"] {
+            assert!(text.contains(header), "missing {header}: {text}");
+        }
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("to-offsite") && l.contains("88")),
+            "alreadyPresent count must render: {text}"
+        );
+        // The Ready-condition problem line renders like the repository ones.
+        assert!(
+            text.contains(
+                "! SnapshotReplication media/to-offsite: destination repository not Ready"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_replications_render_no_section() {
+        let mut report = sample();
+        report.snapshot_replications.clear();
+        let text = render(&report, now());
+        assert!(!text.contains("SNAPSHOT REPLICATIONS"), "{text}");
+    }
+
+    #[test]
+    fn snapshot_replication_row_serializes_last_run_camel_case() {
+        let v = serde_json::to_value(sample()).unwrap();
+        let row = &v["snapshotReplications"][0];
+        assert_eq!(row["lastReplicated"], "2026-06-11T06:00:00Z");
+        assert_eq!(row["lastRun"]["identitiesSelected"], 4);
+        assert_eq!(row["lastRun"]["snapshotsCopied"], 12);
+        assert_eq!(row["lastRun"]["alreadyPresent"], 88);
+        assert_eq!(row["lastRun"]["failed"], 0);
+        assert_eq!(row["lastRun"]["pruned"], 2);
+    }
+
+    #[test]
+    fn replication_filter_matches_source_or_destination_ref() {
+        let filter = RepoFilter {
+            uid: "u1".into(),
+            name: "nas".into(),
+            kind: RepositoryKind::Repository,
+            namespace: Some("media".into()),
+        };
+        let repl = |source: serde_json::Value, dest: serde_json::Value| -> SnapshotReplication {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1", "kind": "SnapshotReplication",
+                "metadata": { "name": "r", "namespace": "media" },
+                "spec": {
+                    "sourceRef": source,
+                    "destinationRef": dest,
+                    "schedule": { "cron": "0 6 * * *" },
+                }
+            }))
+            .unwrap()
+        };
+        let other = serde_json::json!({ "kind": "ClusterRepository", "name": "offsite" });
+        let nas = serde_json::json!({ "kind": "Repository", "name": "nas" });
+        // Matches as source (ref ns absent = CR ns) and as destination.
+        assert!(replication_matches(
+            Some(&filter),
+            &repl(nas.clone(), other.clone())
+        ));
+        assert!(replication_matches(
+            Some(&filter),
+            &repl(other.clone(), nas.clone())
+        ));
+        // The same repo name in ANOTHER namespace must not match.
+        let elsewhere =
+            serde_json::json!({ "kind": "Repository", "name": "nas", "namespace": "other" });
+        assert!(!replication_matches(
+            Some(&filter),
+            &repl(elsewhere, other.clone())
+        ));
+        // No filter keeps everything.
+        assert!(replication_matches(None, &repl(other.clone(), other)));
     }
 
     #[test]

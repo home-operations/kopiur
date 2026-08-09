@@ -492,6 +492,51 @@ pub enum ValidationError {
         name: String,
     },
 
+    /// A `SnapshotReplication`'s `sourceRef` and `destinationRef` are two
+    /// *different* references that resolve to the **same storage target**
+    /// (`backend_target_key` — e.g. a namespaced `Repository` and a
+    /// `ClusterRepository` both pointing at one bucket+prefix). The pure
+    /// validator's [`Self::SnapshotReplicationSelfTarget`] catches the literal
+    /// same-ref case; this is the webhook's resolved-backend backstop.
+    #[error(
+        "SnapshotReplication sourceRef ({source_ref}) and destinationRef ({destination_ref}) \
+         resolve to the same {backend} storage target — a replication cannot copy a \
+         repository's snapshots into its own storage (source and destination would be one \
+         repository). Point destinationRef at a repository backed by different storage \
+         (typically the off-site one)"
+    )]
+    SnapshotReplicationSameStorage {
+        /// The source reference, rendered as `Kind name` (with namespace when set).
+        source_ref: String,
+        /// The destination reference, rendered the same way.
+        destination_ref: String,
+        /// The backend kind both refs resolved to (e.g. `s3`).
+        backend: String,
+    },
+
+    /// A `SnapshotReplication` combines `pruning: mirrorSource` with a
+    /// `spec.selection` that overlaps kopia identities the DESTINATION's own
+    /// `SnapshotPolicy`s write directly. Replicated copies would interleave
+    /// with directly-written snapshots in those identities' histories, and
+    /// mirror-source pruning deletes any copy whose `(identity, startTime)`
+    /// vanished from the source — so a source-side deletion cascades into
+    /// identities the destination does NOT merely mirror. Rejected as a
+    /// data-loss combination.
+    #[error(
+        "spec.selection overlaps {} — this replication would copy snapshots into kopia \
+         identities the destination's own SnapshotPolicies also write directly, and \
+         pruning: mirrorSource deletes any copy whose (identity, startTime) has vanished \
+         from the source, so a source-side deletion cascades into identities the destination \
+         does not merely mirror (a data-loss combination). Fix: exclude these identities via \
+         spec.selection.identities.exclude, or drop pruning: mirrorSource",
+        describe_overlapping_identities(identities)
+    )]
+    SnapshotReplicationOverlapMirrorSource {
+        /// Every overlapping `username@hostname[:path]` identity (the message
+        /// truncates the rendered list to 5; this field carries all of them).
+        identities: Vec<String>,
+    },
+
     /// A `SnapshotReplication` identity matcher set none of
     /// `username`/`hostname`/`sourcePath`. An empty matcher constrains nothing —
     /// in an `include` list it would silently select EVERY identity, and in an
@@ -598,6 +643,39 @@ pub fn describe_identity_change_consumers(consumers: &[String]) -> String {
 /// How many consumer names [`describe_identity_change_consumers`] spells out
 /// before collapsing the rest into `"and N more"`.
 const CONSUMER_LIST_SHOWN: usize = 5;
+
+/// Render the overlap list for
+/// [`ValidationError::SnapshotReplicationOverlapMirrorSource`]: the count, then
+/// up to [`CONSUMER_LIST_SHOWN`] identities, then `"and N more"`. Also reused
+/// verbatim by the webhook to build the non-blocking admission WARNING for the
+/// same overlap without `mirrorSource`, so the deny message and the warning
+/// always name the same identities the same way.
+///
+/// ```
+/// use kopiur_api::error::describe_overlapping_identities;
+///
+/// assert_eq!(
+///     describe_overlapping_identities(&["pg@billing:/pvc/data".to_string()]),
+///     "1 destination-side SnapshotPolicy identity(ies) (pg@billing:/pvc/data)",
+/// );
+/// let many: Vec<String> = (0..7).map(|i| format!("pg-{i}@ns:/p")).collect();
+/// let rendered = describe_overlapping_identities(&many);
+/// assert!(rendered.starts_with("7 destination-side"));
+/// assert!(rendered.ends_with("and 2 more)"), "{rendered}");
+/// ```
+pub fn describe_overlapping_identities(identities: &[String]) -> String {
+    let total = identities.len();
+    let mut names = identities
+        .iter()
+        .take(CONSUMER_LIST_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > CONSUMER_LIST_SHOWN {
+        names.push_str(&format!(", and {} more", total - CONSUMER_LIST_SHOWN));
+    }
+    format!("{total} destination-side SnapshotPolicy identity(ies) ({names})")
+}
 
 /// Result alias for validators. Defaults to `()` for the common "pass/fail with no
 /// value" case.

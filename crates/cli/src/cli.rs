@@ -821,6 +821,9 @@ pub enum SuspendableKind {
     ClusterRepository,
     /// RepositoryReplication — `spec.suspend`.
     Replication,
+    /// SnapshotReplication — `spec.suspend`.
+    #[value(alias = "snapshotreplication")]
+    SnapshotReplication,
 }
 
 /// `kubectl kopiur snapshots …`
@@ -951,6 +954,8 @@ mod tests {
             ("cluster-repository", SuspendableKind::ClusterRepository),
             ("clusterrepo", SuspendableKind::ClusterRepository),
             ("replication", SuspendableKind::Replication),
+            ("snapshot-replication", SuspendableKind::SnapshotReplication),
+            ("snapshotreplication", SuspendableKind::SnapshotReplication),
         ] {
             let cli = parse(&["suspend", token, "x"]).unwrap();
             match cli.command {

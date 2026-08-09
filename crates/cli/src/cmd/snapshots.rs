@@ -130,6 +130,7 @@ pub fn headers(all_namespaces: bool, wide: bool) -> Vec<&'static str> {
             "PINNED",
             "RECORDED",
             "DESCRIPTION",
+            "COPIED-FROM",
         ]);
     }
     h
@@ -162,6 +163,22 @@ fn description_cell(status: Option<&kopiur_api::SnapshotStatus>) -> String {
             let cut: String = d.chars().take(MAX - 1).collect();
             format!("{cut}…")
         }
+    }
+}
+
+/// `status.copiedFrom` as a compact `<Kind>/<name>:<sourceManifestId>` cell —
+/// the replication lineage of an `origin: replicated` row (which SOURCE
+/// repository it was migrated from and which manifest it corresponds to
+/// there). The named CLI consumer of `Snapshot.status.copiedFrom`; empty on
+/// every other origin. Full detail (including the preserved `startTime`) stays
+/// available via `-o yaml`.
+fn copied_from_cell(status: Option<&kopiur_api::SnapshotStatus>) -> String {
+    match status.and_then(|s| s.copied_from.as_ref()) {
+        None => EMPTY_CELL.into(),
+        Some(cf) => format!(
+            "{:?}/{}:{}",
+            cf.repository.kind, cf.repository.name, cf.source_manifest_id
+        ),
     }
 }
 
@@ -266,6 +283,7 @@ pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool
             pinned,
             recorded_cell(status),
             description_cell(status),
+            copied_from_cell(status),
         ]);
     }
     cells
@@ -536,9 +554,12 @@ status:
         let cells = row(&snap, now, true, true);
         // -A inserts NAMESPACE after NAME.
         assert_eq!(cells[1], "media");
-        let tail = &cells[cells.len() - 5..];
-        // Nothing recorded / no description on this row → placeholder cells.
-        assert_eq!(tail, ["nightly@media:/pvc/data", "delete", "-", "-", "-"]);
+        let tail = &cells[cells.len() - 6..];
+        // Nothing recorded / no description / not replicated → placeholder cells.
+        assert_eq!(
+            tail,
+            ["nightly@media:/pvc/data", "delete", "-", "-", "-", "-"]
+        );
         assert_eq!(headers(true, true).len(), cells.len());
     }
 
@@ -554,13 +575,56 @@ status:
             Some("pre-upgrade snapshot with a description far past the forty character cap".into());
         let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
         let cells = row(&snap, now, false, true);
-        let tail = &cells[cells.len() - 2..];
+        let tail = &cells[cells.len() - 3..];
         // uid recorded, gid image-determined → `3001:-`; description truncated
         // with an ellipsis (the full value stays available via -o yaml).
         assert_eq!(tail[0], "3001:-");
         assert!(tail[1].starts_with("pre-upgrade snapshot"), "{}", tail[1]);
         assert!(tail[1].ends_with('…'), "{}", tail[1]);
         assert!(tail[1].chars().count() <= 40);
+        // Not a replicated row → COPIED-FROM stays the placeholder.
+        assert_eq!(tail[2], "-");
+    }
+
+    #[test]
+    fn wide_row_renders_copied_from_for_a_replicated_row() {
+        // The named consumer of Snapshot.status.copiedFrom: a replicated copy
+        // CR shows which source repository (and source manifest) it came from.
+        let snap: Snapshot = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: srepl-copy-1
+  namespace: media
+  creationTimestamp: "2026-06-11T06:00:00Z"
+  labels:
+    kopiur.home-operations.com/origin: replicated
+spec:
+  deletionPolicy: Delete
+status:
+  phase: Succeeded
+  origin: replicated
+  snapshot:
+    kopiaSnapshotID: dst111
+    identity:
+      username: pg
+      hostname: billing
+      sourcePath: /pvc/data
+  copiedFrom:
+    repository:
+      kind: Repository
+      name: nas-src
+    sourceManifestId: src999
+    startTime: "2026-06-10T03:00:00Z"
+"#,
+        );
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        let cells = row(&snap, now, false, true);
+        assert_eq!(cells.last().unwrap(), "Repository/nas-src:src999");
+        // Narrow (non-wide) rows still render the origin column as replicated.
+        let narrow = row(&snap, now, false, false);
+        assert!(narrow.contains(&"replicated".to_string()), "{narrow:?}");
     }
 
     #[test]

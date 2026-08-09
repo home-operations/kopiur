@@ -27,12 +27,14 @@ mod identity;
 mod repository;
 mod restore;
 mod snapshot;
+mod snapshot_replication_overlap;
 
 pub use backend::*;
 pub use identity::*;
 pub use repository::*;
 pub use restore::*;
 pub use snapshot::*;
+pub use snapshot_replication_overlap::*;
 
 /// Validate a `pvcSelector`'s shape.
 ///

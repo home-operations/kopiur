@@ -42,10 +42,10 @@ use crate::error::CliError;
 use crate::output::OutputFormat;
 
 /// Every check doctor performs. Closed enum: adding a check forces the runner
-/// and the renderer to handle it. Nine checks, run in this order.
+/// and the renderer to handle it. Ten checks, run in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DoctorCheck {
-    /// All 8 kopiur CRDs are installed and serve `v1alpha1`.
+    /// All 9 kopiur CRDs are installed and serve `v1alpha1`.
     CrdsInstalled,
     /// The controller Deployment exists and has ready replicas.
     ControllerRunning,
@@ -58,6 +58,10 @@ pub enum DoctorCheck {
     RepositoriesReady,
     /// Every repository's credential Secret(s) resolve.
     CredentialsPresent,
+    /// Every SnapshotReplication's refs resolve to Ready repositories, none is
+    /// silently suspended, none is `Failed`, and any identity-overlap
+    /// condition the operator raised is surfaced.
+    SnapshotReplications,
     /// No Snapshot/Restore/SnapshotSchedule is parked on a structural gate, and
     /// no Snapshot/Restore has been non-terminal longer than the threshold.
     NoStuckWork,
@@ -78,6 +82,7 @@ impl DoctorCheck {
             Self::WebhookAdmits => "webhook admission (live dry-run probe)",
             Self::RepositoriesReady => "repositories ready",
             Self::CredentialsPresent => "credential secrets present",
+            Self::SnapshotReplications => "snapshot replications healthy",
             Self::NoStuckWork => "no blocked or stuck work",
             Self::RecentFailures => "no recent failed snapshots/restores",
             Self::RecentWarnings => "recent warning events",
@@ -202,7 +207,7 @@ fn warn_for(verb: &str, resource: &str, e: &kube::Error) -> Outcome {
     }
 }
 
-/// The 8 CRD names doctor expects, from the same types the plugin is built
+/// The 9 CRD names doctor expects, from the same types the plugin is built
 /// against (so "installed" means "this plugin's schema vintage exists").
 fn expected_crds() -> Vec<(String, CustomResourceDefinition)> {
     fn entry<K: KubeCustomResourceExt>() -> (String, CustomResourceDefinition) {
@@ -218,6 +223,7 @@ fn expected_crds() -> Vec<(String, CustomResourceDefinition)> {
         entry::<Restore>(),
         entry::<kopiur_api::Maintenance>(),
         entry::<kopiur_api::RepositoryReplication>(),
+        entry::<kopiur_api::SnapshotReplication>(),
     ]
 }
 
@@ -596,6 +602,163 @@ async fn check_credentials(ctx: &KubeCtx, repos: &[RepoSummary]) -> Outcome {
                 .into(),
         }
     }
+}
+
+// --- SnapshotReplications ----------------------------------------------------
+
+/// Find the [`RepoSummary`] a replication ref resolves to. An absent ref
+/// namespace means "same as the CR" for a namespaced Repository. Pure.
+fn find_replication_repo<'a>(
+    repos: &'a [RepoSummary],
+    rref: &kopiur_api::common::RepositoryRef,
+    cr_namespace: &str,
+) -> Option<&'a RepoSummary> {
+    repos.iter().find(|s| {
+        s.kind == rref.kind
+            && s.name == rref.name
+            && match rref.kind {
+                RepositoryKind::ClusterRepository => true,
+                RepositoryKind::Repository => {
+                    s.namespace.as_deref()
+                        == Some(rref.namespace.as_deref().unwrap_or(cr_namespace))
+                }
+            }
+    })
+}
+
+/// Evaluate every listed `SnapshotReplication`. Pure, so the whole verdict
+/// matrix is unit-testable from JSON fixtures.
+///
+/// - both refs must resolve to a listed repository AND that repository must be
+///   `Ready` (a replication against a missing/unready repo cannot run) → Fail;
+/// - `spec.suspend` → Warn (paused replication is a deliberate state, but a
+///   forgotten one silently stops the off-site copy);
+/// - phase `Failed` → Fail, surfacing the operator's own diagnosis (the
+///   `Ready`/`Stalled` condition message the failed run's status body wrote);
+/// - any `True` condition whose type names an identity Overlap (the runtime
+///   backstop of the admission overlap check) → Warn with its message.
+///
+/// `repos` is `None` when the repository listing itself degraded — the ref
+/// checks are skipped (warned about by the repositories check), the rest still
+/// run. `all_namespaces` guards the resolve check: under a namespaced scope a
+/// cross-namespace Repository ref is simply not listable, so "not found" there
+/// proves nothing and is skipped rather than reported.
+fn evaluate_snapshot_replications(
+    items: &[kopiur_api::SnapshotReplication],
+    repos: Option<&[RepoSummary]>,
+    all_namespaces: bool,
+) -> Outcome {
+    use kopiur_api::SnapshotReplicationPhase;
+    let mut fails: Vec<String> = Vec::new();
+    let mut warns: Vec<String> = Vec::new();
+    for r in items {
+        let ns = r.metadata.namespace.clone().unwrap_or_default();
+        let label = format!("{ns}/{}", r.name_any());
+        if let Some(repos) = repos {
+            for (field, rref) in [
+                ("sourceRef", &r.spec.source_ref),
+                ("destinationRef", &r.spec.destination_ref),
+            ] {
+                let cross_ns_unlistable = !all_namespaces
+                    && rref.kind == RepositoryKind::Repository
+                    && rref.namespace.as_deref().is_some_and(|n| n != ns);
+                if cross_ns_unlistable {
+                    continue;
+                }
+                let ref_label = format!("{:?} {}", rref.kind, rref.name);
+                match find_replication_repo(repos, rref, &ns) {
+                    None => fails.push(format!(
+                        "{label}: {field} {ref_label} does not resolve to any listed repository"
+                    )),
+                    Some(repo) if repo.phase.as_deref() != Some("Ready") => fails.push(format!(
+                        "{label}: {field} {ref_label} is not Ready ({}{})",
+                        repo.phase.as_deref().unwrap_or("no status"),
+                        repo.ready_message
+                            .as_deref()
+                            .map(|m| format!(": {m}"))
+                            .unwrap_or_default()
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        if r.spec.suspend {
+            warns.push(format!(
+                "{label} is suspended (spec.suspend: true); no replication runs until resumed"
+            ));
+        }
+        let conditions = r
+            .status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default();
+        // Exhaustive on purpose (phases ratchet): a future phase variant must
+        // decide its doctor verdict here, not silently read as healthy.
+        let failed = match r.status.as_ref().and_then(|s| s.phase.as_ref()) {
+            Some(SnapshotReplicationPhase::Failed) => true,
+            Some(
+                SnapshotReplicationPhase::Pending
+                | SnapshotReplicationPhase::Replicating
+                | SnapshotReplicationPhase::Succeeded
+                | SnapshotReplicationPhase::Suspended
+                | SnapshotReplicationPhase::Unknown(_),
+            )
+            | None => false,
+        };
+        if failed {
+            fails.push(format!(
+                "{label} last run Failed: {}",
+                failure_message(conditions)
+                    .unwrap_or_else(|| "(no condition message; kubectl describe it)".into())
+            ));
+        }
+        // The runtime identity-overlap backstop: matched by type fragment so a
+        // condition-name refinement operator-side surfaces here without a
+        // plugin release (the same posture as the unregistered-gate report).
+        for c in conditions {
+            if c.status == "True" && c.type_.contains("Overlap") {
+                warns.push(format!("{label}: {} — {}", c.type_, c.message));
+            }
+        }
+    }
+    if !fails.is_empty() {
+        fails.extend(warns);
+        return Outcome::Fail {
+            what: format!(
+                "snapshot replications unhealthy: {}",
+                join_capped(&fails, 5)
+            ),
+            why: "a replication whose repositories are missing/unready cannot copy, and a \
+                  Failed one stopped copying at its last run — the off-site copy is stale \
+                  until this is fixed"
+                .into(),
+            fix: "the message above is the operator's diagnosis; `kubectl describe \
+                  snapshotreplication <name>` for events, and fix the named repository or \
+                  ref first where one is named"
+                .into(),
+        };
+    }
+    if warns.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::Warn(join_capped(&warns, 5))
+    }
+}
+
+/// List `SnapshotReplication`s in scope and evaluate them. A 404 on the whole
+/// resource (the CRD is newer than this cluster's operator) is a Pass — there
+/// is nothing to check, and a brand-new check must not fail older installs.
+async fn check_snapshot_replications(ctx: &KubeCtx, repos: Option<&[RepoSummary]>) -> Outcome {
+    let api: Api<kopiur_api::SnapshotReplication> = match &ctx.scope {
+        Scope::All => Api::all(ctx.client.clone()),
+        Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
+    };
+    let items = match api.list(&ListParams::default()).await {
+        Ok(l) => l.items,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Outcome::Pass,
+        Err(e) => return warn_for("list", "snapshotreplications", &e),
+    };
+    evaluate_snapshot_replications(&items, repos, matches!(ctx.scope, Scope::All))
 }
 
 // --- the shared structural-gate core (pure) ---------------------------------
@@ -1382,6 +1545,10 @@ pub async fn run(
                 check: DoctorCheck::CredentialsPresent,
                 outcome: check_credentials(ctx, &repos).await,
             });
+            checks.push(CheckResult {
+                check: DoctorCheck::SnapshotReplications,
+                outcome: check_snapshot_replications(ctx, Some(&repos)).await,
+            });
         }
         Err(warn) => {
             checks.push(CheckResult {
@@ -1391,6 +1558,12 @@ pub async fn run(
             checks.push(CheckResult {
                 check: DoctorCheck::CredentialsPresent,
                 outcome: Outcome::Warn("skipped (repositories not listable)".into()),
+            });
+            // Repos unlistable: the ref-resolution arm is skipped, the
+            // suspend/phase/overlap arms still run.
+            checks.push(CheckResult {
+                check: DoctorCheck::SnapshotReplications,
+                outcome: check_snapshot_replications(ctx, None).await,
             });
         }
     }
@@ -1530,9 +1703,13 @@ mod tests {
     }
 
     #[test]
-    fn expected_crds_covers_all_eight_kinds() {
+    fn expected_crds_covers_all_nine_kinds() {
         let names: Vec<String> = expected_crds().into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
+        assert!(
+            names.contains(&"snapshotreplications.kopiur.home-operations.com".to_string()),
+            "{names:?}"
+        );
         for n in &names {
             assert!(n.ends_with(".kopiur.home-operations.com"), "{n}");
         }
@@ -1646,6 +1823,200 @@ mod tests {
         }))
         .expect("repository fixture");
         summarize_repository(&repo)
+    }
+
+    // --- SnapshotReplications check ------------------------------------------
+
+    fn named_repo(name: &str, namespace: &str, phase: &str, ready_message: &str) -> RepoSummary {
+        let conditions = if ready_message.is_empty() {
+            vec![]
+        } else {
+            vec![condition(
+                "Ready",
+                "False",
+                "BackendUnreachable",
+                ready_message,
+            )]
+        };
+        let repo: Repository = serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Repository",
+            "metadata": { "name": name, "namespace": namespace },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "creds" } }
+            },
+            "status": { "phase": phase, "conditions": conditions },
+        }))
+        .expect("repository fixture");
+        summarize_repository(&repo)
+    }
+
+    fn replication(
+        spec_extra: serde_json::Value,
+        status: serde_json::Value,
+    ) -> kopiur_api::SnapshotReplication {
+        let mut spec = serde_json::json!({
+            "sourceRef": { "kind": "Repository", "name": "src" },
+            "destinationRef": { "kind": "Repository", "name": "dst" },
+            "schedule": { "cron": "0 6 * * *" },
+        });
+        if let (Some(base), Some(extra)) = (spec.as_object_mut(), spec_extra.as_object()) {
+            for (k, v) in extra {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "SnapshotReplication",
+            "metadata": { "name": "to-offsite", "namespace": "media" },
+            "spec": spec,
+            "status": status,
+        }))
+        .expect("replication fixture")
+    }
+
+    fn healthy_repl_repos() -> Vec<RepoSummary> {
+        vec![
+            named_repo("src", "media", "Ready", ""),
+            named_repo("dst", "media", "Ready", ""),
+        ]
+    }
+
+    #[test]
+    fn healthy_snapshot_replication_passes() {
+        let items = [replication(
+            serde_json::json!({}),
+            serde_json::json!({ "phase": "Succeeded" }),
+        )];
+        let outcome = evaluate_snapshot_replications(&items, Some(&healthy_repl_repos()), false);
+        assert!(matches!(outcome, Outcome::Pass), "{outcome:?}");
+    }
+
+    #[test]
+    fn unresolvable_destination_ref_fails_naming_the_ref() {
+        let repos = vec![named_repo("src", "media", "Ready", "")];
+        let items = [replication(serde_json::json!({}), serde_json::json!({}))];
+        let (what, why, _) =
+            fail_parts(&evaluate_snapshot_replications(&items, Some(&repos), false));
+        assert!(
+            what.contains("media/to-offsite: destinationRef Repository dst does not resolve"),
+            "{what}"
+        );
+        assert!(why.contains("cannot copy"), "{why}");
+    }
+
+    #[test]
+    fn unready_source_repo_fails_with_the_ready_message() {
+        let repos = vec![
+            named_repo(
+                "src",
+                "media",
+                "Failed",
+                "credentials rejected; fix the Secret",
+            ),
+            named_repo("dst", "media", "Ready", ""),
+        ];
+        let items = [replication(serde_json::json!({}), serde_json::json!({}))];
+        let (what, _, _) = fail_parts(&evaluate_snapshot_replications(&items, Some(&repos), false));
+        assert!(
+            what.contains("sourceRef Repository src is not Ready (Failed: credentials rejected"),
+            "{what}"
+        );
+    }
+
+    #[test]
+    fn suspended_replication_warns() {
+        let items = [replication(
+            serde_json::json!({ "suspend": true }),
+            serde_json::json!({}),
+        )];
+        let outcome = evaluate_snapshot_replications(&items, Some(&healthy_repl_repos()), false);
+        let Outcome::Warn(msg) = outcome else {
+            panic!("suspend must warn, got {outcome:?}");
+        };
+        assert!(msg.contains("media/to-offsite is suspended"), "{msg}");
+    }
+
+    #[test]
+    fn failed_replication_surfaces_the_condition_message() {
+        let items = [replication(
+            serde_json::json!({}),
+            serde_json::json!({
+                "phase": "Failed",
+                "conditions": [condition(
+                    "Ready",
+                    "False",
+                    "ReplicationFailed",
+                    "kopia snapshot migrate exited 1: destination repository not initialized",
+                )],
+            }),
+        )];
+        let (what, _, fix) = fail_parts(&evaluate_snapshot_replications(
+            &items,
+            Some(&healthy_repl_repos()),
+            false,
+        ));
+        assert!(
+            what.contains("media/to-offsite last run Failed: kopia snapshot migrate exited 1"),
+            "{what}"
+        );
+        assert!(
+            fix.contains("kubectl describe snapshotreplication"),
+            "{fix}"
+        );
+    }
+
+    #[test]
+    fn overlap_condition_is_surfaced_as_a_warning() {
+        let items = [replication(
+            serde_json::json!({}),
+            serde_json::json!({
+                "phase": "Succeeded",
+                "conditions": [condition(
+                    "IdentityOverlap",
+                    "True",
+                    "DestinationPolicyOverlap",
+                    "selection overlaps pg@billing:/pvc/data written by SnapshotPolicy media/pg",
+                )],
+            }),
+        )];
+        let outcome = evaluate_snapshot_replications(&items, Some(&healthy_repl_repos()), false);
+        let Outcome::Warn(msg) = outcome else {
+            panic!("an overlap condition must warn, got {outcome:?}");
+        };
+        assert!(msg.contains("IdentityOverlap"), "{msg}");
+        assert!(msg.contains("pg@billing:/pvc/data"), "{msg}");
+    }
+
+    #[test]
+    fn missing_repo_listing_skips_ref_checks_but_keeps_the_rest() {
+        // Repos unlistable (RBAC): the resolve arm is skipped — no false Fail —
+        // while a suspended replication still warns.
+        let items = [replication(
+            serde_json::json!({ "suspend": true }),
+            serde_json::json!({}),
+        )];
+        let outcome = evaluate_snapshot_replications(&items, None, false);
+        assert!(matches!(outcome, Outcome::Warn(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn cross_namespace_ref_is_not_reported_missing_under_a_namespaced_scope() {
+        // Under `-n media`, a sourceRef pinned to another namespace is simply
+        // not listable — "not found" proves nothing there and must not Fail.
+        let items = [replication(
+            serde_json::json!({
+                "sourceRef": { "kind": "Repository", "name": "src", "namespace": "backups" },
+            }),
+            serde_json::json!({}),
+        )];
+        let repos = vec![named_repo("dst", "media", "Ready", "")];
+        let outcome = evaluate_snapshot_replications(&items, Some(&repos), false);
+        assert!(matches!(outcome, Outcome::Pass), "{outcome:?}");
+        // Under -A the same miss IS conclusive.
+        let outcome = evaluate_snapshot_replications(&items, Some(&repos), true);
+        assert!(matches!(outcome, Outcome::Fail { .. }), "{outcome:?}");
     }
 
     /// The privileged-mover refusal, verbatim in shape: the operator's message

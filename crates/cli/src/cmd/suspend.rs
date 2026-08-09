@@ -2,7 +2,8 @@
 //! suspend field (ADR-0005 §14(e)) on any kind that has one.
 
 use kopiur_api::{
-    ClusterRepository, Repository, RepositoryReplication, SnapshotPolicy, SnapshotSchedule,
+    ClusterRepository, Repository, RepositoryReplication, SnapshotPolicy, SnapshotReplication,
+    SnapshotSchedule,
 };
 use kube::api::{Api, Patch, PatchParams};
 use serde::de::DeserializeOwned;
@@ -51,6 +52,11 @@ pub fn kind_meta(kind: SuspendableKind) -> KindMeta {
             singular: "repositoryreplication",
             plural: "repositoryreplications",
         },
+        SuspendableKind::SnapshotReplication => KindMeta {
+            kind: "SnapshotReplication",
+            singular: "snapshotreplication",
+            plural: "snapshotreplications",
+        },
     }
 }
 
@@ -65,7 +71,8 @@ pub fn patch_for(kind: SuspendableKind, desired: bool) -> serde_json::Value {
         SuspendableKind::Policy
         | SuspendableKind::Repository
         | SuspendableKind::ClusterRepository
-        | SuspendableKind::Replication => {
+        | SuspendableKind::Replication
+        | SuspendableKind::SnapshotReplication => {
             serde_json::json!({ "spec": { "suspend": desired } })
         }
     }
@@ -230,6 +237,13 @@ pub async fn run(
             })
             .await?
         }
+        SuspendableKind::SnapshotReplication => {
+            let api: Api<SnapshotReplication> = Api::namespaced(client, ns);
+            toggle(api, meta, Some(ns), &args.name, args.kind, desired, |o| {
+                o.spec.suspend
+            })
+            .await?
+        }
     };
     render(&report, output)
 }
@@ -252,11 +266,37 @@ mod tests {
             SuspendableKind::Repository,
             SuspendableKind::ClusterRepository,
             SuspendableKind::Replication,
+            SuspendableKind::SnapshotReplication,
         ] {
             let p = patch_for(kind, false);
             assert_eq!(p["spec"]["suspend"], false, "{kind:?}");
             assert!(p["spec"].get("schedule").is_none(), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn snapshot_replication_kind_meta_and_name_render_roundtrip() {
+        let meta = kind_meta(SuspendableKind::SnapshotReplication);
+        assert_eq!(meta.kind, "SnapshotReplication");
+        assert_eq!(meta.singular, "snapshotreplication");
+        assert_eq!(meta.plural, "snapshotreplications");
+        let r = SuspendReport {
+            meta,
+            kind: meta.kind,
+            name: "offsite".into(),
+            namespace: Some("media".into()),
+            previous: false,
+            desired: true,
+            object: serde_json::json!({ "kind": "SnapshotReplication" }),
+        };
+        assert_eq!(
+            render(&r, OutputFormat::Name).unwrap(),
+            "snapshotreplication.kopiur.home-operations.com/offsite\n"
+        );
+        assert_eq!(
+            render(&r, OutputFormat::Table).unwrap(),
+            "snapshotreplication.kopiur.home-operations.com/offsite suspended\n"
+        );
     }
 
     fn report(previous: bool, desired: bool) -> SuspendReport {
