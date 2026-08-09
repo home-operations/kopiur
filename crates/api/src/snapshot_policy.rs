@@ -179,22 +179,25 @@ pub fn policy_repositories(
     }
 }
 
-/// The single repository a policy targets, for consumers whose multi-repo
-/// support has not landed yet.
+/// The single repository a policy targets, for code paths that genuinely
+/// cannot take a multi-repository policy.
 ///
-/// The multi-repo arm returns [`ValidationError::MultiRepositoryNotYetEnabled`]
-/// — the same refusal the admission-time feature gate raises — so a consumer
-/// routing this through its defensive validation path fails LOUDLY and
-/// consistently instead of silently picking repository #1. Multi-repo
-/// consumers land in M8/M10; until the gate lifts (M11) this arm is
-/// unreachable at runtime for admitted objects.
+/// The multi-repo arm returns
+/// [`ValidationError::PolicySingleRepositoryRequired`](crate::error::ValidationError::PolicySingleRepositoryRequired)
+/// so a consumer that needs "the one repository" fails LOUDLY instead of silently picking
+/// repository #1. Multi-repo policies address per-repository work through
+/// each child `Snapshot`'s `spec.repository` pin
+/// ([`crate::snapshot::effective_repository_ref`]); callers that can handle
+/// both shapes should match [`policy_repositories`] instead. Callers that
+/// treat multi as "no single answer" (e.g. the restore readiness gate's
+/// non-fatal repository lookup) `.ok()` this deliberately.
 pub fn single_repository_ref(
     spec: &SnapshotPolicySpec,
 ) -> Result<&RepositoryRef, crate::error::ValidationError> {
     match policy_repositories(spec)? {
         PolicyRepositories::Single(r) => Ok(r),
         PolicyRepositories::Multi(_) => {
-            Err(crate::error::ValidationError::MultiRepositoryNotYetEnabled)
+            Err(crate::error::ValidationError::PolicySingleRepositoryRequired)
         }
     }
 }
@@ -2175,11 +2178,11 @@ preflight:
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
-        // The single accessor refuses multi with the feature-gate variant —
-        // never a silent repository #1.
+        // The single-repo-only accessor refuses multi loudly — never a
+        // silent repository #1.
         assert_eq!(
             single_repository_ref(&multi).unwrap_err(),
-            ValidationError::MultiRepositoryNotYetEnabled
+            ValidationError::PolicySingleRepositoryRequired
         );
 
         // Neither / both: named errors, never a panic — a stored CR can be
@@ -2314,8 +2317,9 @@ preflight:
 
     #[test]
     fn snapshot_policy_repository_print_column_is_unchanged() {
-        // The `Repository` column stays `.spec.repository.name` (renders empty
-        // for a future multi-repo policy; documented when the gate lifts).
+        // The `Repository` column stays `.spec.repository.name` (renders
+        // empty for a multi-repo policy — the `Repositories` summary column
+        // covers that shape; documented in docs/backups.md).
         let crd = SnapshotPolicy::crd();
         let json = serde_json::to_value(&crd).expect("serialize CRD");
         let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]

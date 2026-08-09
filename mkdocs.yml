@@ -191,6 +191,7 @@ nav:
       - PVC access modes & RWOP: access-modes.md
       - Restores: restores.md
       - Repository replication: replication.md
+      - Snapshot replication: snapshot-replication.md
       - Movers, RBAC & credentials: movers.md
       - Feature permissions: feature-permissions.md
       - Permissions, UID & GID: permissions.md
@@ -227,6 +228,7 @@ nav:
           - Restore: reference/crds/restore.md
           - Maintenance: reference/crds/maintenance.md
           - RepositoryReplication: reference/crds/repository-replication.md
+          - SnapshotReplication: reference/crds/snapshot-replication.md
           - Shared sub-objects: reference/crds/shared-types.md
       - RBAC reference: rbac.md
       - API reference (rustdoc): api-reference.md

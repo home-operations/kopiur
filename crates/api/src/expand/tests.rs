@@ -779,9 +779,8 @@ fn cache_pvc_name_multi_repo_clips_slugs_never_the_tag() {
 
 // --- mint_cells: the members × repositories cross product (#368) ------------
 
-/// A multi-repo policy fixture in `billing`, spec constructed directly — the
-/// admission feature gate is deliberately bypassed (that is how the
-/// un-admittable behavior is proven until the gate lifts).
+/// A multi-repo policy fixture in `billing`, spec constructed directly (the
+/// same shape admission now accepts — the M7 feature gate is lifted).
 fn multi_repo_policy() -> SnapshotPolicy {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",

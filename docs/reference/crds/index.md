@@ -30,7 +30,5 @@ The design *rationale* behind why these fields are shaped the way they are
 - [Restore](restore.md) — restore data from a repository.
 - [Maintenance](maintenance.md) — repository maintenance (quick/full).
 - [RepositoryReplication](repository-replication.md) — off-site mirror.
-- `SnapshotReplication` — copy snapshots between repositories (see the
-  [field reference](../../field-reference.md#snapshotreplication) for now; its
-  per-field page ships with the feature docs).
+- [SnapshotReplication](snapshot-replication.md) — copy snapshots between repositories.
 - [Shared sub-objects](shared-types.md) — types reused across CRDs (Backend, MoverSpec, …).

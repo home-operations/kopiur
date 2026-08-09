@@ -224,9 +224,9 @@ async fn handle_snapshot_policy(
 
     // ClusterRepository tenancy (fail closed). namespace comes from the request.
     // Looped over every referenced repository: for the single-repo shape this
-    // is exactly the old one-ref check; the multi-repo shape (refused above by
-    // the validator's feature gate until the fan-out data path lands) already
-    // gets the right any-denies-fails semantics for when the gate lifts.
+    // is exactly the old one-ref check; the multi-repo shape gets
+    // any-denies-fails semantics — one non-permitted ClusterRepository member
+    // refuses the whole policy.
     for rref in api::repository_refs(&spec) {
         if let TenancyDecision::Deny(denial) =
             tenancy_for(rref, req.namespace.as_deref(), client).await
@@ -784,6 +784,14 @@ async fn handle_repository_replication(
                 },
             ]));
         }
+        if let Some(path) = api::validate::replication_filesystem_mount_collision(
+            &source_backend,
+            &spec.destination,
+        ) {
+            return Err(AdmissionError::Invalid(vec![
+                ValidationError::ReplicationMountPathCollision { path },
+            ]));
+        }
         if let Err(e) = api::validate::validate_replication_auth(&source_backend, &spec.destination)
         {
             return Err(AdmissionError::Invalid(vec![e]));
@@ -854,6 +862,14 @@ async fn handle_snapshot_replication(
                     destination_ref: repository_ref_label(&spec.destination_ref),
                     backend: dst.kind_str().to_string(),
                 },
+            ]));
+        }
+        // Two distinct fs repos sharing one in-pod path would put two
+        // volumeMounts at a single mountPath in the mover pod — refuse here
+        // rather than fail at Job-create time.
+        if let Some(path) = api::validate::replication_filesystem_mount_collision(src, dst) {
+            return Err(AdmissionError::Invalid(vec![
+                ValidationError::ReplicationMountPathCollision { path },
             ]));
         }
         // One mover pod carries both credential sets, so the same
@@ -1511,6 +1527,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn multi_repo_policy_create_is_admitted() {
+        // The e2e-visible admission contract with the M7 feature gate LIFTED:
+        // a well-formed `spec.repositories` policy is ALLOWED (the client-free
+        // path — the same shared validator the controller re-runs). Namespaced
+        // refs only: a ClusterRepository member would (correctly) fail closed
+        // on the tenancy check with no client.
+        let spec = json!({
+            "repositories": [
+                { "kind": "Repository", "name": "nas" },
+                { "kind": "Repository", "name": "offsite" },
+            ],
+            "sources": [ { "pvc": { "name": "data" } } ],
+        });
+        let req = admission_request("SnapshotPolicy", spec);
+        let resp = dispatch(&req, None).await;
+        assert!(
+            resp.allowed,
+            "well-formed multi-repo policy must be admitted: {:?}",
+            resp.result.message
+        );
+
+        // …while the hooks × repositories quiesce refusal stays.
+        let hooked = json!({
+            "repositories": [ { "name": "nas" }, { "name": "offsite" } ],
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "hooks": { "beforeSnapshot": [ { "workloadExec": {
+                "podSelector": { "matchLabels": { "app": "pg" } },
+                "command": ["true"],
+            } } ] },
+        });
+        let req = admission_request("SnapshotPolicy", hooked);
+        let resp = dispatch(&req, None).await;
+        assert!(!resp.allowed, "hooks × repositories must stay refused");
+        assert!(
+            resp.result.message.contains("SnapshotReplication"),
+            "the refusal must point at the supported alternative: {:?}",
+            resp.result.message
+        );
+    }
+
     /// Build an UPDATE `AdmissionRequest` for a `SnapshotPolicy`, with the new object
     /// (spec + annotations) and the `oldObject` (spec + status) as the API server sends
     /// them. Used by the fork-on-edit guard tests.
@@ -2158,6 +2215,64 @@ mod tests {
         assert!(msg.contains("same Filesystem storage target"), "{msg:?}");
         assert!(msg.contains("Repository src"), "{msg:?}");
         assert!(msg.contains("Repository dst"), "{msg:?}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_replication_fs_mount_path_collision_is_denied() {
+        // Two genuinely different filesystem repos (distinct PVCs — they PASS
+        // the same-storage check) that both mount at the default /repo: the
+        // mover pod cannot carry two volumeMounts at one mountPath.
+        let client = mock_path_client(vec![
+            (
+                "repositories/src",
+                repo_body(
+                    "src",
+                    json!({ "filesystem": {
+                        "path": "/repo", "volume": { "pvc": { "name": "src-pvc" } },
+                    } }),
+                ),
+            ),
+            (
+                "repositories/dst",
+                repo_body(
+                    "dst",
+                    json!({ "filesystem": {
+                        "path": "/repo", "volume": { "pvc": { "name": "dst-pvc" } },
+                    } }),
+                ),
+            ),
+        ]);
+        let req = admission_request("SnapshotReplication", snapshot_replication_spec(json!({})));
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(!resp.allowed, "{:?}", resp.result.message);
+        let msg = resp.result.message;
+        assert!(msg.contains("both mount at \"/repo\""), "{msg:?}");
+        assert!(msg.contains("distinct backend.path"), "{msg:?}");
+
+        // Distinct paths: admitted (all other checks pass).
+        let client = mock_path_client(vec![
+            (
+                "repositories/src",
+                repo_body(
+                    "src",
+                    json!({ "filesystem": {
+                        "path": "/repo", "volume": { "pvc": { "name": "src-pvc" } },
+                    } }),
+                ),
+            ),
+            (
+                "repositories/dst",
+                repo_body(
+                    "dst",
+                    json!({ "filesystem": {
+                        "path": "/repo-dst", "volume": { "pvc": { "name": "dst-pvc" } },
+                    } }),
+                ),
+            ),
+        ]);
+        let req = admission_request("SnapshotReplication", snapshot_replication_spec(json!({})));
+        let resp = dispatch(&req, Some(&client)).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
     }
 
     #[tokio::test]

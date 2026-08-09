@@ -17,9 +17,10 @@ possibly superseded (ADR-0004 renamed kinds/fields; ADR-0005 added features;
 ADR-0001/0002 are abandoned Go drafts). Don't cite an ADR section for a fact you
 can state from the code — point at the code.
 
-The operator exposes **8 CRDs** in API group `kopiur.home-operations.com`, version `v1alpha1`:
+The operator exposes **9 CRDs** in API group `kopiur.home-operations.com`, version `v1alpha1`:
 `Repository` (ns), `ClusterRepository` (cluster), `SnapshotPolicy`, `Snapshot`,
-`SnapshotSchedule`, `Restore`, `Maintenance`, `RepositoryReplication` (all ns).
+`SnapshotSchedule`, `Restore`, `Maintenance`, `RepositoryReplication`,
+`SnapshotReplication` (all ns).
 It separates **recipe** (`SnapshotPolicy`) from **invocation** (`Snapshot`) from
 **schedule** (`SnapshotSchedule`), makes the repository a first-class resource,
 and ties a kopia snapshot's lifecycle to its `Snapshot` CR via a finalizer +

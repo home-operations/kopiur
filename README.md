@@ -1,20 +1,22 @@
 # kopiur
 
-**Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Backup` CR by a finalizer + `deletionPolicy`. The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. See [ADR-0003](docs/adr/0003-kopiur-rust-operator.md) for the full design.
+**Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Snapshot` CR by a finalizer + `deletionPolicy`. The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. See [ADR-0003](docs/adr/0003-kopiur-rust-operator.md) for the full design.
 
 > Status: **alpha** — API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
 
-## The 7 CRDs (`kopiur.home-operations.com/v1alpha1`)
+## The 9 CRDs (`kopiur.home-operations.com/v1alpha1`)
 
-| CRD                 | Scope      | Layer                | Purpose                                                                         |
-| ------------------- | ---------- | -------------------- | ------------------------------------------------------------------------------- |
-| `Repository`        | Namespaced | Storage              | A kopia repository owned by one namespace: backend, encryption, credentials.    |
-| `ClusterRepository` | Cluster    | Storage              | A shared repository for platform teams, gated by `allowedNamespaces`.           |
-| `BackupConfig`      | Namespaced | Recipe               | _What_ to back up: PVC sources, identity, retention, policy, hooks. Idempotent. |
-| `Backup`            | Namespaced | Invocation + Catalog | One kopia snapshot as a Kubernetes object. The universal trigger entry point.   |
-| `BackupSchedule`    | Namespaced | Cron                 | _When_ it runs: cron + jitter + timezone; creates `Backup` CRs.                 |
-| `Restore`           | Namespaced | Operation            | Restore a snapshot to a PVC, or act as a passive volume-populator source.       |
-| `Maintenance`       | Namespaced | Lifecycle            | Schedules `kopia maintenance` quick + full with an ownership lease.             |
+| CRD                     | Scope      | Layer                | Purpose                                                                                                                                 |
+| ----------------------- | ---------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `Repository`            | Namespaced | Storage              | A kopia repository owned by one namespace: backend, encryption, credentials.                                                            |
+| `ClusterRepository`     | Cluster    | Storage              | A shared repository for platform teams, gated by `allowedNamespaces`.                                                                   |
+| `SnapshotPolicy`        | Namespaced | Recipe               | _What_ to back up: PVC sources, identity, retention, policy, hooks — into one repository or a 1–8 multi-repository fan-out. Idempotent. |
+| `Snapshot`              | Namespaced | Invocation + Catalog | One kopia snapshot as a Kubernetes object. The universal trigger entry point.                                                           |
+| `SnapshotSchedule`      | Namespaced | Cron                 | _When_ it runs: cron + jitter + timezone; creates `Snapshot` CRs.                                                                       |
+| `Restore`               | Namespaced | Operation            | Restore a snapshot to a PVC, or act as a passive volume-populator source.                                                               |
+| `Maintenance`           | Namespaced | Lifecycle            | Schedules `kopia maintenance` quick + full with an ownership lease.                                                                     |
+| `RepositoryReplication` | Namespaced | Durability           | Mirror a repository's blobs to a second backend on a schedule (the "2" in 3-2-1).                                                       |
+| `SnapshotReplication`   | Namespaced | Durability           | Copy selected snapshots from one repository into another on a schedule (kopia `snapshot migrate`).                                      |
 
 ## Quickstart
 
@@ -53,11 +55,11 @@ Full reference: **[docs/cli/index.md](docs/cli/index.md)**.
 ## Layout
 
 ```
-crates/          Rust workspace (api, kopia, webhook, controller, mover, xtask)
+crates/          Rust workspace (api, kopia, webhook, controller, mover, cli, telemetry, e2e, xtask)
 deploy/crds/     Generated CRDs (cargo xtask gen-crds) — checked in
 deploy/rbac/     Generated RBAC (cargo xtask gen-rbac) — checked in
 deploy/helm/     Helm chart (deploy/helm/kopiur)
-deploy/examples/ 8 runnable usage walkthroughs
+deploy/examples/ 40 runnable usage walkthroughs (numbered ladder + backends + scenarios)
 docs/adr/        Architecture Decision Records (0003 is canonical)
 ```
 

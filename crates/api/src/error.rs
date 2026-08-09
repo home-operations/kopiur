@@ -504,6 +504,22 @@ pub enum ValidationError {
         backend: String,
     },
 
+    /// Two distinct filesystem repositories in one replication share the same
+    /// in-pod `backend.path`, so the mover Job would carry two volumeMounts at
+    /// one `mountPath` — an invalid pod spec that otherwise fails only at
+    /// Job-create time. Different volumes make them pass the self-target check;
+    /// the mount topology is the problem.
+    #[error(
+        "the source and destination filesystem repositories both mount at {path:?} inside the \
+         replication mover pod; two volumes cannot share one mountPath. Give one of them a \
+         distinct backend.path (e.g. /repo-dst) — the path is where the volume mounts inside \
+         kopiur's pods, so changing it does not move any data"
+    )]
+    ReplicationMountPathCollision {
+        /// The shared in-pod mount path.
+        path: String,
+    },
+
     /// A `SnapshotReplication`'s `sourceRef` and `destinationRef` are the same
     /// reference (same kind, name, and effective namespace) — copying a
     /// repository's snapshots into itself is a no-op at best and duplicates
@@ -630,15 +646,21 @@ pub enum ValidationError {
         second: usize,
     },
 
-    /// `SnapshotPolicy.spec.repositories` was set, but multi-repository
-    /// fan-out is not wired end-to-end in this build yet — admitting it now
-    /// would corrupt the policy's shared kopia cache and fake verification
-    /// results. The refusal is lifted once the full data path lands.
+    /// A code path that genuinely requires a SINGLE repository (the
+    /// [`single_repository_ref`](crate::snapshot_policy::single_repository_ref)
+    /// accessor's `Multi` arm) was handed a multi-repository policy. This is
+    /// NOT an admission refusal — `spec.repositories` is fully supported; a
+    /// multi-repo policy's per-repository work is addressed through each
+    /// child `Snapshot`'s `spec.repository` pin, never through a policy-level
+    /// "the one repository" read, so any consumer still asking for one fails
+    /// loudly here instead of silently picking repository #1.
     #[error(
-        "spec.repositories is not yet enabled in this build; use spec.repository (single) — \
-         multi-repository fan-out lands later in this release line"
+        "this operation reads a policy-level single repository, but the SnapshotPolicy \
+         uses spec.repositories (multi-repository fan-out) — select the repository \
+         explicitly (the per-child Snapshot spec.repository pin, or the operation's own \
+         repository selector) instead of relying on a single policy repository"
     )]
-    MultiRepositoryNotYetEnabled,
+    PolicySingleRepositoryRequired,
 
     /// A `SnapshotPolicy` combines `spec.hooks` with `spec.repositories`.
     /// Hooks quiesce the workload around ONE capture; with N concurrent

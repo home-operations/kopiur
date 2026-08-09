@@ -1671,8 +1671,8 @@ fn backup_config_aggregate_collects_multiple_errors() {
 }
 
 /// Build a policy spec via the cluster's parse path (YAML → JSON value →
-/// typed) with an arbitrary repository surface, for the M7 exactly-one-of /
-/// feature-gate matrix below.
+/// typed) with an arbitrary repository surface, for the exactly-one-of /
+/// multi-repository admission matrix below.
 fn policy_spec_yaml(repo_surface: &str, extra: &str) -> SnapshotPolicySpec {
     let yaml = format!("{repo_surface}sources: [ {{ pvc: {{ name: d }} }} ]\n{extra}");
     let value: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -1713,20 +1713,23 @@ fn policy_repository_exactly_one_matrix() {
 }
 
 #[test]
-fn policy_repositories_feature_gate_refuses_multi_repo() {
-    // THE M7 feature gate: a well-formed multi-repo spec is refused outright
-    // until the fan-out data path lands (lifted in M11).
+fn policy_repositories_well_formed_multi_repo_is_accepted() {
+    // The M7 feature gate is LIFTED (M11): a well-formed multi-repo spec —
+    // distinct entries, no hooks — is admitted with no errors at all. This is
+    // the e2e-visible admission contract for multi-repository fan-out.
     let multi = policy_spec_yaml("repositories: [ { name: a }, { name: b } ]\n", "");
-    let errs = validate_backup_config(&multi);
-    assert!(
-        errs.iter()
-            .any(|e| matches!(e, ValidationError::MultiRepositoryNotYetEnabled)),
-        "{errs:?}"
-    );
-    // The message tells the user what to do instead.
-    let msg = ValidationError::MultiRepositoryNotYetEnabled.to_string();
-    assert!(msg.contains("not yet enabled"), "{msg}");
-    assert!(msg.contains("use spec.repository (single)"), "{msg}");
+    assert_eq!(validate_backup_config(&multi), vec![]);
+
+    // A single-entry `repositories:` list is equally legal (the exactly-one-of
+    // rule is about which FIELD is set, not the entry count).
+    let one_entry = policy_spec_yaml("repositories: [ { name: a } ]\n", "");
+    assert_eq!(validate_backup_config(&one_entry), vec![]);
+
+    // The single-repo-only accessor still refuses multi loudly, with a message
+    // that points at per-child/per-operation repository selection.
+    let msg = ValidationError::PolicySingleRepositoryRequired.to_string();
+    assert!(msg.contains("spec.repositories"), "{msg}");
+    assert!(msg.contains("spec.repository pin"), "{msg}");
 }
 
 #[test]

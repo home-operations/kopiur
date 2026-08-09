@@ -16,7 +16,7 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 | ------------------- | ---------- | -------------------- | ------------------------------------------------------------------------------- |
 | `Repository`        | Namespaced | Storage              | A kopia repository owned by one namespace: backend, encryption, credentials.    |
 | `ClusterRepository` | Cluster    | Storage              | A shared repository for platform teams, gated by `allowedNamespaces`.           |
-| `SnapshotPolicy`      | Namespaced | Recipe               | _What_ to back up: PVC sources, identity, retention, policy, hooks. Idempotent. |
+| `SnapshotPolicy`      | Namespaced | Recipe               | _What_ to back up: PVC sources, identity, retention, policy, hooks — into one repository or a 1–8 [multi-repository fan-out](backups.md#repositories--one-recipe-several-repositories-fan-out). Idempotent. |
 | `Snapshot`            | Namespaced | Invocation + Catalog | One kopia snapshot as a Kubernetes object. The universal trigger entry point.   |
 | `SnapshotSchedule`    | Namespaced | Cron                 | _When_ it runs: cron + jitter + timezone; creates `Snapshot` CRs.                 |
 | `Restore`           | Namespaced | Operation            | Restore a snapshot to a PVC, or act as a passive volume-populator source.       |

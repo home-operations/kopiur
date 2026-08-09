@@ -1,0 +1,138 @@
+# Example 40 — Multi-repository fan-out (one recipe, two repositories)
+#
+# One SnapshotPolicy that backs its source up into TWO repositories on every
+# run: an on-prem NAS (MinIO) and an off-site S3 bucket. `spec.repositories`
+# replaces `spec.repository` (exactly one of the two must be set); each firing
+# then mints one Snapshot CR + one mover Job PER (source × repository) — two
+# independent captures, each with its own retention window, verification, and
+# cache.
+#
+# Field shapes verified against crates/api: `repositories` is a list of 1-8
+# RepositoryRefs (kind defaults to Repository), distinct entries required;
+# `spec.hooks` cannot be combined with `spec.repositories` (webhook-refused —
+# use a single-repo policy + a SnapshotReplication instead, see example 39).
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section
+# markers (docs/backups.md pulls the policy stage on its own). Plain YAML
+# comments — the file stays `kubectl apply -f`-able as-is.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: offsite-repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # The two repositories are fully independent — different backends, different
+  # passwords. Nothing about them needs to match.
+  KOPIA_PASSWORD: "a-different-long-random-password"
+---
+# Target 1: the on-prem NAS (an in-cluster MinIO here).
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: backups
+      prefix: billing/
+      endpoint: minio.storage.svc:9000
+      region: us-east-1
+      tls:
+        disableTls: true # in-cluster MinIO over plain HTTP
+      auth:
+        secretRef:
+          name: nas-repo-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+# Target 2: the off-site S3 bucket.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: offsite-s3
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: offsite-snapshots
+      prefix: prod/
+      region: us-west-2
+      auth:
+        secretRef:
+          name: offsite-repo-creds
+  encryption:
+    passwordSecretRef:
+      name: offsite-repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  # `repositories` (1-8 distinct entries) replaces `repository` — exactly one
+  # of the two fields may be set. Every firing backs the source up into EACH
+  # listed repository: one Snapshot CR + one mover Job per (source × repo).
+  # A ClusterRepository entry works too (kind: ClusterRepository).
+  repositories:
+    - kind: Repository
+      name: nas
+    - kind: Repository
+      name: offsite-s3
+  sources:
+    - pvc:
+        name: postgres-data
+  # Retention is applied PER (source, repository): keepDaily: 14 keeps 14
+  # dailies in `nas` AND 14 in `offsite-s3` — a repo outage never lets the
+  # healthy repo's history evict the broken one's.
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+  # NOTE: `hooks:` is refused on a multi-repo policy — N concurrent children
+  # cannot honor a freeze/thaw quiesce contract. For hooked backups plus a
+  # second repository, keep the policy single-repo and add a
+  # SnapshotReplication (example 39).
+# --8<-- [end:policy]
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    cron: "H 2 * * *"
+    jitter: 30m
+    runOnCreate: false
+# Restores from this policy must say WHICH repository to read (the two are
+# independent captures that can diverge):
+#   spec.source.fromPolicy: { name: postgres-data }
+#   spec.repository: { kind: Repository, name: offsite-s3 }
+# Manual runs can target one member: kubectl kopiur snapshot now \
+#   --policy postgres-data --repository offsite-s3

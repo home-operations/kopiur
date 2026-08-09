@@ -237,9 +237,10 @@ pub struct NoPruning {}
 /// they classify as EXTERNAL deletions and the destination repository's
 /// mass-deletion breaker (`deletionProtection.threshold`) **holds a bulk
 /// source-side vanish**: ransomware emptying the source cannot cascade into
-/// emptying the off-site copy in one wave. The hold surfaces as a
-/// `PruneHeldByBreaker` condition and is released with the breaker's normal
-/// timestamp acknowledgement.
+/// emptying the off-site copy in one wave. The hold surfaces through the
+/// breaker's normal machinery — a `DeletionHeld` condition on each held copy
+/// `Snapshot` and `MassDeletionHeld` on the destination repository — and is
+/// released with the breaker's normal timestamp acknowledgement.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorSourcePruning {}

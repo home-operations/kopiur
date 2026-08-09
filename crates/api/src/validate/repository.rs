@@ -1078,6 +1078,48 @@ pub fn replication_destination_differs(
     backend_target_key(source) != backend_target_key(dest)
 }
 
+/// Two DISTINCT filesystem repositories that share the same in-pod
+/// `backend.path` cannot ride one replication mover pod: the Job mounts each
+/// repo's volume at its own `path`, and two volumeMounts at one `mountPath`
+/// make the pod spec invalid — a failure that would otherwise surface only as
+/// a reconcile-time Job-create error. [`backend_target_key`] deliberately keys
+/// filesystem targets by (path, volume) so this pair PASSES the self-target
+/// check (different volumes = genuinely different repos); the mount collision
+/// is a separate, mover-topology constraint, so it gets its own guard.
+///
+/// Returns the shared path when both backends are filesystem-backed and their
+/// `path`s are equal (regardless of volume); `None` otherwise. Callers deny at
+/// admission and defensively re-check at Job-spawn time.
+///
+/// ```
+/// use kopiur_api::backend::Backend;
+/// use kopiur_api::validate::replication_filesystem_mount_collision;
+/// let fs = |path: &str, pvc: &str| -> Backend {
+///     serde_json::from_value(serde_json::json!({
+///         "filesystem": { "path": path, "volume": { "pvc": { "name": pvc } } }
+///     }))
+///     .unwrap()
+/// };
+/// let a = fs("/repo", "a");
+/// assert_eq!(
+///     replication_filesystem_mount_collision(&a, &fs("/repo", "b")),
+///     Some("/repo".to_string())
+/// );
+/// assert_eq!(replication_filesystem_mount_collision(&a, &fs("/repo-dst", "b")), None);
+/// ```
+pub fn replication_filesystem_mount_collision(
+    source: &crate::backend::Backend,
+    dest: &crate::backend::Backend,
+) -> Option<String> {
+    use crate::backend::Backend;
+    match (source, dest) {
+        (Backend::Filesystem(s), Backend::Filesystem(d)) if s.path == d.path => {
+            Some(s.path.clone())
+        }
+        _ => None,
+    }
+}
+
 /// A structural identity key for a backend (kind + identifying target), used by
 /// [`replication_destination_differs`] to decide whether two backends point at the
 /// same storage. Exhaustive over [`crate::backend::Backend`] so a new backend cannot

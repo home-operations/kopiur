@@ -1288,8 +1288,8 @@ mod tests {
     /// Multi-repo fan-out (#368): an adopted row of a multi-repo policy stamps
     /// `spec.repository` = the repository it was DISCOVERED in (normalized) —
     /// the pin the (source, repo) retention buckets and deletion batching key
-    /// on. Spec constructed directly (bypassing the admission feature gate),
-    /// which is exactly how the un-admittable behavior is proven.
+    /// on. Spec constructed directly — the same shape admission accepts now
+    /// that the M7 feature gate is lifted.
     #[test]
     fn build_adopted_snapshot_pins_the_discovered_repository_for_multi_repo() {
         let spec: SnapshotPolicySpec = serde_json::from_value(serde_json::json!({

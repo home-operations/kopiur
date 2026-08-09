@@ -18,6 +18,8 @@
 //! registry rather than from anything restated here — a gate the operator
 //! grows is one the CLI reports with no code change on this side.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
@@ -228,10 +230,45 @@ fn expected_crds() -> Vec<(String, CustomResourceDefinition)> {
     ]
 }
 
+/// Top-level `spec` fields of the plugin's compiled-in `v1alpha1` schema that
+/// the LIVE CRD lacks — the "stale CRD schema" signal. **Pure.**
+///
+/// Why this matters: Helm never upgrades the chart's `crds/` directory, so an
+/// operator upgrade can leave old CRD schemas behind — and the apiserver then
+/// silently PRUNES any new spec field from applied objects. For
+/// `SnapshotPolicy.spec.repositories` the prune is at least loud downstream
+/// (the webhook refuses the neither-field shape), but for most fields it is a
+/// silent no-op, which is why doctor checks the live schema directly. One
+/// direction only: a live CRD with EXTRA fields (cluster newer than the
+/// plugin) is fine, matching the newer-CRD tolerance elsewhere in doctor.
+fn missing_spec_fields(
+    expected: &CustomResourceDefinition,
+    live: &CustomResourceDefinition,
+) -> Vec<String> {
+    fn spec_field_names(crd: &CustomResourceDefinition) -> Option<BTreeSet<String>> {
+        let version = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.name == kopiur_api::VERSION)?;
+        let schema = version.schema.as_ref()?.open_api_v3_schema.as_ref()?;
+        let spec = schema.properties.as_ref()?.get("spec")?;
+        Some(spec.properties.as_ref()?.keys().cloned().collect())
+    }
+    let Some(expected_fields) = spec_field_names(expected) else {
+        return Vec::new();
+    };
+    match spec_field_names(live) {
+        // No readable v1alpha1 spec schema at all: everything is missing.
+        None => expected_fields.into_iter().collect(),
+        Some(live_fields) => expected_fields.difference(&live_fields).cloned().collect(),
+    }
+}
+
 async fn check_crds(ctx: &KubeCtx) -> Outcome {
     let api: Api<CustomResourceDefinition> = Api::all(ctx.client.clone());
     let mut missing = Vec::new();
-    for (name, _) in expected_crds() {
+    for (name, expected) in expected_crds() {
         match api.get_opt(&name).await {
             Ok(Some(crd)) => {
                 let serves_v1alpha1 = crd
@@ -244,6 +281,24 @@ async fn check_crds(ctx: &KubeCtx) -> Outcome {
                         what: format!("CRD {name} does not serve {}", kopiur_api::VERSION),
                         why: "this plugin (and the operator) speak v1alpha1 only".into(),
                         fix: "upgrade/reinstall the kopiur CRDs (helm upgrade, or apply deploy/crds/)"
+                            .into(),
+                    };
+                }
+                let stale = missing_spec_fields(&expected, &crd);
+                if !stale.is_empty() {
+                    return Outcome::Fail {
+                        what: format!(
+                            "CRD {name} schema is stale: missing spec field(s) {}",
+                            stale.join(", ")
+                        ),
+                        why: "Helm never upgrades the chart's crds/ directory, so the live CRD \
+                              predates this schema — the apiserver PRUNES these fields from every \
+                              applied object (e.g. a multi-repository SnapshotPolicy loses \
+                              spec.repositories, and admission then refuses the neither-repository \
+                              shape)"
+                            .into(),
+                        fix: "apply the current CRDs: kubectl apply --server-side -f deploy/crds/ \
+                              (or your GitOps CRD-upgrade path, e.g. Flux CreateReplace)"
                             .into(),
                     };
                 }
@@ -1671,6 +1726,40 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// The stale-CRD-schema detector (#368 upgrade hazard): a live
+    /// `snapshotpolicies` CRD from before `spec.repositories` must be flagged,
+    /// because the apiserver would silently prune the field from applied
+    /// objects; an up-to-date (or NEWER) live schema must pass.
+    #[test]
+    fn missing_spec_fields_flags_a_pruned_repositories_schema() {
+        let expected = SnapshotPolicy::crd();
+
+        // Up to date: live == expected ⇒ nothing missing.
+        assert!(missing_spec_fields(&expected, &expected).is_empty());
+
+        // Stale: strip `spec.repositories` from the live schema, the exact
+        // shape a pre-multi-repo cluster serves after a helm-only upgrade.
+        let mut live_json = serde_json::to_value(&expected).unwrap();
+        let removed = live_json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("repositories");
+        assert!(removed.is_some(), "fixture must actually strip the field");
+        let live: CustomResourceDefinition = serde_json::from_value(live_json).unwrap();
+        assert_eq!(
+            missing_spec_fields(&expected, &live),
+            vec!["repositories".to_string()]
+        );
+
+        // Newer live schema (extra field) is NOT flagged — one direction only.
+        let mut newer_json = serde_json::to_value(&expected).unwrap();
+        newer_json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["futureField"] = serde_json::json!({ "type": "string" });
+        let newer: CustomResourceDefinition = serde_json::from_value(newer_json).unwrap();
+        assert!(missing_spec_fields(&expected, &newer).is_empty());
     }
 
     #[test]

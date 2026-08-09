@@ -91,6 +91,46 @@ stage of [example 01](examples.md#example-01--single-pvc-scheduled)):
 --8<-- "deploy/examples/01-single-pvc-scheduled.yaml:policy"
 ```
 
+### Repositories — one recipe, several repositories (fan-out)
+
+A recipe targets its repositories with **exactly one of** two fields: `repository` (one `Repository`/`ClusterRepository` — everything above and below this section) or `repositories`, a list of **1–8 distinct** refs that backs every source up into **each** of them on every run ([example 40](https://github.com/home-operations/kopiur/tree/main/deploy/examples/40-multi-repository-policy.yaml)):
+
+```yaml
+--8<-- "deploy/examples/40-multi-repository-policy.yaml:policy"
+```
+
+The mental model: each firing expands to **one `Snapshot` CR + one mover Job per (source × repository)**. Every child is an ordinary single-repo backup from there on — its own kopia snapshot, its own retention bucket, its own verification — pinned to its repository via `spec.repository` stamped at mint time. Child names gain a `-repo-<name>-<hash>` marker (single-repo children keep their exact legacy names), and each repository gets its **own mover cache PVC** (`kopiur-cache-<policy>-<repo>-<hash>`; single-repo keeps `kopiur-cache-<policy>`), because two kopia repositories can never share one cache.
+
+What "per repository" means in practice:
+
+- **Retention is per (source, repository).** `keepDaily: 7` over 2 repositories keeps seven dailies **in each** — never seven total — so an outage of one repository can't let the healthy one's history evict the broken one's records. Failed-run history (`failedJobsHistoryLimit`) is likewise bounded **per repository**.
+- **Identity is per repository.** Each child resolves its kopia identity under **its own** repository's [`identityDefaults`](repositories.md#identitydefaults--per-tenant-identity-cel) — so one recipe legitimately has N identities, one per repository, and the identity-change/fork guards check every (identity, repository) pair.
+- **Verification is per repository**, with one verify Job per repo per slot. `status.verification` lists each repository's result, and the flat `status.lastVerified` is the **minimum** (oldest) across the current repository set — "verified" means *every* repository is verified, so one unverifiable repo keeps the flat timestamp honest.
+- **Captures are independent — not a cross-repo point in time.** Each repository's child stages and reads the source on its own; the N snapshots of one slot are *close* in time but not one consistent instant across repositories. For a multi-PVC selector with `groupBy: VolumeGroupSnapshot`, each repository gets its **own** VolumeGroupSnapshot per slot — budget **N×** the CSI snapshot quota and storage-side load.
+- **Deletion protection is per repository.** Deleting a multi-repo policy's history trips each repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) independently — expect **one acknowledgement per repository**, not one total (`kubectl kopiur doctor` groups the held sets per repo with the exact ack command for each).
+- **Restores must pick a repository.** A `fromPolicy` restore against a multi-repo policy is refused until `spec.repository` names **one member** of the policy's set (the message lists the valid choices); a non-member ref is refused too. Kopiur never guesses repository #1 — the N captures can diverge. See [Restores](restores.md).
+- **`concurrencyPolicy: Forbid` (the schedule default) holds the whole slot.** Single-flight is per *schedule*: while any child of the previous slot is still running — one slow or unreachable repository is enough — the next slot is skipped for **all** repositories. Use `Allow` if a lagging repository must not delay the healthy ones' cadence.
+- **The cross product is capped at 400 children per slot** (sources × repositories). A slot over the cap is skipped whole — never partially minted — with a `FanoutCapped` condition on the schedule and a `doctor` finding.
+- `kubectl get snapshotpolicy` renders the single-repo `Repository` column **blank** for a multi-repo policy; the `Repositories` column (from `status.repositorySummary`) lists the set.
+
+/// warning | `hooks` cannot be combined with `repositories`
+
+Hooks quiesce the workload around **one** capture. With N concurrent fan-out children, the first child to finish would run the after-snapshot (thaw) hooks while the other N−1 movers are still reading — voiding the quiesce guarantee — and serializing the children would multiply the freeze window by N. The webhook refuses the combination. For an app-consistent backup **plus** a second repository, keep the policy single-repo with hooks and add a [`SnapshotReplication`](snapshot-replication.md) that copies its snapshots into the second repository — that is exactly its use case.
+
+///
+
+/// note | Fan-out vs. replication — writing twice vs. copying once
+
+`repositories` reads the **source** N times and uploads N times per run — N truly independent captures, at N× the source I/O and upload cost. A [`SnapshotReplication`](snapshot-replication.md) backs up once and *copies* the result repository-to-repository — cheaper on the workload, and the copies are byte-identical to the original capture. A [`RepositoryReplication`](replication.md) mirrors the whole repository's blobs to a passive destination. All three are legitimate "second repository" strategies; fan-out is the one where the second capture must not depend on the first repository being healthy.
+
+///
+
+/// warning | Upgrading: apply the new CRD schema before using `repositories`
+
+Helm never upgrades the chart's `crds/` directory, so on an existing install the live `SnapshotPolicy` CRD may predate `spec.repositories` — and the apiserver **prunes** unknown fields, after which admission refuses the policy (neither `repository` nor `repositories` set — loud, not silent). `kubectl apply --server-side -f deploy/crds/` first; `kubectl kopiur doctor` flags a stale schema. See [Upgrading](upgrade.md#0100-snapshotreplication-multi-repository-fan-out-new-rbac-and-a-new-snapshot-phase).
+
+///
+
 ### Sources — what to back up
 
 `sources` is a list. Each entry is **exactly one of** a single PVC, a label selector, or an inline NFS export (mutually exclusive — the webhook rejects setting more than one on a source).

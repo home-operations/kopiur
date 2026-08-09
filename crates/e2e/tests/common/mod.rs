@@ -102,14 +102,41 @@ pub fn repository_json(
     subpath: &str,
     extra_spec: serde_json::Value,
 ) -> serde_json::Value {
+    repository_json_with(
+        name,
+        subpath,
+        consts::ISOLATED_REPO_PATH,
+        CREDS_SECRET,
+        extra_spec,
+    )
+}
+
+/// Like [`repository_json`], but with an explicit in-pod mount `path` and
+/// credentials Secret (key `KOPIA_PASSWORD`), so a scenario can give a
+/// repository its OWN password and/or a non-default mount path.
+///
+/// The `path` knob matters when TWO filesystem repositories meet in ONE mover
+/// pod (a `SnapshotReplication` fs→fs run mounts the source read-only AND the
+/// destination read-write): both defaulting to `/repo` would put two volumes at
+/// one `mountPath`. kopia writes the repo at the PVC *root* regardless of the
+/// mount path (same fact the `RepositoryReplication` e2e relies on), so a
+/// verifier over the same `subpath` at the default `/repo` still reads a repo
+/// written under a different `path`.
+pub fn repository_json_with(
+    name: &str,
+    subpath: &str,
+    path: &str,
+    creds_secret: &str,
+    extra_spec: serde_json::Value,
+) -> serde_json::Value {
     merge_spec(
         serde_json::json!({
             "apiVersion": "kopiur.home-operations.com/v1alpha1",
             "kind": "Repository",
             "metadata": { "name": name, "namespace": E2E_NAMESPACE },
             "spec": {
-                "backend": { "filesystem": { "path": consts::ISOLATED_REPO_PATH, "volume": { "pvc": { "name": consts::isolated_repo_pvc(subpath) } } } },
-                "encryption": { "passwordSecretRef": { "name": CREDS_SECRET, "key": "KOPIA_PASSWORD" } },
+                "backend": { "filesystem": { "path": path, "volume": { "pvc": { "name": consts::isolated_repo_pvc(subpath) } } } },
+                "encryption": { "passwordSecretRef": { "name": creds_secret, "key": "KOPIA_PASSWORD" } },
                 "create": { "enabled": true }
             }
         }),
@@ -440,6 +467,19 @@ pub fn assert_hardening_survives(sc: &k8s_openapi::api::core::v1::SecurityContex
 /// observed `status.storageStats.snapshotCount` (the catalog-scan count). Used to
 /// prove whether a kopia snapshot exists in the repo.
 pub async fn observed_snapshot_count(client: &Client, verifier: &str, subpath: &str) -> i64 {
+    observed_snapshot_count_with_creds(client, verifier, subpath, CREDS_SECRET).await
+}
+
+/// Like [`observed_snapshot_count`], but connecting with a scenario-owned
+/// credentials Secret — for repositories whose password is NOT the shared
+/// `kopia-creds` one (e.g. the different-password `SnapshotReplication`
+/// destination).
+pub async fn observed_snapshot_count_with_creds(
+    client: &Client,
+    verifier: &str,
+    subpath: &str,
+    creds_secret: &str,
+) -> i64 {
     // The verifier connects to the SAME isolated repo dir as the writer (same subpath
     // ⇒ same PVC); ensure it exists (idempotent) in case the verifier runs first.
     ensure_repo(client, subpath).await;
@@ -449,9 +489,11 @@ pub async fn observed_snapshot_count(client: &Client, verifier: &str, subpath: &
             &PostParams::default(),
             // ReadOnly + create disabled: only ever CONNECTS to the existing repo and
             // scans its catalog (never writes/maintains).
-            &cr(repository_json(
+            &cr(repository_json_with(
                 verifier,
                 subpath,
+                consts::ISOLATED_REPO_PATH,
+                creds_secret,
                 serde_json::json!({ "mode": "ReadOnly", "create": { "enabled": false } }),
             )),
         )

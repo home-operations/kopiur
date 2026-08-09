@@ -991,9 +991,8 @@ mod tests {
 
     /// The 5-way contract of [`effective_repository_ref`] — the single
     /// launch/deletion/pin/preflight repository decision (multi-repo fan-out,
-    /// #368). Specs are constructed directly (the admission feature gate is
-    /// deliberately bypassed): this is exactly how the un-admittable multi-repo
-    /// behavior is proven until the gate lifts.
+    /// #368). Specs are constructed directly, the same shapes admission
+    /// accepts now that the M7 feature gate is lifted.
     mod effective_repository {
         use super::super::effective_repository_ref;
         use crate::error::ValidationError;

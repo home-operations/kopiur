@@ -310,6 +310,14 @@ async fn spawn_replication_job(
     {
         return Err(Error::Validation(e.to_string()));
     }
+    if let Some(path) = kopiur_api::validate::replication_filesystem_mount_collision(
+        &repo.backend,
+        &repl.spec.destination,
+    ) {
+        return Err(Error::Validation(
+            kopiur_api::ValidationError::ReplicationMountPathCollision { path }.to_string(),
+        ));
+    }
     if let Err(e) = kopiur_api::validate::validate_replication_destination_secret_namespace(
         &repl.spec.destination,
         namespace,

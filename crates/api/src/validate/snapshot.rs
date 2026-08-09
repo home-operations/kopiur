@@ -19,14 +19,14 @@ use crate::snapshot_schedule::SnapshotScheduleSpec;
 ///      duplicate detection needs. (A `namespace`-omitted and an explicit
 ///      same-namespace ref to one repository are not caught here; the webhook
 ///      guards that identity-level collision separately.)
-///   4. **The feature gate**: `spec.repositories` is refused outright until
-///      the multi-repository data path lands end-to-end
-///      ([`ValidationError::MultiRepositoryNotYetEnabled`]) — admitting it
-///      early would corrupt the policy's shared kopia cache and fake
-///      verification results.
-///   5. `hooks` × `repositories` mutual exclusion
-///      ([`ValidationError::PolicyHooksWithRepositories`]) — added alongside
-///      the gate so lifting it cannot forget the quiesce-contract refusal.
+///   4. `hooks` × `repositories` mutual exclusion
+///      ([`ValidationError::PolicyHooksWithRepositories`]) — hooks quiesce a
+///      workload around ONE capture; N concurrent fan-out children void that
+///      contract (use a single-repo policy + `SnapshotReplication` instead).
+///
+/// A well-formed multi-repo spec is ACCEPTED — the M7 "not yet enabled"
+/// feature gate was lifted once the fan-out data path (per-child pins,
+/// per-repo retention/cache/verification) landed end-to-end.
 fn validate_policy_repositories(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     let mut errs = Vec::new();
     if let Err(e) = crate::snapshot_policy::policy_repositories(spec) {
@@ -50,14 +50,8 @@ fn validate_policy_repositories(spec: &SnapshotPolicySpec) -> Vec<ValidationErro
             seen.insert(key, i);
         }
     }
-    if crate::snapshot_policy::is_multi_repo(spec) {
-        // THE FEATURE GATE (M7): keep multi-repo un-admittable until the full
-        // fan-out data path (pins, per-repo retention/cache/verification)
-        // lands. Removed by the milestone that lifts the gate (M11).
-        errs.push(ValidationError::MultiRepositoryNotYetEnabled);
-        if spec.hooks.is_some() {
-            errs.push(ValidationError::PolicyHooksWithRepositories);
-        }
+    if crate::snapshot_policy::is_multi_repo(spec) && spec.hooks.is_some() {
+        errs.push(ValidationError::PolicyHooksWithRepositories);
     }
     errs
 }

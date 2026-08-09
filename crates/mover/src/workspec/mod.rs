@@ -1640,7 +1640,7 @@ impl ResolvedIdentity {
 /// converts one to the other. Credentials are NOT here: they arrive as env vars
 /// (mounted Secret) so they never land in a ConfigMap.
 ///
-/// The variants mirror the eight CRD `Backend` kinds one-to-one, so the
+/// The variants mirror the CRD `Backend` kinds one-to-one, so the
 /// controller's `Backend -> RepositoryConnect` map is exhaustive (a new backend
 /// cannot compile until it is wired through to the mover).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

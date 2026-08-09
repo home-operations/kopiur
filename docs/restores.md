@@ -56,6 +56,19 @@ source:
 
 `asOf` (newest snapshot at/before an RFC3339 instant) and `offset` (count back from latest) usually travel alone — `asOf` is the "roll back to a known-good time" knob; `offset` is "the previous one." They do compose if you set both: `asOf` filters first, then `offset` counts back within what's left ("the one before the last known-good").
 
+/// warning | A multi-repository policy needs an explicit `spec.repository`
+
+When the policy uses [`spec.repositories` fan-out](backups.md#repositories--one-recipe-several-repositories-fan-out), a `fromPolicy` restore must also set `spec.repository` to **one member** of the policy's set — the N repositories are independent captures that can diverge, so Kopiur refuses to guess (the rejection lists the valid choices, and a ref outside the set is refused too). Single-repo policies need nothing extra.
+
+```yaml
+repository: { kind: Repository, name: offsite-s3 } # which member to read
+source:
+    fromPolicy:
+        name: postgres-data
+```
+
+///
+
 /// note | The resolution is pinned — a restore never silently retargets
 Whatever the source resolves to is written ONCE to `status.resolved.kopiaSnapshotID` and reused for the rest of the restore's life. New snapshots appearing mid-flight (a schedule firing) cannot change which snapshot this Restore writes.
 ///

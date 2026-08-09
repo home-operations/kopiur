@@ -228,8 +228,9 @@ fn repo_matches(
 
 /// Render a policy's repository target for the status table. A display path
 /// has no error surface, so the invalid/multi shapes get honest placeholders
-/// instead of a silent repository #1 (multi-repo rendering proper lands with
-/// the fan-out data path in M8/M10).
+/// instead of a silent repository #1 — the per-repository detail for a
+/// multi-repo policy lives in `kubectl get snapshotpolicy` (the
+/// `Repositories` print column renders `status.repositorySummary`).
 fn policy_repository_display(spec: &kopiur_api::SnapshotPolicySpec) -> String {
     use kopiur_api::PolicyRepositories;
     match kopiur_api::policy_repositories(spec) {
@@ -1133,6 +1134,57 @@ mod tests {
         ));
         // No filter keeps everything.
         assert!(replication_matches(None, &repl(other.clone(), other)));
+    }
+
+    #[test]
+    fn policy_filter_matches_any_of_the_repository_set() {
+        let filter = RepoFilter {
+            uid: "u1".into(),
+            name: "nas".into(),
+            kind: RepositoryKind::Repository,
+            namespace: Some("media".into()),
+        };
+        let policy = |repo_surface: serde_json::Value| -> SnapshotPolicy {
+            let mut spec = serde_json::json!({
+                "sources": [ { "pvc": { "name": "d" } } ],
+            });
+            spec.as_object_mut()
+                .unwrap()
+                .extend(repo_surface.as_object().unwrap().clone());
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1", "kind": "SnapshotPolicy",
+                "metadata": { "name": "p", "namespace": "media" },
+                "spec": spec,
+            }))
+            .unwrap()
+        };
+        // Single-repo: matches (ref ns absent = policy ns).
+        assert!(policy_matches(
+            Some(&filter),
+            &policy(serde_json::json!({ "repository": { "name": "nas" } }))
+        ));
+        // Multi-repo: ANY-of over `spec.repositories` — the filtered repo may
+        // be any member, so the policy shows up under every repo it targets.
+        assert!(policy_matches(
+            Some(&filter),
+            &policy(serde_json::json!({ "repositories": [
+                { "kind": "ClusterRepository", "name": "offsite" },
+                { "name": "nas" },
+            ] }))
+        ));
+        // …but not when no member matches (same name, wrong namespace).
+        assert!(!policy_matches(
+            Some(&filter),
+            &policy(serde_json::json!({ "repositories": [
+                { "name": "nas", "namespace": "other" },
+                { "kind": "ClusterRepository", "name": "offsite" },
+            ] }))
+        ));
+        // No filter keeps everything.
+        assert!(policy_matches(
+            None,
+            &policy(serde_json::json!({ "repositories": [ { "name": "x" } ] }))
+        ));
     }
 
     #[test]

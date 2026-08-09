@@ -746,9 +746,11 @@ pub fn expand_sources(
                             > 1)
                     .then(|| SnapshotSourceGroup {
                         namespace: target.namespace.clone(),
-                        // Repo dimension: none yet — the multi-repo fan-out
-                        // consumers of `group_name(.., Some(repo_key))` land in
-                        // M8/M10; passing None keeps names byte-identical.
+                        // Repo dimension: none HERE — `expand_sources` emits
+                        // repo-agnostic members, and `mint_cells` re-derives
+                        // this name with `Some(repo_key)` per repository for a
+                        // multi-repo policy. Passing None keeps single-repo
+                        // names byte-identical to the legacy form.
                         volume_group_snapshot_name: group_name(
                             base_name,
                             &target.namespace,

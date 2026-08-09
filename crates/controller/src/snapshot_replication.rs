@@ -751,6 +751,16 @@ async fn spawn_snapshot_replication_job(
     {
         return Err(Error::Validation(e.to_string()));
     }
+    // Two distinct fs repos sharing one in-pod path would render an invalid
+    // pod (two volumeMounts at a single mountPath). The webhook denies this at
+    // admission; this is the defensive backstop for stored/skew CRs.
+    if let Some(path) =
+        kopiur_api::validate::replication_filesystem_mount_collision(&source.backend, &dest.backend)
+    {
+        return Err(Error::Validation(
+            kopiur_api::ValidationError::ReplicationMountPathCollision { path }.to_string(),
+        ));
+    }
     let work_spec = build_snapshot_replication_work_spec(repl, source, dest, namespace, cr_name);
 
     let mut labels = BTreeMap::new();
@@ -796,9 +806,10 @@ async fn spawn_snapshot_replication_job(
     // A filesystem DESTINATION needs its volume mounted read-write — `kopia
     // snapshot migrate` writes the copies into it. Carried in the
     // `source_volume` slot (the Job builder just turns it into a pod
-    // volume/mount at the destination's path; the two repositories are distinct
-    // CRs whose paths the webhook keeps from colliding, so the two mounts never
-    // fight). Object-store destinations reach the backend over the network.
+    // volume/mount at the destination's path; the mount-path-collision guard —
+    // webhook deny + the spawn-time backstop above — keeps the two paths
+    // distinct, so the mounts never fight). Object-store destinations reach
+    // the backend over the network.
     let dest_volume =
         io::filesystem_repo_mount_source(&dest.backend).map(|mount_source| VolumeMountSpec {
             source: mount_source,

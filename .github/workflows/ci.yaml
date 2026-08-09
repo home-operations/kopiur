@@ -198,6 +198,14 @@ jobs:
           - shard: reshape-async
             bins: "verification replication"
             backends: false
+          # SnapshotReplication (issue #368): logical snapshot-level replication
+          # via `kopia snapshot migrate`. Cron-driven multi-minute waits like
+          # reshape-async, but four scenarios each provisioning a two-repository
+          # fixture — its own shard keeps it and the other async cron suites
+          # under the job timeout. Filesystem only.
+          - shard: snapshot-replication
+            bins: "snapshot_replication"
+            backends: false
           # Staging deadline + staged-PVC overrides/bind race (#198, #223): the
           # deadline tests quiesce kube-system/snapshot-controller (they own
           # VolumeSnapshot status while it's down), which no other test may

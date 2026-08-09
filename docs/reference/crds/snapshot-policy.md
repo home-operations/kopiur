@@ -8,11 +8,22 @@ the [field reference](../../field-reference.md); for how-to guidance see
 
 ## `spec`
 
-### `repository`
+### `repository` / `repositories`
 
-Discriminated reference to the repository this recipe backs up to — either a
-namespaced `Repository` or a cluster-scoped `ClusterRepository`. The wire shape
-carries a `kind` so the referent kind is explicit.
+Where the backups go — **exactly one of** the two fields is set (webhook- and
+CEL-enforced):
+
+- `repository` — discriminated reference to one repository: a namespaced
+  `Repository` or a cluster-scoped `ClusterRepository`. The wire shape carries
+  a `kind` so the referent kind is explicit.
+- `repositories` — a list of **1–8 distinct** such refs for
+  [multi-repository fan-out](../../backups.md#repositories--one-recipe-several-repositories-fan-out):
+  every run backs each source up into **each** listed repository (one
+  `Snapshot` CR + one mover Job per (source, repository) pair — independent
+  captures, per-repo identity/retention/verification/cache). Duplicate entries
+  are refused, and `repositories` is mutually exclusive with `hooks` (the
+  quiesce contract cannot span N concurrent children — use a single-repo
+  policy plus a [`SnapshotReplication`](snapshot-replication.md) instead).
 
 ### `identity`
 

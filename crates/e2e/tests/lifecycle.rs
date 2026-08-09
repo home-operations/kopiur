@@ -14,7 +14,7 @@
 //! These tests assert on real operator output: a Repository reaching Ready, a
 //! Snapshot reaching Succeeded with a real kopia snapshot id, a Restore Completed,
 //! schedule-driven Snapshot creation, finalizer-driven snapshot deletion, and a
-//! Maintenance lease claim — across six of the seven CRDs.
+//! Maintenance lease claim — across six of the nine CRDs.
 
 #![cfg(all(unix, feature = "e2e"))]
 
