@@ -924,6 +924,28 @@ async fn bootstrap_cluster_via_mover(
         probe_enabled && bootstrapped_before && already_ready && !reverify && !spec_changed;
 
     if let Some(job) = job_api.get_opt(&job_name).await? {
+        // Stale-generation recycle — the namespaced reconciler's twin (see the
+        // doc on `repository::stale_bootstrap_job`): a terminal Job launched
+        // for an older generation must be recycled at once so a user's spec
+        // fix re-bootstraps a terminally-`Failed` repository immediately
+        // instead of re-reading the stale failed result until the Job's TTL.
+        if crate::snapshot::job_terminal_state(&job).is_some()
+            && crate::repository::stale_bootstrap_job(
+                job.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_GENERATION_ANNOTATION))
+                    .map(String::as_str),
+                repo.metadata.generation,
+            )
+        {
+            tracing::info!(
+                repo = %name,
+                "recycling a terminal bootstrap Job launched for an older generation"
+            );
+            io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
         return match crate::snapshot::job_terminal_state(&job) {
             // Still running. A catalog-refresh re-run of an already-Ready repo
             // keeps its phase — flapping Ready→Initializing every refresh would
@@ -1268,7 +1290,7 @@ async fn bootstrap_cluster_via_mover(
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
         extra_env: Vec::new(),
-        annotations: Default::default(),
+        annotations: crate::repository::bootstrap_generation_annotation(repo.metadata.generation),
         // Bootstrap is a short connect/create probe: an emptyDir cache suffices.
         cache_volume: Default::default(),
         scratch_volume: None,

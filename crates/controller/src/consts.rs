@@ -99,6 +99,16 @@ pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replica
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
 
+/// Annotation on a bootstrap Job recording the `Repository` generation it was
+/// launched FOR. The terminal-Job recycle gate compares it against the live
+/// generation: a spec edit makes any lingering terminal Job stale and recycles
+/// it immediately — phase-independent, so a user fixing a terminally-`Failed`
+/// repository's config re-bootstraps at once instead of waiting out the failed
+/// Job's TTL. Comparing the JOB's stamp (not `status.observedGeneration`) is
+/// what makes this livelock-free: the freshly-launched Job carries the current
+/// generation, so its own result is always consumed, never recycled.
+pub const BOOTSTRAP_GENERATION_ANNOTATION: &str = "kopiur.home-operations.com/bootstrap-generation";
+
 /// `COMPONENT_LABEL` value for snapshot-replication (logical, `kopia snapshot
 /// migrate`) mover Jobs (issue #368).
 pub const SNAPSHOT_REPLICATION_COMPONENT: &str = "snapshot-replication";
