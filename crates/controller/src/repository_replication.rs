@@ -411,6 +411,7 @@ async fn spawn_replication_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         cache_volume: Default::default(),
         scratch_volume: None,

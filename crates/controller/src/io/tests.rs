@@ -1539,6 +1539,27 @@ fn wi_rolebinding_name_truncates_long_sa_names_with_a_stable_hash() {
 }
 
 #[test]
+fn snapshot_replication_mover_name_derives_from_the_generic_role() {
+    // The default chart wiring (`<fullname>-mover`) yields the exact name
+    // `gen-rbac` ships and the chart's snapshotReplicationMoverName helper
+    // renders, so the runtime binding always references an existing role.
+    assert_eq!(
+        snapshot_replication_mover_name("kopiur-mover"),
+        "kopiur-snapshot-replication-mover"
+    );
+    assert_eq!(
+        snapshot_replication_mover_name("myrelease-kopiur-mover"),
+        "myrelease-kopiur-snapshot-replication-mover"
+    );
+    // A custom role name without the conventional suffix still derives
+    // deterministically (and distinctly from the generic role).
+    assert_eq!(
+        snapshot_replication_mover_name("custom-role"),
+        "custom-role-snapshot-replication"
+    );
+}
+
+#[test]
 fn missing_wi_sa_message_is_actionable_per_cloud() {
     use kopiur_api::creds::WorkloadIdentityCloud;
     for (cloud, annotation) in [

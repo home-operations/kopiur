@@ -20,7 +20,7 @@ use kube::{Api, Client, ResourceExt};
 use kopiur_api::common::RepositoryKind;
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryReplication, Restore, Snapshot,
-    SnapshotPolicy, SnapshotSchedule,
+    SnapshotPolicy, SnapshotReplication, SnapshotSchedule,
 };
 
 use crate::config;
@@ -28,7 +28,7 @@ use crate::context::Context;
 use crate::metrics::ResourceStores;
 use crate::{
     cluster_repository, consts, maintenance, repository, repository_replication, restore, snapshot,
-    snapshot_policy, snapshot_schedule, watch,
+    snapshot_policy, snapshot_replication, snapshot_schedule, watch,
 };
 
 /// The watcher config EVERY informer in the process shares — the controller
@@ -155,7 +155,7 @@ fn publish_store<K>(
     let _ = cell.set(store);
 }
 
-/// Spawn all eight controllers and join them. Split out so it can be driven
+/// Spawn all nine controllers and join them. Split out so it can be driven
 /// independently of the metrics server. The shared Maintenance informer that the
 /// repo reconcilers read is set up separately in [`run`].
 pub(crate) async fn spawn_all(
@@ -761,6 +761,81 @@ pub(crate) async fn spawn_all(
             }
         });
 
+    // SnapshotReplication (issue #368) owns its per-slot mover Jobs, watches BOTH
+    // endpoint repositories (a source OR destination flipping Ready resumes a
+    // waiting replication), and watches Secrets/ConfigMaps through a two-hop
+    // join (secret → referencing repository → replications targeting it) —
+    // both endpoints are repository CRs here, so unlike RepositoryReplication
+    // there is no inline destination backend to match directly.
+    let crepo_ref_store = crepo.as_ref().map(|(s, _)| s.clone());
+    let srepl_api: Api<SnapshotReplication> = scoped_api(&client, &scope);
+    let srepl_ctx = ctx.clone();
+    let srepl_ctrl = Controller::new(srepl_api, cfg.clone()).with_config(ctrl_cfg.clone());
+    let srepl_store = srepl_ctrl.store();
+    let mut srepl_ctrl = srepl_ctrl
+        .owns_with(scoped_api::<Job>(&client, &scope), (), owned_cfg.clone())
+        .watches(scoped_api::<Repository>(&client, &scope), cfg.clone(), {
+            let store = srepl_store.clone();
+            move |r: Repository| watch::repository_to_snapshot_replications(&store, &r)
+        })
+        .watches_stream(
+            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg),
+            {
+                let srepl = srepl_store.clone();
+                let repos = repo_store.clone();
+                let crepos = crepo_ref_store.clone();
+                move |s: PartialObjectMeta<Secret>| {
+                    let mut out = watch::secret_to_snapshot_replications(&srepl, &repos, &s);
+                    if let Some(cr) = &crepos {
+                        out.extend(watch::secret_to_snapshot_replications_via_cluster(
+                            &srepl, cr, &s,
+                        ));
+                    }
+                    out
+                }
+            },
+        )
+        .watches_stream(
+            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg),
+            {
+                let srepl = srepl_store.clone();
+                let repos = repo_store.clone();
+                let crepos = crepo_ref_store.clone();
+                move |cm: PartialObjectMeta<ConfigMap>| {
+                    let mut out = watch::configmap_to_snapshot_replications(&srepl, &repos, &cm);
+                    if let Some(cr) = &crepos {
+                        out.extend(watch::configmap_to_snapshot_replications_via_cluster(
+                            &srepl, cr, &cm,
+                        ));
+                    }
+                    out
+                }
+            },
+        );
+    if cluster_wide {
+        srepl_ctrl = srepl_ctrl.watches(
+            Api::<ClusterRepository>::all(client.clone()),
+            cfg.clone(),
+            {
+                let store = srepl_store.clone();
+                move |r: ClusterRepository| {
+                    watch::cluster_repository_to_snapshot_replications(&store, &r)
+                }
+            },
+        );
+    }
+    let srepl_ctrl = srepl_ctrl
+        .run(
+            snapshot_replication::reconcile,
+            snapshot_replication::error_policy,
+            srepl_ctx,
+        )
+        .for_each(|res| async move {
+            if let Err(e) = res {
+                tracing::debug!(error = %e, "snapshot_replication reconcile error");
+            }
+        });
+
     // Register the store-backed observable gauges (kopiur_resource_phase, the
     // per-Snapshot stat series, and the per-policy "latest" family). Their callbacks
     // read these reflector caches at scrape time, so each series exists only while
@@ -794,5 +869,6 @@ pub(crate) async fn spawn_all(
         restore_ctrl,
         maint_ctrl,
         repl_ctrl,
+        srepl_ctrl,
     );
 }

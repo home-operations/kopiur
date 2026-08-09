@@ -1267,6 +1267,7 @@ async fn bootstrap_cluster_via_mover(
         result_configmap: Some(&job_name),
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations: Default::default(),
         // Bootstrap is a short connect/create probe: an emptyDir cache suffices.
         cache_volume: Default::default(),

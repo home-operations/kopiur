@@ -92,6 +92,22 @@ pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replica
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
 
+/// `COMPONENT_LABEL` value for snapshot-replication (logical, `kopia snapshot
+/// migrate`) mover Jobs (issue #368).
+pub const SNAPSHOT_REPLICATION_COMPONENT: &str = "snapshot-replication";
+/// Label tying a snapshot-replication Job back to its owning
+/// `SnapshotReplication` (single-flight selector: [`COMPONENT_LABEL`] +
+/// this = CR name). Deliberately the SAME label the replication mover stamps on
+/// copy `Snapshot` CRs ([`kopiur_api::consts::SNAPSHOT_REPLICATION_LABEL`]) —
+/// one label, one meaning: "belongs to this SnapshotReplication". The
+/// component label disambiguates Jobs from copy CRs where it matters.
+pub const SNAPSHOT_REPLICATION_INSTANCE_LABEL: &str =
+    kopiur_api::consts::SNAPSHOT_REPLICATION_LABEL;
+/// Annotation on a snapshot-replication Job recording the scheduled slot it
+/// runs (RFC3339; not a valid *label* value because of the colons).
+pub const SNAPSHOT_REPLICATION_SLOT_ANNOTATION: &str =
+    "kopiur.home-operations.com/snapshot-replication-slot";
+
 /// Annotation on the kopia-server Deployment's POD TEMPLATE carrying a short
 /// hash of the serialized `ServerWorkSpec`. The server reads its spec from a
 /// mounted ConfigMap, and a ConfigMap content change alone never restarts a

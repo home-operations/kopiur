@@ -68,48 +68,15 @@ pub fn triple_spec(t: &IdentityTriple) -> String {
     format!("{}@{}:{}", t.0, t.1, t.2)
 }
 
-/// Component-glob match: `*` and `?` match within a path component but never
-/// across `/`; every `/` in the pattern must align with a `/` in the value.
-/// Implemented by splitting both sides on `/` and glob-matching per segment —
-/// obviously-correct segment semantics rather than a backtracker with a
-/// non-crossing special case. For `username`/`hostname` (which contain no
-/// `/`) this degenerates to a plain glob.
-///
-/// TODO(orchestrator): the M3 api slice exports the same matcher for the
-/// webhook's glob-syntax validation; dedupe onto the api's once merged.
-pub fn component_glob_matches(pattern: &str, value: &str) -> bool {
-    let ps: Vec<&str> = pattern.split('/').collect();
-    let vs: Vec<&str> = value.split('/').collect();
-    ps.len() == vs.len() && ps.iter().zip(vs.iter()).all(|(p, v)| segment_glob(p, v))
-}
-
-/// Classic greedy glob over a single path segment (`*` = any run of chars,
-/// `?` = any one char; no `/` can appear in either side here).
-fn segment_glob(pattern: &str, value: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let v: Vec<char> = value.chars().collect();
-    let (mut pi, mut vi) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while vi < v.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == v[vi]) && p[pi] != '*' {
-            pi += 1;
-            vi += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, vi));
-            pi += 1;
-        } else if let Some((sp, sv)) = star {
-            pi = sp + 1;
-            vi = sv + 1;
-            star = Some((sp, sv + 1));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
+/// The ONE component-glob matcher, re-exported from `kopiur_api` — the SAME
+/// function admission validates patterns against
+/// ([`kopiur_api::snapshot_replication::component_glob_matches`]), so what the
+/// webhook admitted and what this mover selects cannot fork. Semantics per the
+/// CRD's `IdentityMatcher` docs: anchored per-component, `*` = any run of
+/// characters (including none — matching is per structured identity component,
+/// so there is no separator for it to "cross"), `?` = exactly one character,
+/// everything else literal.
+pub use kopiur_api::snapshot_replication::component_glob_matches;
 
 /// Whether one matcher matches a triple: every PRESENT field must
 /// component-glob-match its component; an absent field matches anything. An

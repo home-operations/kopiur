@@ -1446,7 +1446,9 @@ pub struct IdentityMatcherSpec {
     /// Glob for the kopia `hostname` component.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// Glob for the kopia source-path component (`*`/`?` never cross `/`).
+    /// Glob for the kopia source-path component (anchored; `*` matches any run
+    /// of characters — matching is per structured component, so there is no
+    /// separator to cross).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
 }

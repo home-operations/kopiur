@@ -43,37 +43,21 @@ fn ts(s: &str) -> DateTime<Utc> {
 }
 
 // --- component_glob_matches --------------------------------------------------
+// The matcher is the api crate's exported one (the full behavior matrix lives
+// in `kopiur_api::snapshot_replication`'s tests, next to the webhook's
+// glob-syntax validation). This pins the mover-visible contract of the shared
+// fn — the CRD semantics: anchored, per-component, `*` any run of characters
+// (matching is per structured identity component, so there is no separator to
+// "cross" — a `*` in a sourcePath pattern DOES span `/`).
 
 #[test]
-fn component_glob_literal_star_and_question() {
+fn component_glob_is_the_shared_api_matcher() {
     assert!(component_glob_matches("mydb", "mydb"));
     assert!(!component_glob_matches("mydb", "mydb2"));
-    assert!(component_glob_matches("my*", "mydb"));
-    assert!(component_glob_matches("*db", "mydb"));
-    assert!(component_glob_matches("m*b", "mydb"));
-    assert!(component_glob_matches("*", "anything"));
-    assert!(component_glob_matches("my?b", "mydb"));
-    assert!(!component_glob_matches("my?b", "mydddb"));
-    // Empty pattern matches only the empty value.
-    assert!(component_glob_matches("", ""));
-    assert!(!component_glob_matches("", "x"));
-    // Multiple stars.
-    assert!(component_glob_matches("*a*c*", "xxaxxcxx"));
-    assert!(!component_glob_matches("*a*c*", "xxaxxbxx"));
-}
-
-#[test]
-fn component_glob_never_crosses_path_separators() {
-    // `*` stays within one component: /pvc/* matches one level, not two.
     assert!(component_glob_matches("/pvc/*", "/pvc/mydb"));
-    assert!(!component_glob_matches("/pvc/*", "/pvc/mydb/data"));
-    assert!(component_glob_matches("/pvc/*/data", "/pvc/mydb/data"));
-    // `?` never matches `/` either (segment counts must agree).
-    assert!(!component_glob_matches("/pvc?mydb", "/pvc/mydb"));
-    // Literal `/` must align.
-    assert!(component_glob_matches("/a/b", "/a/b"));
-    assert!(!component_glob_matches("/a/b", "/a/b/c"));
-    assert!(!component_glob_matches("/a/b/c", "/a/b"));
+    // CRD-documented semantics: `*` matches any run INCLUDING `/` (this forked
+    // from admission when the mover carried its own `/`-splitting matcher).
+    assert!(component_glob_matches("/pvc/*", "/pvc/mydb/data"));
 }
 
 // --- matcher_matches ---------------------------------------------------------

@@ -27,3 +27,36 @@ rules:
   verbs:
   - get
   - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: kopiur
+  name: kopiur-snapshot-replication-mover
+rules:
+- apiGroups:
+  - kopiur.home-operations.com
+  resources:
+  - snapshots
+  verbs:
+  - get
+  - list
+  - create
+  - patch
+  - delete
+- apiGroups:
+  - kopiur.home-operations.com
+  resources:
+  - snapshots/status
+  - snapshotreplications/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - patch

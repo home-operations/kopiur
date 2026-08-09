@@ -1992,6 +1992,7 @@ async fn srepl_terminal(
 ///   opens, so migrate's source open would read the DESTINATION's cached
 ///   format blob and fail with "invalid repository password" — pinned by
 ///   `crates/kopia/tests/integration_migrate.rs`.
+///
 /// Per-run file locations for the two-repository replicate flow. Everything
 /// lives under the writable cache emptyDir; the two config paths are what keep
 /// the source and destination connections from clobbering each other.
@@ -2363,8 +2364,6 @@ async fn run_snapshot_replicate_flow(
     source_connect: &ConnectSpec,
     kopia_binary: Option<&str>,
 ) -> Result<()> {
-    use kopiur_mover::error::KopiaOp as Op;
-
     info!(
         source_backend = spec.repository.kind_str(),
         destination_backend = op.destination.kind_str(),
@@ -2407,7 +2406,7 @@ async fn run_snapshot_replicate_flow(
         &snapshot_replicate_ok_body(
             op.destination.kind_str(),
             &chrono::Utc::now(),
-            &stats,
+            stats,
             "ReplicationSucceeded",
             &format!(
                 "replicated {} snapshot(s) across {} identit{} ({} already present, {} pruned)",

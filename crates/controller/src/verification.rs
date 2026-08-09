@@ -498,6 +498,7 @@ async fn spawn_verify_job(
         result_configmap: None,
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
+        extra_env: Vec::new(),
         annotations,
         // Inherit moverDefaults.cache (overlaid by the recipe's mover.cache) for the
         // kopia cache volume — but always per-run ephemeral, never the backup's warm

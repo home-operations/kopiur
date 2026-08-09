@@ -191,23 +191,35 @@ fn operator_role_can_server_side_apply_the_minted_mover_rbac() {
 /// The dedicated, least-privilege mover role is generated for both install modes
 /// and grants ONLY what the mover uses (status patch on the owning CRDs + the
 /// bootstrap-result configmap patch) — never the operator's broad rule set.
+/// The rules of the named (Cluster)Role document within a multi-doc RBAC file
+/// (the mover files now carry BOTH the generic and the snapshot-replication
+/// mover roles, so "first role in the file" is no longer a selector).
+fn named_role_rules(content: &str, name: &str) -> Vec<PolicyRule> {
+    docs(content)
+        .into_iter()
+        .find_map(|d| {
+            let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
+            let doc_name = v
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str());
+            (doc_name == Some(name)).then_some(())?;
+            match v.get("kind").and_then(|k| k.as_str()) {
+                Some("ClusterRole") => serde_yaml::from_str::<ClusterRole>(&d).ok()?.rules,
+                Some("Role") => serde_yaml::from_str::<Role>(&d).ok()?.rules,
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| panic!("no (Cluster)Role named {name} with rules"))
+}
+
 #[test]
 fn mover_role_is_least_privilege() {
     let artifacts = xtask::rbac::artifacts().expect("generate RBAC artifacts");
     for rel in ["rbac/mover-clusterrole.yaml", "rbac/mover-role.yaml"] {
         let a = artifact(&artifacts, rel);
         assert!(a.content.starts_with(RBAC_HEADER), "{rel} missing header");
-        let role_rules = docs(&a.content)
-            .into_iter()
-            .find_map(|d| {
-                let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
-                match v.get("kind").and_then(|k| k.as_str()) {
-                    Some("ClusterRole") => serde_yaml::from_str::<ClusterRole>(&d).ok()?.rules,
-                    Some("Role") => serde_yaml::from_str::<Role>(&d).ok()?.rules,
-                    _ => None,
-                }
-            })
-            .unwrap_or_else(|| panic!("{rel} must contain a (Cluster)Role with rules"));
+        let role_rules = named_role_rules(&a.content, "kopiur-mover");
 
         // Grants the mover's actual API surface.
         assert!(
@@ -232,6 +244,57 @@ fn mover_role_is_least_privilege() {
             assert!(
                 !rule_grants(&role_rules, g, r),
                 "{rel} must NOT grant {g}/{r} (mover is least-privilege)"
+            );
+        }
+        // The rationale for the SEPARATE snapshot-replication role: the generic
+        // mover SA must never hold namespace-wide Snapshot create/delete — a
+        // compromised generic mover pod could otherwise erase every backup
+        // record in its namespace.
+        assert!(
+            !rule_grants(&role_rules, "kopiur.home-operations.com", "snapshots"),
+            "{rel}: the GENERIC mover role must never grant the snapshots primary resource"
+        );
+    }
+}
+
+/// The dedicated snapshot-replication mover role (issue #368): ships in both
+/// install modes, grants the copy-CR lifecycle (get/list/create/patch/delete
+/// on `snapshots` — SSA needs `patch`+`create`, m:217cd0be) plus the status
+/// patches and configmap parity — and NOTHING of the operator's broad set.
+#[test]
+fn snapshot_replication_mover_role_grants_the_copy_cr_lifecycle() {
+    let artifacts = xtask::rbac::artifacts().expect("generate RBAC artifacts");
+    for rel in ["rbac/mover-clusterrole.yaml", "rbac/mover-role.yaml"] {
+        let a = artifact(&artifacts, rel);
+        let rules = named_role_rules(&a.content, "kopiur-snapshot-replication-mover");
+        for verb in ["get", "list", "create", "patch", "delete"] {
+            assert!(
+                rule_grants_verb(&rules, "kopiur.home-operations.com", "snapshots", verb),
+                "{rel}: dedicated role must grant `{verb}` on snapshots"
+            );
+        }
+        for resource in ["snapshots/status", "snapshotreplications/status"] {
+            for verb in ["get", "patch"] {
+                assert!(
+                    rule_grants_verb(&rules, "kopiur.home-operations.com", resource, verb),
+                    "{rel}: dedicated role must grant `{verb}` on {resource}"
+                );
+            }
+        }
+        assert!(
+            rule_grants_verb(&rules, "", "configmaps", "patch"),
+            "{rel}: dedicated role keeps the generic mover's configmaps surface"
+        );
+        // Still a mover role: none of the operator's broad grants.
+        for (g, r) in [
+            ("batch", "jobs"),
+            ("", "secrets"),
+            ("", "pods"),
+            ("kopiur.home-operations.com", "snapshotpolicies"),
+        ] {
+            assert!(
+                !rule_grants(&rules, g, r),
+                "{rel}: dedicated role must NOT grant {g}/{r}"
             );
         }
     }
