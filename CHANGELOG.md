@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.1](https://github.com/home-operations/kopiur/compare/0.10.0...0.10.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* **mise:** something about mise warnings ([#373](https://github.com/home-operations/kopiur/issues/373)) ([fde8073](https://github.com/home-operations/kopiur/commit/fde8073235387b7b54931a33e22a43dd684b7e06))
+* **rust:** update crate cel (0.14.1 → 0.14.2) ([#379](https://github.com/home-operations/kopiur/issues/379)) ([4a60221](https://github.com/home-operations/kopiur/commit/4a60221b49bc2ab984b1cb6076b923b4be985387))
+* **rust:** update crate futures (0.3.33 → 0.3.34) ([#378](https://github.com/home-operations/kopiur/issues/378)) ([ff657b8](https://github.com/home-operations/kopiur/commit/ff657b8083b41bebe731ce093aa5b4e43bdd410f))
+* **rust:** update crate rcgen (0.14.8 → 0.14.9) ([#377](https://github.com/home-operations/kopiur/issues/377)) ([e3b3b3f](https://github.com/home-operations/kopiur/commit/e3b3b3f767f0f6130ab7ec69bdb75f22abc77ec7))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update tool aqua:astral-sh/uv (0.12.2 → 0.12.3) ([#375](https://github.com/home-operations/kopiur/issues/375)) ([952af6d](https://github.com/home-operations/kopiur/commit/952af6d8aa5bb5bcb0587ef3ea8a5a9789a9aefa))
+
 ## [0.10.0](https://github.com/home-operations/kopiur/compare/0.9.5...0.10.0) (2026-08-09)
 
 
